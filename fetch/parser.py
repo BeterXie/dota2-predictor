@@ -74,6 +74,7 @@ def parse_players(match: dict) -> list[dict]:
             "backpack_1": p.get("backpack_1"),
             "backpack_2": p.get("backpack_2"),
             "item_neutral": p.get("item_neutral"),
+            "firstblood_claimed": p.get("firstblood_claimed"),
         })
     return rows
 

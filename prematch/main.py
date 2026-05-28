@@ -1,24 +1,24 @@
 """Pre-match prediction CLI.
 
-Predict a Dota 2 match outcome before it starts, using only pre-match data:
-team history, H2H records, and hero lineup statistics.
+Predict a Dota 2 match outcome before it starts using a weighted scoring system
+that combines hero matchup advantage, team recent form, H2H records, and team
+historical strength.
 
 Usage:
     python -m prematch.main \\
         --radiant 9247354 --dire 10150538 \\
         --radiant-heroes 1,2,3,4,5 --dire-heroes 6,7,8,9,10 \\
-        [--league 19101]
+        [--league 19101] [--ml]
 """
 
 import argparse
 import json
-import pickle
 import sys
 from pathlib import Path
 
 import yaml
 
-from .feature_builder import build_prematch_features
+from .scorer import predict_match
 
 
 def _load_config() -> dict:
@@ -27,18 +27,6 @@ def _load_config() -> dict:
         with open(config_path) as f:
             return yaml.safe_load(f)
     return {}
-
-
-def _load_prematch_model(models_dir: str) -> dict:
-    """Load the pre-match model bundle from prematch_latest.pkl."""
-    latest = Path(models_dir) / "prematch_latest.pkl"
-    if not latest.exists():
-        raise FileNotFoundError(
-            f"Pre-match model not found: {latest}\n"
-            f"Train it first: python -m prematch.train"
-        )
-    with open(latest, "rb") as f:
-        return pickle.load(f)
 
 
 def _parse_hero_list(raw: str, side: str) -> list[int]:
@@ -78,7 +66,77 @@ def _validate_team_exists(db_path: str, team_id: int) -> None:
         conn.close()
 
 
-def run(
+def _run_scorer(
+    radiant_id: int,
+    dire_id: int,
+    league_id: int,
+    radiant_heroes: list[int],
+    dire_heroes: list[int],
+    db_path: str,
+    predictions_dir: str,
+) -> None:
+    """Run prediction using the heuristic scoring system."""
+    print("Computing prediction scores from hero matchups, team form, H2H...")
+    result = predict_match(db_path, radiant_id, dire_id, radiant_heroes, dire_heroes)
+
+    # Output
+    print(f"\n  Radiant win probability: {result['radiant_win_prob']:.2%}")
+    print(f"  Confidence: {result['confidence']} ({result['confidence_score']:.2f})")
+
+    print("\n  Component breakdown:")
+    for name, comp in result["components"].items():
+        w = result["weights_used"][name]
+        score = comp["score"]
+        bar = "█" * int(abs(score) * 20) if abs(score) > 0.01 else "─"
+        side = "R" if score > 0 else ("D" if score < 0 else " ")
+        print(f"  [{w:.0%}] {name:16s} {score:+.4f} {bar} {side}")
+        if "radiant_win_rate" in comp:
+            print(f"       radiant recent WR={comp['radiant_win_rate']:.0%}  "
+                  f"dire={comp['dire_win_rate']:.0%}")
+        if "total_matches" in comp and comp["total_matches"] > 0:
+            print(f"       H2H: {comp.get('radiant_wins',0)}-"
+                  f"{comp['total_matches']-comp.get('radiant_wins',0)} "
+                  f"({comp['total_matches']} matches)")
+        if "best_matchups" in comp and comp["best_matchups"]:
+            r, d, a = comp["best_matchups"][0]
+            print(f"       best matchup: hero {r} vs {d} ({a:+.4f})")
+
+    # Save prediction
+    from predict.output import format_output, save_prediction, _sanitize
+
+    # Wrap result to match the expected format
+    prediction = {
+        "radiant_win_prob": result["radiant_win_prob"],
+        "confidence": result["confidence"],
+        "top_factors": _format_factors(result),
+    }
+
+    output = format_output(prediction, radiant_id, dire_id, league_id,
+                           {"timestamp": "scorer", "metrics": {}}, db_path)
+    file_path = save_prediction(output, predictions_dir)
+
+    print(f"\n  Prediction saved to {file_path}")
+    print(json.dumps(_sanitize(output), indent=2, ensure_ascii=False))
+
+
+def _format_factors(result: dict) -> list[dict]:
+    """Extract top contributing factors from the scoring result."""
+    factors = []
+    for name, comp in result["components"].items():
+        score = comp["score"]
+        if abs(score) < 0.01:
+            continue
+        direction = "radiant" if score > 0 else "dire"
+        factors.append({
+            "factor": name,
+            "impact": round(abs(score), 4),
+            "direction": direction,
+        })
+    factors.sort(key=lambda x: x["impact"], reverse=True)
+    return factors
+
+
+def _run_ml(
     radiant_id: int,
     dire_id: int,
     league_id: int,
@@ -88,63 +146,36 @@ def run(
     models_dir: str,
     predictions_dir: str,
 ) -> None:
-    if radiant_id == dire_id:
-        print("Error: radiant and dire teams must be different.", file=sys.stderr)
-        sys.exit(1)
+    """Run prediction using the XGBoost ML model (fallback)."""
+    from predict.predictor import load_model, predict
+    from .feature_builder import build_prematch_features
 
-    _validate_team_exists(db_path, radiant_id)
-    _validate_team_exists(db_path, dire_id)
-
-    # Load pre-match model
-    print(f"Loading pre-match model from {models_dir} ...")
-    bundle = _load_prematch_model(models_dir)
+    bundle = load_model(models_dir)
     feature_names = bundle["feature_names"]
-    print(
-        f"Model expects {len(feature_names)} pre-match features "
-        f"(version {bundle.get('timestamp', '?')})."
-    )
+    print(f"Model expects {len(feature_names)} features "
+          f"(version {bundle.get('timestamp', '?')}).")
 
-    # Build features
-    print(
-        f"Building feature vector for radiant={radiant_id} dire={dire_id} "
-        f"with hero lineups..."
-    )
     features = build_prematch_features(
         radiant_id, dire_id, league_id,
         radiant_heroes, dire_heroes,
         db_path, feature_names,
     )
 
-    # Predict (reuse predict module's predictor logic)
-    print("Running prediction ...")
-    import os as _os
-    _project_root = Path(__file__).resolve().parent.parent
-    if str(_project_root) not in sys.path:
-        sys.path.insert(0, str(_project_root))
-    from predict.predictor import predict
-
     result = predict(bundle, features)
 
-    # Output
     print(f"\nRadiant win probability: {result['radiant_win_prob']:.2%}")
     print(f"Confidence: {result['confidence']}")
 
     if result["top_factors"]:
         print("\nTop contributing factors:")
         for f in result["top_factors"]:
-            print(
-                f"  {f['factor']:40s} impact={f['impact']:.4f}  "
-                f"direction={f['direction']}"
-            )
+            print(f"  {f['factor']:40s} impact={f['impact']:.4f}  "
+                  f"direction={f['direction']}")
 
-    # Format and save
-    from predict.output import format_output, save_prediction
-
+    from predict.output import format_output, save_prediction, _sanitize
     output = format_output(result, radiant_id, dire_id, league_id, bundle, db_path)
     file_path = save_prediction(output, predictions_dir)
-
     print(f"\nPrediction saved to {file_path}")
-    from predict.output import _sanitize
     print(json.dumps(_sanitize(output), indent=2, ensure_ascii=False))
 
 
@@ -155,19 +186,21 @@ def main():
     parser.add_argument("--radiant", type=int, required=True, help="Radiant team ID")
     parser.add_argument("--dire", type=int, required=True, help="Dire team ID")
     parser.add_argument(
-        "--radiant-heroes",
-        type=str,
-        required=True,
+        "--radiant-heroes", type=str, required=True,
         help="Comma-separated radiant hero IDs (5 required), e.g. 1,2,3,4,5",
     )
     parser.add_argument(
-        "--dire-heroes",
-        type=str,
-        required=True,
+        "--dire-heroes", type=str, required=True,
         help="Comma-separated dire hero IDs (5 required), e.g. 6,7,8,9,10",
     )
+    parser.add_argument("--league", type=int, default=0, help="League ID (optional)")
     parser.add_argument(
-        "--league", type=int, default=0, help="League ID (optional)"
+        "--ml", action="store_true",
+        help="Use XGBoost ML model instead of heuristic scorer",
+    )
+    parser.add_argument(
+        "--weights", type=str, default=None,
+        help="Custom weights: hero_matchup,team_form,h2h,team_strength (comma-sep)",
     )
     args = parser.parse_args()
 
@@ -184,19 +217,27 @@ def main():
     if not Path(db_path).exists():
         print(f"Database not found: {db_path}", file=sys.stderr)
         sys.exit(1)
-    if not Path(models_dir, "prematch_latest.pkl").exists():
-        print(
-            f"Pre-match model not found: {Path(models_dir) / 'prematch_latest.pkl'}\n"
-            f"Train it first: python -m prematch.train",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
-    run(
-        args.radiant, args.dire, args.league,
-        radiant_heroes, dire_heroes,
-        db_path, models_dir, predictions_dir,
-    )
+    if args.ml:
+        if not Path(models_dir, "prematch_latest.pkl").exists():
+            print(
+                f"Pre-match model not found: {Path(models_dir) / 'prematch_latest.pkl'}\n"
+                f"Train it first: python -m prematch.train",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _run_ml(args.radiant, args.dire, args.league,
+                radiant_heroes, dire_heroes,
+                db_path, models_dir, predictions_dir)
+    else:
+        custom_weights = None
+        if args.weights:
+            keys = ["hero_matchup", "team_form", "h2h", "team_strength"]
+            vals = [float(v) for v in args.weights.split(",")]
+            custom_weights = dict(zip(keys, vals))
+        _run_scorer(args.radiant, args.dire, args.league,
+                    radiant_heroes, dire_heroes,
+                    db_path, predictions_dir)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,9 @@ class OpenDotaClient:
     async def get_hero_stats(self) -> list[dict]:
         return await self._request("/api/heroStats")
 
+    async def get_hero_matchups(self, hero_id: int) -> list[dict]:
+        return await self._request(f"/api/heroes/{hero_id}/matchups")
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.aclose()

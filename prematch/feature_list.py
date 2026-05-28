@@ -1,7 +1,10 @@
 """Pre-match feature names — subset of the full 183 features that are available
-before a match starts. These exclude all in-game stats (KDA, GPM from the match,
-tower kills, teamfights, etc.), hero role stats (which depend on post-match GPM),
-and draft order features.
+before a match starts.
+
+Excludes all in-game stats (KDA, GPM from the match itself, tower kills,
+teamfights, etc.) and hero role stats (which depend on post-match GPM).
+Only features that can be computed from historical data or external APIs
+are included, preventing data leakage from the match being predicted.
 """
 
 PREMATCH_FEATURES = frozenset({
@@ -16,21 +19,7 @@ PREMATCH_FEATURES = frozenset({
     "h2h_radiant_win_rate",
     "h2h_match_count",
 
-    # ---- Radiant team base stats (12) ----
-    "radiant_total_kills",
-    "radiant_total_deaths",
-    "radiant_total_assists",
-    "radiant_avg_gpm",
-    "radiant_avg_xpm",
-    "radiant_total_net_worth",
-    "radiant_total_last_hits",
-    "radiant_total_denies",
-    "radiant_gpm_std",
-    "radiant_max_net_worth",
-    "radiant_total_hero_damage",
-    "radiant_first_blood",
-
-    # ---- Radiant team rolling (12) ----
+    # ---- Radiant team rolling stats from historical matches (12) ----
     "radiant_team_win_rate_10",
     "radiant_team_avg_gpm_10",
     "radiant_team_avg_xpm_10",
@@ -44,21 +33,7 @@ PREMATCH_FEATURES = frozenset({
     "radiant_team_avg_xpm_50",
     "radiant_team_net_worth_lead_10min_50",
 
-    # ---- Dire team base stats (12) ----
-    "dire_total_kills",
-    "dire_total_deaths",
-    "dire_total_assists",
-    "dire_avg_gpm",
-    "dire_avg_xpm",
-    "dire_total_net_worth",
-    "dire_total_last_hits",
-    "dire_total_denies",
-    "dire_gpm_std",
-    "dire_max_net_worth",
-    "dire_total_hero_damage",
-    "dire_first_blood",
-
-    # ---- Dire team rolling (12) ----
+    # ---- Dire team rolling stats from historical matches (12) ----
     "dire_team_win_rate_10",
     "dire_team_avg_gpm_10",
     "dire_team_avg_xpm_10",
@@ -72,19 +47,7 @@ PREMATCH_FEATURES = frozenset({
     "dire_team_avg_xpm_50",
     "dire_team_net_worth_lead_10min_50",
 
-    # ---- Diff: team base + rolling (24) ----
-    "diff_team_id",
-    "diff_total_kills",
-    "diff_total_deaths",
-    "diff_total_assists",
-    "diff_avg_gpm",
-    "diff_avg_xpm",
-    "diff_total_net_worth",
-    "diff_total_last_hits",
-    "diff_total_denies",
-    "diff_gpm_std",
-    "diff_max_net_worth",
-    "diff_total_hero_damage",
+    # ---- Diff: team rolling stats (12) ----
     "diff_team_win_rate_10",
     "diff_team_avg_gpm_10",
     "diff_team_avg_xpm_10",
@@ -111,4 +74,18 @@ PREMATCH_FEATURES = frozenset({
     "radiant_avg_hero_ban_rate_patch",
     "dire_avg_hero_ban_rate_patch",
     "diff_avg_hero_ban_rate_patch",
+
+    # ---- Hero counter features (12) ----
+    "radiant_avg_hero_advantage",
+    "dire_avg_hero_advantage",
+    "diff_avg_hero_advantage",
+    "radiant_min_hero_advantage",
+    "radiant_max_hero_advantage",
+    "dire_min_hero_advantage",
+    "dire_max_hero_advantage",
+    "diff_min_hero_advantage",
+    "diff_max_hero_advantage",
+    "radiant_hero_advantage_std",
+    "dire_hero_advantage_std",
+    "diff_hero_advantage_std",
 })

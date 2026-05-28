@@ -4,271 +4,29 @@ Computes team rolling windows (10/20/50 matches), hero per-patch statistics,
 and head-to-head records between teams. All temporal aggregations use only
 matches that occurred BEFORE the current match's start_time to prevent data
 leakage.
+
+Single-entity query functions are imported from shared.queries.
 """
 
-import sqlite3
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 
+from shared.queries import (
+    compute_h2h,
+    compute_hero_patch_stats,
+    compute_team_rolling,
+    connect as _connect,
+    empty_team_rolling,
+)
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-# ---------------------------------------------------------------------------
-# Per-entity query functions (used by predict/ and other modules)
-# ---------------------------------------------------------------------------
-
-
-def compute_team_rolling(
-    db_path: str,
-    team_id: int,
-    before_time: int | None = None,
-    window_sizes: tuple[int, ...] = (10, 20, 50),
-) -> dict:
-    """Compute rolling stats for a single team based on matches before *before_time*.
-
-    Returns a dict keyed like ``team_win_rate_10``, ``team_avg_gpm_20``, etc.
-    If *before_time* is None all matches are considered.
-    """
-    with _connect(db_path) as conn:
-        params = [team_id, team_id]
-        time_filter = ""
-        if before_time is not None:
-            time_filter = "AND m.start_time < ?"
-            params.append(before_time)
-
-        # Team match performances: one row per match the team played,
-        # ordered most-recent first so we can take the first N.
-        df = pd.read_sql_query(
-            f"""
-            SELECT
-                m.match_id,
-                m.start_time,
-                CASE WHEN m.radiant_team_id = ? THEN 1 ELSE 0 END AS is_radiant,
-                CASE
-                    WHEN m.radiant_team_id = ? AND m.radiant_win = 1 THEN 1
-                    WHEN m.dire_team_id  = ? AND m.radiant_win = 0 THEN 1
-                    ELSE 0
-                END AS win,
-                COALESCE(ps.avg_gpm, 0) AS avg_gpm,
-                COALESCE(ps.avg_xpm, 0) AS avg_xpm,
-                COALESCE(
-                    CASE WHEN m.radiant_team_id = ? THEN ga.value ELSE -ga.value END,
-                    0
-                ) AS net_worth_lead_10min
-            FROM matches m
-            LEFT JOIN (
-                SELECT match_id, is_radiant,
-                       AVG(gold_per_min * 1.0) AS avg_gpm,
-                       AVG(xp_per_min * 1.0)   AS avg_xpm
-                FROM match_players
-                GROUP BY match_id, is_radiant
-            ) ps ON ps.match_id = m.match_id
-                AND ps.is_radiant = (CASE WHEN m.radiant_team_id = ? THEN 1 ELSE 0 END)
-            LEFT JOIN gold_advantage ga
-                ON ga.match_id = m.match_id AND ga.time_min = 10
-            WHERE (m.radiant_team_id = ? OR m.dire_team_id = ?)
-                  {time_filter}
-            ORDER BY m.start_time DESC
-            """,
-            conn,
-            params=[team_id, team_id, team_id, team_id, team_id, team_id, team_id]
-            + ([before_time] if before_time is not None else []),
-        )
-
-    if df.empty:
-        return _empty_team_rolling(window_sizes)
-
-    result = {}
-    for n in window_sizes:
-        window = df.head(n)
-        k = len(window)
-        if k == 0:
-            result.update(
-                {
-                    f"team_win_rate_{n}": np.nan,
-                    f"team_avg_gpm_{n}": np.nan,
-                    f"team_avg_xpm_{n}": np.nan,
-                    f"team_net_worth_lead_10min_{n}": np.nan,
-                }
-            )
-        else:
-            result[f"team_win_rate_{n}"] = float(window["win"].mean())
-            result[f"team_avg_gpm_{n}"] = float(window["avg_gpm"].mean())
-            result[f"team_avg_xpm_{n}"] = float(window["avg_xpm"].mean())
-            result[f"team_net_worth_lead_10min_{n}"] = float(
-                window["net_worth_lead_10min"].mean()
-            )
-    return result
-
-
-def compute_hero_patch_stats(
-    db_path: str,
-    hero_id: int,
-    patch: int,
-    before_time: int | None = None,
-) -> dict:
-    """Compute hero stats for a specific hero in a specific patch.
-
-    Returns ``hero_win_rate_patch``, ``hero_avg_gpm_patch``,
-    ``hero_pick_rate_patch``, ``hero_ban_rate_patch``.
-    """
-    with _connect(db_path) as conn:
-        params: list = [patch]
-        time_filter = ""
-        if before_time is not None:
-            time_filter = "AND m.start_time < ?"
-            params.append(before_time)
-
-        # Total matches in patch (before cutoff)
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM matches WHERE patch = ? {time_filter}",
-            params,
-        ).fetchone()[0]
-
-        if total == 0:
-            return {
-                "hero_win_rate_patch": np.nan,
-                "hero_avg_gpm_patch": np.nan,
-                "hero_pick_rate_patch": np.nan,
-                "hero_ban_rate_patch": np.nan,
-            }
-
-        # Matches where this hero was picked
-        picks = conn.execute(
-            f"""
-            SELECT COUNT(DISTINCT mp.match_id)
-            FROM match_players mp
-            JOIN matches m ON m.match_id = mp.match_id
-            WHERE mp.hero_id = ? AND m.patch = ? {time_filter.replace('m.', 'm.')}
-            """,
-            [hero_id] + params,
-        ).fetchone()[0]
-
-        # Matches where this hero was banned
-        bans = conn.execute(
-            f"""
-            SELECT COUNT(DISTINCT pb.match_id)
-            FROM picks_bans pb
-            JOIN matches m ON m.match_id = pb.match_id
-            WHERE pb.hero_id = ? AND pb.is_pick = 0 AND m.patch = ? {time_filter.replace('m.', 'm.')}
-            """,
-            [hero_id] + params,
-        ).fetchone()[0]
-
-        # Win rate when picked
-        wins = conn.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM match_players mp
-            JOIN matches m ON m.match_id = mp.match_id
-            WHERE mp.hero_id = ? AND m.patch = ? {time_filter.replace('m.', 'm.')}
-              AND (
-                (mp.is_radiant = 1 AND m.radiant_win = 1)
-                OR (mp.is_radiant = 0 AND m.radiant_win = 0)
-              )
-            """,
-            [hero_id] + params,
-        ).fetchone()[0]
-
-        # Total picks of this hero (can be 2 per match, one on each side)
-        total_picks = conn.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM match_players mp
-            JOIN matches m ON m.match_id = mp.match_id
-            WHERE mp.hero_id = ? AND m.patch = ? {time_filter.replace('m.', 'm.')}
-            """,
-            [hero_id] + params,
-        ).fetchone()[0]
-
-        avg_gpm = conn.execute(
-            f"""
-            SELECT AVG(mp.gold_per_min * 1.0)
-            FROM match_players mp
-            JOIN matches m ON m.match_id = mp.match_id
-            WHERE mp.hero_id = ? AND m.patch = ? {time_filter.replace('m.', 'm.')}
-            """,
-            [hero_id] + params,
-        ).fetchone()[0]
-
-    return {
-        "hero_win_rate_patch": float(wins / total_picks) if total_picks else np.nan,
-        "hero_avg_gpm_patch": float(avg_gpm) if avg_gpm is not None else np.nan,
-        "hero_pick_rate_patch": float(picks / total) if total else np.nan,
-        "hero_ban_rate_patch": float(bans / total) if total else np.nan,
-    }
-
-
-def compute_h2h(
-    db_path: str,
-    team_a: int,
-    team_b: int,
-    before_time: int | None = None,
-) -> dict:
-    """Compute head-to-head record between *team_a* and *team_b*.
-
-    Returns ``h2h_a_win_rate`` (team_a's win rate vs team_b) and
-    ``h2h_match_count`` (number of prior encounters).
-    """
-    with _connect(db_path) as conn:
-        params: list = []
-        time_filter = ""
-        if before_time is not None:
-            time_filter = "AND start_time < ?"
-            params.append(before_time)
-
-        # Matches where both teams played each other (team_a vs team_b in either order)
-        rows = conn.execute(
-            f"""
-            SELECT radiant_team_id, dire_team_id, radiant_win
-            FROM matches
-            WHERE (
-                (radiant_team_id = ? AND dire_team_id = ?)
-                OR (radiant_team_id = ? AND dire_team_id = ?)
-            ) {time_filter}
-            """,
-            [team_a, team_b, team_b, team_a] + params,
-        ).fetchall()
-
-    total = len(rows)
-    if total == 0:
-        return {"h2h_a_win_rate": np.nan, "h2h_match_count": 0}
-
-    wins = 0
-    for r in rows:
-        if r["radiant_team_id"] == team_a and r["radiant_win"]:
-            wins += 1
-        elif r["dire_team_id"] == team_a and not r["radiant_win"]:
-            wins += 1
-
-    return {"h2h_a_win_rate": float(wins / total), "h2h_match_count": total}
+_WINDOW_SIZES = (10, 20, 50)
 
 
 # ---------------------------------------------------------------------------
 # Batch computation — enriches feature DataFrames with aggregated columns
 # ---------------------------------------------------------------------------
-
-_WINDOW_SIZES = (10, 20, 50)
-
-
-def _empty_team_rolling(window_sizes: tuple[int, ...] = _WINDOW_SIZES) -> dict:
-    d = {}
-    for n in window_sizes:
-        d.update(
-            {
-                f"team_win_rate_{n}": np.nan,
-                f"team_avg_gpm_{n}": np.nan,
-                f"team_avg_xpm_{n}": np.nan,
-                f"team_net_worth_lead_10min_{n}": np.nan,
-            }
-        )
-    return d
 
 
 def _empty_hero_patch() -> dict:
@@ -496,7 +254,7 @@ def compute_and_merge_aggregates(
     for _, row in team_df.iterrows():
         mid = int(row["match_id"])
         tid = int(row["team_id"])
-        tr = team_rolling_results.get((mid, tid), _empty_team_rolling())
+        tr = team_rolling_results.get((mid, tid), empty_team_rolling())
         team_agg_rows.append(tr)
     team_agg_df = pd.DataFrame(team_agg_rows, index=team_df.index)
     team_df = pd.concat([team_df, team_agg_df], axis=1)

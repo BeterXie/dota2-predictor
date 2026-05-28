@@ -72,10 +72,12 @@
   .league-row label { display: block; font-size: 0.75rem; color: #8b90a0; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem; }
   .league-row select { width: 100%; padding: 0.45rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 4px; color: #d0d4e0; font-size: 0.85rem; }
 
-  .btn-row { text-align: center; margin-bottom: 2rem; }
-  .btn-row button { padding: 0.7rem 3rem; background: #2d5fbd; border: none; color: #fff; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+  .btn-row { text-align: center; margin-bottom: 2rem; display: flex; gap: 0.75rem; justify-content: center; }
+  .btn-row button { padding: 0.7rem 2.5rem; background: #2d5fbd; border: none; color: #fff; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
   .btn-row button:hover { background: #3d73e0; }
   .btn-row button:disabled { background: #1e2030; color: #4a4d5a; cursor: not-allowed; }
+  #reset-btn { background: #2a2d3a; }
+  #reset-btn:hover { background: #3a3d4a; }
 
   .error-msg { color: #f44336; padding: 1rem; background: #2a1015; border-radius: 6px; margin: 1rem 0; display: none; }
 
@@ -220,6 +222,7 @@
 
 <div class="btn-row">
   <button id="predict-btn" onclick="predict()">Predict Winner</button>
+  <button id="reset-btn" onclick="resetAll()">Reset</button>
 </div>
 
 <div id="error-msg" class="error-msg"></div>
@@ -344,6 +347,29 @@ function clearSlot(side, pos) {
   document.getElementById(side + '-slot-' + pos).classList.remove('has-hero');
 }
 
+function resetAll() {
+  // Reset team selectors
+  document.getElementById('radiant-team').value = '';
+  document.getElementById('dire-team').value = '';
+  // Reset league
+  document.getElementById('league').value = '';
+  // Clear all hero slots
+  for (const side of ['rad', 'dir']) {
+    for (let pos = 1; pos <= 5; pos++) {
+      clearSlot(side, pos);
+    }
+  }
+  // Reset state
+  selectedHeroes.rad = {};
+  selectedHeroes.dir = {};
+  // Hide result and error
+  document.getElementById('result').classList.remove('show');
+  document.getElementById('error-msg').style.display = 'none';
+  // Reset button state
+  document.getElementById('predict-btn').disabled = false;
+  document.getElementById('predict-btn').textContent = 'Predict Winner';
+}
+
 // ---- Predict ----
 async function predict() {
   const errorEl = document.getElementById('error-msg');
@@ -397,16 +423,18 @@ async function predict() {
     probEl.className = 'prob ' + (prob >= 0.5 ? 'radiant-win' : 'dire-win');
 
     document.getElementById('conf-text').textContent =
-      `Confidence: ${data.prediction.confidence}  |  Model: ${data.model.version}  |  Accuracy: ${(data.model.accuracy * 100).toFixed(0)}%`;
+      `Confidence: ${data.prediction.confidence} (${((data.prediction.confidence_score || 0) * 100).toFixed(0)}% data coverage)`;
 
     const factorsList = document.getElementById('factors-list');
     factorsList.innerHTML = '';
     const factors = data.prediction.top_factors || [];
+	    const compLabels = {hero_matchup:'Hero Matchup', team_form:'Team Form', h2h:'Head-to-Head', team_strength:'Team Strength'};
     if (factors.length > 0) {
       factors.forEach(f => {
+        const label = compLabels[f.factor] || f.factor;
         factorsList.innerHTML += `<div class="factor-row">
-          <span class="name">${f.factor}</span>
-          <span class="impact">${f.impact.toFixed(4)}</span>
+          <span class="name">${label}</span>
+          <span class="impact">${f.impact.toFixed(3)}</span>
           <span class="dir ${f.direction === 'radiant' ? 'rad' : 'dirr'}">${f.direction}</span>
         </div>`;
       });

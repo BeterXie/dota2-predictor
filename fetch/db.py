@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS heroes (
     localized_name  TEXT,
     primary_attr    TEXT,
     attack_type     TEXT,
-    roles           TEXT
+    roles           TEXT,
+    hero_key        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS match_players (
@@ -105,7 +106,8 @@ CREATE TABLE IF NOT EXISTS match_players (
     backpack_0      INTEGER,
     backpack_1      INTEGER,
     backpack_2      INTEGER,
-    item_neutral    INTEGER
+    item_neutral    INTEGER,
+    firstblood_claimed INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_match_players_match ON match_players(match_id);
@@ -184,6 +186,18 @@ CREATE TABLE IF NOT EXISTS chat (
     type        TEXT,
     message     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS hero_matchups (
+    hero_id     INTEGER REFERENCES heroes(hero_id),
+    vs_hero_id  INTEGER REFERENCES heroes(hero_id),
+    games_played INTEGER,
+    wins        INTEGER,
+    synergy     REAL,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (hero_id, vs_hero_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hero_matchups_hero ON hero_matchups(hero_id);
 """
 
 
@@ -223,15 +237,18 @@ class Database:
     def insert_heroes(self, heroes: list[dict]) -> None:
         conn = self.connect()
         for h in heroes:
+            internal_name = h.get("name", "")
+            hero_key = internal_name.replace("npc_dota_hero_", "") if internal_name else ""
             conn.execute(
-                """INSERT OR REPLACE INTO heroes (hero_id, localized_name, primary_attr, attack_type, roles)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO heroes (hero_id, localized_name, primary_attr, attack_type, roles, hero_key)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     h["id"],
                     h.get("localized_name"),
                     h.get("primary_attr"),
                     h.get("attack_type"),
                     json.dumps(h.get("roles")),
+                    hero_key,
                 ),
             )
         conn.commit()
@@ -298,13 +315,13 @@ class Database:
                     kills, deaths, assists, gold_per_min, xp_per_min, net_worth,
                     last_hits, denies, hero_damage, hero_healing, tower_damage, level,
                     item_0, item_1, item_2, item_3, item_4, item_5,
-                    backpack_0, backpack_1, backpack_2, item_neutral
+                    backpack_0, backpack_1, backpack_2, item_neutral, firstblood_claimed
                 ) VALUES (
                     :match_id, :account_id, :player_slot, :hero_id, :is_radiant, :team_id,
                     :kills, :deaths, :assists, :gold_per_min, :xp_per_min, :net_worth,
                     :last_hits, :denies, :hero_damage, :hero_healing, :tower_damage, :level,
                     :item_0, :item_1, :item_2, :item_3, :item_4, :item_5,
-                    :backpack_0, :backpack_1, :backpack_2, :item_neutral
+                    :backpack_0, :backpack_1, :backpack_2, :item_neutral, :firstblood_claimed
                 )""",
                 players,
             )
@@ -382,6 +399,27 @@ class Database:
 
         conn.commit()
         logger.info("Inserted match %d.", match_id)
+
+    def insert_hero_matchups(self, hero_id: int, matchups: list[dict]) -> None:
+        conn = self.connect()
+        conn.executemany(
+            """INSERT OR REPLACE INTO hero_matchups
+               (hero_id, vs_hero_id, games_played, wins, synergy)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (
+                    hero_id,
+                    m["hero_id"],
+                    m.get("games_played", 0),
+                    m.get("wins", 0),
+                    m.get("synergy"),
+                )
+                for m in matchups
+                if m.get("hero_id") != hero_id
+            ],
+        )
+        conn.commit()
+        logger.info("Inserted %d matchups for hero %d.", len(matchups) - 1, hero_id)
 
     @staticmethod
     def _delete_match_children(conn: sqlite3.Connection, match_id: int) -> None:

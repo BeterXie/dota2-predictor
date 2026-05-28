@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,24 @@ def _safe_execute(query: str, params: tuple = (), fetch: str = "all") -> Any:
         return [] if fetch == "all" else None
 
 
+def _parse_date_to_ts(date_str: str) -> int:
+    """Parse an ISO date string (e.g. '2025-01-01' or '2025-01-01T00:00:00')
+    to a Unix timestamp. Accepts bare Unix timestamp strings for backwards
+    compatibility."""
+    try:
+        ts = int(date_str)
+        return ts
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(date_str)
+    except ValueError:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
 # --- Matches ---
 
 def get_matches(
@@ -72,10 +91,10 @@ def get_matches(
         params.append(league_id)
     if date_from is not None:
         where.append("m.start_time >= ?")
-        params.append(date_from)
+        params.append(_parse_date_to_ts(date_from))
     if date_to is not None:
         where.append("m.start_time <= ?")
-        params.append(date_to)
+        params.append(_parse_date_to_ts(date_to))
 
     where_clause = ("WHERE " + " AND ".join(where)) if where else ""
     count_query = f"SELECT COUNT(*) FROM matches m {where_clause}"
@@ -337,7 +356,8 @@ def get_heroes() -> list[dict]:
 def get_hero_grid() -> dict[str, list[dict]]:
     """Return heroes grouped by primary_attr with image URLs for the hero picker."""
     rows = _safe_execute("""
-        SELECT hero_id, localized_name, primary_attr, hero_key
+        SELECT hero_id, localized_name, primary_attr,
+               COALESCE(NULLIF(hero_key, ''), '') AS hero_key
         FROM heroes
         ORDER BY localized_name
     """, fetch="all")

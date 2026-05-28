@@ -25,6 +25,7 @@ from train.dataset import build_training_data, split_train_test
 from train.evaluate import evaluate, print_report
 from train.model import cross_validate, train
 
+from .feature_builder import COUNTER_FEATURE_NAMES, build_counter_features_for_matches
 from .feature_list import PREMATCH_FEATURES
 
 
@@ -107,6 +108,19 @@ def main() -> None:
 
     # Fill remaining NaN with 0
     X_pm = X_pm.fillna(0)
+
+    # ---- Hero counter features (from OpenDota matchup data) ----------------
+    match_ids = X_pm.index.tolist()
+    counter_df = build_counter_features_for_matches(db_path, match_ids)
+    counter_df = counter_df.reindex(X_pm.index).fillna(0.0)
+
+    # Only keep counter features that are in PREMATCH_FEATURES
+    counter_cols = [c for c in COUNTER_FEATURE_NAMES if c in PREMATCH_FEATURES]
+    if counter_cols:
+        X_pm = X_pm.join(counter_df[counter_cols], how="left").fillna(0.0)
+        # Track new features added
+        new_counter_cols = [c for c in counter_cols if c not in prematch_cols]
+        prematch_cols.extend(new_counter_cols)
 
     print(f"Pre-match matrix: {X_pm.shape[0]} matches x {X_pm.shape[1]} features")
     print(f"Target distribution: {y.sum()} radiant wins / {len(y) - y.sum()} dire wins")

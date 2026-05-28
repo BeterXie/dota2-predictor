@@ -19,13 +19,17 @@ _DB_PATH = os.environ.get("DATABASE_PATH", str(_PROJECT_DIR / "data" / "dota2.db
 _MODELS_DIR = os.environ.get("MODELS_DIR", str(_PROJECT_DIR / "data" / "models"))
 _PREDICTIONS_DIR = os.environ.get("PREDICTIONS_DIR", str(_PROJECT_DIR / "data" / "predictions"))
 
+# Ensure project root is on sys.path (once at startup, not lazily)
+_project_root_str = str(_PROJECT_DIR)
+if _project_root_str not in sys.path:
+    sys.path.insert(0, _project_root_str)
+
 _prediction_module = None
 
 
 def _get_prediction_module():
     global _prediction_module
     if _prediction_module is None:
-        sys.path.insert(0, str(_PROJECT_DIR))
         from predict import feature_builder, output, predictor
         _prediction_module = (feature_builder, output, predictor)
     return _prediction_module
@@ -111,11 +115,11 @@ def create_prediction(request: PredictionRequest):
     finally:
         conn.close()
 
-    # Validate model exists
-    if not Path(_MODELS_DIR, "latest.pkl").exists():
+    # Validate pre-match model exists
+    if not Path(_MODELS_DIR, "prematch_latest.pkl").exists():
         raise HTTPException(
             status_code=503,
-            detail="Model not found. Train the model first (python -m train.main).",
+            detail="Pre-match model not found. Train it first: python -m prematch.train",
         )
 
     try:
@@ -154,10 +158,9 @@ _prematch_builder = None
 def _get_prematch_builder():
     global _prematch_builder
     if _prematch_builder is None:
-        sys.path.insert(0, str(_PROJECT_DIR))
-        from prematch.feature_builder import build_prematch_features
-        from predict import output, predictor
-        _prematch_builder = (build_prematch_features, output, predictor)
+        from prematch.scorer import predict_match
+        from predict import output
+        _prematch_builder = (predict_match, output)
     return _prematch_builder
 
 
@@ -184,36 +187,46 @@ def create_prematch_prediction(request: PrematchRequest):
     finally:
         conn.close()
 
-    # Validate pre-match model exists
-    if not Path(_MODELS_DIR, "prematch_latest.pkl").exists():
-        raise HTTPException(
-            status_code=503,
-            detail="Pre-match model not found. Train it first: python -m prematch.train",
-        )
-
     try:
-        build_prematch_features, output, predictor = _get_prematch_builder()
+        predict_match, output = _get_prematch_builder()
 
-        # Load model bundle
-        import pickle
-        with open(Path(_MODELS_DIR) / "prematch_latest.pkl", "rb") as f:
-            bundle = pickle.load(f)
-
-        features = build_prematch_features(
+        result = predict_match(
+            _DB_PATH,
             request.radiant_id, request.dire_id,
-            request.league_id or 0,
             request.radiant_heroes, request.dire_heroes,
-            _DB_PATH, bundle["feature_names"],
         )
-        result = predictor.predict(bundle, features)
+
+        # Wrap result to match expected format
+        prediction = {
+            "radiant_win_prob": result["radiant_win_prob"],
+            "confidence": result["confidence"],
+            "confidence_score": result["confidence_score"],
+            "top_factors": _format_scorer_factors(result),
+        }
+
         prediction_output = output.format_output(
-            result, request.radiant_id, request.dire_id,
-            request.league_id or 0, bundle, _DB_PATH,
+            prediction, request.radiant_id, request.dire_id,
+            request.league_id or 0,
+            {"timestamp": "scorer", "metrics": {}}, _DB_PATH,
         )
         file_path = output.save_prediction(prediction_output, _PREDICTIONS_DIR)
         prediction_output["file_path"] = file_path
         return output._sanitize(prediction_output)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+
+def _format_scorer_factors(result: dict) -> list[dict]:
+    factors = []
+    for name, comp in result.get("components", {}).items():
+        score = comp.get("score", 0)
+        if abs(score) < 0.01:
+            continue
+        direction = "radiant" if score > 0 else "dire"
+        factors.append({
+            "factor": name,
+            "impact": round(abs(score), 4),
+            "direction": direction,
+        })
+    factors.sort(key=lambda x: x["impact"], reverse=True)
+    return factors

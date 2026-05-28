@@ -8,15 +8,18 @@ import numpy as np
 import pandas as pd
 
 
-def load_model(models_dir: str) -> dict:
-    """Load the model bundle from latest.pkl.
+def load_model(models_dir: str, filename: str = "prematch_latest.pkl") -> dict:
+    """Load a model bundle from a pickle file.
+
+    Defaults to the pre-match model so that predictions only use features
+    available before the match starts (team history, H2H, hero lineups).
 
     Returns the bundle dict with keys: model, feature_names, metrics, imputer, timestamp.
     """
-    latest = Path(models_dir) / "latest.pkl"
-    if not latest.exists():
-        raise FileNotFoundError(f"Model not found: {latest}")
-    with open(latest, "rb") as f:
+    path = Path(models_dir) / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Model not found: {path}")
+    with open(path, "rb") as f:
         return pickle.load(f)
 
 

@@ -107,7 +107,8 @@ def run(db_path: str, features_dir: str) -> None:
         )
 
         match_feat = extract_match_features(
-            match_row, match_gold, match_xp, match_obj, match_tf, match_tfp
+            match_row, match_gold, match_xp, match_obj, match_tf, match_tfp,
+            players_df=match_players,
         )
         match_records.append(match_feat)
         team_records.extend(

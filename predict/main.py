@@ -104,8 +104,12 @@ def main():
     if not Path(db_path).exists():
         print(f"Database not found: {db_path}", file=sys.stderr)
         sys.exit(1)
-    if not Path(models_dir, "latest.pkl").exists():
-        print(f"Model not found: {Path(models_dir) / 'latest.pkl'}", file=sys.stderr)
+    if not Path(models_dir, "prematch_latest.pkl").exists():
+        print(
+            f"Pre-match model not found: {Path(models_dir) / 'prematch_latest.pkl'}\n"
+            f"Train it first: python -m prematch.train",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     run(args.radiant, args.dire, args.league, db_path, models_dir, predictions_dir)

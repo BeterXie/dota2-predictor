@@ -17,16 +17,17 @@ def _safe_int(val, default=0):
         return default
 
 
-def _first_blood_radiant(match_first_blood_time, gold_adv_df: pd.DataFrame) -> bool:
-    """Approximate which team got first blood by checking gold advantage."""
-    fb_time = match_first_blood_time
-    if pd.isna(fb_time) or (isinstance(fb_time, (int, float)) and fb_time <= 0):
+def _first_blood_radiant(players_df: pd.DataFrame) -> bool:
+    """Determine which team got first blood from player data."""
+    if players_df.empty:
         return False
-    minute = int(fb_time // 60)
-    row = gold_adv_df[gold_adv_df["time_min"] == minute]
-    if row.empty:
+    fb_col = "firstblood_claimed"
+    if fb_col not in players_df.columns:
         return False
-    return float(row["value"].iloc[0]) > 0
+    fb_players = players_df[players_df[fb_col].notna() & (players_df[fb_col] != 0)]
+    if fb_players.empty:
+        return False
+    return bool(fb_players.iloc[0]["is_radiant"])
 
 
 def _count_sign_swings(series: pd.Series) -> int:
@@ -40,6 +41,8 @@ def _count_sign_swings(series: pd.Series) -> int:
 
 
 def _gold_adv_at_minute(gold_adv_df: pd.DataFrame, minute: int) -> int:
+    if gold_adv_df.empty or "time_min" not in gold_adv_df.columns:
+        return 0
     row = gold_adv_df[gold_adv_df["time_min"] == minute]
     if row.empty:
         return 0
@@ -47,6 +50,8 @@ def _gold_adv_at_minute(gold_adv_df: pd.DataFrame, minute: int) -> int:
 
 
 def _xp_adv_at_minute(xp_adv_df: pd.DataFrame, minute: int) -> int:
+    if xp_adv_df.empty or "time_min" not in xp_adv_df.columns:
+        return 0
     row = xp_adv_df[xp_adv_df["time_min"] == minute]
     if row.empty:
         return 0
@@ -60,38 +65,47 @@ def extract_match_features(
     objectives_df: pd.DataFrame,
     teamfights_df: pd.DataFrame,
     tf_players_df: pd.DataFrame,
+    players_df: pd.DataFrame | None = None,
 ) -> dict:
     """Extract match-level features for a single match."""
 
-    fb_radiant = _first_blood_radiant(
-        match_row.get("first_blood_time"), gold_adv_df
-    )
+    if players_df is not None and not players_df.empty:
+        fb_radiant = _first_blood_radiant(players_df)
+    else:
+        fb_radiant = False
 
     # Gold advantage stats
-    gold_values = gold_adv_df["value"] if len(gold_adv_df) > 0 else pd.Series([0])
+    gold_values = gold_adv_df["value"] if len(gold_adv_df) > 0 and "value" in gold_adv_df.columns else pd.Series([0])
 
     # Tower / barracks kills from objectives
-    buildings = objectives_df[objectives_df["type"] == "building_kill"]
-    keys = buildings["key"].fillna("")
+    if len(objectives_df) > 0 and "type" in objectives_df.columns:
+        buildings = objectives_df[objectives_df["type"] == "building_kill"]
+        keys = buildings["key"].fillna("")
 
-    radiant_tower_kills = int(keys.str.contains("badguys_tower").sum())
-    dire_tower_kills = int(keys.str.contains("goodguys_tower").sum())
-    radiant_barracks_kills = int(keys.str.contains("badguys.*rax").sum())
-    dire_barracks_kills = int(keys.str.contains("goodguys.*rax").sum())
+        radiant_tower_kills = int(keys.str.contains("badguys_tower").sum())
+        dire_tower_kills = int(keys.str.contains("goodguys_tower").sum())
+        radiant_barracks_kills = int(keys.str.contains("badguys.*rax").sum())
+        dire_barracks_kills = int(keys.str.contains("goodguys.*rax").sum())
 
-    # First tower times
-    radiant_tower_times = buildings.loc[
-        keys.str.contains("badguys_tower"), "time"
-    ]
-    dire_tower_times = buildings.loc[
-        keys.str.contains("goodguys_tower"), "time"
-    ]
-    radiant_first_tower_time = (
-        int(radiant_tower_times.min()) if len(radiant_tower_times) > 0 else 0
-    )
-    dire_first_tower_time = (
-        int(dire_tower_times.min()) if len(dire_tower_times) > 0 else 0
-    )
+        radiant_tower_times = buildings.loc[
+            keys.str.contains("badguys_tower"), "time"
+        ]
+        dire_tower_times = buildings.loc[
+            keys.str.contains("goodguys_tower"), "time"
+        ]
+        radiant_first_tower_time = (
+            int(radiant_tower_times.min()) if len(radiant_tower_times) > 0 else 0
+        )
+        dire_first_tower_time = (
+            int(dire_tower_times.min()) if len(dire_tower_times) > 0 else 0
+        )
+    else:
+        radiant_tower_kills = 0
+        dire_tower_kills = 0
+        radiant_barracks_kills = 0
+        dire_barracks_kills = 0
+        radiant_first_tower_time = 0
+        dire_first_tower_time = 0
 
     # Teamfight analysis
     teamfight_count = len(teamfights_df)

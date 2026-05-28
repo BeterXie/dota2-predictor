@@ -7,7 +7,32 @@
       "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({'data_count': len\\(d.get\\('data',[]\\)\\), 'total': d.get\\('pagination',{}\\).get\\('total',0\\)}, indent=2\\)\\)\")",
       "Bash(curl -s http://localhost:8000/)",
       "Bash(curl -s http://localhost:8000/api/heroes)",
-      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'heroes: {len\\(d\\)} returned'\\)\")"
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'heroes: {len\\(d\\)} returned'\\)\")",
+      "Bash(git commit *)",
+      "Bash(gh auth *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(ssh-keyscan -t rsa github.com)",
+      "Bash(curl -sI https://github.com)",
+      "Bash(cmd.exe /c \"cd /d c:\\\\Users\\\\59908\\\\dota2-predictor && git push -u origin master 2>&1\")",
+      "Bash(powershell.exe -Command \"Set-Location 'c:\\\\Users\\\\59908\\\\dota2-predictor'; git push -u origin master 2>&1\")",
+      "Bash(ssh-keygen -t ed25519 -C beterxie-github -f __TRACKED_VAR__/.ssh/id_ed25519_github -N '')",
+      "Bash(nslookup github.com)",
+      "Bash(ssh -i ~/.ssh/id_ed25519_github -o StrictHostKeyChecking=accept-new -T git@github.com)",
+      "Bash(echo \"20.205.243.166 github.com\" >> /etc/hosts 2>&1 || echo \"/etc/hosts not writable\")",
+      "Bash(sqlite3 \"c:/Users/59908/dota2-predictor/data/dota2.db\" \"SELECT COUNT\\(*\\) as count FROM matches; SELECT COUNT\\(*\\) as count FROM matches WHERE leagueid=19696; SELECT COUNT\\(*\\) as count FROM teams; SELECT COUNT\\(*\\) as count FROM leagues;\")",
+      "Bash(where python *)",
+      "Bash(where py *)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/Program Files/**)",
+      "Bash(/c/Users/59908/AppData/Local/Programs/Python/Python310/python.exe -m pip list)",
+      "Bash(/c/Users/59908/AppData/Local/Programs/Python/Python310/python.exe -m fetch.main)",
+      "Bash(/c/Users/59908/AppData/Local/Programs/Python/Python310/python.exe -m features.main)",
+      "WebFetch(domain:stratz.com)",
+      "WebFetch(domain:docs.opendota.com)"
+    ],
+    "additionalDirectories": [
+      "\\etc"
     ]
   }
 }
