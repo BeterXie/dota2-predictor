@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pre-Match Prediction — Dota 2 Predictor</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f1117; color: #d0d4e0; padding: 2rem; max-width: 1200px; margin: 0 auto; }
+  a { color: #6ea8fe; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .nav { margin-bottom: 1.5rem; font-size: 0.85rem; }
+  .nav a { margin-right: 1.2rem; }
+
+  h1 { font-size: 1.6rem; margin-bottom: 0.3rem; }
+  .subtitle { color: #6b7084; margin-bottom: 2rem; font-size: 0.9rem; }
+
+  .main-grid { display: grid; grid-template-columns: 1fr auto 1fr; gap: 1.5rem; align-items: start; margin-bottom: 1.5rem; }
+  .side { background: #141723; border: 1px solid #1e2030; border-radius: 8px; padding: 1.25rem; }
+  .side.radiant { border-color: #2d5a27; }
+  .side.dire { border-color: #5a2727; }
+  .side h2 { font-size: 1.1rem; margin-bottom: 1rem; font-weight: 600; }
+  .radiant h2 { color: #b8e986; }
+  .dire h2 { color: #ff8a65; }
+
+  .vs { display: flex; align-items: center; font-size: 1.3rem; font-weight: 700; color: #4a4d5a; padding-top: 3rem; }
+
+  .field { margin-bottom: 0.75rem; }
+  .field label { display: block; font-size: 0.75rem; color: #8b90a0; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem; }
+  .field select { width: 100%; padding: 0.45rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 4px; color: #d0d4e0; font-size: 0.85rem; }
+  .field select:focus { outline: none; border-color: #4a7cf7; }
+
+  /* Hero picker slots */
+  .hero-slot { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; padding: 0.35rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 6px; cursor: pointer; transition: border-color 0.15s; min-height: 52px; }
+  .hero-slot:hover { border-color: #4a7cf7; }
+  .hero-slot .pos-num { width: 24px; text-align: center; font-size: 0.8rem; font-weight: 700; color: #6b7084; flex-shrink: 0; }
+  .hero-slot .hero-img { width: 40px; height: 24px; border-radius: 3px; overflow: hidden; flex-shrink: 0; background: #0f1117; }
+  .hero-slot .hero-img img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
+  .hero-slot .hero-name { flex: 1; font-size: 0.85rem; color: #6b7084; }
+  .hero-slot .hero-name.selected { color: #d0d4e0; }
+  .hero-slot .clear-btn { display: none; width: 20px; height: 20px; line-height: 18px; text-align: center; font-size: 0.8rem; color: #8b90a0; cursor: pointer; border-radius: 50%; flex-shrink: 0; }
+  .hero-slot .clear-btn:hover { color: #f44336; background: #2a1015; }
+  .hero-slot.has-hero .clear-btn { display: block; }
+  .hero-slot .pos-label { font-size: 0.65rem; color: #4a4d5a; margin-top: 1px; }
+
+  /* Modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: #141723; border: 1px solid #2a2d3a; border-radius: 10px; width: 900px; max-width: 95vw; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column; }
+  .modal-header { padding: 1rem 1.25rem; border-bottom: 1px solid #1e2030; display: flex; justify-content: space-between; align-items: center; }
+  .modal-header h3 { font-size: 1rem; color: #8b90a0; }
+  .modal-header button { background: none; border: none; color: #8b90a0; font-size: 1.2rem; cursor: pointer; }
+  .modal-header button:hover { color: #f44336; }
+
+  .attr-tabs { display: flex; gap: 0; border-bottom: 1px solid #1e2030; padding: 0 1.25rem; }
+  .attr-tab { padding: 0.6rem 1.2rem; font-size: 0.8rem; font-weight: 600; color: #6b7084; cursor: pointer; border-bottom: 2px solid transparent; text-transform: uppercase; letter-spacing: 0.5px; }
+  .attr-tab:hover { color: #b0b8d0; }
+  .attr-tab.active { color: #4a7cf7; border-bottom-color: #4a7cf7; }
+
+  .hero-grid { flex: 1; overflow-y: auto; padding: 0.75rem; display: none; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 0.5rem; }
+  .hero-grid.active { display: grid; }
+
+  .hero-card { display: flex; flex-direction: column; align-items: center; padding: 0.5rem 0.3rem; border-radius: 6px; cursor: pointer; border: 1px solid transparent; transition: all 0.12s; }
+  .hero-card:hover { background: #1a1c2a; border-color: #4a7cf7; }
+  .hero-card .card-img { width: 64px; height: 36px; border-radius: 3px; overflow: hidden; background: #0f1117; margin-bottom: 0.25rem; }
+  .hero-card .card-img img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
+  .hero-card .card-name { font-size: 0.7rem; color: #8b90a0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+
+  /* League row */
+  .league-row { margin-bottom: 1.5rem; max-width: 350px; }
+  .league-row label { display: block; font-size: 0.75rem; color: #8b90a0; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem; }
+  .league-row select { width: 100%; padding: 0.45rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 4px; color: #d0d4e0; font-size: 0.85rem; }
+
+  .btn-row { text-align: center; margin-bottom: 2rem; }
+  .btn-row button { padding: 0.7rem 3rem; background: #2d5fbd; border: none; color: #fff; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+  .btn-row button:hover { background: #3d73e0; }
+  .btn-row button:disabled { background: #1e2030; color: #4a4d5a; cursor: not-allowed; }
+
+  .error-msg { color: #f44336; padding: 1rem; background: #2a1015; border-radius: 6px; margin: 1rem 0; display: none; }
+
+  /* Result */
+  .result { background: #141723; border: 1px solid #1e2030; border-radius: 8px; padding: 1.5rem; display: none; }
+  .result.show { display: block; }
+  .result .prob { font-size: 2.5rem; font-weight: 700; text-align: center; }
+  .prob.radiant-win { color: #b8e986; }
+  .prob.dire-win { color: #ff8a65; }
+  .result .conf { text-align: center; color: #8b90a0; margin: 0.3rem 0 1rem; font-size: 0.9rem; }
+  .result .factors { margin-top: 1rem; }
+  .result .factors h3 { font-size: 0.9rem; color: #8b90a0; margin-bottom: 0.5rem; }
+  .factor-row { display: flex; justify-content: space-between; padding: 0.3rem 0; border-bottom: 1px solid #1a1c2a; font-size: 0.85rem; }
+  .factor-row .name { flex: 1; }
+  .factor-row .impact { width: 60px; text-align: right; color: #8b90a0; }
+  .factor-row .dir { width: 70px; text-align: right; }
+  .dir.rad { color: #b8e986; }
+  .dir.dirr { color: #ff8a65; }
+
+  @media (max-width: 800px) {
+    .main-grid { grid-template-columns: 1fr; }
+    .vs { padding-top: 0; justify-content: center; }
+    .hero-grid { grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); }
+  }
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/">Matches</a>
+  <a href="/prematch" style="color:#b8e986">Pre-Match Prediction</a>
+</div>
+
+<h1>Pre-Match Prediction</h1>
+<p class="subtitle">Select teams and hero lineups to predict the match outcome before it starts.</p>
+
+<div class="main-grid">
+  <!-- Radiant Side -->
+  <div class="side radiant">
+    <h2>Radiant</h2>
+    <div class="field">
+      <label>Team</label>
+      <select id="radiant-team"><option value="">Select team...</option></select>
+    </div>
+    <div class="hero-slot" id="rad-slot-1" onclick="openPicker('rad',1)">
+      <span class="pos-num">1</span>
+      <span class="hero-img"><img id="rad-img-1" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="rad-name-1">Carry — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('rad',1)">&times;</span>
+    </div>
+    <div class="hero-slot" id="rad-slot-2" onclick="openPicker('rad',2)">
+      <span class="pos-num">2</span>
+      <span class="hero-img"><img id="rad-img-2" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="rad-name-2">Mid — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('rad',2)">&times;</span>
+    </div>
+    <div class="hero-slot" id="rad-slot-3" onclick="openPicker('rad',3)">
+      <span class="pos-num">3</span>
+      <span class="hero-img"><img id="rad-img-3" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="rad-name-3">Offlane — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('rad',3)">&times;</span>
+    </div>
+    <div class="hero-slot" id="rad-slot-4" onclick="openPicker('rad',4)">
+      <span class="pos-num">4</span>
+      <span class="hero-img"><img id="rad-img-4" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="rad-name-4">Soft Support — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('rad',4)">&times;</span>
+    </div>
+    <div class="hero-slot" id="rad-slot-5" onclick="openPicker('rad',5)">
+      <span class="pos-num">5</span>
+      <span class="hero-img"><img id="rad-img-5" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="rad-name-5">Hard Support — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('rad',5)">&times;</span>
+    </div>
+  </div>
+
+  <div class="vs">VS</div>
+
+  <!-- Dire Side -->
+  <div class="side dire">
+    <h2>Dire</h2>
+    <div class="field">
+      <label>Team</label>
+      <select id="dire-team"><option value="">Select team...</option></select>
+    </div>
+    <div class="hero-slot" id="dir-slot-1" onclick="openPicker('dir',1)">
+      <span class="pos-num">1</span>
+      <span class="hero-img"><img id="dir-img-1" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="dir-name-1">Carry — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('dir',1)">&times;</span>
+    </div>
+    <div class="hero-slot" id="dir-slot-2" onclick="openPicker('dir',2)">
+      <span class="pos-num">2</span>
+      <span class="hero-img"><img id="dir-img-2" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="dir-name-2">Mid — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('dir',2)">&times;</span>
+    </div>
+    <div class="hero-slot" id="dir-slot-3" onclick="openPicker('dir',3)">
+      <span class="pos-num">3</span>
+      <span class="hero-img"><img id="dir-img-3" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="dir-name-3">Offlane — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('dir',3)">&times;</span>
+    </div>
+    <div class="hero-slot" id="dir-slot-4" onclick="openPicker('dir',4)">
+      <span class="pos-num">4</span>
+      <span class="hero-img"><img id="dir-img-4" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="dir-name-4">Soft Support — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('dir',4)">&times;</span>
+    </div>
+    <div class="hero-slot" id="dir-slot-5" onclick="openPicker('dir',5)">
+      <span class="pos-num">5</span>
+      <span class="hero-img"><img id="dir-img-5" src="" style="display:none" alt=""></span>
+      <span class="hero-name" id="dir-name-5">Hard Support — click to pick</span>
+      <span class="clear-btn" onclick="event.stopPropagation();clearSlot('dir',5)">&times;</span>
+    </div>
+  </div>
+</div>
+
+<!-- Hero Picker Modal -->
+<div class="modal-overlay" id="picker-overlay" onclick="closePicker()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3 id="picker-title">Pick a Hero</h3>
+      <button onclick="closePicker()">&times;</button>
+    </div>
+    <div class="attr-tabs">
+      <div class="attr-tab active" data-attr="str" onclick="switchTab('str')">Strength</div>
+      <div class="attr-tab" data-attr="agi" onclick="switchTab('agi')">Agility</div>
+      <div class="attr-tab" data-attr="int" onclick="switchTab('int')">Intelligence</div>
+      <div class="attr-tab" data-attr="all" onclick="switchTab('all')">Universal</div>
+    </div>
+    <div class="hero-grid active" id="grid-str"></div>
+    <div class="hero-grid" id="grid-agi"></div>
+    <div class="hero-grid" id="grid-int"></div>
+    <div class="hero-grid" id="grid-all"></div>
+  </div>
+</div>
+
+<div class="league-row">
+  <label>League (optional)</label>
+  <select id="league"><option value="">Any league</option></select>
+</div>
+
+<div class="btn-row">
+  <button id="predict-btn" onclick="predict()">Predict Winner</button>
+</div>
+
+<div id="error-msg" class="error-msg"></div>
+
+<div id="result" class="result">
+  <div class="prob" id="prob-text"></div>
+  <div class="conf" id="conf-text"></div>
+  <div class="factors">
+    <h3>Top Contributing Factors</h3>
+    <div id="factors-list"></div>
+  </div>
+</div>
+
+<script>
+// ---- State ----
+let heroGrid = {};          // {str: [...], agi: [...], int: [...], all: [...]}
+let selectedHeroes = {};    // { rad: {1: heroObj, 2: ...}, dir: {...} }
+selectedHeroes.rad = {};
+selectedHeroes.dir = {};
+let activePicker = null;    // {side: 'rad'|'dir', pos: 1-5}
+let activeAttr = 'str';
+
+const POS_NAMES = {1:'Carry', 2:'Mid', 3:'Offlane', 4:'Soft Support', 5:'Hard Support'};
+
+// ---- Init ----
+async function init() {
+  try {
+    const [gridResp, teamResp, leagueResp] = await Promise.all([
+      fetch('/api/hero-grid'),
+      fetch('/api/teams'),
+      fetch('/api/leagues')
+    ]);
+    heroGrid = await gridResp.json();
+    const teams = await teamResp.json();
+    const leagues = await leagueResp.json();
+
+    // Populate team selectors: only teams with matches
+    const activeTeams = teams.filter(t => t.match_count > 0).sort((a, b) => (b.match_count||0) - (a.match_count||0));
+    const teamOpts = activeTeams.map(t =>
+      `<option value="${t.team_id}">${t.name || 'Team ' + t.team_id} (${t.match_count} matches)</option>`
+    ).join('');
+    ['radiant-team', 'dire-team'].forEach(id => {
+      document.getElementById(id).innerHTML += teamOpts;
+    });
+
+    // Populate leagues
+    const leagueOpts = leagues.sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+      .map(l => `<option value="${l.leagueid}">${l.name || 'League ' + l.leagueid} (${l.match_count || 0} matches)</option>`)
+      .join('');
+    document.getElementById('league').innerHTML += leagueOpts;
+
+    // Build hero grids
+    buildGrids();
+  } catch (err) {
+    showError('Failed to load data: ' + err.message);
+  }
+}
+
+function buildGrids() {
+  for (const attr of ['str', 'agi', 'int', 'all']) {
+    const grid = document.getElementById('grid-' + attr);
+    if (!grid) continue;
+    grid.innerHTML = '';
+    const heroes = heroGrid[attr] || [];
+    heroes.forEach(h => {
+      const card = document.createElement('div');
+      card.className = 'hero-card';
+      card.innerHTML = `
+        <div class="card-img"><img src="${h.image_url}" loading="lazy" onerror="this.parentElement.innerHTML='<div style=width:64px;height:36px;background:#1a1c2a;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:0.6rem;color:#4a4d5a>${h.localized_name[0]}</div>'"></div>
+        <span class="card-name">${h.localized_name}</span>
+      `;
+      card.onclick = () => selectHero(h);
+      grid.appendChild(card);
+    });
+  }
+}
+
+// ---- Hero Picker ----
+function openPicker(side, pos) {
+  activePicker = { side, pos };
+  document.getElementById('picker-title').textContent =
+    `Pick ${side === 'rad' ? 'Radiant' : 'Dire'} Position ${pos} — ${POS_NAMES[pos]}`;
+  document.getElementById('picker-overlay').classList.add('open');
+  switchTab(activeAttr);
+}
+
+function closePicker() {
+  document.getElementById('picker-overlay').classList.remove('open');
+  activePicker = null;
+}
+
+function switchTab(attr) {
+  activeAttr = attr;
+  document.querySelectorAll('.attr-tab').forEach(t => t.classList.toggle('active', t.dataset.attr === attr));
+  document.querySelectorAll('.hero-grid').forEach(g => g.classList.toggle('active', g.id === 'grid-' + attr));
+}
+
+function selectHero(hero) {
+  if (!activePicker) return;
+  const { side, pos } = activePicker;
+  selectedHeroes[side][pos] = hero;
+
+  // Update slot display
+  document.getElementById(side + '-name-' + pos).textContent = hero.localized_name;
+  document.getElementById(side + '-name-' + pos).classList.add('selected');
+  const img = document.getElementById(side + '-img-' + pos);
+  img.src = hero.image_url;
+  img.style.display = 'block';
+  img.alt = hero.localized_name;
+  document.getElementById(side + '-slot-' + pos).classList.add('has-hero');
+
+  closePicker();
+}
+
+function clearSlot(side, pos) {
+  delete selectedHeroes[side][pos];
+  document.getElementById(side + '-name-' + pos).textContent = POS_NAMES[pos] + ' — click to pick';
+  document.getElementById(side + '-name-' + pos).classList.remove('selected');
+  const img = document.getElementById(side + '-img-' + pos);
+  img.src = '';
+  img.style.display = 'none';
+  document.getElementById(side + '-slot-' + pos).classList.remove('has-hero');
+}
+
+// ---- Predict ----
+async function predict() {
+  const errorEl = document.getElementById('error-msg');
+  const resultEl = document.getElementById('result');
+  const btn = document.getElementById('predict-btn');
+
+  errorEl.style.display = 'none';
+  resultEl.classList.remove('show');
+
+  const radiantId = parseInt(document.getElementById('radiant-team').value);
+  const direId = parseInt(document.getElementById('dire-team').value);
+  const leagueId = parseInt(document.getElementById('league').value) || 0;
+
+  if (!radiantId || !direId) { showError('Please select both Radiant and Dire teams.'); return; }
+  if (radiantId === direId) { showError('Radiant and Dire teams must be different.'); return; }
+
+  // Collect hero selections
+  let radiantHeroes = [], direHeroes = [];
+  for (const [side, arr] of [['rad', radiantHeroes], ['dir', direHeroes]]) {
+    for (let pos = 1; pos <= 5; pos++) {
+      const h = selectedHeroes[side][pos];
+      if (!h) { showError(`Please pick all 5 heroes for ${side === 'rad' ? 'Radiant' : 'Dire'} (position ${pos} missing).`); return; }
+      arr.push(h.hero_id);
+    }
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Predicting...';
+
+  try {
+    const resp = await fetch('/api/prematch-predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        radiant_id: radiantId, dire_id: direId,
+        radiant_heroes: radiantHeroes, dire_heroes: direHeroes,
+        league_id: leagueId || null
+      })
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || resp.statusText);
+    }
+
+    const data = await resp.json();
+    const prob = data.prediction.radiant_win_prob;
+
+    const probEl = document.getElementById('prob-text');
+    probEl.textContent = `Radiant: ${(prob * 100).toFixed(1)}%  —  Dire: ${((1 - prob) * 100).toFixed(1)}%`;
+    probEl.className = 'prob ' + (prob >= 0.5 ? 'radiant-win' : 'dire-win');
+
+    document.getElementById('conf-text').textContent =
+      `Confidence: ${data.prediction.confidence}  |  Model: ${data.model.version}  |  Accuracy: ${(data.model.accuracy * 100).toFixed(0)}%`;
+
+    const factorsList = document.getElementById('factors-list');
+    factorsList.innerHTML = '';
+    const factors = data.prediction.top_factors || [];
+    if (factors.length > 0) {
+      factors.forEach(f => {
+        factorsList.innerHTML += `<div class="factor-row">
+          <span class="name">${f.factor}</span>
+          <span class="impact">${f.impact.toFixed(4)}</span>
+          <span class="dir ${f.direction === 'radiant' ? 'rad' : 'dirr'}">${f.direction}</span>
+        </div>`;
+      });
+    } else {
+      factorsList.innerHTML = '<div style="color:#6b7084;font-size:0.85rem">No factor breakdown available</div>';
+    }
+
+    resultEl.classList.add('show');
+  } catch (err) {
+    showError('Prediction failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Predict Winner';
+  }
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-msg');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+init();
+</script>
+</body>
+</html>

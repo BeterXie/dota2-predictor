@@ -1,0 +1,20 @@
+features_dir: "../data/features"
+models_dir: "../data/models"
+database: "../data/dota2.db"
+
+model:
+  name: "xgboost"
+  params:
+    objective: "binary:logistic"
+    eval_metric: "logloss"
+    max_depth: 6
+    learning_rate: 0.1
+    n_estimators: 200
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+
+training:
+  test_size: 0.2
+  cv_folds: 5
+  random_state: 42

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"exit: $?\")",
+      "Bash(python -c \"import fastapi; import uvicorn; import yaml; print\\('Dependencies OK'\\)\")",
+      "Bash(python -c \"from web.app import app; print\\('FastAPI app created:', app.title\\); print\\('Routes:', [r.path for r in app.routes]\\)\")",
+      "Bash(python -m web.main)",
+      "Bash(python -c \"import urllib.request; print\\(urllib.request.urlopen\\('http://127.0.0.1:8765/api/matches/8826468180'\\).read\\(\\).decode\\(\\)[:500]\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(kill %1)",
+      "Bash(sqlite3 \"c:/Users/59908/dota2-predictor/data/dota2.db\" \"SELECT COUNT\\(*\\) FROM matches;\")",
+      "Bash(sqlite3 \"c:/Users/59908/dota2-predictor/data/dota2.db\" \".tables\")",
+      "Bash(python -c \"import sqlite3; conn=sqlite3.connect\\('c:/Users/59908/dota2-predictor/data/dota2.db'\\); tables=conn.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table'\\\\\"\\).fetchall\\(\\); print\\([t[0] for t in tables]\\); conn.close\\(\\)\")",
+      "Bash(python -m features.main)",
+      "Bash(python -m train.main)",
+      "Bash(cd /d c:\\\\Users\\\\59908\\\\dota2-predictor)",
+      "Bash(python -c \"import sqlite3; conn=sqlite3.connect\\('data/dota2.db'\\); rows=conn.execute\\('SELECT DISTINCT radiant_team_id, dire_team_id FROM matches'\\).fetchall\\(\\); print\\('radiant_team_ids:', [r[0] for r in rows]\\); print\\('dire_team_ids:', [r[1] for r in rows]\\); rows2=conn.execute\\('SELECT team_id, name FROM teams'\\).fetchall\\(\\); print\\('teams table:', rows2\\); conn.close\\(\\)\")",
+      "Bash(python -m predict.main --radiant 10150538 --dire 9247354 --league 19101)",
+      "Bash(python -m predict.main --radiant 10150538 --dire 9247354)"
+    ]
+  }
+}

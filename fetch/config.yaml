@@ -1,0 +1,8 @@
+database: "../data/dota2.db"
+
+leagues: [19696]
+teams: []
+specific_matches: []
+date_range:
+  start: "2025-01-01"
+  end: "2026-12-31"

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sqlite3; conn = sqlite3.connect\\('data/dota2.db'\\); print\\('Tables:', [r[0] for r in conn.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table'\\\\\"\\).fetchall\\(\\)]\\); print\\('Match count:', conn.execute\\('SELECT COUNT\\(*\\) FROM matches'\\).fetchone\\(\\)[0]\\); print\\('Hero count:', conn.execute\\('SELECT COUNT\\(*\\) FROM heroes'\\).fetchone\\(\\)[0]\\); print\\('Team count:', conn.execute\\('SELECT COUNT\\(*\\) FROM teams'\\).fetchone\\(\\)[0]\\); conn.close\\(\\)\")",
+      "Bash(curl -s http://localhost:8000/api/matches)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({'data_count': len\\(d.get\\('data',[]\\)\\), 'total': d.get\\('pagination',{}\\).get\\('total',0\\)}, indent=2\\)\\)\")",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(curl -s http://localhost:8000/api/heroes)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f'heroes: {len\\(d\\)} returned'\\)\")"
+    ]
+  }
+}

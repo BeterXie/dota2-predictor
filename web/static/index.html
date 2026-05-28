@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dota 2 Predictor</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f1117; color: #d0d4e0; padding: 2rem; }
+  h1 { margin-bottom: 0.5rem; }
+  .subtitle { color: #6b7084; margin-bottom: 1.5rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid #1e2030; }
+  th { color: #8b90a0; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; }
+  td { font-size: 0.9rem; }
+  tr:hover td { background: #1a1c2a; }
+  .win { color: #4caf50; font-weight: 600; }
+  .loss { color: #f44336; font-weight: 600; }
+  .radiant { color: #b8e986; }
+  .dire { color: #ff8a65; }
+  .loading { color: #6b7084; padding: 2rem; text-align: center; }
+  .error { color: #f44336; padding: 1rem; background: #2a1015; border-radius: 6px; margin: 1rem 0; }
+  .pagination { display: flex; gap: 0.5rem; margin-top: 1rem; align-items: center; }
+  .pagination button { padding: 0.4rem 0.8rem; background: #1e2030; color: #d0d4e0; border: 1px solid #2a2d3a; border-radius: 4px; cursor: pointer; }
+  .pagination button:disabled { opacity: 0.4; cursor: default; }
+  .pagination span { color: #8b90a0; font-size: 0.85rem; }
+  .filters { display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: flex-end; }
+  .filters label { font-size: 0.8rem; color: #8b90a0; display: block; margin-bottom: 0.2rem; }
+  .filters input { padding: 0.35rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 4px; color: #d0d4e0; }
+  .filters button { padding: 0.35rem 0.75rem; background: #2d5fbd; border: none; color: #fff; border-radius: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="nav" style="margin-bottom:1rem;font-size:0.85rem">
+  <a href="/" style="color:#b8e986">Matches</a>
+  <a href="/prematch" style="color:#6ea8fe;margin-left:1rem">Pre-Match Prediction</a>
+</div>
+<h1>Dota 2 Predictor</h1>
+<p class="subtitle">Recent professional matches</p>
+
+<div class="filters">
+  <div>
+    <label for="team-id">Team ID</label>
+    <input id="team-id" type="number" placeholder="Any team" style="width:100px">
+  </div>
+  <div>
+    <label for="league-id">League ID</label>
+    <input id="league-id" type="number" placeholder="Any league" style="width:110px">
+  </div>
+  <div>
+    <label for="date-from">From</label>
+    <input id="date-from" type="date">
+  </div>
+  <div>
+    <label for="date-to">To</label>
+    <input id="date-to" type="date">
+  </div>
+  <button id="apply-filters">Apply</button>
+</div>
+
+<div id="content"><div class="loading">Loading matches...</div></div>
+
+<script>
+const BASE = '/api/matches';
+let page = 1;
+
+function formatDuration(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function formatDate(ts) {
+  if (!ts) return '-';
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+function buildURL() {
+  const params = new URLSearchParams({ page: page, page_size: 20 });
+  const teamId = document.getElementById('team-id').value;
+  const leagueId = document.getElementById('league-id').value;
+  const dateFrom = document.getElementById('date-from').value;
+  const dateTo = document.getElementById('date-to').value;
+  if (teamId) params.set('team_id', teamId);
+  if (leagueId) params.set('league_id', leagueId);
+  if (dateFrom) params.set('date_from', Math.floor(new Date(dateFrom).getTime() / 1000));
+  if (dateTo) params.set('date_to', Math.floor(new Date(dateTo + 'T23:59:59').getTime() / 1000));
+  return `${BASE}?${params}`;
+}
+
+async function loadMatches() {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading matches...</div>';
+  try {
+    const resp = await fetch(buildURL());
+    const json = await resp.json();
+    renderMatches(json);
+  } catch (err) {
+    content.innerHTML = `<div class="error">Failed to load: ${err.message}</div>`;
+  }
+}
+
+function renderMatches(json) {
+  const content = document.getElementById('content');
+  if (!json.data || json.data.length === 0) {
+    content.innerHTML = '<div class="loading">No matches found. Fetch match data first (Module A) to populate the database.</div>';
+    return;
+  }
+
+  let html = '<table><thead><tr>';
+  html += '<th>Match ID</th><th>Radiant</th><th>Dire</th><th>Winner</th><th>Score</th><th>Duration</th><th>League</th><th>Date</th>';
+  html += '</tr></thead><tbody>';
+
+  for (const m of json.data) {
+    const rName = m.radiant_team_name || `Team ${m.radiant_team_id || '?'}`;
+    const dName = m.dire_team_name || `Team ${m.dire_team_id || '?'}`;
+    html += '<tr>';
+    html += `<td><a href="/api/matches/${m.match_id}" style="color:#6ea8fe">${m.match_id}</a></td>`;
+    html += `<td class="radiant">${rName}</td>`;
+    html += `<td class="dire">${dName}</td>`;
+    html += `<td>${m.radiant_win ? `<span class="win radiant">Radiant</span>` : `<span class="loss dire">Dire</span>`}</td>`;
+    html += `<td>${m.radiant_score ?? '-'} - ${m.dire_score ?? '-'}</td>`;
+    html += `<td>${m.duration ? formatDuration(m.duration) : '-'}</td>`;
+    html += `<td>${m.league_name || (m.leagueid ? `League ${m.leagueid}` : '-')}</td>`;
+    html += `<td>${formatDate(m.start_time)}</td>`;
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+
+  const p = json.pagination;
+  html += '<div class="pagination">';
+  html += `<button ${page <= 1 ? 'disabled' : ''} onclick="goToPage(1)">First</button>`;
+  html += `<button ${page <= 1 ? 'disabled' : ''} onclick="goToPage(${page - 1})">Prev</button>`;
+  html += `<span>Page ${p.page} of ${p.total_pages} (${p.total} matches)</span>`;
+  html += `<button ${page >= p.total_pages ? 'disabled' : ''} onclick="goToPage(${page + 1})">Next</button>`;
+  html += `<button ${page >= p.total_pages ? 'disabled' : ''} onclick="goToPage(${p.total_pages})">Last</button>`;
+  html += '</div>';
+
+  content.innerHTML = html;
+}
+
+function goToPage(p) {
+  page = p;
+  loadMatches();
+}
+
+document.getElementById('apply-filters').addEventListener('click', () => { page = 1; loadMatches(); });
+loadMatches();
+</script>
+</body>
+</html>

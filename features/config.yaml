@@ -1,0 +1,2 @@
+database: "../data/dota2.db"
+features_dir: "../data/features"
