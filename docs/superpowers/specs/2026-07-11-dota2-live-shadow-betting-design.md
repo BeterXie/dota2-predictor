@@ -35,7 +35,9 @@ provider if PandaScore does not cover enough target matches or its measured
 latency is unsuitable.
 
 - Free Fixtures API supports initial fixture discovery and mapping.
-- Sandbox supports integration and deterministic replay development.
+- PandaScore's public sandbox and event recovery currently cover LoL/CS, not
+  Dota 2. Dota integration therefore requires a live-supported match and local
+  recording for deterministic replay tests.
 - Pro Live WebSocket frames/events are required for production live signals.
 - Lower-latency feeds are evaluated only after coverage and licensing are
   confirmed.
@@ -106,10 +108,12 @@ between providers freezes the match until reviewed.
 - Mark odds stale when their age exceeds a configured threshold.
 - Detect gaps, event reordering, score regression, and local clock drift.
 
-PandaScore reconnects from the last confirmed cursor when supported. If event
-continuity cannot be proven, signal generation pauses until a fresh consistent
-state is established. RayBet timeouts retain the last snapshot for display and
-audit, but stale prices cannot be treated as executable.
+PandaScore reconnects from the last confirmed cursor only when the game and
+plan support recovery. PandaScore currently does not document recovery for Dota
+2. A Dota disconnect therefore creates an explicit gap and pauses signal
+generation until a fresh consistent state is established. RayBet timeouts
+retain the last snapshot for display and audit, but stale prices cannot be
+treated as executable.
 
 Signals are recalculated on confirmed event or price changes. A hypothetical
 order uses the next still-open odds snapshot after the signal. This prevents an
