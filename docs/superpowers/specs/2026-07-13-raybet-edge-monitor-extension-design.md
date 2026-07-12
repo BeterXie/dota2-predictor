@@ -222,8 +222,10 @@ RayBet page. A batch contains at most 50 events and 1 MiB. Successful event IDs
 are removed only after the companion acknowledges them.
 
 Retry uses bounded exponential backoff with jitter, beginning at one second and
-capped at 60 seconds. A companion outage never triggers unbounded browser work
-or a page-visible error.
+capped at 60 seconds. Short retries use a timer, while a one-shot
+`chrome.alarms` wakeup preserves the retry after Manifest V3 service-worker
+suspension. Successful delivery clears the alarm. A companion outage never
+triggers unbounded browser work or a page-visible error.
 
 ### Popup
 
@@ -258,6 +260,7 @@ request data.
 The manifest requests only:
 
 - `storage` for pairing configuration and the session queue
+- `alarms` for one-shot delivery retry after service-worker suspension
 - host access for `https://www.ray086.com/*` and
   `https://cfinfo.365raylinks.com/*`
 - `http://127.0.0.1/*` for the companion; the client itself connects only to
@@ -652,6 +655,7 @@ State changes are local and never alter the RayBet page.
 - Canonical hashes are stable and retries retain event IDs.
 - Payload, batch, queue, and drop-oldest limits are exact at boundaries.
 - Pause, resume, backoff, and service-worker suspension preserve state rules.
+- Alarm wakeup resumes a pending retry and is cleared after acknowledgement.
 - The fixed `manualControlData` sampler runs only under its visibility and
   recent-Dota conditions, copies only two primitives, and remains diagnostic.
 
