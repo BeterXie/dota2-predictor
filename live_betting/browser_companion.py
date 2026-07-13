@@ -239,15 +239,17 @@ def create_app(
         return JSONResponse({"results": results})
 
     @app.get("/v1/status")
+    @app.post("/v1/status")
     async def status(request: Request) -> Response:
         origin = request.headers.get("origin")
+        body = await request.body()
         try:
             authenticator.authenticate(
                 request.headers,
                 origin=origin,
-                method="GET",
+                method=request.method,
                 path="/v1/status",
-                body=b"",
+                body=body,
                 rate_bucket="status",
             )
         except AuthFailure as error:

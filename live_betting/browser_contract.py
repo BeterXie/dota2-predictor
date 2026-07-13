@@ -62,10 +62,12 @@ _FORBIDDEN_KEY_PARTS = (
     "cookie", "authorization", "bearer", "token", "secret", "session", "csrf",
     "user", "member", "account", "profile", "username", "phone", "email", "identity",
     "balance", "wallet", "currency", "deposit", "withdrawal", "rebate", "transaction",
-    "device", "fingerprint", "advertising", "analytics", "clientid",
+    "device", "fingerprint", "advertising", "analytics", "persistentclient", "clientid",
+    "visitorid", "browserid", "machineid", "installid",
     "betslip", "selectionslip", "stake", "potentialreturn", "order", "submit", "ticket",
     "requestheader", "responseheader", "requestbody", "formdata", "postbody",
 )
+_DANGEROUS_KEYS = frozenset({"__proto__", "prototype", "constructor"})
 
 
 def find_forbidden_payload_key(value: Any) -> str | None:
@@ -81,6 +83,8 @@ def find_forbidden_payload_key(value: Any) -> str | None:
             visited.add(identity)
         if isinstance(current, dict):
             for key, child in current.items():
+                if str(key).casefold() in _DANGEROUS_KEYS:
+                    return str(key)
                 normalized = _normalized_key(str(key))
                 if any(part in normalized for part in _FORBIDDEN_KEY_PARTS):
                     return str(key)
@@ -221,6 +225,8 @@ def find_forbidden_batch_key(value: Any) -> str | None:
             return forbidden
         for key in item:
             if key not in KNOWN_ENVELOPE_KEYS:
+                if str(key).casefold() in _DANGEROUS_KEYS:
+                    return str(key)
                 normalized = _normalized_key(str(key))
                 if any(part in normalized for part in _FORBIDDEN_KEY_PARTS):
                     return str(key)

@@ -65,11 +65,28 @@ class BrowserContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.parse(forbidden)
 
+    def test_backend_rejects_all_extension_identity_and_prototype_keys(self) -> None:
+        keys = (
+            "persistent_client", "visitorId", "browser-id", "machine_id", "installId",
+            "__proto__", "prototype", "constructor",
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                event = valid_event()
+                event["payload"]["result"][key] = "redacted"
+                event["payload_hash"] = payload_sha256(event["payload"])
+                with self.assertRaises(ValidationError):
+                    self.parse(event)
+                self.assertEqual(find_forbidden_batch_key([event]), key)
+
     def test_batch_security_scan_ignores_legitimate_session_envelope(self) -> None:
         event = valid_event()
         self.assertIsNone(find_forbidden_batch_key([event]))
         event["authorization_token"] = "redacted"
         self.assertEqual(find_forbidden_batch_key([event]), "authorization_token")
+        del event["authorization_token"]
+        event["constructor"] = "redacted"
+        self.assertEqual(find_forbidden_batch_key([event]), "constructor")
 
     def test_only_dota_and_metadata_only_unknown_are_accepted(self) -> None:
         wrong_game = valid_event()

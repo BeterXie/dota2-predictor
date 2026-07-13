@@ -160,6 +160,11 @@ class BrowserCompanionTests(unittest.TestCase):
         self.assertEqual(status.json()["duplicate_count"], 1)
         self.assertEqual(status.json()["known_dota_match_count"], 1)
 
+        post_headers = self.auth_headers("POST", "/v1/status", b"")
+        post_status = self.client.post("/v1/status", headers=post_headers)
+        self.assertEqual(post_status.status_code, 200)
+        self.assertEqual(post_status.json()["known_dota_match_count"], 1)
+
     def test_bad_auth_and_forbidden_batch_are_rejected(self) -> None:
         body = b"[]"
         response = self.client.post(
