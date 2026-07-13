@@ -204,12 +204,22 @@ CREATE INDEX IF NOT EXISTS idx_hero_matchups_hero ON hero_matchups(hero_id);
 class Database:
     """Manages the SQLite database connection and all write operations."""
 
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ):
+        if db_path is None and connection is None:
+            raise ValueError("db_path or connection is required")
         self.db_path = db_path
-        self._conn: sqlite3.Connection | None = None
+        self._conn = connection
+        self._owns_connection = connection is None
 
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
+            if self.db_path is None:
+                raise RuntimeError("injected database connection is unavailable")
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(self.db_path)
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -217,7 +227,7 @@ class Database:
         return self._conn
 
     def close(self) -> None:
-        if self._conn is not None:
+        if self._conn is not None and self._owns_connection:
             self._conn.close()
             self._conn = None
 
@@ -254,27 +264,29 @@ class Database:
         conn.commit()
         logger.info("Inserted %d heroes.", len(heroes))
 
-    def insert_team(self, team: dict) -> None:
+    def insert_team(self, team: dict, commit: bool = True) -> None:
         conn = self.connect()
         conn.execute(
             """INSERT OR REPLACE INTO teams (team_id, name, tag, logo_url)
                VALUES (:team_id, :name, :tag, :logo_url)""",
             team,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         logger.debug("Inserted team %d (%s).", team["team_id"], team.get("name"))
 
-    def insert_league(self, league: dict) -> None:
+    def insert_league(self, league: dict, commit: bool = True) -> None:
         conn = self.connect()
         conn.execute(
             """INSERT OR REPLACE INTO leagues (leagueid, name, tier)
                VALUES (:leagueid, :name, :tier)""",
             league,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         logger.debug("Inserted league %d (%s).", league["leagueid"], league.get("name"))
 
-    def insert_match(self, match: dict) -> None:
+    def insert_match(self, match: dict, commit: bool = True) -> None:
         """Parse a full match JSON and insert into all related tables."""
         conn = self.connect()
         match_id = match["match_id"]
@@ -285,10 +297,10 @@ class Database:
         for side in ("radiant", "dire"):
             team = parse_team_info(match, side)
             if team:
-                self.insert_team(team)
+                self.insert_team(team, commit=False)
         league = parse_league_info(match)
         if league:
-            self.insert_league(league)
+            self.insert_league(league, commit=False)
 
         conn.execute(
             """INSERT OR REPLACE INTO matches (
@@ -397,7 +409,8 @@ class Database:
                 chat_rows,
             )
 
-        conn.commit()
+        if commit:
+            conn.commit()
         logger.info("Inserted match %d.", match_id)
 
     def insert_hero_matchups(self, hero_id: int, matchups: list[dict]) -> None:

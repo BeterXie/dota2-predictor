@@ -1,5 +1,6 @@
 """Parse OpenDota API JSON responses into flat dicts for database insert."""
 
+import math
 from typing import Any
 
 
@@ -21,13 +22,46 @@ def parse_match_basic(match: dict) -> dict:
         "region": match.get("region"),
         "radiant_score": match.get("radiant_score"),
         "dire_score": match.get("dire_score"),
-        "stomp": match.get("stomp", 0),
-        "comeback": match.get("comeback", 0),
+        "stomp": match.get("stomp"),
+        "comeback": match.get("comeback"),
         "tower_status_radiant": match.get("tower_status_radiant"),
         "tower_status_dire": match.get("tower_status_dire"),
         "barracks_status_radiant": match.get("barracks_status_radiant"),
         "barracks_status_dire": match.get("barracks_status_dire"),
     }
+
+
+def _finite_number(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _extract_10min_value(time_series: Any) -> int | float | None:
+    """Return the source-recorded minute-10 sample without interpolation."""
+    if not isinstance(time_series, list) or len(time_series) <= 10:
+        return None
+    return _finite_number(time_series[10])
+
+
+def _count_events_before(log: Any, max_time: int = 600) -> int | None:
+    """Count a complete source event log through ``max_time`` seconds."""
+    if not isinstance(log, list):
+        return None
+
+    times: list[int | float] = []
+    for event in log:
+        if not isinstance(event, dict):
+            return None
+        event_time = _finite_number(event.get("time"))
+        if event_time is None:
+            return None
+        times.append(event_time)
+    return sum(event_time <= max_time for event_time in times)
 
 
 def parse_players(match: dict) -> list[dict]:
@@ -36,14 +70,30 @@ def parse_players(match: dict) -> list[dict]:
 
     rows = []
     for p in match.get("players") or []:
-        slot = p.get("player_slot", 0)
-        is_radiant = slot < 128
+        slot = p.get("player_slot")
+        is_radiant = slot < 128 if isinstance(slot, int) and not isinstance(slot, bool) else None
 
         team_id = None
-        if is_radiant:
-            team_id = p.get("team_id", radiant_team_id)
-        else:
-            team_id = p.get("team_id", dire_team_id)
+        if is_radiant is True:
+            team_id = p.get("team_id") or radiant_team_id
+        elif is_radiant is False:
+            team_id = p.get("team_id") or dire_team_id
+
+        # Early-game stats from time series
+        gold_10min = _extract_10min_value(p.get("gold_t"))
+        lh_10min = _extract_10min_value(p.get("lh_t"))
+        xp_10min = _extract_10min_value(p.get("xp_t"))
+
+        # Early events are available only when their exact source log is present.
+        kills_before_10 = _count_events_before(p.get("kills_log"), 600)
+        deaths_before_10 = _count_events_before(p.get("deaths_log"), 600)
+        assists_before_10 = _count_events_before(p.get("assists_log"), 600)
+        obs_10min = _count_events_before(p.get("obs_log"), 600)
+        sen_10min = _count_events_before(p.get("sen_log"), 600)
+        observer_kills_10min = _count_events_before(
+            p.get("observer_kills_log"), 600
+        )
+        sentry_kills_10min = _count_events_before(p.get("sentry_kills_log"), 600)
 
         rows.append({
             "match_id": match["match_id"],
@@ -52,9 +102,9 @@ def parse_players(match: dict) -> list[dict]:
             "hero_id": p.get("hero_id"),
             "is_radiant": is_radiant,
             "team_id": team_id,
-            "kills": p.get("kills", 0),
-            "deaths": p.get("deaths", 0),
-            "assists": p.get("assists", 0),
+            "kills": p.get("kills"),
+            "deaths": p.get("deaths"),
+            "assists": p.get("assists"),
             "gold_per_min": p.get("gold_per_min"),
             "xp_per_min": p.get("xp_per_min"),
             "net_worth": p.get("net_worth"),
@@ -75,6 +125,21 @@ def parse_players(match: dict) -> list[dict]:
             "backpack_2": p.get("backpack_2"),
             "item_neutral": p.get("item_neutral"),
             "firstblood_claimed": p.get("firstblood_claimed"),
+            # Early-game fields
+            "gold_10min": gold_10min,
+            "lh_10min": lh_10min,
+            "xp_10min": xp_10min,
+            "kills_10min": kills_before_10,
+            "deaths_10min": deaths_before_10,
+            "assists_10min": assists_before_10,
+            "obs_placed_10min": obs_10min,
+            "sen_placed_10min": sen_10min,
+            "lane_efficiency": p.get("lane_efficiency"),
+            "lane_role": p.get("lane_role"),
+            "is_roaming": p.get("is_roaming"),
+            "kda": p.get("kda"),
+            "observer_kills_10min": observer_kills_10min,
+            "sentry_kills_10min": sentry_kills_10min,
         })
     return rows
 
@@ -110,13 +175,13 @@ def parse_teamfights(match: dict) -> tuple[list[dict], list[dict]]:
             tf_players.append({
                 "tf_local_idx": idx,
                 "player_slot": p.get("player_slot") if "player_slot" in p else p.get("slot"),
-                "deaths": p.get("deaths", 0),
-                "buybacks": p.get("buybacks", 0),
-                "damage": p.get("damage", 0),
-                "healing": p.get("healing", 0),
-                "gold_delta": p.get("gold_delta", 0),
-                "xp_delta": p.get("xp_delta", 0),
-                "kills": p.get("kills", 0),
+                "deaths": p.get("deaths"),
+                "buybacks": p.get("buybacks"),
+                "damage": p.get("damage"),
+                "healing": p.get("healing"),
+                "gold_delta": p.get("gold_delta"),
+                "xp_delta": p.get("xp_delta"),
+                "kills": p.get("kills"),
             })
     return tfs, tf_players
 
