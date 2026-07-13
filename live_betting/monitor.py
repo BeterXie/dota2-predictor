@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
 from .match_linker import choose_unique, score_candidate
 from .models import ProviderMatch, utc_now
@@ -183,6 +184,14 @@ def run(args: argparse.Namespace) -> int:
 
     with LiveBettingStore(db_path) as store, RayBetClient() as client:
         store.init_schema()
+        started_at = utc_now()
+        record_health(
+            store.connection,
+            "raybet_worker",
+            "starting",
+            heartbeat_at=started_at,
+            details={"source": "worker"},
+        )
         failures = 0
         list_rows: list[dict[str, Any]] | None = None
         raw_fingerprints: dict[str, str] = {}
@@ -198,6 +207,15 @@ def run(args: argparse.Namespace) -> int:
                     raw_fingerprints=raw_fingerprints,
                 )
                 failures = 0
+                succeeded_at = utc_now()
+                record_health(
+                    store.connection,
+                    "raybet_worker",
+                    "healthy",
+                    heartbeat_at=succeeded_at,
+                    success_at=succeeded_at,
+                    details={"source": "worker", **summary},
+                )
                 logger.info(
                     "collected matches=%d odds=%d changed=%d",
                     summary["matches"], summary["odds"], summary["changed"],
@@ -206,6 +224,15 @@ def run(args: argparse.Namespace) -> int:
                 failures += 1
                 now = utc_now()
                 store.record_collector("raybet", error_at=now, error=f"{type(exc).__name__}: {exc}")
+                record_health(
+                    store.connection,
+                    "raybet_worker",
+                    "degraded",
+                    heartbeat_at=now,
+                    error_at=now,
+                    error=type(exc).__name__,
+                    details={"source": "worker", "consecutive_failures": failures},
+                )
                 logger.error("RayBet collection failed: %s", exc)
                 if args.once:
                     return 1

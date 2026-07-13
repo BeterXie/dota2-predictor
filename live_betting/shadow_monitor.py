@@ -14,6 +14,7 @@ from typing import Any
 
 from .alignment import align_snapshots
 from .comeback import no_signal_decision
+from .health import record_health
 from .market_state import build_market_surface
 from .models import Market, OddsSnapshot, ShadowOrder
 from .profiles import (
@@ -801,11 +802,41 @@ def main() -> int:
     strategy = ComebackShadowStrategy()
     with LiveBettingStore(args.database) as store:
         store.init_schema()
+        started_at = datetime.now(timezone.utc)
+        record_health(
+            store.connection,
+            "shadow_worker",
+            "starting",
+            heartbeat_at=started_at,
+            details={"source": "worker"},
+        )
         while True:
             try:
-                print(json.dumps(run_once(store, strategy, args.vision_jsonl),
-                                 ensure_ascii=False, default=str))
-            except Exception:
+                result = run_once(store, strategy, args.vision_jsonl)
+                succeeded_at = datetime.now(timezone.utc)
+                record_health(
+                    store.connection,
+                    "shadow_worker",
+                    "healthy",
+                    heartbeat_at=succeeded_at,
+                    success_at=succeeded_at,
+                    details={
+                        "source": "worker",
+                        "run_status": str(result.get("status", "unknown")),
+                    },
+                )
+                print(json.dumps(result, ensure_ascii=False, default=str))
+            except Exception as error:
+                failed_at = datetime.now(timezone.utc)
+                record_health(
+                    store.connection,
+                    "shadow_worker",
+                    "degraded",
+                    heartbeat_at=failed_at,
+                    error_at=failed_at,
+                    error=type(error).__name__,
+                    details={"source": "worker"},
+                )
                 logger.exception("shadow monitor iteration failed")
                 if args.once:
                     return 1

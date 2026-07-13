@@ -95,6 +95,30 @@ python -m live_betting.report --database data/dota2.db `
   --output data/live_betting/shadow_report.json
 ```
 
+Deliver simulation notifications from the transactional outbox (credentials
+are read only from `DOTA2_SMTP_SENDER` and `DOTA2_SMTP_AUTH_CODE`, or an
+installed OS keyring):
+
+```powershell
+python scripts/run_notification_worker.py --database data/dota2.db --once
+```
+
+The worker uses `smtp.qq.com:465` with certificate-verified implicit TLS. A
+missing SMTP configuration reports `mail_unhealthy` and does not stop odds
+collection or shadow evaluation. Every message states that no real wager was
+placed.
+
+Run the local health/report supervisor once (safe for verification) or keep it
+running with only explicitly selected components:
+
+```powershell
+python scripts/run_dota_shadow_service.py --once --database data/dota2.db
+```
+
+The supervisor uses a single-instance lock, writes component health and strict
+coverage reports, and leaves collection, shadow, and mail workers stopped until
+their `--start-*` flags are supplied.
+
 `strategy_decisions` retains rejected decisions and their reasons. A result is
 descriptive below 100 settled shadow orders and remains provisional below 500.
 Post-match fields are written only after RayBet marks the series completed and

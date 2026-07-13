@@ -268,6 +268,62 @@ CREATE TABLE IF NOT EXISTS settlements (
     evidence_ref TEXT NOT NULL,
     review_required INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_key TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN ('filled', 'settled')),
+    channel TEXT NOT NULL DEFAULT 'email',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'leased', 'sent', 'dead_letter')),
+    recipient TEXT NOT NULL,
+    message_id TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    statistics_cutoff TEXT NOT NULL,
+    template_version TEXT NOT NULL,
+    lease_token TEXT,
+    lease_until TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_at TEXT,
+    last_error TEXT,
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (order_key, event_type, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
+    ON notification_outbox(status, next_attempt_at, lease_until);
+CREATE TABLE IF NOT EXISTS notification_outbox_audit (
+    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbox_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS service_health (
+    component TEXT PRIMARY KEY,
+    status TEXT NOT NULL
+        CHECK (status IN ('starting', 'healthy', 'degraded', 'unhealthy', 'stopped')),
+    last_heartbeat_at TEXT,
+    last_success_at TEXT,
+    last_error_at TEXT,
+    last_error TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS notification_outbox_payload_immutable
+BEFORE UPDATE ON notification_outbox
+WHEN OLD.order_key IS NOT NEW.order_key
+  OR OLD.event_type IS NOT NEW.event_type
+  OR OLD.channel IS NOT NEW.channel
+  OR OLD.payload_json IS NOT NEW.payload_json
+  OR OLD.statistics_cutoff IS NOT NEW.statistics_cutoff
+  OR OLD.template_version IS NOT NEW.template_version
+  OR OLD.recipient IS NOT NEW.recipient
+  OR OLD.message_id IS NOT NEW.message_id
+BEGIN
+    SELECT RAISE(ABORT, 'notification outbox payload is immutable');
+END;
 CREATE TABLE IF NOT EXISTS collector_runs (
     collector TEXT PRIMARY KEY,
     last_success_at TEXT,
@@ -1213,6 +1269,39 @@ class LiveBettingStore:
                 resolved.order_key, resolved.status, expected_status="pending"
             ):
                 raise RuntimeError("pending order has no matching pending map attempt")
+            if resolved.status == "filled":
+                map_row = self.connection.execute(
+                    """SELECT map_number FROM shadow_map_attempts
+                        WHERE order_key=?""",
+                    (resolved.order_key,),
+                ).fetchone()
+                if map_row is None or resolved.filled_at is None:
+                    raise RuntimeError("filled order is missing map provenance")
+                from .notifications import EVENT_FILLED, simulation_payload
+
+                self.enqueue_notification(
+                    order_key=resolved.order_key,
+                    event_type=EVENT_FILLED,
+                    payload=simulation_payload(
+                        EVENT_FILLED,
+                        {
+                            "raybet_match_id": resolved.raybet_match_id,
+                            "map_number": int(map_row["map_number"]),
+                            "selected_side": resolved.market.side,
+                            "signal_price": resolved.signal_price,
+                            "fill_price": resolved.fill_price,
+                            "model_probability": resolved.model_probability,
+                            "market_probability": resolved.market_probability,
+                            "edge": resolved.model_probability
+                            - resolved.market_probability,
+                            "signal_transport_at": resolved.signal_transport_at,
+                            "filled_at": resolved.filled_at,
+                            "order_key": resolved.order_key,
+                        },
+                    ),
+                    stats_cutoff_at=resolved.filled_at,
+                    created_at=resolved.filled_at,
+                )
             return resolved
 
     @staticmethod
@@ -1443,13 +1532,63 @@ class LiveBettingStore:
         )
         return cursor.rowcount == 1
 
+    def enqueue_notification(
+        self,
+        *,
+        order_key: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+        stats_cutoff_at: datetime,
+        created_at: datetime,
+    ) -> bool:
+        from .notifications import enqueue
+
+        return enqueue(
+            self.connection,
+            order_key=order_key,
+            event_type=event_type,
+            payload=payload,
+            stats_cutoff_at=stats_cutoff_at,
+            created_at=created_at,
+        )
+
     def insert_settlement(
         self, order_key: str, result: str, return_units: float,
         settled_at: datetime, evidence_ref: str, review_required: bool = False,
     ) -> bool:
-        cursor = self.execute(
-            """INSERT OR IGNORE INTO settlements VALUES (?, ?, ?, ?, ?, ?)""",
-            (order_key, result, return_units, settled_at.isoformat(), evidence_ref,
-             int(review_required)),
-        )
-        return cursor.rowcount == 1
+        with self.transaction():
+            cursor = self.connection.execute(
+                """INSERT OR IGNORE INTO settlements VALUES (?, ?, ?, ?, ?, ?)""",
+                (order_key, result, return_units, settled_at.isoformat(), evidence_ref,
+                 int(review_required)),
+            )
+            if cursor.rowcount != 1:
+                return False
+            if not review_required:
+                order = self.connection.execute(
+                    """SELECT raybet_match_id, market_key, fill_price
+                         FROM shadow_orders WHERE order_key=?""",
+                    (order_key,),
+                ).fetchone()
+                if order is not None:
+                    from .notifications import EVENT_SETTLED, simulation_payload
+
+                    self.enqueue_notification(
+                        order_key=order_key,
+                        event_type=EVENT_SETTLED,
+                        payload=simulation_payload(
+                            EVENT_SETTLED,
+                            {
+                                "raybet_match_id": str(order["raybet_match_id"]),
+                                "result": result,
+                                "return_units": return_units,
+                                "fill_price": order["fill_price"],
+                                "evidence_ref": evidence_ref,
+                                "settled_at": settled_at,
+                                "order_key": order_key,
+                            },
+                        ),
+                        stats_cutoff_at=settled_at,
+                        created_at=settled_at,
+                    )
+            return True
