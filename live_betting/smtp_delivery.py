@@ -39,6 +39,8 @@ class SMTPConfig:
             auth_code = _read_keyring(sender)
         if not sender or not auth_code:
             raise SMTPConfigurationError("SMTP sender or authorization code is missing")
+        if any(ord(char) < 33 or ord(char) > 126 for char in auth_code):
+            raise SMTPConfigurationError("SMTP authorization code is invalid")
         _validate_header(sender, "sender")
         return cls(sender=sender, auth_code=auth_code)
 

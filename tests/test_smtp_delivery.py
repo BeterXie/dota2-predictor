@@ -87,6 +87,15 @@ class SMTPDeliveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sanitize_header("bad\x00header", "subject")
 
+    def test_non_ascii_or_whitespace_authorization_code_is_rejected(self) -> None:
+        for auth_code in ("\u5df2\u5f55", "two words", "line\nbreak"):
+            with self.subTest(auth_code=auth_code):
+                with self.assertRaisesRegex(SMTPConfigurationError, "invalid"):
+                    SMTPConfig.from_environment({
+                        "DOTA2_SMTP_SENDER": "sender@qq.com",
+                        "DOTA2_SMTP_AUTH_CODE": auth_code,
+                    })
+
     def test_message_is_simulation_and_uses_stable_id(self) -> None:
         config = SMTPConfig("sender@qq.com", "secret")
         message = build_message(record(), config)
