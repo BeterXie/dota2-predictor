@@ -21,6 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import prematch.scorer as _scorer
 
 
+COMPONENT_KEYS = tuple(_scorer._DEFAULT_WEIGHTS)
+CAUSAL_BACKTEST_WEIGHTS = {
+    name: value if name in {"team_form", "player_skill", "early_game"} else 0.0
+    for name, value in _scorer._DEFAULT_WEIGHTS.items()
+}
+
+
 def get_matches(db_path: str) -> list[dict]:
     """Fetch all matches with hero picks and player account IDs from the database."""
     conn = sqlite3.connect(db_path)
@@ -36,11 +43,12 @@ def get_matches(db_path: str) -> list[dict]:
     result = []
     for m in matches:
         players = conn.execute(
-            "SELECT hero_id, is_radiant, account_id FROM match_players WHERE match_id = ?",
+            """SELECT hero_id, is_radiant, account_id, player_slot
+                 FROM match_players WHERE match_id = ? ORDER BY player_slot""",
             (m["match_id"],),
         ).fetchall()
-        r_heroes = sorted([p["hero_id"] for p in players if p["is_radiant"]])
-        d_heroes = sorted([p["hero_id"] for p in players if not p["is_radiant"]])
+        r_heroes = [p["hero_id"] for p in players if p["is_radiant"]]
+        d_heroes = [p["hero_id"] for p in players if not p["is_radiant"]]
         r_accounts = [p["account_id"] for p in players if p["is_radiant"]]
         d_accounts = [p["account_id"] for p in players if not p["is_radiant"]]
         if len(r_heroes) == 5 and len(d_heroes) == 5:
@@ -60,7 +68,13 @@ def get_matches(db_path: str) -> list[dict]:
     return result
 
 
-def run_basic_test(db_path: str, matches: list[dict]) -> dict:
+def run_basic_test(
+    db_path: str,
+    matches: list[dict],
+    *,
+    weights: dict[str, float] | None = None,
+    include_players: bool = True,
+) -> dict:
     """Run predictions on all matches (in-sample, may have minor leakage)."""
     correct = 0
     total = 0
@@ -75,8 +89,9 @@ def run_basic_test(db_path: str, matches: list[dict]) -> dict:
                 m["dire_team_id"],
                 m["radiant_heroes"],
                 m["dire_heroes"],
-                radiant_players=m.get("radiant_players"),
-                dire_players=m.get("dire_players"),
+                weights=weights,
+                radiant_players=m.get("radiant_players") if include_players else None,
+                dire_players=m.get("dire_players") if include_players else None,
             )
             predicted_win = pred["radiant_win_prob"] > 0.5
             actual_win = m["radiant_win"]
@@ -105,10 +120,18 @@ def run_basic_test(db_path: str, matches: list[dict]) -> dict:
     return {"accuracy": accuracy, "correct": correct, "total": total, "results": results}
 
 
-def run_time_split_test(db_path: str, matches: list[dict], split_ratio: float = 0.7) -> dict:
+def run_time_split_test(
+    db_path: str,
+    matches: list[dict],
+    split_ratio: float = 0.7,
+    *,
+    weights: dict[str, float] | None = None,
+    include_players: bool = True,
+) -> dict:
     """Split by time: first split_ratio for training, rest for testing.
 
-    This avoids temporal data leakage by only using past data for predictions.
+    Only causal match-history components are enabled because the database does
+    not retain point-in-time snapshots for global hero aggregates.
     """
     split_idx = int(len(matches) * split_ratio)
     train_matches = matches[:split_idx]
@@ -116,6 +139,7 @@ def run_time_split_test(db_path: str, matches: list[dict], split_ratio: float = 
 
     print(f"Time split: {len(train_matches)} train / {len(test_matches)} test")
     print("(Using only training-period data from a temporary DB copy)")
+    weights = _causal_backtest_weights(weights)
 
     import tempfile
     import shutil
@@ -132,9 +156,9 @@ def run_time_split_test(db_path: str, matches: list[dict], split_ratio: float = 
     for mid in test_match_ids:
         conn.execute("DELETE FROM match_players WHERE match_id = ?", (mid,))
         conn.execute("DELETE FROM picks_bans WHERE match_id = ?", (mid,))
-        conn.execute("DELETE FROM teamfights WHERE match_id = ?", (mid,))
         conn.execute("DELETE FROM teamfight_players WHERE teamfight_id IN "
                      "(SELECT id FROM teamfights WHERE match_id = ?)", (mid,))
+        conn.execute("DELETE FROM teamfights WHERE match_id = ?", (mid,))
         conn.execute("DELETE FROM gold_advantage WHERE match_id = ?", (mid,))
         conn.execute("DELETE FROM xp_advantage WHERE match_id = ?", (mid,))
         conn.execute("DELETE FROM objectives WHERE match_id = ?", (mid,))
@@ -156,8 +180,9 @@ def run_time_split_test(db_path: str, matches: list[dict], split_ratio: float = 
                 m["dire_team_id"],
                 m["radiant_heroes"],
                 m["dire_heroes"],
-                radiant_players=m.get("radiant_players"),
-                dire_players=m.get("dire_players"),
+                weights=weights,
+                radiant_players=m.get("radiant_players") if include_players else None,
+                dire_players=m.get("dire_players") if include_players else None,
             )
             predicted_win = pred["radiant_win_prob"] > 0.5
             is_correct = predicted_win == m["radiant_win"]
@@ -190,13 +215,25 @@ def run_time_split_test(db_path: str, matches: list[dict], split_ratio: float = 
     return {"accuracy": accuracy, "correct": correct, "total": total, "results": results}
 
 
-def run_rolling_test(db_path: str, matches: list[dict], window: int = 100) -> dict:
+def run_rolling_test(
+    db_path: str,
+    matches: list[dict],
+    window: int = 100,
+    *,
+    weights: dict[str, float] | None = None,
+    include_players: bool = True,
+) -> dict:
     """Rolling window backtest: for each match, use only the prior `window` matches.
 
-    This is the strictest test of the scorer's predictive power.
+    Global hero aggregates are disabled because they are not versioned by
+    availability time in the current schema.
     """
     import tempfile
     import shutil
+
+    if window < 1:
+        raise ValueError("window must be at least one")
+    weights = _causal_backtest_weights(weights)
 
     # Sort by time
     matches = sorted(matches, key=lambda m: m["start_time"])
@@ -238,8 +275,9 @@ def run_rolling_test(db_path: str, matches: list[dict], window: int = 100) -> di
                 m["dire_team_id"],
                 m["radiant_heroes"],
                 m["dire_heroes"],
-                radiant_players=m.get("radiant_players"),
-                dire_players=m.get("dire_players"),
+                weights=weights,
+                radiant_players=m.get("radiant_players") if include_players else None,
+                dire_players=m.get("dire_players") if include_players else None,
                 before_time=m["start_time"],
             )
             predicted_win = pred["radiant_win_prob"] > 0.5
@@ -344,6 +382,31 @@ def _trim_old_matches(db_path: str, oldest_to_keep: int) -> None:
     conn.close()
 
 
+def _causal_backtest_weights(
+    weights: dict[str, float] | None,
+) -> dict[str, float]:
+    selected = dict(CAUSAL_BACKTEST_WEIGHTS if weights is None else weights)
+    _scorer._validated_weights(selected)
+    unavailable = {
+        name for name in ("hero_matchup", "draft_profile") if selected[name] != 0.0
+    }
+    if unavailable:
+        raise ValueError(
+            "causal backtests require zero weight for unversioned components: "
+            + ",".join(sorted(unavailable))
+        )
+    return selected
+
+
+def _parse_weights(value: str) -> dict[str, float]:
+    values = [float(item) for item in value.split(",")]
+    if len(values) != len(COMPONENT_KEYS):
+        raise ValueError(f"--weights requires exactly {len(COMPONENT_KEYS)} values")
+    weights = dict(zip(COMPONENT_KEYS, values))
+    _scorer._validated_weights(weights)
+    return weights
+
+
 def print_report(result: dict, label: str = "BASIC") -> None:
     """Pretty-print regression test report."""
     print(f"\n{'='*60}")
@@ -412,9 +475,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of matches to test")
     parser.add_argument("--weights", type=str, default=None,
-                        help="Comma-separated weights: hero_matchup,team_form,h2h,team_strength (e.g. 0.5,0.3,0.1,0.1)")
-    parser.add_argument("--extended", action="store_true",
-                        help="Use extended weights (includes draft_profile)")
+                        help="Comma-separated weights: hero_matchup,team_form,draft_profile,player_skill,early_game")
     parser.add_argument("--no-players", action="store_true",
                         help="Disable player-based components (player_skill, early_game)")
     args = parser.parse_args()
@@ -429,36 +490,13 @@ def main():
     # Parse custom weights
     custom_weights = None
     if args.weights:
-        keys = ["hero_matchup", "team_form", "h2h", "team_strength"]
-        vals = [float(v) for v in args.weights.split(",")]
-        if len(vals) != 4:
-            print("--weights requires exactly 4 values", file=sys.stderr)
-            sys.exit(1)
-        custom_weights = dict(zip(keys, vals))
+        try:
+            custom_weights = _parse_weights(args.weights)
+            if args.rolling or args.time_split is not None:
+                custom_weights = _causal_backtest_weights(custom_weights)
+        except ValueError as error:
+            parser.error(str(error))
         print(f"Custom weights: {custom_weights}")
-
-    # Patch scorer if needed
-    if custom_weights or args.no_players or args.extended:
-        from prematch import scorer as _S
-        _orig_predict = _S.predict_match
-
-        def _patched_predict(db_path, radiant_id, dire_id, radiant_heroes, dire_heroes, **kwargs):
-            if args.no_players:
-                kwargs.pop('radiant_players', None)
-                kwargs.pop('dire_players', None)
-                kwargs.pop('before_time', None)
-            return _orig_predict(
-                db_path, radiant_id, dire_id, radiant_heroes, dire_heroes,
-                weights=custom_weights, extended=args.extended, **kwargs,
-            )
-
-        _S.predict_match = _patched_predict
-        weight_label = f"weights={custom_weights}" if custom_weights else ""
-        if args.extended:
-            weight_label += ("+" if weight_label else "") + "extended"
-        if args.no_players:
-            weight_label += ("+" if weight_label else "") + "no-players"
-        print(f"Mode: {weight_label or 'custom'}")
 
     print(f"Loading matches from {db_path}...")
     matches = get_matches(db_path)
@@ -471,13 +509,30 @@ def main():
     start = time.time()
 
     if args.rolling:
-        result = run_rolling_test(db_path, matches, args.window)
+        result = run_rolling_test(
+            db_path,
+            matches,
+            args.window,
+            weights=custom_weights,
+            include_players=not args.no_players,
+        )
         label = f"ROLLING (window={args.window})"
     elif args.time_split is not None:
-        result = run_time_split_test(db_path, matches, args.time_split)
+        result = run_time_split_test(
+            db_path,
+            matches,
+            args.time_split,
+            weights=custom_weights,
+            include_players=not args.no_players,
+        )
         label = f"TIME-SPLIT ({args.time_split:.0%} train)"
     else:
-        result = run_basic_test(db_path, matches)
+        result = run_basic_test(
+            db_path,
+            matches,
+            weights=custom_weights,
+            include_players=not args.no_players,
+        )
         label = "BASIC (in-sample)"
 
     elapsed = time.time() - start

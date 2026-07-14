@@ -217,12 +217,17 @@ async def run(
                 derived = _run_derived(runtime, report)
                 if _report_due(report, direct_one_shot):
                     _write_coverage(runtime, now)
+                candidate_error = getattr(report, "candidate_error", None)
+                successful = _report_due(report, direct_one_shot)
                 _record_runtime_health(
                     runtime,
-                    "healthy",
+                    "degraded" if candidate_error else "healthy",
                     datetime.now(timezone.utc),
                     report=report,
                     derived=derived,
+                    successful=successful,
+                    error=candidate_error,
+                    error_at=getattr(report, "candidate_error_at", None),
                 )
             except BaseException as error:
                 failed_at = datetime.now(timezone.utc)
@@ -232,6 +237,7 @@ async def run(
                         "unhealthy",
                         failed_at,
                         error=error,
+                        error_at=failed_at,
                     )
                 except Exception:
                     logger.exception("Failed to persist strict_ingest health")
@@ -277,7 +283,9 @@ def _record_runtime_health(
     *,
     report: object | None = None,
     derived: object | None = None,
-    error: BaseException | None = None,
+    successful: bool = False,
+    error: BaseException | str | None = None,
+    error_at: datetime | None = None,
 ) -> None:
     if runtime.health_connection is None:
         return
@@ -288,14 +296,15 @@ def _record_runtime_health(
         "run": _report_payload(report),
         "derived": _report_payload(derived),
     }
+    error_text = None if error is None else str(error)
     record_health(
         runtime.health_connection,
         "strict_ingest",
         status,
         heartbeat_at=heartbeat_at,
-        success_at=heartbeat_at if status == "healthy" else None,
-        error_at=heartbeat_at if error is not None else None,
-        error=None if error is None else str(error),
+        success_at=heartbeat_at if successful else None,
+        error_at=error_at,
+        error=error_text,
         details=details,
     )
 

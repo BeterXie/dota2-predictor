@@ -8,8 +8,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Collection, Iterator
+from typing import Collection, Iterator, Mapping
 
+from .benchmarks import BENCHMARK_VERSION
 from .player_scoring import score_version_for_role
 from .team_profiles import PROFILE_VERSION
 from .team_states import LABEL_VERSION
@@ -32,6 +33,12 @@ class DerivedRunReport:
     profile_cutoff: str | None
 
 
+@dataclass(frozen=True)
+class _SourceSnapshot:
+    content_hash: str
+    normalizer_version: str
+
+
 class StrictDerivedPipeline:
     """Complete only maps whose current source version lacks derived lineage."""
 
@@ -48,9 +55,18 @@ class StrictDerivedPipeline:
         with self._connection() as connection:
             self._bootstrap_existing(connection)
             pending = self._pending_ids(connection)
+            ready_requested = self._ready_ids(connection, requested)
             if force:
-                pending.update(requested)
+                missing = requested - ready_requested
+                if missing:
+                    raise ValueError(
+                        "formal ready match not found: "
+                        + ",".join(str(value) for value in sorted(missing))
+                    )
+            pending.update(ready_requested)
             self._require_formal_ids(connection, pending)
+            pending = self._causal_successor_ids(connection, pending)
+            sources = self._source_snapshots(connection, pending)
 
         if not pending:
             return DerivedRunReport(len(requested), 0, 0, 0, 0, 0, 0, None)
@@ -82,21 +98,25 @@ class StrictDerivedPipeline:
             match_ids=ordered,
         )
         with self._connection() as connection:
-            self._verify_derived(connection, ordered)
-            now = datetime.now(UTC).isoformat()
-            with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._verify_source_snapshots(connection, sources)
+                self._verify_derived(connection, sources)
+                now = datetime.now(UTC).isoformat()
                 for match_id in ordered:
-                    content_hash = connection.execute(
-                        "SELECT latest_raw_content_hash FROM match_ingest_status "
-                        "WHERE match_id=?",
-                        (match_id,),
-                    ).fetchone()[0]
-                    connection.execute(
+                    source = sources[match_id]
+                    cursor = connection.execute(
                         """INSERT INTO strict_derived_status
                            (match_id, source_content_hash, role_assignment_version,
                             score_version, team_state_version, profile_version,
-                            profile_cutoff, derived_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            profile_cutoff, derived_at, normalizer_version,
+                            benchmark_version)
+                           SELECT status.match_id, status.latest_raw_content_hash,
+                                  ?, ?, ?, ?, ?, ?, status.normalizer_version, ?
+                             FROM match_ingest_status AS status
+                            WHERE status.match_id=?
+                              AND status.latest_raw_content_hash=?
+                              AND status.normalizer_version=?
                            ON CONFLICT(match_id) DO UPDATE SET
                              source_content_hash=excluded.source_content_hash,
                              role_assignment_version=excluded.role_assignment_version,
@@ -104,18 +124,31 @@ class StrictDerivedPipeline:
                              team_state_version=excluded.team_state_version,
                              profile_version=excluded.profile_version,
                              profile_cutoff=excluded.profile_cutoff,
+                             normalizer_version=excluded.normalizer_version,
+                             benchmark_version=excluded.benchmark_version,
                              derived_at=excluded.derived_at""",
                         (
-                            match_id,
-                            content_hash,
                             ROLE_VERSION,
                             SCORE_VERSION,
                             LABEL_VERSION,
                             PROFILE_VERSION,
                             cutoff.isoformat(),
                             now,
+                            BENCHMARK_VERSION,
+                            match_id,
+                            source.content_hash,
+                            source.normalizer_version,
                         ),
                     )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            f"source version changed while deriving match {match_id}"
+                        )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
         return DerivedRunReport(
             len(requested),
             len(ordered),
@@ -178,15 +211,122 @@ class StrictDerivedPipeline:
                            OR derived.role_assignment_version<>?
                            OR derived.score_version<>?
                            OR derived.team_state_version<>?
-                           OR derived.profile_version<>?)""",
-                (ROLE_VERSION, SCORE_VERSION, LABEL_VERSION, PROFILE_VERSION),
+                           OR derived.profile_version<>?
+                           OR derived.normalizer_version IS NOT status.normalizer_version
+                           OR derived.benchmark_version IS NOT ?)""",
+                (
+                    ROLE_VERSION,
+                    SCORE_VERSION,
+                    LABEL_VERSION,
+                    PROFILE_VERSION,
+                    BENCHMARK_VERSION,
+                ),
             )
         }
+
+    @staticmethod
+    def _ready_ids(
+        connection: sqlite3.Connection, match_ids: Collection[int]
+    ) -> set[int]:
+        if not match_ids:
+            return set()
+        placeholders = ",".join("?" for _ in match_ids)
+        return {
+            int(row[0])
+            for row in connection.execute(
+                f"""SELECT match_id FROM formal_map_eligibility
+                     WHERE match_id IN ({placeholders})
+                       AND player_readiness='ready'
+                       AND state_readiness='ready'""",
+                tuple(match_ids),
+            )
+        }
+
+    @staticmethod
+    def _causal_successor_ids(
+        connection: sqlite3.Connection, match_ids: Collection[int]
+    ) -> set[int]:
+        if not match_ids:
+            return set()
+        placeholders = ",".join("?" for _ in match_ids)
+        row = connection.execute(
+            f"""SELECT status.start_time, status.match_id
+                  FROM match_ingest_status AS status
+                 WHERE status.match_id IN ({placeholders})
+                 ORDER BY status.start_time, status.match_id
+                 LIMIT 1""",
+            tuple(match_ids),
+        ).fetchone()
+        if row is None or row["start_time"] is None:
+            raise ValueError("affected maps must have a start time")
+        return {
+            int(candidate[0])
+            for candidate in connection.execute(
+                """SELECT eligible.match_id
+                     FROM formal_map_eligibility AS eligible
+                     JOIN match_ingest_status AS status USING(match_id)
+                    WHERE eligible.player_readiness='ready'
+                      AND eligible.state_readiness='ready'
+                      AND (status.start_time>?
+                           OR (status.start_time=? AND status.match_id>=?))""",
+                (int(row["start_time"]), int(row["start_time"]), int(row["match_id"])),
+            )
+        }
+
+    @staticmethod
+    def _source_snapshots(
+        connection: sqlite3.Connection, match_ids: Collection[int]
+    ) -> dict[int, _SourceSnapshot]:
+        if not match_ids:
+            return {}
+        placeholders = ",".join("?" for _ in match_ids)
+        rows = connection.execute(
+            f"""SELECT match_id, latest_raw_content_hash, normalizer_version
+                  FROM match_ingest_status
+                 WHERE match_id IN ({placeholders})""",
+            tuple(match_ids),
+        ).fetchall()
+        snapshots: dict[int, _SourceSnapshot] = {}
+        for row in rows:
+            content_hash = row["latest_raw_content_hash"]
+            normalizer_version = row["normalizer_version"]
+            if content_hash is None or not str(normalizer_version or "").strip():
+                raise ValueError(
+                    f"affected map {row['match_id']} has no complete source version"
+                )
+            snapshots[int(row["match_id"])] = _SourceSnapshot(
+                str(content_hash), str(normalizer_version)
+            )
+        missing = set(match_ids) - set(snapshots)
+        if missing:
+            raise ValueError(
+                "formal ready match not found: "
+                + ",".join(str(value) for value in sorted(missing))
+            )
+        return snapshots
+
+    @staticmethod
+    def _verify_source_snapshots(
+        connection: sqlite3.Connection,
+        sources: Mapping[int, _SourceSnapshot],
+    ) -> None:
+        current = StrictDerivedPipeline._source_snapshots(connection, sources)
+        changed = [
+            match_id
+            for match_id, source in sources.items()
+            if current.get(match_id) != source
+        ]
+        if changed:
+            raise RuntimeError(
+                "source version changed while deriving matches: "
+                + ",".join(str(value) for value in sorted(changed))
+            )
 
     def _bootstrap_existing(self, connection: sqlite3.Connection) -> None:
         """Adopt already-complete rows once without recomputing the whole archive."""
         rows = connection.execute(
             """SELECT eligible.match_id, status.latest_raw_content_hash,
+                      status.normalizer_version,
                       MAX(facts.created_at) AS facts_created_at,
                       matches.radiant_team_id, matches.dire_team_id
                  FROM formal_map_eligibility AS eligible
@@ -194,7 +334,7 @@ class StrictDerivedPipeline:
                  JOIN matches USING(match_id)
                  JOIN player_map_facts AS facts
                    ON facts.match_id=eligible.match_id
-                  AND facts.fact_version='opendota-exact-v1:' ||
+                  AND facts.fact_version=status.normalizer_version || ':' ||
                                          status.latest_raw_content_hash
                 LEFT JOIN strict_derived_status AS derived
                   ON derived.match_id=eligible.match_id
@@ -206,7 +346,10 @@ class StrictDerivedPipeline:
         adopted: list[tuple[object, ...]] = []
         for row in rows:
             match_id = int(row["match_id"])
-            if not self._existing_map_is_complete(connection, row):
+            if (
+                not str(row["normalizer_version"] or "").strip()
+                or not self._existing_map_is_complete(connection, row)
+            ):
                 continue
             cutoffs = []
             for team_id in (row["radiant_team_id"], row["dire_team_id"]):
@@ -231,6 +374,8 @@ class StrictDerivedPipeline:
                     PROFILE_VERSION,
                     max(cutoffs),
                     now,
+                    row["normalizer_version"],
+                    BENCHMARK_VERSION,
                 )
             )
         if adopted:
@@ -239,8 +384,9 @@ class StrictDerivedPipeline:
                     """INSERT OR IGNORE INTO strict_derived_status
                        (match_id, source_content_hash, role_assignment_version,
                         score_version, team_state_version, profile_version,
-                        profile_cutoff, derived_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        profile_cutoff, derived_at, normalizer_version,
+                        benchmark_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     adopted,
                 )
 
@@ -255,11 +401,19 @@ class StrictDerivedPipeline:
                   AND assignment_version=? AND position BETWEEN 1 AND 5""",
             (match_id, ROLE_VERSION),
         ).fetchone()[0]
-        score_row = connection.execute(
-            """SELECT COUNT(*), MIN(created_at) FROM player_map_scores
+        score_rows = connection.execute(
+            """SELECT created_at, explanation_json FROM player_map_scores
                 WHERE match_id=? AND score_version=?""",
             (match_id, SCORE_VERSION),
-        ).fetchone()
+        ).fetchall()
+        benchmark_versions: list[object] = []
+        for score in score_rows:
+            try:
+                benchmark_versions.append(
+                    dict(json.loads(score["explanation_json"])).get("benchmark_version")
+                )
+            except (TypeError, ValueError):
+                return False
         states = connection.execute(
             """SELECT source_versions_json FROM team_map_states
                 WHERE match_id=? AND label_version=?""",
@@ -273,9 +427,10 @@ class StrictDerivedPipeline:
                 return False
         return (
             role_count == 10
-            and score_row[0] == 10
-            and score_row[1] is not None
-            and str(score_row[1]) >= str(row["facts_created_at"])
+            and len(score_rows) == 10
+            and min(str(score["created_at"]) for score in score_rows)
+            >= str(row["facts_created_at"])
+            and all(value == BENCHMARK_VERSION for value in benchmark_versions)
             and len(states) == 2
             and all(value == row["latest_raw_content_hash"] for value in state_hashes)
         )
@@ -300,29 +455,54 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _verify_derived(
-        connection: sqlite3.Connection, match_ids: Collection[int]
+        connection: sqlite3.Connection,
+        sources: Mapping[int, _SourceSnapshot],
     ) -> None:
-        for match_id in match_ids:
+        for match_id, source in sources.items():
             role_count = connection.execute(
                 """SELECT COUNT(*) FROM player_role_assignments
                     WHERE match_id=? AND purpose='observed_position'
                       AND assignment_version=? AND position BETWEEN 1 AND 5""",
                 (match_id, ROLE_VERSION),
             ).fetchone()[0]
-            score_count = connection.execute(
-                "SELECT COUNT(*) FROM player_map_scores "
+            score_rows = connection.execute(
+                "SELECT explanation_json FROM player_map_scores "
                 "WHERE match_id=? AND score_version=?",
                 (match_id, SCORE_VERSION),
-            ).fetchone()[0]
-            state_count = connection.execute(
-                "SELECT COUNT(*) FROM team_map_states "
+            ).fetchall()
+            benchmark_versions: list[object] = []
+            for score in score_rows:
+                try:
+                    benchmark_versions.append(
+                        dict(json.loads(score["explanation_json"])).get(
+                            "benchmark_version"
+                        )
+                    )
+                except (TypeError, ValueError):
+                    benchmark_versions.append(None)
+            states = connection.execute(
+                "SELECT source_versions_json FROM team_map_states "
                 "WHERE match_id=? AND label_version=?",
                 (match_id, LABEL_VERSION),
-            ).fetchone()[0]
-            if (role_count, score_count, state_count) != (10, 10, 2):
+            ).fetchall()
+            state_hashes: list[object] = []
+            for state in states:
+                try:
+                    state_hashes.append(dict(json.loads(state[0])).get("opendota"))
+                except (TypeError, ValueError):
+                    state_hashes.append(None)
+            if (role_count, len(score_rows), len(states)) != (10, 10, 2):
                 raise RuntimeError(
                     f"derived cardinality mismatch for {match_id}: "
-                    f"roles={role_count}, scores={score_count}, states={state_count}"
+                    f"roles={role_count}, scores={len(score_rows)}, states={len(states)}"
+                )
+            if any(value != BENCHMARK_VERSION for value in benchmark_versions):
+                raise RuntimeError(
+                    f"derived benchmark version mismatch for match {match_id}"
+                )
+            if any(value != source.content_hash for value in state_hashes):
+                raise RuntimeError(
+                    f"derived source hash mismatch for match {match_id}"
                 )
 
 

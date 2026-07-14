@@ -20,6 +20,7 @@ from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot
 from live_betting.profiles.draft_curve import DraftCurve, DraftPoint
 from live_betting.research import (
+    append_research_successor_price_labels,
     manual_clock_evidence,
     record_research_prediction,
     research_summary,
@@ -92,7 +93,7 @@ def observation(at: datetime) -> VisionObservation:
     )
 
 
-def curve(*, global_passed: bool = True) -> DraftCurve:
+def curve(*, global_passed: bool = True, model_hash: str = "2" * 64) -> DraftCurve:
     return DraftCurve(
         (
             DraftPoint(
@@ -107,7 +108,7 @@ def curve(*, global_passed: bool = True) -> DraftCurve:
                 input_refs=("model:immutable", "features:immutable"),
                 uncertainty=0.02,
                 feature_hash="1" * 64,
-                model_hash="2" * 64,
+                model_hash=model_hash,
                 calibration_hash="3" * 64,
                 global_calibration_passed=global_passed,
                 global_gate_ref="global-gate:passed" if global_passed else "",
@@ -292,6 +293,164 @@ class ResearchLivePredictionTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    def test_prediction_after_settlement_is_not_result_labeled(self) -> None:
+        result = SimpleNamespace(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=9_001,
+            winner_side="team_two",
+            team_one_kills=20,
+            team_two_kills=35,
+            duration_seconds=2_400,
+            evidence_ref="opendota:9001",
+            settled_at=NOW,
+        )
+        self.assertTrue(self.store.insert_map_result(result))
+
+        observed_at = NOW + timedelta(seconds=5)
+        rows = snapshots(observed_at)
+        state_hash = self.record_transport("post-settlement", observed_at, rows)
+        prediction = record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=observation(observed_at),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="post-settlement",
+            transport_hash=state_hash,
+            transport_at=observed_at,
+            created_at=observed_at,
+        )
+        self.assertIsNotNone(prediction)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM research_result_labels"
+            ).fetchone()[0],
+            0,
+        )
+        self.store.connection.execute(
+            """INSERT INTO research_result_labels
+               (label_key, prediction_key, winner_side, selected_side_win,
+                dota_match_id, evidence_ref, settled_at, created_at)
+               VALUES (?, ?, 'team_two', 1, 9001, 'legacy:invalid', ?, ?)""",
+            (
+                f"{prediction.prediction_key}:legacy-result",
+                prediction.prediction_key,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+        self.assertEqual(research_summary(self.store.connection)["result_labels"], 0)
+
+    def test_backfilled_result_does_not_label_later_prediction(self) -> None:
+        observed_at = NOW + timedelta(seconds=5)
+        rows = snapshots(observed_at)
+        state_hash = self.record_transport("before-backfill", observed_at, rows)
+        record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=observation(observed_at),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="before-backfill",
+            transport_hash=state_hash,
+            transport_at=observed_at,
+            created_at=observed_at,
+        )
+        self.assertTrue(self.store.insert_map_result(SimpleNamespace(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=9_003,
+            winner_side="team_two",
+            team_one_kills=20,
+            team_two_kills=35,
+            duration_seconds=2_400,
+            evidence_ref="opendota:9003",
+            settled_at=NOW,
+        )))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM research_result_labels"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_first_later_winner_quote_labels_without_auxiliary_markets(self) -> None:
+        first_rows = snapshots(NOW)
+        first_hash = self.record_transport("first-winner", NOW, first_rows)
+        record_research_prediction(
+            self.store,
+            snapshots=first_rows,
+            surface=build_market_surface(first_rows),
+            observation=observation(NOW),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="first-winner",
+            transport_hash=first_hash,
+            transport_at=NOW,
+            created_at=NOW,
+        )
+
+        successor_at = NOW + timedelta(seconds=5)
+        winner_rows = snapshots(successor_at)[:2]
+        successor_hash = self.record_transport(
+            "winner-only", successor_at, winner_rows
+        )
+        inserted = append_research_successor_price_labels(
+            self.store,
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            transport_key="winner-only",
+            transport_hash=successor_hash,
+            transport_at=successor_at,
+            snapshots=winner_rows,
+            created_at=successor_at,
+        )
+        self.assertEqual(inserted, 1)
+        label = self.store.connection.execute(
+            "SELECT transport_key, seconds_after_prediction FROM research_price_labels"
+        ).fetchone()
+        self.assertEqual(tuple(label), ("winner-only", 5.0))
+
+    def test_summary_separates_model_and_calibration_cohorts(self) -> None:
+        for index, model_hash in enumerate(("2" * 64, "4" * 64)):
+            observed_at = NOW + timedelta(seconds=index * 10)
+            rows = snapshots(observed_at, underdog_price=3.0 - index * 0.1)
+            key = f"cohort-{index}"
+            state_hash = self.record_transport(key, observed_at, rows)
+            record_research_prediction(
+                self.store,
+                snapshots=rows,
+                surface=build_market_surface(rows),
+                observation=observation(observed_at),
+                draft_curve=curve(model_hash=model_hash),
+                strict_mapping=Mapping(),
+                transport_key=key,
+                transport_hash=state_hash,
+                transport_at=observed_at,
+                created_at=observed_at,
+            )
+        self.assertTrue(self.store.insert_map_result(SimpleNamespace(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=9_002,
+            winner_side="team_two",
+            team_one_kills=20,
+            team_two_kills=35,
+            duration_seconds=2_400,
+            evidence_ref="opendota:9002",
+            settled_at=NOW + timedelta(hours=1),
+        )))
+        summary = research_summary(self.store.connection)
+        self.assertEqual(len(summary["model_cohorts"]), 2)
+        self.assertEqual(summary["scorable_model_results"], 2)
+        self.assertIsNone(summary["model_accuracy"])
+        self.assertIsNone(summary["model_brier_score"])
+        self.assertIsNone(summary["model_log_loss"])
 
     def insert_manual_event(
         self, *, captured_at: datetime, current_index: int, clock: str

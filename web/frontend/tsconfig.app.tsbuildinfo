@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/format.ts","./src/main.tsx","./src/test-setup.ts","./src/types.ts","./src/components/matchrail.tsx","./src/components/matchworkspace.tsx","./src/components/operationspanel.tsx","./src/components/probabilitychart.tsx","./src/components/statusbadge.tsx"],"version":"5.9.3"}

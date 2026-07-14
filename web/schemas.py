@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 
 # --- Pagination ---
@@ -182,11 +181,25 @@ class PredictionRequest(BaseModel):
 class PrematchRequest(BaseModel):
     radiant_id: int
     dire_id: int
-    radiant_heroes: list[int]
-    dire_heroes: list[int]
+    radiant_heroes: list[int] = Field(min_length=5, max_length=5)
+    dire_heroes: list[int] = Field(min_length=5, max_length=5)
     league_id: int | None = None
-    radiant_players: list[int] | None = None
-    dire_players: list[int] | None = None
+    radiant_players: list[int] | None = Field(default=None, min_length=5, max_length=5)
+    dire_players: list[int] | None = Field(default=None, min_length=5, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_lineups(self) -> "PrematchRequest":
+        heroes = self.radiant_heroes + self.dire_heroes
+        if any(hero_id <= 0 for hero_id in heroes) or len(set(heroes)) != 10:
+            raise ValueError("draft must contain 10 distinct positive hero IDs")
+        player_sides = (self.radiant_players, self.dire_players)
+        if (player_sides[0] is None) != (player_sides[1] is None):
+            raise ValueError("player rosters must be provided for both sides or neither")
+        if self.radiant_players is not None and self.dire_players is not None:
+            players = self.radiant_players + self.dire_players
+            if any(account_id <= 0 for account_id in players) or len(set(players)) != 10:
+                raise ValueError("rosters must contain 10 distinct positive account IDs")
+        return self
 
 
 class PredictionFactor(BaseModel):

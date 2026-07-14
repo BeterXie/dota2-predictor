@@ -23,7 +23,7 @@ from .ingest import (
 from .models import RegisteredEvent, StageScope
 from .raw_archive import ArtifactReceipt
 from .registry import EventRegistry, SCOPE_POLICY_VERSION
-from .scheduler import next_retry_at
+from .scheduler import SchedulerRetryState, next_retry_at
 from .storage import IntelligenceStorage
 
 
@@ -777,6 +777,53 @@ class SQLiteIngestAdapter:
                        checkpoint_at=excluded.checkpoint_at,
                        updated_at=excluded.updated_at""",
                 (key, timestamp, timestamp),
+            )
+            self.connection.execute(
+                "DELETE FROM ingest_scheduler_retry_state WHERE checkpoint_key=?",
+                (key,),
+            )
+
+    def get_scheduler_retry_state(self, key: str) -> SchedulerRetryState | None:
+        row = self.connection.execute(
+            """SELECT failure_count, next_retry_at, last_error, updated_at
+                 FROM ingest_scheduler_retry_state WHERE checkpoint_key=?""",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        retry_at = _datetime(row["next_retry_at"])
+        assert retry_at is not None
+        return SchedulerRetryState(
+            int(row["failure_count"]),
+            retry_at,
+            str(row["last_error"]),
+            _datetime(row["updated_at"]),
+        )
+
+    def set_scheduler_retry_state(
+        self,
+        key: str,
+        state: SchedulerRetryState,
+        updated_at: datetime,
+    ) -> None:
+        timestamp = _iso(updated_at)
+        with self.storage.transaction():
+            self.connection.execute(
+                """INSERT INTO ingest_scheduler_retry_state
+                   (checkpoint_key, failure_count, next_retry_at, last_error,
+                    updated_at) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(checkpoint_key) DO UPDATE SET
+                       failure_count=excluded.failure_count,
+                       next_retry_at=excluded.next_retry_at,
+                       last_error=excluded.last_error,
+                       updated_at=excluded.updated_at""",
+                (
+                    key,
+                    state.failure_count,
+                    _iso(state.next_retry_at),
+                    state.last_error,
+                    timestamp,
+                ),
             )
 
     def record_raw_artifact(self, receipt: ArtifactReceipt) -> None:

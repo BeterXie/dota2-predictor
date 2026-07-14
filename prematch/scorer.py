@@ -1,10 +1,7 @@
 """Pre-match prediction scorer.
 
-Combines three core signals into a single win-probability estimate:
-  1. Hero matchup advantage (ban/pick counter scoring) — 40% weight
-  2. Team recent form (win rate + performance)      — 35% weight
-  3. Head-to-head record                            — 15% weight
-  4. Team historical strength (overall stats)       — 10% weight
+Combines hero matchup, team form, draft profile, player skill, and early-game
+signals into a single win-probability estimate.
 
 Each sub-score is in [-1, 1] (positive = radiant favoured).
 Weights are dynamically adjusted when data is missing.
@@ -22,14 +19,6 @@ _DEFAULT_WEIGHTS = {
     "draft_profile": 0.14,
     "player_skill": 0.09,
     "early_game": 0.00,       # needs more per-player data to be useful
-}
-
-_EXTENDED_WEIGHTS = {
-    "hero_matchup": 0.35,
-    "team_form": 0.25,
-    "h2h": 0.10,
-    "team_strength": 0.10,
-    "draft_profile": 0.20,
 }
 
 # Dimensions used in draft profile and their weights within the component
@@ -260,8 +249,6 @@ def _team_recent_stats(
         if (r["radiant_team_id"] == team_id and r["radiant_win"]) or \
            (r["dire_team_id"] == team_id and not r["radiant_win"]):
             wins += 1
-
-    match_ids = [r["match_id"] for r in rows if "match_id" in r.keys()]
 
     # Also try to get GPM from recent matches
     with _connect(db_path) as conn2:
@@ -807,11 +794,14 @@ def _compute_early_game(
         total_w = 0.0
         score = 0.0
         if core_valid:
-            score += 0.35 * core_diff; total_w += 0.35
+            score += 0.35 * core_diff
+            total_w += 0.35
         if mid_valid:
-            score += 0.25 * mid_diff; total_w += 0.25
+            score += 0.25 * mid_diff
+            total_w += 0.25
         if sup_valid:
-            score += 0.40 * sup_diff; total_w += 0.40
+            score += 0.40 * sup_diff
+            total_w += 0.40
         if total_w > 0:
             score /= total_w
 
@@ -958,7 +948,6 @@ def predict_match(
     radiant_players: list[int] | None = None,
     dire_players: list[int] | None = None,
     before_time: int | None = None,
-    extended: bool = False,
 ) -> dict[str, Any]:
     """Predict the outcome of a Dota 2 match.
 
@@ -972,15 +961,18 @@ def predict_match(
         radiant_players: Optional 5 account IDs for radiant (enables player skill).
         dire_players: Optional 5 account IDs for dire (enables player skill).
         before_time: Unix timestamp for backtesting (only use matches before this).
-        extended: If True, include draft_profile and player_skill components.
-
     Returns:
         Dict with prediction, confidence, and per-component breakdown.
     """
-    if weights:
-        w = dict(weights)
-    else:
-        w = dict(_DEFAULT_WEIGHTS)
+    _validate_lineups(
+        radiant_id,
+        dire_id,
+        radiant_heroes,
+        dire_heroes,
+        radiant_players,
+        dire_players,
+    )
+    w = _validated_weights(weights)
 
     # Compute all components
     hero = _compute_hero_matchup_score(db_path, radiant_heroes, dire_heroes)
@@ -1037,6 +1029,52 @@ def predict_match(
         "components": components,
         "weights_used": adjusted,
     }
+
+
+def _validated_weights(weights: dict[str, float] | None) -> dict[str, float]:
+    if weights is None:
+        return dict(_DEFAULT_WEIGHTS)
+    expected = set(_DEFAULT_WEIGHTS)
+    actual = set(weights)
+    if actual != expected:
+        missing = ",".join(sorted(expected - actual)) or "none"
+        unknown = ",".join(sorted(actual - expected)) or "none"
+        raise ValueError(
+            f"weights must define exactly the scorer components "
+            f"(missing={missing}; unknown={unknown})"
+        )
+    values = {name: float(weights[name]) for name in _DEFAULT_WEIGHTS}
+    if any(not np.isfinite(value) or value < 0.0 for value in values.values()):
+        raise ValueError("weights must be finite and non-negative")
+    if sum(values.values()) <= 0.0:
+        raise ValueError("at least one weight must be positive")
+    return values
+
+
+def _validate_lineups(
+    radiant_id: int,
+    dire_id: int,
+    radiant_heroes: list[int],
+    dire_heroes: list[int],
+    radiant_players: list[int] | None,
+    dire_players: list[int] | None,
+) -> None:
+    if radiant_id == dire_id:
+        raise ValueError("radiant and dire teams must be different")
+    heroes = radiant_heroes + dire_heroes
+    if len(radiant_heroes) != 5 or len(dire_heroes) != 5:
+        raise ValueError("each side must provide exactly five heroes")
+    if any(hero_id <= 0 for hero_id in heroes) or len(set(heroes)) != 10:
+        raise ValueError("draft must contain 10 distinct positive hero IDs")
+    if (radiant_players is None) != (dire_players is None):
+        raise ValueError("player rosters must be provided for both sides or neither")
+    if radiant_players is None or dire_players is None:
+        return
+    players = radiant_players + dire_players
+    if len(radiant_players) != 5 or len(dire_players) != 5:
+        raise ValueError("each side must provide exactly five account IDs")
+    if any(account_id <= 0 for account_id in players) or len(set(players)) != 10:
+        raise ValueError("rosters must contain 10 distinct positive account IDs")
 
 
 def _adjust_weights(

@@ -8,10 +8,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+from event_intelligence.benchmarks import BENCHMARK_VERSION
 from event_intelligence.facts import extract_completed_match_facts
 from event_intelligence.incremental import SCORE_VERSION, StrictDerivedPipeline
 from event_intelligence.ingest import (
+    MATCH_PROCESSOR_VERSION,
     IngestReport,
     StrictEventIngestor,
     completed_match_processing_result,
@@ -23,10 +26,12 @@ from event_intelligence.ingest_adapters import (
 from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
 from event_intelligence.opendota import OpenDotaAdapter
 from event_intelligence.registry import EventRegistry
+from event_intelligence.scheduler import ScheduleRun, SchedulerRetryState
 from event_intelligence.storage import IntelligenceStorage
 from fetch.db import Database
 from scripts.run_strict_event_ingest import (
     Runtime,
+    _record_runtime_health,
     build_default_runtime,
     build_parser,
     run,
@@ -307,12 +312,26 @@ class IngestAdapterTests(unittest.TestCase):
         )
 
         self.store.set_scheduler_checkpoint("active_poll", NOW)
+        retry = SchedulerRetryState(
+            2,
+            NOW + timedelta(hours=1),
+            "catalog unavailable",
+            NOW,
+        )
+        self.store.set_scheduler_retry_state("candidate_scan", retry, NOW)
         reopened = IntelligenceStorage(self.path)
         try:
             reopened_store = SQLiteIngestAdapter(
                 reopened, EventRegistry(reopened), Database(connection=reopened.connection)
             )
             self.assertEqual(reopened_store.get_scheduler_checkpoint("active_poll"), NOW)
+            self.assertEqual(
+                reopened_store.get_scheduler_retry_state("candidate_scan"), retry
+            )
+            reopened_store.set_scheduler_checkpoint("candidate_scan", NOW)
+            self.assertIsNone(
+                reopened_store.get_scheduler_retry_state("candidate_scan")
+            )
         finally:
             reopened.close()
 
@@ -477,11 +496,14 @@ class IngestAdapterTests(unittest.TestCase):
         pipeline = StrictDerivedPipeline(self.path)
         first = pipeline.run(ingest_report.changed_match_ids)
         second = pipeline.run(())
+        requested_again = pipeline.run(ingest_report.changed_match_ids)
 
         self.assertEqual((first.derived_maps, first.assignment_rows), (1, 20))
         self.assertEqual((first.score_rows, first.state_rows), (10, 2))
         self.assertEqual(second.derived_maps, 0)
+        self.assertEqual(requested_again.derived_maps, 1)
         connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
         try:
             self.assertEqual(
                 connection.execute(
@@ -494,12 +516,170 @@ class IngestAdapterTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM strict_derived_status").fetchone()[0],
                 1,
             )
+            status = connection.execute(
+                """SELECT normalizer_version, benchmark_version
+                     FROM strict_derived_status WHERE match_id=8001"""
+            ).fetchone()
+            self.assertEqual(
+                tuple(status), (MATCH_PROCESSOR_VERSION, BENCHMARK_VERSION)
+            )
+            connection.execute(
+                """UPDATE strict_derived_status
+                      SET normalizer_version='old-normalizer'
+                    WHERE match_id=8001"""
+            )
+            connection.commit()
+            self.assertEqual(pipeline._pending_ids(connection), {8_001})
+            connection.execute(
+                """UPDATE strict_derived_status
+                      SET normalizer_version=?, benchmark_version='old-benchmark'
+                    WHERE match_id=8001""",
+                (MATCH_PROCESSOR_VERSION,),
+            )
+            connection.commit()
+            self.assertEqual(pipeline._pending_ids(connection), {8_001})
+            sources = pipeline._source_snapshots(connection, {8_001})
+            connection.execute(
+                """UPDATE player_map_scores
+                      SET explanation_json='{"benchmark_version":"old-benchmark"}'
+                    WHERE match_id=8001 AND player_slot=0"""
+            )
+            connection.commit()
+            with self.assertRaisesRegex(RuntimeError, "benchmark version mismatch"):
+                pipeline._verify_derived(connection, sources)
+            connection.execute(
+                """UPDATE match_ingest_status
+                      SET state_readiness='retryable' WHERE match_id=8001"""
+            )
+            connection.commit()
+            with self.assertRaisesRegex(ValueError, "formal ready match not found: 8001"):
+                pipeline.run((8_001,), force=True)
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM team_style_profiles").fetchone()[0],
                 2,
             )
         finally:
             connection.close()
+
+    def test_changed_earlier_map_rederives_all_causal_successors(self) -> None:
+        earlier = completed_payload(8_001, 1)
+        later = completed_payload(8_002, 11)
+        earlier["start_time"] = int((NOW - timedelta(hours=2)).timestamp())
+        later["start_time"] = int((NOW - timedelta(hours=1)).timestamp())
+        payloads = {8_001: earlier, 8_002: later}
+
+        class CompletedClient:
+            async def get_leagues(self) -> list[dict]:
+                return []
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                return [
+                    {
+                        "match_id": payload["match_id"],
+                        "leagueid": payload["leagueid"],
+                        "start_time": payload["start_time"],
+                    }
+                    for payload in payloads.values()
+                ]
+
+            async def get_match(self, match_id: int) -> dict:
+                return payloads[match_id]
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CompletedClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+        first_ingest = asyncio.run(
+            ingestor.run_once(event_id="pgl-wallachia-s8-2026")
+        )
+        self.assertEqual(first_ingest.changed_match_ids, (8_001, 8_002))
+        pipeline = StrictDerivedPipeline(self.path)
+        self.assertEqual(pipeline.run(first_ingest.changed_match_ids).derived_maps, 2)
+
+        self.storage.connection.execute(
+            """UPDATE strict_derived_status
+                  SET source_content_hash=? WHERE match_id=8001""",
+            ("0" * 64,),
+        )
+        self.storage.connection.commit()
+
+        rerun = pipeline.run(())
+        self.assertEqual((rerun.pending_maps, rerun.derived_maps), (2, 2))
+
+    def test_source_change_during_derivation_cannot_complete_lineage(self) -> None:
+        payload = completed_payload()
+        payload["start_time"] = int((NOW - timedelta(hours=1)).timestamp())
+        summary = {
+            "match_id": payload["match_id"],
+            "leagueid": payload["leagueid"],
+            "start_time": payload["start_time"],
+        }
+
+        class CompletedClient:
+            async def get_leagues(self) -> list[dict]:
+                return []
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                return [summary]
+
+            async def get_match(self, match_id: int) -> dict:
+                return payload
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CompletedClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+        ingest_report = asyncio.run(
+            ingestor.run_once(event_id="pgl-wallachia-s8-2026")
+        )
+
+        from scripts.build_strict_team_profiles import (
+            build_strict_profiles as real_build_profiles,
+        )
+
+        def change_source(*args: object, **kwargs: object) -> object:
+            report = real_build_profiles(*args, **kwargs)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """UPDATE match_ingest_status
+                          SET latest_raw_content_hash=? WHERE match_id=8001""",
+                    ("f" * 64,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            return report
+
+        with patch(
+            "scripts.build_strict_team_profiles.build_strict_profiles",
+            side_effect=change_source,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source version changed"):
+                StrictDerivedPipeline(self.path).run(ingest_report.changed_match_ids)
+
+        self.assertEqual(
+            self.storage.connection.execute(
+                "SELECT COUNT(*) FROM strict_derived_status"
+            ).fetchone()[0],
+            0,
+        )
+        verification = sqlite3.connect(self.path)
+        verification.row_factory = sqlite3.Row
+        try:
+            sources = StrictDerivedPipeline._source_snapshots(verification, {8_001})
+            with self.assertRaisesRegex(RuntimeError, "derived source hash mismatch"):
+                StrictDerivedPipeline._verify_derived(verification, sources)
+        finally:
+            verification.close()
 
     def test_success_atomically_writes_legacy_exact_facts_and_readiness(self) -> None:
         payload = completed_payload()
@@ -705,7 +885,7 @@ class IngestAdapterTests(unittest.TestCase):
                 first_usable_at=upgraded_at, payload=payload, facts=processing.facts,
                 artifact_unchanged=False, detail_complete=True, retryable=False,
                 missing_reasons=(), next_retry_at=None,
-                processor_version="opendota-exact-v1",
+                processor_version="opendota-exact-v2",
             ),
             "normalized",
         )
@@ -713,13 +893,19 @@ class IngestAdapterTests(unittest.TestCase):
             """SELECT normalizer_version, raw_artifact_version
                FROM match_ingest_status WHERE match_id=8001"""
         ).fetchone()
-        self.assertEqual(tuple(row), ("opendota-exact-v1", 2))
+        self.assertEqual(tuple(row), ("opendota-exact-v2", 2))
         self.assertEqual(
             self.storage.connection.execute(
                 "SELECT COUNT(*) FROM player_map_facts WHERE match_id=8001"
             ).fetchone()[0],
             20,
         )
+        derived = StrictDerivedPipeline(self.path).run((8_001,))
+        self.assertEqual(derived.derived_maps, 1)
+        lineage = self.storage.connection.execute(
+            "SELECT normalizer_version FROM strict_derived_status WHERE match_id=8001"
+        ).fetchone()
+        self.assertEqual(lineage["normalizer_version"], "opendota-exact-v2")
 
     def test_less_complete_changed_payload_never_replaces_complete_version(self) -> None:
         payload = completed_payload()
@@ -936,6 +1122,79 @@ class IngestAdapterTests(unittest.TestCase):
         report = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(report["formal_maps"], 0)
         self.assertEqual(report["versions"]["player_score"], SCORE_VERSION)
+
+    def test_cli_marks_isolated_catalog_failure_as_degraded(self) -> None:
+        class UnusedIngestor:
+            async def run_once(self, **values: object) -> None:
+                raise AssertionError("scheduler one-shot must use the scheduler")
+
+        class DegradedScheduler:
+            async def run_due(self, *args: object, **kwargs: object) -> ScheduleRun:
+                return ScheduleRun(
+                    active_polled=True,
+                    recent_rescanned=True,
+                    changed_match_ids=(8_001,),
+                    candidate_error="catalog unavailable",
+                    candidate_retry_at=NOW + timedelta(minutes=15),
+                    candidate_error_at=NOW,
+                )
+
+        runtime = Runtime(
+            UnusedIngestor(),  # type: ignore[arg-type]
+            DegradedScheduler(),  # type: ignore[arg-type]
+            health_connection=self.storage.connection,
+        )
+        args = build_parser().parse_args(["--scheduler-once"])
+
+        self.assertEqual(asyncio.run(run(args, runtime_factory=lambda _: runtime)), 0)
+        health = self.storage.connection.execute(
+            """SELECT status, last_success_at, last_error_at, last_error,
+                      details_json FROM service_health
+                 WHERE component='strict_ingest'"""
+        ).fetchone()
+        self.assertEqual((health["status"], health["last_error"]), (
+            "degraded",
+            "catalog unavailable",
+        ))
+        self.assertIsNotNone(health["last_success_at"])
+        self.assertEqual(health["last_error_at"], NOW.isoformat())
+        self.assertEqual(
+            json.loads(health["details_json"])["run"]["changed_match_ids"],
+            [8_001],
+        )
+
+    def test_catalog_backoff_heartbeat_preserves_real_result_times(self) -> None:
+        runtime = Runtime(
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            health_connection=self.storage.connection,
+        )
+        _record_runtime_health(
+            runtime,
+            "degraded",
+            NOW,
+            successful=True,
+            error="catalog unavailable",
+            error_at=NOW,
+        )
+        heartbeat = NOW + timedelta(minutes=5)
+        _record_runtime_health(
+            runtime,
+            "degraded",
+            heartbeat,
+            successful=False,
+            error="catalog unavailable",
+            error_at=NOW,
+        )
+
+        row = self.storage.connection.execute(
+            """SELECT last_heartbeat_at, last_success_at, last_error_at
+                 FROM service_health WHERE component='strict_ingest'"""
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            (heartbeat.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
 
     def test_cli_scheduler_once_runs_one_due_cycle_and_closes_runtime(self) -> None:
         class UnusedIngestor:

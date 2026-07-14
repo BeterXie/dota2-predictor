@@ -26,22 +26,29 @@ from live_betting.smtp_delivery import (
 NOW = datetime(2026, 7, 14, 1, 0, tzinfo=timezone.utc)
 
 
-def record(event_type: str = EVENT_FILLED) -> OutboxRecord:
+def record(
+    event_type: str = EVENT_FILLED,
+    template_version: str = TEMPLATE_VERSION,
+) -> OutboxRecord:
+    payload = simulation_payload(event_type, {
+        "raybet_match_id": "match-1",
+        "map_number": 1,
+        "selected_side": "team_one",
+        "result": "win",
+    })
+    payload["template_version"] = template_version
     return OutboxRecord(
         outbox_id=1,
         order_key="order-1",
         event_type=event_type,
         channel="email",
-        payload_json=canonical_payload(simulation_payload(event_type, {
-            "raybet_match_id": "match-1",
-            "map_number": 1,
-            "selected_side": "team_one",
-            "result": "win",
-        })),
+        payload_json=canonical_payload(payload),
         stats_cutoff_at=NOW,
-        template_version=TEMPLATE_VERSION,
+        template_version=template_version,
         recipient="599084618@qq.com",
-        message_id=stable_message_id("order-1", event_type),
+        message_id=stable_message_id(
+            "order-1", event_type, template_version=template_version
+        ),
         status="leased",
         attempt_count=1,
         next_attempt_at=NOW,
@@ -137,6 +144,20 @@ class SMTPDeliveryTests(unittest.TestCase):
             "[Dota 2 模拟] 模拟订单已结算：match-1",
         )
         self.assertIn("事件：模拟订单已结算", message.get_content())
+
+    def test_legacy_retry_keeps_legacy_subject_and_body(self) -> None:
+        message = build_message(
+            record(template_version="dota2-shadow-email-v1"),
+            SMTPConfig("sender@qq.com", "secret"),
+        )
+        self.assertEqual(
+            str(message["Subject"]),
+            "[Dota2 simulation] filled shadow order: match-1",
+        )
+        body = message.get_content()
+        self.assertIn("SIMULATION ONLY", body)
+        self.assertIn("raybet_match_id: match-1", body)
+        self.assertNotIn("Dota 2 实时模拟通知", body)
 
     def test_implicit_tls_delivery_uses_context_and_no_plaintext_client(self) -> None:
         FakeSMTP.instances.clear()

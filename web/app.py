@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from . import queries
-from .routers import heroes, leagues, matches, teams
+from .routers import heroes, leagues, matches, monitor, teams
 from .schemas import H2HComparison, MatchSummary, PrematchRequest, PredictionRequest, TeamBase
 
 # Resolve paths for the prediction module
@@ -25,6 +27,8 @@ if _project_root_str not in sys.path:
     sys.path.insert(0, _project_root_str)
 
 _prediction_module = None
+_fetch_process: subprocess.Popen[bytes] | None = None
+_fetch_process_lock = threading.Lock()
 
 
 def _get_prediction_module():
@@ -45,6 +49,7 @@ app.include_router(matches.router)
 app.include_router(teams.router)
 app.include_router(heroes.router)
 app.include_router(leagues.router)
+app.include_router(monitor.router)
 
 # ---- Hero grid endpoint (for pre-match hero picker) ----
 
@@ -83,25 +88,39 @@ def recent_matches(limit: int = Query(30, ge=1, le=100)):
 # ---- Trigger data fetch ----
 
 @app.post("/api/fetch-latest", tags=["admin"])
-def trigger_fetch(match_id: int | None = None, force: bool = False):
+def trigger_fetch(
+    request: Request,
+    match_id: int | None = Query(default=None, gt=0),
+    force: bool = False,
+    admin_action: str | None = Header(default=None, alias="X-Dota2-Admin-Action"),
+):
     """Trigger fetching latest matches from OpenDota (runs in background).
 
     If match_id is provided, fetches only that match.
     If force is True, re-fetches even if already in DB.
     """
-    import subprocess, sys
+    client_host = request.client.host if request.client is not None else ""
+    if client_host not in {"127.0.0.1", "::1"} or admin_action != "fetch":
+        raise HTTPException(status_code=403, detail="Local admin request required")
+    global _fetch_process
     try:
         cmd = [sys.executable, "-m", "fetch.main"]
         if match_id is not None:
             cmd.extend(["--match-id", str(match_id)])
         if force:
             cmd.append("--force")
-        subprocess.Popen(
-            cmd,
-            cwd=str(_PROJECT_DIR),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        with _fetch_process_lock:
+            if _fetch_process is not None and _fetch_process.poll() is None:
+                raise HTTPException(status_code=409, detail="A fetch is already running")
+            _fetch_process = subprocess.Popen(
+                cmd,
+                cwd=str(_PROJECT_DIR),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                ),
+            )
         parts = []
         if match_id:
             parts.append(f"match {match_id}")
@@ -110,10 +129,13 @@ def trigger_fetch(match_id: int | None = None, force: bool = False):
         if force:
             parts.append("with --force")
         return {"status": "started", "message": f"Fetching {' '.join(parts)} in background..."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start fetch: {e}")
 
 STATIC_DIR = Path(__file__).parent / "static"
+MONITOR_DIST_DIR = Path(__file__).parent / "frontend" / "dist"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -122,6 +144,32 @@ def serve_index():
     if index_path.exists():
         return HTMLResponse(index_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>Dota 2 Predictor</h1><p>index.html not found.</p>")
+
+
+@app.get("/monitor", include_in_schema=False)
+@app.get("/monitor/{asset_path:path}", include_in_schema=False)
+def serve_monitor(asset_path: str = ""):
+    """Serve the built local monitoring console and its hashed assets."""
+    root = MONITOR_DIST_DIR.resolve()
+    if asset_path:
+        candidate = (root / asset_path).resolve()
+        if root in candidate.parents and candidate.is_file():
+            return FileResponse(
+                candidate,
+                headers={"Cache-Control": "public, max-age=31536000, immutable"},
+            )
+    index_path = root / "index.html"
+    if index_path.is_file():
+        return FileResponse(
+            index_path,
+            media_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return Response(
+        "Monitor frontend is not built. Run: cd web/frontend && npm install && npm run build",
+        status_code=503,
+        media_type="text/plain",
+    )
 
 
 @app.get("/api/stats/head-to-head", response_model=H2HComparison, tags=["stats"])

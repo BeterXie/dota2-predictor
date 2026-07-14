@@ -58,7 +58,6 @@ def format_output(
 ) -> dict:
     """Assemble the final prediction output dict per DESIGN.md Module D."""
     now = datetime.now(timezone.utc)
-    today_str = now.strftime("%Y%m%d")
 
     metrics = bundle.get("metrics", {})
     test_metrics = metrics.get("test", {}) if isinstance(metrics, dict) else {}

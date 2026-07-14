@@ -100,8 +100,6 @@ def get_matches(
     count_query = f"SELECT COUNT(*) FROM matches m {where_clause}"
 
     total = _safe_execute(count_query, tuple(params), fetch="value") or 0
-    total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 1
-
     data_query = f"""
         SELECT m.match_id, m.radiant_team_id, m.dire_team_id, m.radiant_win,
                m.duration, m.start_time, m.leagueid, m.radiant_score, m.dire_score,
@@ -121,29 +119,6 @@ def get_matches(
     return rows, total
 
 
-def _compute_position(lane_role, gold_per_min):
-    """Derive Dota 2 position (1-5) from lane_role and gold_per_min.
-
-    lane_role: 1=safe, 2=mid, 3=offlane, 4=jungle (may be None)
-    gold_per_min: used to distinguish core from support within the same lane
-
-    Returns None if position cannot be determined.
-    """
-    if lane_role is None:
-        return None
-    # Mid is always position 2
-    if lane_role == 2:
-        return 2
-    # Safe lane: high GPM = pos 1, low GPM = pos 5
-    if lane_role == 1:
-        return 1  # temporary — sorted within same lane by GPM below
-    # Offlane: high GPM = pos 3, low GPM = pos 4
-    if lane_role == 3:
-        return 3
-    # Jungle or other — fall back
-    return None
-
-
 def _sort_heroes_by_position(heroes: list[dict]) -> list[dict]:
     """Sort heroes into position order (1-5) using lane_role + GPM.
 
@@ -159,46 +134,28 @@ def _sort_heroes_by_position(heroes: list[dict]) -> list[dict]:
     safe_lane = [h for h in heroes if h.get("lane_role") == 1]
     mid_lane = [h for h in heroes if h.get("lane_role") == 2]
     off_lane = [h for h in heroes if h.get("lane_role") == 3]
-    other = [h for h in heroes if h.get("lane_role") not in (1, 2, 3)]
-
     # Sort within each group by GPM descending (higher GPM = core)
     safe_lane.sort(key=lambda h: h.get("gold_per_min", 0) or 0, reverse=True)
     off_lane.sort(key=lambda h: h.get("gold_per_min", 0) or 0, reverse=True)
 
-    result = []
-    # Position 1: safe lane, highest GPM
+    positions: list[dict | None] = [None, None, None, None, None]
     if safe_lane:
-        result.append(safe_lane[0])
-    # Position 2: mid lane
+        positions[0] = safe_lane[0]
     if mid_lane:
-        result.append(mid_lane[0])
-    # Position 3: offlane, highest GPM
-    if len(off_lane) >= 1:
-        result.append(off_lane[0])
-    # Position 4: offlane, lowest GPM (or any remaining offlane)
+        positions[1] = mid_lane[0]
+    if off_lane:
+        positions[2] = off_lane[0]
     if len(off_lane) >= 2:
-        result.append(off_lane[1])
-    elif len(off_lane) == 1 and safe_lane:
-        result.append(off_lane[0])
-    # Position 5: safe lane, lowest GPM
+        positions[3] = off_lane[1]
     if len(safe_lane) >= 2:
-        result.append(safe_lane[1])
+        positions[4] = safe_lane[1]
 
-    # Add any players not yet assigned (jungle, roaming, ambiguous)
-    assigned = set(id(h) for h in result)
-    for h in heroes:
-        if id(h) not in assigned:
-            result.append(h)
-
-    # Fill missing positions from other/unassigned
-    if len(result) < 5:
-        remaining = [h for h in heroes if id(h) not in assigned]
-        for h in remaining:
-            if len(result) >= 5:
-                break
-            result.append(h)
-
-    return result[:5]
+    assigned = {id(hero) for hero in positions if hero is not None}
+    remaining = iter(hero for hero in heroes if id(hero) not in assigned)
+    for index, hero in enumerate(positions):
+        if hero is None:
+            positions[index] = next(remaining)
+    return [hero for hero in positions if hero is not None]
 
 
 def get_match_draft(match_id: int) -> dict | None:

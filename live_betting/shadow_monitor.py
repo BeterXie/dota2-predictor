@@ -22,7 +22,10 @@ from .profiles import (
     TeamStyleProfile,
     build_draft_curve,
 )
-from .research import record_research_prediction
+from .research import (
+    append_research_successor_price_labels,
+    record_research_prediction,
+)
 from .shadow_strategy import ComebackShadowStrategy
 from .storage import LiveBettingStore
 from .strict_eligibility import query_strict_live_eligibility
@@ -642,6 +645,16 @@ def run_once(
             "transport_key": current_transport.observation_key,
             "aligned": aligned,
         }
+    successor_price_labels = append_research_successor_price_labels(
+        store,
+        raybet_match_id=match_id,
+        map_number=map_number,
+        transport_key=current_transport.observation_key,
+        transport_hash=current_transport.state_hash,
+        transport_at=current_transport_at,
+        snapshots=snapshots,
+        created_at=run_at,
+    )
 
     observations = [_observation(item) for item in store.connection.execute(
         """SELECT * FROM vision_observations WHERE raybet_match_id=?
@@ -725,6 +738,11 @@ def run_once(
             "actionability": "research_only",
         }
     )
+    if research_payload is not None:
+        research_payload["price_labels_inserted"] = (
+            int(research_payload["price_labels_inserted"])
+            + successor_price_labels
+        )
     active_draft = draft.at(observation.game_clock_seconds or 0)
     if active_draft is None:
         draft_reason = draft.wait_reason(observation.game_clock_seconds or 0)

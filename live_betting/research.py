@@ -432,6 +432,35 @@ def _append_successor_price_labels(
     return inserted
 
 
+def append_research_successor_price_labels(
+    store: LiveBettingStore,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    transport_key: str,
+    transport_hash: str,
+    transport_at: datetime,
+    snapshots: Sequence[OddsSnapshot],
+    created_at: datetime,
+) -> int:
+    """Label prior predictions from the first later complete winner quote."""
+    observed_at = _utc(transport_at, "transport_at")
+    created = _utc(created_at, "created_at")
+    if not _SHA256_RE.fullmatch(transport_hash):
+        raise ValueError("transport_hash must be a lowercase SHA-256 digest")
+    with store.transaction():
+        return _append_successor_price_labels(
+            store,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            transport_key=transport_key,
+            transport_hash=transport_hash,
+            transport_at=observed_at,
+            snapshots=snapshots,
+            created_at=created,
+        )
+
+
 def record_research_prediction(
     store: LiveBettingStore,
     *,
@@ -622,17 +651,45 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         ).fetchall()
         result_rows = connection.execute(
             """SELECT prediction.raw_model_probability,
-                      prediction.market_probability, label.selected_side_win
-                 FROM research_result_labels AS label
-                 JOIN research_live_predictions AS prediction
-                   ON prediction.prediction_key=label.prediction_key"""
+                      prediction.market_probability, label.selected_side_win,
+                      prediction.model_hash, prediction.calibration_hash,
+                      prediction.gate_status
+                  FROM research_result_labels AS label
+                  JOIN research_live_predictions AS prediction
+                    ON prediction.prediction_key=label.prediction_key
+                 WHERE julianday(prediction.observed_at) <
+                       julianday(label.settled_at)"""
         ).fetchall()
     except sqlite3.OperationalError:
         price_rows = []
         result_rows = []
-    model_points = [
-        (float(row[0]), int(row[2])) for row in result_rows if row[0] is not None
+    cohort_points: dict[tuple[str | None, str | None, str], list[tuple[float, int]]] = {}
+    for row in result_rows:
+        if row[0] is None:
+            continue
+        key = (
+            None if row[3] is None else str(row[3]),
+            None if row[4] is None else str(row[4]),
+            str(row[5]),
+        )
+        cohort_points.setdefault(key, []).append((float(row[0]), int(row[2])))
+    model_cohorts = []
+    for (model_hash, calibration_hash, gate_status), points in sorted(
+        cohort_points.items(), key=lambda item: tuple("" if value is None else value for value in item[0])
+    ):
+        model_cohorts.append({
+            "model_hash": model_hash,
+            "calibration_hash": calibration_hash,
+            "gate_status": gate_status,
+            "results": len(points),
+            "accuracy": _accuracy(points),
+            "brier_score": brier_score(points),
+            "log_loss": log_loss(points),
+        })
+    passed_cohorts = [
+        cohort for cohort in model_cohorts if cohort["gate_status"] == "passed"
     ]
+    headline = passed_cohorts[0] if len(passed_cohorts) == 1 else None
     market_points = [(float(row[1]), int(row[2])) for row in result_rows]
     price_probability_moves = [float(row[2]) - float(row[0]) for row in price_rows]
     price_moves = [float(row[3]) - float(row[1]) for row in price_rows]
@@ -651,10 +708,13 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
             math.fsum(price_moves) / len(price_moves) if price_moves else None
         ),
         "result_labels": len(result_rows),
-        "scorable_model_results": len(model_points),
-        "model_accuracy": _accuracy(model_points),
-        "model_brier_score": brier_score(model_points) if model_points else None,
-        "model_log_loss": log_loss(model_points) if model_points else None,
+        "scorable_model_results": sum(
+            int(cohort["results"]) for cohort in passed_cohorts
+        ),
+        "model_accuracy": None if headline is None else headline["accuracy"],
+        "model_brier_score": None if headline is None else headline["brier_score"],
+        "model_log_loss": None if headline is None else headline["log_loss"],
+        "model_cohorts": model_cohorts,
         "market_accuracy": _accuracy(market_points),
         "market_brier_score": brier_score(market_points) if market_points else None,
         "market_log_loss": log_loss(market_points) if market_points else None,
@@ -664,6 +724,7 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
 
 __all__ = [
     "ACTIONABILITY",
+    "append_research_successor_price_labels",
     "ManualClockEvidence",
     "RESEARCH_SCHEMA_VERSION",
     "ResearchPrediction",

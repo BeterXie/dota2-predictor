@@ -38,7 +38,17 @@ def next_retry_at(attempted_at: datetime, failure_count: int) -> datetime | None
 class ScheduleStore(Protocol):
     def get_scheduler_checkpoint(self, key: str) -> datetime | None: ...
 
-    def set_scheduler_checkpoint(self, key: str, value: datetime) -> None: ...
+    def set_scheduler_checkpoint(self, key: str, value: datetime) -> None:
+        """Persist success and atomically clear retry state for the same key."""
+        ...
+
+    def get_scheduler_retry_state(
+        self, key: str
+    ) -> SchedulerRetryState | None: ...
+
+    def set_scheduler_retry_state(
+        self, key: str, state: SchedulerRetryState, updated_at: datetime
+    ) -> None: ...
 
 
 class ScheduledIngestor(Protocol):
@@ -50,11 +60,22 @@ class ScheduledIngestor(Protocol):
 
 
 @dataclass(frozen=True)
+class SchedulerRetryState:
+    failure_count: int
+    next_retry_at: datetime
+    last_error: str
+    failed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class ScheduleRun:
     active_polled: bool
     recent_rescanned: bool
     candidate_scanned: bool = False
     changed_match_ids: tuple[int, ...] = ()
+    candidate_error: str | None = None
+    candidate_retry_at: datetime | None = None
+    candidate_error_at: datetime | None = None
 
 
 class IngestScheduler:
@@ -80,6 +101,9 @@ class IngestScheduler:
         recent_rescanned = False
         candidate_scanned = False
         changed_match_ids: set[int] = set()
+        candidate_error = None
+        candidate_retry_at = None
+        candidate_error_at = None
 
         active_checkpoint = self._store.get_scheduler_checkpoint("active_poll")
         if include_active and self._is_due(
@@ -100,14 +124,58 @@ class IngestScheduler:
             recent_rescanned = True
 
         candidate_checkpoint = self._store.get_scheduler_checkpoint("candidate_scan")
-        if self._is_due(candidate_checkpoint, now, CANDIDATE_SCAN_INTERVAL):
-            await self._ingestor.discover_event_candidates(now)
-            self._store.set_scheduler_checkpoint("candidate_scan", now)
-            candidate_scanned = True
+        candidate_retry = self._store.get_scheduler_retry_state("candidate_scan")
+        if candidate_retry is not None:
+            candidate_error = candidate_retry.last_error
+            candidate_retry_at = _utc(candidate_retry.next_retry_at)
+            candidate_error_at = (
+                None
+                if candidate_retry.failed_at is None
+                else _utc(candidate_retry.failed_at)
+            )
+        retry_due = candidate_retry_at is None or candidate_retry_at <= now
+        if self._is_due(
+            candidate_checkpoint, now, CANDIDATE_SCAN_INTERVAL
+        ) and retry_due:
+            try:
+                await self._ingestor.discover_event_candidates(now)
+            except Exception as error:
+                failure_count = (
+                    1
+                    if candidate_retry is None
+                    else candidate_retry.failure_count + 1
+                )
+                retry_count = min(failure_count, len(RETRY_DELAYS))
+                retry_at = next_retry_at(now, retry_count)
+                assert retry_at is not None
+                candidate_error = (
+                    " ".join(str(error).split()) or type(error).__name__
+                )[:500]
+                candidate_retry_at = retry_at
+                candidate_error_at = now
+                self._store.set_scheduler_retry_state(
+                    "candidate_scan",
+                    SchedulerRetryState(
+                        failure_count,
+                        retry_at,
+                        candidate_error,
+                        now,
+                    ),
+                    now,
+                )
+            else:
+                self._store.set_scheduler_checkpoint("candidate_scan", now)
+                candidate_scanned = True
+                candidate_error = None
+                candidate_retry_at = None
+                candidate_error_at = None
 
         return ScheduleRun(
             active_polled,
             recent_rescanned,
             candidate_scanned,
             tuple(sorted(changed_match_ids)),
+            candidate_error,
+            candidate_retry_at,
+            candidate_error_at,
         )

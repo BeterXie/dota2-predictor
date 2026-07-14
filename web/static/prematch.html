@@ -132,6 +132,21 @@
   .matrix-table .cell-score { font-weight: 700; }
   .matrix-legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.7rem; color: #6b7084; flex-wrap: wrap; }
   .matrix-legend span { display: flex; align-items: center; gap: 0.25rem; }
+  .comparison-section { margin-top: 2rem; }
+  .comparison-section h3 { font-size: 1rem; color: #c0c4d0; margin-bottom: 1rem; border-bottom: 1px solid #1e2030; padding-bottom: 0.5rem; }
+  .comp-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
+  .comp-block { background: #13141f; border: 1px solid #1e2030; border-radius: 8px; overflow: hidden; }
+  .comp-block h4 { margin: 0; padding: 0.6rem 1rem; background: #1a1c2a; font-size: 0.85rem; color: #c0c4d0; }
+  .comp-row { display: flex; padding: 0.35rem 1rem; font-size: 0.78rem; border-bottom: 1px solid #1a1c2a; }
+  .comp-row.header { font-weight: 600; color: #6b7084; background: #0d0e17; }
+  .comp-row span:first-child { flex: 1.2; }
+  .comp-row .radiant-label { flex: 1; color: #b8e986; text-align: center; }
+  .comp-row .dire-label { flex: 1; color: #ff8a65; text-align: center; }
+  .comp-row .val { flex: 1; text-align: center; font-variant-numeric: tabular-nums; }
+  .comp-row .val.r { color: #b8e986; }
+  .comp-row .val.d { color: #ff8a65; }
+  .comp-row .val.better { font-weight: 700; }
+  .comp-score-bar { margin-top: 0.5rem; padding: 0 1rem 0.6rem; font-size: 0.78rem; color: #8b90a0; }
   .legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
   .legend-dot.adv { background: #0a2a0a; border: 1px solid #2a5a2a; }
   .legend-dot.slight { background: #1a2a1a; border: 1px solid #2a4a2a; }
@@ -308,21 +323,6 @@
       <span><span class="legend-dot slight-dis"></span>略劣</span>
       <span><span class="legend-dot dis"></span>劣势</span>
       <span style="margin-left:0.5rem">数值 = 英雄胜率 − 该英雄平均胜率</span>
-    .comparison-section { margin-top: 2rem; }
-    .comparison-section h3 { font-size: 1rem; color: #c0c4d0; margin-bottom: 1rem; border-bottom: 1px solid #1e2030; padding-bottom: 0.5rem; }
-    .comp-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
-    .comp-block { background: #13141f; border: 1px solid #1e2030; border-radius: 8px; overflow: hidden; }
-    .comp-block h4 { margin: 0; padding: 0.6rem 1rem; background: #1a1c2a; font-size: 0.85rem; color: #c0c4d0; }
-    .comp-row { display: flex; padding: 0.35rem 1rem; font-size: 0.78rem; border-bottom: 1px solid #1a1c2a; }
-    .comp-row.header { font-weight: 600; color: #6b7084; background: #0d0e17; }
-    .comp-row span:first-child { flex: 1.2; }
-    .comp-row .radiant-label { flex: 1; color: #b8e986; text-align: center; }
-    .comp-row .dire-label { flex: 1; color: #ff8a65; text-align: center; }
-    .comp-row .val { flex: 1; text-align: center; font-variant-numeric: tabular-nums; }
-    .comp-row .val.r { color: #b8e986; }
-    .comp-row .val.d { color: #ff8a65; }
-    .comp-row .val.better { font-weight: 700; }
-    .comp-score-bar { margin-top: 0.5rem; padding: 0 1rem 0.6rem; font-size: 0.78rem; color: #8b90a0; }
     </div>
   </div>
   <div class="comparison-section" id="comparison-section" style="display:none">
@@ -507,6 +507,15 @@ function resetAll() {
   document.getElementById('predict-btn').textContent = 'Predict Winner';
 }
 
+function completePlayerRoster(side) {
+  const players = selectedPlayers[side];
+  if (players.length !== 5) return null;
+  for (let index = 0; index < 5; index++) {
+    if (!Number.isInteger(players[index]) || players[index] <= 0) return null;
+  }
+  return players.slice();
+}
+
 // ---- Predict ----
 async function predict() {
   const errorEl = document.getElementById('error-msg');
@@ -535,6 +544,10 @@ async function predict() {
 
   btn.disabled = true;
   btn.textContent = 'Predicting...';
+  const radiantPlayers = completePlayerRoster('rad');
+  const direPlayers = completePlayerRoster('dir');
+  const includePlayerRosters = radiantPlayers !== null && direPlayers !== null &&
+    new Set(radiantPlayers.concat(direPlayers)).size === 10;
 
   try {
     const resp = await fetch('/api/prematch-predict', {
@@ -544,8 +557,8 @@ async function predict() {
         radiant_id: radiantId, dire_id: direId,
         radiant_heroes: radiantHeroes, dire_heroes: direHeroes,
         league_id: leagueId || null,
-        radiant_players: selectedPlayers.rad.length === 5 ? selectedPlayers.rad : null,
-        dire_players: selectedPlayers.dir.length === 5 ? selectedPlayers.dir : null,
+        radiant_players: includePlayerRosters ? radiantPlayers : null,
+        dire_players: includePlayerRosters ? direPlayers : null,
       })
     });
 
@@ -865,6 +878,14 @@ function fillForm(data) {
   var dbg = document.getElementById('error-msg');
   dbg.style.display = 'block';
 
+  selectedPlayers.rad = [];
+  selectedPlayers.dir = [];
+  for (var clearSide of ['rad', 'dir']) {
+    for (var clearPosition = 1; clearPosition <= 5; clearPosition++) {
+      clearSlot(clearSide, clearPosition);
+    }
+  }
+
   // Teams
   var radTeamEl = document.getElementById('radiant-team');
   var dirTeamEl = document.getElementById('dire-team');
@@ -937,8 +958,11 @@ async function refetchMatch() {
   var statusEl = document.getElementById('fetch-status');
   statusEl.textContent = 'Re-fetching match ' + mid + '...';
   try {
-    var resp = await fetch('/api/fetch-latest?match_id=' + encodeURIComponent(mid) + '&force=true', { method: 'POST' });
+    var resp = await fetch('/api/fetch-latest?match_id=' + encodeURIComponent(mid) + '&force=true', {
+      method: 'POST', headers: {'X-Dota2-Admin-Action': 'fetch'}
+    });
     var data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.statusText);
     statusEl.textContent = data.message;
     showToast(data.message, 'success');
   } catch (err4) {
@@ -951,8 +975,11 @@ async function fetchLatest() {
   var statusEl = document.getElementById('fetch-status');
   statusEl.textContent = 'Starting...';
   try {
-    var resp = await fetch('/api/fetch-latest', { method: 'POST' });
+    var resp = await fetch('/api/fetch-latest', {
+      method: 'POST', headers: {'X-Dota2-Admin-Action': 'fetch'}
+    });
     var data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.statusText);
     statusEl.textContent = data.message;
     showToast(data.message, 'success');
   } catch (err4) {
@@ -967,6 +994,13 @@ function showToast(msg, type) {
   toast.className = 'toast ' + (type || 'success');
   setTimeout(function() { toast.className = 'toast'; }, 3000);
 }
+
+document.getElementById('radiant-team').addEventListener('change', function() {
+  selectedPlayers.rad = [];
+});
+document.getElementById('dire-team').addEventListener('change', function() {
+  selectedPlayers.dir = [];
+});
 
 init();
 </script>

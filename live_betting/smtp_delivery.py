@@ -51,6 +51,8 @@ _RESULT_LABELS = {
     "half_loss": "输一半",
     "loss": "输",
 }
+_LEGACY_TEMPLATE_VERSION = "dota2-shadow-email-v1"
+_CURRENT_TEMPLATE_VERSION = "dota2-shadow-email-v2"
 
 
 class SMTPConfigurationError(RuntimeError):
@@ -84,9 +86,20 @@ class SMTPConfig:
 
 def build_message(record: OutboxRecord, config: SMTPConfig) -> EmailMessage:
     payload = record.payload
-    event_label = _EVENT_LABELS[record.event_type]
+    if record.template_version == _LEGACY_TEMPLATE_VERSION:
+        event_label = (
+            "filled shadow order"
+            if record.event_type == EVENT_FILLED
+            else "settled shadow order"
+        )
+        subject_text = f"[Dota2 simulation] {event_label}: "
+    elif record.template_version == _CURRENT_TEMPLATE_VERSION:
+        event_label = _EVENT_LABELS[record.event_type]
+        subject_text = f"[Dota 2 模拟] {event_label}："
+    else:
+        raise ValueError(f"unsupported SMTP template: {record.template_version}")
     match = _payload_text(payload, "raybet_match_id", "unknown-match")
-    subject = sanitize_header(f"[Dota 2 模拟] {event_label}：{match}", "subject")
+    subject = sanitize_header(f"{subject_text}{match}", "subject")
     message = EmailMessage()
     message["From"] = sanitize_header(config.sender, "sender")
     message["To"] = sanitize_header(record.recipient, "recipient")
@@ -99,6 +112,20 @@ def build_message(record: OutboxRecord, config: SMTPConfig) -> EmailMessage:
 def render_body(record: OutboxRecord) -> str:
     """Render only immutable stored payload; retries cannot change statistics."""
     payload = record.payload
+    if record.template_version == _LEGACY_TEMPLATE_VERSION:
+        lines = [
+            "Dota 2 live shadow notification",
+            "SIMULATION ONLY: no real wager was placed.",
+            f"Event: {record.event_type}",
+            f"Order: {record.order_key}",
+            f"Statistics cutoff: {record.stats_cutoff_at.isoformat()}",
+            "",
+        ]
+        for key in sorted(payload):
+            lines.append(f"{key}: {payload[key]}")
+        return "\n".join(lines) + "\n"
+    if record.template_version != _CURRENT_TEMPLATE_VERSION:
+        raise ValueError(f"unsupported SMTP template: {record.template_version}")
     lines = [
         "Dota 2 实时模拟通知",
         "仅为模拟：未进行任何真实投注。",

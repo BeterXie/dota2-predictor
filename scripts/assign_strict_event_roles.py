@@ -163,7 +163,9 @@ def load_strict_maps(
            WHERE eligible.player_readiness='ready'
              AND f.first_usable_at IS NOT NULL
              AND f.is_radiant IS NOT NULL
-             AND f.fact_version='opendota-exact-v1:' || status.latest_raw_content_hash
+             AND f.fact_version=
+                 COALESCE(status.normalizer_version, 'opendota-exact-v1') ||
+                 ':' || status.latest_raw_content_hash
              AND a.source='opendota'
            ORDER BY f.match_id, f.player_slot"""
     ).fetchall()

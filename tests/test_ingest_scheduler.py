@@ -12,6 +12,7 @@ from event_intelligence.scheduler import (
     RECENT_RESCAN_WINDOW,
     RETRY_DELAYS,
     IngestScheduler,
+    SchedulerRetryState,
     next_retry_at,
 )
 
@@ -22,12 +23,22 @@ NOW = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
 class FakeScheduleStore:
     def __init__(self) -> None:
         self.values: dict[str, datetime] = {}
+        self.retries: dict[str, SchedulerRetryState] = {}
 
     def get_scheduler_checkpoint(self, key: str) -> datetime | None:
         return self.values.get(key)
 
     def set_scheduler_checkpoint(self, key: str, value: datetime) -> None:
         self.values[key] = value
+        self.retries.pop(key, None)
+
+    def get_scheduler_retry_state(self, key: str) -> SchedulerRetryState | None:
+        return self.retries.get(key)
+
+    def set_scheduler_retry_state(
+        self, key: str, state: SchedulerRetryState, updated_at: datetime
+    ) -> None:
+        self.retries[key] = state
 
 
 class FakeIngestor:
@@ -139,6 +150,55 @@ class SchedulerTests(unittest.TestCase):
         report = asyncio.run(IngestScheduler(ChangedIngestor(), FakeScheduleStore()).run_due(NOW))
 
         self.assertEqual(report.changed_match_ids, (1, 2, 3))
+
+    def test_catalog_failure_isolated_and_persistently_backed_off(self) -> None:
+        class FailingCatalogIngestor(FakeIngestor):
+            async def poll_active(self, now: datetime) -> object:
+                self.active_calls.append(now)
+                return SimpleNamespace(changed_match_ids=(7,))
+
+            async def discover_event_candidates(self, now: datetime) -> object:
+                self.candidate_calls.append(now)
+                raise RuntimeError("catalog temporarily unavailable")
+
+        store = FakeScheduleStore()
+        ingestor = FailingCatalogIngestor()
+        report = asyncio.run(
+            IngestScheduler(ingestor, store).run_due(NOW, include_recent=False)
+        )
+
+        self.assertEqual(report.changed_match_ids, (7,))
+        self.assertFalse(report.candidate_scanned)
+        self.assertEqual(report.candidate_error, "catalog temporarily unavailable")
+        self.assertEqual(report.candidate_retry_at, NOW + RETRY_DELAYS[0])
+        self.assertEqual(report.candidate_error_at, NOW)
+        self.assertEqual(store.retries["candidate_scan"].failure_count, 1)
+        self.assertEqual(store.get_scheduler_checkpoint("active_poll"), NOW)
+        self.assertIsNone(store.get_scheduler_checkpoint("candidate_scan"))
+
+        before_retry = NOW + RETRY_DELAYS[0] - timedelta(seconds=1)
+        restarted = FakeIngestor()
+        waiting = asyncio.run(
+            IngestScheduler(restarted, store).run_due(
+                before_retry, include_active=False, include_recent=False
+            )
+        )
+        self.assertEqual(restarted.candidate_calls, [])
+        self.assertEqual(waiting.candidate_error, "catalog temporarily unavailable")
+        self.assertEqual(waiting.candidate_error_at, NOW)
+
+        retry_at = NOW + RETRY_DELAYS[0]
+        recovered = asyncio.run(
+            IngestScheduler(restarted, store).run_due(
+                retry_at, include_active=False, include_recent=False
+            )
+        )
+        self.assertEqual(restarted.candidate_calls, [retry_at])
+        self.assertTrue(recovered.candidate_scanned)
+        self.assertIsNone(recovered.candidate_error)
+        self.assertIsNone(recovered.candidate_error_at)
+        self.assertNotIn("candidate_scan", store.retries)
+        self.assertEqual(store.get_scheduler_checkpoint("candidate_scan"), retry_at)
 
 
 if __name__ == "__main__":

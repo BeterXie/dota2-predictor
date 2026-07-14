@@ -493,7 +493,8 @@ BEFORE DELETE ON research_result_labels
 BEGIN
     SELECT RAISE(ABORT, 'research result label is append-only');
 END;
-CREATE TRIGGER IF NOT EXISTS research_result_from_map_result
+DROP TRIGGER IF EXISTS research_result_from_map_result;
+CREATE TRIGGER research_result_from_map_result
 AFTER INSERT ON map_results
 BEGIN
     INSERT OR IGNORE INTO research_result_labels
@@ -503,9 +504,11 @@ BEGIN
            CASE WHEN selected_side=NEW.winner_side THEN 1 ELSE 0 END,
            NEW.dota_match_id, NEW.evidence_ref, NEW.settled_at, NEW.settled_at
       FROM research_live_predictions
-     WHERE raybet_match_id=NEW.raybet_match_id AND map_number=NEW.map_number;
+     WHERE raybet_match_id=NEW.raybet_match_id AND map_number=NEW.map_number
+       AND julianday(observed_at) < julianday(NEW.settled_at);
 END;
-CREATE TRIGGER IF NOT EXISTS research_result_from_late_prediction
+DROP TRIGGER IF EXISTS research_result_from_late_prediction;
+CREATE TRIGGER research_result_from_late_prediction
 AFTER INSERT ON research_live_predictions
 BEGIN
     INSERT OR IGNORE INTO research_result_labels
@@ -517,7 +520,8 @@ BEGIN
            NEW.created_at
       FROM map_results AS result
      WHERE result.raybet_match_id=NEW.raybet_match_id
-       AND result.map_number=NEW.map_number;
+       AND result.map_number=NEW.map_number
+       AND julianday(NEW.observed_at) < julianday(result.settled_at);
 END;
 """
 

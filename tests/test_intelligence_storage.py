@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "draft_predictions",
     "notification_outbox",
     "service_health",
+    "ingest_scheduler_retry_state",
     "strict_derived_status",
 }
 
@@ -141,7 +142,7 @@ class IntelligenceStorageTests(unittest.TestCase):
                     storage.connection.execute(
                         "SELECT MAX(version) FROM intelligence_schema_version"
                     ).fetchone()[0],
-                    3,
+                    4,
                 )
                 columns = {
                     row[1]
@@ -150,12 +151,97 @@ class IntelligenceStorageTests(unittest.TestCase):
                     )
                 }
                 self.assertIn("start_time", columns)
+                derived_columns = {
+                    row[1]
+                    for row in storage.connection.execute(
+                        "PRAGMA table_info(strict_derived_status)"
+                    )
+                }
+                self.assertTrue(
+                    {"normalizer_version", "benchmark_version"} <= derived_columns
+                )
                 self.assertIsNotNone(
                     storage.connection.execute(
                         """SELECT 1 FROM sqlite_master
                            WHERE type='table' AND name='ingest_scheduler_checkpoints'"""
                     ).fetchone()
                 )
+
+    def test_version_four_additively_migrates_derived_lineage_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intelligence.db"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """CREATE TABLE strict_derived_status (
+                    match_id INTEGER PRIMARY KEY,
+                    source_content_hash TEXT NOT NULL,
+                    role_assignment_version TEXT NOT NULL,
+                    score_version TEXT NOT NULL,
+                    team_state_version TEXT NOT NULL,
+                    profile_version TEXT NOT NULL,
+                    profile_cutoff TEXT NOT NULL,
+                    derived_at TEXT NOT NULL
+                )"""
+            )
+            connection.commit()
+            connection.close()
+
+            with IntelligenceStorage(path) as storage:
+                storage.init_schema(seed_events=False)
+                columns = {
+                    row[1]: row[3]
+                    for row in storage.connection.execute(
+                        "PRAGMA table_info(strict_derived_status)"
+                    )
+                }
+                self.assertEqual(columns["normalizer_version"], 0)
+                self.assertEqual(columns["benchmark_version"], 0)
+                self.assertEqual(
+                    storage.connection.execute(
+                        "SELECT MAX(version) FROM intelligence_schema_version"
+                    ).fetchone()[0],
+                    4,
+                )
+
+    def test_migration_backfills_legacy_normalizer_from_complete_v1_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intelligence.db"
+            content_hash = "a" * 64
+            with IntelligenceStorage(path) as storage:
+                storage.init_schema()
+                storage.connection.execute(
+                    """INSERT INTO match_ingest_status
+                       (match_id, event_id, stage_scope, stage_in_scope,
+                        has_valid_result, latest_raw_content_hash,
+                        discovered_at, updated_at)
+                       VALUES (8001, 'pgl-wallachia-s8-2026', 'main_event', 1,
+                               1, ?, '2026-01-01T00:00:00+00:00',
+                               '2026-01-01T00:00:00+00:00')""",
+                    (content_hash,),
+                )
+                storage.connection.executemany(
+                    """INSERT INTO player_map_facts
+                       (match_id, player_slot, facts_json, coverage,
+                        source_content_hash, fact_version, created_at)
+                       VALUES (8001, ?, '{}', 1.0, ?, ?,
+                               '2026-01-01T00:00:00+00:00')""",
+                    (
+                        (
+                            slot,
+                            content_hash,
+                            f"opendota-exact-v1:{content_hash}",
+                        )
+                        for slot in (0, 1, 2, 3, 4, 128, 129, 130, 131, 132)
+                    ),
+                )
+                storage.connection.commit()
+
+                storage.init_schema(seed_events=False)
+
+                row = storage.connection.execute(
+                    "SELECT normalizer_version FROM match_ingest_status WHERE match_id=8001"
+                ).fetchone()
+                self.assertEqual(row["normalizer_version"], "opendota-exact-v1")
 
     def test_incompatible_old_registry_rolls_back_new_schema_and_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

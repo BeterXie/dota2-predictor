@@ -11,7 +11,7 @@ from typing import Any, Iterator, Sequence
 
 
 BUSY_TIMEOUT_MS = 5_000
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 SCHEMA_SQL = """
@@ -367,6 +367,14 @@ CREATE TABLE IF NOT EXISTS ingest_scheduler_checkpoints (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ingest_scheduler_retry_state (
+    checkpoint_key TEXT PRIMARY KEY,
+    failure_count INTEGER NOT NULL CHECK (failure_count > 0),
+    next_retry_at TEXT NOT NULL,
+    last_error TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS strict_derived_status (
     match_id INTEGER PRIMARY KEY
         REFERENCES match_ingest_status(match_id) ON DELETE CASCADE,
@@ -376,7 +384,9 @@ CREATE TABLE IF NOT EXISTS strict_derived_status (
     team_state_version TEXT NOT NULL,
     profile_version TEXT NOT NULL,
     profile_cutoff TEXT NOT NULL,
-    derived_at TEXT NOT NULL
+    derived_at TEXT NOT NULL,
+    normalizer_version TEXT NOT NULL,
+    benchmark_version TEXT NOT NULL
 );
 
 CREATE VIEW IF NOT EXISTS formal_events AS
@@ -511,6 +521,34 @@ class IntelligenceStorage:
             self.connection.execute(
                 """ALTER TABLE match_ingest_status
                    ADD COLUMN attempt_generation INTEGER NOT NULL DEFAULT 0"""
+            )
+        self.connection.execute(
+            """UPDATE match_ingest_status
+                  SET normalizer_version='opendota-exact-v1'
+                WHERE normalizer_version IS NULL
+                  AND latest_raw_content_hash IS NOT NULL
+                  AND (SELECT COUNT(*)
+                         FROM player_map_facts AS facts
+                        WHERE facts.match_id=match_ingest_status.match_id
+                          AND facts.source_content_hash=
+                              match_ingest_status.latest_raw_content_hash
+                          AND facts.fact_version='opendota-exact-v1:' ||
+                              match_ingest_status.latest_raw_content_hash) = 10"""
+        )
+
+        derived_columns = {
+            str(row[1])
+            for row in self.connection.execute(
+                "PRAGMA table_info(strict_derived_status)"
+            )
+        }
+        if "normalizer_version" not in derived_columns:
+            self.connection.execute(
+                "ALTER TABLE strict_derived_status ADD COLUMN normalizer_version TEXT"
+            )
+        if "benchmark_version" not in derived_columns:
+            self.connection.execute(
+                "ALTER TABLE strict_derived_status ADD COLUMN benchmark_version TEXT"
             )
 
         artifact_columns = {
