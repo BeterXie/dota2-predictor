@@ -185,6 +185,8 @@ class PrematchRequest(BaseModel):
     radiant_heroes: list[int]
     dire_heroes: list[int]
     league_id: int | None = None
+    radiant_players: list[int] | None = None
+    dire_players: list[int] | None = None
 
 
 class PredictionFactor(BaseModel):

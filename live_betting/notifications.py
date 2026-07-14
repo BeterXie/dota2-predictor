@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping
 CHANNEL_EMAIL = "email"
 EVENT_FILLED = "filled"
 EVENT_SETTLED = "settled"
-TEMPLATE_VERSION = "dota2-shadow-email-v1"
+TEMPLATE_VERSION = "dota2-shadow-email-v2"
 DEFAULT_RECIPIENT = "599084618@qq.com"
 RETRY_DELAYS = (60, 300, 1800, 7200, 43200)
 

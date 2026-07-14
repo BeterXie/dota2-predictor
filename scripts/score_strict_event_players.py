@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -575,7 +575,13 @@ def build_scores(
     *,
     min_samples: int = 5,
     target_match_id: int | None = None,
+    target_match_ids: Collection[int] | None = None,
 ) -> tuple[ScoredRow, ...]:
+    if target_match_id is not None and target_match_ids is not None:
+        raise ValueError("target_match_id and target_match_ids are mutually exclusive")
+    selected_ids = (
+        None if target_match_ids is None else {int(value) for value in target_match_ids}
+    )
     prepared: list[tuple[StrictMap, StrictPlayerFact, dict[str, float | None]]] = []
     for game in games:
         for player in game.players:
@@ -616,6 +622,8 @@ def build_scores(
     ] = {}
     for game, player, raw in prepared:
         if target_match_id is not None and game.match_id != target_match_id:
+            continue
+        if selected_ids is not None and game.match_id not in selected_ids:
             continue
         position = int(player.position)
         role_cutoff = player.role_assignment_cutoff
@@ -806,9 +814,13 @@ def run_scoring(
     *,
     dry_run: bool = False,
     match_id: int | None = None,
+    match_ids: Collection[int] | None = None,
     assignment_version: str | None = None,
     min_samples: int = 5,
 ) -> ScoreReport:
+    if match_id is not None and match_ids is not None:
+        raise ValueError("match_id and match_ids are mutually exclusive")
+    selected_ids = None if match_ids is None else {int(value) for value in match_ids}
     database = database.resolve()
     if dry_run:
         connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
@@ -826,12 +838,19 @@ def run_scoring(
             database_path=database,
             assignment_version=resolved_assignment_version,
         )
-        if match_id is not None and all(game.match_id != match_id for game in games):
-            raise ValueError(f"formal ready match not found: {match_id}")
+        available_ids = {game.match_id for game in games}
+        requested_ids = {match_id} if match_id is not None else selected_ids
+        missing_ids = set() if requested_ids is None else requested_ids - available_ids
+        if missing_ids:
+            raise ValueError(
+                "formal ready match not found: "
+                + ",".join(str(value) for value in sorted(missing_ids))
+            )
         scores = build_scores(
             games,
             min_samples=min_samples,
             target_match_id=match_id,
+            target_match_ids=selected_ids,
         )
         inserted, updated, unchanged = persist_scores(
             connection, scores, dry_run=dry_run
@@ -840,7 +859,7 @@ def run_scoring(
             score_version_for_role(resolved_assignment_version),
             BENCHMARK_VERSION,
             dry_run,
-            len(games) if match_id is None else 1,
+            len(games) if requested_ids is None else len(requested_ids),
             len(scores),
             inserted,
             updated,

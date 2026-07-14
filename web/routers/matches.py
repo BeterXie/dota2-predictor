@@ -10,6 +10,15 @@ from ..schemas import GoldAdvantagePoint, MatchDetail, MatchPlayer, MatchSummary
 router = APIRouter(prefix="/api/matches", tags=["matches"])
 
 
+@router.get("/{match_id}/draft")
+def match_draft(match_id: int):
+    """Return team and hero picks for auto-fill."""
+    data = queries.get_match_draft(match_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Match {match_id} not found")
+    return data
+
+
 @router.get("", response_model=PaginatedResponse)
 def list_matches(
     page: int = Query(1, ge=1),

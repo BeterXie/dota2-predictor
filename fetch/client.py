@@ -70,6 +70,9 @@ class OpenDotaClient:
     async def get_match(self, match_id: int) -> dict:
         return await self._request(f"/api/matches/{match_id}")
 
+    async def get_leagues(self) -> list[dict]:
+        return await self._request("/api/leagues")
+
     async def get_league_matches(self, league_id: int) -> list[dict]:
         return await self._request(f"/api/leagues/{league_id}/matches")
 

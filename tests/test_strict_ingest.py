@@ -223,6 +223,7 @@ class StrictIngestTests(unittest.TestCase):
         self.assertEqual(store.candidates, [(102, "league_mismatch")])
         self.assertNotIn(102, store.statuses)
         self.assertEqual((report.discovered, report.completed), (1, 1))
+        self.assertEqual(report.changed_match_ids, (101,))
 
     def test_legacy_match_with_partial_player_row_is_refetched(self) -> None:
         store = FakeStore()
@@ -343,6 +344,7 @@ class StrictIngestTests(unittest.TestCase):
 
         self.assertEqual(client.detail_calls, [402])
         self.assertEqual(report.unchanged, 1)
+        self.assertEqual(report.changed_match_ids, ())
         self.assertIsNone(store.successes[0]["facts"])
 
     def test_detail_fetches_are_bounded_by_configured_concurrency(self) -> None:

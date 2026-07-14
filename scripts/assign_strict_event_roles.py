@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -249,7 +249,11 @@ def build_assignments(
     *,
     availability_mode: AvailabilityMode,
     match_id: int | None = None,
+    match_ids: Collection[int] | None = None,
 ) -> tuple[PersistedAssignment, ...]:
+    if match_id is not None and match_ids is not None:
+        raise ValueError("match_id and match_ids are mutually exclusive")
+    selected_ids = None if match_ids is None else {int(value) for value in match_ids}
     history: list[HistoricalPositionEvidence] = []
     output: list[PersistedAssignment] = []
     for game in games:
@@ -322,7 +326,11 @@ def build_assignments(
                             ),
                         )
                     )
-        if match_id is None or game.match_id == match_id:
+        if (
+            (match_id is None and selected_ids is None)
+            or game.match_id == match_id
+            or (selected_ids is not None and game.match_id in selected_ids)
+        ):
             output.extend(map_rows)
     return tuple(output)
 
@@ -410,8 +418,12 @@ def run_assignment(
     *,
     dry_run: bool = False,
     match_id: int | None = None,
+    match_ids: Collection[int] | None = None,
     availability_mode: AvailabilityMode = AvailabilityMode.RECONSTRUCTED_WALK_FORWARD,
 ) -> AssignmentReport:
+    if match_id is not None and match_ids is not None:
+        raise ValueError("match_id and match_ids are mutually exclusive")
+    selected_ids = None if match_ids is None else {int(value) for value in match_ids}
     database = database.resolve()
     connection = sqlite3.connect(
         f"file:{database.as_posix()}?mode=ro" if dry_run else database,
@@ -422,10 +434,19 @@ def run_assignment(
     connection.execute("PRAGMA busy_timeout=5000")
     try:
         games = load_strict_maps(connection, database_path=database)
-        if match_id is not None and all(game.match_id != match_id for game in games):
-            raise ValueError(f"formal ready match not found: {match_id}")
+        available_ids = {game.match_id for game in games}
+        requested_ids = {match_id} if match_id is not None else selected_ids
+        missing_ids = set() if requested_ids is None else requested_ids - available_ids
+        if missing_ids:
+            raise ValueError(
+                "formal ready match not found: "
+                + ",".join(str(value) for value in sorted(missing_ids))
+            )
         rows = build_assignments(
-            games, availability_mode=availability_mode, match_id=match_id
+            games,
+            availability_mode=availability_mode,
+            match_id=match_id,
+            match_ids=selected_ids,
         )
         inserted, updated, unchanged = persist_assignments(
             connection, rows, dry_run=dry_run
@@ -435,7 +456,7 @@ def run_assignment(
             availability_mode.value,
             dry_run,
             len(games),
-            len(games) if match_id is None else 1,
+            len(games) if requested_ids is None else len(requested_ids),
             len(rows),
             inserted,
             updated,

@@ -91,13 +91,17 @@ def format_output(
 
 
 def _sanitize(obj):
-    """Recursively replace NaN/Infinity with None so JSON output is valid."""
+    """Recursively replace NaN/Infinity with None and convert numpy types to native Python."""
     if isinstance(obj, dict):
         return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_sanitize(v) for v in obj]
-    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-        return None
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return float(obj)
+    if hasattr(obj, 'item'):  # numpy scalar → native Python
+        return _sanitize(obj.item())
     return obj
 
 

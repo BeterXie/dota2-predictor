@@ -17,6 +17,7 @@ RETRY_DELAYS = (
 ACTIVE_POLL_INTERVAL = timedelta(minutes=15)
 RECENT_RESCAN_INTERVAL = timedelta(days=1)
 RECENT_RESCAN_WINDOW = timedelta(days=7)
+CANDIDATE_SCAN_INTERVAL = timedelta(days=1)
 
 
 def _utc(value: datetime) -> datetime:
@@ -45,11 +46,15 @@ class ScheduledIngestor(Protocol):
 
     def rescan_recent(self, since: datetime, now: datetime) -> Awaitable[object]: ...
 
+    def discover_event_candidates(self, now: datetime) -> Awaitable[object]: ...
+
 
 @dataclass(frozen=True)
 class ScheduleRun:
     active_polled: bool
     recent_rescanned: bool
+    candidate_scanned: bool = False
+    changed_match_ids: tuple[int, ...] = ()
 
 
 class IngestScheduler:
@@ -73,12 +78,15 @@ class IngestScheduler:
         now = _utc(now)
         active_polled = False
         recent_rescanned = False
+        candidate_scanned = False
+        changed_match_ids: set[int] = set()
 
         active_checkpoint = self._store.get_scheduler_checkpoint("active_poll")
         if include_active and self._is_due(
             active_checkpoint, now, ACTIVE_POLL_INTERVAL
         ):
-            await self._ingestor.poll_active(now)
+            result = await self._ingestor.poll_active(now)
+            changed_match_ids.update(getattr(result, "changed_match_ids", ()))
             self._store.set_scheduler_checkpoint("active_poll", now)
             active_polled = True
 
@@ -86,8 +94,20 @@ class IngestScheduler:
         if include_recent and self._is_due(
             recent_checkpoint, now, RECENT_RESCAN_INTERVAL
         ):
-            await self._ingestor.rescan_recent(now - RECENT_RESCAN_WINDOW, now)
+            result = await self._ingestor.rescan_recent(now - RECENT_RESCAN_WINDOW, now)
+            changed_match_ids.update(getattr(result, "changed_match_ids", ()))
             self._store.set_scheduler_checkpoint("recent_rescan", now)
             recent_rescanned = True
 
-        return ScheduleRun(active_polled, recent_rescanned)
+        candidate_checkpoint = self._store.get_scheduler_checkpoint("candidate_scan")
+        if self._is_due(candidate_checkpoint, now, CANDIDATE_SCAN_INTERVAL):
+            await self._ingestor.discover_event_candidates(now)
+            self._store.set_scheduler_checkpoint("candidate_scan", now)
+            candidate_scanned = True
+
+        return ScheduleRun(
+            active_polled,
+            recent_rescanned,
+            candidate_scanned,
+            tuple(sorted(changed_match_ids)),
+        )

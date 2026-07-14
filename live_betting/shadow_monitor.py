@@ -22,6 +22,7 @@ from .profiles import (
     TeamStyleProfile,
     build_draft_curve,
 )
+from .research import record_research_prediction
 from .shadow_strategy import ComebackShadowStrategy
 from .storage import LiveBettingStore
 from .strict_eligibility import query_strict_live_eligibility
@@ -38,6 +39,7 @@ MAX_ODDS_TRANSPORT_AGE = timedelta(seconds=15)
 class TransportRef:
     observation_key: str
     observed_at: datetime
+    state_hash: str
 
 
 @dataclass(frozen=True)
@@ -507,7 +509,8 @@ def _transport_refs(
     as_of: datetime,
 ) -> list[TransportRef]:
     rows = connection.execute(
-        """SELECT observation_key, observed_at FROM odds_transport_observations
+        """SELECT observation_key, observed_at, normalized_state_hash
+             FROM odds_transport_observations
            WHERE raybet_match_id=? AND observed_at<=?
               AND timing_status='on_time' AND processing_status='processed'
            ORDER BY observed_at DESC, observation_key DESC LIMIT 2""",
@@ -517,6 +520,7 @@ def _transport_refs(
         TransportRef(
             str(row["observation_key"]),
             datetime.fromisoformat(str(row["observed_at"])),
+            str(row["normalized_state_hash"]),
         )
         for row in rows
     ]
@@ -697,6 +701,30 @@ def run_once(
         observation.dire_hero_ids,
         as_of,
     )
+    research = record_research_prediction(
+        store,
+        snapshots=snapshots,
+        surface=surface,
+        observation=observation,
+        draft_curve=draft,
+        strict_mapping=strict.mapping,
+        transport_key=current_transport.observation_key,
+        transport_hash=current_transport.state_hash,
+        transport_at=current_transport_at,
+        created_at=run_at,
+    )
+    research_payload = (
+        None
+        if research is None
+        else {
+            "prediction_key": research.prediction_key,
+            "inserted": research.inserted,
+            "price_labels_inserted": research.price_labels_inserted,
+            "gate_status": research.gate_status,
+            "gate_failures": list(research.gate_failures),
+            "actionability": "research_only",
+        }
+    )
     active_draft = draft.at(observation.game_clock_seconds or 0)
     if active_draft is None:
         draft_reason = draft.wait_reason(observation.game_clock_seconds or 0)
@@ -722,6 +750,7 @@ def run_once(
             "reason_code": draft_reason,
             "decision_key": decision.decision_key,
             "inputs": decision.inputs,
+            "research": research_payload,
         }
 
     previous_snapshots = None
@@ -783,12 +812,14 @@ def run_once(
             "market_probability": result.decision.market_probability,
             "edge": result.decision.edge,
             "inputs": result.decision.inputs,
+            "research": research_payload,
         }
     return {
         "status": "no_signal", "reason": result.decision.reason,
         "edge": result.decision.edge, "quality": result.decision.data_quality,
         "decision_key": result.decision.decision_key,
         "inputs": result.decision.inputs,
+        "research": research_payload,
     }
 
 

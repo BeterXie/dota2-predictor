@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from event_intelligence.scheduler import (
     ACTIVE_POLL_INTERVAL,
+    CANDIDATE_SCAN_INTERVAL,
     RECENT_RESCAN_INTERVAL,
     RECENT_RESCAN_WINDOW,
     RETRY_DELAYS,
@@ -32,6 +34,7 @@ class FakeIngestor:
     def __init__(self) -> None:
         self.active_calls: list[datetime] = []
         self.recent_calls: list[tuple[datetime, datetime]] = []
+        self.candidate_calls: list[datetime] = []
 
     async def poll_active(self, now: datetime) -> object:
         self.active_calls.append(now)
@@ -39,6 +42,10 @@ class FakeIngestor:
 
     async def rescan_recent(self, since: datetime, now: datetime) -> object:
         self.recent_calls.append((since, now))
+        return object()
+
+    async def discover_event_candidates(self, now: datetime) -> object:
+        self.candidate_calls.append(now)
         return object()
 
 
@@ -88,6 +95,7 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(first_ingestor.active_calls, [NOW])
         self.assertEqual(first_ingestor.recent_calls, [(NOW - RECENT_RESCAN_WINDOW, NOW)])
+        self.assertEqual(first_ingestor.candidate_calls, [NOW])
 
         restarted_ingestor = FakeIngestor()
         restarted = IngestScheduler(restarted_ingestor, store)
@@ -95,12 +103,15 @@ class SchedulerTests(unittest.TestCase):
         asyncio.run(restarted.run_due(active_due))
         self.assertEqual(restarted_ingestor.active_calls, [active_due])
         self.assertEqual(restarted_ingestor.recent_calls, [])
+        self.assertEqual(restarted_ingestor.candidate_calls, [])
 
         scan_due = NOW + RECENT_RESCAN_INTERVAL
         asyncio.run(restarted.run_due(scan_due))
         self.assertEqual(restarted_ingestor.recent_calls, [
             (scan_due - RECENT_RESCAN_WINDOW, scan_due)
         ])
+        self.assertEqual(CANDIDATE_SCAN_INTERVAL, RECENT_RESCAN_INTERVAL)
+        self.assertEqual(restarted_ingestor.candidate_calls, [scan_due])
 
     def test_failed_operation_does_not_advance_checkpoint(self) -> None:
         class FailingIngestor(FakeIngestor):
@@ -114,6 +125,20 @@ class SchedulerTests(unittest.TestCase):
             asyncio.run(scheduler.run_due(NOW, include_recent=False))
 
         self.assertIsNone(store.get_scheduler_checkpoint("active_poll"))
+
+    def test_changed_map_ids_are_merged_across_due_operations(self) -> None:
+        class ChangedIngestor(FakeIngestor):
+            async def poll_active(self, now: datetime) -> object:
+                self.active_calls.append(now)
+                return SimpleNamespace(changed_match_ids=(3, 1))
+
+            async def rescan_recent(self, since: datetime, now: datetime) -> object:
+                self.recent_calls.append((since, now))
+                return SimpleNamespace(changed_match_ids=(2, 3))
+
+        report = asyncio.run(IngestScheduler(ChangedIngestor(), FakeScheduleStore()).run_due(NOW))
+
+        self.assertEqual(report.changed_match_ids, (1, 2, 3))
 
 
 if __name__ == "__main__":

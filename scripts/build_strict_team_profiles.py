@@ -11,7 +11,7 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Collection, Sequence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -456,7 +456,12 @@ def _persist_profile(
     )
 
 
-def build_strict_profiles(database: Path, cutoff: datetime) -> BuildReport:
+def build_strict_profiles(
+    database: Path,
+    cutoff: datetime,
+    *,
+    match_ids: Collection[int] | None = None,
+) -> BuildReport:
     if cutoff.tzinfo is None or cutoff.utcoffset() is None:
         raise ValueError("cutoff must be timezone-aware")
     cutoff = cutoff.astimezone(UTC)
@@ -466,8 +471,17 @@ def build_strict_profiles(database: Path, cutoff: datetime) -> BuildReport:
         Database(connection=storage.connection).init_db()
         connection = storage.connection
         maps = _load_strict_maps(connection)
+        selected_ids = None if match_ids is None else {int(value) for value in match_ids}
+        available_ids = {match.match_id for match in maps}
+        missing_ids = set() if selected_ids is None else selected_ids - available_ids
+        if missing_ids:
+            raise ValueError(
+                "formal ready match not found: "
+                + ",".join(str(value) for value in sorted(missing_ids))
+            )
         created_at = datetime.now(UTC).isoformat()
         profile_rows: dict[int, list[ProfileMap]] = {}
+        affected_team_ids: set[int] = set()
         state_count = 0
         unscorable_count = 0
         with storage.transaction():
@@ -483,9 +497,12 @@ def build_strict_profiles(database: Path, cutoff: datetime) -> BuildReport:
                     source_versions={"opendota": match.source_version},
                 )
                 for state in states:
-                    _persist_state(connection, state, created_at)
-                    state_count += 1
-                    unscorable_count += state.label.value == "state_unscorable"
+                    if selected_ids is None or match.match_id in selected_ids:
+                        _persist_state(connection, state, created_at)
+                        state_count += 1
+                        unscorable_count += state.label.value == "state_unscorable"
+                        if state.team_id is not None:
+                            affected_team_ids.add(state.team_id)
                     if state.team_id is None:
                         continue
                     event_weight, event_scope = _event_strength(match)
@@ -526,6 +543,8 @@ def build_strict_profiles(database: Path, cutoff: datetime) -> BuildReport:
             all_rows = tuple(row for rows in profile_rows.values() for row in rows)
             profiles = []
             for team_id, rows in sorted(profile_rows.items()):
+                if selected_ids is not None and team_id not in affected_team_ids:
+                    continue
                 prior = tuple(
                     row
                     for row in rows

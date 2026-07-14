@@ -16,6 +16,7 @@ It has no real betting endpoint.
 - Team style, roster-change, player form, and draft timing profiles
 - Explainable comeback decisions with one shadow attempt per map
 - Exact-draft OpenDota post-match labeling and JSON evaluation reports
+- Append-only research-only live predictions with successor-price and result labels
 
 ## Commands
 
@@ -57,9 +58,16 @@ python scripts/run_comeback_shadow.py `
   --vision-jsonl data/live_betting/live_observations
 ```
 
+For every strictly mapped map with a complete market surface and confirmed
+ten-hero observation, the same worker also appends a non-actionable research
+prediction. Missing deployment/calibration artifacts remain `null` with an
+explicit gate reason. These rows never enter `shadow_orders`; manual-control
+page time remains `diagnostic_untrusted` even after continuity checks.
+
 For passive browser capture, start `python -m live_betting.browser_companion`
-and load `edge-extension/` as an unpacked Edge extension. Pairing and safety
-details are documented in `edge-extension/README.md`.
+and load `edge-extension/` as an unpacked Edge extension. It connects directly
+to the localhost companion; setup and safety details are documented in
+`edge-extension/README.md`.
 
 Refresh the local hero-recognition asset after the Dota hero roster changes:
 
@@ -86,6 +94,10 @@ Generate the current shadow report:
 python -m live_betting.report --database data/dota2.db `
   --output data/live_betting/shadow_report.json
 ```
+
+The report includes research coverage, next-price movement, settled accuracy,
+Brier score, and log-loss. Model metrics remain `null` until a deployable model
+has produced raw probabilities and post-match labels exist.
 
 Deliver simulation notifications from the transactional outbox (credentials
 are read only from `DOTA2_SMTP_SENDER` and `DOTA2_SMTP_AUTH_CODE`, or an

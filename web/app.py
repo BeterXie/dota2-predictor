@@ -53,6 +53,66 @@ def hero_grid():
     """Return heroes grouped by primary attribute with image URLs."""
     return queries.get_hero_grid()
 
+
+# ---- Recent matches (for pre-match page) ----
+
+@app.get("/api/recent-matches", tags=["matches"])
+def recent_matches(limit: int = Query(30, ge=1, le=100)):
+    """Return the most recent matches with team names, for quick lookup."""
+    conn = queries.get_db()
+    try:
+        rows = conn.execute(
+            """SELECT m.match_id, m.radiant_team_id, m.dire_team_id,
+                      m.radiant_win, m.start_time, m.leagueid,
+                      rt.name AS radiant_name, dt.name AS dire_name,
+                      l.name AS league_name
+               FROM matches m
+               LEFT JOIN teams rt ON m.radiant_team_id = rt.team_id
+               LEFT JOIN teams dt ON m.dire_team_id = dt.team_id
+               LEFT JOIN leagues l ON m.leagueid = l.leagueid
+               ORDER BY m.start_time DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        conn.close()
+        raise
+
+
+# ---- Trigger data fetch ----
+
+@app.post("/api/fetch-latest", tags=["admin"])
+def trigger_fetch(match_id: int | None = None, force: bool = False):
+    """Trigger fetching latest matches from OpenDota (runs in background).
+
+    If match_id is provided, fetches only that match.
+    If force is True, re-fetches even if already in DB.
+    """
+    import subprocess, sys
+    try:
+        cmd = [sys.executable, "-m", "fetch.main"]
+        if match_id is not None:
+            cmd.extend(["--match-id", str(match_id)])
+        if force:
+            cmd.append("--force")
+        subprocess.Popen(
+            cmd,
+            cwd=str(_PROJECT_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        parts = []
+        if match_id:
+            parts.append(f"match {match_id}")
+        else:
+            parts.append("latest matches")
+        if force:
+            parts.append("with --force")
+        return {"status": "started", "message": f"Fetching {' '.join(parts)} in background..."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start fetch: {e}")
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -146,9 +206,15 @@ def create_prediction(request: PredictionRequest):
 
 @app.get("/prematch", response_class=HTMLResponse)
 def serve_prematch_page():
+    from fastapi.responses import Response
     index_path = STATIC_DIR / "prematch.html"
     if index_path.exists():
-        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+        content = index_path.read_text(encoding="utf-8")
+        return Response(
+            content=content,
+            media_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
     return HTMLResponse("<h1>Pre-Match Prediction</h1><p>prematch.html not found.</p>")
 
 
@@ -194,6 +260,8 @@ def create_prematch_prediction(request: PrematchRequest):
             _DB_PATH,
             request.radiant_id, request.dire_id,
             request.radiant_heroes, request.dire_heroes,
+            radiant_players=request.radiant_players,
+            dire_players=request.dire_players,
         )
 
         # Wrap result to match expected format
@@ -202,6 +270,13 @@ def create_prematch_prediction(request: PrematchRequest):
             "confidence": result["confidence"],
             "confidence_score": result["confidence_score"],
             "top_factors": _format_scorer_factors(result),
+            "hero_matrix": result["components"]["hero_matchup"].get("matrix", []),
+            "radiant_heroes": result["components"]["hero_matchup"].get("radiant_heroes", []),
+            "dire_heroes": result["components"]["hero_matchup"].get("dire_heroes", []),
+            # Full component breakdowns for team comparison view
+            "components": result["components"],
+            "weights_used": result["weights_used"],
+            "raw_score": result["raw_score"],
         }
 
         prediction_output = output.format_output(

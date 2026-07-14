@@ -88,12 +88,25 @@ class IngestReport:
     retryable: int = 0
     failed: int = 0
     unchanged: int = 0
+    changed_match_ids: tuple[int, ...] = ()
 
-    def plus(self, **changes: int) -> "IngestReport":
+    def plus(self, **changes: object) -> "IngestReport":
         values = self.__dict__.copy()
         for key, value in changes.items():
-            values[key] += value
+            if key == "changed_match_ids":
+                values[key] = tuple(
+                    sorted({*values[key], *(int(item) for item in value)})  # type: ignore[arg-type]
+                )
+            else:
+                values[key] += int(value)  # type: ignore[operator]
         return IngestReport(**values)
+
+
+@dataclass(frozen=True)
+class CandidateDiscoveryReport:
+    catalog_rows: int = 0
+    candidates_seen: int = 0
+    candidates_created: int = 0
 
 
 class EventRegistryPort(Protocol):
@@ -133,13 +146,20 @@ class IngestStorePort(Protocol):
         discovered_at: datetime,
     ) -> None: ...
 
+    def record_event_candidate(
+        self,
+        summary: Mapping[str, object],
+        reason: str,
+        discovered_at: datetime,
+    ) -> bool: ...
+
     def list_legacy_match_ids(self, event: ApprovedEvent) -> Sequence[int]: ...
 
     def get_ingest_status(self, match_id: int) -> StoredStatus | None: ...
 
     def begin_ingest_attempt(self, match_id: int, attempted_at: datetime) -> int: ...
 
-    def record_ingest_success(self, **values: object) -> None: ...
+    def record_ingest_success(self, **values: object) -> str | None: ...
 
     def record_ingest_failure(self, **values: object) -> None: ...
 
@@ -162,6 +182,8 @@ class SourceResponse(Protocol):
 
 
 class CompletedMatchClient(Protocol):
+    async def fetch_leagues(self) -> SourceResponse: ...
+
     async def fetch_league_matches(self, league_id: int) -> SourceResponse: ...
 
     async def fetch_match(self, match_id: int) -> SourceResponse: ...
@@ -172,6 +194,15 @@ class RawArchivePort(Protocol):
 
 
 MatchProcessor = Callable[[object, int], MatchProcessingResult]
+
+
+_CATALOG_ID_FLOOR = 19_000
+_CATALOG_ID_CEILING = 65_000
+_POTENTIAL_STRICT_EVENT = re.compile(
+    r"(?i)(?:\b2026\b|\bpgl\b|dreamleague|\bblast\b|\besl\b|"
+    r"esports world cup|the international|fissure|betboom dacha|"
+    r"riyadh masters|games of the future|elite league|clavision)"
+)
 
 
 def completed_match_processing_result(
@@ -255,6 +286,10 @@ class StrictEventIngestor:
         async with self._semaphore:
             return await self._client.fetch_league_matches(league_id)
 
+    async def _fetch_catalog(self) -> SourceResponse:
+        async with self._semaphore:
+            return await self._client.fetch_leagues()
+
     async def _fetch_match(self, match_id: int) -> SourceResponse:
         async with self._semaphore:
             return await self._client.fetch_match(match_id)
@@ -320,6 +355,44 @@ class StrictEventIngestor:
                 new_ids.add(match_id)
         return new_ids, formal_ids, candidate_count
 
+    async def discover_event_candidates(
+        self, now: datetime
+    ) -> CandidateDiscoveryReport:
+        """Over-capture plausible catalog rows into the pending audit queue."""
+        now = _utc(now)
+        response = await self._fetch_catalog()
+        self._archive_response(
+            response, match_id=None, first_usable_at=_utc(response.received_at)
+        )
+        if not isinstance(response.payload, list):
+            raise ValueError("OpenDota league catalog response is not a list")
+        approved_ids = {
+            int(event.league_id) for event in self._registry.approved_events()
+        }
+        max_approved = max(approved_ids, default=0)
+        seen = created = 0
+        for item in response.payload:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                league_id = int(item.get("leagueid"))
+            except (TypeError, ValueError):
+                continue
+            name = str(item.get("name") or "").strip()
+            if (
+                league_id <= 0
+                or league_id in approved_ids
+                or league_id < _CATALOG_ID_FLOOR
+                or league_id >= _CATALOG_ID_CEILING
+                or (league_id <= max_approved and not _POTENTIAL_STRICT_EVENT.search(name))
+            ):
+                continue
+            seen += 1
+            created += self._store.record_event_candidate(
+                dict(item), "missing_required_strict_evidence", now
+            )
+        return CandidateDiscoveryReport(len(response.payload), seen, created)
+
     async def _ingest_match(self, match_id: int, now: datetime) -> IngestReport:
         status_before = self._store.get_ingest_status(match_id)
         if status_before is None:
@@ -373,7 +446,7 @@ class StrictEventIngestor:
             retry_at = (
                 next_retry_at(now, attempt_count) if processing.retryable else None
             )
-            self._store.record_ingest_success(
+            outcome = self._store.record_ingest_success(
                 match_id=match_id,
                 attempted_at=now,
                 attempt_count=attempt_count,
@@ -396,6 +469,11 @@ class StrictEventIngestor:
                 completed=int(processing.detail_complete),
                 retryable=int(processing.retryable),
                 unchanged=int(unchanged),
+                changed_match_ids=(
+                    (match_id,)
+                    if outcome == "normalized" or (outcome is None and not unchanged)
+                    else ()
+                ),
             )
         except Exception as error:
             retry_at = (
@@ -489,6 +567,7 @@ class StrictEventIngestor:
                 retryable=result.retryable,
                 failed=result.failed,
                 unchanged=result.unchanged,
+                changed_match_ids=result.changed_match_ids,
             )
 
         if reconcile and hasattr(self._store, "reconcile_event"):

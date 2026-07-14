@@ -99,6 +99,11 @@ def _point_inputs(point: DraftPoint | None, wait_reason: str | None) -> dict[str
         "support": point.support,
         "uncertainty": point.uncertainty,
         "calibration_ref": point.calibration_ref,
+        "global_calibration_passed": point.global_calibration_passed,
+        "global_gate_ref": point.global_gate_ref,
+        "feature_hash": point.feature_hash,
+        "model_hash": point.model_hash,
+        "calibration_hash": point.calibration_hash,
         "input_refs": list(point.input_refs),
         "validation_reason": point.validation_reason,
     }

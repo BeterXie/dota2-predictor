@@ -9,11 +9,48 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Mapping
 
-from .notifications import EVENT_FILLED, OutboxRecord
+from .notifications import EVENT_FILLED, EVENT_SETTLED, OutboxRecord
 
 
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
+
+_EVENT_LABELS = {
+    EVENT_FILLED: "模拟订单已成交",
+    EVENT_SETTLED: "模拟订单已结算",
+}
+_PAYLOAD_LABELS = {
+    "raybet_match_id": "RayBet 比赛编号",
+    "map_number": "地图局号",
+    "selected_side": "选择方",
+    "signal_price": "信号赔率",
+    "fill_price": "成交赔率",
+    "model_probability": "模型概率",
+    "market_probability": "市场隐含概率",
+    "edge": "模型优势",
+    "signal_transport_at": "信号传输时间",
+    "filled_at": "成交时间",
+    "order_key": "订单编号",
+    "result": "结算结果",
+    "return_units": "返还单位",
+    "evidence_ref": "结算依据",
+    "settled_at": "结算时间",
+    "simulation": "是否为模拟",
+    "real_wager_placed": "是否真实下注",
+    "event_type": "事件类型",
+    "template_version": "模板版本",
+}
+_SIDE_LABELS = {
+    "team_one": "队伍一",
+    "team_two": "队伍二",
+}
+_RESULT_LABELS = {
+    "win": "赢",
+    "half_win": "赢一半",
+    "push": "走盘",
+    "half_loss": "输一半",
+    "loss": "输",
+}
 
 
 class SMTPConfigurationError(RuntimeError):
@@ -47,9 +84,9 @@ class SMTPConfig:
 
 def build_message(record: OutboxRecord, config: SMTPConfig) -> EmailMessage:
     payload = record.payload
-    event_label = "filled shadow order" if record.event_type == EVENT_FILLED else "settled shadow order"
+    event_label = _EVENT_LABELS[record.event_type]
     match = _payload_text(payload, "raybet_match_id", "unknown-match")
-    subject = sanitize_header(f"[Dota2 simulation] {event_label}: {match}", "subject")
+    subject = sanitize_header(f"[Dota 2 模拟] {event_label}：{match}", "subject")
     message = EmailMessage()
     message["From"] = sanitize_header(config.sender, "sender")
     message["To"] = sanitize_header(record.recipient, "recipient")
@@ -63,16 +100,31 @@ def render_body(record: OutboxRecord) -> str:
     """Render only immutable stored payload; retries cannot change statistics."""
     payload = record.payload
     lines = [
-        "Dota 2 live shadow notification",
-        "SIMULATION ONLY: no real wager was placed.",
-        f"Event: {record.event_type}",
-        f"Order: {record.order_key}",
-        f"Statistics cutoff: {record.stats_cutoff_at.isoformat()}",
+        "Dota 2 实时模拟通知",
+        "仅为模拟：未进行任何真实投注。",
+        f"事件：{_EVENT_LABELS[record.event_type]}",
+        f"订单：{record.order_key}",
+        f"统计数据截止时间：{record.stats_cutoff_at.isoformat()}",
         "",
     ]
     for key in sorted(payload):
-        lines.append(f"{key}: {payload[key]}")
+        label = _PAYLOAD_LABELS.get(key, f"其他信息（{key}）")
+        lines.append(f"{label}：{_display_value(key, payload[key])}")
     return "\n".join(lines) + "\n"
+
+
+def _display_value(key: str, value: object) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None:
+        return "无"
+    if key == "event_type":
+        return _EVENT_LABELS.get(str(value), str(value))
+    if key == "selected_side":
+        return _SIDE_LABELS.get(str(value), str(value))
+    if key == "result":
+        return _RESULT_LABELS.get(str(value), str(value))
+    return str(value)
 
 
 def send_message(

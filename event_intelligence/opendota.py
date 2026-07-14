@@ -17,6 +17,8 @@ class MatchIdentityError(ValueError):
 
 
 class OpenDotaClientProtocol(Protocol):
+    async def get_leagues(self) -> list[dict[str, Any]]: ...
+
     async def get_match(self, match_id: int) -> dict[str, Any]: ...
 
     async def get_league_matches(self, league_id: int) -> list[dict[str, Any]]: ...
@@ -76,6 +78,13 @@ class OpenDotaAdapter:
         payload = await self._client.get_match(match_id)
         if not isinstance(payload, dict):
             raise TypeError("OpenDota match response must be a JSON object")
+        return self._response(endpoint, payload)
+
+    async def fetch_leagues(self) -> OpenDotaResponse:
+        endpoint = "/api/leagues"
+        payload = await self._client.get_leagues()
+        if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+            raise TypeError("OpenDota league catalog response must be a JSON array")
         return self._response(endpoint, payload)
 
     async def fetch_league_matches(self, league_id: int) -> OpenDotaResponse:

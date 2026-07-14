@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 
 from live_betting.notifications import (
     EVENT_FILLED,
+    EVENT_SETTLED,
     OutboxRecord,
+    TEMPLATE_VERSION,
+    canonical_payload,
+    simulation_payload,
     stable_message_id,
 )
 from live_betting.smtp_delivery import (
@@ -22,17 +26,22 @@ from live_betting.smtp_delivery import (
 NOW = datetime(2026, 7, 14, 1, 0, tzinfo=timezone.utc)
 
 
-def record() -> OutboxRecord:
+def record(event_type: str = EVENT_FILLED) -> OutboxRecord:
     return OutboxRecord(
         outbox_id=1,
         order_key="order-1",
-        event_type=EVENT_FILLED,
+        event_type=event_type,
         channel="email",
-        payload_json='{"raybet_match_id":"match-1","value":1}',
+        payload_json=canonical_payload(simulation_payload(event_type, {
+            "raybet_match_id": "match-1",
+            "map_number": 1,
+            "selected_side": "team_one",
+            "result": "win",
+        })),
         stats_cutoff_at=NOW,
-        template_version="dota2-shadow-email-v1",
+        template_version=TEMPLATE_VERSION,
         recipient="599084618@qq.com",
-        message_id=stable_message_id("order-1", EVENT_FILLED),
+        message_id=stable_message_id("order-1", event_type),
         status="leased",
         attempt_count=1,
         next_attempt_at=NOW,
@@ -96,14 +105,38 @@ class SMTPDeliveryTests(unittest.TestCase):
                         "DOTA2_SMTP_AUTH_CODE": auth_code,
                     })
 
-    def test_message_is_simulation_and_uses_stable_id(self) -> None:
+    def test_message_uses_chinese_template_and_stable_id(self) -> None:
         config = SMTPConfig("sender@qq.com", "secret")
         message = build_message(record(), config)
         self.assertEqual(message["Message-ID"], stable_message_id("order-1", EVENT_FILLED))
+        self.assertEqual(
+            str(message["Subject"]),
+            "[Dota 2 模拟] 模拟订单已成交：match-1",
+        )
         body = message.get_content()
-        self.assertIn("SIMULATION ONLY", body)
-        self.assertIn("no real wager was placed", body)
+        self.assertIn("Dota 2 实时模拟通知", body)
+        self.assertIn("仅为模拟：未进行任何真实投注。", body)
+        self.assertIn("事件：模拟订单已成交", body)
+        self.assertIn("RayBet 比赛编号：match-1", body)
+        self.assertIn("选择方：队伍一", body)
+        self.assertIn("结算结果：赢", body)
+        self.assertIn("是否为模拟：是", body)
+        self.assertIn("是否真实下注：否", body)
+        self.assertIn("模板版本：dota2-shadow-email-v2", body)
+        self.assertNotIn("SIMULATION ONLY", body)
+        self.assertNotIn("raybet_match_id:", body)
         self.assertNotIn("secret", body)
+
+    def test_settled_message_subject_is_chinese(self) -> None:
+        message = build_message(
+            record(EVENT_SETTLED),
+            SMTPConfig("sender@qq.com", "secret"),
+        )
+        self.assertEqual(
+            str(message["Subject"]),
+            "[Dota 2 模拟] 模拟订单已结算：match-1",
+        )
+        self.assertIn("事件：模拟订单已结算", message.get_content())
 
     def test_implicit_tls_delivery_uses_context_and_no_plaintext_client(self) -> None:
         FakeSMTP.instances.clear()

@@ -399,6 +399,126 @@ CREATE TABLE IF NOT EXISTS map_results (
     settled_at TEXT NOT NULL,
     PRIMARY KEY (raybet_match_id, map_number)
 );
+CREATE TABLE IF NOT EXISTS research_live_predictions (
+    prediction_key TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL CHECK (map_number BETWEEN 1 AND 10),
+    observed_at TEXT NOT NULL,
+    game_clock_seconds INTEGER NOT NULL CHECK (game_clock_seconds >= 0),
+    game_minute REAL NOT NULL CHECK (game_minute >= 0.0),
+    selected_side TEXT NOT NULL CHECK (selected_side IN ('team_one', 'team_two')),
+    market_probability REAL NOT NULL CHECK (market_probability BETWEEN 0.0 AND 1.0),
+    market_price REAL NOT NULL CHECK (market_price > 1.0),
+    raw_model_probability REAL
+        CHECK (raw_model_probability IS NULL OR raw_model_probability BETWEEN 0.0 AND 1.0),
+    feature_hash TEXT CHECK (feature_hash IS NULL OR length(feature_hash)=64),
+    model_hash TEXT CHECK (model_hash IS NULL OR length(model_hash)=64),
+    calibration_hash TEXT CHECK (calibration_hash IS NULL OR length(calibration_hash)=64),
+    transport_key TEXT NOT NULL REFERENCES odds_transport_observations(observation_key),
+    transport_hash TEXT NOT NULL CHECK (length(transport_hash)=64),
+    radiant_hero_ids_json TEXT NOT NULL,
+    dire_hero_ids_json TEXT NOT NULL,
+    radiant_team_side TEXT CHECK (radiant_team_side IN ('team_one', 'team_two')),
+    strict_mapping_id INTEGER NOT NULL,
+    clock_source TEXT NOT NULL CHECK (clock_source='vision'),
+    clock_trust TEXT NOT NULL CHECK (clock_trust='trusted_vision'),
+    manual_clock_event_id TEXT REFERENCES browser_events(event_id),
+    manual_clock_seconds INTEGER
+        CHECK (manual_clock_seconds IS NULL OR manual_clock_seconds >= 0),
+    manual_clock_trust TEXT NOT NULL
+        CHECK (manual_clock_trust IN ('not_observed', 'diagnostic_untrusted')),
+    manual_clock_validation TEXT NOT NULL,
+    actionability TEXT NOT NULL CHECK (actionability='research_only'),
+    gate_status TEXT NOT NULL CHECK (gate_status IN ('unavailable', 'failed', 'passed')),
+    gate_failures_json TEXT NOT NULL,
+    input_context_hash TEXT NOT NULL CHECK (length(input_context_hash)=64),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_prediction_match_time
+    ON research_live_predictions(raybet_match_id, map_number, observed_at);
+CREATE TABLE IF NOT EXISTS research_price_labels (
+    label_key TEXT PRIMARY KEY,
+    prediction_key TEXT NOT NULL UNIQUE
+        REFERENCES research_live_predictions(prediction_key),
+    transport_key TEXT NOT NULL REFERENCES odds_transport_observations(observation_key),
+    transport_hash TEXT NOT NULL CHECK (length(transport_hash)=64),
+    observed_at TEXT NOT NULL,
+    selected_side TEXT NOT NULL CHECK (selected_side IN ('team_one', 'team_two')),
+    price REAL NOT NULL CHECK (price > 1.0),
+    market_probability REAL NOT NULL CHECK (market_probability BETWEEN 0.0 AND 1.0),
+    seconds_after_prediction REAL NOT NULL CHECK (seconds_after_prediction > 0.0),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_price_transport
+    ON research_price_labels(transport_key, observed_at);
+CREATE TABLE IF NOT EXISTS research_result_labels (
+    label_key TEXT PRIMARY KEY,
+    prediction_key TEXT NOT NULL UNIQUE
+        REFERENCES research_live_predictions(prediction_key),
+    winner_side TEXT NOT NULL CHECK (winner_side IN ('team_one', 'team_two')),
+    selected_side_win INTEGER NOT NULL CHECK (selected_side_win IN (0, 1)),
+    dota_match_id INTEGER NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    settled_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS research_live_predictions_no_update
+BEFORE UPDATE ON research_live_predictions
+BEGIN
+    SELECT RAISE(ABORT, 'research prediction is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS research_live_predictions_no_delete
+BEFORE DELETE ON research_live_predictions
+BEGIN
+    SELECT RAISE(ABORT, 'research prediction is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS research_price_labels_no_update
+BEFORE UPDATE ON research_price_labels
+BEGIN
+    SELECT RAISE(ABORT, 'research price label is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS research_price_labels_no_delete
+BEFORE DELETE ON research_price_labels
+BEGIN
+    SELECT RAISE(ABORT, 'research price label is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS research_result_labels_no_update
+BEFORE UPDATE ON research_result_labels
+BEGIN
+    SELECT RAISE(ABORT, 'research result label is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS research_result_labels_no_delete
+BEFORE DELETE ON research_result_labels
+BEGIN
+    SELECT RAISE(ABORT, 'research result label is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS research_result_from_map_result
+AFTER INSERT ON map_results
+BEGIN
+    INSERT OR IGNORE INTO research_result_labels
+        (label_key, prediction_key, winner_side, selected_side_win,
+         dota_match_id, evidence_ref, settled_at, created_at)
+    SELECT prediction_key || ':result', prediction_key, NEW.winner_side,
+           CASE WHEN selected_side=NEW.winner_side THEN 1 ELSE 0 END,
+           NEW.dota_match_id, NEW.evidence_ref, NEW.settled_at, NEW.settled_at
+      FROM research_live_predictions
+     WHERE raybet_match_id=NEW.raybet_match_id AND map_number=NEW.map_number;
+END;
+CREATE TRIGGER IF NOT EXISTS research_result_from_late_prediction
+AFTER INSERT ON research_live_predictions
+BEGIN
+    INSERT OR IGNORE INTO research_result_labels
+        (label_key, prediction_key, winner_side, selected_side_win,
+         dota_match_id, evidence_ref, settled_at, created_at)
+    SELECT NEW.prediction_key || ':result', NEW.prediction_key, result.winner_side,
+           CASE WHEN NEW.selected_side=result.winner_side THEN 1 ELSE 0 END,
+           result.dota_match_id, result.evidence_ref, result.settled_at,
+           NEW.created_at
+      FROM map_results AS result
+     WHERE result.raybet_match_id=NEW.raybet_match_id
+       AND result.map_number=NEW.map_number;
+END;
 """
 
 
@@ -1443,6 +1563,81 @@ class LiveBettingStore:
              decision.edge, decision.data_quality, int(decision.eligible),
              decision.reason, self.json(decision.contributions),
              decision.input_ref, decision.strategy_version),
+        )
+        return cursor.rowcount == 1
+
+    def insert_research_prediction(self, prediction: Any) -> bool:
+        """Append one non-actionable live prediction without touching order tables."""
+        cursor = self.execute(
+            """INSERT INTO research_live_predictions
+               (prediction_key, schema_version, raybet_match_id, map_number,
+                observed_at, game_clock_seconds, game_minute, selected_side,
+                market_probability, market_price, raw_model_probability,
+                feature_hash, model_hash, calibration_hash, transport_key,
+                transport_hash, radiant_hero_ids_json, dire_hero_ids_json,
+                radiant_team_side, strict_mapping_id, clock_source, clock_trust,
+                manual_clock_event_id, manual_clock_seconds, manual_clock_trust,
+                manual_clock_validation, actionability, gate_status,
+                gate_failures_json, input_context_hash, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(prediction_key) DO NOTHING""",
+            (
+                prediction.prediction_key,
+                prediction.schema_version,
+                prediction.raybet_match_id,
+                prediction.map_number,
+                self._iso(prediction.observed_at),
+                prediction.game_clock_seconds,
+                prediction.game_minute,
+                prediction.selected_side,
+                prediction.market_probability,
+                prediction.market_price,
+                prediction.raw_model_probability,
+                prediction.feature_hash,
+                prediction.model_hash,
+                prediction.calibration_hash,
+                prediction.transport_key,
+                prediction.transport_hash,
+                self.json(list(prediction.radiant_hero_ids)),
+                self.json(list(prediction.dire_hero_ids)),
+                prediction.radiant_team_side,
+                prediction.strict_mapping_id,
+                prediction.clock_source,
+                prediction.clock_trust,
+                prediction.manual_clock_event_id,
+                prediction.manual_clock_seconds,
+                prediction.manual_clock_trust,
+                prediction.manual_clock_validation,
+                prediction.actionability,
+                prediction.gate_status,
+                self.json(list(prediction.gate_failures)),
+                prediction.input_context_hash,
+                self._iso(prediction.created_at),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def insert_research_price_label(self, label: Any) -> bool:
+        cursor = self.execute(
+            """INSERT INTO research_price_labels
+               (label_key, prediction_key, transport_key, transport_hash,
+                observed_at, selected_side, price, market_probability,
+                seconds_after_prediction, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(prediction_key) DO NOTHING""",
+            (
+                label.label_key,
+                label.prediction_key,
+                label.transport_key,
+                label.transport_hash,
+                self._iso(label.observed_at),
+                label.selected_side,
+                label.price,
+                label.market_probability,
+                label.seconds_after_prediction,
+                self._iso(label.created_at),
+            ),
         )
         return cursor.rowcount == 1
 

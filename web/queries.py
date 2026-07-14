@@ -121,6 +121,146 @@ def get_matches(
     return rows, total
 
 
+def _compute_position(lane_role, gold_per_min):
+    """Derive Dota 2 position (1-5) from lane_role and gold_per_min.
+
+    lane_role: 1=safe, 2=mid, 3=offlane, 4=jungle (may be None)
+    gold_per_min: used to distinguish core from support within the same lane
+
+    Returns None if position cannot be determined.
+    """
+    if lane_role is None:
+        return None
+    # Mid is always position 2
+    if lane_role == 2:
+        return 2
+    # Safe lane: high GPM = pos 1, low GPM = pos 5
+    if lane_role == 1:
+        return 1  # temporary — sorted within same lane by GPM below
+    # Offlane: high GPM = pos 3, low GPM = pos 4
+    if lane_role == 3:
+        return 3
+    # Jungle or other — fall back
+    return None
+
+
+def _sort_heroes_by_position(heroes: list[dict]) -> list[dict]:
+    """Sort heroes into position order (1-5) using lane_role + GPM.
+
+    Falls back to player_slot ordering if lane_role data is unavailable.
+    """
+    has_lane_data = all(h.get("lane_role") is not None for h in heroes)
+    if not has_lane_data or len(heroes) != 5:
+        # Fall back to player_slot ordering
+        heroes.sort(key=lambda h: h.get("player_slot", 0))
+        return heroes
+
+    # Group by lane
+    safe_lane = [h for h in heroes if h.get("lane_role") == 1]
+    mid_lane = [h for h in heroes if h.get("lane_role") == 2]
+    off_lane = [h for h in heroes if h.get("lane_role") == 3]
+    other = [h for h in heroes if h.get("lane_role") not in (1, 2, 3)]
+
+    # Sort within each group by GPM descending (higher GPM = core)
+    safe_lane.sort(key=lambda h: h.get("gold_per_min", 0) or 0, reverse=True)
+    off_lane.sort(key=lambda h: h.get("gold_per_min", 0) or 0, reverse=True)
+
+    result = []
+    # Position 1: safe lane, highest GPM
+    if safe_lane:
+        result.append(safe_lane[0])
+    # Position 2: mid lane
+    if mid_lane:
+        result.append(mid_lane[0])
+    # Position 3: offlane, highest GPM
+    if len(off_lane) >= 1:
+        result.append(off_lane[0])
+    # Position 4: offlane, lowest GPM (or any remaining offlane)
+    if len(off_lane) >= 2:
+        result.append(off_lane[1])
+    elif len(off_lane) == 1 and safe_lane:
+        result.append(off_lane[0])
+    # Position 5: safe lane, lowest GPM
+    if len(safe_lane) >= 2:
+        result.append(safe_lane[1])
+
+    # Add any players not yet assigned (jungle, roaming, ambiguous)
+    assigned = set(id(h) for h in result)
+    for h in heroes:
+        if id(h) not in assigned:
+            result.append(h)
+
+    # Fill missing positions from other/unassigned
+    if len(result) < 5:
+        remaining = [h for h in heroes if id(h) not in assigned]
+        for h in remaining:
+            if len(result) >= 5:
+                break
+            result.append(h)
+
+    return result[:5]
+
+
+def get_match_draft(match_id: int) -> dict | None:
+    """Return team + hero picks for a match (used for auto-fill).
+
+    Heroes are sorted by actual position (1-5) using lane_role + GPM,
+    falling back to player_slot ordering if lane data is unavailable.
+    """
+    conn = get_db()
+    IMG = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes"
+    try:
+        match = conn.execute(
+            "SELECT radiant_team_id, dire_team_id, leagueid FROM matches WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()
+        if not match:
+            return None
+        result = {
+            "match_id": match_id,
+            "radiant_team_id": match["radiant_team_id"],
+            "dire_team_id": match["dire_team_id"],
+            "league_id": match["leagueid"],
+        }
+        heroes = conn.execute(
+            """SELECT mp.hero_id, mp.is_radiant, mp.account_id,
+                      mp.player_slot, mp.lane_role, mp.gold_per_min,
+                      h.localized_name, h.hero_key
+               FROM match_players mp
+               LEFT JOIN heroes h ON mp.hero_id = h.hero_id
+               WHERE mp.match_id = ? ORDER BY mp.is_radiant DESC""",
+            (match_id,),
+        ).fetchall()
+        # Build raw hero dicts with sort metadata
+        radiant_raw = [
+            {"hero_id": h["hero_id"], "name": h["localized_name"] or f"Hero {h['hero_id']}",
+             "image_url": f"{IMG}/{h['hero_key']}.png" if h["hero_key"] else "",
+             "account_id": h["account_id"],
+             "player_slot": h["player_slot"], "lane_role": h["lane_role"],
+             "gold_per_min": h["gold_per_min"]}
+            for h in heroes if h["is_radiant"]
+        ]
+        dire_raw = [
+            {"hero_id": h["hero_id"], "name": h["localized_name"] or f"Hero {h['hero_id']}",
+             "image_url": f"{IMG}/{h['hero_key']}.png" if h["hero_key"] else "",
+             "account_id": h["account_id"],
+             "player_slot": h["player_slot"], "lane_role": h["lane_role"],
+             "gold_per_min": h["gold_per_min"]}
+            for h in heroes if not h["is_radiant"]
+        ]
+        result["radiant_heroes"] = _sort_heroes_by_position(radiant_raw)
+        result["dire_heroes"] = _sort_heroes_by_position(dire_raw)
+        # Strip internal sort keys from output
+        for side_heroes in (result["radiant_heroes"], result["dire_heroes"]):
+            for h in side_heroes:
+                h.pop("player_slot", None)
+                h.pop("lane_role", None)
+                h.pop("gold_per_min", None)
+        return result
+    finally:
+        conn.close()
+
+
 def get_match_detail(match_id: int) -> dict | None:
     conn = get_db()
     try:

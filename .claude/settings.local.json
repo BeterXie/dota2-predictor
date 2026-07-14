@@ -29,7 +29,8 @@
       "Bash(/c/Users/59908/AppData/Local/Programs/Python/Python310/python.exe -m fetch.main)",
       "Bash(/c/Users/59908/AppData/Local/Programs/Python/Python310/python.exe -m features.main)",
       "WebFetch(domain:stratz.com)",
-      "WebFetch(domain:docs.opendota.com)"
+      "WebFetch(domain:docs.opendota.com)",
+      "WebFetch(domain:docs.stratz.com)"
     ],
     "additionalDirectories": [
       "\\etc"

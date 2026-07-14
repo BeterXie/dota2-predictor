@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .evaluation import brier_score, log_loss, shadow_summary
 from .health import read_health
+from .research import research_summary
 
 
 def build_report(connection: sqlite3.Connection) -> dict[str, object]:
@@ -56,6 +57,7 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         "service_health": health,
         "strategy_versions": strategy_versions,
         "strict_scope": strict_counts,
+        "research": research_summary(connection),
         "stability_status": (
             "descriptive_only" if settled < 100 else
             "provisional" if settled < 500 else "stability_sample_reached"

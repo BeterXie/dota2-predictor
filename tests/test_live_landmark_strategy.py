@@ -89,6 +89,10 @@ class DraftCurveSelectionTests(unittest.TestCase):
                     10, 0.4, 0.0, 0.0, 1.0, validated=True, support=100,
                     calibration_ref="test:passed", input_refs=("test:model",),
                     uncertainty=0.0,
+                    feature_hash="1" * 64, model_hash="2" * 64,
+                    calibration_hash="3" * 64,
+                    global_calibration_passed=True,
+                    global_gate_ref="test:global-passed",
                 ),
                 DraftPoint(
                     20,
@@ -106,6 +110,10 @@ class DraftCurveSelectionTests(unittest.TestCase):
                     30, 0.9, 0.0, 0.0, 1.0, validated=True, support=100,
                     calibration_ref="test:passed", input_refs=("test:model",),
                     uncertainty=0.0,
+                    feature_hash="1" * 64, model_hash="2" * 64,
+                    calibration_hash="3" * 64,
+                    global_calibration_passed=True,
+                    global_gate_ref="test:global-passed",
                 ),
             )
         )
@@ -128,6 +136,10 @@ class DraftCurveSelectionTests(unittest.TestCase):
             calibration_ref="calibration",
             input_refs=("input",),
             uncertainty=0.01,
+            feature_hash="1" * 64, model_hash="2" * 64,
+            calibration_hash="3" * 64,
+            global_calibration_passed=True,
+            global_gate_ref="test:global-passed",
         )
         missing_ref = DraftPoint(
             20,
@@ -140,11 +152,29 @@ class DraftCurveSelectionTests(unittest.TestCase):
             calibration_ref="",
             input_refs=("input",),
             uncertainty=0.01,
+            feature_hash="1" * 64, model_hash="2" * 64,
+            calibration_hash="3" * 64,
+            global_calibration_passed=True,
+            global_gate_ref="test:global-passed",
         )
         curve = DraftCurve((unsupported, missing_ref))
 
         self.assertIsNone(curve.at(20 * 60))
         self.assertEqual(curve.wait_reason(20 * 60), "no_validated_past_draft_landmark")
+
+    def test_global_calibration_gate_is_explicit_and_fail_closed(self) -> None:
+        point = DraftPoint(
+            10, 0.6, 0.0, 0.0, 1.0,
+            validated=True, support=500,
+            calibration_ref="slice:passed", input_refs=("input",),
+            uncertainty=0.01,
+            feature_hash="1" * 64, model_hash="2" * 64,
+            calibration_hash="3" * 64,
+            global_calibration_passed=False,
+            global_gate_ref="",
+        )
+        self.assertFalse(point.passes_live_gate)
+        self.assertIsNone(DraftCurve((point,)).at(10 * 60))
 
 
 class StrictComebackStrategyTests(unittest.TestCase):
@@ -182,6 +212,10 @@ class StrictComebackStrategyTests(unittest.TestCase):
                         calibration_ref="calibration:passed",
                         input_refs=("model:immutable", "features:immutable"),
                         uncertainty=0.0,
+                        feature_hash="1" * 64, model_hash="2" * 64,
+                        calibration_hash="3" * 64,
+                        global_calibration_passed=True,
+                        global_gate_ref="test:global-passed",
                     ),
                 )
             ),

@@ -95,6 +95,25 @@ def snapshots(at: datetime, *, status: int = 5) -> list[OddsSnapshot]:
     ]
 
 
+def complete_snapshots(at: datetime, *, status: int = 5) -> list[OddsSnapshot]:
+    rows = snapshots(at, status=status)
+    for odds_id, group, market_type, side, line in (
+        ("kh-one", "kh-group", "kill_handicap", "team_one", -5.5),
+        ("kh-two", "kh-group", "kill_handicap", "team_two", 5.5),
+        ("total-over", "total-group", "total_kills", "over", 50.5),
+        ("total-under", "total-group", "total_kills", "under", 50.5),
+        ("duration-over", "duration-group", "duration", "over", 36.5),
+        ("duration-under", "duration-group", "duration", "under", 36.5),
+    ):
+        rows.append(
+            OddsSnapshot(
+                "match-1", odds_id, group, at, 1.9, status,
+                Market(market_type, "map_1", side, line, f"{side}:{line}", True),
+            )
+        )
+    return rows
+
+
 def observation(at: datetime, *, frame: str = "frame") -> VisionObservation:
     return VisionObservation(
         "match-1", 1, at, 600, False,
@@ -132,8 +151,9 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def record_transport(
         self, at: datetime, *, key: str, status: int = 5,
+        rows: list[OddsSnapshot] | None = None,
     ) -> list[OddsSnapshot]:
-        rows = snapshots(at, status=status)
+        rows = rows or snapshots(at, status=status)
         self.store.store_odds_observation(
             source="direct",
             observation_key=key,
@@ -322,7 +342,10 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def test_missing_validated_landmark_is_persisted_before_profiles(self) -> None:
         strategy, _, _ = self._prepare_strategy_run()
-        self.record_transport(NOW + timedelta(seconds=1), key="no-landmark")
+        at = NOW + timedelta(seconds=1)
+        self.record_transport(
+            at, key="no-landmark", rows=complete_snapshots(at)
+        )
 
         with patch("live_betting.shadow_monitor._profiles") as profiles:
             result = run_once(
@@ -343,6 +366,30 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             "SELECT reason FROM strategy_decisions"
         ).fetchone()
         self.assertIn("validated_live_draft_prediction_missing", row["reason"])
+        research = self.store.connection.execute(
+            """SELECT actionability, raw_model_probability, feature_hash,
+                      model_hash, calibration_hash, gate_status,
+                      gate_failures_json, manual_clock_trust,
+                      manual_clock_validation
+                 FROM research_live_predictions"""
+        ).fetchone()
+        self.assertIsNotNone(research)
+        self.assertEqual(research["actionability"], "research_only")
+        self.assertIsNone(research["raw_model_probability"])
+        self.assertIsNone(research["feature_hash"])
+        self.assertIsNone(research["model_hash"])
+        self.assertIsNone(research["calibration_hash"])
+        self.assertEqual(research["gate_status"], "unavailable")
+        self.assertIn(
+            "validated_live_draft_prediction_missing",
+            __import__("json").loads(research["gate_failures_json"]),
+        )
+        self.assertEqual(research["manual_clock_trust"], "not_observed")
+        self.assertEqual(research["manual_clock_validation"], "not_observed")
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM shadow_orders").fetchone()[0],
+            0,
+        )
 
     def _prepare_strategy_run(
         self, *, add_observation: bool = True,
@@ -397,6 +444,10 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 10, 0.5, 0.0, 0.0, 0.0, validated=True, support=100,
                 calibration_ref="test:passed", input_refs=("test:model",),
                 uncertainty=0.0,
+                feature_hash="1" * 64, model_hash="2" * 64,
+                calibration_hash="3" * 64,
+                global_calibration_passed=True,
+                global_gate_ref="test:global-passed",
             ),))
 
         strategy.fake_profiles = fake_profiles

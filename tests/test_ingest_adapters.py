@@ -10,7 +10,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from event_intelligence.facts import extract_completed_match_facts
-from event_intelligence.ingest import StrictEventIngestor, completed_match_processing_result
+from event_intelligence.incremental import SCORE_VERSION, StrictDerivedPipeline
+from event_intelligence.ingest import (
+    IngestReport,
+    StrictEventIngestor,
+    completed_match_processing_result,
+)
 from event_intelligence.ingest_adapters import (
     RegistryIngestAdapter,
     SQLiteIngestAdapter,
@@ -188,6 +193,60 @@ class IngestAdapterTests(unittest.TestCase):
         self.assertEqual(
             self.storage.connection.execute("SELECT COUNT(*) FROM event_candidates").fetchone()[0],
             1,
+        )
+
+    def test_catalog_discovery_is_pending_only_and_preserves_source_fields(self) -> None:
+        catalog = [
+            {"leagueid": 19_543, "name": "PGL Wallachia 2026 Season 8"},
+            {"leagueid": 19_719, "name": "The International 2026", "ticket": "ti"},
+            {"leagueid": 20_002, "name": "Unknown Future League"},
+            {"leagueid": 18_999, "name": "PGL Historical"},
+        ]
+
+        class CatalogClient:
+            async def get_leagues(self) -> list[dict]:
+                return catalog
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                raise AssertionError("catalog discovery must not fetch matches")
+
+            async def get_match(self, match_id: int) -> dict:
+                raise AssertionError("catalog discovery must not fetch details")
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CatalogClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+
+        first = asyncio.run(ingestor.discover_event_candidates(NOW))
+        second = asyncio.run(
+            ingestor.discover_event_candidates(NOW + timedelta(hours=1))
+        )
+
+        self.assertEqual((first.catalog_rows, first.candidates_seen), (4, 2))
+        self.assertEqual((first.candidates_created, second.candidates_created), (2, 0))
+        rows = self.storage.connection.execute(
+            """SELECT provider_event_id, evidence_status, audit_status, evidence_json
+                 FROM event_candidates
+                WHERE source='opendota_league_catalog'
+                ORDER BY provider_event_id"""
+        ).fetchall()
+        self.assertEqual(
+            [(row[0], row[1], row[2]) for row in rows],
+            [("19719", "unverified", "pending"), ("20002", "unverified", "pending")],
+        )
+        evidence = json.loads(rows[0][3])
+        self.assertEqual(evidence["source_fields"]["ticket"], "ti")
+        self.assertEqual(evidence["decision"], "pending_manual_audit")
+        self.assertEqual(len(self.registry.formal_events()), 4)
+        self.assertIsNotNone(
+            self.storage.connection.execute(
+                "SELECT 1 FROM raw_source_observations WHERE endpoint='/api/leagues'"
+            ).fetchone()
         )
         self.assertEqual(
             self.storage.connection.execute("SELECT COUNT(*) FROM match_ingest_status").fetchone()[0],
@@ -382,6 +441,65 @@ class IngestAdapterTests(unittest.TestCase):
             self.storage.connection.execute("SELECT COUNT(*) FROM matches").fetchone()[0],
             0,
         )
+
+    def test_changed_map_runs_durable_derived_pipeline_idempotently(self) -> None:
+        payload = completed_payload()
+        payload["start_time"] = int((NOW - timedelta(hours=1)).timestamp())
+        summary = {
+            "match_id": payload["match_id"],
+            "leagueid": payload["leagueid"],
+            "start_time": payload["start_time"],
+        }
+
+        class CompletedClient:
+            async def get_leagues(self) -> list[dict]:
+                return []
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                return [summary]
+
+            async def get_match(self, match_id: int) -> dict:
+                return payload
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CompletedClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+        ingest_report = asyncio.run(
+            ingestor.run_once(event_id="pgl-wallachia-s8-2026")
+        )
+        self.assertEqual(ingest_report.changed_match_ids, (8_001,))
+
+        pipeline = StrictDerivedPipeline(self.path)
+        first = pipeline.run(ingest_report.changed_match_ids)
+        second = pipeline.run(())
+
+        self.assertEqual((first.derived_maps, first.assignment_rows), (1, 20))
+        self.assertEqual((first.score_rows, first.state_rows), (10, 2))
+        self.assertEqual(second.derived_maps, 0)
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM player_map_scores WHERE score_version=?",
+                    (SCORE_VERSION,),
+                ).fetchone()[0],
+                10,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM strict_derived_status").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM team_style_profiles").fetchone()[0],
+                2,
+            )
+        finally:
+            connection.close()
 
     def test_success_atomically_writes_legacy_exact_facts_and_readiness(self) -> None:
         payload = completed_payload()
@@ -787,6 +905,38 @@ class IngestAdapterTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(ingestor.calls, 1)
+
+    def test_cli_records_strict_health_and_writes_current_coverage(self) -> None:
+        class FakeIngestor:
+            async def run_once(self, **values: object) -> IngestReport:
+                return IngestReport()
+
+        class UnusedScheduler:
+            async def run_due(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("--once must use the ingestor")
+
+        output = Path(self.directory.name) / "coverage.json"
+        runtime = Runtime(
+            FakeIngestor(),  # type: ignore[arg-type]
+            UnusedScheduler(),  # type: ignore[arg-type]
+            database=self.path,
+            health_connection=self.storage.connection,
+            coverage_report=output,
+        )
+        args = build_parser().parse_args(["--once"])
+
+        self.assertEqual(asyncio.run(run(args, runtime_factory=lambda _: runtime)), 0)
+
+        health = self.storage.connection.execute(
+            "SELECT status, details_json FROM service_health "
+            "WHERE component='strict_ingest'"
+        ).fetchone()
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(json.loads(health["details_json"])["source"], "worker")
+        report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(report["formal_maps"], 0)
+        self.assertEqual(report["versions"]["player_score"], SCORE_VERSION)
+
     def test_cli_scheduler_once_runs_one_due_cycle_and_closes_runtime(self) -> None:
         class UnusedIngestor:
             async def run_once(self, **values: object) -> None:

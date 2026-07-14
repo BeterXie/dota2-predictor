@@ -11,7 +11,7 @@ from typing import Any, Iterator, Sequence
 
 
 BUSY_TIMEOUT_MS = 5_000
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 SCHEMA_SQL = """
@@ -365,6 +365,18 @@ CREATE TABLE IF NOT EXISTS ingest_scheduler_checkpoints (
     checkpoint_key TEXT PRIMARY KEY,
     checkpoint_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strict_derived_status (
+    match_id INTEGER PRIMARY KEY
+        REFERENCES match_ingest_status(match_id) ON DELETE CASCADE,
+    source_content_hash TEXT NOT NULL CHECK (length(source_content_hash) = 64),
+    role_assignment_version TEXT NOT NULL,
+    score_version TEXT NOT NULL,
+    team_state_version TEXT NOT NULL,
+    profile_version TEXT NOT NULL,
+    profile_cutoff TEXT NOT NULL,
+    derived_at TEXT NOT NULL
 );
 
 CREATE VIEW IF NOT EXISTS formal_events AS

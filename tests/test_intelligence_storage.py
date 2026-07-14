@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "draft_predictions",
     "notification_outbox",
     "service_health",
+    "strict_derived_status",
 }
 
 
@@ -140,7 +141,7 @@ class IntelligenceStorageTests(unittest.TestCase):
                     storage.connection.execute(
                         "SELECT MAX(version) FROM intelligence_schema_version"
                     ).fetchone()[0],
-                    2,
+                    3,
                 )
                 columns = {
                     row[1]

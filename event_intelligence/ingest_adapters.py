@@ -22,7 +22,7 @@ from .ingest import (
 )
 from .models import RegisteredEvent, StageScope
 from .raw_archive import ArtifactReceipt
-from .registry import EventRegistry
+from .registry import EventRegistry, SCOPE_POLICY_VERSION
 from .scheduler import next_retry_at
 from .storage import IntelligenceStorage
 
@@ -257,6 +257,46 @@ class SQLiteIngestAdapter:
             evidence=evidence,
             discovered_at=discovered_at,
         )
+
+    def record_event_candidate(
+        self,
+        summary: Mapping[str, object],
+        reason: str,
+        discovered_at: datetime,
+    ) -> bool:
+        league_id = _integer(summary.get("leagueid"))
+        name = str(summary.get("name") or "").strip()
+        if league_id is None or league_id <= 0 or not name:
+            return False
+        if self.registry.get_by_league_id(league_id) is not None:
+            return False
+        source = "opendota_league_catalog"
+        provider_id = str(league_id)
+        existing = self.connection.execute(
+            "SELECT 1 FROM event_candidates WHERE source=? AND provider_event_id=?",
+            (source, provider_id),
+        ).fetchone()
+        self.registry.discover_candidate(
+            source=source,
+            provider_event_id=provider_id,
+            canonical_name=name,
+            evidence_urls=(f"https://www.opendota.com/leagues/{league_id}",),
+            evidence={
+                "reason": reason,
+                "source_fields": dict(summary),
+                "scope_policy_version": SCOPE_POLICY_VERSION,
+                "scope_starts_at": "2026-04-01T00:00:00+00:00",
+                "missing_required_evidence": [
+                    "formal_main_event_scope",
+                    "main_event_dates",
+                    "prize_pool_usd_at_least_1000000",
+                    "tier_1",
+                ],
+                "decision": "pending_manual_audit",
+            },
+            discovered_at=discovered_at,
+        )
+        return existing is None
 
     def list_legacy_match_ids(self, event: ApprovedEvent) -> tuple[int, ...]:
         if not self._table_exists("matches"):

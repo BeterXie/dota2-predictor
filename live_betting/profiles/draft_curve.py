@@ -8,6 +8,7 @@ until a separately persisted live landmark is both predicted and calibrated.
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 CHECKPOINTS = (10, 20, 30, 40, 50)
 MIN_LANDMARK_SUPPORT = 100
 MAX_LANDMARK_AGE_MINUTES = 10.0
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,11 @@ class DraftPoint:
     input_refs: tuple[str, ...] = ()
     uncertainty: float | None = None
     validation_reason: str | None = None
+    feature_hash: str | None = None
+    model_hash: str | None = None
+    calibration_hash: str | None = None
+    global_calibration_passed: bool = False
+    global_gate_ref: str = ""
 
     def __post_init__(self) -> None:
         if self.minute not in CHECKPOINTS:
@@ -60,15 +67,29 @@ class DraftPoint:
             or not 0.0 <= float(self.uncertainty) <= 0.5
         ):
             raise ValueError("uncertainty must be between 0 and 0.5 or None")
+        for name, value in (
+            ("feature_hash", self.feature_hash),
+            ("model_hash", self.model_hash),
+            ("calibration_hash", self.calibration_hash),
+        ):
+            if value is not None and not _SHA256_RE.fullmatch(value):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest or None")
+        if not isinstance(self.global_calibration_passed, bool):
+            raise ValueError("global_calibration_passed must be boolean")
 
     @property
     def passes_live_gate(self) -> bool:
         return (
             self.validated
+            and self.global_calibration_passed
             and self.support >= MIN_LANDMARK_SUPPORT
             and bool(self.calibration_ref.strip())
+            and bool(self.global_gate_ref.strip())
             and bool(self.input_refs)
             and self.uncertainty is not None
+            and self.feature_hash is not None
+            and self.model_hash is not None
+            and self.calibration_hash is not None
         )
 
 

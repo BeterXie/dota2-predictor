@@ -469,6 +469,10 @@ class ComebackStrategyTests(unittest.TestCase):
                     validated=True, support=100,
                     calibration_ref="test:passed", input_refs=("test:model",),
                     uncertainty=0.0,
+                    feature_hash="1" * 64, model_hash="2" * 64,
+                    calibration_hash="3" * 64,
+                    global_calibration_passed=True,
+                    global_gate_ref="test:global-passed",
                 )
                 for minute in (10, 20, 30, 40, 50)
             )),

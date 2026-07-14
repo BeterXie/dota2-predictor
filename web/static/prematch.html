@@ -81,6 +81,22 @@
 
   .error-msg { color: #f44336; padding: 1rem; background: #2a1015; border-radius: 6px; margin: 1rem 0; display: none; }
 
+  /* Toolbar */
+  .toolbar { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1.5rem; padding: 0.75rem 1rem; background: #141723; border: 1px solid #1e2030; border-radius: 8px; }
+  .toolbar label { font-size: 0.75rem; color: #8b90a0; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+  .toolbar input { padding: 0.4rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 4px; color: #d0d4e0; font-size: 0.85rem; width: 130px; }
+  .toolbar input:focus { outline: none; border-color: #4a7cf7; }
+  .toolbar button { padding: 0.4rem 1rem; background: #2a2d3a; border: none; color: #d0d4e0; border-radius: 4px; font-size: 0.8rem; cursor: pointer; white-space: nowrap; transition: background 0.15s; }
+  .toolbar button:hover { background: #3a3d4a; }
+  .toolbar button.primary { background: #2d5fbd; }
+  .toolbar button.primary:hover { background: #3d73e0; }
+  .toolbar .sep { width: 1px; height: 24px; background: #2a2d3a; }
+  .toolbar .hint { font-size: 0.7rem; color: #4a4d5a; }
+  .toolbar select { padding: 0.4rem 0.5rem; background: #1a1c2a; border: 1px solid #2a2d3a; border-radius: 4px; color: #d0d4e0; font-size: 0.85rem; max-width: 300px; }
+  .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; padding: 0.75rem 1.25rem; border-radius: 6px; font-size: 0.85rem; z-index: 200; display: none; }
+  .toast.success { background: #1a3a1a; color: #b8e986; border: 1px solid #2a5a2a; display: block; }
+  .toast.error { background: #3a1a1a; color: #ff8a65; border: 1px solid #5a2a2a; display: block; }
+
   /* Result */
   .result { background: #141723; border: 1px solid #1e2030; border-radius: 8px; padding: 1.5rem; display: none; }
   .result.show { display: block; }
@@ -97,6 +113,36 @@
   .dir.rad { color: #b8e986; }
   .dir.dirr { color: #ff8a65; }
 
+  /* Hero matchup matrix */
+  .matrix-section { margin-top: 1.5rem; }
+  .matrix-section h3 { font-size: 0.9rem; color: #8b90a0; margin-bottom: 0.75rem; }
+  .matrix-wrap { overflow-x: auto; }
+  .matrix-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  .matrix-table th, .matrix-table td { padding: 0.4rem 0.5rem; text-align: center; border: 1px solid #1e2030; white-space: nowrap; }
+  .matrix-table th { background: #1a1c2a; color: #8b90a0; font-weight: 600; position: sticky; }
+  .matrix-table .rad-header { background: #1a2a1a; color: #b8e986; }
+  .matrix-table .dir-header { background: #2a1a1a; color: #ff8a65; }
+  .matrix-table .row-hero { text-align: left; font-weight: 600; color: #b8e986; min-width: 80px; }
+  .matrix-table .col-hero { min-width: 70px; writing-mode: vertical-rl; text-orientation: mixed; height: 120px; vertical-align: bottom; padding-bottom: 0.5rem; }
+  .cell-adv { background: #0a2a0a; color: #b8e986; }
+  .cell-slight-adv { background: #1a2a1a; color: #8fbc8f; }
+  .cell-even { background: #1a1c2a; color: #6b7084; }
+  .cell-slight-dis { background: #2a1a1a; color: #d4957f; }
+  .cell-dis { background: #2a0a0a; color: #ff8a65; }
+  .matrix-table .cell-score { font-weight: 700; }
+  .matrix-legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.7rem; color: #6b7084; flex-wrap: wrap; }
+  .matrix-legend span { display: flex; align-items: center; gap: 0.25rem; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  .legend-dot.adv { background: #0a2a0a; border: 1px solid #2a5a2a; }
+  .legend-dot.slight { background: #1a2a1a; border: 1px solid #2a4a2a; }
+  .legend-dot.even { background: #1a1c2a; border: 1px solid #2a2d3a; }
+  .legend-dot.slight-dis { background: #2a1a1a; border: 1px solid #4a2a2a; }
+  .legend-dot.dis { background: #2a0a0a; border: 1px solid #5a2a2a; }
+  .hero-summary { display: flex; gap: 0.75rem; margin-bottom: 0.75rem; font-size: 0.8rem; }
+  .hero-summary .rad-summary, .hero-summary .dir-summary { flex: 1; }
+  .hero-summary .sum-item { display: flex; justify-content: space-between; padding: 0.15rem 0; }
+  .hero-summary .sum-score { font-weight: 600; }
+
   @media (max-width: 800px) {
     .main-grid { grid-template-columns: 1fr; }
     .vs { padding-top: 0; justify-content: center; }
@@ -111,7 +157,22 @@
 </div>
 
 <h1>Pre-Match Prediction</h1>
-<p class="subtitle">Select teams and hero lineups to predict the match outcome before it starts.</p>
+<p class="subtitle">v5 — Select teams and hero lineups to predict the match outcome before it starts.</p>
+
+<div class="toolbar">
+  <label>Match ID</label>
+  <input type="number" id="match-id-input" placeholder="e.g. 8828912690">
+  <button class="primary" onclick="autoFillFromMatch()">Auto-fill</button>
+  <button onclick="refetchMatch()" title="Re-fetch this match from OpenDota (use if heroes are missing)">Re-fetch</button>
+  <span class="sep"></span>
+  <button onclick="loadRecentMatches()">Latest Matches</button>
+  <select id="recent-matches-select" style="display:none" onchange="autoFillFromSelect()">
+    <option value="">-- Select a recent match --</option>
+  </select>
+  <span class="sep"></span>
+  <button onclick="fetchLatest()" title="Pull newest matches from OpenDota">Fetch New Data</button>
+  <span id="fetch-status" class="hint"></span>
+</div>
 
 <div class="main-grid">
   <!-- Radiant Side -->
@@ -234,6 +295,76 @@
     <h3>Top Contributing Factors</h3>
     <div id="factors-list"></div>
   </div>
+  <div class="matrix-section" id="matrix-section">
+    <h3>Hero Matchups — Radiant vs Dire</h3>
+    <div class="hero-summary" id="hero-summary"></div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="matrix-table"></table>
+    </div>
+    <div class="matrix-legend">
+      <span><span class="legend-dot adv"></span>优势</span>
+      <span><span class="legend-dot slight"></span>略优</span>
+      <span><span class="legend-dot even"></span>均势</span>
+      <span><span class="legend-dot slight-dis"></span>略劣</span>
+      <span><span class="legend-dot dis"></span>劣势</span>
+      <span style="margin-left:0.5rem">数值 = 英雄胜率 − 该英雄平均胜率</span>
+    .comparison-section { margin-top: 2rem; }
+    .comparison-section h3 { font-size: 1rem; color: #c0c4d0; margin-bottom: 1rem; border-bottom: 1px solid #1e2030; padding-bottom: 0.5rem; }
+    .comp-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
+    .comp-block { background: #13141f; border: 1px solid #1e2030; border-radius: 8px; overflow: hidden; }
+    .comp-block h4 { margin: 0; padding: 0.6rem 1rem; background: #1a1c2a; font-size: 0.85rem; color: #c0c4d0; }
+    .comp-row { display: flex; padding: 0.35rem 1rem; font-size: 0.78rem; border-bottom: 1px solid #1a1c2a; }
+    .comp-row.header { font-weight: 600; color: #6b7084; background: #0d0e17; }
+    .comp-row span:first-child { flex: 1.2; }
+    .comp-row .radiant-label { flex: 1; color: #b8e986; text-align: center; }
+    .comp-row .dire-label { flex: 1; color: #ff8a65; text-align: center; }
+    .comp-row .val { flex: 1; text-align: center; font-variant-numeric: tabular-nums; }
+    .comp-row .val.r { color: #b8e986; }
+    .comp-row .val.d { color: #ff8a65; }
+    .comp-row .val.better { font-weight: 700; }
+    .comp-score-bar { margin-top: 0.5rem; padding: 0 1rem 0.6rem; font-size: 0.78rem; color: #8b90a0; }
+    </div>
+  </div>
+  <div class="comparison-section" id="comparison-section" style="display:none">
+    <h3>Team Comparison — 双方近期数据对比</h3>
+
+    <div class="comp-cards" id="comp-cards">
+      <!-- Player Skill -->
+      <div class="comp-block" id="comp-player-skill">
+        <h4>选手实力</h4>
+        <div class="comp-row header"><span></span><span class="radiant-label">Radiant</span><span class="dire-label">Dire</span></div>
+        <div class="comp-body" id="ps-body"></div>
+      </div>
+
+      <!-- Early Game -->
+      <div class="comp-block" id="comp-early-game">
+        <h4>前期对抗 (10min)</h4>
+        <div class="comp-row header"><span></span><span class="radiant-label">Radiant</span><span class="dire-label">Dire</span></div>
+        <div class="comp-body" id="eg-body"></div>
+      </div>
+
+      <!-- Draft Profile -->
+      <div class="comp-block" id="comp-draft-profile">
+        <h4>阵容画像</h4>
+        <div class="comp-row header"><span></span><span class="radiant-label">Radiant</span><span class="dire-label">Dire</span></div>
+        <div class="comp-body" id="dp-body"></div>
+      </div>
+
+      <!-- Team Form -->
+      <div class="comp-block" id="comp-team-form">
+        <h4>队伍状态</h4>
+        <div class="comp-row header"><span></span><span class="radiant-label">Radiant</span><span class="dire-label">Dire</span></div>
+        <div class="comp-body" id="tf-body"></div>
+      </div>
+
+      <!-- Team Strength -->
+      <div class="comp-block" id="comp-team-strength">
+        <h4>队伍强度</h4>
+        <div class="comp-row header"><span></span><span class="radiant-label">Radiant</span><span class="dire-label">Dire</span></div>
+        <div class="comp-body" id="ts-body"></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -242,6 +373,9 @@ let heroGrid = {};          // {str: [...], agi: [...], int: [...], all: [...]}
 let selectedHeroes = {};    // { rad: {1: heroObj, 2: ...}, dir: {...} }
 selectedHeroes.rad = {};
 selectedHeroes.dir = {};
+let selectedPlayers = {};   // { rad: [accountId, ...], dir: [accountId, ...] }
+selectedPlayers.rad = [];
+selectedPlayers.dir = [];
 let activePicker = null;    // {side: 'rad'|'dir', pos: 1-5}
 let activeAttr = 'str';
 
@@ -362,6 +496,9 @@ function resetAll() {
   // Reset state
   selectedHeroes.rad = {};
   selectedHeroes.dir = {};
+  selectedPlayers.rad = [];
+  selectedPlayers.dir = [];
+  document.getElementById('comparison-section').style.display = 'none';
   // Hide result and error
   document.getElementById('result').classList.remove('show');
   document.getElementById('error-msg').style.display = 'none';
@@ -406,7 +543,9 @@ async function predict() {
       body: JSON.stringify({
         radiant_id: radiantId, dire_id: direId,
         radiant_heroes: radiantHeroes, dire_heroes: direHeroes,
-        league_id: leagueId || null
+        league_id: leagueId || null,
+        radiant_players: selectedPlayers.rad.length === 5 ? selectedPlayers.rad : null,
+        dire_players: selectedPlayers.dir.length === 5 ? selectedPlayers.dir : null,
       })
     });
 
@@ -442,6 +581,9 @@ async function predict() {
       factorsList.innerHTML = '<div style="color:#6b7084;font-size:0.85rem">No factor breakdown available</div>';
     }
 
+    renderMatrix(data);
+    renderComparison(data);
+
     resultEl.classList.add('show');
   } catch (err) {
     showError('Prediction failed: ' + err.message);
@@ -451,13 +593,383 @@ async function predict() {
   }
 }
 
+function renderMatrix(data) {
+  const matrix = data.prediction.hero_matrix || [];
+  const radHeroes = data.prediction.radiant_heroes || [];
+  const dirHeroes = data.prediction.dire_heroes || [];
+  const section = document.getElementById('matrix-section');
+
+  if (!matrix.length || !radHeroes.length || !dirHeroes.length) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+
+  // Hero summary: total advantage per hero
+  var summaryHtml = '<div class="rad-summary"><strong style="color:#b8e986">Radiant</strong>';
+  for (var i = 0; i < radHeroes.length; i++) {
+    var h = radHeroes[i];
+    var row = matrix[i] || [];
+    var total = 0;
+    row.forEach(function(c) { total += c.adv; });
+    var pct = (total * 100).toFixed(1);
+    var cls = total > 0.03 ? 'color:#b8e986' : total < -0.03 ? 'color:#ff8a65' : 'color:#8b90a0';
+    var sign = total >= 0 ? '+' : '';
+    summaryHtml += '<div class="sum-item"><span>' + h.name + '</span><span class="sum-score" style="' + cls + '">' + sign + pct + '%</span></div>';
+  }
+  summaryHtml += '</div>';
+
+  summaryHtml += '<div class="dir-summary"><strong style="color:#ff8a65">Dire</strong>';
+  for (var j = 0; j < dirHeroes.length; j++) {
+    var h2 = dirHeroes[j];
+    var total2 = 0;
+    for (var i2 = 0; i2 < matrix.length; i2++) {
+      total2 -= matrix[i2][j].adv;
+    }
+    var pct2 = (total2 * 100).toFixed(1);
+    var cls2 = total2 > 0.03 ? 'color:#ff8a65' : total2 < -0.03 ? 'color:#b8e986' : 'color:#8b90a0';
+    var sign2 = total2 >= 0 ? '+' : '';
+    summaryHtml += '<div class="sum-item"><span>' + h2.name + '</span><span class="sum-score" style="' + cls2 + '">' + sign2 + pct2 + '%</span></div>';
+  }
+  summaryHtml += '</div>';
+  document.getElementById('hero-summary').innerHTML = summaryHtml;
+
+  // Build matrix table
+  var tableHtml = '<thead><tr><th></th>';
+  dirHeroes.forEach(function(h3) {
+    tableHtml += '<th class="dir-header col-hero">' + h3.name + '</th>';
+  });
+  tableHtml += '</tr></thead><tbody>';
+
+  for (var i3 = 0; i3 < matrix.length; i3++) {
+    var row2 = matrix[i3];
+    tableHtml += '<tr><td class="row-hero">' + radHeroes[i3].name + '</td>';
+    for (var j3 = 0; j3 < row2.length; j3++) {
+      var cell = row2[j3];
+      var cellClass = 'cell-even';
+      if (cell.adv > 0.03) cellClass = 'cell-adv';
+      else if (cell.adv > 0.01) cellClass = 'cell-slight-adv';
+      else if (cell.adv < -0.03) cellClass = 'cell-dis';
+      else if (cell.adv < -0.01) cellClass = 'cell-slight-dis';
+      var sign3 = cell.adv > 0 ? '+' : '';
+      var pct3 = (cell.adv * 100).toFixed(1);
+      tableHtml += '<td class="' + cellClass + '"><span class="cell-score">' + sign3 + pct3 + '%</span><br><span style="font-size:0.65rem">' + cell.verdict + '</span></td>';
+    }
+    tableHtml += '</tr>';
+  }
+  tableHtml += '</tbody>';
+  document.getElementById('matrix-table').innerHTML = tableHtml;
+}
+
+function renderComparison(data) {
+  var comps = (data.prediction && data.prediction.components) || {};
+  var weights = (data.prediction && data.prediction.weights_used) || {};
+  var section = document.getElementById('comparison-section');
+  var anyVisible = false;
+
+  // Player Skill
+  anyVisible |= renderPlayerSkill(comps.player_skill, weights.player_skill);
+  // Early Game
+  anyVisible |= renderEarlyGame(comps.early_game, weights.early_game);
+  // Draft Profile
+  anyVisible |= renderDraftProfile(comps.draft_profile, weights.draft_profile);
+  // Team Form
+  anyVisible |= renderTeamForm(comps.team_form, weights.team_form);
+  // Team Strength (hidden by default — too simple)
+  document.getElementById('comp-team-strength').style.display = 'none';
+
+  section.style.display = anyVisible ? '' : 'none';
+}
+
+function renderPlayerSkill(ps, weight) {
+  var el = document.getElementById('comp-player-skill');
+  var body = document.getElementById('ps-body');
+  if (!ps || !ps.radiant || !ps.dire) { el.style.display = 'none'; return false; }
+  el.style.display = '';
+  var r = ps.radiant, d = ps.dire;
+  body.innerHTML =
+    compRow('KDA', r.kda, d.kda, '.2f', false) +
+    compRow('GPM', r.gpm, d.gpm, '.0f', false) +
+    compRow('历史胜率', (r.win_rate*100)+'%', (d.win_rate*100)+'%', 's', false) +
+    compRow('选手数据覆盖', r.players_with_data+'/5', d.players_with_data+'/5', 's', false) +
+    compScoreBar(ps.score, weight, 'player_skill');
+  return true;
+}
+
+function renderEarlyGame(eg, weight) {
+  var el = document.getElementById('comp-early-game');
+  var body = document.getElementById('eg-body');
+  if (!eg || !eg.radiant || !eg.dire) { el.style.display = 'none'; return false; }
+  el.style.display = '';
+  var r = eg.radiant, d = eg.dire;
+  var html = '';
+  // Core
+  if (r.core_count > 0 || d.core_count > 0) {
+    html += '<div class="comp-row" style="color:#8b90a0;font-size:0.72rem;padding:0.2rem 1rem">核心位(' + (r.core_count||0) + '/' + (d.core_count||0) + '人)</div>';
+    html += compRow('Gold@10min', Math.round(r.core_avg_gold||0), Math.round(d.core_avg_gold||0), '.0f', false);
+    html += compRow('正补@10min', Math.round(r.core_avg_lh||0), Math.round(d.core_avg_lh||0), '.0f', false);
+    html += compRow('经验@10min', Math.round(r.core_avg_xp||0), Math.round(d.core_avg_xp||0), '.0f', false);
+  }
+  // Mid
+  if (r.mid_count > 0 || d.mid_count > 0) {
+    html += '<div class="comp-row" style="color:#8b90a0;font-size:0.72rem;padding:0.2rem 1rem">中单位(' + (r.mid_count||0) + '/' + (d.mid_count||0) + '人)</div>';
+    html += compRow('击杀@10min', (r.mid_avg_kills||0).toFixed(2), (d.mid_avg_kills||0).toFixed(2), 's', false);
+    html += compRow('经验@10min', Math.round(r.mid_avg_xp||0), Math.round(d.mid_avg_xp||0), '.0f', false);
+    html += compRow('Gold@10min', Math.round(r.mid_avg_gold||0), Math.round(d.mid_avg_gold||0), '.0f', false);
+  }
+  // Support
+  if (r.support_count > 0 || d.support_count > 0) {
+    html += '<div class="comp-row" style="color:#8b90a0;font-size:0.72rem;padding:0.2rem 1rem">辅助位(' + (r.support_count||0) + '/' + (d.support_count||0) + '人)</div>';
+    html += compRow('排假眼@10min', (r.sup_avg_obs_kills||0).toFixed(2), (d.sup_avg_obs_kills||0).toFixed(2), 's', false);
+    html += compRow('排真眼@10min', (r.sup_avg_sen_kills||0).toFixed(2), (d.sup_avg_sen_kills||0).toFixed(2), 's', false);
+    html += compRow('插假眼@10min', (r.sup_avg_obs||0).toFixed(2), (d.sup_avg_obs||0).toFixed(2), 's', false);
+    html += compRow('助攻@10min', (r.sup_avg_assists||0).toFixed(2), (d.sup_avg_assists||0).toFixed(2), 's', false);
+    html += compRow('击杀@10min', (r.sup_avg_kills||0).toFixed(2), (d.sup_avg_kills||0).toFixed(2), 's', false);
+  }
+  html += compScoreBar(eg.score, weight, 'early_game');
+  body.innerHTML = html;
+  return true;
+}
+
+function renderDraftProfile(dp, weight) {
+  var el = document.getElementById('comp-draft-profile');
+  var body = document.getElementById('dp-body');
+  if (!dp || !dp.dimensions) { el.style.display = 'none'; return false; }
+  el.style.display = '';
+  var dims = dp.dimensions;
+  var html = '';
+  for (var k in dims) {
+    var dim = dims[k];
+    var label = dimLabels[k] || k;
+    html += compRow(label, formatDim(k, dim.radiant_avg), formatDim(k, dim.dire_avg), 's', false);
+  }
+  html += compScoreBar(dp.score, weight, 'draft_profile');
+  body.innerHTML = html;
+  return true;
+}
+
+function renderTeamForm(tf, weight) {
+  var el = document.getElementById('comp-team-form');
+  var body = document.getElementById('tf-body');
+  if (!tf || tf.radiant_win_rate === undefined) { el.style.display = 'none'; return false; }
+  el.style.display = '';
+  body.innerHTML =
+    compRow('近期胜率', (tf.radiant_win_rate*100).toFixed(0)+'%', (tf.dire_win_rate*100).toFixed(0)+'%', 's', false) +
+    compRow('场均GPM', Math.round(tf.radiant_avg_gpm||0), Math.round(tf.dire_avg_gpm||0), '.0f', false) +
+    compScoreBar(tf.score, weight, 'team_form');
+  return true;
+}
+
+function compRow(label, rVal, dVal, fmt, forceNumeric) {
+  var rStr = (forceNumeric && !isNaN(rVal)) ? Number(rVal).toLocaleString() : String(rVal);
+  var dStr = (forceNumeric && !isNaN(dVal)) ? Number(dVal).toLocaleString() : String(dVal);
+  var rNum = parseFloat(rVal), dNum = parseFloat(dVal);
+  var rCls = '', dCls = '';
+  if (!isNaN(rNum) && !isNaN(dNum)) {
+    if (rNum > dNum + 0.001) rCls = ' better';
+    else if (dNum > rNum + 0.001) dCls = ' better';
+  }
+  return '<div class="comp-row"><span>' + label + '</span><span class="val r' + rCls + '">' + rStr + '</span><span class="val d' + dCls + '">' + dStr + '</span></div>';
+}
+
+function compScoreBar(score, weight, factorKey) {
+  var w = (weight * 100).toFixed(0);
+  var dir = score > 0.01 ? 'Radiant优势' : score < -0.01 ? 'Dire优势' : '均势';
+  var cls = score > 0.01 ? 'r' : score < -0.01 ? 'd' : '';
+  var barW = Math.min(100, Math.abs(score) * 100);
+  return '<div class="comp-score-bar">' +
+    '<span>综合: <b class="' + cls + '">' + (score>0?'+':'') + score.toFixed(3) + '</b> (' + dir + ', 权重' + w + '%)</span>' +
+    '<div style="background:#1e2030;height:3px;margin-top:3px;border-radius:2px"><div style="background:'+(score>0?'#b8e986':'#ff8a65')+';height:100%;width:'+barW+'%;border-radius:2px"></div></div>' +
+    '</div>';
+}
+
+function formatDim(key, val) {
+  var dimPcts = ['win_rate', 'scaling_score'];
+  if (typeof val === 'number') {
+    if (dimPcts.indexOf(key) >= 0) return (val * 100).toFixed(1) + '%';
+    return Math.round(val).toLocaleString();
+  }
+  return String(val);
+}
+
+var dimLabels = {
+  tower_damage: '推塔伤害',
+  hero_damage_per_min: '英雄伤害/分',
+  gold_per_min: '打钱速度',
+  hero_healing_per_min: '治疗/分',
+  scaling_score: '后期成长性',
+  win_rate: '英雄胜率'
+};
+
 function showError(msg) {
   const el = document.getElementById('error-msg');
   el.textContent = msg;
   el.style.display = 'block';
 }
 
+// ---- Auto-fill & Fetch ----
+
+async function autoFillFromMatch() {
+  var mid = document.getElementById('match-id-input').value.trim();
+  console.log('[autoFill] match ID input:', mid);
+  if (!mid) { showToast('Please enter a match ID', 'error'); return; }
+  try {
+    var url = '/api/matches/' + mid + '/draft';
+    console.log('[autoFill] fetching:', url);
+    var resp = await fetch(url);
+    console.log('[autoFill] response status:', resp.status, resp.ok);
+    if (!resp.ok) {
+      var err = await resp.json();
+      console.error('[autoFill] API error:', err);
+      throw new Error(err.detail || 'Match not found');
+    }
+    var data = await resp.json();
+    console.log('[autoFill] received data:', data);
+    console.log('[autoFill] radiant_heroes:', data.radiant_heroes);
+    console.log('[autoFill] dire_heroes:', data.dire_heroes);
+    fillForm(data);
+    showToast('Loaded match ' + mid, 'success');
+  } catch (err2) {
+    console.error('[autoFill] exception:', err2);
+    showToast('Failed: ' + err2.message, 'error');
+  }
+}
+
+function autoFillFromSelect() {
+  var sel = document.getElementById('recent-matches-select');
+  var mid = sel.value;
+  if (!mid) return;
+  document.getElementById('match-id-input').value = mid;
+  autoFillFromMatch();
+}
+
+async function loadRecentMatches() {
+  var sel = document.getElementById('recent-matches-select');
+  try {
+    var resp = await fetch('/api/recent-matches?limit=30');
+    var matches = await resp.json();
+    sel.innerHTML = '<option value="">-- Select a recent match --</option>';
+    matches.forEach(function(m) {
+      var date = new Date(m.start_time * 1000).toISOString().slice(0, 10);
+      sel.innerHTML += '<option value="' + m.match_id + '">[' + date + '] ' + (m.radiant_name || 'R' + m.radiant_team_id) + ' vs ' + (m.dire_name || 'D' + m.dire_team_id) + '</option>';
+    });
+    sel.style.display = 'inline-block';
+    showToast('Loaded ' + matches.length + ' recent matches', 'success');
+  } catch (err3) {
+    showToast('Failed to load matches: ' + err3.message, 'error');
+  }
+}
+
+function fillForm(data) {
+  console.log('[fillForm] called with data keys:', Object.keys(data));
+  var dbg = document.getElementById('error-msg');
+  dbg.style.display = 'block';
+
+  // Teams
+  var radTeamEl = document.getElementById('radiant-team');
+  var dirTeamEl = document.getElementById('dire-team');
+  radTeamEl.value = data.radiant_team_id || '';
+  dirTeamEl.value = data.dire_team_id || '';
+  if (data.league_id) {
+    document.getElementById('league').value = data.league_id;
+  }
+
+  // Check if heroes are empty (match exists but no player data was fetched)
+  var radHeroes = data.radiant_heroes || [];
+  var dirHeroes = data.dire_heroes || [];
+  if (radHeroes.length === 0 && dirHeroes.length === 0) {
+    dbg.style.color = '#ff8a65';
+    dbg.textContent = 'Match ' + data.match_id + ' has no player data. ' +
+      'Click the "Re-fetch" button to pull full match details from OpenDota, ' +
+      'then click "Auto-fill" again.';
+    return;
+  }
+
+  dbg.style.color = '#b8e986';
+  dbg.textContent = 'Loaded match ' + data.match_id + ' with ' + radHeroes.length + ' radiant and ' + dirHeroes.length + ' dire heroes.';
+
+  // Heroes
+  var sides = [
+    {key: 'radiant_heroes', prefix: 'rad'},
+    {key: 'dire_heroes', prefix: 'dir'}
+  ];
+  for (var si = 0; si < sides.length; si++) {
+    var sideKey = sides[si].key;
+    var prefix = sides[si].prefix;
+    var heroes = data[sideKey] || [];
+    for (var i = 0; i < Math.min(heroes.length, 5); i++) {
+      var h = heroes[i];
+      var pos = i + 1;
+      var heroName, heroImg;
+      if (typeof h === 'object' && h.name) {
+        heroName = h.name;
+        heroImg = h.image_url || '';
+      } else {
+        heroName = 'Hero ' + (typeof h === 'object' ? h.hero_id : h);
+        heroImg = '';
+      }
+      var heroObj = {hero_id: (typeof h === 'object' ? h.hero_id : h), localized_name: heroName, image_url: heroImg};
+      selectedHeroes[prefix][pos] = heroObj;
+      // Store player account_id from draft response
+      if (typeof h === 'object' && h.account_id) {
+        if (!selectedPlayers[prefix]) selectedPlayers[prefix] = [];
+        selectedPlayers[prefix][i] = h.account_id;
+      }
+      var nameEl = document.getElementById(prefix + '-name-' + pos);
+      var imgEl = document.getElementById(prefix + '-img-' + pos);
+      var slotEl = document.getElementById(prefix + '-slot-' + pos);
+      nameEl.textContent = heroName;
+      nameEl.classList.add('selected');
+      imgEl.src = heroImg;
+      imgEl.style.display = heroImg ? 'block' : 'none';
+      imgEl.alt = heroName;
+      slotEl.classList.add('has-hero');
+    }
+    for (var j = heroes.length; j < 5; j++) {
+      clearSlot(prefix, j + 1);
+    }
+  }
+}
+
+async function refetchMatch() {
+  var mid = document.getElementById('match-id-input').value.trim();
+  if (!mid) { showToast('Please enter a match ID', 'error'); return; }
+  var statusEl = document.getElementById('fetch-status');
+  statusEl.textContent = 'Re-fetching match ' + mid + '...';
+  try {
+    var resp = await fetch('/api/fetch-latest?match_id=' + encodeURIComponent(mid) + '&force=true', { method: 'POST' });
+    var data = await resp.json();
+    statusEl.textContent = data.message;
+    showToast(data.message, 'success');
+  } catch (err4) {
+    statusEl.textContent = '';
+    showToast('Failed: ' + err4.message, 'error');
+  }
+}
+
+async function fetchLatest() {
+  var statusEl = document.getElementById('fetch-status');
+  statusEl.textContent = 'Starting...';
+  try {
+    var resp = await fetch('/api/fetch-latest', { method: 'POST' });
+    var data = await resp.json();
+    statusEl.textContent = data.message;
+    showToast(data.message, 'success');
+  } catch (err4) {
+    statusEl.textContent = '';
+    showToast('Failed: ' + err4.message, 'error');
+  }
+}
+
+function showToast(msg, type) {
+  var toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.className = 'toast ' + (type || 'success');
+  setTimeout(function() { toast.className = 'toast'; }, 3000);
+}
+
 init();
 </script>
+<div class="toast" id="toast"></div>
 </body>
 </html>
