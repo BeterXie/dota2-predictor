@@ -1,24 +1,21 @@
-"""RayBet collection loop and PandaScore fixture linking."""
+"""RayBet collection loop."""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import gzip
 import hashlib
 import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
-from .match_linker import choose_unique, score_candidate
-from .models import ProviderMatch, utc_now
-from .providers.pandascore import PandaScoreProvider
+from .models import utc_now
 from .raybet import RayBetClient
 from .storage import LiveBettingStore
 
@@ -36,20 +33,6 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip())
-
-
-def _raybet_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
-    return parsed.astimezone(timezone.utc)
-
-
-def _split_match_name(value: str) -> tuple[str, str]:
-    parts = value.split(" - VS - ", 1)
-    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else (value.strip(), "")
 
 
 def _write_raw(raw_dir: Path, match_id: str, payload: dict[str, Any], now: datetime) -> Path:
@@ -73,59 +56,14 @@ def _direct_observation_key(
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-async def fetch_pandascore_matches(token: str) -> list[ProviderMatch]:
-    provider = PandaScoreProvider(token)
-    try:
-        live, upcoming = await asyncio.gather(
-            provider.list_live_matches(), provider.list_upcoming_matches()
-        )
-        return live + upcoming
-    finally:
-        await provider.close()
-
-
-def link_matches(
-    store: LiveBettingStore,
-    raybet_rows: list[dict[str, Any]],
-    provider_matches: list[ProviderMatch],
-    now: datetime,
-) -> None:
-    for provider_match in provider_matches:
-        store.upsert_provider_match(provider_match, now)
-    for row in raybet_rows:
-        team_one, team_two = _split_match_name(str(row.get("match_name") or ""))
-        round_name = str(row.get("round") or "").lower()
-        best_of = int(round_name[2:]) if round_name.startswith("bo") and round_name[2:].isdigit() else None
-        candidates = [
-            score_candidate(
-                ray_team_one=team_one,
-                ray_team_two=team_two,
-                ray_tournament=str(row.get("tournament_name") or ""),
-                ray_scheduled_at=_raybet_time(row.get("start_time")),
-                ray_best_of=best_of,
-                candidate=match,
-            )
-            for match in provider_matches
-        ]
-        selected = choose_unique(candidates)
-        if selected:
-            store.upsert_match_link(
-                str(row.get("id")), "pandascore", selected.provider_match_id,
-                selected.confidence, "accepted", ";".join(selected.reasons), now,
-            )
-
-
 def collect_once(
     store: LiveBettingStore,
     client: RayBetClient,
     raw_dir: Path,
-    provider_matches: list[ProviderMatch] | None = None,
     list_rows: list[dict[str, Any]] | None = None,
     raw_fingerprints: dict[str, str] | None = None,
 ) -> dict[str, int]:
-    now = utc_now()
     list_rows = list_rows if list_rows is not None else client.live_matches()
-    details: list[dict[str, Any]] = []
     odds_count = 0
     changed_count = 0
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
@@ -133,7 +71,6 @@ def collect_once(
         payload = client.match_odds(str(list_row.get("id")))
         observed_at = utc_now()
         result = payload.get("result") or {}
-        details.append(result)
         match_id = str(result.get("id"))
         fingerprint = _fingerprint(payload)
         if raw_fingerprints.get(match_id) != fingerprint:
@@ -155,22 +92,8 @@ def collect_once(
             )
             changed_count += changes
         odds_count += len(snapshots)
-    if provider_matches:
-        link_matches(store, details, provider_matches, now)
-    store.record_collector("raybet", success_at=now)
-    return {"matches": len(details), "odds": odds_count, "changed": changed_count}
-
-
-def load_pandascore_matches(enabled: bool) -> list[ProviderMatch]:
-    """Load optional commercial fixture data only after explicit CLI opt-in."""
-    if not enabled:
-        logger.info("PandaScore fixture linking is disabled")
-        return []
-    token = os.environ.get("PANDASCORE_TOKEN", "")
-    if not token:
-        logger.warning("PANDASCORE_TOKEN is absent; PandaScore linking is disabled")
-        return []
-    return asyncio.run(fetch_pandascore_matches(token))
+    store.record_collector("raybet", success_at=utc_now())
+    return {"matches": len(list_rows), "odds": odds_count, "changed": changed_count}
 
 
 def run(args: argparse.Namespace) -> int:
@@ -178,9 +101,6 @@ def run(args: argparse.Namespace) -> int:
     db_path = Path(args.database)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_dir = Path(args.raw_dir)
-    provider_matches = load_pandascore_matches(
-        getattr(args, "enable_pandascore", False)
-    )
 
     with LiveBettingStore(db_path) as store, RayBetClient() as client:
         store.init_schema()
@@ -203,7 +123,7 @@ def run(args: argparse.Namespace) -> int:
                     list_rows = client.live_matches()
                     next_list_refresh = monotonic_now + args.list_interval
                 summary = collect_once(
-                    store, client, raw_dir, provider_matches, list_rows=list_rows,
+                    store, client, raw_dir, list_rows=list_rows,
                     raw_fingerprints=raw_fingerprints,
                 )
                 failures = 0
@@ -249,11 +169,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--list-interval", type=float, default=15.0)
     parser.add_argument("--max-backoff", type=float, default=300.0)
-    parser.add_argument(
-        "--enable-pandascore",
-        action="store_true",
-        help="explicitly enable optional PandaScore fixture linking",
-    )
     parser.add_argument("--once", action="store_true")
     return parser.parse_args()
 

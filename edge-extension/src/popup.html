@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dota 2 Monitor</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Dota 2 Monitor</h1>
+      <p id="stateLine"><span id="stateDot"></span><span id="stateText">Loading</span></p>
+    </div>
+    <button id="openOptions" class="icon-button" type="button" title="Settings" aria-label="Settings">&#9881;</button>
+  </header>
+  <main>
+    <label class="toggle-row">
+      <span>Capture</span>
+      <input id="captureToggle" type="checkbox" role="switch">
+    </label>
+    <dl>
+      <div><dt>Companion</dt><dd id="companionValue">Checking</dd></div>
+      <div><dt>Dota matches</dt><dd id="matchCount">0</dd></div>
+      <div><dt>Queued</dt><dd id="queueCount">0</dd></div>
+      <div><dt>Dropped</dt><dd id="dropCount">0</dd></div>
+      <div><dt>Last event</dt><dd id="lastEvent">None</dd></div>
+    </dl>
+    <a id="reportLink" class="report-link" href="#" hidden>Open shadow report</a>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

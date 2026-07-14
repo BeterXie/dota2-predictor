@@ -1,4 +1,4 @@
-"""Parse versioned JSONL observations emitted by dota2-ad-assistant."""
+"""Parse versioned JSONL observations emitted by the local vision watcher."""
 
 from __future__ import annotations
 

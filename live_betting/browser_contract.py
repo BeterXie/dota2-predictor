@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from datetime import datetime, timezone
 from enum import Enum
@@ -11,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+import rfc8785
 
 
 SCHEMA_VERSION = 1
@@ -20,10 +20,12 @@ SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
 MATCH_RE = re.compile(r"^[0-9]{1,32}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
-RAYBET_ORIGINS = frozenset({
-    "https://www.ray086.com",
-    "https://cfinfo.365raylinks.com",
-})
+RAYBET_ORIGINS = frozenset(
+    {
+        "https://www.ray086.com",
+        "https://cfinfo.365raylinks.com",
+    }
+)
 
 
 class Transport(str, Enum):
@@ -43,11 +45,8 @@ class EventType(str, Enum):
 
 
 def canonical_json(value: Any) -> bytes:
-    """Return the UTF-8 canonical form shared with the extension."""
-    return json.dumps(
-        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    """Return RFC 8785 canonical JSON shared with the extension."""
+    return rfc8785.dumps(value)
 
 
 def payload_sha256(payload: Any) -> str:
@@ -59,13 +58,50 @@ def _normalized_key(value: str) -> str:
 
 
 _FORBIDDEN_KEY_PARTS = (
-    "cookie", "authorization", "bearer", "token", "secret", "session", "csrf",
-    "user", "member", "account", "profile", "username", "phone", "email", "identity",
-    "balance", "wallet", "currency", "deposit", "withdrawal", "rebate", "transaction",
-    "device", "fingerprint", "advertising", "analytics", "persistentclient", "clientid",
-    "visitorid", "browserid", "machineid", "installid",
-    "betslip", "selectionslip", "stake", "potentialreturn", "order", "submit", "ticket",
-    "requestheader", "responseheader", "requestbody", "formdata", "postbody",
+    "cookie",
+    "authorization",
+    "bearer",
+    "token",
+    "secret",
+    "session",
+    "csrf",
+    "user",
+    "member",
+    "account",
+    "profile",
+    "username",
+    "phone",
+    "email",
+    "identity",
+    "balance",
+    "wallet",
+    "currency",
+    "deposit",
+    "withdrawal",
+    "rebate",
+    "transaction",
+    "device",
+    "fingerprint",
+    "advertising",
+    "analytics",
+    "persistentclient",
+    "clientid",
+    "visitorid",
+    "browserid",
+    "machineid",
+    "installid",
+    "betslip",
+    "selectionslip",
+    "stake",
+    "potentialreturn",
+    "order",
+    "submit",
+    "ticket",
+    "requestheader",
+    "responseheader",
+    "requestbody",
+    "formdata",
+    "postbody",
 )
 _DANGEROUS_KEYS = frozenset({"__proto__", "prototype", "constructor"})
 
@@ -150,7 +186,12 @@ class BrowserEvent(BaseModel):
     @classmethod
     def validate_origin(cls, value: str) -> str:
         parsed = urlsplit(value)
-        if value not in RAYBET_ORIGINS or parsed.path or parsed.query or parsed.fragment:
+        if (
+            value not in RAYBET_ORIGINS
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
             raise ValueError("page_origin is not an allowed RayBet origin")
         return value
 
@@ -188,23 +229,34 @@ class BrowserEvent(BaseModel):
         unverifiable_oversize_hash = (
             self.capture_reason == "payload_too_large" and not self.payload
         )
-        if not unverifiable_oversize_hash and hashlib.sha256(encoded).hexdigest() != self.payload_hash:
+        if (
+            not unverifiable_oversize_hash
+            and hashlib.sha256(encoded).hexdigest() != self.payload_hash
+        ):
             raise ValueError("payload hash mismatch")
         if self.game_id not in (None, 151):
             raise ValueError("only Dota 2 game_id=151 is accepted")
         if self.event_type is not EventType.UNKNOWN and self.game_id != 151:
             raise ValueError("recognized events require game_id=151")
         match_bound = {
-            EventType.ODDS, EventType.MARKET_UPDATE, EventType.VIDEO,
+            EventType.ODDS,
+            EventType.MARKET_UPDATE,
+            EventType.VIDEO,
             EventType.MANUAL_CONTROL,
         }
         if self.event_type in match_bound and self.raybet_match_id is None:
             raise ValueError("event type requires a RayBet match id")
         if self.event_type is EventType.UNKNOWN and self.payload:
             raise ValueError("unknown events must be metadata-only")
-        if self.capture_reason in {"payload_too_large", "raw_payload_too_large"} and self.payload:
+        if (
+            self.capture_reason in {"payload_too_large", "raw_payload_too_large"}
+            and self.payload
+        ):
             raise ValueError("oversized events must be metadata-only")
-        if self.event_type is EventType.MANUAL_CONTROL and self.capture_reason != "diagnostic_untrusted":
+        if (
+            self.event_type is EventType.MANUAL_CONTROL
+            and self.capture_reason != "diagnostic_untrusted"
+        ):
             raise ValueError("manual control data must remain diagnostic")
         return self
 

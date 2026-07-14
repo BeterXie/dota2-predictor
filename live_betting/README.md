@@ -1,43 +1,21 @@
 # Dota 2 Live Shadow Betting
 
-This package records RayBet Dota 2 odds and, when provisioned, PandaScore live
-data. It creates hypothetical orders only. It has no real betting endpoint.
+This package records RayBet Dota 2 odds and creates hypothetical orders only.
+It has no real betting endpoint.
 
 ## Current Capability
 
 - RayBet Dota 2 discovery (`game_id=151`) and immutable odds snapshots
-- PandaScore Dota 2 fixtures, `/lives` endpoint discovery, frames/events sockets
-- Conservative cross-provider fixture matching
 - Winner, total kills, team total kills, kill handicap, race-to-kills, and
   duration market normalization and settlement
 - Complete-outcome-group de-vigging
 - Next-snapshot fills, slippage rejection, idempotent shadow orders
 - Brier, log-loss, fill-rate, and shadow ROI helpers
-- Explicit odds-source backoff and commercial-feed-disabled state
+- Explicit odds-source backoff
 - Causal visual-clock alignment with no future-frame interpolation
 - Team style, roster-change, player form, and draft timing profiles
 - Explainable comeback decisions with one shadow attempt per map
 - Exact-draft OpenDota post-match labeling and JSON evaluation reports
-
-PandaScore does not currently document Dota 2 support in its sandbox or event
-recovery feature. Record live Dota payloads locally before changing the frame
-and event mappings. Any WebSocket gap freezes signal generation.
-
-## Configuration
-
-PandaScore is disabled by default, even when a token remains in `.env`. To use
-the optional commercial fixture linker, set the secret in `.env` and opt in on
-the command line:
-
-```dotenv
-PANDASCORE_TOKEN=
-```
-
-```powershell
-python -m live_betting.monitor --enable-pandascore
-```
-
-The normal RayBet collector commands below never call PandaScore.
 
 ## Commands
 
@@ -47,33 +25,47 @@ One read-only collection pass:
 python -m live_betting.monitor --once
 ```
 
-Continuous collection (15-second match refresh, 3-second odds refresh):
+Continuous collection with the production-safe polling intervals:
 
 ```powershell
-python -m live_betting.monitor
-```
-
-After PandaScore Live access is provisioned, collect frames and events:
-
-```powershell
-python -m live_betting.pandascore_monitor
+python -m live_betting.monitor --database data/dota2.db `
+  --raw-dir data/live_betting/raw --interval 6 --list-interval 30
 ```
 
 Run tests:
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m pytest -q
 ```
 
 Raw snapshots are written under `data/live_betting/raw/`; normalized rows use
 the existing `data/dota2.db` database.
 
-Run the strategy monitor against the visual observation directory:
+Start one visual watcher for every active RayBet match that exposes an HLS
+stream. Observations, evidence frames, and watcher logs stay under the project
+data directory:
+
+```powershell
+python scripts/supervise_raybet_streams.py --database data/dota2.db
+```
+
+Run the strategy monitor against that observation directory:
 
 ```powershell
 python scripts/run_comeback_shadow.py `
   --database data/dota2.db `
-  --vision-jsonl C:/Users/59908/dota2-ad-assistant/logs/live_observations
+  --vision-jsonl data/live_betting/live_observations
+```
+
+For passive browser capture, start `python -m live_betting.browser_companion`
+and load `edge-extension/` as an unpacked Edge extension. Pairing and safety
+details are documented in `edge-extension/README.md`.
+
+Refresh the local hero-recognition asset after the Dota hero roster changes:
+
+```powershell
+python scripts/fetch_hero_portraits.py
+python scripts/build_hero_features.py
 ```
 
 Run exact-draft post-match labeling for every completed observed series:

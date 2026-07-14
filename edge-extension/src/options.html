@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dota 2 Monitor Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Monitor Settings</h1>
+      <span id="pairState">Not paired</span>
+    </header>
+    <section>
+      <h2>Local companion</h2>
+      <div class="pair-row">
+        <label for="pairCode">Pairing code</label>
+        <input id="pairCode" type="password" inputmode="numeric" autocomplete="one-time-code" maxlength="32">
+        <button id="pairButton" type="button">Pair</button>
+      </div>
+      <p id="pairMessage" role="status"></p>
+    </section>
+    <section>
+      <h2>Capture</h2>
+      <label class="check-row"><input id="ray086Enabled" type="checkbox"> www.ray086.com</label>
+      <label class="check-row"><input id="raylinksEnabled" type="checkbox"> cfinfo.365raylinks.com</label>
+      <label class="select-row" for="debugLevel"><span>Debug level</span>
+        <select id="debugLevel"><option value="off">Off</option><option value="errors">Errors</option><option value="diagnostic">Diagnostic</option></select>
+      </label>
+    </section>
+    <footer><button id="saveButton" type="button">Save</button><span id="saveMessage" role="status"></span></footer>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

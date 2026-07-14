@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import unittest
 from copy import deepcopy
+from pathlib import Path
 
 from pydantic import ValidationError
 
 from live_betting.browser_contract import (
     BrowserEvent,
+    canonical_json,
     find_forbidden_batch_key,
     payload_sha256,
 )
@@ -39,10 +41,27 @@ class BrowserContractTests(unittest.TestCase):
     def parse(self, value: dict) -> BrowserEvent:
         return BrowserEvent.model_validate_json(json.dumps(value))
 
+    def test_canonical_json_matches_extension_rfc8785_vectors(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "edge-extension"
+            / "tests"
+            / "fixtures"
+            / "canonical-vectors.json"
+        )
+        for vector in json.loads(path.read_text(encoding="utf-8")):
+            with self.subTest(name=vector["name"]):
+                self.assertEqual(
+                    canonical_json(vector["value"]).decode("utf-8"),
+                    vector["canonical"],
+                )
+
     def test_accepts_strict_schema_v1_event(self) -> None:
         event = self.parse(valid_event())
         self.assertEqual(event.game_id, 151)
-        self.assertEqual(event.captured_at_utc.isoformat(), "2026-07-13T08:12:34.567000+00:00")
+        self.assertEqual(
+            event.captured_at_utc.isoformat(), "2026-07-13T08:12:34.567000+00:00"
+        )
 
     def test_rejects_unknown_envelope_field_and_future_schema(self) -> None:
         unknown = valid_event()
@@ -67,8 +86,14 @@ class BrowserContractTests(unittest.TestCase):
 
     def test_backend_rejects_all_extension_identity_and_prototype_keys(self) -> None:
         keys = (
-            "persistent_client", "visitorId", "browser-id", "machine_id", "installId",
-            "__proto__", "prototype", "constructor",
+            "persistent_client",
+            "visitorId",
+            "browser-id",
+            "machine_id",
+            "installId",
+            "__proto__",
+            "prototype",
+            "constructor",
         )
         for key in keys:
             with self.subTest(key=key):
@@ -94,11 +119,16 @@ class BrowserContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.parse(wrong_game)
         unknown = deepcopy(valid_event())
-        unknown.update({
-            "event_type": "unknown", "game_id": None,
-            "raybet_match_id": None, "payload": {},
-            "payload_hash": payload_sha256({}), "capture_reason": "unknown_endpoint",
-        })
+        unknown.update(
+            {
+                "event_type": "unknown",
+                "game_id": None,
+                "raybet_match_id": None,
+                "payload": {},
+                "payload_hash": payload_sha256({}),
+                "capture_reason": "unknown_endpoint",
+            }
+        )
         self.parse(unknown)
 
     def test_manual_control_is_always_untrusted_diagnostic(self) -> None:
@@ -109,14 +139,18 @@ class BrowserContractTests(unittest.TestCase):
         event["capture_reason"] = "diagnostic_untrusted"
         self.parse(event)
 
-    def test_oversized_sanitized_hash_is_format_checked_but_not_recomputed(self) -> None:
+    def test_oversized_sanitized_hash_is_format_checked_but_not_recomputed(
+        self,
+    ) -> None:
         event = valid_event()
-        event.update({
-            "payload": {},
-            "payload_hash": "c" * 64,
-            "payload_bytes": 300_000,
-            "capture_reason": "payload_too_large",
-        })
+        event.update(
+            {
+                "payload": {},
+                "payload_hash": "c" * 64,
+                "payload_bytes": 300_000,
+                "capture_reason": "payload_too_large",
+            }
+        )
         parsed = self.parse(event)
         self.assertEqual(parsed.payload_hash, "c" * 64)
 

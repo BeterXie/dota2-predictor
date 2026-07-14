@@ -16,7 +16,6 @@ from live_betting.markets import (
     normalized_state_hash,
     snapshots_from_payload,
 )
-from live_betting.match_linker import LinkCandidate, choose_unique, normalize_name
 from live_betting.models import (
     LiveFrame,
     Market,
@@ -29,7 +28,6 @@ from live_betting.profiles.draft_curve import DraftCurve, DraftPoint
 from live_betting.profiles.player_form import PlayerForm
 from live_betting.profiles.rosters import roster_history_weight
 from live_betting.profiles.team_style import TeamStyleProfile, build_team_style
-from live_betting.providers.pandascore import PandaScoreProvider
 from live_betting.settlement import MapResult, settle
 from live_betting.storage import LiveBettingStore
 from live_betting.strategy import attempt_fill, make_order
@@ -109,18 +107,6 @@ class MarketTests(unittest.TestCase):
              "group_short_name": "Winner", "tag": "win", "odds": "2.10", "status": 5}]}}
         snapshot = snapshots_from_payload(payload)[0]
         self.assertEqual(snapshot.market.side, "team_two")
-
-
-class LinkerTests(unittest.TestCase):
-    def test_name_normalization(self) -> None:
-        self.assertEqual(normalize_name("Nigma Galaxy"), "nigmagalaxy")
-
-    def test_requires_unique_best_candidate(self) -> None:
-        self.assertIsNone(choose_unique([LinkCandidate("a", 0.91, ()), LinkCandidate("b", 0.86, ())]))
-        self.assertEqual(
-            choose_unique([LinkCandidate("a", 0.94, ()), LinkCandidate("b", 0.80, ())]).provider_match_id,
-            "a",
-        )
 
 
 class EventTests(unittest.TestCase):
@@ -337,17 +323,6 @@ class EvaluationTests(unittest.TestCase):
             for row in split:
                 owners.setdefault(row.raybet_match_id, set()).add(split_index)
         self.assertTrue(all(len(value) == 1 for value in owners.values()))
-
-
-class PandaScoreContractTests(unittest.TestCase):
-    def test_frame_parser_preserves_zero_scores(self) -> None:
-        frame = PandaScoreProvider._frame("match", {
-            "type": "frame",
-            "payload": {"sequence": 7, "game": {"id": 9, "time": 0,
-                "teams": [{"kills": 0, "gold": 600}, {"kills": 0, "gold": 600}]}}
-        })
-        self.assertEqual(frame.game_time, 0)
-        self.assertEqual((frame.team_one_kills, frame.team_two_kills), (0, 0))
 
 
 class VisionContractTests(unittest.TestCase):
