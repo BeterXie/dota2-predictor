@@ -26,9 +26,11 @@ npm test
 4. Select this `edge-extension` directory.
 5. Use the extension card's reload button after local source changes.
 
-The popup reports `Connected` as soon as the companion is reachable. No
-pairing code or local secret is required. Use the popup to pause capture and
-view queue health.
+The popup reports `Connected` as soon as the companion is reachable. Page
+hook, bridge, transport, and classification rows separately confirm that the
+RayBet page is actually being observed. Diagnostics retain only counters and
+allowlisted host/path metadata; URL queries and response bodies are excluded.
+No pairing code or local secret is required.
 
 The companion remains bound to `127.0.0.1` and accepts only the configured
 extension Origin. This workspace defaults to the currently loaded extension:

@@ -36,7 +36,6 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
     paired: true,
     secret: "legacy-secret-must-be-removed",
     enabledDomains: {ray086: true, raylinks: true},
-    debugLevel: "errors",
   });
 
   const previousFetch = globalThis.fetch;
@@ -74,12 +73,11 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
   const normalized = local.values.get("raybetMonitorConfig");
   assert.deepEqual(normalized, {
     enabledDomains: {ray086: true, raylinks: true},
-    debugLevel: "errors",
   });
   assert.equal(Object.hasOwn(normalized, "paired"), false);
   assert.equal(Object.hasOwn(normalized, "secret"), false);
 
-  const send = (message, sender = {url: "https://www.ray086.com/esports"}) => new Promise((resolve) => {
+  const send = (message, sender = {url: "https://ray086.com/esports"}) => new Promise((resolve) => {
     const keepAlive = messageListeners[0](message, sender, resolve);
     assert.equal(keepAlive, true);
   });
@@ -98,8 +96,38 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
   };
   await send({
     action: "raybet.capture.event",
-    source_origin: "https://cfinfo.365raylinks.com",
+    source_origin: "https://iminfo.esportsworldlink.com",
     event,
+  });
+  await send({
+    action: "raybet.capture.diagnostic",
+    kind: "hook_initialized",
+    frame_context: "top",
+    observed_at_utc: "2026-07-14T12:00:00.000Z",
+  });
+  await send({
+    action: "raybet.capture.diagnostic",
+    kind: "bridge_ready",
+    frame_context: "top",
+    config_loaded: true,
+    observed_at_utc: "2026-07-14T12:00:00.500Z",
+  });
+  await send({
+    action: "raybet.capture.diagnostic",
+    kind: "transport_observed",
+    frame_context: "top",
+    transport: "fetch",
+    source_host: "iminfo.esportsworldlink.com",
+    source_path: "/v2/odds",
+    amount: 7,
+    observed_at_utc: "2026-07-14T12:00:01.000Z",
+  });
+  await send({
+    action: "raybet.capture.diagnostic",
+    kind: "classification",
+    outcome: "ignored",
+    reason: "non_dota",
+    observed_at_utc: "2026-07-14T12:00:02.000Z",
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
   let status = await send({action: "raybet.popup.getStatus"});
@@ -108,11 +136,30 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
   assert.equal(status.companion.reachable, true);
   assert.equal(status.companion.connected, true);
   assert.equal(status.companion.lastError, null);
+  assert.equal(status.diagnostics.initialization.hook.top, 1);
+  assert.equal(status.diagnostics.bridgeConfigLoaded, true);
+  assert.equal(status.diagnostics.transports.fetch, 7);
+  assert.deepEqual(status.diagnostics.lastObserved, {
+    transport: "fetch",
+    sourceHost: "iminfo.esportsworldlink.com",
+    sourcePath: "/v2/odds",
+    observedAt: "2026-07-14T12:00:01.000Z",
+    frameContext: "top",
+  });
+  assert.equal(status.diagnostics.classification.ignoredReasons.non_dota, 1);
+
+  const invalidDiagnostic = await send({
+    action: "raybet.capture.diagnostic",
+    kind: "transport_observed",
+    transport: "fetch",
+    source_host: "iminfo.esportsworldlink.com",
+    source_path: "/v2/odds?token=forbidden",
+  });
+  assert.deepEqual(invalidDiagnostic, {accepted: false, reason: "invalid_diagnostic"});
 
   await send({
     action: "raybet.options.save",
     enabledDomains: {ray086: true, raylinks: false},
-    debugLevel: "errors",
   });
   assert.deepEqual(tabMessages.at(-1).message.enabledDomains, {ray086: true, raylinks: false});
   const disabled = await send({

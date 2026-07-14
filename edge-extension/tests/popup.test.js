@@ -18,6 +18,8 @@ test("popup refreshes connection and capture state after a toggle", async () => 
   const selectors = [
     "#stateDot", "#stateText", "#captureToggle", "#companionValue",
     "#matchCount", "#queueCount", "#dropCount", "#lastEvent",
+    "#hookStatus", "#bridgeStatus", "#observedCount", "#classifiedCount",
+    "#lastObserved", "#lastDecision",
     "#reportLink", "#openOptions",
   ];
   const elements = new Map(selectors.map((selector) => [selector, fakeElement()]));
@@ -28,6 +30,21 @@ test("popup refreshes connection and capture state after a toggle", async () => 
     recognizedMatches: ["42"],
     queue: [],
     counters: {dropped: 0},
+    diagnostics: {
+      bridgeConfigLoaded: true,
+      initialization: {
+        hook: {top: 1, child: 0},
+        ready: {top: 1, child: 0},
+      },
+      transports: {fetch: 3, xhr: 2, websocket: 1},
+      classification: {accepted: 2, ignored: 1},
+      lastObserved: {
+        sourceHost: "iminfo.esportsworldlink.com",
+        sourcePath: "/v2/odds",
+        observedAt: "2026-07-14T12:00:00.000Z",
+      },
+      lastClassification: {outcome: "ignored", reason: "non_dota"},
+    },
     lastEvent: null,
     remote: {report_url: "http://127.0.0.1:9000/report"},
   };
@@ -60,6 +77,11 @@ test("popup refreshes connection and capture state after a toggle", async () => 
   assert.equal(elements.get("#companionValue").textContent, "Connected");
   assert.equal(elements.get("#captureToggle").checked, true);
   assert.equal(elements.get("#reportLink").hidden, false);
+  assert.equal(elements.get("#hookStatus").textContent, "top 1 | child 0");
+  assert.equal(elements.get("#observedCount").textContent, "F 3 | X 2 | W 1");
+  assert.equal(elements.get("#classifiedCount").textContent, "2 accepted | 1 ignored");
+  assert.match(elements.get("#lastObserved").textContent, /^iminfo\.esportsworldlink\.com\/v2\/odds \| /);
+  assert.equal(elements.get("#lastDecision").textContent, "ignored: non_dota");
 
   elements.get("#captureToggle").checked = false;
   await elements.get("#captureToggle").listeners.get("change")({

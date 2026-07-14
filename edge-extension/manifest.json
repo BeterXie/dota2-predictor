@@ -5,8 +5,10 @@
   "description": "Passively records sanitized RayBet Dota 2 market events for local shadow analysis.",
   "permissions": ["storage", "alarms"],
   "host_permissions": [
+    "https://ray086.com/*",
     "https://www.ray086.com/*",
     "https://cfinfo.365raylinks.com/*",
+    "https://iminfo.esportsworldlink.com/*",
     "http://127.0.0.1/*"
   ],
   "background": {
@@ -15,14 +17,14 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://www.ray086.com/*"],
+      "matches": ["https://ray086.com/*", "https://www.ray086.com/*"],
       "js": ["src/main-hook.js"],
       "run_at": "document_start",
       "all_frames": false,
       "world": "MAIN"
     },
     {
-      "matches": ["https://www.ray086.com/*"],
+      "matches": ["https://ray086.com/*", "https://www.ray086.com/*"],
       "js": [
         "src/constants.js",
         "src/canonical-json.js",

@@ -10,9 +10,18 @@ test("manifest has the fixed minimal permission surface", () => {
   assert.deepEqual(manifest.host_permissions.sort(), [
     "http://127.0.0.1/*",
     "https://cfinfo.365raylinks.com/*",
+    "https://iminfo.esportsworldlink.com/*",
+    "https://ray086.com/*",
     "https://www.ray086.com/*",
   ]);
   const forbidden = ["cookies", "tabs", "history", "webRequest", "webRequestBlocking", "<all_urls>"];
   for (const permission of forbidden) assert.ok(!manifest.permissions.includes(permission));
   assert.equal(manifest.background.type, "module");
+  for (const script of manifest.content_scripts) {
+    assert.deepEqual(script.matches.sort(), [
+      "https://ray086.com/*",
+      "https://www.ray086.com/*",
+    ]);
+    assert.equal(script.all_frames, false);
+  }
 });

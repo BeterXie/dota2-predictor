@@ -4,6 +4,7 @@
   const ACTIONS = Object.freeze({
   EVENT: "raybet.capture.event",
   COUNTER: "raybet.capture.counter",
+  DIAGNOSTIC: "raybet.capture.diagnostic",
   GET_CONFIG: "raybet.capture.getConfig",
   STATE: "raybet.capture.state",
   });
@@ -35,8 +36,10 @@
   ]);
 
   const RAYBET_HOSTS = Object.freeze([
+  "ray086.com",
   "www.ray086.com",
   "cfinfo.365raylinks.com",
+  "iminfo.esportsworldlink.com",
   ]);
 
   Object.assign(api, {
@@ -44,6 +47,7 @@
     EXTENSION_VERSION: "0.1.0",
     DOTA2_GAME_ID: 151,
     HOOK_CHANNEL: "dota2-raybet-capture-v1",
+    DIAGNOSTIC_CHANNEL: "dota2-raybet-diagnostic-v1",
     BRIDGE_READY_CHANNEL: "dota2-raybet-bridge-ready-v1",
     ACTIONS,
     LIMITS,

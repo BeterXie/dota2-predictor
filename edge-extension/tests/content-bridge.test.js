@@ -25,16 +25,18 @@ function fixture(name) {
   return JSON.parse(readFileSync(join(root, "tests", "fixtures", name), "utf8"));
 }
 
-function loadBridge() {
+function loadBridge(pageUrl = "https://www.ray086.com/esports", rejectConfig = false) {
   const events = [];
   const eventMessages = [];
   const counters = [];
+  const diagnostics = [];
   const stateListeners = [];
   const window = new FakeWindow();
   const chrome = {
     runtime: {
       sendMessage: async (message) => {
         if (message.action === "raybet.capture.getConfig") {
+          if (rejectConfig) throw new Error("config unavailable");
           return {
             paused: false,
             enabled: true,
@@ -47,6 +49,7 @@ function loadBridge() {
           events.push(message.event);
         }
         if (message.action === "raybet.capture.counter") counters.push(message);
+        if (message.action === "raybet.capture.diagnostic") diagnostics.push(message);
         return {accepted: true};
       },
       onMessage: {addListener: (listener) => stateListeners.push(listener)},
@@ -55,7 +58,7 @@ function loadBridge() {
   const context = vm.createContext({
     window,
     chrome,
-    location: new URL("https://www.ray086.com/esports"),
+    location: new URL(pageUrl),
     performance,
     crypto,
     TextEncoder,
@@ -82,7 +85,7 @@ function loadBridge() {
   ]) {
     vm.runInContext(readFileSync(join(root, "src", file), "utf8"), context, {filename: file});
   }
-  return {window, events, eventMessages, counters, stateListeners};
+  return {window, events, eventMessages, counters, diagnostics, stateListeners};
 }
 
 function rawCandidate({
@@ -179,6 +182,62 @@ test("bridge applies source-domain changes immediately", async () => {
   await flush();
   assert.equal(harness.events.length, 3);
   assert.equal(harness.eventMessages[2].source_origin, "https://www.ray086.com");
+});
+
+test("bridge accepts the active no-www page and secondary market API", async () => {
+  const harness = loadBridge("https://ray086.com/esports");
+  await flush();
+  harness.window.postMessage(rawCandidate({
+    sequence: 1,
+    path: "/v2/odds?match_id=410001&token=discarded",
+    matchId: "410001",
+    payload: fixture("odds.json"),
+    origin: "https://iminfo.esportsworldlink.com",
+  }));
+  await flush();
+
+  assert.equal(harness.events.length, 1);
+  assert.equal(harness.events[0].page_origin, "https://ray086.com");
+  assert.equal(harness.events[0].source_path, "/v2/odds");
+  assert.equal(harness.eventMessages[0].source_origin, "https://iminfo.esportsworldlink.com");
+  assert.equal(JSON.stringify(harness.events[0]).includes("token"), false);
+  assert.ok(harness.diagnostics.some((item) => item.kind === "bridge_ready"));
+  assert.ok(harness.diagnostics.some((item) => item.kind === "classification"
+    && item.outcome === "accepted"));
+});
+
+test("diagnostic traffic cannot consume the candidate token bucket", async () => {
+  const harness = loadBridge("https://ray086.com/esports");
+  await flush();
+  for (let index = 0; index < 25; index += 1) {
+    harness.window.postMessage(JSON.stringify({
+      channel: "dota2-raybet-diagnostic-v1",
+      kind: "transport_observed",
+      observed_at_utc: "2026-07-14T12:00:00.000Z",
+      frame_context: "top",
+      transport: "fetch",
+      source_host: "iminfo.esportsworldlink.com",
+      source_path: "/v2/odds",
+      amount: 1,
+    }));
+  }
+  harness.window.postMessage(rawCandidate({
+    sequence: 1,
+    path: "/v2/odds?match_id=410001",
+    matchId: "410001",
+    payload: fixture("odds.json"),
+    origin: "https://iminfo.esportsworldlink.com",
+  }));
+  await flush();
+  assert.equal(harness.events.length, 1);
+  assert.equal(harness.events[0].event_type, "odds");
+});
+
+test("bridge diagnostics distinguish a failed config load", async () => {
+  const harness = loadBridge("https://ray086.com/esports", true);
+  await flush();
+  const ready = harness.diagnostics.find((item) => item.kind === "bridge_ready");
+  assert.equal(ready.config_loaded, false);
 });
 
 test("bridge accepts allowlisted WSS market events end to end", async () => {

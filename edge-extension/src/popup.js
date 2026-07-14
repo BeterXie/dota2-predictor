@@ -19,6 +19,29 @@ function render(status) {
   const last = status.lastEvent;
   document.querySelector("#lastEvent").textContent = last
     ? `${last.eventType} · ${new Date(last.capturedAt).toLocaleTimeString()}` : "None";
+  const diagnostics = status.diagnostics || {};
+  const initialization = diagnostics.initialization || {};
+  const initText = (value) => {
+    const top = Number(value?.top || 0);
+    const child = Number(value?.child || 0);
+    return top || child ? `top ${top} | child ${child}` : "Not seen";
+  };
+  document.querySelector("#hookStatus").textContent = initText(initialization.hook);
+  document.querySelector("#bridgeStatus").textContent = diagnostics.bridgeConfigLoaded === false
+    ? "Config failed" : initText(initialization.ready);
+  const transports = diagnostics.transports || {};
+  document.querySelector("#observedCount").textContent =
+    `F ${Number(transports.fetch || 0)} | X ${Number(transports.xhr || 0)} | W ${Number(transports.websocket || 0)}`;
+  const classification = diagnostics.classification || {};
+  document.querySelector("#classifiedCount").textContent =
+    `${Number(classification.accepted || 0)} accepted | ${Number(classification.ignored || 0)} ignored`;
+  const observed = diagnostics.lastObserved;
+  document.querySelector("#lastObserved").textContent = observed
+    ? `${observed.sourceHost}${observed.sourcePath} | ${new Date(observed.observedAt).toLocaleTimeString()}`
+    : "None";
+  const decision = diagnostics.lastClassification;
+  document.querySelector("#lastDecision").textContent = decision
+    ? `${decision.outcome}: ${decision.reason}` : "None";
   const report = status.remote?.report_url;
   const link = document.querySelector("#reportLink");
   if (report && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(report)) {

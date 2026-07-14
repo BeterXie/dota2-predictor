@@ -20,6 +20,7 @@ class FakeWindow extends EventTarget {
     this.XMLHttpRequest = Xhr;
     this.WebSocket = WebSocketImpl;
     this.messages = [];
+    this.top = this;
   }
 
   postMessage(data) {
@@ -79,7 +80,7 @@ function contextFor(fetchImpl) {
   return {context, window};
 }
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
+const flush = () => new Promise((resolve) => setTimeout(resolve, 300));
 
 test("fetch return value is unchanged and early capture flushes after bridge ready", async () => {
   const payload = JSON.stringify({result: {id: 42, game_id: 151, odds: []}});
@@ -96,10 +97,19 @@ test("fetch return value is unchanged and early capture flushes after bridge rea
 
   window.postMessage("dota2-raybet-bridge-ready-v1", "*");
   await flush();
-  const candidate = JSON.parse(window.messages.find((item) => typeof item === "string" && item.startsWith("{")));
+  const messages = window.messages
+    .filter((item) => typeof item === "string" && item.startsWith("{"))
+    .map((item) => JSON.parse(item));
+  const candidate = messages.find((item) => item.channel === "dota2-raybet-capture-v1");
   assert.equal(candidate.transport, "fetch");
   assert.equal(candidate.raybet_match_id, "42");
   assert.equal(candidate.body_text, payload);
+  const diagnostics = messages.filter((item) => item.channel === "dota2-raybet-diagnostic-v1");
+  assert.ok(diagnostics.some((item) => item.kind === "hook_initialized"));
+  const observed = diagnostics.find((item) => item.kind === "transport_observed");
+  assert.equal(observed.source_host, "cfinfo.365raylinks.com");
+  assert.equal(observed.source_path, "/v2/odds");
+  assert.equal(JSON.stringify(observed).includes("match_id"), false);
 });
 
 test("XHR completion and WebSocket listener preserve page-facing behavior", async () => {
@@ -126,6 +136,8 @@ test("XHR completion and WebSocket listener preserve page-facing behavior", asyn
     .map((item) => JSON.parse(item));
   assert.ok(candidates.some((item) => item.transport === "xhr"));
   assert.ok(candidates.some((item) => item.transport === "websocket"));
+  assert.ok(candidates.some((item) => item.kind === "transport_observed"
+    && item.source_path === "/v2/match"));
   assert.equal(pageMessages, 1);
   assert.equal(window.WebSocket.OPEN, 1);
   assert.equal(socket instanceof FakeSocket, true);

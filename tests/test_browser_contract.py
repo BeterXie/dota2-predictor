@@ -22,7 +22,7 @@ def valid_event() -> dict:
         "event_id": "a" * 64,
         "capture_session_id": "b" * 32,
         "captured_at_utc": "2026-07-13T08:12:34.567Z",
-        "page_origin": "https://www.ray086.com",
+        "page_origin": "https://ray086.com",
         "page_path": "/sports/esports",
         "source_path": "/v2/odds",
         "transport": "fetch",

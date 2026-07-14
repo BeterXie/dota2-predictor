@@ -2,11 +2,18 @@
   "use strict";
 
   const HOOK_CHANNEL = "dota2-raybet-capture-v1";
+  const DIAGNOSTIC_CHANNEL = "dota2-raybet-diagnostic-v1";
   const BRIDGE_READY_CHANNEL = "dota2-raybet-bridge-ready-v1";
   const RAW_LIMIT = 1024 * 1024;
   const EARLY_LIMIT_COUNT = 60;
   const EARLY_LIMIT_BYTES = 1024 * 1024;
-  const ALLOWED_HOSTS = new Set(["www.ray086.com", "cfinfo.365raylinks.com"]);
+  const DIAGNOSTIC_FLUSH_MS = 250;
+  const ALLOWED_HOSTS = new Set([
+    "ray086.com",
+    "www.ray086.com",
+    "cfinfo.365raylinks.com",
+    "iminfo.esportsworldlink.com",
+  ]);
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8", {fatal: false});
   const early = [];
@@ -15,6 +22,8 @@
   let sequence = 0;
   let activeDotaMatchId = null;
   let lastDotaOddsAt = 0;
+  const pendingTransportDiagnostics = new Map();
+  let diagnosticFlushTimer = null;
 
   function ownDataValue(object, key) {
     if (object === null || (typeof object !== "object" && typeof object !== "function")) return undefined;
@@ -54,20 +63,8 @@
     window.postMessage(serialized, "*");
   }
 
-  function emitCandidate(candidate) {
-    let serialized = candidateString(candidate);
-    let bytes = encoder.encode(serialized).byteLength;
-    if (bytes > RAW_LIMIT + 16 * 1024) {
-      serialized = candidateString({
-        transport: candidate.transport,
-        source_url: candidate.source_url,
-        raybet_match_id: candidate.raybet_match_id || null,
-        body_text: null,
-        raw_bytes: candidate.raw_bytes || bytes,
-        capture_reason: "raw_payload_too_large",
-      });
-      bytes = encoder.encode(serialized).byteLength;
-    }
+  function emitSerialized(serialized) {
+    const bytes = encoder.encode(serialized).byteLength;
     if (bridgeReady) {
       postSerialized(serialized);
       return;
@@ -81,6 +78,55 @@
       early.push({serialized, bytes});
       earlyBytes += bytes;
     }
+  }
+
+  function emitCandidate(candidate) {
+    let serialized = candidateString(candidate);
+    const bytes = encoder.encode(serialized).byteLength;
+    if (bytes > RAW_LIMIT + 16 * 1024) {
+      serialized = candidateString({
+        transport: candidate.transport,
+        source_url: candidate.source_url,
+        raybet_match_id: candidate.raybet_match_id || null,
+        body_text: null,
+        raw_bytes: candidate.raw_bytes || bytes,
+        capture_reason: "raw_payload_too_large",
+      });
+    }
+    emitSerialized(serialized);
+  }
+
+  function emitDiagnostic(kind, detail = {}) {
+    emitSerialized(JSON.stringify({
+      channel: DIAGNOSTIC_CHANNEL,
+      kind,
+      observed_at_utc: new Date().toISOString(),
+      frame_context: window.top === undefined || window === window.top ? "top" : "child",
+      ...detail,
+    }));
+  }
+
+  function emitTransportObserved(transport, url) {
+    if (!allowedUrl(url)) return;
+    const knownPath = ["/v2/match", "/v2/odds", "/live"].includes(url.pathname)
+      ? url.pathname : "/other";
+    const key = `${transport}\n${url.hostname}\n${knownPath}`;
+    const current = pendingTransportDiagnostics.get(key) || {
+      transport,
+      source_host: url.hostname,
+      source_path: knownPath,
+      amount: 0,
+    };
+    current.amount = Math.min(1000, current.amount + 1);
+    pendingTransportDiagnostics.set(key, current);
+    if (diagnosticFlushTimer !== null) return;
+    diagnosticFlushTimer = setTimeout(() => {
+      diagnosticFlushTimer = null;
+      for (const detail of pendingTransportDiagnostics.values()) {
+        emitDiagnostic("transport_observed", detail);
+      }
+      pendingTransportDiagnostics.clear();
+    }, DIAGNOSTIC_FLUSH_MS);
   }
 
   function markActiveDota(sourceUrl, bodyText) {
@@ -157,6 +203,7 @@
       Promise.resolve(result).then((response) => {
         const sourceUrl = response?.url ? parseUrl(response.url) : parseUrl(args[0]);
         if (!response || !relevantHttpUrl(sourceUrl)) return;
+        emitTransportObserved("fetch", sourceUrl);
         void readFetchClone(response.clone(), sourceUrl.href);
       }).catch(() => undefined);
       return result;
@@ -179,6 +226,7 @@
       if (meta?.url && relevantHttpUrl(meta.url)) {
         this.addEventListener("loadend", () => queueMicrotask(() => {
           try {
+            emitTransportObserved("xhr", meta.url);
             let text = null;
             if (!this.responseType || this.responseType === "text") text = this.responseText;
             else if (this.responseType === "json") text = JSON.stringify(this.response);
@@ -204,6 +252,7 @@
       const url = parseUrl(args[0]);
       if (allowedUrl(url)) {
         socket.addEventListener("message", (event) => {
+          emitTransportObserved("websocket", url);
           if (typeof event.data === "string") {
             const bytes = encoder.encode(event.data).byteLength;
             emitText("websocket", url.href, bytes > RAW_LIMIT ? null : event.data, bytes,
@@ -231,6 +280,8 @@
     for (const item of early.splice(0)) postSerialized(item.serialized);
     earlyBytes = 0;
   });
+
+  emitDiagnostic("hook_initialized");
 
   setInterval(() => {
     if (!activeDotaMatchId || Date.now() - lastDotaOddsAt > 30_000 || document.visibilityState !== "visible") return;

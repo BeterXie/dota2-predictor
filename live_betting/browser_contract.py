@@ -22,8 +22,10 @@ VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 RAYBET_ORIGINS = frozenset(
     {
+        "https://ray086.com",
         "https://www.ray086.com",
         "https://cfinfo.365raylinks.com",
+        "https://iminfo.esportsworldlink.com",
     }
 )
 

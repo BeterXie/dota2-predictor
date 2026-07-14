@@ -16,6 +16,12 @@
   };
   let tokens = 60;
   let lastRefill = performance.now();
+  let diagnosticTokens = 20;
+  let lastDiagnosticRefill = performance.now();
+
+  function frameContext() {
+    return window.top === undefined || window === window.top ? "top" : "child";
+  }
 
   function takeToken() {
     const now = performance.now();
@@ -26,12 +32,51 @@
     return true;
   }
 
+  function takeDiagnosticToken() {
+    const now = performance.now();
+    diagnosticTokens = Math.min(20, diagnosticTokens + ((now - lastDiagnosticRefill) / 1000) * 5);
+    lastDiagnosticRefill = now;
+    if (diagnosticTokens < 1) return false;
+    diagnosticTokens -= 1;
+    return true;
+  }
+
   function count(counter, amount = 1) {
     void chrome.runtime.sendMessage({action: api.ACTIONS.COUNTER, counter, amount}).catch(() => undefined);
   }
 
+  function diagnostic(kind, detail = {}) {
+    void chrome.runtime.sendMessage({
+      action: api.ACTIONS.DIAGNOSTIC,
+      kind,
+      observed_at_utc: new Date().toISOString(),
+      frame_context: frameContext(),
+      ...detail,
+    }).catch(() => undefined);
+  }
+
+  function ignored(reason) {
+    count("ignored");
+    diagnostic("classification", {outcome: "ignored", reason});
+  }
+
+  function accepted(reason) {
+    diagnostic("classification", {outcome: "accepted", reason});
+  }
+
+  async function forwardEvent(origin, event) {
+    const response = await chrome.runtime.sendMessage({
+      action: api.ACTIONS.EVENT,
+      source_origin: origin,
+      event,
+    });
+    if (response?.accepted) accepted(event.capture_reason || event.event_type);
+    else ignored(response?.reason || "service_worker_rejected");
+  }
+
   function safePageOrigin() {
-    return location.origin === "https://www.ray086.com" ? location.origin : null;
+    return ["https://ray086.com", "https://www.ray086.com"].includes(location.origin)
+      ? location.origin : null;
   }
 
   function sourceOrigin(raw) {
@@ -48,8 +93,10 @@
   }
 
   function sourceEnabled(origin) {
-    if (origin === "https://www.ray086.com") return Boolean(config.enabledDomains?.ray086);
-    if (origin === "https://cfinfo.365raylinks.com") {
+    if (["https://ray086.com", "https://www.ray086.com"].includes(origin)) {
+      return Boolean(config.enabledDomains?.ray086);
+    }
+    if (["https://cfinfo.365raylinks.com", "https://iminfo.esportsworldlink.com"].includes(origin)) {
       return Boolean(config.enabledDomains?.raylinks);
     }
     return false;
@@ -89,7 +136,7 @@
       payloadBytes = sanitized.bytes;
       payloadHash = await api.sha256Hex(api.canonicalJson(sanitized.value));
     } else {
-      count("ignored");
+      ignored(sanitized.reason || "invalid_envelope");
       return null;
     }
 
@@ -139,7 +186,7 @@
   async function metadataEnvelope(raw, reason) {
     const matchId = raw.raybet_match_id ? String(raw.raybet_match_id) : null;
     if (!matchId || !classificationState.dotaMatchIds.has(matchId)) {
-      count("ignored");
+      ignored("metadata_untrusted_match");
       return null;
     }
     return envelopeFor(raw, {
@@ -153,14 +200,17 @@
   }
 
   async function processRaw(raw) {
-    if (!config.enabled || config.paused || !config.captureSessionId) return;
+    if (!config.enabled || config.paused || !config.captureSessionId) {
+      ignored("capture_inactive");
+      return;
+    }
     if (!api.ALLOWED_TRANSPORTS.includes(raw.transport) || !Number.isInteger(raw.sequence)) {
-      count("ignored");
+      ignored("invalid_raw");
       return;
     }
     const origin = sourceOrigin(raw);
     if (!sourceEnabled(origin)) {
-      count("ignored");
+      ignored("disabled_source");
       return;
     }
     count("candidates");
@@ -168,17 +218,13 @@
       const event = await metadataEnvelope(raw, raw.capture_reason);
       if (event) {
         count("metadataOnly");
-        await chrome.runtime.sendMessage({
-          action: api.ACTIONS.EVENT,
-          source_origin: origin,
-          event,
-        });
+        await forwardEvent(origin, event);
       }
       return;
     }
     const payload = parsePayload(raw);
     if (!payload) {
-      count("ignored");
+      ignored("invalid_json");
       return;
     }
     const guarded = api.sanitizeCandidate(payload, {SANITIZED_BYTES: api.LIMITS.RAW_BYTES});
@@ -186,11 +232,7 @@
       const event = await metadataEnvelope(raw, guarded.reason || "invalid_candidate");
       if (event) {
         count("metadataOnly");
-        await chrome.runtime.sendMessage({
-          action: api.ACTIONS.EVENT,
-          source_origin: origin,
-          event,
-        });
+        await forwardEvent(origin, event);
       }
       return;
     }
@@ -203,25 +245,52 @@
     };
     const result = api.classifyCandidate(candidate, classificationState);
     if (!result.events.length) {
-      count("ignored");
+      ignored(result.ignoredReason || "no_events");
       return;
     }
     for (const classified of result.events) {
       const event = await envelopeFor(raw, classified);
-      if (!event || !event.page_origin) continue;
+      if (!event) continue;
+      if (!event.page_origin) {
+        ignored("invalid_page_origin");
+        continue;
+      }
       if (event.capture_reason || event.event_type === "unknown") count("metadataOnly");
-      await chrome.runtime.sendMessage({
-        action: api.ACTIONS.EVENT,
-        source_origin: origin,
-        event,
-      });
+      await forwardEvent(origin, event);
     }
+  }
+
+  function forwardHookDiagnostic(raw) {
+    if (raw.kind === "hook_initialized") {
+      diagnostic("hook_initialized", {
+        observed_at_utc: raw.observed_at_utc,
+        frame_context: raw.frame_context,
+      });
+      return;
+    }
+    if (raw.kind !== "transport_observed"
+        || !["fetch", "xhr", "websocket"].includes(raw.transport)
+        || !api.RAYBET_HOSTS.includes(raw.source_host)
+        || typeof raw.source_path !== "string"
+        || raw.source_path.length > 512
+        || !raw.source_path.startsWith("/")
+        || raw.source_path.includes("?")
+        || raw.source_path.includes("#")) return;
+    diagnostic("transport_observed", {
+      observed_at_utc: raw.observed_at_utc,
+      frame_context: raw.frame_context,
+      transport: raw.transport,
+      source_host: raw.source_host,
+      source_path: raw.source_path,
+      amount: Number.isInteger(raw.amount) && raw.amount >= 1 && raw.amount <= 1000
+        ? raw.amount : 1,
+    });
   }
 
   window.addEventListener("message", (event) => {
     if (event.source !== window || typeof event.data !== "string") return;
     if (event.data === api.BRIDGE_READY_CHANNEL) return;
-    if (!event.data.startsWith("{") || encoder.encode(event.data).byteLength > rawLimit || !takeToken()) {
+    if (!event.data.startsWith("{") || encoder.encode(event.data).byteLength > rawLimit) {
       count("ignored");
       return;
     }
@@ -229,11 +298,19 @@
     try {
       raw = JSON.parse(event.data);
     } catch {
-      count("ignored");
+      ignored("invalid_bridge_json");
+      return;
+    }
+    if (raw.channel === api.DIAGNOSTIC_CHANNEL) {
+      if (takeDiagnosticToken()) forwardHookDiagnostic(raw);
       return;
     }
     if (raw.channel !== api.HOOK_CHANNEL) return;
-    void processRaw(raw).catch(() => count("ignored"));
+    if (!takeToken()) {
+      ignored("rate_limited");
+      return;
+    }
+    void processRaw(raw).catch(() => ignored("processing_error"));
   });
 
   chrome.runtime.onMessage.addListener((message) => {
@@ -247,10 +324,13 @@
     }
   });
 
+  diagnostic("bridge_initialized");
   chrome.runtime.sendMessage({action: api.ACTIONS.GET_CONFIG}).then((value) => {
     if (value && typeof value.captureSessionId === "string") config = value;
+    diagnostic("bridge_ready", {config_loaded: Boolean(config.captureSessionId)});
     window.postMessage(api.BRIDGE_READY_CHANNEL, "*");
   }).catch(() => {
+    diagnostic("bridge_ready", {config_loaded: false});
     window.postMessage(api.BRIDGE_READY_CHANNEL, "*");
   });
 

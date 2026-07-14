@@ -37,6 +37,13 @@ test("classic scripts load in order and expose the shared API", () => {
   assert.equal(api.LIMITS.RAW_BYTES, 1024 * 1024);
   assert.equal(api.LIMITS.SANITIZED_BYTES, 256 * 1024);
   assert.equal(api.ACTIONS.EVENT, "raybet.capture.event");
+  assert.equal(api.ACTIONS.DIAGNOSTIC, "raybet.capture.diagnostic");
+  assert.deepEqual(plain(api.RAYBET_HOSTS), [
+    "ray086.com",
+    "www.ray086.com",
+    "cfinfo.365raylinks.com",
+    "iminfo.esportsworldlink.com",
+  ]);
   assert.equal(typeof api.sanitizeCandidate, "function");
   assert.equal(typeof api.classifyCandidate, "function");
 });
