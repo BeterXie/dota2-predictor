@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 SCOPE_POLICY_VERSION = "strict-t1-usd1m-main-event-v1"
 AUDITED_AT = "2026-07-13T00:00:00+00:00"
+REGISTRY_UPDATED_AT = "2026-07-13T20:56:00+00:00"
 EXCLUDED_CATEGORIES = (
     "qualifier",
     "division_2",
@@ -92,18 +93,23 @@ APPROVED_EVENT_SEEDS: tuple[dict[str, Any], ...] = (
         "event_id": "ewc-dota2-2026",
         "canonical_name": "Esports World Cup 2026",
         "tier": "tier_1",
-        "prize_pool_usd": 1_000_000,
+        "prize_pool_usd": 2_000_000,
         "main_event_start_at": "2026-07-07T00:00:00+00:00",
-        "main_event_end_at": "2026-07-12T23:59:59+00:00",
+        "main_event_end_at": "2026-07-19T23:59:59+00:00",
         "opendota_league_id": 19785,
-        "official_evidence_urls": ("https://www.esportsworldcup.com/",),
-        "expected_map_count": 120,
+        "official_evidence_urls": (
+            "https://www.esportsworldcup.com/en/competitions/2026/dota2",
+            "https://blast.tv/dota/tournaments/esports-world-cup-2026-dota-2",
+        ),
+        "expected_map_count": None,
         "observed_map_count": 120,
-        "public_map_count": 121,
+        "public_map_count": 120,
         "reconciliation_status": "reconciliation_pending",
         "reconciliation_note": (
-            "OpenDota exposes 120 maps while the audited public count is 121; "
-            "the unmatched or duplicate map remains unresolved."
+            "The event remains active through 2026-07-19 UTC. Official data "
+            "contains 120 completed game objects through the group stage; the "
+            "58-second LGD-VP tiebreaker record has no game object and is "
+            "excluded. The final map count remains unknown."
         ),
         "included_stages": ("main_event",),
         "include_internal_lcq": 0,
@@ -125,6 +131,7 @@ class EventRegistry:
 
     def seed_approved_events(self) -> None:
         with self._transaction():
+            self._migrate_known_seed_corrections()
             for seed in APPROVED_EVENT_SEEDS:
                 self.connection.execute(
                     """INSERT OR IGNORE INTO event_registry
@@ -162,9 +169,90 @@ class EventRegistry:
                         self._json(EXCLUDED_CATEGORIES),
                         seed["include_internal_lcq"],
                         AUDITED_AT,
-                        AUDITED_AT,
+                        REGISTRY_UPDATED_AT,
                     ),
                 )
+
+    def _migrate_known_seed_corrections(self) -> None:
+        ewc = next(
+            seed
+            for seed in APPROVED_EVENT_SEEDS
+            if seed["event_id"] == "ewc-dota2-2026"
+        )
+        legacy_note = (
+            "OpenDota exposes 120 maps while the audited public count is 121; "
+            "the unmatched or duplicate map remains unresolved."
+        )
+        interim_note = (
+            "The event remains active through 2026-07-19 UTC. OpenDota's 120 "
+            "maps and the audited public count of 121 are interim; the final "
+            "map count and the current one-map discrepancy remain unresolved."
+        )
+        self.connection.execute(
+            """UPDATE event_registry
+               SET prize_pool_usd=?, main_event_end_at=?,
+                   official_evidence_urls_json=?, expected_map_count=?,
+                   public_map_count=?,
+                   reconciliation_note=CASE
+                       WHEN reconciliation_note=? THEN ?
+                       ELSE reconciliation_note
+                   END,
+                   updated_at=CASE
+                       WHEN updated_at > ? THEN updated_at
+                       ELSE ?
+                   END
+               WHERE event_id='ewc-dota2-2026'
+                 AND canonical_name='Esports World Cup 2026'
+                 AND tier='tier_1'
+                 AND prize_pool_usd=1000000
+                 AND main_event_start_at='2026-07-07T00:00:00+00:00'
+                 AND main_event_end_at='2026-07-12T23:59:59+00:00'
+                 AND opendota_league_id=19785
+                 AND official_evidence_urls_json=?
+                 AND expected_map_count=120
+                 AND public_map_count=121""",
+            (
+                ewc["prize_pool_usd"],
+                ewc["main_event_end_at"],
+                self._json(ewc["official_evidence_urls"]),
+                ewc["expected_map_count"],
+                ewc["public_map_count"],
+                legacy_note,
+                ewc["reconciliation_note"],
+                REGISTRY_UPDATED_AT,
+                REGISTRY_UPDATED_AT,
+                self._json(("https://www.esportsworldcup.com/",)),
+            ),
+        )
+        self.connection.execute(
+            """UPDATE event_registry
+               SET public_map_count=?,
+                   reconciliation_note=?,
+                   updated_at=CASE
+                       WHEN updated_at > ? THEN updated_at
+                       ELSE ?
+                   END
+               WHERE event_id='ewc-dota2-2026'
+                 AND canonical_name='Esports World Cup 2026'
+                 AND tier='tier_1'
+                 AND prize_pool_usd=2000000
+                 AND main_event_start_at='2026-07-07T00:00:00+00:00'
+                 AND main_event_end_at='2026-07-19T23:59:59+00:00'
+                 AND opendota_league_id=19785
+                 AND official_evidence_urls_json=?
+                 AND expected_map_count IS NULL
+                 AND observed_map_count=120
+                 AND public_map_count=121
+                 AND reconciliation_note=?""",
+            (
+                ewc["public_map_count"],
+                ewc["reconciliation_note"],
+                REGISTRY_UPDATED_AT,
+                REGISTRY_UPDATED_AT,
+                self._json(ewc["official_evidence_urls"]),
+                interim_note,
+            ),
+        )
 
     def formal_events(self) -> tuple[RegisteredEvent, ...]:
         rows = self.connection.execute(
@@ -266,7 +354,9 @@ class EventRegistry:
 
     @staticmethod
     def _json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        return json.dumps(
+            value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        )
 
     @staticmethod
     def _iso(value: datetime) -> str:
@@ -289,9 +379,12 @@ class EventRegistry:
             main_event_start_at=cls._datetime(row["main_event_start_at"]),
             main_event_end_at=cls._datetime(row["main_event_end_at"]),
             opendota_league_id=int(row["opendota_league_id"]),
-            secondary_provider_ids=tuple(sorted((str(key), str(value))
-                                                for key, value in secondary.items())),
-            official_evidence_urls=tuple(json.loads(row["official_evidence_urls_json"])),
+            secondary_provider_ids=tuple(
+                sorted((str(key), str(value)) for key, value in secondary.items())
+            ),
+            official_evidence_urls=tuple(
+                json.loads(row["official_evidence_urls_json"])
+            ),
             evidence_status=EvidenceStatus(row["evidence_status"]),
             scope_policy_version=str(row["scope_policy_version"]),
             scope=EventScope(row["scope"]),
@@ -303,8 +396,9 @@ class EventRegistry:
             observed_map_count=row["observed_map_count"],
             public_map_count=row["public_map_count"],
             reconciliation_note=row["reconciliation_note"],
-            included_stages=tuple(StageScope(value)
-                                  for value in json.loads(row["included_stages_json"])),
+            included_stages=tuple(
+                StageScope(value) for value in json.loads(row["included_stages_json"])
+            ),
             excluded_categories=tuple(json.loads(row["excluded_categories_json"])),
             include_internal_lcq=bool(row["include_internal_lcq"]),
         )
@@ -312,7 +406,11 @@ class EventRegistry:
     @classmethod
     def _candidate(cls, row: sqlite3.Row) -> EventCandidate:
         audit_status = row["audit_status"]
-        approval = ApprovalStatus.APPROVED if audit_status in ("approved", "promoted") else ApprovalStatus(audit_status)
+        approval = (
+            ApprovalStatus.APPROVED
+            if audit_status in ("approved", "promoted")
+            else ApprovalStatus(audit_status)
+        )
         return EventCandidate(
             candidate_id=int(row["candidate_id"]),
             source=str(row["source"]),

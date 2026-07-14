@@ -41,6 +41,13 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _non_empty_text(value: str) -> str:
+    parsed = value.strip()
+    if not parsed:
+        raise argparse.ArgumentTypeError("must not be empty")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
@@ -50,10 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=ROOT / "data" / "raw" / "event_intelligence",
     )
     parser.add_argument("--once", action="store_true", help="run one immediate cycle")
-    parser.add_argument("--event", help="approved internal event ID")
-    parser.add_argument("--match", type=_positive_int, help="formal discovered match ID")
     parser.add_argument(
-        "--active", action="store_true", help="limit discovery to active approved events"
+        "--scheduler-once",
+        action="store_true",
+        help="run one due scheduler cycle and persist its checkpoints",
+    )
+    parser.add_argument(
+        "--event", type=_non_empty_text, help="approved internal event ID"
+    )
+    parser.add_argument(
+        "--match", type=_positive_int, help="formal discovered match ID"
+    )
+    parser.add_argument(
+        "--active",
+        action="store_true",
+        help="limit discovery to active approved events",
     )
     parser.add_argument(
         "--reconcile", action="store_true", help="update event reconciliation evidence"
@@ -124,7 +142,10 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
     scheduler = IngestScheduler(ingestor, store)
     callbacks = tuple(
         callback
-        for callback in (getattr(client, "close", None), getattr(storage, "close", None))
+        for callback in (
+            getattr(client, "close", None),
+            getattr(storage, "close", None),
+        )
         if callback is not None
     )
     return Runtime(ingestor, scheduler, callbacks)
@@ -144,14 +165,23 @@ async def run(
 ) -> int:
     if args.match is not None and args.active:
         raise ValueError("--match cannot be combined with --active")
+    if args.scheduler_once and (
+        args.once or args.event is not None or args.match is not None or args.reconcile
+    ):
+        raise ValueError(
+            "--scheduler-once cannot be combined with direct one-shot filters"
+        )
     runtime = runtime_factory(args)
     try:
-        one_shot = bool(
-            args.once or args.event or args.match is not None or args.reconcile
+        direct_one_shot = bool(
+            args.once
+            or args.event is not None
+            or args.match is not None
+            or args.reconcile
         )
         while True:
             now = datetime.now(timezone.utc)
-            if one_shot:
+            if direct_one_shot:
                 report = await runtime.ingestor.run_once(
                     event_id=args.event,
                     match_id=args.match,
@@ -164,7 +194,7 @@ async def run(
                     now, include_recent=not args.active
                 )
             print(_report_json(report), flush=True)
-            if one_shot:
+            if direct_one_shot or args.scheduler_once:
                 return 0
             await asyncio.sleep(args.interval)
     finally:
@@ -176,6 +206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.match is not None and args.active:
         parser.error("--match cannot be combined with --active")
+    if args.scheduler_once and (
+        args.once or args.event is not None or args.match is not None or args.reconcile
+    ):
+        parser.error("--scheduler-once cannot be combined with direct one-shot filters")
     try:
         return asyncio.run(run(args))
     except KeyboardInterrupt:
@@ -186,5 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     raise SystemExit(main())

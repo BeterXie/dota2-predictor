@@ -13,7 +13,7 @@ from .benchmarks import BenchmarkSnapshot, robust_z
 from .raw_archive import canonical_json_bytes
 
 
-SCORE_VERSION = "player-score-v2"
+SCORE_VERSION = "player-score-v3"
 ROLE_DEPENDENT_CONFIDENCE = 0.7
 
 
@@ -55,9 +55,7 @@ def _metric(
     return MetricSpec(name, transform, denominator, direction)
 
 
-def _component(
-    name: str, weight: float, *metrics: MetricSpec
-) -> ComponentConfig:
+def _component(name: str, weight: float, *metrics: MetricSpec) -> ComponentConfig:
     return ComponentConfig(name, weight, metrics)
 
 
@@ -90,24 +88,24 @@ ROLE_SCORING_CONFIGS = (
                 _metric("kills_assists", TEAM_SHARE, "team_kills"),
             ),
             _component(
-                "tower_roshan_conversion",
+                "objective_damage",
                 0.20,
                 _metric("tower_damage", TEAM_SHARE, "team_tower_damage"),
-                _metric(
-                    "roshan_participations", OPPORTUNITY, "roshan_opportunities"
-                ),
+                _metric("roshan_damage", PER_10),
             ),
             _component("survival", 0.10, _metric("deaths", PER_10, direction=-1)),
             _component(
                 "late_fights",
                 0.10,
                 _metric(
-                    "late_fight_participations",
+                    "detected_late_teamfight_participations",
                     OPPORTUNITY,
                     "late_fight_opportunities",
                 ),
                 _metric(
-                    "late_fight_output", TEAM_SHARE, "team_late_fight_output"
+                    "detected_late_teamfight_damage",
+                    TEAM_SHARE,
+                    "team_late_teamfight_damage",
                 ),
             ),
         ),
@@ -122,12 +120,15 @@ ROLE_SCORING_CONFIGS = (
                 _metric("last_hits_10_diff", RAW),
             ),
             _component(
-                "rotation_participation",
+                "early_activity",
                 0.25,
                 _metric(
-                    "early_kill_participations", OPPORTUNITY, "early_team_kills"
+                    "detected_early_teamfight_participations",
+                    OPPORTUNITY,
+                    "early_teamfight_opportunities",
                 ),
-                _metric("rune_pickups", PER_10),
+                _metric("logged_rune_pickups_at_10", RAW),
+                _metric("kills_at_10", RAW),
             ),
             _component(
                 "kill_damage_output",
@@ -136,14 +137,10 @@ ROLE_SCORING_CONFIGS = (
                 _metric("hero_damage", TEAM_SHARE, "team_hero_damage"),
             ),
             _component(
-                "tempo_objectives",
+                "building_pressure",
                 0.15,
-                _metric(
-                    "early_objective_participations",
-                    OPPORTUNITY,
-                    "early_objective_opportunities",
-                ),
                 _metric("tower_damage", TEAM_SHARE, "team_tower_damage"),
+                _metric("high_ground_damage", PER_10),
             ),
             _component(
                 "resource_efficiency",
@@ -158,37 +155,36 @@ ROLE_SCORING_CONFIGS = (
         3,
         (
             _component(
-                "suppress_opposing_carry",
+                "opposing_carry_economy",
                 0.20,
-                _metric("opposing_carry_gold_suppression_at_10", RAW),
-                _metric("opposing_carry_lh_suppression_at_10", RAW),
+                _metric("opposing_carry_gold_at_10", RAW, direction=-1),
+                _metric("opposing_carry_last_hits_at_10", RAW, direction=-1),
             ),
             _component(
-                "damage_taken_initiation_control",
+                "tank_and_control",
                 0.25,
                 _metric("damage_taken", PER_10),
                 _metric("control_seconds", PER_10),
-                _metric("initiations", OPPORTUNITY, "initiation_opportunities"),
             ),
             _component(
                 "teamfights",
                 0.20,
                 _metric(
-                    "teamfight_participations",
+                    "detected_teamfight_participations",
                     OPPORTUNITY,
                     "teamfight_opportunities",
                 ),
-                _metric("teamfight_impact", TEAM_SHARE, "team_teamfight_impact"),
+                _metric(
+                    "detected_teamfight_damage",
+                    TEAM_SHARE,
+                    "team_teamfight_damage",
+                ),
             ),
             _component(
-                "tower_high_ground_conversion",
+                "building_pressure",
                 0.15,
                 _metric("tower_damage", TEAM_SHARE, "team_tower_damage"),
-                _metric(
-                    "high_ground_participations",
-                    OPPORTUNITY,
-                    "high_ground_opportunities",
-                ),
+                _metric("high_ground_damage", PER_10),
             ),
             _component(
                 "low_resource_efficiency",
@@ -203,12 +199,14 @@ ROLE_SCORING_CONFIGS = (
         4,
         (
             _component(
-                "early_rotation_participation",
+                "early_activity",
                 0.25,
                 _metric(
-                    "early_kill_participations", OPPORTUNITY, "early_team_kills"
+                    "detected_early_teamfight_participations",
+                    OPPORTUNITY,
+                    "early_teamfight_opportunities",
                 ),
-                _metric("rotations_at_10", RAW),
+                _metric("logged_rune_pickups_at_10", RAW),
             ),
             _component(
                 "vision_dewarding",
@@ -218,16 +216,15 @@ ROLE_SCORING_CONFIGS = (
                 _metric("dewards", PER_10),
             ),
             _component(
-                "control_initiation",
+                "control",
                 0.25,
                 _metric("control_seconds", PER_10),
-                _metric("initiations", OPPORTUNITY, "initiation_opportunities"),
             ),
             _component(
                 "teamfights",
                 0.15,
                 _metric(
-                    "teamfight_participations",
+                    "detected_teamfight_participations",
                     OPPORTUNITY,
                     "teamfight_opportunities",
                 ),
@@ -240,11 +237,10 @@ ROLE_SCORING_CONFIGS = (
                 _metric("control_seconds", PER_ECONOMY, "net_worth"),
             ),
             _component(
-                "objective_conversion",
+                "objective_damage",
                 0.05,
-                _metric(
-                    "objective_participations", OPPORTUNITY, "objective_opportunities"
-                ),
+                _metric("roshan_damage", PER_10),
+                _metric("high_ground_damage", PER_10),
             ),
         ),
     ),
@@ -259,17 +255,16 @@ ROLE_SCORING_CONFIGS = (
                 _metric("dewards", PER_10),
             ),
             _component(
-                "control_save_healing",
+                "control_healing",
                 0.25,
                 _metric("control_seconds", PER_10),
-                _metric("saves", OPPORTUNITY, "save_opportunities"),
                 _metric("hero_healing", PER_10),
             ),
             _component(
                 "teamfight_participation",
                 0.20,
                 _metric(
-                    "teamfight_participations",
+                    "detected_teamfight_participations",
                     OPPORTUNITY,
                     "teamfight_opportunities",
                 ),
@@ -282,18 +277,17 @@ ROLE_SCORING_CONFIGS = (
                 _metric("assists", PER_ECONOMY, "net_worth"),
             ),
             _component(
-                "lane_support_pulls_stacks",
+                "early_lane_support",
                 0.10,
-                _metric("pulls", OPPORTUNITY, "pull_opportunities"),
+                _metric("observer_wards_at_10", RAW),
+                _metric("sentry_wards_at_10", RAW),
                 _metric("stacks", PER_10),
-                _metric("lane_support_events", PER_10),
             ),
             _component(
-                "objectives",
+                "objective_damage",
                 0.05,
-                _metric(
-                    "objective_participations", OPPORTUNITY, "objective_opportunities"
-                ),
+                _metric("roshan_damage", PER_10),
+                _metric("high_ground_damage", PER_10),
             ),
         ),
     ),
@@ -319,6 +313,7 @@ class PlayerScoreInput:
     event_strength: float
     target_started_at: datetime
     first_usable_at: datetime | None
+    source_content_hash: str
     role_assignment_source: str
     role_assignment_cutoff: datetime
     role_assignment_input_hash: str
@@ -338,6 +333,8 @@ class MetricResult:
     transformed_value: float | None
     benchmark_median: float | None
     benchmark_mad: float | None
+    benchmark_sample_size: int | None
+    benchmark_fallback_level: str | None
     robust_z: float | None
     direction: int
     missing_reason: str | None
@@ -383,7 +380,9 @@ class PlayerMapScore:
 
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value):
-        return {field.name: _jsonable(getattr(value, field.name)) for field in fields(value)}
+        return {
+            field.name: _jsonable(getattr(value, field.name)) for field in fields(value)
+        }
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, datetime):
@@ -396,7 +395,9 @@ def _jsonable(value: Any) -> Any:
 
 
 def config_for_position(position: int) -> RoleScoringConfig:
-    config = next((row for row in ROLE_SCORING_CONFIGS if row.position == position), None)
+    config = next(
+        (row for row in ROLE_SCORING_CONFIGS if row.position == position), None
+    )
     if config is None:
         raise ValueError("position must be between 1 and 5")
     return config
@@ -422,6 +423,15 @@ def _finite_number(value: object) -> bool:
     )
 
 
+def _validate_sha256(value: str, field: str) -> None:
+    if len(value) != 64:
+        raise ValueError(f"{field} must be a SHA-256 hex digest")
+    try:
+        int(value, 16)
+    except ValueError as error:
+        raise ValueError(f"{field} must be a SHA-256 hex digest") from error
+
+
 def _transform(
     spec: MetricSpec,
     raw: Mapping[str, float | None],
@@ -437,7 +447,11 @@ def _transform(
     if spec.transform is PER_10:
         if duration_seconds <= 0:
             return None, None, "duration_missing"
-        return float(numerator) / duration_seconds * 600.0, float(duration_seconds), None
+        return (
+            float(numerator) / duration_seconds * 600.0,
+            float(duration_seconds),
+            None,
+        )
     denominator = raw.get(spec.denominator_metric or "")
     if not _finite_number(denominator) or denominator <= 0:
         return (
@@ -458,9 +472,9 @@ def transform_player_metrics(
 ) -> dict[str, float | None]:
     raw = _raw_mapping(raw_metrics)
     return {
-        f"{component.name}.{spec.raw_metric}": _transform(
-            spec, raw, duration_seconds
-        )[0]
+        f"{component.name}.{spec.raw_metric}": _transform(spec, raw, duration_seconds)[
+            0
+        ]
         for component in config_for_position(position).components
         for spec in component.metrics
     }
@@ -497,7 +511,10 @@ def score_player_map(
     config = config_for_position(value.position)
     if not 0.0 <= value.role_confidence <= 1.0:
         raise ValueError("role_confidence must be between 0 and 1")
-    if benchmark.position != value.position or benchmark.target_match_id != value.match_id:
+    if (
+        benchmark.position != value.position
+        or benchmark.target_match_id != value.match_id
+    ):
         raise ValueError("benchmark target does not match player score input")
     if value.first_usable_at is not None and value.first_usable_at > benchmark.cutoff:
         raise ValueError("player facts were not usable at the scoring cutoff")
@@ -505,12 +522,8 @@ def score_player_map(
         raise ValueError("role assignment was not usable at the scoring cutoff")
     if not value.role_assignment_source.strip():
         raise ValueError("role assignment source cannot be empty")
-    if len(value.role_assignment_input_hash) != 64:
-        raise ValueError("role assignment input hash must be a SHA-256 hex digest")
-    try:
-        int(value.role_assignment_input_hash, 16)
-    except ValueError as error:
-        raise ValueError("role assignment input hash must be a SHA-256 hex digest") from error
+    _validate_sha256(value.source_content_hash, "source content hash")
+    _validate_sha256(value.role_assignment_input_hash, "role assignment input hash")
     residual_values = tuple(
         point
         for point in (
@@ -562,8 +575,16 @@ def score_player_map(
                     numerator=float(numerator) if _finite_number(numerator) else None,
                     denominator=denominator,
                     transformed_value=transformed,
-                    benchmark_median=statistic.median if statistic is not None else None,
+                    benchmark_median=statistic.median
+                    if statistic is not None
+                    else None,
                     benchmark_mad=statistic.mad if statistic is not None else None,
+                    benchmark_sample_size=(
+                        statistic.sample_size if statistic is not None else None
+                    ),
+                    benchmark_fallback_level=(
+                        statistic.fallback_level if statistic is not None else None
+                    ),
                     robust_z=z_score,
                     direction=spec.direction,
                     missing_reason=missing,

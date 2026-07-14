@@ -74,7 +74,15 @@ CREATE TABLE IF NOT EXISTS heroes (
     primary_attr    TEXT,
     attack_type     TEXT,
     roles           TEXT,
-    hero_key        TEXT
+    hero_key        TEXT,
+    pro_pick        INTEGER DEFAULT 0,
+    pro_win         INTEGER DEFAULT 0,
+    pro_ban         INTEGER DEFAULT 0,
+    pub_pick        INTEGER DEFAULT 0,
+    pub_win         INTEGER DEFAULT 0,
+    turbo_picks     INTEGER DEFAULT 0,
+    turbo_wins      INTEGER DEFAULT 0,
+    win_rate        REAL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS match_players (
@@ -107,12 +115,27 @@ CREATE TABLE IF NOT EXISTS match_players (
     backpack_1      INTEGER,
     backpack_2      INTEGER,
     item_neutral    INTEGER,
-    firstblood_claimed INTEGER
+    firstblood_claimed INTEGER,
+    gold_10min      INTEGER,
+    lh_10min        INTEGER,
+    xp_10min        INTEGER,
+    kills_10min     INTEGER,
+    deaths_10min    INTEGER,
+    assists_10min   INTEGER,
+    obs_placed_10min INTEGER,
+    sen_placed_10min INTEGER,
+    lane_efficiency REAL,
+    lane_role       INTEGER,
+    is_roaming      BOOLEAN,
+    kda             REAL,
+    observer_kills_10min INTEGER,
+    sentry_kills_10min   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_match_players_match ON match_players(match_id);
 CREATE INDEX IF NOT EXISTS idx_match_players_hero ON match_players(hero_id);
 CREATE INDEX IF NOT EXISTS idx_match_players_team ON match_players(team_id);
+CREATE INDEX IF NOT EXISTS idx_match_players_account ON match_players(account_id);
 
 CREATE TABLE IF NOT EXISTS picks_bans (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +221,30 @@ CREATE TABLE IF NOT EXISTS hero_matchups (
 );
 
 CREATE INDEX IF NOT EXISTS idx_hero_matchups_hero ON hero_matchups(hero_id);
+
+CREATE TABLE IF NOT EXISTS hero_duration_stats (
+    hero_id     INTEGER REFERENCES heroes(hero_id),
+    duration_min INTEGER,
+    games_played INTEGER,
+    wins        INTEGER,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (hero_id, duration_min)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hero_duration_hero ON hero_duration_stats(hero_id);
+
+CREATE TABLE IF NOT EXISTS hero_benchmarks (
+    hero_id     INTEGER REFERENCES heroes(hero_id),
+    metric      TEXT,
+    p50         REAL,
+    p75         REAL,
+    p90         REAL,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (hero_id, metric)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hero_benchmarks_hero ON hero_benchmarks(hero_id);
+
 """
 
 
@@ -234,13 +281,51 @@ class Database:
     def init_db(self) -> None:
         conn = self.connect()
         conn.executescript(SCHEMA_SQL)
+        self._migrate(conn)
         conn.commit()
         logger.info("Database schema initialized.")
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add missing columns to existing tables."""
+        migrations = [
+            "ALTER TABLE heroes ADD COLUMN pro_pick INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN pro_win INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN pro_ban INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN pub_pick INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN pub_win INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN turbo_picks INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN turbo_wins INTEGER DEFAULT 0",
+            "ALTER TABLE heroes ADD COLUMN win_rate REAL DEFAULT 0.0",
+            # Early-game columns for match_players
+            "ALTER TABLE match_players ADD COLUMN gold_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN lh_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN xp_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN kills_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN deaths_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN assists_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN obs_placed_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN sen_placed_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN lane_efficiency REAL",
+            "ALTER TABLE match_players ADD COLUMN lane_role INTEGER",
+            "ALTER TABLE match_players ADD COLUMN is_roaming BOOLEAN",
+            "ALTER TABLE match_players ADD COLUMN kda REAL",
+            "ALTER TABLE match_players ADD COLUMN observer_kills_10min INTEGER",
+            "ALTER TABLE match_players ADD COLUMN sentry_kills_10min INTEGER",
+        ]
+        for sql in migrations:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     def is_fetched(self, match_id: int) -> bool:
         conn = self.connect()
         row = conn.execute(
-            "SELECT 1 FROM matches WHERE match_id = ?", (match_id,)
+            """SELECT 1 FROM matches m
+               WHERE m.match_id = ?
+                 AND EXISTS (SELECT 1 FROM match_players mp WHERE mp.match_id = m.match_id)""",
+            (match_id,),
         ).fetchone()
         return row is not None
 
@@ -327,13 +412,23 @@ class Database:
                     kills, deaths, assists, gold_per_min, xp_per_min, net_worth,
                     last_hits, denies, hero_damage, hero_healing, tower_damage, level,
                     item_0, item_1, item_2, item_3, item_4, item_5,
-                    backpack_0, backpack_1, backpack_2, item_neutral, firstblood_claimed
+                    backpack_0, backpack_1, backpack_2, item_neutral, firstblood_claimed,
+                    gold_10min, lh_10min, xp_10min,
+                    kills_10min, deaths_10min, assists_10min,
+                    obs_placed_10min, sen_placed_10min,
+                    lane_efficiency, lane_role, is_roaming, kda,
+                    observer_kills_10min, sentry_kills_10min
                 ) VALUES (
                     :match_id, :account_id, :player_slot, :hero_id, :is_radiant, :team_id,
                     :kills, :deaths, :assists, :gold_per_min, :xp_per_min, :net_worth,
                     :last_hits, :denies, :hero_damage, :hero_healing, :tower_damage, :level,
                     :item_0, :item_1, :item_2, :item_3, :item_4, :item_5,
-                    :backpack_0, :backpack_1, :backpack_2, :item_neutral, :firstblood_claimed
+                    :backpack_0, :backpack_1, :backpack_2, :item_neutral, :firstblood_claimed,
+                    :gold_10min, :lh_10min, :xp_10min,
+                    :kills_10min, :deaths_10min, :assists_10min,
+                    :obs_placed_10min, :sen_placed_10min,
+                    :lane_efficiency, :lane_role, :is_roaming, :kda,
+                    :observer_kills_10min, :sentry_kills_10min
                 )""",
                 players,
             )
@@ -433,6 +528,71 @@ class Database:
         )
         conn.commit()
         logger.info("Inserted %d matchups for hero %d.", len(matchups) - 1, hero_id)
+
+    def insert_hero_duration_stats(self, hero_id: int, durations: list[dict]) -> None:
+        """Insert hero win rate by game duration from OpenDota /heroes/{id}/durations."""
+        conn = self.connect()
+        conn.executemany(
+            """INSERT OR REPLACE INTO hero_duration_stats
+               (hero_id, duration_min, games_played, wins)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (hero_id, d["duration_min"], d["games_played"], d["wins"])
+                for d in durations
+                if d.get("games_played", 0) >= 10
+            ],
+        )
+        conn.commit()
+
+    def insert_hero_benchmarks(self, hero_id: int, benchmarks: dict) -> None:
+        """Insert hero performance benchmarks from OpenDota /benchmarks.
+
+        API returns percentiles at [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99].
+        We map: p50=0.5, p75=0.7 (nearest), p90=0.9.
+        """
+        conn = self.connect()
+        rows = []
+        for metric, percentiles in benchmarks.items():
+            p_vals = {p["percentile"]: p["value"] for p in percentiles}
+            rows.append((
+                hero_id,
+                metric,
+                p_vals.get(0.5, 0),
+                p_vals.get(0.7, p_vals.get(0.8, 0)),
+                p_vals.get(0.9, 0),
+            ))
+        conn.executemany(
+            """INSERT OR REPLACE INTO hero_benchmarks
+               (hero_id, metric, p50, p75, p90)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+        logger.info("Inserted %d benchmarks for hero %d.", len(rows), hero_id)
+
+    def update_hero_stats(self, hero_stats: list[dict]) -> None:
+        """Update heroes table with stats from /api/heroStats.
+
+        Adds pro_pick, pro_win, pro_ban, and bracket-specific pick/win rates.
+        """
+        conn = self.connect()
+        for hs in hero_stats:
+            hero_id = hs["id"]
+            conn.execute(
+                """UPDATE heroes SET
+                   pro_pick = ?, pro_win = ?, pro_ban = ?,
+                   pub_pick = ?, pub_win = ?,
+                   turbo_picks = ?, turbo_wins = ?
+                   WHERE hero_id = ?""",
+                (
+                    hs.get("pro_pick", 0), hs.get("pro_win", 0), hs.get("pro_ban", 0),
+                    hs.get("pub_pick", 0), hs.get("pub_win", 0),
+                    hs.get("turbo_picks", 0), hs.get("turbo_wins", 0),
+                    hero_id,
+                ),
+            )
+        conn.commit()
+        logger.info("Updated stats for %d heroes.", len(hero_stats))
 
     @staticmethod
     def _delete_match_children(conn: sqlite3.Connection, match_id: int) -> None:

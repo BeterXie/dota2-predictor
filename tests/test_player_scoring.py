@@ -25,7 +25,10 @@ from event_intelligence.player_scoring import (
 from scripts.score_strict_event_players import (
     StrictMap,
     StrictPlayerFact,
+    _exact_log_count,
+    _high_ground_damage,
     _raw_metrics,
+    _roshan_damage,
     build_scores,
     run_scoring,
 )
@@ -49,44 +52,35 @@ def complete_raw_metrics() -> dict[str, float]:
         "assists": 14,
         "kills_assists": 20,
         "team_kills": 30,
-        "roshan_participations": 2,
-        "roshan_opportunities": 3,
-        "late_fight_participations": 3,
+        "roshan_damage": 2_000,
+        "high_ground_damage": 1_500,
+        "detected_late_teamfight_participations": 3,
         "late_fight_opportunities": 4,
-        "late_fight_output": 8_000,
-        "team_late_fight_output": 20_000,
+        "detected_late_teamfight_damage": 8_000,
+        "team_late_teamfight_damage": 20_000,
+        "detected_early_teamfight_participations": 2,
+        "early_teamfight_opportunities": 3,
+        "detected_early_teamfight_damage": 2_000,
+        "team_early_teamfight_damage": 5_000,
         "gold_10_diff": 500,
         "last_hits_10_diff": 8,
-        "early_kill_participations": 5,
-        "early_team_kills": 8,
-        "rune_pickups": 6,
-        "early_objective_participations": 2,
-        "early_objective_opportunities": 3,
-        "opposing_carry_gold_suppression_at_10": 600,
-        "opposing_carry_lh_suppression_at_10": 10,
+        "kills_at_10": 2,
+        "logged_rune_pickups_at_10": 3,
+        "opposing_carry_gold_at_10": 4_400,
+        "opposing_carry_last_hits_at_10": 48,
         "damage_taken": 30_000,
         "control_seconds": 75,
-        "initiations": 8,
-        "initiation_opportunities": 10,
-        "teamfight_participations": 7,
+        "detected_teamfight_participations": 7,
         "teamfight_opportunities": 8,
-        "teamfight_impact": 18_000,
-        "team_teamfight_impact": 50_000,
-        "high_ground_participations": 2,
-        "high_ground_opportunities": 3,
-        "rotations_at_10": 4,
+        "detected_teamfight_damage": 18_000,
+        "team_teamfight_damage": 50_000,
         "observer_wards": 8,
         "sentry_wards": 12,
+        "observer_wards_at_10": 3,
+        "sentry_wards_at_10": 4,
         "dewards": 5,
-        "objective_participations": 5,
-        "objective_opportunities": 7,
-        "saves": 3,
-        "save_opportunities": 4,
         "hero_healing": 4_000,
-        "pulls": 5,
-        "pull_opportunities": 7,
         "stacks": 6,
-        "lane_support_events": 8,
     }
 
 
@@ -111,6 +105,7 @@ def score_input(
         event_strength=1.0,
         target_started_at=TARGET_START,
         first_usable_at=CUTOFF - timedelta(minutes=1),
+        source_content_hash="b" * 64,
         role_assignment_source="single_map_evidence",
         role_assignment_cutoff=role_assignment_cutoff or CUTOFF - timedelta(minutes=2),
         role_assignment_input_hash="a" * 64,
@@ -138,6 +133,7 @@ def benchmark_for(value: PlayerScoreInput):
                 event_strength=value.event_strength,
                 completed_at=completed,
                 first_usable_at=completed,
+                source_content_hash=f"{index + 100:064x}",
                 role_assignment_source="single_map_evidence",
                 role_assignment_cutoff=completed,
                 role_assignment_input_hash=f"{index:064x}",
@@ -166,18 +162,22 @@ def benchmark_for(value: PlayerScoreInput):
 
 class PlayerScoringTests(unittest.TestCase):
     def test_frozen_role_weights_sum_to_exactly_one(self) -> None:
-        self.assertEqual({config.position for config in ROLE_SCORING_CONFIGS}, set(range(1, 6)))
+        self.assertEqual(
+            {config.position for config in ROLE_SCORING_CONFIGS}, set(range(1, 6))
+        )
         for config in ROLE_SCORING_CONFIGS:
-            self.assertEqual(math.fsum(component.weight for component in config.components), 1.0)
+            self.assertEqual(
+                math.fsum(component.weight for component in config.components), 1.0
+            )
 
     def test_transformations_are_explicit_and_source_exact(self) -> None:
         raw = complete_raw_metrics()
         transformed = transform_player_metrics(4, raw, duration_seconds=1_800)
 
-        self.assertEqual(transformed["control_initiation.control_seconds"], 25.0)
+        self.assertEqual(transformed["control.control_seconds"], 25.0)
         self.assertEqual(
-            transformed["teamfights.teamfight_participations"],
-            raw["teamfight_participations"] / raw["teamfight_opportunities"],
+            transformed["teamfights.detected_teamfight_participations"],
+            raw["detected_teamfight_participations"] / raw["teamfight_opportunities"],
         )
         self.assertEqual(
             transformed["low_resource_efficiency.hero_damage"],
@@ -207,8 +207,15 @@ class PlayerScoringTests(unittest.TestCase):
                 if metric.raw_metric in missing
             ]
             self.assertTrue(missing_results)
-            self.assertTrue(all(metric.transformed_value is None for metric in missing_results))
-            self.assertTrue(all(metric.missing_reason == "source_missing" for metric in missing_results))
+            self.assertTrue(
+                all(metric.transformed_value is None for metric in missing_results)
+            )
+            self.assertTrue(
+                all(
+                    metric.missing_reason == "source_missing"
+                    for metric in missing_results
+                )
+            )
 
     def test_role_confidence_and_coverage_shrink_toward_neutral(self) -> None:
         base_input = score_input(1)
@@ -222,7 +229,9 @@ class PlayerScoringTests(unittest.TestCase):
         )
 
         self.assertGreater(full.execution_score, 50.0)
-        self.assertLess(abs(uncertain.execution_score - 50), abs(full.execution_score - 50))
+        self.assertLess(
+            abs(uncertain.execution_score - 50), abs(full.execution_score - 50)
+        )
         self.assertFalse(uncertain.ranking_eligible)
 
         empty = score_player_map(
@@ -249,11 +258,15 @@ class PlayerScoringTests(unittest.TestCase):
         self.assertEqual(positive.result_adjustment_applied, 5.0)
         self.assertEqual(negative.result_adjustment_applied, -5.0)
         self.assertEqual(dict(positive.residual_points)["opponent_strength"], 1.0)
-        self.assertLessEqual(positive.result_adjusted_score - positive.execution_score, 5.0)
-        self.assertGreaterEqual(negative.result_adjusted_score - negative.execution_score, -5.0)
+        self.assertLessEqual(
+            positive.result_adjusted_score - positive.execution_score, 5.0
+        )
+        self.assertGreaterEqual(
+            negative.result_adjusted_score - negative.execution_score, -5.0
+        )
 
     def test_recompute_from_same_inputs_is_byte_equivalent(self) -> None:
-        value = score_input(5)
+        value = score_input(1)
         benchmark = benchmark_for(value)
 
         first = score_player_map(value, benchmark)
@@ -263,6 +276,19 @@ class PlayerScoringTests(unittest.TestCase):
         self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
         self.assertEqual(len(first.input_hash), 64)
         self.assertEqual(first.benchmark_hash, benchmark.benchmark_hash)
+        farm = next(
+            component
+            for component in first.components
+            if component.name == "farm_efficiency"
+        )
+        last_hits = next(
+            metric for metric in farm.metrics if metric.raw_metric == "last_hits"
+        )
+        self.assertEqual(last_hits.benchmark_sample_size, 5)
+        self.assertEqual(
+            last_hits.benchmark_fallback_level,
+            "patch_position_duration_event",
+        )
 
     def test_role_dependency_is_in_input_hash_and_score_version(self) -> None:
         value = score_input(1)
@@ -277,17 +303,21 @@ class PlayerScoringTests(unittest.TestCase):
         self.assertEqual(
             changed.version, score_version_for_role("observed-position-v2")
         )
+        changed_source = score_player_map(
+            replace(value, source_content_hash="c" * 64), benchmark
+        )
+        self.assertNotEqual(first.input_hash, changed_source.input_hash)
 
     def test_role_assignment_after_cutoff_is_rejected(self) -> None:
-        value = score_input(
-            1, role_assignment_cutoff=CUTOFF + timedelta(seconds=1)
-        )
+        value = score_input(1, role_assignment_cutoff=CUTOFF + timedelta(seconds=1))
         benchmark = benchmark_for(replace(value, role_assignment_cutoff=CUTOFF))
 
         with self.assertRaisesRegex(ValueError, "role assignment"):
             score_player_map(value, benchmark)
 
-    def test_exact_artifact_metrics_include_teamfights_objectives_and_carry_suppression(self) -> None:
+    def test_exact_artifact_metrics_include_fights_runes_and_target_damage(
+        self,
+    ) -> None:
         roles = (3, 2, 1, 4, 5, 1, 2, 3, 4, 5)
         slots = (0, 1, 2, 3, 4, 128, 129, 130, 131, 132)
         players = []
@@ -323,7 +353,30 @@ class PlayerScoringTests(unittest.TestCase):
                     content_hash="b" * 64,
                 )
             )
-            raw_players.append({"player_slot": slot})
+            raw_players.append(
+                {
+                    "player_slot": slot,
+                    "runes_log": [
+                        {"time": 0, "key": "5"},
+                        {"time": 600, "key": "8"},
+                        {"time": 601, "key": "2"},
+                    ],
+                    "damage": {
+                        "npc_dota_roshan": 400 + index,
+                        (
+                            "npc_dota_badguys_tower3_top"
+                            if slot < 128
+                            else "npc_dota_goodguys_tower3_top"
+                        ): 300 + index,
+                        (
+                            "npc_dota_badguys_melee_rax_top"
+                            if slot < 128
+                            else "npc_dota_goodguys_melee_rax_top"
+                        ): 200 + index,
+                        "npc_dota_neutral_centaur_khan": 999,
+                    },
+                }
+            )
         fight_players = [
             {
                 "damage": 100 + index,
@@ -345,33 +398,37 @@ class PlayerScoringTests(unittest.TestCase):
             {
                 "players": raw_players,
                 "teamfights": [
-                    {"start": 900, "players": fight_players},
-                    {"start": 1_900, "players": fight_players},
-                ],
-                "objectives": [
-                    {
-                        "type": "building_kill",
-                        "key": "npc_dota_badguys_tower3_top",
-                        "player_slot": 0,
-                    },
-                    {"type": "CHAT_MESSAGE_ROSHAN_KILL", "team": 2},
+                    {"start": 300, "end": 360, "players": fight_players},
+                    {"start": 590, "end": 620, "players": fight_players},
+                    {"start": 900, "end": 960, "players": fight_players},
+                    {"start": 1_900, "end": 1_960, "players": fight_players},
                 ],
             },
         )
 
         raw = _raw_metrics(game, players[0])
 
-        self.assertEqual(raw["opposing_carry_gold_suppression_at_10"], 500.0)
-        self.assertEqual(raw["opposing_carry_lh_suppression_at_10"], 5.0)
-        self.assertEqual(raw["teamfight_participations"], 2.0)
-        self.assertEqual(raw["teamfight_opportunities"], 2.0)
-        self.assertEqual(raw["late_fight_participations"], 1.0)
-        self.assertEqual(raw["high_ground_participations"], 1.0)
-        self.assertEqual(raw["high_ground_opportunities"], 1.0)
-        self.assertEqual(raw["roshan_opportunities"], 1.0)
-        self.assertIsNone(raw["roshan_participations"])
-        self.assertIsNone(raw["objective_participations"])
-        self.assertIsNone(raw.get("initiations"))
+        self.assertEqual(raw["opposing_carry_gold_at_10"], 4_500.0)
+        self.assertEqual(raw["opposing_carry_last_hits_at_10"], 50.0)
+        self.assertEqual(raw["detected_teamfight_participations"], 4.0)
+        self.assertEqual(raw["teamfight_opportunities"], 4.0)
+        self.assertEqual(raw["detected_teamfight_damage"], 400.0)
+        self.assertEqual(raw["team_teamfight_damage"], 2_040.0)
+        self.assertEqual(raw["detected_early_teamfight_participations"], 1.0)
+        self.assertEqual(raw["early_teamfight_opportunities"], 1.0)
+        self.assertEqual(raw["detected_late_teamfight_participations"], 1.0)
+        self.assertEqual(raw["logged_rune_pickups_at_10"], 2.0)
+        self.assertEqual(raw["roshan_damage"], 400.0)
+        self.assertEqual(raw["high_ground_damage"], 500.0)
+        retired = {
+            "roshan_participations",
+            "objective_participations",
+            "initiations",
+            "rotations_at_10",
+            "teamfight_impact",
+            "opposing_carry_gold_suppression_at_10",
+        }
+        self.assertTrue(retired.isdisjoint(raw))
         transformed = transform_player_metrics(3, raw, game.duration_seconds)
         self.assertGreaterEqual(
             sum(value is not None for value in transformed.values()), 11
@@ -404,6 +461,20 @@ class PlayerScoringTests(unittest.TestCase):
             one_map_scores,
         )
 
+    def test_exact_raw_empty_missing_and_invalid_sources_stay_distinct(self) -> None:
+        self.assertEqual(_exact_log_count([], through_seconds=600), 0.0)
+        self.assertIsNone(_exact_log_count(None, through_seconds=600))
+        self.assertIsNone(_exact_log_count([{"time": "invalid"}], through_seconds=600))
+
+        self.assertEqual(_roshan_damage({"damage": {}}), 0.0)
+        self.assertIsNone(_roshan_damage(None))
+        self.assertIsNone(_roshan_damage({"damage": {"npc_dota_roshan": "bad"}}))
+        self.assertEqual(
+            _high_ground_damage({"damage": {}}, is_radiant=True),
+            0.0,
+        )
+        self.assertIsNone(_high_ground_damage(None, is_radiant=True))
+
     def test_boolean_values_never_become_source_facts(self) -> None:
         value = score_input(1)
         benchmark = benchmark_for(value)
@@ -413,7 +484,9 @@ class PlayerScoringTests(unittest.TestCase):
         result = score_player_map(score_input(1, raw), benchmark)
 
         farm = next(row for row in result.components if row.name == "farm_efficiency")
-        last_hits = next(metric for metric in farm.metrics if metric.raw_metric == "last_hits")
+        last_hits = next(
+            metric for metric in farm.metrics if metric.raw_metric == "last_hits"
+        )
         self.assertEqual(last_hits.missing_reason, "source_invalid")
         with self.assertRaisesRegex(ValueError, "non-finite"):
             score_player_map(
@@ -423,7 +496,7 @@ class PlayerScoringTests(unittest.TestCase):
 
 
 class StrictPlayerScoringCliTests(unittest.TestCase):
-    def test_dry_run_and_repeated_write_are_idempotent_without_legacy_rows(self) -> None:
+    def test_dry_run_repeated_write_and_legacy_v2_preservation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "strict.db"
@@ -564,8 +637,12 @@ class StrictPlayerScoringCliTests(unittest.TestCase):
 
             first = run_scoring(database)
             second = run_scoring(database)
-            self.assertEqual((first.inserted, first.updated, first.unchanged), (10, 0, 0))
-            self.assertEqual((second.inserted, second.updated, second.unchanged), (0, 0, 10))
+            self.assertEqual(
+                (first.inserted, first.updated, first.unchanged), (10, 0, 0)
+            )
+            self.assertEqual(
+                (second.inserted, second.updated, second.unchanged), (0, 0, 10)
+            )
             with IntelligenceStorage(database) as verification:
                 row = verification.connection.execute(
                     """SELECT score_version, component_facts_json
@@ -597,7 +674,8 @@ class StrictPlayerScoringCliTests(unittest.TestCase):
                               component_facts_json, component_scores_json,
                               weights_json, coverage, role_confidence,
                               benchmark_cutoff, benchmark_hash, ?,
-                              'player-score-v1', explanation_json, created_at
+                              'player-score-v2+observed-role=observed-position-v1',
+                              explanation_json, created_at
                        FROM player_map_scores
                        WHERE match_id=9001 AND player_slot=0""",
                     ("f" * 64,),
@@ -617,12 +695,8 @@ class StrictPlayerScoringCliTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "--assignment-version"):
                 run_scoring(database, dry_run=True)
-            old = run_scoring(
-                database, assignment_version="observed-position-v1"
-            )
-            new = run_scoring(
-                database, assignment_version="observed-position-v2"
-            )
+            old = run_scoring(database, assignment_version="observed-position-v1")
+            new = run_scoring(database, assignment_version="observed-position-v2")
             self.assertEqual(old.unchanged, 10)
             self.assertEqual(new.inserted, 10)
             with IntelligenceStorage(database) as verification:
@@ -634,7 +708,10 @@ class StrictPlayerScoringCliTests(unittest.TestCase):
                 self.assertEqual(
                     [(row["score_version"], row["count"]) for row in versions],
                     [
-                        ("player-score-v1", 1),
+                        (
+                            "player-score-v2+observed-role=observed-position-v1",
+                            1,
+                        ),
                         (score_version_for_role("observed-position-v1"), 10),
                         (score_version_for_role("observed-position-v2"), 10),
                     ],

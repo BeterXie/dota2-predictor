@@ -12,7 +12,7 @@ from typing import Iterable
 from .raw_archive import canonical_json_bytes
 
 
-BENCHMARK_VERSION = "player-benchmark-v2"
+BENCHMARK_VERSION = "player-benchmark-v3"
 MAD_SCALE = 1.4826
 
 
@@ -26,6 +26,7 @@ class BenchmarkObservation:
     event_strength: float
     completed_at: datetime
     first_usable_at: datetime | None
+    source_content_hash: str
     role_assignment_source: str
     role_assignment_cutoff: datetime
     role_assignment_input_hash: str
@@ -58,7 +59,9 @@ class BenchmarkSnapshot:
     source_input_hash: str
 
     def get(self, metric_id: str) -> BenchmarkMetric | None:
-        return next((metric for metric in self.metrics if metric.metric_id == metric_id), None)
+        return next(
+            (metric for metric in self.metrics if metric.metric_id == metric_id), None
+        )
 
     def require(self, metric_id: str) -> BenchmarkMetric:
         metric = self.get(metric_id)
@@ -133,6 +136,7 @@ def _observation_payload(row: BenchmarkObservation) -> tuple[object, ...]:
         row.first_usable_at.astimezone(timezone.utc).isoformat()
         if row.first_usable_at is not None
         else None,
+        row.source_content_hash,
         row.role_assignment_source,
         row.role_assignment_cutoff.astimezone(timezone.utc).isoformat(),
         row.role_assignment_input_hash,
@@ -184,6 +188,7 @@ def build_benchmark_snapshot(
         raise ValueError("position must be between 1 and 5")
     if min_samples < 1:
         raise ValueError("min_samples must be positive")
+    rows = tuple(observations)
     target_started_at = _utc(target_started_at, "target_started_at")
     cutoff = _utc(cutoff, "cutoff")
     target_duration_band = duration_band(duration_seconds)
@@ -192,7 +197,7 @@ def build_benchmark_snapshot(
         sorted(
             (
                 row
-                for row in observations
+                for row in rows
                 if row.match_id != target_match_id
                 and row.completed_at < target_started_at
                 and row.completed_at <= cutoff
@@ -203,6 +208,15 @@ def build_benchmark_snapshot(
             key=lambda row: (row.completed_at, row.match_id, row.player_id),
         )
     )
+    for row in eligible:
+        if len(row.source_content_hash) != 64:
+            raise ValueError("source_content_hash must be a SHA-256 hex digest")
+        try:
+            int(row.source_content_hash, 16)
+        except ValueError as error:
+            raise ValueError(
+                "source_content_hash must be a SHA-256 hex digest"
+            ) from error
     source_bytes = canonical_json_bytes([_observation_payload(row) for row in eligible])
     source_hash = hashlib.sha256(source_bytes).hexdigest()
     level_names = (
@@ -212,9 +226,7 @@ def build_benchmark_snapshot(
         "position",
         "global",
     )
-    buckets: dict[str, dict[str, list[float]]] = {
-        level: {} for level in level_names
-    }
+    buckets: dict[str, dict[str, list[float]]] = {level: {} for level in level_names}
     for row in eligible:
         matching_levels = ["global"]
         if row.position == position:
@@ -223,10 +235,7 @@ def build_benchmark_snapshot(
                 matching_levels.append("patch_position")
                 if duration_band(row.duration_seconds) == target_duration_band:
                     matching_levels.append("patch_position_duration")
-                    if (
-                        event_strength_band(row.event_strength)
-                        == target_strength_band
-                    ):
+                    if event_strength_band(row.event_strength) == target_strength_band:
                         matching_levels.append("patch_position_duration_event")
         for metric_id, value in dict(row.metrics).items():
             if (

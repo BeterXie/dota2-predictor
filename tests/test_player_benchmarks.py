@@ -43,6 +43,7 @@ def observation(
         event_strength=strength,
         completed_at=completed,
         first_usable_at=usable,
+        source_content_hash=f"{match_id + 100:064x}",
         role_assignment_source="single_map_evidence",
         role_assignment_cutoff=role_assignment_cutoff or usable,
         role_assignment_input_hash=f"{match_id:064x}",
@@ -68,7 +69,10 @@ def snapshot(rows, *, min_samples: int = 3):
 class PlayerBenchmarkTests(unittest.TestCase):
     def test_exact_cell_uses_median_and_mad(self) -> None:
         result = snapshot(
-            [observation(index, value) for index, value in enumerate((1, 2, 3, 4, 100), 1)]
+            [
+                observation(index, value)
+                for index, value in enumerate((1, 2, 3, 4, 100), 1)
+            ]
         )
         metric = result.require(METRIC)
 
@@ -91,26 +95,37 @@ class PlayerBenchmarkTests(unittest.TestCase):
         self.assertEqual(metric.fallback_level, "patch_position_duration")
 
     def test_future_and_late_usable_rows_do_not_change_snapshot_or_hash(self) -> None:
-        earlier = [observation(index, value) for index, value in enumerate((8, 9, 10), 1)]
+        earlier = [
+            observation(index, value) for index, value in enumerate((8, 9, 10), 1)
+        ]
         baseline = snapshot(earlier)
-        future = observation(
-            90,
-            1_000_000,
-            completed_at=TARGET_START + timedelta(seconds=1),
-            first_usable_at=TARGET_START + timedelta(seconds=2),
+        future = replace(
+            observation(
+                90,
+                1_000_000,
+                completed_at=TARGET_START + timedelta(seconds=1),
+                first_usable_at=TARGET_START + timedelta(seconds=2),
+            ),
+            source_content_hash="excluded-future-hash",
         )
-        late = observation(
-            91,
-            -1_000_000,
-            completed_at=TARGET_START - timedelta(days=1),
-            first_usable_at=CUTOFF + timedelta(seconds=1),
+        late = replace(
+            observation(
+                91,
+                -1_000_000,
+                completed_at=TARGET_START - timedelta(days=1),
+                first_usable_at=CUTOFF + timedelta(seconds=1),
+            ),
+            source_content_hash="excluded-late-hash",
         )
-        late_role = observation(
-            92,
-            500_000,
-            completed_at=TARGET_START - timedelta(days=2),
-            first_usable_at=TARGET_START - timedelta(days=1),
-            role_assignment_cutoff=CUTOFF + timedelta(seconds=1),
+        late_role = replace(
+            observation(
+                92,
+                500_000,
+                completed_at=TARGET_START - timedelta(days=2),
+                first_usable_at=TARGET_START - timedelta(days=1),
+                role_assignment_cutoff=CUTOFF + timedelta(seconds=1),
+            ),
+            source_content_hash="excluded-role-hash",
         )
 
         changed = snapshot([future, *reversed(earlier), late, late_role])
@@ -125,7 +140,23 @@ class PlayerBenchmarkTests(unittest.TestCase):
         rows = [observation(index, value) for index, value in enumerate((8, 9, 10), 1)]
         baseline = snapshot(rows)
         changed = snapshot(
-            [replace(row, role_assignment_version="observed-position-v2") for row in rows]
+            [
+                replace(row, role_assignment_version="observed-position-v2")
+                for row in rows
+            ]
+        )
+
+        self.assertNotEqual(changed.source_input_hash, baseline.source_input_hash)
+        self.assertNotEqual(changed.benchmark_hash, baseline.benchmark_hash)
+
+    def test_source_content_hash_changes_benchmark_hash(self) -> None:
+        rows = [observation(index, value) for index, value in enumerate((8, 9, 10), 1)]
+        baseline = snapshot(rows)
+        changed = snapshot(
+            [
+                replace(row, source_content_hash=f"{index + 500:064x}")
+                for index, row in enumerate(rows)
+            ]
         )
 
         self.assertNotEqual(changed.source_input_hash, baseline.source_input_hash)

@@ -787,7 +787,53 @@ class IngestAdapterTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(ingestor.calls, 1)
+    def test_cli_scheduler_once_runs_one_due_cycle_and_closes_runtime(self) -> None:
+        class UnusedIngestor:
+            async def run_once(self, **values: object) -> None:
+                raise AssertionError("scheduler one-shot must use the scheduler")
 
+        class FakeScheduler:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def run_due(self, now: object, **values: object) -> dict[str, object]:
+                self.calls.append({"now": now, **values})
+                return values
+
+        for arguments, include_recent in (
+            (["--scheduler-once"], True),
+            (["--scheduler-once", "--active"], False),
+        ):
+            scheduler = FakeScheduler()
+            closed: list[bool] = []
+            runtime = Runtime(
+                UnusedIngestor(),
+                scheduler,  # type: ignore[arg-type]
+                close_callbacks=(lambda: closed.append(True),),
+            )
+            args = build_parser().parse_args(arguments)
+
+            result = asyncio.run(run(args, runtime_factory=lambda _: runtime))
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(scheduler.calls), 1)
+            self.assertEqual(scheduler.calls[0]["include_recent"], include_recent)
+            self.assertEqual(closed, [True])
+
+    def test_cli_scheduler_once_rejects_direct_one_shot_filters(self) -> None:
+        for direct_arguments in (
+            ["--once"],
+            ["--reconcile"],
+            ["--event", "pgl-wallachia-s8-2026"],
+            ["--match", "1"],
+        ):
+            args = build_parser().parse_args(["--scheduler-once", *direct_arguments])
+            with self.assertRaisesRegex(ValueError, "direct one-shot filters"):
+                asyncio.run(run(args, runtime_factory=lambda _: None))  # type: ignore[arg-type,return-value]
+
+    def test_cli_rejects_empty_event_id(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["--event", " "])
 
 if __name__ == "__main__":
     unittest.main()

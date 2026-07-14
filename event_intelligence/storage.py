@@ -503,7 +503,9 @@ class IntelligenceStorage:
 
         artifact_columns = {
             str(row[1])
-            for row in self.connection.execute("PRAGMA table_info(raw_source_artifacts)")
+            for row in self.connection.execute(
+                "PRAGMA table_info(raw_source_artifacts)"
+            )
         }
         if artifact_columns and "artifact_id" not in artifact_columns:
             raise RuntimeError(
@@ -522,9 +524,12 @@ class IntelligenceStorage:
         events = {event.event_id: event for event in registry.formal_events()}
         expected_ids = {str(seed["event_id"]) for seed in APPROVED_EVENT_SEEDS}
         if set(events) != expected_ids:
-            raise RuntimeError("approved event seed set conflicts with the audited registry")
+            raise RuntimeError(
+                "approved event seed set conflicts with the audited registry"
+            )
         for seed in APPROVED_EVENT_SEEDS:
             event = events[str(seed["event_id"])]
+            expected_map_count = seed["expected_map_count"]
             expected = (
                 str(seed["canonical_name"]),
                 str(seed["tier"]),
@@ -540,8 +545,7 @@ class IntelligenceStorage:
                 "approved",
                 "manual_event_audit",
                 datetime.fromisoformat(AUDITED_AT),
-                int(seed["expected_map_count"]),
-                int(seed["public_map_count"]),
+                (int(expected_map_count) if expected_map_count is not None else None),
                 tuple(seed["included_stages"]),
                 tuple(EXCLUDED_CATEGORIES),
                 bool(seed["include_internal_lcq"]),
@@ -562,7 +566,6 @@ class IntelligenceStorage:
                 event.approved_by,
                 event.approved_at,
                 event.expected_map_count,
-                event.public_map_count,
                 tuple(stage.value for stage in event.included_stages),
                 event.excluded_categories,
                 event.include_internal_lcq,

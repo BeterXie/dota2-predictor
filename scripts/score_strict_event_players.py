@@ -39,6 +39,7 @@ from event_intelligence.raw_archive import canonical_json_bytes  # noqa: E402
 
 UTC = timezone.utc
 FORMAL_EVENT_STRENGTH = 1.0
+EARLY_FIGHT_END_SECONDS = 10 * 60
 LATE_FIGHT_START_SECONDS = 30 * 60
 
 
@@ -251,7 +252,9 @@ def load_strict_maps(
         grouped.setdefault(value.match_id, []).append(value)
         artifact_key = (artifact_path, value.content_hash)
         if artifact_key not in payloads:
-            payloads[artifact_key] = _artifact_payload(artifact_path, value.content_hash)
+            payloads[artifact_key] = _artifact_payload(
+                artifact_path, value.content_hash
+            )
 
     maps = []
     for current_match_id, players in sorted(grouped.items()):
@@ -259,7 +262,9 @@ def load_strict_maps(
             continue
         identities = {(row.artifact_path, row.content_hash) for row in players}
         if len(identities) != 1:
-            raise ValueError(f"match {current_match_id} has inconsistent fact artifacts")
+            raise ValueError(
+                f"match {current_match_id} has inconsistent fact artifacts"
+            )
         payload = payloads[next(iter(identities))]
         if payload.get("match_id") != current_match_id:
             raise ValueError(f"artifact identity mismatch for match {current_match_id}")
@@ -322,15 +327,25 @@ def _player_index(game: StrictMap, player: StrictPlayerFact) -> int | None:
 def _fight_record(record: object) -> tuple[bool, float] | None:
     if not isinstance(record, dict):
         return None
-    values = tuple(_number(record.get(name)) for name in ("damage", "healing", "deaths", "buybacks"))
+    damage = _number(record.get("damage"))
+    activity = tuple(
+        _number(record.get(name))
+        for name in ("damage", "healing", "deaths", "buybacks")
+    )
     killed = record.get("killed")
-    if any(value is None or value < 0 for value in values) or not isinstance(killed, dict):
+    if (
+        damage is None
+        or any(value is None or value < 0 for value in activity)
+        or not isinstance(killed, dict)
+    ):
         return None
     kill_values = tuple(_number(value) for value in killed.values())
     if any(value is None or value < 0 for value in kill_values):
         return None
-    exact = tuple(value for value in (*values, *kill_values) if value is not None)
-    return any(value > 0 for value in exact), math.fsum(exact)
+    detected = any(
+        value > 0 for value in (*activity, *kill_values) if value is not None
+    )
+    return detected, damage
 
 
 def _teamfight_metrics(
@@ -341,14 +356,18 @@ def _teamfight_metrics(
     own_team = tuple(row for row in game.players if row.is_radiant == player.is_radiant)
     own_indexes = tuple(_player_index(game, row) for row in own_team)
     missing = {
-        "teamfight_participations": None,
+        "detected_teamfight_participations": None,
         "teamfight_opportunities": None,
-        "teamfight_impact": None,
-        "team_teamfight_impact": None,
-        "late_fight_participations": None,
+        "detected_teamfight_damage": None,
+        "team_teamfight_damage": None,
+        "detected_early_teamfight_participations": None,
+        "early_teamfight_opportunities": None,
+        "detected_early_teamfight_damage": None,
+        "team_early_teamfight_damage": None,
+        "detected_late_teamfight_participations": None,
         "late_fight_opportunities": None,
-        "late_fight_output": None,
-        "team_late_fight_output": None,
+        "detected_late_teamfight_damage": None,
+        "team_late_teamfight_damage": None,
     }
     if (
         not isinstance(raw_fights, list)
@@ -358,117 +377,129 @@ def _teamfight_metrics(
     ):
         return missing
 
-    parsed: list[tuple[float, tuple[tuple[bool, float], ...]]] = []
+    parsed: list[tuple[float, float, tuple[tuple[bool, float], ...]]] = []
     for fight in raw_fights:
         if not isinstance(fight, dict):
             return missing
         start = _number(fight.get("start"))
+        end = _number(fight.get("end"))
         records = fight.get("players")
-        if start is None or not isinstance(records, list) or len(records) != 10:
+        if (
+            start is None
+            or end is None
+            or start < 0
+            or end < start
+            or not isinstance(records, list)
+            or len(records) != 10
+        ):
             return missing
         facts = tuple(_fight_record(record) for record in records)
         if any(row is None for row in facts):
             return missing
-        parsed.append((start, tuple(row for row in facts if row is not None)))
+        parsed.append((start, end, tuple(row for row in facts if row is not None)))
 
     own_exact_indexes = tuple(int(index) for index in own_indexes if index is not None)
 
     def aggregate(
-        rows: Sequence[tuple[float, tuple[tuple[bool, float], ...]]]
+        rows: Sequence[tuple[float, float, tuple[tuple[bool, float], ...]]],
     ) -> tuple[float, float, float, float]:
         return (
-            float(sum(row[1][player_index][0] for row in rows)),
+            float(sum(row[2][player_index][0] for row in rows)),
             float(len(rows)),
-            math.fsum(row[1][player_index][1] for row in rows),
-            math.fsum(
-                row[1][index][1] for row in rows for index in own_exact_indexes
-            ),
+            math.fsum(row[2][player_index][1] for row in rows),
+            math.fsum(row[2][index][1] for row in rows for index in own_exact_indexes),
         )
 
     all_values = aggregate(parsed)
+    early_values = aggregate(
+        tuple(row for row in parsed if row[1] <= EARLY_FIGHT_END_SECONDS)
+    )
     late_values = aggregate(
         tuple(row for row in parsed if row[0] >= LATE_FIGHT_START_SECONDS)
     )
     return {
-        "teamfight_participations": all_values[0],
+        "detected_teamfight_participations": all_values[0],
         "teamfight_opportunities": all_values[1],
-        "teamfight_impact": all_values[2],
-        "team_teamfight_impact": all_values[3],
-        "late_fight_participations": late_values[0],
+        "detected_teamfight_damage": all_values[2],
+        "team_teamfight_damage": all_values[3],
+        "detected_early_teamfight_participations": early_values[0],
+        "early_teamfight_opportunities": early_values[1],
+        "detected_early_teamfight_damage": early_values[2],
+        "team_early_teamfight_damage": early_values[3],
+        "detected_late_teamfight_participations": late_values[0],
         "late_fight_opportunities": late_values[1],
-        "late_fight_output": late_values[2],
-        "team_late_fight_output": late_values[3],
+        "detected_late_teamfight_damage": late_values[2],
+        "team_late_teamfight_damage": late_values[3],
     }
 
 
-def _objective_side(row: Mapping[str, Any]) -> bool | None:
-    if row.get("type") == "CHAT_MESSAGE_ROSHAN_KILL":
-        return {2: True, 3: False}.get(row.get("team"))
-    if row.get("type") != "building_kill":
+def _raw_player(game: StrictMap, player: StrictPlayerFact) -> Mapping[str, Any] | None:
+    index = _player_index(game, player)
+    raw_players = game.artifact.get("players")
+    if index is None or not isinstance(raw_players, list):
         return None
-    key = row.get("key")
-    if not isinstance(key, str):
+    row = raw_players[index]
+    return row if isinstance(row, dict) else None
+
+
+def _exact_log_count(value: object, *, through_seconds: int) -> float | None:
+    if not isinstance(value, list):
         return None
-    if "badguys" in key:
-        return True
-    if "goodguys" in key:
-        return False
-    return None
+    times = []
+    for event in value:
+        if not isinstance(event, dict):
+            return None
+        timestamp = _number(event.get("time"))
+        if timestamp is None:
+            return None
+        times.append(timestamp)
+    return float(sum(timestamp <= through_seconds for timestamp in times))
 
 
-def _attributed_objectives(
-    game: StrictMap,
-    player: StrictPlayerFact,
-    *,
-    high_ground_only: bool,
-) -> tuple[float | None, float | None]:
-    raw = game.artifact.get("objectives")
-    if not isinstance(raw, list):
-        return None, None
-    candidates = []
-    for row in raw:
-        if not isinstance(row, dict) or _objective_side(row) != player.is_radiant:
-            continue
-        key = row.get("key")
-        if high_ground_only and not (
-            row.get("type") == "building_kill"
-            and isinstance(key, str)
-            and ("tower3" in key or "_rax_" in key)
-        ):
-            continue
-        candidates.append(row)
-    slots = []
-    for row in candidates:
-        slot = row.get("player_slot", row.get("slot"))
-        if not isinstance(slot, int) or isinstance(slot, bool):
-            return None, float(len(candidates))
-        if (slot < 128) != player.is_radiant:
-            return None, float(len(candidates))
-        slots.append(slot)
-    return float(slots.count(player.player_slot)), float(len(candidates))
-
-
-def _roshan_opportunities(
-    game: StrictMap, player: StrictPlayerFact
+def _target_damage(
+    raw_player: Mapping[str, Any] | None,
+    predicate: Any,
 ) -> float | None:
-    raw = game.artifact.get("objectives")
-    if not isinstance(raw, list):
+    if raw_player is None or not isinstance(raw_player.get("damage"), dict):
         return None
-    roshans = [
-        row
-        for row in raw
-        if isinstance(row, dict) and row.get("type") == "CHAT_MESSAGE_ROSHAN_KILL"
-    ]
-    sides = tuple(_objective_side(row) for row in roshans)
-    if any(side is None for side in sides):
-        return None
-    return float(sum(side == player.is_radiant for side in sides))
+    selected = []
+    for target, value in raw_player["damage"].items():
+        if isinstance(target, str) and predicate(target):
+            number = _number(value)
+            if number is None or number < 0:
+                return None
+            selected.append(number)
+    return math.fsum(selected)
+
+
+def _roshan_damage(raw_player: Mapping[str, Any] | None) -> float | None:
+    return _target_damage(raw_player, lambda target: target == "npc_dota_roshan")
+
+
+def _high_ground_damage(
+    raw_player: Mapping[str, Any] | None, *, is_radiant: bool
+) -> float | None:
+    enemy = "badguys" if is_radiant else "goodguys"
+    prefix = f"npc_dota_{enemy}_"
+
+    def high_ground_target(target: str) -> bool:
+        if not target.startswith(prefix):
+            return False
+        suffix = target[len(prefix) :]
+        return suffix == "fort" or suffix.startswith(
+            ("tower3_", "tower4", "melee_rax_", "range_rax_")
+        )
+
+    return _target_damage(raw_player, high_ground_target)
 
 
 def _raw_metrics(game: StrictMap, player: StrictPlayerFact) -> dict[str, float | None]:
     facts = player.facts
+    raw_player = _raw_player(game, player)
     own_team = tuple(row for row in game.players if _team_key(row) == _team_key(player))
-    opponents = tuple(row for row in game.players if row.is_radiant != player.is_radiant)
+    opponents = tuple(
+        row for row in game.players if row.is_radiant != player.is_radiant
+    )
 
     def fact(name: str) -> float | None:
         return _number(facts.get(name))
@@ -491,10 +522,8 @@ def _raw_metrics(game: StrictMap, player: StrictPlayerFact) -> dict[str, float |
         other = _number(lane_opponent.facts.get(name)) if lane_opponent else None
         return own - other if own is not None and other is not None else None
 
-    def opposing_carry_suppression(name: str) -> float | None:
-        own = fact(name)
-        other = _number(opposing_carry.facts.get(name)) if opposing_carry else None
-        return own - other if own is not None and other is not None else None
+    def opposing_carry_value(name: str) -> float | None:
+        return _number(opposing_carry.facts.get(name)) if opposing_carry else None
 
     damage_taken = facts.get("damage_taken")
     if isinstance(damage_taken, dict):
@@ -502,12 +531,6 @@ def _raw_metrics(game: StrictMap, player: StrictPlayerFact) -> dict[str, float |
     else:
         damage_taken_total = _number(damage_taken)
 
-    objective_participations, objective_opportunities = _attributed_objectives(
-        game, player, high_ground_only=False
-    )
-    high_ground_participations, high_ground_opportunities = _attributed_objectives(
-        game, player, high_ground_only=True
-    )
     values: dict[str, float | None] = {
         "last_hits": fact("last_hits"),
         "net_worth": fact("net_worth"),
@@ -522,28 +545,26 @@ def _raw_metrics(game: StrictMap, player: StrictPlayerFact) -> dict[str, float |
         "team_kills": team_sum("kills"),
         "gold_10_diff": lane_diff("gold_at_10"),
         "last_hits_10_diff": lane_diff("last_hits_at_10"),
-        "opposing_carry_gold_suppression_at_10": opposing_carry_suppression(
-            "gold_at_10"
+        "opposing_carry_gold_at_10": opposing_carry_value("gold_at_10"),
+        "opposing_carry_last_hits_at_10": opposing_carry_value("last_hits_at_10"),
+        "kills_at_10": fact("kills_at_10"),
+        "logged_rune_pickups_at_10": _exact_log_count(
+            None if raw_player is None else raw_player.get("runes_log"),
+            through_seconds=10 * 60,
         ),
-        "opposing_carry_lh_suppression_at_10": opposing_carry_suppression(
-            "last_hits_at_10"
-        ),
-        "early_kill_participations": pair_sum("kills_at_10", "assists_at_10"),
-        "early_team_kills": team_sum("kills_at_10"),
-        "rune_pickups": fact("rune_pickups"),
         "damage_taken": damage_taken_total,
         "control_seconds": fact("stuns"),
         "observer_wards": fact("observer_wards_placed"),
         "sentry_wards": fact("sentry_wards_placed"),
+        "observer_wards_at_10": fact("observer_wards_at_10"),
+        "sentry_wards_at_10": fact("sentry_wards_at_10"),
         "dewards": pair_sum("observer_kills", "sentry_kills"),
         "hero_healing": fact("hero_healing"),
         "stacks": fact("camps_stacked"),
-        "roshan_participations": None,
-        "roshan_opportunities": _roshan_opportunities(game, player),
-        "objective_participations": objective_participations,
-        "objective_opportunities": objective_opportunities,
-        "high_ground_participations": high_ground_participations,
-        "high_ground_opportunities": high_ground_opportunities,
+        "roshan_damage": _roshan_damage(raw_player),
+        "high_ground_damage": _high_ground_damage(
+            raw_player, is_radiant=player.is_radiant
+        ),
     }
     values.update(_teamfight_metrics(game, player))
     return values
@@ -571,6 +592,7 @@ def build_scores(
             event_strength=FORMAL_EVENT_STRENGTH,
             completed_at=game.completed_at,
             first_usable_at=_effective_usable_at(player),
+            source_content_hash=player.content_hash,
             role_assignment_source=str(player.role_assignment_source),
             role_assignment_cutoff=player.role_assignment_cutoff,
             role_assignment_input_hash=str(player.role_assignment_input_hash),
@@ -644,13 +666,16 @@ def build_scores(
                 event_strength=FORMAL_EVENT_STRENGTH,
                 target_started_at=game.started_at,
                 first_usable_at=player.first_usable_at,
+                source_content_hash=player.content_hash,
                 role_assignment_source=role_source,
                 role_assignment_cutoff=role_cutoff,
                 role_assignment_input_hash=role_hash,
                 role_assignment_version=role_version,
                 raw_metrics=tuple(sorted(raw.items())),
                 residuals=ResidualAdjustments(),
-                result_adjustment=5.0 if game.radiant_win == player.is_radiant else -5.0,
+                result_adjustment=5.0
+                if game.radiant_win == player.is_radiant
+                else -5.0,
             ),
             benchmark,
         )
@@ -700,6 +725,8 @@ def persist_scores(
                             "transformed_value": metric.transformed_value,
                             "benchmark_median": metric.benchmark_median,
                             "benchmark_mad": metric.benchmark_mad,
+                            "benchmark_sample_size": metric.benchmark_sample_size,
+                            "benchmark_fallback_level": metric.benchmark_fallback_level,
                             "robust_z": metric.robust_z,
                             "direction": metric.direction,
                             "missing_reason": metric.missing_reason,
