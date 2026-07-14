@@ -24,8 +24,7 @@ test("popup refreshes connection and capture state after a toggle", async () => 
   let status = {
     state: "capturing",
     paused: false,
-    paired: true,
-    companion: {reachable: true, authenticated: true},
+    companion: {reachable: true, connected: true},
     recognizedMatches: ["42"],
     queue: [],
     counters: {dropped: 0},

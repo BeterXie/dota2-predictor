@@ -1,4 +1,4 @@
-import {CompanionError, fetchCompanionStatus, pairCompanion, sendEventBatch} from "./companion-client.js";
+import {CompanionError, fetchCompanionStatus, sendEventBatch} from "./companion-client.js";
 import {acknowledge, enqueueBounded, makeBatch, retryDelayMs} from "./queue.js";
 
 const SESSION_KEY = "raybetMonitorSession";
@@ -36,14 +36,12 @@ function initialState() {
     nextRetryAt: null,
     recognizedMatches: [],
     lastEvent: null,
-    companion: {reachable: false, authenticated: false, lastError: null},
+    companion: {reachable: false, connected: false, lastError: null},
   };
 }
 
 function initialConfig() {
   return {
-    paired: false,
-    secret: null,
     enabledDomains: {ray086: true, raylinks: true},
     debugLevel: "errors",
   };
@@ -67,7 +65,15 @@ async function writeState(state) {
 
 async function readConfig() {
   const stored = await chrome.storage.local.get(CONFIG_KEY);
-  return {...initialConfig(), ...(stored[CONFIG_KEY] || {})};
+  const current = stored[CONFIG_KEY] || {};
+  return {
+    enabledDomains: {
+      ray086: current.enabledDomains?.ray086 !== false,
+      raylinks: current.enabledDomains?.raylinks !== false,
+    },
+    debugLevel: ["off", "errors", "diagnostic"].includes(current.debugLevel)
+      ? current.debugLevel : "errors",
+  };
 }
 
 async function writeConfig(config) {
@@ -80,6 +86,7 @@ async function initialize() {
     chrome.storage.local.setAccessLevel?.({accessLevel: "TRUSTED_CONTEXTS"}),
     chrome.storage.session.setAccessLevel?.({accessLevel: "TRUSTED_CONTEXTS"}),
   ]);
+  await writeConfig(await readConfig());
   await serialized(async () => {
     const state = await readState();
     await writeState(state);
@@ -108,7 +115,7 @@ async function scheduleRetry(error) {
     state.state = state.paused ? "paused" : "buffering";
     state.companion = {
       reachable: error instanceof CompanionError ? error.status > 0 : false,
-      authenticated: false,
+      connected: false,
       lastError: error.code || error.name || "delivery_error",
     };
     await writeState(state);
@@ -126,10 +133,9 @@ async function deliverQueued() {
     return deliveryPromise;
   }
   deliveryPromise = (async () => {
-    const config = await readConfig();
     const snapshot = await serialized(async () => {
       const state = await readState();
-      if (state.paused || !config.paired || !config.secret) {
+      if (state.paused) {
         return null;
       }
       return makeBatch(state.queue).events;
@@ -138,7 +144,7 @@ async function deliverQueued() {
       return;
     }
     try {
-      const response = await sendEventBatch(snapshot, config.secret);
+      const response = await sendEventBatch(snapshot);
       const ids = acknowledgedIds(response);
       await serialized(async () => {
         const state = await readState();
@@ -147,7 +153,7 @@ async function deliverQueued() {
         state.retryAttempt = 0;
         state.nextRetryAt = null;
         state.state = state.paused ? "paused" : "capturing";
-        state.companion = {reachable: true, authenticated: true, lastError: null};
+        state.companion = {reachable: true, connected: true, lastError: null};
         await writeState(state);
       });
       clearTimeout(retryTimer);
@@ -157,9 +163,6 @@ async function deliverQueued() {
         setTimeout(() => void deliverQueued(), 0);
       }
     } catch (error) {
-      if (error instanceof CompanionError && (error.status === 401 || error.status === 403)) {
-        await writeConfig({...config, paired: false});
-      }
       await scheduleRetry(error);
     }
   })().finally(() => {
@@ -262,23 +265,21 @@ async function handleMessage(message, sender) {
       });
       return {accepted: true};
     case "raybet.popup.getStatus": {
-      const [state, config] = await Promise.all([readState(), readConfig()]);
+      const state = await readState();
       let remote = null;
       let companion = {...state.companion};
-      if (config.paired && config.secret) {
-        try {
-          remote = await fetchCompanionStatus(config.secret);
-          companion = {reachable: true, authenticated: true, lastError: null};
-        } catch (error) {
-          remote = null;
-          companion = {
-            reachable: error instanceof CompanionError ? error.status > 0 : false,
-            authenticated: false,
-            lastError: error.code || error.name || "status_error",
-          };
-        }
+      try {
+        remote = await fetchCompanionStatus();
+        companion = {reachable: true, connected: true, lastError: null};
+      } catch (error) {
+        remote = null;
+        companion = {
+          reachable: error instanceof CompanionError ? error.status > 0 : false,
+          connected: false,
+          lastError: error.code || error.name || "status_error",
+        };
       }
-      return {...state, companion, paired: config.paired, remote};
+      return {...state, companion, remote};
     }
     case "raybet.popup.setPaused": {
       const state = await serialized(async () => {
@@ -307,13 +308,6 @@ async function handleMessage(message, sender) {
       });
       await broadcastCaptureState(await readState(), config);
       return config;
-    }
-    case "raybet.options.pair": {
-      const response = await pairCompanion(String(message.code || "").trim());
-      if (!response.secret) throw new Error("Pairing response did not include a secret");
-      const config = await writeConfig({...(await readConfig()), paired: true, secret: response.secret});
-      void deliverQueued();
-      return {paired: config.paired};
     }
     default:
       return {error: "unknown_action"};

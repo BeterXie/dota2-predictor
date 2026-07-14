@@ -10,9 +10,9 @@ function render(status) {
   dot.className = stateTone(state);
   document.querySelector("#stateText").textContent = state.replaceAll("_", " ");
   document.querySelector("#captureToggle").checked = !status.paused;
-  document.querySelector("#companionValue").textContent = status.paired
-    ? (status.companion?.reachable && status.companion?.authenticated
-      ? "Connected" : "Unavailable") : "Not paired";
+  document.querySelector("#companionValue").textContent =
+    status.companion?.reachable && status.companion?.connected
+      ? "Connected" : "Unavailable";
   document.querySelector("#matchCount").textContent = String(status.recognizedMatches?.length || 0);
   document.querySelector("#queueCount").textContent = String(status.queue?.length || 0);
   document.querySelector("#dropCount").textContent = String(status.counters?.dropped || 0);

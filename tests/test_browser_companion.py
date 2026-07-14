@@ -1,34 +1,21 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from live_betting.browser_auth import (
-    PairingManager,
-    PairingStateStore,
-    RequestAuthenticator,
-    sign_request,
-)
-from live_betting.browser_companion import CompanionConfig, create_app
+from live_betting.browser_companion import MAX_BODY_BYTES, CompanionConfig, create_app
 from live_betting.browser_contract import payload_sha256
 
 
 ORIGIN = "chrome-extension://" + "a" * 32
-
-
-class FakeProtector:
-    def protect(self, plaintext: bytes) -> bytes:
-        return bytes(value ^ 0x5A for value in plaintext)
-
-    def unprotect(self, ciphertext: bytes) -> bytes:
-        return bytes(value ^ 0x5A for value in ciphertext)
+VERSION_HEADERS = {
+    "Origin": ORIGIN,
+    "X-Dota-Extension-Version": "0.1.0",
+}
 
 
 def browser_event(event_id: str = "1" * 64) -> dict:
@@ -80,7 +67,9 @@ def browser_event(event_id: str = "1" * 64) -> dict:
         "game_id": 151,
         "payload": payload,
         "payload_hash": payload_sha256(payload),
-        "payload_bytes": len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()),
+        "payload_bytes": len(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ),
         "capture_reason": None,
         "extension_version": "0.1.0",
     }
@@ -90,117 +79,194 @@ class BrowserCompanionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
-        state_store = PairingStateStore(root / "pair.json", FakeProtector())
-        self.pairing = PairingManager(state_store)
-        self.code = self.pairing.issue_code()
-        config = CompanionConfig(database=root / "test.db", pairing_state=root / "pair.json")
         self.app = create_app(
-            config,
-            pairing=self.pairing,
-            authenticator=RequestAuthenticator(self.pairing),
+            CompanionConfig(database=root / "test.db", extension_origin=ORIGIN)
         )
         self.client = TestClient(self.app)
-        paired = self.client.post(
-            "/v1/pair",
-            headers={"Origin": ORIGIN},
-            json={"code": self.code, "extension_version": "0.1.0"},
-        )
-        self.assertEqual(paired.status_code, 200)
-        self.secret = base64.b64decode(paired.json()["secret"])
 
     def tearDown(self) -> None:
         self.client.close()
         self.temp.cleanup()
 
-    def auth_headers(self, method: str, path: str, body: bytes) -> dict[str, str]:
-        timestamp = str(int(time.time() * 1000))
-        nonce = hashlib.sha256(f"{path}:{timestamp}:{time.time_ns()}".encode()).hexdigest()[:32]
-        return {
-            "Origin": ORIGIN,
-            "X-Dota-Extension-Version": "0.1.0",
-            "X-Dota-Timestamp": timestamp,
-            "X-Dota-Nonce": nonce,
-            "X-Dota-Signature": sign_request(
-                self.secret, timestamp, nonce, method, path, body
-            ),
-        }
+    @staticmethod
+    def headers(*, content_type: bool = False) -> dict[str, str]:
+        headers = dict(VERSION_HEADERS)
+        if content_type:
+            headers["Content-Type"] = "application/json"
+        return headers
 
     def test_health_and_origin_limited_preflight(self) -> None:
-        self.assertEqual(self.client.get("/health").json(), {"protocol_version": 1, "state": "ok"})
+        self.assertEqual(
+            self.client.get("/health").json(),
+            {"protocol_version": 1, "state": "ok"},
+        )
         response = self.client.options("/v1/events", headers={"Origin": ORIGIN})
         self.assertEqual(response.status_code, 204)
         self.assertEqual(response.headers["access-control-allow-origin"], ORIGIN)
-        denied = self.client.options(
-            "/v1/events", headers={"Origin": "chrome-extension://" + "b" * 32}
-        )
-        self.assertEqual(denied.status_code, 403)
+        for denied_origin in (
+            "chrome-extension://" + "b" * 32,
+            "https://www.ray086.com",
+        ):
+            denied = self.client.options(
+                "/v1/events", headers={"Origin": denied_origin}
+            )
+            self.assertEqual(denied.status_code, 403)
 
-    def test_authenticated_batch_is_idempotent_and_status_has_no_payload(self) -> None:
+    def test_direct_batch_is_idempotent_and_status_has_no_payload(self) -> None:
         event = browser_event()
         body = json.dumps([event], separators=(",", ":")).encode()
         first = self.client.post(
-            "/v1/events",
-            content=body,
-            headers={**self.auth_headers("POST", "/v1/events", body), "Content-Type": "application/json"},
+            "/v1/events", content=body, headers=self.headers(content_type=True)
         )
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(first.json()["results"][0]["status"], "accepted")
         second = self.client.post(
-            "/v1/events",
-            content=body,
-            headers={**self.auth_headers("POST", "/v1/events", body), "Content-Type": "application/json"},
+            "/v1/events", content=body, headers=self.headers(content_type=True)
         )
         self.assertEqual(second.json()["results"][0]["status"], "duplicate")
 
-        headers = self.auth_headers("GET", "/v1/status", b"")
-        status = self.client.get("/v1/status", headers=headers)
+        status = self.client.post(
+            "/v1/status", content=b"{}", headers=self.headers(content_type=True)
+        )
         self.assertEqual(status.status_code, 200)
-        serialized = status.text.lower()
-        self.assertNotIn("payload", serialized)
+        self.assertNotIn("payload", status.text.lower())
         self.assertEqual(status.json()["duplicate_count"], 1)
         self.assertEqual(status.json()["known_dota_match_count"], 1)
+        self.assertEqual(self.client.get("/v1/status").status_code, 405)
 
-        post_headers = self.auth_headers("POST", "/v1/status", b"")
-        post_status = self.client.post("/v1/status", headers=post_headers)
-        self.assertEqual(post_status.status_code, 200)
-        self.assertEqual(post_status.json()["known_dota_match_count"], 1)
+    def test_origin_and_version_are_required(self) -> None:
+        body = json.dumps([browser_event()], separators=(",", ":")).encode()
+        for headers, expected in (
+            ({"Content-Type": "application/json"}, 403),
+            ({
+                "Origin": "chrome-extension://" + "b" * 32,
+                "Content-Type": "application/json",
+                "X-Dota-Extension-Version": "0.1.0",
+            }, 403),
+            ({
+                "Origin": "https://www.ray086.com",
+                "Content-Type": "application/json",
+                "X-Dota-Extension-Version": "0.1.0",
+            }, 403),
+            ({"Origin": ORIGIN, "Content-Type": "application/json"}, 400),
+            ({
+                "Origin": ORIGIN,
+                "Content-Type": "application/json",
+                "X-Dota-Extension-Version": "9.9.9",
+            }, 400),
+        ):
+            response = self.client.post("/v1/events", content=body, headers=headers)
+            self.assertEqual(response.status_code, expected, response.text)
 
-    def test_bad_auth_and_forbidden_batch_are_rejected(self) -> None:
-        body = b"[]"
+        for headers, expected in (
+            ({"Content-Type": "application/json"}, 403),
+            ({
+                "Origin": "chrome-extension://" + "b" * 32,
+                "Content-Type": "application/json",
+                "X-Dota-Extension-Version": "0.1.0",
+            }, 403),
+            ({"Origin": ORIGIN, "Content-Type": "application/json"}, 400),
+            ({
+                "Origin": ORIGIN,
+                "Content-Type": "application/json",
+                "X-Dota-Extension-Version": "9.9.9",
+            }, 400),
+        ):
+            response = self.client.post("/v1/status", content=b"{}", headers=headers)
+            self.assertEqual(response.status_code, expected, response.text)
+
+    def test_event_version_matches_the_direct_client_version(self) -> None:
+        event = browser_event()
+        event["extension_version"] = "9.9.9"
         response = self.client.post(
             "/v1/events",
-            content=body,
-            headers={"Origin": ORIGIN, "Content-Type": "application/json"},
+            content=json.dumps([event], separators=(",", ":")).encode(),
+            headers=self.headers(content_type=True),
         )
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["results"][0]["reason"],
+            "unsupported_extension_version",
+        )
 
+    def test_body_and_batch_boundaries(self) -> None:
+        exact = self.client.post(
+            "/v1/events",
+            content=b" " * MAX_BODY_BYTES,
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(exact.status_code, 400)
+        self.assertEqual(exact.json()["code"], "invalid_json")
+        oversized = self.client.post(
+            "/v1/events",
+            content=b" " * (MAX_BODY_BYTES + 1),
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(oversized.status_code, 413)
+
+        accepted_batch = [browser_event(f"{index + 10:064x}") for index in range(50)]
+        accepted = self.client.post(
+            "/v1/events",
+            content=json.dumps(accepted_batch, separators=(",", ":")).encode(),
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(len(accepted.json()["results"]), 50)
+
+        too_many = [browser_event(f"{index + 100:064x}") for index in range(51)]
+        rejected = self.client.post(
+            "/v1/events",
+            content=json.dumps(too_many, separators=(",", ":")).encode(),
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(rejected.json()["code"], "invalid_batch")
+
+    def test_forbidden_fields_and_content_type_are_rejected(self) -> None:
         event = browser_event()
         event["payload"]["authorization_token"] = "fixture-sensitive"
         forbidden = json.dumps([event], separators=(",", ":")).encode()
         response = self.client.post(
             "/v1/events",
             content=forbidden,
-            headers={
-                **self.auth_headers("POST", "/v1/events", forbidden),
-                "Content-Type": "application/json",
-            },
+            headers=self.headers(content_type=True),
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["code"], "forbidden_field")
         self.assertNotIn("fixture-sensitive", response.text)
 
-    def test_authenticated_event_batch_requires_json_content_type(self) -> None:
-        body = json.dumps([browser_event()], separators=(",", ":")).encode()
+        valid = json.dumps([browser_event()], separators=(",", ":")).encode()
         response = self.client.post(
-            "/v1/events",
-            content=body,
-            headers={
-                **self.auth_headers("POST", "/v1/events", body),
-                "Content-Type": "text/plain",
-            },
+            "/v1/events", content=valid, headers=self.headers()
         )
         self.assertEqual(response.status_code, 415)
         self.assertEqual(response.json()["code"], "unsupported_media_type")
+
+    def test_status_rate_limit_is_retained(self) -> None:
+        for _ in range(60):
+            response = self.client.post(
+                "/v1/status", content=b"{}", headers=self.headers(content_type=True)
+            )
+            self.assertEqual(response.status_code, 200)
+        limited = self.client.post(
+            "/v1/status", content=b"{}", headers=self.headers(content_type=True)
+        )
+        self.assertEqual(limited.status_code, 429)
+
+    def test_event_rate_limit_is_retained(self) -> None:
+        for _ in range(120):
+            response = self.client.post(
+                "/v1/events", content=b"[]", headers=self.headers(content_type=True)
+            )
+            self.assertEqual(response.status_code, 400)
+        limited = self.client.post(
+            "/v1/events", content=b"[]", headers=self.headers(content_type=True)
+        )
+        self.assertEqual(limited.status_code, 429)
+
+    def test_invalid_configured_origin_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "extension_origin"):
+            CompanionConfig(extension_origin="chrome-extension://invalid")
 
 
 if __name__ == "__main__":

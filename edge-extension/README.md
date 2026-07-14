@@ -1,8 +1,8 @@
 # Dota 2 Live Market Monitor
 
 This unpacked Microsoft Edge Manifest V3 extension passively observes
-sanitized RayBet Dota 2 match and odds responses and sends them to the local
-predictor companion at `127.0.0.1:8765`.
+sanitized RayBet Dota 2 match and odds responses and sends them directly to
+the local predictor companion at `127.0.0.1:8765`.
 
 It does not read credentials, account data, balance, bet slips, stake inputs,
 or order submissions. It cannot place a real wager.
@@ -24,19 +24,27 @@ npm test
 2. Open `edge://extensions` in a normal Edge window.
 3. Enable Developer mode and choose **Load unpacked**.
 4. Select this `edge-extension` directory.
-5. Open the extension settings and enter the one-time pairing code printed by
-   the companion.
+5. Use the extension card's reload button after local source changes.
 
-Use the popup to pause capture and view queue health. Removing the extension
-deletes its browser-session queue and local pairing secret.
+The popup reports `Connected` as soon as the companion is reachable. No
+pairing code or local secret is required. Use the popup to pause capture and
+view queue health.
 
-If the extension was removed, reinstalled with a different ID, or lost its
-local secret, stop the companion and reset its persisted pairing:
+The companion remains bound to `127.0.0.1` and accepts only the configured
+extension Origin. This workspace defaults to the currently loaded extension:
 
-```powershell
-cd C:\Users\59908\dota2-predictor
-python -m live_betting.browser_companion --reset-pairing
-python -m live_betting.browser_companion
+```text
+chrome-extension://gfccbmpmpgicjfleahjbokeifhjnemam
 ```
 
-Then enter the newly printed one-time code in the extension settings.
+If Edge assigns a different unpacked extension ID, start the companion with
+the exact Origin shown on `edge://extensions`:
+
+```powershell
+python -m live_betting.browser_companion `
+  --extension-origin chrome-extension://<extension-id>
+```
+
+Removing the extension deletes its browser-session queue. The companion still
+enforces the Dota-only event contract, payload limits, and forbidden-field
+checks. Real wager execution remains permanently disabled.

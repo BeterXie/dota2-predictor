@@ -2,17 +2,15 @@
 * { box-sizing: border-box; }
 body { margin: 0; color: #1f2933; background: #f4f6f8; }
 main { width: min(560px, calc(100% - 32px)); margin: 24px auto; background: #fff; border: 1px solid #d6dce3; border-radius: 6px; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid #dfe4e9; }
+header { display: flex; align-items: center; padding: 18px 20px; border-bottom: 1px solid #dfe4e9; }
 h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
 h2 { margin: 0 0 14px; font-size: 14px; letter-spacing: 0; }
-#pairState { color: #68737e; font-size: 12px; }
 section { padding: 18px 20px; border-bottom: 1px solid #e1e5ea; }
-.pair-row { display: grid; grid-template-columns: 100px minmax(0, 1fr) 72px; gap: 10px; align-items: center; }
 label, select, input, button { font: inherit; font-size: 13px; }
 input, select { min-width: 0; height: 34px; border: 1px solid #bdc6cf; border-radius: 4px; padding: 6px 8px; }
 button { min-height: 34px; border: 1px solid #1d6f52; border-radius: 4px; padding: 6px 14px; color: #fff; background: #167052; cursor: pointer; }
 .check-row, .select-row { display: flex; align-items: center; gap: 10px; min-height: 38px; }
 .check-row input { width: 16px; height: 16px; }
 .select-row { justify-content: space-between; }
-#pairMessage, #saveMessage { min-height: 16px; margin: 8px 0 0; color: #59636e; font-size: 12px; }
+#saveMessage { min-height: 16px; margin: 8px 0 0; color: #59636e; font-size: 12px; }
 footer { display: flex; align-items: center; gap: 12px; padding: 16px 20px; }

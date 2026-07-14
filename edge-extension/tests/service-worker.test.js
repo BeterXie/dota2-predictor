@@ -18,13 +18,35 @@ function storageArea() {
   };
 }
 
-test("service worker serializes session queue and honors pause", async () => {
+function jsonResponse(payload) {
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: {"Content-Type": "application/json"},
+  });
+}
+
+test("service worker connects directly, cleans legacy secrets, and honors pause", async () => {
   const local = storageArea();
   const session = storageArea();
   const messageListeners = [];
   const alarmListeners = [];
   const alarms = [];
   const tabMessages = [];
+  local.values.set("raybetMonitorConfig", {
+    paired: true,
+    secret: "legacy-secret-must-be-removed",
+    enabledDomains: {ray086: true, raylinks: true},
+    debugLevel: "errors",
+  });
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (url.endsWith("/v1/status")) return jsonResponse({protocol_version: 1});
+    const events = JSON.parse(init.body);
+    return jsonResponse({
+      results: events.map((event) => ({event_id: event.event_id, status: "accepted"})),
+    });
+  };
   globalThis.chrome = {
     storage: {local, session},
     runtime: {
@@ -49,6 +71,13 @@ test("service worker serializes session queue and honors pause", async () => {
   assert.equal(alarmListeners.length, 1);
   assert.deepEqual(local.access, [{accessLevel: "TRUSTED_CONTEXTS"}]);
   assert.deepEqual(session.access, [{accessLevel: "TRUSTED_CONTEXTS"}]);
+  const normalized = local.values.get("raybetMonitorConfig");
+  assert.deepEqual(normalized, {
+    enabledDomains: {ray086: true, raylinks: true},
+    debugLevel: "errors",
+  });
+  assert.equal(Object.hasOwn(normalized, "paired"), false);
+  assert.equal(Object.hasOwn(normalized, "secret"), false);
 
   const send = (message, sender = {url: "https://www.ray086.com/esports"}) => new Promise((resolve) => {
     const keepAlive = messageListeners[0](message, sender, resolve);
@@ -72,9 +101,13 @@ test("service worker serializes session queue and honors pause", async () => {
     source_origin: "https://cfinfo.365raylinks.com",
     event,
   });
+  await new Promise((resolve) => setTimeout(resolve, 20));
   let status = await send({action: "raybet.popup.getStatus"});
-  assert.equal(status.queue.length, 1);
+  assert.equal(status.queue.length, 0);
   assert.deepEqual(status.recognizedMatches, ["42"]);
+  assert.equal(status.companion.reachable, true);
+  assert.equal(status.companion.connected, true);
+  assert.equal(status.companion.lastError, null);
 
   await send({
     action: "raybet.options.save",
@@ -88,8 +121,6 @@ test("service worker serializes session queue and honors pause", async () => {
     event: {...event, event_id: "2".repeat(64)},
   });
   assert.deepEqual(disabled, {accepted: false, reason: "disabled_source"});
-  status = await send({action: "raybet.popup.getStatus"});
-  assert.equal(status.queue.length, 1);
 
   await send({action: "raybet.popup.setPaused", paused: true});
   await send({
@@ -99,33 +130,22 @@ test("service worker serializes session queue and honors pause", async () => {
   });
   status = await send({action: "raybet.popup.getStatus"});
   assert.equal(status.state, "paused");
-  assert.equal(status.queue.length, 1);
-
-  const previousFetch = globalThis.fetch;
-  const storedConfig = local.values.get("raybetMonitorConfig");
-  local.values.set("raybetMonitorConfig", {
-    ...storedConfig,
-    paired: true,
-    secret: btoa(String.fromCharCode(...new Uint8Array(32).fill(1))),
-  });
-  globalThis.fetch = async () => new Response(JSON.stringify({protocol_version: 1}), {
-    status: 200,
-    headers: {"Content-Type": "application/json"},
-  });
-  status = await send({action: "raybet.popup.getStatus"});
-  assert.equal(status.companion.reachable, true);
-  assert.equal(status.companion.authenticated, true);
-  assert.equal(status.companion.lastError, null);
-  globalThis.fetch = previousFetch;
+  assert.equal(status.queue.length, 0);
 
   let rejectDelivery;
   let markDeliveryStarted;
   const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (url) => {
+    if (url.endsWith("/v1/status")) return jsonResponse({protocol_version: 1});
     markDeliveryStarted();
     return new Promise((_, reject) => { rejectDelivery = reject; });
   };
   await send({action: "raybet.popup.setPaused", paused: false});
+  await send({
+    action: "raybet.capture.event",
+    source_origin: "https://www.ray086.com",
+    event: {...event, event_id: "4".repeat(64)},
+  });
   await deliveryStarted;
   await send({action: "raybet.popup.setPaused", paused: true});
   rejectDelivery(new TypeError("network unavailable"));
@@ -133,9 +153,10 @@ test("service worker serializes session queue and honors pause", async () => {
   const persisted = session.values.get("raybetMonitorSession");
   assert.equal(persisted.paused, true);
   assert.equal(persisted.state, "paused");
-  globalThis.fetch = previousFetch;
+  assert.equal(persisted.queue.length, 1);
   const retryWait = Math.max(0, persisted.nextRetryAt - Date.now()) + 100;
   await new Promise((resolve) => setTimeout(resolve, retryWait));
 
+  globalThis.fetch = previousFetch;
   delete globalThis.chrome;
 });

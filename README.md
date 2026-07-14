@@ -69,8 +69,8 @@ python scripts/run_strict_event_ingest.py --database data/dota2.db
 
 The Edge extension is at `edge-extension/`. See
 [edge-extension/README.md](edge-extension/README.md) for local companion
-pairing. The extension passively captures sanitized Dota 2 market events and
-cannot submit a wager.
+setup. It connects directly to the localhost companion, passively captures
+sanitized Dota 2 market events, and cannot submit a wager.
 
 ## Database
 
