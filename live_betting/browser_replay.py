@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -137,7 +138,7 @@ def replay_browser_events(
         target_path.unlink()
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(source_path) as source:
+    with closing(sqlite3.connect(source_path)) as source:
         source.row_factory = sqlite3.Row
         rows = source.execute("SELECT * FROM browser_events").fetchall()
 

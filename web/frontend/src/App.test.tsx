@@ -338,6 +338,106 @@ describe("App data recovery and ownership", () => {
     expect(api.createControlSession).not.toHaveBeenCalled();
   });
 
+  it("does not refetch an immutable replay detail when live snapshots advance", async () => {
+    const liveMatch = match("live");
+    const replayMatch: MonitorMatch = {
+      ...match("replay"),
+      lifecycle: "ended",
+      history_eligible: true,
+    };
+    const replaySnapshot = {
+      ...snapshot,
+      matches: [liveMatch, replayMatch],
+    };
+    let snapshotListener: ((event: MessageEvent<string>) => void) | null = null;
+    api.fetchBootstrap.mockResolvedValue(replaySnapshot);
+    api.snapshotStream.mockReturnValue({
+      addEventListener: vi.fn((name: string, listener: (event: MessageEvent<string>) => void) => {
+        if (name === "snapshot") snapshotListener = listener;
+      }),
+      close: vi.fn(),
+      onerror: null,
+      onopen: null,
+    });
+
+    render(<App />);
+    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(await screen.findByText("odds-replay")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(api.fetchMatchDetail).toHaveBeenCalledWith("replay", expect.any(AbortSignal));
+    });
+    const callsBeforeSnapshot = api.fetchMatchDetail.mock.calls.length;
+
+    await act(async () => {
+      snapshotListener?.(new MessageEvent("snapshot", {
+        data: JSON.stringify({ ...replaySnapshot, cursor: "cursor-2" }),
+      }));
+      await Promise.resolve();
+    });
+
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(callsBeforeSnapshot);
+  });
+
+  it("refreshes live detail at a bounded cadence without overlapping requests", async () => {
+    vi.useFakeTimers();
+    let resolveRefresh: ((value: unknown) => void) | undefined;
+    api.fetchMatchDetail
+      .mockResolvedValueOnce({
+        ...match("a"),
+        winner_timeline: [],
+        decisions: [],
+        vision: [],
+        markets: [],
+      })
+      .mockReturnValueOnce(new Promise((resolve) => {
+        resolveRefresh = resolve;
+      }));
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+    });
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      vi.advanceTimersByTime(20_000);
+      await Promise.resolve();
+    });
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveRefresh?.({
+        ...match("a"),
+        winner_timeline: [],
+        decisions: [],
+        vision: [],
+        markets: [],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(4_999);
+      await Promise.resolve();
+    });
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(3);
+  });
+
   it("keeps live and ended match lists isolated", async () => {
     const endedMatch: MonitorMatch = {
       ...match("ended"),

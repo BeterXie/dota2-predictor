@@ -1535,7 +1535,13 @@ class LiveBettingStore:
               team_two=excluded.team_two, scheduled_at=excluded.scheduled_at,
               best_of=excluded.best_of, status=excluded.status,
               live_url=excluded.live_url, raw_json=excluded.raw_json,
-              updated_at=excluded.updated_at""",
+              updated_at=excluded.updated_at
+            WHERE julianday(excluded.updated_at) IS NOT NULL
+              AND (
+                    julianday(raybet_matches.updated_at) IS NULL
+                    OR julianday(excluded.updated_at) >=
+                       julianday(raybet_matches.updated_at)
+              )""",
             (
                 str(safe_row.get("id")),
                 str(safe_row.get("tournament_name") or ""),

@@ -835,6 +835,15 @@ def approve_automatic_exact_evidence(
         raise StrictMappingError(failure.reason) from failure
     if mapping.acceptance_mode != "manual_exact":
         raise StrictMappingError("automatic_approval_requires_manual_exact_source")
+    causal_reason = _approval_source_causal_reason(
+        approval_approved_at=approved_at,
+        approval_recorded_at=recorded_at,
+        source_accepted_at=mapping.accepted_at,
+        source_recorded_at=mapping.recorded_at,
+        source_metadata_updated_at=mapping.raybet_metadata_updated_at,
+    )
+    if causal_reason is not None:
+        raise StrictMappingError(causal_reason)
     eligible = query_strict_live_eligibility(
         connection,
         raybet_match_id=mapping.raybet_match_id,
@@ -1541,7 +1550,9 @@ def _automatic_approval_id(
     as_of: datetime,
 ) -> int:
     row = connection.execute(
-        """SELECT approval.approval_id
+        """SELECT approval.approval_id, approval.approved_at,
+                  approval.recorded_at, source.accepted_at,
+                  source.recorded_at, source.raybet_metadata_updated_at
              FROM strict_live_automatic_evidence_approvals AS approval
              JOIN strict_live_map_mappings AS source
                ON source.mapping_id=approval.source_mapping_id
@@ -1577,6 +1588,18 @@ def _automatic_approval_id(
     ).fetchone()
     if row is None:
         raise _FailClosed("automatic_exact_evidence_not_preapproved")
+    causal_reason = _automatic_approval_causal_reason(
+        approval_approved_at=row[1],
+        approval_recorded_at=row[2],
+        source_accepted_at=row[3],
+        source_recorded_at=row[4],
+        source_metadata_updated_at=row[5],
+        mapping_accepted_at=values["accepted_at"],
+        mapping_recorded_at=values["recorded_at"],
+        transport_at=as_of,
+    )
+    if causal_reason is not None:
+        raise _FailClosed(causal_reason)
     return int(row[0])
 
 
@@ -1818,7 +1841,8 @@ def _automatic_mapping_approval_reason(
                   approval.raybet_identity_hash, approval.canonical_identity_hash,
                   approval.crosswalk_evidence_hash, approval.evidence_hash,
                   approval.approved_at, approval.recorded_at,
-                  invalidation.invalidation_id
+                  invalidation.invalidation_id, source.accepted_at,
+                  source.recorded_at, source.raybet_metadata_updated_at
              FROM strict_live_automatic_evidence_approvals AS approval
              JOIN strict_live_map_mappings AS source
                ON source.mapping_id=approval.source_mapping_id
@@ -1845,8 +1869,90 @@ def _automatic_mapping_approval_reason(
         return "automatic_exact_approval_mismatch"
     if row[12] is not None:
         return "automatic_exact_approval_invalidated"
-    if _parse_timestamp(str(row[10])) > transport_at or _parse_timestamp(str(row[11])) > transport_at:
-        return "automatic_exact_approval_not_yet_available"
+    return _automatic_approval_causal_reason(
+        approval_approved_at=row[10],
+        approval_recorded_at=row[11],
+        source_accepted_at=row[13],
+        source_recorded_at=row[14],
+        source_metadata_updated_at=row[15],
+        mapping_accepted_at=mapping.accepted_at,
+        mapping_recorded_at=mapping.recorded_at,
+        transport_at=transport_at,
+    )
+
+
+def _automatic_approval_causal_reason(
+    *,
+    approval_approved_at: object,
+    approval_recorded_at: object,
+    source_accepted_at: object,
+    source_recorded_at: object,
+    source_metadata_updated_at: object,
+    mapping_accepted_at: object,
+    mapping_recorded_at: object,
+    transport_at: datetime,
+) -> str | None:
+    source_reason = _approval_source_causal_reason(
+        approval_approved_at=approval_approved_at,
+        approval_recorded_at=approval_recorded_at,
+        source_accepted_at=source_accepted_at,
+        source_recorded_at=source_recorded_at,
+        source_metadata_updated_at=source_metadata_updated_at,
+    )
+    if source_reason is not None:
+        return source_reason
+    try:
+        approval_recorded = _parse_timestamp(str(approval_recorded_at))
+        mapping_accepted = (
+            mapping_accepted_at
+            if isinstance(mapping_accepted_at, datetime)
+            else _parse_timestamp(str(mapping_accepted_at))
+        )
+        mapping_recorded = (
+            mapping_recorded_at
+            if isinstance(mapping_recorded_at, datetime)
+            else _parse_timestamp(str(mapping_recorded_at))
+        )
+    except (TypeError, ValueError):
+        return "automatic_exact_approval_causal_order_invalid"
+    if any(
+        value.tzinfo is None or value.utcoffset() is None
+        for value in (mapping_accepted, mapping_recorded, transport_at)
+    ):
+        return "automatic_exact_approval_causal_order_invalid"
+    mapping_accepted = mapping_accepted.astimezone(timezone.utc)
+    mapping_recorded = mapping_recorded.astimezone(timezone.utc)
+    transport_at = transport_at.astimezone(timezone.utc)
+    if not (
+        approval_recorded <= mapping_accepted <= mapping_recorded
+        and approval_recorded <= transport_at
+    ):
+        return "automatic_exact_approval_causal_order_invalid"
+    return None
+
+
+def _approval_source_causal_reason(
+    *,
+    approval_approved_at: object,
+    approval_recorded_at: object,
+    source_accepted_at: object,
+    source_recorded_at: object,
+    source_metadata_updated_at: object,
+) -> str | None:
+    try:
+        approval_approved = _parse_timestamp(str(approval_approved_at))
+        approval_recorded = _parse_timestamp(str(approval_recorded_at))
+        source_accepted = _parse_timestamp(str(source_accepted_at))
+        source_recorded = _parse_timestamp(str(source_recorded_at))
+        source_metadata = _parse_timestamp(str(source_metadata_updated_at))
+    except (TypeError, ValueError):
+        return "automatic_exact_approval_causal_order_invalid"
+    if not (
+        approval_approved <= approval_recorded
+        and source_accepted <= source_recorded <= approval_recorded
+        and source_metadata <= source_recorded
+    ):
+        return "automatic_exact_approval_causal_order_invalid"
     return None
 
 

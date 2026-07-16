@@ -83,34 +83,70 @@ def collect_once(
     list_rows = list_rows if list_rows is not None else client.live_matches()
     odds_count = 0
     changed_count = 0
+    error_count = 0
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
     _write_raw(raw_dir, "_match_list", {"result": list_rows}, utc_now())
     for list_row in list_rows:
-        payload = sanitize_raybet_payload(client.match_odds(str(list_row.get("id"))))
-        observed_at = utc_now()
-        result = payload.get("result") or {}
-        match_id = str(result.get("id"))
-        fingerprint = _fingerprint(payload)
-        _write_raw(raw_dir, match_id, payload, observed_at)
-        raw_fingerprints[match_id] = fingerprint
-        snapshots = snapshots_from_payload(payload, received_at=observed_at)
-        with store.transaction():
-            store.upsert_raybet_match(result, observed_at)
-            _, changes = store.store_odds_observation(
-                source="direct",
-                observation_key=_direct_observation_key(
-                    match_id, observed_at, fingerprint
-                ),
-                source_event_id=None,
-                raybet_match_id=match_id,
-                observed_at=observed_at,
-                normalized_state_hash=normalized_state_hash(snapshots),
-                snapshots=snapshots,
+        match_id = ""
+        try:
+            if not isinstance(list_row, dict):
+                raise ValueError("live match list row is not an object")
+            match_id = str(list_row.get("id") or "")
+            if not match_id.isdigit():
+                raise ValueError("live match list id is invalid")
+            payload = sanitize_raybet_payload(client.match_odds(match_id))
+            result = payload.get("result") if isinstance(payload, dict) else None
+            if (
+                not isinstance(result, dict)
+                or str(result.get("id") or "") != match_id
+                or type(result.get("game_id")) is not int
+                or int(result["game_id"]) != 151
+            ):
+                raise ValueError("live odds response identity mismatch")
+            observed_at = utc_now()
+            fingerprint = _fingerprint(payload)
+            _write_raw(raw_dir, match_id, payload, observed_at)
+            raw_fingerprints[match_id] = fingerprint
+            snapshots = snapshots_from_payload(payload, received_at=observed_at)
+            with store.transaction():
+                store.upsert_raybet_match(result, observed_at)
+                _, changes = store.store_odds_observation(
+                    source="direct",
+                    observation_key=_direct_observation_key(
+                        match_id, observed_at, fingerprint
+                    ),
+                    source_event_id=None,
+                    raybet_match_id=match_id,
+                    observed_at=observed_at,
+                    normalized_state_hash=normalized_state_hash(snapshots),
+                    snapshots=snapshots,
+                )
+                changed_count += changes
+            odds_count += len(snapshots)
+        except Exception as error:
+            error_count += 1
+            logger.warning(
+                "RayBet fetch failed for live match_id=%s (%s)",
+                match_id or "<invalid>",
+                type(error).__name__,
             )
-            changed_count += changes
-        odds_count += len(snapshots)
-    store.record_collector("raybet", success_at=utc_now())
-    return {"matches": len(list_rows), "odds": odds_count, "changed": changed_count}
+    completed_at = utc_now()
+    if error_count:
+        store.record_collector(
+            "raybet",
+            success_at=completed_at if len(list_rows) > error_count else None,
+            error_at=completed_at,
+            error=f"{error_count} live match(s) failed",
+        )
+    else:
+        store.record_collector("raybet", success_at=completed_at)
+    return {
+        "matches": len(list_rows) - error_count,
+        "listed": len(list_rows),
+        "odds": odds_count,
+        "changed": changed_count,
+        "errors": error_count,
+    }
 
 
 def collect_completed_once(
@@ -292,12 +328,27 @@ def run(args: argparse.Namespace) -> int:
                         )
                 failures = 0
                 succeeded_at = utc_now()
+                partial_errors = summary["errors"] + completed_summary["errors"]
+                worker_status = "degraded" if partial_errors else "healthy"
+                collection_succeeded = any(
+                    (
+                        item["matches"] > 0
+                        or (item["listed"] == 0 and item["errors"] == 0)
+                    )
+                    for item in (summary, completed_summary)
+                )
                 record_health(
                     store.connection,
                     "raybet_worker",
-                    "healthy",
+                    worker_status,
                     heartbeat_at=succeeded_at,
-                    success_at=succeeded_at,
+                    success_at=succeeded_at if collection_succeeded else None,
+                    error_at=succeeded_at if partial_errors else None,
+                    error=(
+                        f"{partial_errors} match collection error(s)"
+                        if partial_errors
+                        else None
+                    ),
                     details={
                         "source": "worker",
                         **summary,

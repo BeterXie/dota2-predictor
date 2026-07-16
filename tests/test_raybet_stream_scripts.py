@@ -21,9 +21,11 @@ from scripts.supervise_raybet_streams import (
 )
 from scripts.invalidate_vision_observations import freeze_draft_map, invalidate
 from scripts.watch_raybet_stream import (
+    ALLOWED_STREAM_HOSTS,
     DEFAULT_OBSERVATION_DIR as WATCHER_OBSERVATION_DIR,
     ROOT,
     _meaningful,
+    _validate_stream_url,
     completion_check_due,
     current_frame_clock_fields,
     match_is_complete,
@@ -34,6 +36,9 @@ from contracts.live_observation import LiveObservation
 from vision.map_state import ConfirmedClock
 from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
+
+
+STREAM_URL = "https://play.ehome.gg/live.m3u8"
 
 
 def test_visual_supervisor_cli_constructs_parser() -> None:
@@ -99,7 +104,7 @@ def _source_database(
             "INSERT INTO raybet_matches VALUES (?, ?, ?, ?, ?, ?)",
             (
                 "42",
-                "https://stream.test/live.m3u8",
+                STREAM_URL,
                 json.dumps(raw),
                 3,
                 status,
@@ -161,7 +166,7 @@ def test_match_source_prefers_manual_current_index(tmp_path: Path) -> None:
             (3, "map-2-a", "42", "winner", "1", "map_2", "2026-07-14T01:00:00+00:00"),
         ],
     )
-    assert match_source(database, "42") == ("https://stream.test/live.m3u8", 3)
+    assert match_source(database, "42") == (STREAM_URL, 3)
 
 
 def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
@@ -174,7 +179,7 @@ def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
         ]
     }
     database = _source_database(tmp_path, raw, [])
-    signed = "https://stream.test/live.m3u8?auth_key=EPHEMERAL_TOKEN"
+    signed = "https://qplay.ehome.gg/live.m3u8?auth_key=EPHEMERAL_TOKEN"
     response = {
         "result": {
             "id": 42,
@@ -199,7 +204,7 @@ def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
         ).fetchone()
     finally:
         connection.close()
-    assert stored[0] == "https://stream.test/live.m3u8"
+    assert stored[0] == STREAM_URL
     assert "EPHEMERAL_TOKEN" not in stored[1]
 
 
@@ -212,7 +217,7 @@ def test_match_source_uses_settled_maps_not_open_future_markets(
         [],
     )
 
-    assert match_source(database, "42") == ("https://stream.test/live.m3u8", 2)
+    assert match_source(database, "42") == (STREAM_URL, 2)
 
 
 def test_match_source_does_not_mistake_future_open_market_for_current_map(
@@ -220,7 +225,7 @@ def test_match_source_does_not_mistake_future_open_market_for_current_map(
 ) -> None:
     database = _source_database(tmp_path, _raybet_payload(), [])
 
-    assert match_source(database, "42") == ("https://stream.test/live.m3u8", 1)
+    assert match_source(database, "42") == (STREAM_URL, 1)
 
 
 def test_match_source_fails_closed_when_current_map_is_ambiguous(
@@ -253,7 +258,7 @@ def test_explicit_map_override_bypasses_ambiguous_market_inference(
     )
 
     assert match_source(database, "42", map_override=2) == (
-        "https://stream.test/live.m3u8",
+        STREAM_URL,
         2,
     )
 
@@ -261,17 +266,99 @@ def test_explicit_map_override_bypasses_ambiguous_market_inference(
 def test_direct_url_requires_explicit_map_number() -> None:
     with pytest.raises(ValueError, match="--map-number is required"):
         resolve_source(
-            url="https://stream.test/live.m3u8",
+            url=STREAM_URL,
             database=None,
             match_id="42",
             map_number=None,
         )
     assert resolve_source(
-        url="https://stream.test/live.m3u8",
+        url=STREAM_URL,
         database=None,
         match_id="42",
         map_number=2,
-    ) == ("https://stream.test/live.m3u8", 2)
+    ) == (STREAM_URL, 2)
+
+
+@pytest.mark.parametrize("host", sorted(ALLOWED_STREAM_HOSTS))
+@pytest.mark.parametrize(
+    ("scheme", "port"),
+    (("https", ""), ("https", ":443"), ("http", ":80")),
+)
+def test_stream_url_allowlist_accepts_public_hosts_and_signed_queries(
+    host: str, scheme: str, port: str
+) -> None:
+    url = f"{scheme}://{host}{port}/live.m3u8?auth_key=EPHEMERAL_TOKEN"
+
+    assert _validate_stream_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    (
+        "https://localhost/live.m3u8",
+        "https://127.0.0.1/live.m3u8",
+        "https://10.0.0.7/live.m3u8",
+        "https://play.ehome.gg:8443/live.m3u8",
+        "https://user:pass@play.ehome.gg/live.m3u8",
+        "https://play.ehome.gg/live.m3u8#fragment",
+        "https://not-allowlisted.example/live.m3u8",
+    ),
+)
+def test_stream_url_allowlist_rejects_private_and_ambiguous_urls(
+    bad_url: str,
+) -> None:
+    with pytest.raises(ValueError, match="invalid stream URL"):
+        _validate_stream_url(bad_url)
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    (
+        "https://localhost/live.m3u8",
+        "https://play.ehome.gg:8443/live.m3u8",
+        "https://user:pass@play.ehome.gg/live.m3u8",
+    ),
+)
+def test_stream_url_allowlist_applies_to_sqlite_and_explicit_sources(
+    tmp_path: Path, bad_url: str
+) -> None:
+    database = _source_database(tmp_path, {}, [])
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE raybet_matches SET live_url=? WHERE raybet_match_id='42'",
+            (bad_url,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="invalid stored live URL"):
+        match_source(database, "42")
+    with pytest.raises(ValueError, match="invalid explicit stream URL"):
+        resolve_source(
+            url=bad_url,
+            database=None,
+            match_id="42",
+            map_number=1,
+        )
+
+
+def test_stream_url_allowlist_applies_to_fresh_source(tmp_path: Path) -> None:
+    database = _source_database(tmp_path, {}, [])
+    response = {
+        "result": {
+            "id": 42,
+            "game_id": 151,
+            "live_url": "http://127.0.0.1:8000/private.m3u8",
+        }
+    }
+    with patch("scripts.watch_raybet_stream.RayBetClient") as client_type:
+        client = client_type.return_value.__enter__.return_value
+        client.match_odds.return_value = response
+        with pytest.raises(ValueError, match="invalid fresh live URL"):
+            match_source(database, "42", refresh_url=True)
+        client.match_odds.assert_called_once_with("42")
 
 
 def test_supervisor_does_not_override_inferred_map_number(tmp_path: Path) -> None:

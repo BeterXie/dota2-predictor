@@ -406,9 +406,16 @@
   display: flex;
   min-height: 46px;
   align-items: center;
+  overflow-x: auto;
   padding: 4px 18px;
   border-bottom: 1px solid var(--border, #303840);
   background: var(--surface, #151a20);
+  scrollbar-color: #3a444e transparent;
+  scrollbar-width: thin;
+}
+
+.intel-mode-bar > [role="tablist"] {
+  flex: 0 0 max-content;
 }
 
 .intel-match-layout {

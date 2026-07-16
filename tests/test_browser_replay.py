@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,7 +110,7 @@ def test_replay_reads_immutable_payload_and_orders_by_capture_time() -> None:
         source = root / "source.db"
         target = root / "target.db"
         _write_source(source, reverse=True)
-        with sqlite3.connect(source) as connection:
+        with closing(sqlite3.connect(source)) as connection:
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(
                     "UPDATE browser_events SET payload_json='{}' WHERE event_id=?",
@@ -118,11 +119,10 @@ def test_replay_reads_immutable_payload_and_orders_by_capture_time() -> None:
 
         summary = replay_browser_events(source, target)
         assert summary["events"] == 2
-        with sqlite3.connect(target) as connection:
+        with closing(sqlite3.connect(target)) as connection:
             rows = connection.execute(
                 "SELECT event_id, captured_at, received_at FROM browser_events ORDER BY captured_at"
             ).fetchall()
-        connection.close()
         assert [row[0] for row in rows] == [f"{1:064x}", f"{2:064x}"]
         assert rows[0][1] == rows[0][2]
 

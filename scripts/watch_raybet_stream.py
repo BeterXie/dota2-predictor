@@ -40,6 +40,37 @@ LIVE_BETTING_DATA = ROOT / "data" / "live_betting"
 DEFAULT_OBSERVATION_DIR = LIVE_BETTING_DATA / "live_observations"
 DEFAULT_EVIDENCE_DIR = LIVE_BETTING_DATA / "live_evidence"
 DEFAULT_FEATURES = ROOT / "vision" / "templates" / "hero_features.npz"
+ALLOWED_STREAM_HOSTS = frozenset(
+    {
+        "play.ehome.gg",
+        "qplay.ehome.gg",
+        "qplay.shyxswl.com",
+    }
+)
+
+
+def _validate_stream_url(url: object, *, description: str = "stream URL") -> str:
+    """Accept only public RayBet HLS hosts and their signed query strings."""
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"invalid {description}")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError(f"invalid {description}") from error
+    scheme = parsed.scheme.casefold()
+    hostname = parsed.hostname.casefold() if parsed.hostname is not None else None
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    if (
+        scheme not in {"http", "https"}
+        or hostname not in ALLOWED_STREAM_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, default_port}
+        or parsed.fragment
+    ):
+        raise ValueError(f"invalid {description}")
+    return url
 
 
 def _manual_map_number(payload: object, best_of: int | None) -> int | None:
@@ -85,19 +116,7 @@ def _fresh_stream_payload(match_id: str) -> tuple[str, dict[str, object]]:
     url = result.get("live_url")
     if not isinstance(url, str):
         raise ValueError(f"no fresh live URL found for RayBet match {match_id}")
-    try:
-        parsed = urlsplit(url)
-    except ValueError as error:
-        raise ValueError(
-            f"invalid fresh live URL for RayBet match {match_id}"
-        ) from error
-    if (
-        parsed.scheme not in {"http", "https"}
-        or parsed.hostname is None
-        or parsed.username
-        or parsed.password
-    ):
-        raise ValueError(f"invalid fresh live URL for RayBet match {match_id}")
+    _validate_stream_url(url, description=f"fresh live URL for RayBet match {match_id}")
     return url, result
 
 
@@ -120,7 +139,9 @@ def match_source(
         if refresh_url:
             url, payload = _fresh_stream_payload(match_id)
         else:
-            url = str(row[0])
+            url = _validate_stream_url(
+                row[0], description=f"stored live URL for RayBet match {match_id}"
+            )
             try:
                 payload = json.loads(str(row[1] or "{}"))
             except (TypeError, ValueError):
@@ -158,19 +179,20 @@ def resolve_source(
     map_number: int | None,
     refresh_url: bool = False,
 ) -> tuple[str, int]:
-    if url:
+    if url is not None:
         if map_number is None:
             raise ValueError("--map-number is required with --url")
         if map_number < 1 or map_number > 10:
             raise ValueError("map number must be between 1 and 10")
-        return url, map_number
+        return _validate_stream_url(url, description="explicit stream URL"), map_number
     if database:
-        return match_source(
+        resolved_url, resolved_map = match_source(
             database,
             match_id,
             map_override=map_number,
             refresh_url=refresh_url,
         )
+        return _validate_stream_url(resolved_url), resolved_map
     raise ValueError("provide --url or --database")
 
 

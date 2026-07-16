@@ -151,6 +151,55 @@ describe("IntelligenceDashboard", () => {
       },
       radiant_state: state("radiant", "comeback", 101),
       dire_state: state("dire", "throw", 202),
+      player_performance: [{
+        player_slot: 0,
+        account_id: 11,
+        player_name: "River",
+        team_id: 101,
+        side: "radiant",
+        hero_id: 2,
+        hero_name: "Axe",
+        performance: {
+          kills: 8,
+          deaths: 2,
+          assists: 11,
+          gold_per_min: 650,
+          xp_per_min: 720,
+          net_worth: 21000,
+          last_hits: 260,
+          denies: 12,
+          hero_damage: 24000,
+          hero_healing: 0,
+          tower_damage: 9000,
+          level: 25,
+          lane_efficiency: 0.57,
+          kda: 9.5,
+        },
+      }, {
+        player_slot: 1,
+        account_id: 12,
+        player_name: "Delta",
+        team_id: 101,
+        side: "radiant",
+        hero_id: 5,
+        hero_name: "Crystal Maiden",
+        performance: {
+          kills: 2,
+          deaths: 7,
+          assists: 16,
+          gold_per_min: 310,
+          xp_per_min: 420,
+          net_worth: 9800,
+          last_hits: 48,
+          denies: 3,
+          hero_damage: 12000,
+          hero_healing: 800,
+          tower_damage: 300,
+          level: 18,
+          lane_efficiency: 0.49,
+          kda: 2.57,
+        },
+      }],
       player_scores: [{
         player_slot: 0,
         account_id: 11,
@@ -218,6 +267,9 @@ describe("IntelligenceDashboard", () => {
     expect(screen.getByText("K/D/A 8 / 2 / 11")).toBeInTheDocument();
     expect(screen.getByText(/GPM\/XPM 650 \/ 720/)).toBeInTheDocument();
     expect(screen.getByText(/英雄\/建筑伤害 24,000 \/ 9,000/)).toBeInTheDocument();
+    expect(screen.getByText("Delta")).toBeInTheDocument();
+    expect(screen.getByText("K/D/A 2 / 7 / 16")).toBeInTheDocument();
+    expect(screen.getByText("评分待处理")).toBeInTheDocument();
     expect(screen.getAllByText("历史重建").length).toBeGreaterThan(0);
     expect(screen.getAllByText("击杀比分 31 : 18")).toHaveLength(2);
     expect(screen.getByText("比赛局势分类")).toBeInTheDocument();

@@ -42,6 +42,8 @@ type HistoryView = "replay" | "intelligence";
 type PrimaryView = "live" | "history" | "operations";
 type ViewMode = "live" | HistoryView | "operations";
 
+const LIVE_DETAIL_REFRESH_MS = 5_000;
+
 const IntelligenceDashboard = lazy(() =>
   import("./components/IntelligenceDashboard").then((module) => ({
     default: module.IntelligenceDashboard,
@@ -258,21 +260,48 @@ export default function App() {
   useEffect(() => {
     if (!selectedId || (view !== "live" && view !== "replay")) {
       setDetail(null);
+      setDetailLoading(false);
       return;
     }
-    const controller = new AbortController();
-    setDetailLoading(true);
-    fetchMatchDetail(selectedId, controller.signal)
-      .then((data) => {
+    let disposed = false;
+    let controller: AbortController | null = null;
+    let refreshTimer: number | null = null;
+
+    const load = async () => {
+      if (disposed || controller) return;
+      const request = new AbortController();
+      controller = request;
+      setDetailLoading(true);
+      try {
+        const data = await fetchMatchDetail(selectedId, request.signal);
+        if (disposed || request.signal.aborted) return;
         setDetail(data);
         setDetailError(null);
-      })
-      .catch((reason: Error) => {
-        if (reason.name !== "AbortError") setDetailError(reason.message || "无法加载赛事详情");
-      })
-      .finally(() => setDetailLoading(false));
-    return () => controller.abort();
-  }, [selectedId, snapshot?.cursor, view]);
+      } catch (reason) {
+        if (
+          !disposed
+          && (!(reason instanceof Error) || reason.name !== "AbortError")
+        ) {
+          setDetailError(errorText(reason, "无法加载赛事详情"));
+        }
+      } finally {
+        if (controller === request) controller = null;
+        if (!disposed) {
+          setDetailLoading(false);
+          if (view === "live") {
+            refreshTimer = window.setTimeout(() => void load(), LIVE_DETAIL_REFRESH_MS);
+          }
+        }
+      }
+    };
+
+    void load();
+    return () => {
+      disposed = true;
+      controller?.abort();
+      if (refreshTimer != null) window.clearTimeout(refreshTimer);
+    };
+  }, [selectedId, view]);
 
   useEffect(() => {
     if (!snapshot || (view !== "live" && view !== "replay")) return;

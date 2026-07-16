@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -614,6 +615,49 @@ class ComebackStrategyTests(unittest.TestCase):
                     incomplete.append(row)
                 result = ComebackShadowStrategy().evaluate(
                     snapshots=incomplete,
+                    previous_snapshots=previous,
+                    previous_observation=self.observation(),
+                    previous_transport_key="previous",
+                    map_already_attempted=False,
+                    **self.strategy_kwargs(decided_at=current[0].received_at),
+                )
+                self.assertIsNone(result.order)
+                self.assertEqual(result.decision.reason, "market_surface_incomplete")
+
+    def test_supporting_group_lines_must_be_coherent(self) -> None:
+        previous = self.snapshots(NOW)
+        current = self.snapshots(NOW + timedelta(seconds=3))
+        cases = {
+            "extra_outcome": current + [
+                replace(
+                    current[2],
+                    odds_id="kh-extra",
+                    market=replace(current[2].market, outcome_key="team_one:extra"),
+                )
+            ],
+            "total_line_mismatch": [
+                replace(
+                    row,
+                    market=replace(row.market, line=49.5)
+                    if row.odds_id == "kills-under"
+                    else row.market,
+                )
+                for row in current
+            ],
+            "handicap_line_mismatch": [
+                replace(
+                    row,
+                    market=replace(row.market, line=-5.5)
+                    if row.odds_id == "kh-dog"
+                    else row.market,
+                )
+                for row in current
+            ],
+        }
+        for name, malformed in cases.items():
+            with self.subTest(name=name):
+                result = ComebackShadowStrategy().evaluate(
+                    snapshots=malformed,
                     previous_snapshots=previous,
                     previous_observation=self.observation(),
                     previous_transport_key="previous",

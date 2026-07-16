@@ -16,6 +16,7 @@ from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import claim
 from live_betting.report import build_report
 from live_betting.storage import LiveBettingStore
+from live_betting.strict_read_gate import strict_read_gate
 from live_betting.strict_eligibility import (
     StrictMappingConflictError,
     StrictMappingError,
@@ -185,8 +186,14 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             "evidence": evidence(),
             "accepted_by": "operator-a",
             "accepted_at": ACCEPTED_AT,
+            "acceptance_mode": "manual_exact",
         }
         values.update(overrides)
+        if (
+            values["acceptance_mode"] == "automatic_exact"
+            and "accepted_at" not in overrides
+        ):
+            values["accepted_at"] = RECORDED_AT
         return accept_strict_live_map_mapping(self.connection, **values)  # type: ignore[arg-type]
 
     def query(self, *, at: datetime = RECORDED_AT, map_number: int = 1):
@@ -933,6 +940,46 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             self.query(map_number=2).mapping_refs["strict_mapping_acceptance_mode"],
             "automatic_exact",
         )
+
+    def test_automatic_exact_rejects_mapping_accepted_before_approval_record(self) -> None:
+        manual = self.accept(map_number=1)
+        approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=manual.mapping_id,
+            approved_by="operator-b",
+            approved_at=ACCEPTED_AT,
+        )
+
+        with self.assertRaisesRegex(
+            StrictMappingError,
+            "automatic_exact_approval_causal_order_invalid",
+        ):
+            self.accept(
+                map_number=2,
+                acceptance_mode="automatic_exact",
+                accepted_by="automatic-mapper",
+                accepted_at=ACCEPTED_AT,
+            )
+
+        automatic = self.accept(
+            map_number=2,
+            acceptance_mode="automatic_exact",
+            accepted_by="automatic-mapper",
+            accepted_at=RECORDED_AT,
+        )
+        gate = strict_read_gate(
+            self.connection,
+            mapping_id_sql=str(automatic.mapping_id),
+            raybet_match_id_sql="'match-1'",
+            map_number_sql="2",
+            signal_at_sql=f"'{RECORDED_AT.isoformat()}'",
+            dependent_type="shadow_order",
+            dependent_key_sql="'automatic-order'",
+        )
+        row = self.connection.execute(
+            f"SELECT {gate.included_sql}, {gate.unverifiable_sql}"
+        ).fetchone()
+        self.assertEqual(tuple(row), (1, 0))
 
     def test_monitor_cursor_tracks_mapping_approval_and_invalidation(self) -> None:
         mapping = self.accept()

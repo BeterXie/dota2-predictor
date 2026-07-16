@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -42,14 +43,38 @@ def _complete_groups(
             groups[row.odds_group_id].append(row)
     return [
         rows for rows in groups.values()
-        if required_sides <= {row.market.side for row in rows}
+        if len(rows) == 2
+        and required_sides == {row.market.side for row in rows}
+        and len({row.odds_id for row in rows}) == 2
         and all(
             row.market.supported
             and row.price > 1
             and raybet_odds_is_open(row.status)
             for row in rows
         )
+        and _coherent_lines(rows, market_type)
     ]
+
+
+def _coherent_lines(rows: list[OddsSnapshot], market_type: str) -> bool:
+    """Reject supporting groups whose paired lines cannot describe one market."""
+    if market_type == "winner":
+        return True
+    lines = {row.market.side: row.market.line for row in rows}
+    if any(not _finite_line(line) for line in lines.values()):
+        return False
+    if market_type == "kill_handicap":
+        return lines["team_one"] == -lines["team_two"]
+    return lines["over"] == lines["under"]
+
+
+def _finite_line(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def _near_even_line(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from live_betting.monitor import (
     collect_completed_once,
     collect_once,
     completed_refresh_due,
+    run,
 )
 from live_betting.raybet import RayBetClient
 from live_betting.shadow_monitor import latest_market_state
@@ -496,7 +498,8 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
     def test_direct_collector_archives_each_list_and_odds_response(self) -> None:
         payload = {
             "result": {
-                "id": "match-1",
+                "id": "1001",
+                "game_id": 151,
                 "team": [
                     {"team_id": 1, "pos": 1, "team_name": "One"},
                     {"team_id": 2, "pos": 2, "team_name": "Two"},
@@ -524,13 +527,142 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                         NOW + timedelta(seconds=offset) for offset in range(6)
                     ),
                 ):
-                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "match-1"}], raw_fingerprints={})
-                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "match-1"}], raw_fingerprints={})
+                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "1001"}], raw_fingerprints={})
+                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "1001"}], raw_fingerprints={})
 
             list_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "_match_list").glob("*.json.gz"))
-            odds_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "match-1").glob("*.json.gz"))
+            odds_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "1001").glob("*.json.gz"))
             self.assertEqual(len(list_files), 2)
             self.assertEqual(len(odds_files), 2)
+
+    def test_direct_collector_rejects_mismatched_and_non_dota_responses(self) -> None:
+        responses = {
+            "1001": {"result": {"id": "1002", "game_id": 151, "odds": []}},
+            "1002": {"result": {"id": "1002", "game_id": "151", "odds": []}},
+        }
+
+        class Client:
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                return responses[match_id]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                summary = collect_once(
+                    store,
+                    Client(),
+                    Path(directory) / "raw",
+                    list_rows=[{"id": "1001"}, {"id": "1002"}],
+                    raw_fingerprints={},
+                )
+                self.assertEqual(summary["listed"], 2)
+                self.assertEqual(summary["matches"], 0)
+                self.assertEqual(summary["errors"], 2)
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM raybet_matches").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM odds_snapshots").fetchone()[0],
+                    0,
+                )
+
+    def test_direct_collector_continues_after_one_match_failure(self) -> None:
+        payload = {
+            "result": {
+                "id": "1002",
+                "game_id": 151,
+                "team": [],
+                "odds": [],
+            }
+        }
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                self.calls.append(match_id)
+                if match_id == "1001":
+                    raise TimeoutError("fixture timeout")
+                return payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client()
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                summary = collect_once(
+                    store,
+                    client,
+                    Path(directory) / "raw",
+                    list_rows=[{"id": "1001"}, {"id": "1002"}],
+                    raw_fingerprints={},
+                )
+                self.assertEqual(client.calls, ["1001", "1002"])
+                self.assertEqual(summary["matches"], 1)
+                self.assertEqual(summary["errors"], 1)
+                self.assertIsNotNone(
+                    store.connection.execute(
+                        "SELECT 1 FROM raybet_matches WHERE raybet_match_id='1002'"
+                    ).fetchone()
+                )
+                collector = store.connection.execute(
+                    "SELECT last_success_at, last_error_at, last_error "
+                    "FROM collector_runs WHERE collector='raybet'"
+                ).fetchone()
+                self.assertIsNotNone(collector["last_success_at"])
+                self.assertIsNotNone(collector["last_error_at"])
+                self.assertIn("1 live match", collector["last_error"])
+
+    def test_worker_marks_partial_collection_as_degraded(self) -> None:
+        payload = {
+            "result": {
+                "id": "1002",
+                "game_id": 151,
+                "team": [],
+                "odds": [],
+            }
+        }
+
+        class Client:
+            def __enter__(self) -> "Client":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def live_matches(self) -> list[dict[str, object]]:
+                return [{"id": "1001"}, {"id": "1002"}]
+
+            def completed_matches(self) -> list[dict[str, object]]:
+                return []
+
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                if match_id == "1001":
+                    raise TimeoutError("fixture timeout")
+                return payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            args = SimpleNamespace(
+                database=database,
+                raw_dir=Path(directory) / "raw",
+                interval=0.0,
+                list_interval=15.0,
+                completed_interval=300.0,
+                max_backoff=300.0,
+                once=True,
+                schema_prepared=False,
+            )
+            with patch("live_betting.monitor.RayBetClient", return_value=Client()):
+                self.assertEqual(run(args), 0)
+            with LiveBettingStore(database) as store:
+                health = store.connection.execute(
+                    "SELECT status, details_json FROM service_health "
+                    "WHERE component='raybet_worker'"
+                ).fetchone()
+                self.assertEqual(health["status"], "degraded")
+                self.assertEqual(json.loads(health["details_json"])["errors"], 1)
 
     def test_browser_match_is_insert_only(self) -> None:
         direct = {
@@ -558,7 +690,8 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
     def test_direct_complete_response_rolls_back_on_market_failure(self) -> None:
         payload = {
             "result": {
-                "id": "match-1",
+                "id": "1001",
+                "game_id": 151,
                 "tournament_name": "Atomic Cup",
                 "team": [
                     {"team_id": 1, "pos": 1, "team_name": "One"},
@@ -591,11 +724,12 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                     return original(row)
 
                 with patch.object(store, "insert_odds", side_effect=fail_second):
-                    with self.assertRaisesRegex(RuntimeError, "injected"):
-                        collect_once(
-                            store, Client(), Path(directory) / "raw",
-                            list_rows=[{"id": "match-1"}], raw_fingerprints={},
-                        )
+                    summary = collect_once(
+                        store, Client(), Path(directory) / "raw",
+                        list_rows=[{"id": "1001"}], raw_fingerprints={},
+                    )
+                self.assertEqual(summary["matches"], 0)
+                self.assertEqual(summary["errors"], 1)
                 for table in (
                     "raybet_matches", "odds_snapshots", "odds_transport_observations"
                 ):
@@ -603,6 +737,45 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                         store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
                         0,
                     )
+
+    def test_raybet_metadata_does_not_regress_on_late_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                store.upsert_raybet_match(
+                    {
+                        "id": "1001",
+                        "game_id": 151,
+                        "tournament_name": "New Cup",
+                        "team": [
+                            {"pos": 1, "team_name": "New One"},
+                            {"pos": 2, "team_name": "New Two"},
+                        ],
+                        "status": 2,
+                    },
+                    NOW + timedelta(seconds=10),
+                )
+                store.upsert_raybet_match(
+                    {
+                        "id": "1001",
+                        "game_id": 151,
+                        "tournament_name": "Old Cup",
+                        "team": [
+                            {"pos": 1, "team_name": "Old One"},
+                            {"pos": 2, "team_name": "Old Two"},
+                        ],
+                        "status": 1,
+                    },
+                    NOW,
+                )
+                row = store.connection.execute(
+                    "SELECT tournament, team_one, status, updated_at "
+                    "FROM raybet_matches WHERE raybet_match_id='1001'"
+                ).fetchone()
+                self.assertEqual(row["tournament"], "New Cup")
+                self.assertEqual(row["team_one"], "New One")
+                self.assertEqual(row["status"], "2")
+                self.assertEqual(row["updated_at"], (NOW + timedelta(seconds=10)).isoformat())
 
 
 if __name__ == "__main__":

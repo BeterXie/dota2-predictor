@@ -826,9 +826,7 @@ function PlayerScoreTable({
   scores: IntelligencePlayerMapScore[];
   performance: IntelligencePlayerPerformance[];
 }) {
-  const rows: (IntelligencePlayerMapScore | IntelligencePlayerPerformance)[] = (
-    scores.length ? scores : performance
-  );
+  const rows = mergePlayerRows(scores, performance);
   if (!rows.length) return <EmptyState compact message="本场暂无选手评分或赛后表现" />;
   return (
     <div className="intel-table-scroll">
@@ -887,6 +885,36 @@ function PlayerScoreTable({
       </table>
     </div>
   );
+}
+
+function mergePlayerRows(
+  scores: IntelligencePlayerMapScore[],
+  performance: IntelligencePlayerPerformance[],
+): (IntelligencePlayerMapScore | IntelligencePlayerPerformance)[] {
+  const scoresBySlot = new Map(scores.map((row) => [row.player_slot, row]));
+  const performanceBySlot = new Map(performance.map((row) => [row.player_slot, row]));
+  const slots = Array.from(new Set([
+    ...scoresBySlot.keys(),
+    ...performanceBySlot.keys(),
+  ])).sort((left, right) => left - right);
+
+  return slots.map((slot) => {
+    const score = scoresBySlot.get(slot);
+    const archived = performanceBySlot.get(slot);
+    if (!score) return archived!;
+    if (!archived) return score;
+    return {
+      ...archived,
+      ...score,
+      account_id: score.account_id ?? archived.account_id,
+      player_name: score.player_name ?? archived.player_name,
+      team_id: score.team_id ?? archived.team_id,
+      side: score.side ?? archived.side,
+      hero_id: score.hero_id ?? archived.hero_id,
+      hero_name: score.hero_name ?? archived.hero_name,
+      performance: score.performance ?? archived.performance,
+    };
+  });
 }
 
 function DraftPredictionTable({ predictions }: { predictions: IntelligenceDraftPrediction[] }) {
