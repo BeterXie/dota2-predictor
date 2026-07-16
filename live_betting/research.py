@@ -648,17 +648,50 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         dependent_type="research_prediction",
         dependent_key_sql="prediction.prediction_key",
     )
-    vision_reason = _required_schema_reason(
+    vision_invalidation_reason = _required_schema_reason(
         connection,
         "vision_derived_invalidations",
         {"dependent_type", "dependent_key"},
     )
-    vision_available = vision_reason is None
+    draft_anchor_reason = _required_schema_reason(
+        connection,
+        "vision_draft_anchors",
+        {"raybet_match_id", "map_number", "status"},
+    )
+    draft_conflict_reason = _required_schema_reason(
+        connection,
+        "vision_draft_conflicts",
+        {"raybet_match_id", "map_number"},
+    )
+    vision_available = all(
+        reason is None
+        for reason in (
+            vision_invalidation_reason,
+            draft_anchor_reason,
+            draft_conflict_reason,
+        )
+    )
     vision_invalidated_sql = (
-        "EXISTS ("
+        "(EXISTS ("
         "SELECT 1 FROM vision_derived_invalidations AS invalidation "
         "WHERE invalidation.dependent_type='research_prediction' "
-        "AND invalidation.dependent_key=prediction.prediction_key)"
+        "AND invalidation.dependent_key=prediction.prediction_key) "
+        "OR EXISTS ("
+        "SELECT 1 FROM vision_draft_anchors AS anchor "
+        "WHERE anchor.raybet_match_id=prediction.raybet_match_id "
+        "AND anchor.map_number=prediction.map_number "
+        "AND anchor.status='conflict' "
+        "AND (anchor.conflict_at IS NULL "
+        "OR julianday(anchor.conflict_at) IS NULL "
+        "OR julianday(prediction.observed_at) IS NULL "
+        "OR julianday(anchor.conflict_at)<=julianday(prediction.observed_at) "
+        "OR EXISTS ("
+        "SELECT 1 FROM vision_draft_conflicts AS conflict "
+        "WHERE conflict.raybet_match_id=anchor.raybet_match_id "
+        "AND conflict.map_number=anchor.map_number "
+        "AND (julianday(conflict.captured_at) IS NULL "
+        "OR julianday(conflict.captured_at)<=julianday(prediction.observed_at))"
+        "))))"
         if vision_available
         else "0"
     )
@@ -670,8 +703,15 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
     )
 
     prediction_unknown = list(strict_gate.unknown_reasons)
-    if vision_reason is not None:
-        prediction_unknown.append(vision_reason)
+    prediction_unknown.extend(
+        reason
+        for reason in (
+            vision_invalidation_reason,
+            draft_anchor_reason,
+            draft_conflict_reason,
+        )
+        if reason is not None
+    )
     try:
         prediction_audit_rows = connection.execute(
             f"""SELECT prediction.gate_status,

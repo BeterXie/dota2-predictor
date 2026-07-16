@@ -652,6 +652,64 @@ class ResearchLivePredictionTests(unittest.TestCase):
             1,
         )
 
+    def test_future_draft_conflict_preserves_prior_research_and_result(self) -> None:
+        original = observation(NOW)
+        self.assertTrue(self.store.insert_vision_observation(original))
+        rows = snapshots(NOW)
+        state_hash = self.record_transport("draft-conflict", NOW, rows)
+        prediction = record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=original,
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="draft-conflict",
+            transport_hash=state_hash,
+            transport_at=NOW,
+            created_at=NOW,
+        )
+        self.assertIsNotNone(prediction)
+        settled_at = NOW + timedelta(seconds=5)
+        self.record_reconciliation(9_006, settled_at)
+        self.assertTrue(self.store.insert_map_result(SimpleNamespace(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=9_006,
+            winner_side="team_two",
+            team_one_kills=20,
+            team_two_kills=35,
+            duration_seconds=2_400,
+            evidence_ref="settlement-reconciliation:38408499:map:1",
+            settled_at=settled_at,
+        )))
+        self.assertEqual(research_summary(self.store.connection)["result_labels"], 1)
+
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=10),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="later-conflicting-draft",
+        )
+        self.assertTrue(self.store.insert_vision_observation(conflicting))
+
+        summary = research_summary(self.store.connection)
+        self.assertEqual(summary["included_predictions"], 1)
+        self.assertEqual(summary["included_result_labels"], 1)
+        self.assertEqual(
+            summary["prediction_audit"]["exclusion_reasons"][
+                "vision_invalidated"
+            ],
+            0,
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT status, reason FROM settlement_reconciliations"
+            ).fetchone()),
+            ("confirmed", "source_winners_agree"),
+        )
+
     def test_first_later_winner_quote_labels_without_auxiliary_markets(self) -> None:
         first_rows = snapshots(NOW)
         first_hash = self.record_transport("first-winner", NOW, first_rows)

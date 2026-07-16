@@ -521,15 +521,24 @@ class LiveReportCohortTests(unittest.TestCase):
         self.assertEqual(report["included_decision_count"], 0)
         self.assertEqual(report["invalidated_decision_count"], 1)
 
-    def test_order_audit_counts_temporal_draft_conflict_exclusion(self) -> None:
+    def test_order_audit_preserves_signal_before_future_conflict(self) -> None:
         self.insert_settled_order(1)
         self.store.connection.execute(
             """INSERT INTO vision_draft_anchors
                (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
                 dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
                VALUES ('match-1', 1, ?, '[1,2,3,4,5]', '[6,7,8,9,10]',
-                       ?, 'anchor-frame', 'conflict', ?)""",
-            ("a" * 64, NOW.isoformat(), NOW.isoformat()),
+                       ?, 'anchor-frame', 'anchored', NULL)""",
+            (
+                "a" * 64,
+                NOW.isoformat(),
+            ),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_draft_anchors
+                  SET status='conflict', conflict_at=?
+                WHERE raybet_match_id='match-1' AND map_number=1""",
+            ((NOW + timedelta(minutes=1)).isoformat(),),
         )
         self.store.connection.commit()
 
@@ -538,21 +547,21 @@ class LiveReportCohortTests(unittest.TestCase):
 
         self.assertEqual(audit["status"], "available")
         self.assertEqual(audit["total_orders"], 1)
-        self.assertEqual(audit["included_orders"], 0)
-        self.assertEqual(audit["scored_orders"], 0)
-        self.assertEqual(audit["excluded_orders"], 1)
+        self.assertEqual(audit["included_orders"], 1)
+        self.assertEqual(audit["scored_orders"], 1)
+        self.assertEqual(audit["excluded_orders"], 0)
         self.assertEqual(audit["invalidated_orders"], 0)
-        self.assertEqual(audit["draft_conflict_orders"], 1)
-        self.assertEqual(report["orders"]["signals"], 0)
+        self.assertEqual(audit["draft_conflict_orders"], 0)
+        self.assertEqual(report["orders"]["signals"], 1)
 
         decision_audit = report["decision_audit"]
         self.assertEqual(decision_audit["status"], "available")
         self.assertEqual(decision_audit["raw_decisions"], 1)
-        self.assertEqual(decision_audit["included_decisions"], 0)
-        self.assertEqual(decision_audit["excluded_decisions"], 1)
+        self.assertEqual(decision_audit["included_decisions"], 1)
+        self.assertEqual(decision_audit["excluded_decisions"], 0)
         self.assertEqual(decision_audit["invalidated_decisions"], 0)
-        self.assertEqual(decision_audit["draft_conflict_decisions"], 1)
-        self.assertEqual(report["draft_conflict_decision_count"], 1)
+        self.assertEqual(decision_audit["draft_conflict_decisions"], 0)
+        self.assertEqual(report["draft_conflict_decision_count"], 0)
 
     def test_pre_migration_missing_reconciliation_table_fails_closed(self) -> None:
         self.insert_settled_order(1)

@@ -46,6 +46,13 @@ class StoredMapResult:
     settled_at: datetime
 
 
+@dataclass(frozen=True)
+class VisionDraftIdentity:
+    radiant_hero_ids: frozenset[int]
+    dire_hero_ids: frozenset[int]
+    radiant_team_side: str
+
+
 def _scheduled_timestamp(value: str | None) -> int:
     if not value:
         return 0
@@ -70,7 +77,7 @@ def _parse_utc(value: object) -> datetime | None:
 def _draft_identity(
     radiant_value: object,
     dire_value: object,
-) -> tuple[str, frozenset[int]] | None:
+) -> tuple[str, frozenset[int], frozenset[int]] | None:
     try:
         radiant = json.loads(str(radiant_value))
         dire = json.loads(str(dire_value))
@@ -94,7 +101,11 @@ def _draft_identity(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest(), frozenset(hero_ids)
+    return (
+        hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        frozenset(radiant),
+        frozenset(dire),
+    )
 
 
 def _vision_drafts(
@@ -102,7 +113,7 @@ def _vision_drafts(
     match_id: str,
     *,
     causal_cutoffs: dict[int, datetime] | None = None,
-) -> dict[int, set[frozenset[int]]]:
+) -> dict[int, set[VisionDraftIdentity]]:
     """Return trusted draft identities, optionally at per-map event-time cutoffs.
 
     A conflicted map remains hidden by default.  A caller may opt into a
@@ -110,11 +121,13 @@ def _vision_drafts(
     occurred before every recorded conflict.  This keeps post-match replay
     consistent with the causal gates used by settlement.
     """
-    output: dict[int, set[frozenset[int]]] = {}
+    output: dict[int, set[VisionDraftIdentity]] = {}
     try:
         rows = connection.execute(
             """SELECT map_number, draft_hash, radiant_hero_ids, dire_hero_ids,
-                      anchored_at, source_frame_ref, status, conflict_at
+                      radiant_team_side, team_side_anchored_at,
+                      team_side_source_frame_ref, anchored_at,
+                      source_frame_ref, status, conflict_at
                  FROM vision_draft_anchors
                 WHERE raybet_match_id=?""",
             (match_id,),
@@ -127,11 +140,23 @@ def _vision_drafts(
         map_number = int(row["map_number"])
         cutoff = (causal_cutoffs or {}).get(map_number)
         anchored_at = _parse_utc(row["anchored_at"])
-        if anchored_at is None:
+        team_side = row["radiant_team_side"]
+        team_side_anchored_at = _parse_utc(row["team_side_anchored_at"])
+        if (
+            anchored_at is None
+            or team_side not in {"team_one", "team_two"}
+            or team_side_anchored_at is None
+            or team_side_anchored_at < anchored_at
+            or not str(row["team_side_source_frame_ref"] or "").strip()
+        ):
             continue
         if cutoff is not None:
             cutoff = _parse_utc(cutoff)
-            if cutoff is None or anchored_at > cutoff:
+            if (
+                cutoff is None
+                or anchored_at > cutoff
+                or team_side_anchored_at > cutoff
+            ):
                 continue
         status = str(row["status"])
         if status == "conflict":
@@ -164,7 +189,8 @@ def _vision_drafts(
             trusted_observations = connection.execute(
                 """SELECT observation.captured_at,
                           observation.radiant_hero_ids,
-                          observation.dire_hero_ids
+                          observation.dire_hero_ids,
+                          observation.radiant_team_side
                      FROM vision_observations AS observation
                     WHERE observation.raybet_match_id=?
                       AND observation.map_number=?
@@ -209,7 +235,7 @@ def _vision_drafts(
             captured_at = _parse_utc(observation["captured_at"])
             if (
                 captured_at is None
-                or captured_at < anchored_at
+                or captured_at < team_side_anchored_at
                 or (cutoff is not None and captured_at > cutoff)
                 or (
                     latest_invalidation is not None
@@ -220,10 +246,76 @@ def _vision_drafts(
             identity = _draft_identity(
                 observation["radiant_hero_ids"], observation["dire_hero_ids"]
             )
-            if identity is not None and identity[0] == anchor_identity[0]:
-                output.setdefault(map_number, set()).add(anchor_identity[1])
+            if (
+                identity is not None
+                and identity[0] == anchor_identity[0]
+                and observation["radiant_team_side"] == team_side
+            ):
+                output.setdefault(map_number, set()).add(
+                    VisionDraftIdentity(
+                        radiant_hero_ids=anchor_identity[1],
+                        dire_hero_ids=anchor_identity[2],
+                        radiant_team_side=str(team_side),
+                    )
+                )
                 break
     return output
+
+
+def _opendota_matches_vision_identity(
+    detail: dict,
+    vision_identity: VisionDraftIdentity,
+    *,
+    team_one_id: int,
+    team_two_id: int,
+    opendota_league_id: int,
+) -> bool:
+    if (
+        vision_identity.radiant_team_side not in {"team_one", "team_two"}
+        or type(detail.get("leagueid")) is not int
+        or detail["leagueid"] != opendota_league_id
+        or type(detail.get("radiant_team_id")) is not int
+        or type(detail.get("dire_team_id")) is not int
+    ):
+        return False
+    expected_team_ids = (
+        (team_one_id, team_two_id)
+        if vision_identity.radiant_team_side == "team_one"
+        else (team_two_id, team_one_id)
+    )
+    if (
+        detail["radiant_team_id"],
+        detail["dire_team_id"],
+    ) != expected_team_ids:
+        return False
+
+    players = detail.get("players")
+    if (
+        not isinstance(players, list)
+        or len(players) != 10
+        or any(
+            not isinstance(player, dict)
+            or type(player.get("player_slot")) is not int
+            or type(player.get("hero_id")) is not int
+            or player["hero_id"] <= 0
+            for player in players
+        )
+    ):
+        return False
+    slot_to_hero = {
+        int(player["player_slot"]): int(player["hero_id"])
+        for player in players
+    }
+    if set(slot_to_hero) != {*range(5), *range(128, 133)}:
+        return False
+    if len(set(slot_to_hero.values())) != 10:
+        return False
+    return (
+        frozenset(slot_to_hero[slot] for slot in range(5))
+        == vision_identity.radiant_hero_ids
+        and frozenset(slot_to_hero[slot] for slot in range(128, 133))
+        == vision_identity.dire_hero_ids
+    )
 
 
 def _winner(detail: dict, team_id: int, team_side: str) -> tuple[str, int, int]:
@@ -536,9 +628,39 @@ def _reconcile_and_settle(
     store: LiveBettingStore,
     result: StoredMapResult,
     raybet_final: RayBetMapFinal,
+    *,
+    expected_strict_mapping_id: int | None = None,
 ) -> dict[str, object]:
     """Atomically persist source evidence, resolution, settlement, and outbox."""
     with store.transaction():
+        if expected_strict_mapping_id is not None:
+            current_mapping = store.connection.execute(
+                """SELECT 1
+                     FROM strict_live_map_mappings AS mapping
+                     LEFT JOIN strict_live_map_mapping_invalidations
+                       AS direct_invalidation
+                       ON direct_invalidation.mapping_id=mapping.mapping_id
+                     LEFT JOIN strict_live_automatic_evidence_approvals AS approval
+                       ON approval.approval_id=mapping.automatic_approval_id
+                     LEFT JOIN strict_live_map_mapping_invalidations
+                       AS source_invalidation
+                       ON source_invalidation.mapping_id=approval.source_mapping_id
+                    WHERE mapping.mapping_id=?
+                      AND mapping.raybet_match_id=?
+                      AND mapping.map_number=?
+                      AND direct_invalidation.invalidation_id IS NULL
+                      AND source_invalidation.invalidation_id IS NULL""",
+                (
+                    expected_strict_mapping_id,
+                    result.raybet_match_id,
+                    result.map_number,
+                ),
+            ).fetchone()
+            if current_mapping is None:
+                return {
+                    "status": "strict_mapping_unverified",
+                    "orders_settled": 0,
+                }
         # Re-read the order and draft state under the write lock.  A conflict
         # arriving between a preflight read and settlement must not turn into
         # an automatic result.
@@ -681,8 +803,33 @@ def _reconcile_and_settle(
             )
             assert reconciliation["status"] == "manual_review"
             return {"status": "manual_review", "orders_settled": 0}
-        if stored is None:
-            store.insert_map_result(reconciled_result)
+        if stored is None and not store.insert_map_result(reconciled_result):
+            reconciliation = store.record_settlement_reconciliation(
+                raybet_match_id=result.raybet_match_id,
+                map_number=result.map_number,
+                dota_match_id=result.dota_match_id,
+                raybet_status=raybet_final.status,
+                raybet_winner_side=raybet_final.winner_side,
+                opendota_winner_side=result.winner_side,
+                raybet_evidence_ref=raybet_final.evidence_ref,
+                opendota_evidence_ref=result.evidence_ref,
+                raybet_facts=raybet_final.facts(),
+                opendota_facts=opendota_facts,
+                status="manual_review",
+                reason="map_result_persistence_conflict",
+                observed_at=result.settled_at,
+            )
+            assert reconciliation["status"] == "manual_review"
+            for row in all_rows:
+                store.insert_settlement(
+                    str(row["order_key"]),
+                    "review",
+                    0.0,
+                    result.settled_at,
+                    reconciliation_ref,
+                    True,
+                )
+            return {"status": "manual_review", "orders_settled": 0}
         settled = _settle_winner_orders(store, reconciled_result, rows)
         return {"status": "confirmed", "orders_settled": settled}
 
@@ -700,7 +847,8 @@ async def label_once(
     if not match:
         return {"status": "waiting_for_match_metadata"}
     strict_rows = store.connection.execute(
-        """SELECT mapping.map_number, mapping.team_one_id, mapping.team_two_id,
+        """SELECT mapping.mapping_id, mapping.map_number, mapping.event_id,
+                  mapping.team_one_id, mapping.team_two_id,
                   mapping.canonical_team_one_id, mapping.canonical_team_two_id
              FROM strict_live_map_mappings AS mapping
              LEFT JOIN strict_live_map_mapping_invalidations AS direct_invalidation
@@ -717,23 +865,54 @@ async def label_once(
     ).fetchall()
     if not strict_rows:
         return {"status": "waiting_for_strict_mapping"}
+    integer_fields = (
+        "mapping_id",
+        "map_number",
+        "team_one_id",
+        "team_two_id",
+        "canonical_team_one_id",
+        "canonical_team_two_id",
+    )
+    if any(
+        type(row[field]) is not int or int(row[field]) <= 0
+        for row in strict_rows
+        for field in integer_fields
+    ) or any(not str(row["event_id"] or "").strip() for row in strict_rows):
+        return {"status": "strict_mapping_identity_unverified"}
     team_pairs = {
         (int(row["canonical_team_one_id"]), int(row["canonical_team_two_id"]))
         for row in strict_rows
     }
-    if len(team_pairs) != 1:
+    if len(team_pairs) != 1 or any(one == two for one, two in team_pairs):
         return {"status": "strict_mapping_team_conflict"}
     team_one_id, team_two_id = next(iter(team_pairs))
     raybet_team_pairs = {
         (int(row["team_one_id"]), int(row["team_two_id"])) for row in strict_rows
     }
-    if len(raybet_team_pairs) != 1:
+    if len(raybet_team_pairs) != 1 or any(
+        one == two for one, two in raybet_team_pairs
+    ):
         return {"status": "strict_mapping_raybet_team_conflict"}
     raybet_team_ids = next(iter(raybet_team_pairs))
+    event_ids = {str(row["event_id"]) for row in strict_rows}
+    if len(event_ids) != 1:
+        return {"status": "strict_mapping_event_conflict"}
+    event_id = next(iter(event_ids))
     expected_team_id = team_one_id if team_side == "team_one" else team_two_id
     if team_id != expected_team_id:
         return {"status": "strict_mapping_team_mismatch"}
-    strict_maps = {int(row["map_number"]) for row in strict_rows}
+    mapping_ids_by_map: dict[int, set[int]] = {}
+    for row in strict_rows:
+        mapping_ids_by_map.setdefault(int(row["map_number"]), set()).add(
+            int(row["mapping_id"])
+        )
+    if any(len(mapping_ids) != 1 for mapping_ids in mapping_ids_by_map.values()):
+        return {"status": "strict_mapping_map_conflict"}
+    strict_mapping_ids = {
+        map_number: next(iter(mapping_ids))
+        for map_number, mapping_ids in mapping_ids_by_map.items()
+    }
+    strict_maps = set(strict_mapping_ids)
     unresolved_maps = strict_maps - {
         int(row["map_number"])
         for row in store.connection.execute(
@@ -750,6 +929,20 @@ async def label_once(
     )
     if not drafts:
         return {"status": "waiting_for_confirmed_draft"}
+    try:
+        event = store.connection.execute(
+            "SELECT opendota_league_id FROM event_registry WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        event = None
+    if (
+        event is None
+        or type(event["opendota_league_id"]) is not int
+        or event["opendota_league_id"] <= 0
+    ):
+        return {"status": "strict_mapping_event_unverified"}
+    opendota_league_id = int(event["opendota_league_id"])
     try:
         raybet_payload = json.loads(str(match["raw_json"]))
     except (TypeError, json.JSONDecodeError):
@@ -792,8 +985,14 @@ async def label_once(
         and type(row.get("start_time")) is int
         and abs(int(row["start_time"]) - scheduled) <= 6 * 3600
     ]
-    labeled = settled = pending = manual_review = 0
-    for summary in sorted(candidates, key=lambda row: int(row.get("start_time") or 0)):
+    exact_candidates: dict[
+        int, dict[int, tuple[dict, datetime, str, str]]
+    ] = {}
+    ambiguous_maps: set[int] = set()
+    candidates_by_id = {int(row["match_id"]): row for row in candidates}
+    for summary in sorted(
+        candidates_by_id.values(), key=lambda row: int(row.get("start_time") or 0)
+    ):
         dota_match_id = int(summary["match_id"])
         detail = await client.get_match(dota_match_id)
         observed_at = datetime.now(timezone.utc)
@@ -811,34 +1010,99 @@ async def label_once(
         )
         if type(detail.get("match_id")) is not int or detail["match_id"] != dota_match_id:
             raise ValueError("OpenDota match identity is invalid")
-        players = detail.get("players")
-        if (
-            not isinstance(players, list)
-            or len(players) != 10
-            or any(
-                not isinstance(player, dict)
-                or type(player.get("hero_id")) is not int
-                or int(player["hero_id"]) <= 0
-                for player in players
-            )
-        ):
-            continue
-        hero_set = frozenset(int(player["hero_id"]) for player in players)
-        if len(hero_set) != 10:
-            continue
         matching_maps = [
             map_number
-            for map_number, sets in drafts.items()
-            if map_number in strict_maps and hero_set in sets
+            for map_number, identities in drafts.items()
+            if map_number in strict_maps
+            and any(
+                _opendota_matches_vision_identity(
+                    detail,
+                    identity,
+                    team_one_id=team_one_id,
+                    team_two_id=team_two_id,
+                    opendota_league_id=opendota_league_id,
+                )
+                for identity in identities
+            )
         ]
         if len(matching_maps) != 1:
+            if len(matching_maps) > 1:
+                ambiguous_maps.update(matching_maps)
             continue
         map_number = matching_maps[0]
-        if {
-            detail.get("radiant_team_id"),
-            detail.get("dire_team_id"),
-        } != {team_one_id, team_two_id}:
-            continue
+        exact_candidates.setdefault(map_number, {})[dota_match_id] = (
+            detail,
+            observed_at,
+            detail_endpoint,
+            detail_request_identity,
+        )
+
+    ambiguous_maps.update(
+        map_number
+        for map_number, matches in exact_candidates.items()
+        if len(matches) > 1
+    )
+    if ambiguous_maps:
+        quarantined_at = datetime.now(timezone.utc).isoformat()
+        with store.transaction():
+            for map_number in sorted(ambiguous_maps):
+                store.connection.execute(
+                    """UPDATE settlement_reconciliations
+                          SET status='manual_review',
+                              reason=CASE WHEN status='manual_review'
+                                          THEN reason
+                                          ELSE 'opendota_map_identity_ambiguous' END,
+                              updated_at=?
+                        WHERE raybet_match_id=? AND map_number=?""",
+                    (quarantined_at, match_id, map_number),
+                )
+                store.connection.execute(
+                    """UPDATE settlements SET review_required=1
+                        WHERE order_key IN (
+                            SELECT order_key FROM shadow_map_attempts
+                             WHERE raybet_match_id=? AND map_number=?
+                        )""",
+                    (match_id, map_number),
+                )
+                outbox_rows = store.connection.execute(
+                    """SELECT outbox.outbox_id
+                         FROM notification_outbox AS outbox
+                         JOIN shadow_map_attempts AS attempt
+                           ON attempt.order_key=outbox.order_key
+                        WHERE attempt.raybet_match_id=?
+                          AND attempt.map_number=?
+                          AND outbox.event_type='settled'
+                          AND outbox.status IN ('pending', 'leased')""",
+                    (match_id, map_number),
+                ).fetchall()
+                for outbox_row in outbox_rows:
+                    outbox_id = int(outbox_row["outbox_id"])
+                    store.connection.execute(
+                        """UPDATE notification_outbox
+                              SET status='dead_letter', lease_token=NULL,
+                                  lease_until=NULL,
+                                  last_error='opendota_map_identity_ambiguous',
+                                  updated_at=?
+                            WHERE outbox_id=?
+                              AND status IN ('pending', 'leased')""",
+                        (quarantined_at, outbox_id),
+                    )
+                    store.connection.execute(
+                        """INSERT INTO notification_outbox_audit
+                           (outbox_id, action, actor, reason, created_at)
+                           VALUES (?, 'blocked', 'postmatch_identity',
+                                   'opendota_map_identity_ambiguous', ?)""",
+                        (outbox_id, quarantined_at),
+                    )
+        return {
+            "status": "opendota_map_identity_ambiguous",
+            "ambiguous_maps": sorted(ambiguous_maps),
+        }
+
+    labeled = settled = pending = manual_review = 0
+    for map_number in sorted(exact_candidates):
+        dota_match_id, candidate = next(iter(exact_candidates[map_number].items()))
+        detail, observed_at, detail_endpoint, detail_request_identity = candidate
         winner_side, target_kills, opponent_kills = _winner(detail, team_id, team_side)
         if team_side == "team_one":
             team_one_kills, team_two_kills = target_kills, opponent_kills
@@ -848,16 +1112,6 @@ async def label_once(
         if type(duration) is not int or duration <= 0:
             raise ValueError("OpenDota map duration is incomplete or invalid")
         settled_at = datetime.now(timezone.utc)
-        raw_archive.archive_json(
-            source="opendota",
-            endpoint=detail_endpoint,
-            request_identity=detail_request_identity,
-            payload_bytes=canonical_json_bytes(detail),
-            observed_at=observed_at,
-            match_id=dota_match_id,
-            status_code=200,
-            first_usable_at=settled_at,
-        )
         result = StoredMapResult(
             match_id, map_number, dota_match_id, winner_side,
             team_one_kills, team_two_kills, duration,
@@ -880,7 +1134,27 @@ async def label_once(
                 WHERE raybet_match_id=? AND map_number=?""",
             (match_id, map_number),
         ).fetchone()
-        outcome = _reconcile_and_settle(store, result, raybet_final)
+        outcome = _reconcile_and_settle(
+            store,
+            result,
+            raybet_final,
+            expected_strict_mapping_id=strict_mapping_ids[map_number],
+        )
+        if outcome["status"] == "strict_mapping_unverified":
+            return {
+                "status": "strict_mapping_changed_during_postmatch",
+                "map_number": map_number,
+            }
+        raw_archive.archive_json(
+            source="opendota",
+            endpoint=detail_endpoint,
+            request_identity=detail_request_identity,
+            payload_bytes=canonical_json_bytes(detail),
+            observed_at=observed_at,
+            match_id=dota_match_id,
+            status_code=200,
+            first_usable_at=settled_at,
+        )
         if outcome["status"] == "confirmed" and existed is None:
             labeled += 1
         elif outcome["status"] == "pending":

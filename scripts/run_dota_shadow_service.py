@@ -561,7 +561,14 @@ def main() -> int:
     parser.add_argument("--start-mail", action="store_true")
     parser.add_argument("--start-strict-ingest", action="store_true")
     parser.add_argument("--start-postmatch", action="store_true")
-    parser.add_argument("--backup-dir", type=Path)
+    parser.add_argument(
+        "--backup-dir",
+        type=Path,
+        help=(
+            "migration backup directory; defaults to <database-dir>/backups "
+            "and may be placed on another volume"
+        ),
+    )
     parser.add_argument(
         "--migrate",
         action="store_true",

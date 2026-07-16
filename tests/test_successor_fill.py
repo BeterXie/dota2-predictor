@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -45,7 +46,17 @@ class SuccessorFillTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "live.db"
         self.store = LiveBettingStore(self.path)
         self.store.init_schema()
-        self.strict_mapping_id = None
+        self.strict_mapping_id = 1
+        self.strict_context_patch = patch.object(
+            self.store, "_strict_mapping_context_block_reason", return_value=None
+        )
+        self.strict_order_patch = patch.object(
+            self.store, "_strict_mapping_block_reason_for_order", return_value=None
+        )
+        self.strict_context_patch.start()
+        self.strict_order_patch.start()
+        self.addCleanup(self.strict_order_patch.stop)
+        self.addCleanup(self.strict_context_patch.stop)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -148,6 +159,35 @@ class SuccessorFillTests(unittest.TestCase):
                 WHERE o.order_key='order-1'"""
         ).fetchone()
         return str(row[0]), str(row[1]), row[2]
+
+    def test_legacy_writers_cannot_bypass_successor_fill(self) -> None:
+        order = self.pending_order()
+        forged = replace(
+            order,
+            status="filled",
+            fill_price=2.0,
+            filled_at=NOW + timedelta(seconds=1),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "legacy order updater"):
+            self.store.update_order(forged)
+        self.assertFalse(
+            self.store.insert_settlement(
+                order.order_key,
+                "win",
+                2.0,
+                NOW + timedelta(seconds=2),
+                "forged-result",
+            )
+        )
+
+        self.assertEqual(self.statuses(), ("pending", "pending", None))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM settlements"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_every_response_persists_exact_membership_when_semantics_unchanged(self) -> None:
         first = [
@@ -445,9 +485,25 @@ class SuccessorFillTests(unittest.TestCase):
 
         self.store = LiveBettingStore(self.path)
         self.store.init_schema()
-        resolved = self.store.process_pending_successor(order, watermark=at)
-        self.assertEqual((resolved.status, resolved.fill_price), ("filled", 1.99))
-        self.assertIsNone(self.store.process_pending_successor(order, watermark=at))
+        with (
+            patch.object(
+                self.store,
+                "_strict_mapping_block_reason_for_order",
+                return_value=None,
+            ),
+            patch.object(
+                self.store,
+                "_strict_mapping_context_block_reason",
+                return_value=None,
+            ),
+        ):
+            resolved = self.store.process_pending_successor(order, watermark=at)
+            self.assertEqual(
+                (resolved.status, resolved.fill_price), ("filled", 1.99)
+            )
+            self.assertIsNone(
+                self.store.process_pending_successor(order, watermark=at)
+            )
 
         self.store.close()
         self.store = LiveBettingStore(self.path)

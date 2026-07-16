@@ -569,13 +569,18 @@ class MonitorAlertTests(unittest.TestCase):
             """INSERT INTO vision_draft_anchors
                (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
                 dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
-               VALUES (?, 1, ?, '[]', '[]', ?, 'frame-1', 'conflict', ?)""",
+               VALUES (?, 1, ?, '[]', '[]', ?, 'frame-1', 'anchored', NULL)""",
             (
                 "match-conflicted",
                 "a" * 64,
                 (NOW - timedelta(seconds=10)).isoformat(),
-                (NOW + timedelta(seconds=10)).isoformat(),
             ),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_draft_anchors
+                  SET status='conflict', conflict_at=?
+                WHERE raybet_match_id='match-conflicted' AND map_number=1""",
+            ((NOW + timedelta(seconds=10)).isoformat(),),
         )
         self.store.connection.execute(
             """INSERT INTO vision_draft_conflicts
@@ -597,12 +602,6 @@ class MonitorAlertTests(unittest.TestCase):
         self.assertEqual(active_alerts(self.store.connection), [])
 
     def test_paper_signal_requires_verified_strict_mapping(self) -> None:
-        self._insert_pending_order(
-            self.store.connection,
-            order_key="order-null-mapping",
-            raybet_match_id="match-null-mapping",
-            create_strict_mapping=False,
-        )
         self._insert_pending_order(
             self.store.connection,
             order_key="order-orphan-mapping",

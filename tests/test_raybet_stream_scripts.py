@@ -653,7 +653,7 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
                 expires_at, signal_odds_group_id, signal_outcome_key,
                 signal_identity_verified, stake, status, fill_price, filled_at,
                 rejection_reason)
-               VALUES ('order-after', '42', NULL, 'odds-1',
+               VALUES ('order-after', '42', 1, 'odds-1',
                        'winner|map_1|team_two|', ?, 0.5, 0.4, 3.0,
                        'transport-after', ?, ?, 'group-1', 'team_two',
                        1, 1.0, 'filled', 3.0, ?, NULL)""",

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from event_intelligence.storage import IntelligenceStorage
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import (
@@ -27,6 +28,7 @@ from live_betting.notifications import (
 )
 from live_betting.smtp_delivery import SMTPConfig
 from live_betting.storage import LiveBettingStore
+from live_betting.strict_eligibility import accept_strict_live_map_mapping
 from scripts.run_notification_worker import run_once as run_notification_once
 
 
@@ -38,6 +40,7 @@ class NotificationOutboxTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.store = LiveBettingStore(Path(self.directory.name) / "outbox.db")
         self.store.init_schema()
+        self.strict_mapping_id = self._ensure_strict_mapping()
 
     def tearDown(self) -> None:
         self.store.close()
@@ -380,51 +383,100 @@ class NotificationOutboxTests(unittest.TestCase):
             signal_identity_verified=True,
         )
 
-    def _ensure_strict_mapping(self) -> None:
-        if self.store.connection.execute(
-            "SELECT 1 FROM strict_live_map_mappings WHERE mapping_id=1"
-        ).fetchone() is not None:
-            return
-        self.store.connection.commit()
-        self.store.connection.execute("PRAGMA foreign_keys=OFF")
-        try:
-            self.store.connection.execute(
-                """INSERT INTO strict_live_map_mappings
-                   (mapping_id, raybet_match_id, map_number, event_id,
-                    team_one_id, team_two_id, canonical_team_one_id,
-                    canonical_team_one_name, canonical_team_two_id,
-                    canonical_team_two_name, canonical_identity_json,
-                    canonical_identity_hash, crosswalk_evidence_json,
-                    crosswalk_evidence_hash, stage_scope, scheduled_at_utc,
-                    raybet_best_of, raybet_identity_json, raybet_identity_hash,
-                    raybet_metadata_updated_at, source, evidence_json,
-                    evidence_hash, mapping_version, acceptance_mode,
-                    automatic_approval_id, accepted_by, accepted_at,
-                    recorded_at, created_at)
-                   VALUES (1, 'match-1', 1, 'event-test', 101, 202, 101,
-                           'Alpha', 202, 'Beta', '{}', ?, '{}', ?,
-                           'main_event', ?, 3, '{}', ?, ?, 'test', '{}', ?,
-                           'test-v1', 'manual_exact', NULL, 'test', ?, ?, ?)""",
-                (
-                    "a" * 64,
-                    "b" * 64,
-                    NOW.isoformat(),
-                    "c" * 64,
-                    NOW.isoformat(),
-                    "d" * 64,
-                    NOW.isoformat(),
-                    NOW.isoformat(),
-                    NOW.isoformat(),
-                ),
+    def _ensure_strict_mapping(self) -> int:
+        IntelligenceStorage(
+            self.store.path, connection=self.store.connection
+        ).init_schema()
+        self.store.connection.execute(
+            """CREATE TABLE IF NOT EXISTS teams (
+                   team_id INTEGER PRIMARY KEY,
+                   name TEXT,
+                   tag TEXT,
+                   logo_url TEXT,
+                   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        self.store.connection.executemany(
+            "INSERT OR REPLACE INTO teams(team_id, name) VALUES (?, ?)",
+            ((101, "Alpha"), (202, "Beta")),
+        )
+        metadata_at = NOW - timedelta(seconds=2)
+        accepted_at = NOW - timedelta(seconds=1)
+        self.store.upsert_raybet_match(
+            {
+                "id": "match-1",
+                "game_id": 151,
+                "tournament_name": "PGL Wallachia Season 8",
+                "start_time": "2026-04-20 12:00:00",
+                "round": "bo3",
+                "stage": "main_event",
+                "status": 1,
+                "team": [
+                    {"pos": 1, "team_id": 101, "team_name": "Alpha"},
+                    {"pos": 2, "team_id": 202, "team_name": "Beta"},
+                ],
+            },
+            metadata_at,
+        )
+        evidence = {
+            "kind": "manual_cross_source_review",
+            "raybet_url": "https://example.invalid/raybet/match-1",
+            "official_event_url": "https://www.pglesports.com/",
+            "tournament": {
+                "raybet_name": "PGL Wallachia Season 8",
+                "event_name": "PGL Wallachia Season 8",
+            },
+            "schedule": {
+                "raybet_scheduled_at": "2026-04-20 12:00:00",
+                "utc_offset_minutes": 480,
+                "scheduled_at_utc": "2026-04-20T04:00:00+00:00",
+                "timezone_evidence": "audited RayBet UTC+08 display contract",
+            },
+            "stage": {
+                "scope": "main_event",
+                "source_url": "https://www.pglesports.com/",
+            },
+            "team_crosswalk": {
+                "team_one": {
+                    "raybet_team_id": 101,
+                    "raybet_team_name": "Alpha",
+                    "canonical_team_id": 101,
+                    "canonical_team_name": "Alpha",
+                    "source_url": "https://example.invalid/teams/alpha",
+                },
+                "team_two": {
+                    "raybet_team_id": 202,
+                    "raybet_team_name": "Beta",
+                    "canonical_team_id": 202,
+                    "canonical_team_name": "Beta",
+                    "source_url": "https://example.invalid/teams/beta",
+                },
+            },
+        }
+        with patch("live_betting.strict_eligibility._utc_now", return_value=accepted_at):
+            mapping = accept_strict_live_map_mapping(
+                self.store.connection,
+                raybet_match_id="match-1",
+                map_number=1,
+                event_id="pgl-wallachia-s8-2026",
+                team_one_id=101,
+                team_two_id=202,
+                canonical_team_one_id=101,
+                canonical_team_two_id=202,
+                source="test_exact_mapping",
+                evidence=evidence,
+                accepted_by="test",
+                accepted_at=accepted_at,
             )
-            self.store.connection.commit()
-        finally:
-            self.store.connection.execute("PRAGMA foreign_keys=ON")
+        self.store.connection.commit()
+        return mapping.mapping_id
 
     def test_fill_and_settlement_schedule_notifications_atomically(self) -> None:
         order = self._order()
         self.assertTrue(
-            self.store.insert_map_order(order, 1, strict_mapping_id=None)
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
@@ -507,6 +559,9 @@ class NotificationOutboxTests(unittest.TestCase):
 
     def test_claim_uses_paper_signal_source_order_for_legacy_monitor_row(self) -> None:
         self.store.connection.execute(
+            "DROP TRIGGER IF EXISTS shadow_orders_require_strict_mapping_insert"
+        )
+        self.store.connection.execute(
             """INSERT INTO shadow_orders
                (order_key, raybet_match_id, strict_mapping_id, odds_id,
                 market_key, signaled_at, model_probability, market_probability,
@@ -530,6 +585,7 @@ class NotificationOutboxTests(unittest.TestCase):
             (NOW.isoformat(),),
         )
         self.store.connection.commit()
+        self.store.init_schema()
         self.assertTrue(
             enqueue(
                 self.store.connection,
@@ -565,7 +621,7 @@ class NotificationOutboxTests(unittest.TestCase):
                     "SELECT status, last_error FROM notification_outbox"
                 ).fetchone()
             ),
-            ("dead_letter", "vision_draft_conflict"),
+            ("dead_letter", "strict_mapping_unverified"),
         )
 
     def test_claim_rejects_paper_signal_without_source_order_lineage(self) -> None:
@@ -692,7 +748,9 @@ class NotificationOutboxTests(unittest.TestCase):
     def test_fill_and_outbox_roll_back_together_on_notification_failure(self) -> None:
         order = self._order()
         self.assertTrue(
-            self.store.insert_map_order(order, 1, strict_mapping_id=None)
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(

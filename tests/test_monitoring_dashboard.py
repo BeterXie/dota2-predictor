@@ -330,12 +330,17 @@ class MonitoringDashboardTests(unittest.TestCase):
                (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
                 dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
                VALUES ('match-1', 1, ?, '[]', '[]', ?, 'frame-conflict',
-                       'conflict', ?)""",
+                       'anchored', NULL)""",
             (
                 "a" * 64,
                 (NOW - timedelta(seconds=40)).isoformat(),
-                (NOW - timedelta(seconds=10)).isoformat(),
             ),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_draft_anchors
+                  SET status='conflict', conflict_at=?
+                WHERE raybet_match_id='match-1' AND map_number=1""",
+            ((NOW - timedelta(seconds=10)).isoformat(),),
         )
         self.store.connection.commit()
 

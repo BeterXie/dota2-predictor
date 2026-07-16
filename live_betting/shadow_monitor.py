@@ -742,34 +742,60 @@ def run_once(
             "vision_ingested": ingested,
         }
     row = store.connection.execute(
-        """SELECT observation.*
+        """WITH ranked_transport AS (
+               SELECT transport.raybet_match_id, transport.observed_at,
+                      ROW_NUMBER() OVER (
+                          PARTITION BY transport.raybet_match_id
+                          ORDER BY transport.observed_at DESC,
+                                   transport.observation_key DESC
+                      ) AS transport_rank
+                 FROM odds_transport_observations AS transport
+                WHERE transport.observed_at<=?
+                  AND transport.timing_status='on_time'
+                  AND transport.processing_status='processed'
+           ), current_transport AS (
+               SELECT raybet_match_id, observed_at
+                 FROM ranked_transport WHERE transport_rank=1
+           )
+           SELECT observation.*
              FROM vision_observations AS observation
              JOIN vision_draft_anchors AS anchor
                ON anchor.raybet_match_id=observation.raybet_match_id
               AND anchor.map_number=observation.map_number
+             LEFT JOIN current_transport AS transport
+               ON transport.raybet_match_id=observation.raybet_match_id
+            WHERE observation.confirmed=1
+              AND observation.screen_state='game'
               AND (
                     anchor.status='anchored'
                     OR (
                         anchor.status='conflict'
                         AND anchor.conflict_at IS NOT NULL
                         AND julianday(anchor.conflict_at) IS NOT NULL
-                        AND julianday(anchor.conflict_at)>julianday(?)
+                        AND julianday(anchor.conflict_at)>julianday(
+                            COALESCE(transport.observed_at, ?)
+                        )
                         AND NOT EXISTS (
                             SELECT 1 FROM vision_draft_conflicts AS conflict
                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                AND conflict.map_number=anchor.map_number
                                AND (
                                      julianday(conflict.captured_at) IS NULL
-                                     OR julianday(conflict.captured_at)<=julianday(?)
+                                     OR julianday(conflict.captured_at)<=julianday(
+                                         COALESCE(transport.observed_at, ?)
+                                     )
                                )
                         )
                     )
               )
-            WHERE observation.confirmed=1
-              AND observation.screen_state='game'
               AND julianday(observation.captured_at)<=julianday(?)
            ORDER BY observation.captured_at DESC LIMIT 1""",
-        (run_at.isoformat(), run_at.isoformat(), run_at.isoformat()),
+        (
+            run_at.isoformat(),
+            run_at.isoformat(),
+            run_at.isoformat(),
+            run_at.isoformat(),
+        ),
     ).fetchone()
     if not row:
         return {"status": "waiting_for_confirmed_vision", "vision_ingested": ingested}
@@ -820,6 +846,18 @@ def run_once(
         ),
     ).fetchone()
     if not causal_row:
+        if (
+            latest_observation.map_number is not None
+            and store._draft_conflict_at_or_before(
+                match_id,
+                int(latest_observation.map_number),
+                current_transport_at,
+            )
+        ):
+            return {
+                "status": "waiting_for_confirmed_vision",
+                "vision_ingested": ingested,
+            }
         return {
             "status": "waiting_for_usable_alignment",
             "reason": "no_prior_confirmed_observation",

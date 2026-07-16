@@ -158,7 +158,8 @@ def freeze_draft_map(
         store.init_schema()
         rows = store.connection.execute(
             """SELECT observation.captured_at, observation.source_frame_ref,
-                      observation.radiant_hero_ids, observation.dire_hero_ids
+                      observation.radiant_hero_ids, observation.dire_hero_ids,
+                      observation.radiant_team_side
                  FROM vision_observations AS observation
                 WHERE observation.raybet_match_id=?
                   AND observation.map_number=?
@@ -189,6 +190,7 @@ def freeze_draft_map(
                 captured_at.tzinfo is None
                 or captured_at.utcoffset() is None
                 or not str(row["source_frame_ref"]).strip()
+                or row["radiant_team_side"] not in {None, "team_one", "team_two"}
                 or len(radiant) != 5
                 or len(dire) != 5
                 or any(type(hero_id) is not int or hero_id <= 0 for hero_id in heroes)
@@ -216,18 +218,25 @@ def freeze_draft_map(
             store.connection.execute(
                 """INSERT OR IGNORE INTO vision_draft_anchors
                    (raybet_match_id, map_number, draft_hash,
-                    radiant_hero_ids, dire_hero_ids, anchored_at,
-                    source_frame_ref, status, conflict_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'conflict', ?)""",
+                    radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                    team_side_anchored_at, team_side_source_frame_ref,
+                    anchored_at, source_frame_ref, status, conflict_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'anchored', NULL)""",
                 (
                     match_id,
                     map_number,
                     first_hash,
                     str(first["radiant_hero_ids"]),
                     str(first["dire_hero_ids"]),
+                    first["radiant_team_side"],
+                    str(first["captured_at"])
+                    if first["radiant_team_side"] is not None
+                    else None,
+                    str(first["source_frame_ref"])
+                    if first["radiant_team_side"] is not None
+                    else None,
                     str(first["captured_at"]),
                     str(first["source_frame_ref"]),
-                    recorded_at,
                 ),
             )
             anchor = store.connection.execute(
@@ -247,8 +256,9 @@ def freeze_draft_map(
                     """INSERT OR IGNORE INTO vision_draft_conflicts
                        (raybet_match_id, map_number, captured_at,
                         source_frame_ref, observed_draft_hash,
-                        radiant_hero_ids, dire_hero_ids, reason, recorded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        radiant_hero_ids, dire_hero_ids,
+                        observed_radiant_team_side, reason, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         match_id,
                         map_number,
@@ -257,6 +267,7 @@ def freeze_draft_map(
                         draft_hash,
                         str(row["radiant_hero_ids"]),
                         str(row["dire_hero_ids"]),
+                        row["radiant_team_side"],
                         reason,
                         recorded_at,
                     ),

@@ -1543,9 +1543,12 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 "strict_mapping_gate_unavailable",
             )
 
-    def test_null_mapping_legacy_order_keeps_settlement_and_notification_semantics(
+    def test_null_mapping_legacy_order_is_audit_only(
         self,
     ) -> None:
+        self.connection.execute(
+            "DROP TRIGGER IF EXISTS shadow_orders_require_strict_mapping_insert"
+        )
         self.connection.execute(
             """INSERT INTO shadow_orders
                (order_key, raybet_match_id, strict_mapping_id, odds_id,
@@ -1588,14 +1591,27 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.connection.commit()
 
         with LiveBettingStore(self.path) as store:
-            self.assertIsNone(store.order_block_reason("legacy-null-mapping"))
-            self.assertTrue(
+            store.init_schema()
+            self.assertEqual(
+                store.order_block_reason("legacy-null-mapping"),
+                "strict_mapping_unverified",
+            )
+            self.assertFalse(
                 store.insert_settlement(
                     "legacy-null-mapping",
                     "win",
                     2.5,
                     RECORDED_AT,
                     "legacy-result",
+                )
+            )
+            self.assertFalse(
+                store.enqueue_notification(
+                    order_key="legacy-null-mapping",
+                    event_type="settled",
+                    payload={"result": "win"},
+                    stats_cutoff_at=RECORDED_AT,
+                    created_at=RECORDED_AT,
                 )
             )
             self.assertTrue(
@@ -1611,12 +1627,18 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 )
             )
             first = claim(store.connection, now=RECORDED_AT)
-            second = claim(store.connection, now=RECORDED_AT)
+            report = build_report(store.connection)
 
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
+        self.assertIsNone(first)
         self.assertEqual(
-            {first.event_type, second.event_type}, {"settled", "monitor_alert"}
+            tuple(self.connection.execute(
+                "SELECT status, last_error FROM notification_outbox"
+            ).fetchone()),
+            ("dead_letter", "strict_mapping_unverified"),
+        )
+        self.assertEqual(report["orders"]["signals"], 0)
+        self.assertEqual(
+            report["order_audit"]["strict_mapping_unverifiable_orders"], 1
         )
 
     def test_replacement_invalidation_does_not_claim_prior_shadow_order(self) -> None:

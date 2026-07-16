@@ -296,6 +296,7 @@ class ServiceHealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             events: list[str] = []
+            backup_dir = root / "external-volume-backups"
 
             class Child:
                 def poll(self) -> None:
@@ -332,6 +333,8 @@ class ServiceHealthTests(unittest.TestCase):
                 str(root / "service.lock"),
                 "--once",
                 "--migrate",
+                "--backup-dir",
+                str(backup_dir),
                 "--start-companion",
             ]
             with (
@@ -339,7 +342,7 @@ class ServiceHealthTests(unittest.TestCase):
                 patch(
                     "scripts.run_dota_shadow_service.prepare_database",
                     side_effect=prepare,
-                ),
+                ) as migrate,
                 patch(
                     "scripts.run_dota_shadow_service.subprocess.Popen",
                     side_effect=spawn,
@@ -353,6 +356,10 @@ class ServiceHealthTests(unittest.TestCase):
 
             self.assertLess(events.index("prepare"), events.index("spawn"))
             self.assertLess(events.index("spawn"), events.index("service-no-init"))
+            self.assertEqual(
+                migrate.call_args.args,
+                (root / "service.db", backup_dir),
+            )
 
     def test_routine_supervisor_start_verifies_without_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

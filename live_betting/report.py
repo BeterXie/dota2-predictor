@@ -1395,7 +1395,7 @@ def _order_audit_counts(
     """Return report denominators and fail-closed order audit counts.
 
     Evaluation deliberately omits orders whose causal vision evidence was
-    invalidated or whose signal predates a draft conflict.  Those rows still
+    invalidated or whose signal follows a draft conflict.  Those rows still
     need an explicit denominator and reason count so a report cannot make an
     invalidation look like an ordinary missing order.  Review-required orders
     remain in the operational order list but are excluded from scored

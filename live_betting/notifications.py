@@ -158,6 +158,8 @@ def enqueue(
                 ).fetchone()
             if blocked is not None:
                 return False
+            if _draft_conflict_for_order(connection, order_key):
+                return False
         cursor = connection.execute(
             """INSERT INTO notification_outbox
                (order_key, event_type, channel, status, recipient, message_id,
@@ -229,36 +231,7 @@ def _blocked_reason(connection: sqlite3.Connection, row: sqlite3.Row) -> str | N
                 if legacy_invalidation
                 else str(invalidated[0] or "vision_draft_conflict")
             )
-        direct_conflict = connection.execute(
-            """SELECT 1
-                 FROM shadow_orders AS orders
-                 JOIN shadow_map_attempts AS attempt
-                   ON attempt.order_key=orders.order_key
-                 JOIN vision_draft_anchors AS anchor
-                   ON anchor.raybet_match_id=attempt.raybet_match_id
-                  AND anchor.map_number=attempt.map_number
-                WHERE orders.order_key=? AND anchor.status='conflict'
-                  AND (
-                        anchor.conflict_at IS NULL
-                        OR julianday(anchor.conflict_at) IS NULL
-                        OR julianday(orders.signal_transport_at) IS NULL
-                        OR julianday(anchor.conflict_at)
-                             <= julianday(orders.signal_transport_at)
-                        OR EXISTS (
-                             SELECT 1 FROM vision_draft_conflicts AS conflict
-                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
-                                AND conflict.map_number=anchor.map_number
-                                AND (
-                                      julianday(conflict.captured_at) IS NULL
-                                      OR julianday(conflict.captured_at)
-                                           <= julianday(orders.signal_transport_at)
-                                )
-                        )
-                  )
-                LIMIT 1""",
-            (order_key,),
-        ).fetchone()
-        if direct_conflict is not None:
+        if _draft_conflict_for_order(connection, order_key):
             return "vision_draft_conflict"
         if str(row["event_type"]) == EVENT_SETTLED:
             reviewed = connection.execute(
@@ -305,6 +278,41 @@ def _strict_mapping_block_reason(
     return strict_order_mapping_block_reason(
         connection, order_key, require_order=require_order
     )
+
+
+def _draft_conflict_for_order(
+    connection: sqlite3.Connection, order_key: str
+) -> bool:
+    """Return whether an order belongs to a map with ambiguous draft identity."""
+    return connection.execute(
+        """SELECT 1
+             FROM shadow_orders AS orders
+             JOIN shadow_map_attempts AS attempt
+               ON attempt.order_key=orders.order_key
+             JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=attempt.raybet_match_id
+              AND anchor.map_number=attempt.map_number
+            WHERE orders.order_key=? AND anchor.status='conflict'
+              AND (
+                    anchor.conflict_at IS NULL
+                    OR julianday(anchor.conflict_at) IS NULL
+                    OR julianday(orders.signal_transport_at) IS NULL
+                    OR julianday(anchor.conflict_at)
+                         <= julianday(orders.signal_transport_at)
+                    OR EXISTS (
+                         SELECT 1 FROM vision_draft_conflicts AS conflict
+                          WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                            AND conflict.map_number=anchor.map_number
+                            AND (
+                                  julianday(conflict.captured_at) IS NULL
+                                  OR julianday(conflict.captured_at)
+                                       <= julianday(orders.signal_transport_at)
+                            )
+                    )
+              )
+            LIMIT 1""",
+        (order_key,),
+    ).fetchone() is not None
 
 
 def _suppress_locked(

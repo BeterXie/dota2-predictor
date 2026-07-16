@@ -323,6 +323,84 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 ("0" * 64,),
             )
 
+    def test_same_draft_can_anchor_previously_unknown_team_side(self) -> None:
+        unknown = replace(
+            observation(NOW, frame="unknown-side"),
+            radiant_team_side=None,
+        )
+        known = replace(
+            unknown,
+            captured_at=NOW + timedelta(seconds=1),
+            source_frame_ref="known-side",
+            radiant_team_side="team_two",
+        )
+
+        self.assertTrue(self.store.insert_vision_observation(unknown))
+        self.assertTrue(self.store.insert_vision_observation(known))
+
+        anchor = self.store.connection.execute(
+            """SELECT radiant_team_side, team_side_anchored_at,
+                      team_side_source_frame_ref, status
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id='match-1' AND map_number=1"""
+        ).fetchone()
+        self.assertEqual(
+            tuple(anchor),
+            (
+                "team_two",
+                (NOW + timedelta(seconds=1)).isoformat(),
+                "known-side",
+                "anchored",
+            ),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM vision_draft_conflicts"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_confirmed_team_side_reversal_creates_draft_conflict(self) -> None:
+        original = observation(NOW, frame="team-one-side")
+        reversed_side = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=1),
+            source_frame_ref="team-two-side",
+            radiant_team_side="team_two",
+        )
+
+        self.assertTrue(self.store.insert_vision_observation(original))
+        self.assertTrue(self.store.insert_vision_observation(reversed_side))
+
+        anchor = self.store.connection.execute(
+            """SELECT radiant_team_side, status, conflict_at
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id='match-1' AND map_number=1"""
+        ).fetchone()
+        self.assertEqual(
+            tuple(anchor),
+            (
+                "team_one",
+                "conflict",
+                (NOW + timedelta(seconds=1)).isoformat(),
+            ),
+        )
+        conflict = self.store.connection.execute(
+            """SELECT observed_radiant_team_side, reason
+                 FROM vision_draft_conflicts"""
+        ).fetchone()
+        self.assertEqual(
+            tuple(conflict),
+            ("team_two", "confirmed_radiant_team_side_changed"),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT confirmed FROM vision_observations
+                    WHERE source_frame_ref='team-two-side'"""
+            ).fetchone()[0],
+            0,
+        )
+
     def test_draft_conflict_hides_confirmed_frames_from_live_monitor(self) -> None:
         original = observation(NOW, frame="original")
         conflicting = replace(
@@ -375,17 +453,17 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             1,
         )
 
-    def test_future_draft_conflict_does_not_reject_prior_pending_order(self) -> None:
-        original = observation(NOW, frame="original")
+    def test_draft_conflict_after_signal_does_not_reject_pending_order(self) -> None:
+        original = observation(NOW - timedelta(seconds=1), frame="original")
+        self.store.insert_vision_observation(original)
+        self.insert_pending(NOW)
         conflicting = replace(
             original,
-            captured_at=NOW + timedelta(seconds=10),
+            captured_at=NOW + timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="future-conflict",
+            source_frame_ref="conflict-between-signal-and-fill",
         )
-        self.insert_pending(NOW)
-        self.store.insert_vision_observation(original)
         self.store.insert_vision_observation(conflicting)
         self.record_transport(NOW + timedelta(seconds=2), key="successor")
 
@@ -398,7 +476,9 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         row = self.store.connection.execute(
             "SELECT status, filled_at FROM shadow_orders WHERE order_key='order-1'"
         ).fetchone()
-        self.assertEqual(tuple(row), ("filled", (NOW + timedelta(seconds=2)).isoformat()))
+        self.assertEqual(
+            tuple(row), ("filled", (NOW + timedelta(seconds=2)).isoformat())
+        )
         self.assertEqual(
             self.store.connection.execute(
                 """SELECT COUNT(*) FROM vision_derived_invalidations
@@ -431,6 +511,86 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         self.assertNotEqual(result["status"], "waiting_for_confirmed_vision")
         self.assertEqual(result["status"], "no_signal")
         self.assertEqual(result["reason"], "strict_live_ineligible")
+
+    def test_delayed_worker_uses_transport_time_before_draft_conflict(self) -> None:
+        original = observation(NOW, frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=10),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="later-conflict",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.store.upsert_raybet_match(
+            raybet_metadata(), NOW - timedelta(minutes=2)
+        )
+        self.record_transport(NOW + timedelta(seconds=2), key="before-conflict")
+
+        result = run_once(
+            self.store,
+            Mock(),
+            MISSING_VISION,
+            now=NOW + timedelta(seconds=12),
+        )
+
+        self.assertEqual(result["status"], "no_signal")
+        self.assertEqual(result["reason"], "strict_live_ineligible")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT decided_at FROM strategy_decisions"
+            ).fetchone()[0],
+            (NOW + timedelta(seconds=2)).isoformat(),
+        )
+
+    def test_conflicted_match_does_not_hide_another_usable_match(self) -> None:
+        other_observation = replace(
+            observation(NOW, frame="other-match"),
+            raybet_match_id="match-2",
+        )
+        original = observation(NOW + timedelta(seconds=1), frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=2),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict",
+        )
+        self.store.insert_vision_observation(other_observation)
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.record_transport(NOW + timedelta(seconds=3), key="conflicted")
+        other_at = NOW + timedelta(seconds=1)
+        other_rows = [
+            replace(row, raybet_match_id="match-2")
+            for row in snapshots(other_at)
+        ]
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key="other-transport",
+            source_event_id=None,
+            raybet_match_id="match-2",
+            observed_at=other_at,
+            normalized_state_hash=normalized_state_hash(other_rows),
+            snapshots=other_rows,
+        )
+
+        result = run_once(
+            self.store,
+            Mock(),
+            MISSING_VISION,
+            now=NOW + timedelta(seconds=4),
+        )
+
+        self.assertEqual(result["status"], "no_signal")
+        self.assertEqual(result["reason"], "strict_live_ineligible")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT raybet_match_id FROM strategy_decisions"
+            ).fetchone()[0],
+            "match-2",
+        )
 
     def test_storage_rejects_decision_at_or_after_draft_conflict(self) -> None:
         original = observation(NOW, frame="original")

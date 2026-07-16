@@ -87,9 +87,8 @@ def strict_read_gate(
     """Build a fail-closed gate for an internally defined SQL row alias.
 
     Callers own the SQL expressions; this function is deliberately not a
-    general query builder. A genuine NULL mapping keeps legacy behavior. Any
-    non-NULL reference must prove its full mapping and approval lineage as of
-    the signal timestamp.
+    general query builder. A missing mapping is audit-only. Every included row
+    must prove its full mapping and approval lineage as of the signal timestamp.
     """
 
     if dependent_type not in _DEPENDENT_TYPES:
@@ -101,9 +100,9 @@ def strict_read_gate(
         return StrictReadGate(
             available=False,
             unknown_reasons=unknown_reasons,
-            included_sql=f"({legacy_sql})",
+            included_sql="0",
             invalidated_sql="0",
-            unverifiable_sql=f"({mapped_sql})",
+            unverifiable_sql="1",
         )
 
     mapping_id_valid = (
@@ -223,10 +222,11 @@ def strict_read_gate(
     )"""
     verified = f"(({mapping_id_valid}) AND ({valid_mapping}))"
     unverifiable = (
-        f"(({mapped_sql}) AND NOT ({invalidated}) AND NOT ({verified}))"
+        f"(({legacy_sql}) OR (({mapped_sql}) AND NOT ({invalidated}) "
+        f"AND NOT ({verified})))"
     )
     included = (
-        f"(({legacy_sql}) OR (NOT ({invalidated}) AND ({verified})))"
+        f"(({mapped_sql}) AND NOT ({invalidated}) AND ({verified}))"
     )
     return StrictReadGate(
         available=True,

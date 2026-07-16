@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from live_betting.database_protocol import (
 )
 from live_betting.storage import CURRENT_SCHEMA_VERSION as LIVE_VERSION
 from live_betting.storage import LiveBettingStore
+from live_betting.vision import VisionObservation
 from shared.sqlite import connect
 
 
@@ -104,6 +106,30 @@ def test_online_backup_includes_committed_wal_with_writer_still_open(
         )
     finally:
         backup.close()
+
+
+def test_online_backup_rejects_a_destination_without_enough_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "source.db"
+    backup_path = tmp_path / "backups" / "source.db"
+    connection = connect(database)
+    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    connection.execute("INSERT INTO marker VALUES ('preserved')")
+    connection.commit()
+    connection.close()
+
+    monkeypatch.setattr(
+        database_protocol.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient free space"):
+        online_backup(database, backup_path)
+
+    assert not backup_path.exists()
 
 
 def test_prepare_database_backs_up_existing_data_before_migration(
@@ -436,7 +462,7 @@ def test_live_store_itself_rejects_a_future_schema(tmp_path: Path) -> None:
         )
 
 
-def test_live_v1_schema_migrates_to_v2_and_is_idempotent(tmp_path: Path) -> None:
+def test_live_v1_schema_migrates_to_v3_and_is_idempotent(tmp_path: Path) -> None:
     database = tmp_path / "live-v1.db"
     connection = connect(database)
     connection.executescript(
@@ -460,7 +486,39 @@ def test_live_v1_schema_migrates_to_v2_and_is_idempotent(tmp_path: Path) -> None
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, recorded_at)
            VALUES ('shadow_order', 'legacy-order', 'match-1', 1,
-                   'legacy conflict', '2026-07-15T12:00:00+00:00');"""
+                   'legacy conflict', '2026-07-15T12:00:00+00:00');
+           CREATE TABLE vision_draft_anchors (
+               raybet_match_id TEXT NOT NULL,
+               map_number INTEGER NOT NULL,
+               draft_hash TEXT NOT NULL,
+               radiant_hero_ids TEXT NOT NULL,
+               dire_hero_ids TEXT NOT NULL,
+               anchored_at TEXT NOT NULL,
+               source_frame_ref TEXT NOT NULL,
+               status TEXT NOT NULL,
+               conflict_at TEXT,
+               PRIMARY KEY (raybet_match_id, map_number)
+           );
+           CREATE TABLE vision_draft_conflicts (
+               conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               raybet_match_id TEXT NOT NULL,
+               map_number INTEGER NOT NULL,
+               captured_at TEXT NOT NULL,
+               source_frame_ref TEXT NOT NULL,
+               observed_draft_hash TEXT NOT NULL,
+               radiant_hero_ids TEXT NOT NULL,
+               dire_hero_ids TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               recorded_at TEXT NOT NULL,
+               UNIQUE (raybet_match_id, map_number, captured_at, source_frame_ref)
+           );
+           INSERT INTO vision_draft_anchors VALUES (
+               'match-1', 1,
+               'd67fcba0a6956921cceee6d723126ba8928a468c6753c43835db325a6dda8a6a',
+               '[1,2,3,4,5]', '[6,7,8,9,10]',
+               '2026-07-15T12:00:00+00:00', 'legacy-frame',
+               'anchored', NULL
+           );"""
     )
     connection.close()
 
@@ -479,15 +537,49 @@ def test_live_v1_schema_migrates_to_v2_and_is_idempotent(tmp_path: Path) -> None
                  FROM vision_derived_invalidations
                 WHERE dependent_key='legacy-order'"""
         ).fetchone()) == ("legacy conflict", "vision_draft_conflict")
+        anchor = store.connection.execute(
+            """SELECT radiant_team_side, team_side_anchored_at,
+                      team_side_source_frame_ref
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id='match-1' AND map_number=1"""
+        ).fetchone()
+        assert tuple(anchor) == (None, None, None)
+        assert "observed_radiant_team_side" in {
+            str(row[1])
+            for row in store.connection.execute(
+                "PRAGMA table_info(vision_draft_conflicts)"
+            )
+        }
+        promoted_at = datetime(2026, 7, 15, 12, 0, 1, tzinfo=timezone.utc)
+        assert store.insert_vision_observation(VisionObservation(
+            "match-1", 1, promoted_at, 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "side-frame", "game", "team_two",
+        ))
+        promoted = store.connection.execute(
+            """SELECT radiant_team_side, team_side_anchored_at,
+                      team_side_source_frame_ref
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id='match-1' AND map_number=1"""
+        ).fetchone()
+        assert tuple(promoted) == (
+            "team_two", promoted_at.isoformat(), "side-frame"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            store.connection.execute(
+                """UPDATE vision_draft_anchors
+                      SET radiant_team_side='team_one'
+                    WHERE raybet_match_id='match-1' AND map_number=1"""
+            )
         assert [
             int(row[0])
             for row in store.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [1, 2]
+        ] == [1, 3]
 
 
-def test_version_one_binary_rejects_live_v2_database(
+def test_version_one_binary_rejects_live_v3_database(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -497,14 +589,14 @@ def test_version_one_binary_rejects_live_v2_database(
     monkeypatch.setattr(live_storage, "CURRENT_SCHEMA_VERSION", 1)
 
     with LiveBettingStore(database) as legacy_store:
-        with pytest.raises(RuntimeError, match="version 2 is newer than supported"):
+        with pytest.raises(RuntimeError, match="version 3 is newer than supported"):
             legacy_store.init_schema()
         assert [
             int(row[0])
             for row in legacy_store.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [2]
+        ] == [3]
 
 
 def test_existing_database_restores_backup_when_intelligence_init_fails_after_live(

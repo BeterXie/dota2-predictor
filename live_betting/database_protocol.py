@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -401,6 +402,17 @@ def _backup_connection(
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         raise FileExistsError(f"backup already exists: {destination}")
+    page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+    page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+    required_bytes = page_count * page_size
+    available_bytes = shutil.disk_usage(destination.parent).free
+    if available_bytes < required_bytes:
+        raise RuntimeError(
+            "insufficient free space for SQLite backup: "
+            f"destination={destination}, required_bytes={required_bytes}, "
+            f"available_bytes={available_bytes}; choose a backup directory "
+            "on a volume with more free space"
+        )
     target: sqlite3.Connection | None = None
     try:
         target = connect(destination)

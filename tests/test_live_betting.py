@@ -226,7 +226,7 @@ class StorageTests(unittest.TestCase):
                 self.assertTrue(store.insert_odds(snapshot))
                 self.assertFalse(store.insert_odds(snapshot))
 
-    def test_duplicate_order_is_idempotent(self) -> None:
+    def test_legacy_unmapped_order_writer_is_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with LiveBettingStore(Path(directory) / "test.db") as store:
                 store.init_schema()
@@ -249,8 +249,14 @@ class StorageTests(unittest.TestCase):
                     normalized_state_hash=normalized_state_hash([snapshot]),
                     snapshots=[snapshot],
                 )
-                self.assertTrue(store.insert_order(order))
                 self.assertFalse(store.insert_order(order))
+                self.assertFalse(store.insert_order(order))
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM shadow_orders"
+                    ).fetchone()[0],
+                    0,
+                )
 
     def test_only_one_shadow_order_can_reserve_a_map(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
