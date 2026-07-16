@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from live_betting.storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
 from live_betting.storage import LiveBettingStore
 from scripts.run_dota_shadow_service import (
     _DATABASE_HEALTH_CACHE,
+    _ReportWorker,
     SingleInstanceLock,
     _commands,
     _companion_health,
@@ -97,6 +99,79 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertEqual(statuses["mail"], "degraded")
             self.assertEqual(statuses["shadow"], "stopped")
             self.assertEqual(statuses["raybet"], "stopped")
+
+    def test_health_only_cycle_skips_slow_report_builders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "service.db"
+            report = Path(directory) / "report.json"
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("scripts.run_dota_shadow_service.build_report") as shadow,
+                patch(
+                    "scripts.run_dota_shadow_service.build_intelligence_report"
+                ) as intelligence,
+            ):
+                result = service_once(database, report, health_only=True)
+
+            shadow.assert_not_called()
+            intelligence.assert_not_called()
+            self.assertEqual(result, {"pending_orders": 0})
+            self.assertFalse(report.exists())
+            with LiveBettingStore(database) as store:
+                self.assertTrue(read_health(store.connection))
+
+    def test_report_worker_is_single_flight(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        clock = [0.0]
+
+        def slow_report(*args: object) -> None:
+            started.set()
+            self.assertTrue(release.wait(2))
+
+        worker = _ReportWorker(
+            Path("service.db"),
+            Path("report.json"),
+            report_interval=300.0,
+            monotonic=lambda: clock[0],
+        )
+        with patch(
+            "scripts.run_dota_shadow_service._generate_service_report",
+            side_effect=slow_report,
+        ) as generate:
+            self.assertTrue(worker.start_if_idle())
+            self.assertTrue(started.wait(2))
+            self.assertFalse(worker.start_if_idle())
+            release.set()
+            self.assertTrue(worker.wait(2))
+            self.assertFalse(worker.start_if_idle())
+            clock[0] = 299.0
+            self.assertFalse(worker.start_if_idle())
+            clock[0] = 300.0
+            self.assertTrue(worker.start_if_idle())
+            self.assertTrue(worker.wait(2))
+
+        self.assertEqual(generate.call_count, 2)
+        generate.assert_called_with(Path("service.db"), Path("report.json"))
+
+    def test_report_worker_failure_does_not_escape_and_can_retry(self) -> None:
+        worker = _ReportWorker(
+            Path("service.db"), Path("report.json"), report_interval=0.0
+        )
+        with (
+            patch(
+                "scripts.run_dota_shadow_service._generate_service_report",
+                side_effect=RuntimeError("report failed"),
+            ) as generate,
+            patch("scripts.run_dota_shadow_service.sys.stderr"),
+        ):
+            self.assertTrue(worker.start_if_idle())
+            self.assertTrue(worker.wait(2))
+            self.assertEqual(worker.last_error, "RuntimeError: report failed")
+            self.assertTrue(worker.start_if_idle())
+            self.assertTrue(worker.wait(2))
+
+        self.assertEqual(generate.call_count, 2)
 
     def test_missing_smtp_overrides_stale_optional_mail_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -410,12 +485,60 @@ class ServiceHealthTests(unittest.TestCase):
                 patch(
                     "scripts.run_dota_shadow_service.service_once",
                     return_value={"shadow": {"orders": {"signals": 0}}},
-                ),
+                ) as service,
             ):
                 self.assertEqual(main(), 0)
 
             migrate.assert_not_called()
             self.assertLess(events.index("verify"), events.index("spawn"))
+            self.assertFalse(service.call_args.kwargs["health_only"])
+
+    def test_recurring_supervisor_keeps_health_and_reporting_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reporter = Mock()
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(root / "service.db"),
+                "--report",
+                str(root / "service-report.json"),
+                "--lock",
+                str(root / "service.lock"),
+            ]
+            preparation = Mock(
+                backup=None,
+                live_schema_version=LIVE_SCHEMA_VERSION,
+                intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+            )
+            with (
+                patch.object(sys, "argv", argv),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database",
+                    return_value=preparation,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._ReportWorker",
+                    return_value=reporter,
+                ) as worker,
+                patch(
+                    "scripts.run_dota_shadow_service.service_once",
+                    return_value={"pending_orders": 0},
+                ) as service,
+                patch(
+                    "scripts.run_dota_shadow_service.time.sleep",
+                    side_effect=KeyboardInterrupt,
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    main()
+
+            worker.assert_called_once_with(
+                root / "service.db", root / "service-report.json"
+            )
+            self.assertIsNone(service.call_args.args[1])
+            self.assertTrue(service.call_args.kwargs["health_only"])
+            reporter.start_if_idle.assert_called_once_with()
 
     def test_expensive_database_audit_is_cached_between_service_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

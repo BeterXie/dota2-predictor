@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,94 @@ _DATABASE_HEALTH_CACHE: dict[
     str,
     tuple[datetime, tuple[str, str | None, dict[str, Any]]],
 ] = {}
+
+
+def _write_service_report(report_path: Path, result: Mapping[str, Any]) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = report_path.with_name(f".{report_path.name}.tmp")
+    temporary.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, report_path)
+
+
+def _generate_service_report(database: Path, report_path: Path) -> None:
+    """Build a report on a connection owned by the calling thread."""
+    with LiveBettingStore(database) as store:
+        result = {
+            "shadow": build_report(store.connection),
+            "intelligence": build_intelligence_report(store.connection),
+        }
+    _write_service_report(report_path, result)
+
+
+class _ReportWorker:
+    """Run at most one report build without blocking supervisor heartbeats."""
+
+    def __init__(
+        self,
+        database: Path,
+        report_path: Path,
+        *,
+        report_interval: float = 300.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.database = database
+        self.report_path = report_path
+        self.report_interval = report_interval
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._last_finished_at: float | None = None
+        self.last_error: str | None = None
+
+    def start_if_idle(self) -> bool:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            if (
+                self._last_finished_at is not None
+                and self._monotonic() - self._last_finished_at
+                < self.report_interval
+            ):
+                return False
+            self._thread = threading.Thread(
+                target=self._run,
+                name="service-report",
+                daemon=True,
+            )
+            self._thread.start()
+            return True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def _run(self) -> None:
+        try:
+            _generate_service_report(self.database, self.report_path)
+        except Exception as error:
+            message = " ".join(str(error).split())[:500]
+            self.last_error = f"{type(error).__name__}: {message}"
+            print(
+                json.dumps({
+                    "status": "report_error",
+                    "error_type": type(error).__name__,
+                    "error": message,
+                }, ensure_ascii=False),
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            self.last_error = None
+        finally:
+            with self._lock:
+                self._last_finished_at = self._monotonic()
 
 
 class SingleInstanceLock:
@@ -333,6 +422,7 @@ def service_once(
     active_components: set[str] | None = None,
     companion_probe: Callable[[], Mapping[str, Any]] = _probe_companion,
     initialize_schema: bool = True,
+    health_only: bool = False,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     active_components = set(active_components or ())
@@ -464,17 +554,13 @@ def service_once(
             reason=companion_reason,
             details=companion_details,
         )
+        if health_only:
+            return {"pending_orders": pending}
         report = build_report(connection)
         intelligence = build_intelligence_report(connection)
         result = {"shadow": report, "intelligence": intelligence}
         if report_path:
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = report_path.with_name(f".{report_path.name}.tmp")
-            temporary.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary, report_path)
+            _write_service_report(report_path, result)
         return result
 
 
@@ -592,6 +678,9 @@ def main() -> int:
                 if args.migrate
                 else verify_prepared_database(args.database)
             )
+            report_worker = (
+                None if args.once else _ReportWorker(args.database, args.report)
+            )
             while True:
                 for name, command in commands.items():
                     child = children.get(name)
@@ -605,12 +694,19 @@ def main() -> int:
                         )
                 result = service_once(
                     args.database,
-                    args.report,
+                    args.report if args.once else None,
                     active_components=set(commands),
                     initialize_schema=False,
+                    health_only=report_worker is not None,
                 )
+                if report_worker is not None:
+                    report_worker.start_if_idle()
                 print(json.dumps({"status": "ok", "components": list(commands),
-                                  "pending": result["shadow"]["orders"]["signals"],
+                                  "pending": (
+                                      result["pending_orders"]
+                                      if report_worker is not None
+                                      else result["shadow"]["orders"]["signals"]
+                                  ),
                                   "backup": (
                                       str(preparation.backup)
                                       if preparation.backup is not None
