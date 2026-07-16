@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -163,6 +163,20 @@ const snapshot: MonitorSnapshot = {
     ended: 0,
     unhealthy_components: 0,
     active_alerts: 0,
+    live_view: {
+      total: 2,
+      upcoming: 0,
+      live: 0,
+      degraded: 2,
+      ended: 0,
+    },
+    history_view: {
+      total: 0,
+      upcoming: 0,
+      live: 0,
+      degraded: 0,
+      ended: 0,
+    },
   },
 };
 
@@ -265,6 +279,24 @@ describe("App data recovery and ownership", () => {
     expect(screen.queryByRole("button", { name: "select-a" })).not.toBeInTheDocument();
   });
 
+  it("uses view-specific summary counters on the history tab", async () => {
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      summary: {
+        ...snapshot.summary,
+        live_view: { total: 4, upcoming: 2, live: 1, degraded: 1, ended: 0 },
+        history_view: { total: 7, upcoming: 0, live: 0, degraded: 2, ended: 5 },
+      },
+    });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(await screen.findByText("历史比赛")).toBeInTheDocument();
+    expect(screen.getByText("7")).toBeInTheDocument();
+    expect(screen.getByText("历史降级")).toBeInTheDocument();
+    expect(screen.getByText("已完赛")).toBeInTheDocument();
+  });
+
   it("keeps legacy history deep links working", async () => {
     window.history.replaceState(null, "", "/?view=intelligence");
 
@@ -274,8 +306,44 @@ describe("App data recovery and ownership", () => {
     expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
   });
 
+  it("stops hidden monitor detail, mapping, and control refreshes in OpenDota view", async () => {
+    vi.useFakeTimers();
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "OpenDota 赛后情报" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const before = {
+      details: api.fetchMatchDetail.mock.calls.length,
+      mappings: api.fetchMappings.mock.calls.length,
+      controls: api.fetchControlComponents.mock.calls.length,
+    };
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(before.details);
+    expect(api.fetchMappings).toHaveBeenCalledTimes(before.mappings);
+    expect(api.fetchControlComponents).toHaveBeenCalledTimes(before.controls);
+    expect(api.createControlSession).not.toHaveBeenCalled();
+  });
+
   it("keeps live and ended match lists isolated", async () => {
-    const endedMatch: MonitorMatch = { ...match("ended"), lifecycle: "ended" };
+    const endedMatch: MonitorMatch = {
+      ...match("ended"),
+      lifecycle: "ended",
+      history_eligible: true,
+    };
     api.fetchBootstrap.mockResolvedValue({
       ...snapshot,
       matches: [match("live"), endedMatch],
@@ -289,6 +357,24 @@ describe("App data recovery and ownership", () => {
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
     expect(screen.getByRole("button", { name: "select-ended" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
+  });
+
+  it("fails closed when an ended match is missing the archive eligibility flag", async () => {
+    const malformed = { ...match("missing-eligibility"), lifecycle: "ended" } as MonitorMatch;
+    delete (malformed as Partial<MonitorMatch>).history_eligible;
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      matches: [malformed],
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "select-missing-eligibility" }))
+        .not.toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(screen.queryByRole("button", { name: "select-missing-eligibility" })).not.toBeInTheDocument();
   });
 
   it("moves long-stale replay evidence out of the live list without relabeling it ended", async () => {
@@ -349,6 +435,10 @@ describe("App data recovery and ownership", () => {
       await Promise.resolve();
     });
     fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(screen.getByText("component-raybet_collector-stopped")).toBeInTheDocument();
 
     await act(async () => {
@@ -370,6 +460,7 @@ describe("App data recovery and ownership", () => {
       components: [stoppedComponent],
     });
     render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();

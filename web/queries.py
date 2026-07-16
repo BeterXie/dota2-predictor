@@ -25,7 +25,10 @@ def init_db(db_path: str | None = None) -> None:
 
 
 def get_db() -> sqlite3.Connection:
-    return connect_sqlite(DB_PATH, row_factory=sqlite3.Row, wal=True)
+    # Writers initialize WAL once.  Re-issuing PRAGMA journal_mode=WAL for
+    # every HTTP request takes a write lock and can starve reads while the
+    # collectors are ingesting a large database.
+    return connect_sqlite(DB_PATH, row_factory=sqlite3.Row, wal=False)
 
 
 def _safe_execute(query: str, params: tuple = (), fetch: str = "all") -> Any:

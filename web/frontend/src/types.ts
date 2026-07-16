@@ -64,8 +64,13 @@ export interface MonitorMatch {
   provider_status: string;
   live_url: string | null;
   updated_at: string;
+  latest_odds_activity_at?: string | null;
   lifecycle: Lifecycle;
-  history_eligible?: boolean;
+  /**
+   * The backend archive boundary is explicit.  A missing value is invalid
+   * rather than an implicit ended/history signal.
+   */
+  history_eligible: boolean;
   winner: WinnerQuote | null;
   latest_vision: VisionPoint | null;
   latest_decision: StrategyDecision | null;
@@ -190,15 +195,20 @@ export interface MonitorSnapshot {
   health: HealthItem[];
   matches: MonitorMatch[];
   alerts: AlertIncident[];
-  summary: {
-    total: number;
-    upcoming: number;
-    live: number;
-    degraded: number;
-    ended: number;
+  summary: MonitorLifecycleCounts & {
+    live_view: MonitorLifecycleCounts;
+    history_view: MonitorLifecycleCounts;
     unhealthy_components: number;
     active_alerts: number;
   };
+}
+
+export interface MonitorLifecycleCounts {
+  total: number;
+  upcoming: number;
+  live: number;
+  degraded: number;
+  ended: number;
 }
 
 export type ConnectionState = "connecting" | "live" | "fallback" | "offline";
@@ -373,6 +383,9 @@ export interface IntelligenceOverview {
     team_state: string;
     team_profile: string;
     draft_score: string;
+    draft_model: string;
+    draft_backtest: string;
+    draft_features: string;
   };
   coverage: Record<string, number>;
   team_state_distribution: Partial<Record<IntelligenceStateLabel, number>>;
@@ -402,6 +415,12 @@ export interface IntelligencePlayerRanking {
   average_coverage: number;
   average_role_confidence: number;
   score_version: string;
+  /** Legacy/detail payloads may expose one cutoff per row. */
+  benchmark_cutoff?: string | null;
+  /** Aggregated rankings expose all cutoffs contributing to the row. */
+  benchmark_cutoffs?: string[];
+  benchmark_cutoff_min?: string | null;
+  benchmark_cutoff_max?: string | null;
 }
 
 export interface IntelligenceTeamProfile {

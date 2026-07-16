@@ -11,10 +11,13 @@ from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import (
     EVENT_FILLED,
+    EVENT_MONITOR_ALERT,
     EVENT_SETTLED,
+    MONITOR_TEMPLATE_VERSION,
     NotificationConflictError,
     RETRY_DELAYS,
     claim,
+    ensure_sendable,
     enqueue,
     mark_failure,
     mark_sent,
@@ -377,10 +380,51 @@ class NotificationOutboxTests(unittest.TestCase):
             signal_identity_verified=True,
         )
 
+    def _ensure_strict_mapping(self) -> None:
+        if self.store.connection.execute(
+            "SELECT 1 FROM strict_live_map_mappings WHERE mapping_id=1"
+        ).fetchone() is not None:
+            return
+        self.store.connection.commit()
+        self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.store.connection.execute(
+                """INSERT INTO strict_live_map_mappings
+                   (mapping_id, raybet_match_id, map_number, event_id,
+                    team_one_id, team_two_id, canonical_team_one_id,
+                    canonical_team_one_name, canonical_team_two_id,
+                    canonical_team_two_name, canonical_identity_json,
+                    canonical_identity_hash, crosswalk_evidence_json,
+                    crosswalk_evidence_hash, stage_scope, scheduled_at_utc,
+                    raybet_best_of, raybet_identity_json, raybet_identity_hash,
+                    raybet_metadata_updated_at, source, evidence_json,
+                    evidence_hash, mapping_version, acceptance_mode,
+                    automatic_approval_id, accepted_by, accepted_at,
+                    recorded_at, created_at)
+                   VALUES (1, 'match-1', 1, 'event-test', 101, 202, 101,
+                           'Alpha', 202, 'Beta', '{}', ?, '{}', ?,
+                           'main_event', ?, 3, '{}', ?, ?, 'test', '{}', ?,
+                           'test-v1', 'manual_exact', NULL, 'test', ?, ?, ?)""",
+                (
+                    "a" * 64,
+                    "b" * 64,
+                    NOW.isoformat(),
+                    "c" * 64,
+                    NOW.isoformat(),
+                    "d" * 64,
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                ),
+            )
+            self.store.connection.commit()
+        finally:
+            self.store.connection.execute("PRAGMA foreign_keys=ON")
+
     def test_fill_and_settlement_schedule_notifications_atomically(self) -> None:
         order = self._order()
         self.assertTrue(
-            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+            self.store.insert_map_order(order, 1, strict_mapping_id=None)
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
@@ -427,10 +471,228 @@ class NotificationOutboxTests(unittest.TestCase):
             0,
         )
 
+    def test_claim_suppresses_invalidated_order_event(self) -> None:
+        self.assertTrue(self.add(EVENT_FILLED))
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+                       'vision_draft_conflict', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.assertIsNone(claim(self.store.connection, now=NOW))
+        row = self.store.connection.execute(
+            "SELECT status, last_error FROM notification_outbox"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("dead_letter", "vision_draft_conflict"))
+
+    def test_claim_preserves_generic_vision_invalidation_gate_code(self) -> None:
+        self.assertTrue(self.add(EVENT_FILLED))
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+                       'stale_clock', 'vision_observation_invalidated', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.assertIsNone(claim(self.store.connection, now=NOW))
+        row = self.store.connection.execute(
+            "SELECT status, last_error FROM notification_outbox"
+        ).fetchone()
+        self.assertEqual(
+            tuple(row), ("dead_letter", "vision_observation_invalidated")
+        )
+
+    def test_claim_uses_paper_signal_source_order_for_legacy_monitor_row(self) -> None:
+        self.store.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES ('legacy-paper-order', 'match-1', NULL, 'odds-legacy',
+                       'winner|map_1|team_one|', ?, 0.6, 0.4, 2.5,
+                       'transport-legacy', ?, ?, 'group-legacy', 'team_one',
+                       1, 1.0, 'pending')""",
+            (
+                NOW.isoformat(),
+                NOW.isoformat(),
+                (NOW + timedelta(seconds=15)).isoformat(),
+            ),
+        )
+        self.store.connection.execute(
+            """INSERT INTO shadow_map_attempts
+               (raybet_match_id, map_number, order_key, status, created_at)
+               VALUES ('match-1', 1, 'legacy-paper-order', 'pending', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.commit()
+        self.assertTrue(
+            enqueue(
+                self.store.connection,
+                order_key="monitor-incident-7",
+                event_type=EVENT_MONITOR_ALERT,
+                payload={
+                    "incident_id": 7,
+                    "category": "paper_signal",
+                    "severity": "warning",
+                    "title": "paper signal",
+                    "body": "test",
+                    "source": {"order_key": "legacy-paper-order"},
+                    "event_type": EVENT_MONITOR_ALERT,
+                },
+                stats_cutoff_at=NOW,
+                created_at=NOW,
+                template_version=MONITOR_TEMPLATE_VERSION,
+            )
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('shadow_order', 'legacy-paper-order', 'match-1', 1,
+                       'vision_draft_conflict', ?)""",
+            (NOW.isoformat(),),
+        )
+
+        self.assertIsNone(claim(self.store.connection, now=NOW))
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status, last_error FROM notification_outbox"
+                ).fetchone()
+            ),
+            ("dead_letter", "vision_draft_conflict"),
+        )
+
+    def test_claim_rejects_paper_signal_without_source_order_lineage(self) -> None:
+        self.assertTrue(
+            enqueue(
+                self.store.connection,
+                order_key="monitor-incident-missing",
+                event_type=EVENT_MONITOR_ALERT,
+                payload={
+                    "incident_id": 8,
+                    "category": "paper_signal",
+                    "severity": "warning",
+                    "title": "paper signal",
+                    "body": "test",
+                    "source": {"order_key": "missing-paper-order"},
+                    "event_type": EVENT_MONITOR_ALERT,
+                },
+                stats_cutoff_at=NOW,
+                created_at=NOW,
+                template_version=MONITOR_TEMPLATE_VERSION,
+            )
+        )
+
+        self.assertIsNone(claim(self.store.connection, now=NOW))
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status, last_error FROM notification_outbox"
+                ).fetchone()
+            ),
+            ("dead_letter", "strict_mapping_unverified"),
+        )
+
+    def test_mark_sent_rechecks_conflict_after_claim(self) -> None:
+        self.assertTrue(self.add(EVENT_FILLED))
+        record = claim(self.store.connection, now=NOW)
+        self.assertIsNotNone(record)
+        assert record is not None and record.lease_token is not None
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+                       'vision_draft_conflict', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.assertFalse(
+            ensure_sendable(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                lease_token=record.lease_token,
+                now=NOW,
+            )
+        )
+        self.assertFalse(
+            mark_sent(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                lease_token=record.lease_token,
+                sent_at=NOW,
+            )
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM notification_outbox"
+            ).fetchone()[0],
+            "dead_letter",
+        )
+
+    def test_requeue_cannot_resurrect_invalidated_event(self) -> None:
+        self.assertTrue(self.add(EVENT_SETTLED))
+        self.store.connection.execute(
+            "UPDATE notification_outbox SET status='dead_letter'"
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+                       'vision_draft_conflict', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.assertFalse(
+            requeue_dead_letter(
+                self.store.connection,
+                outbox_id=1,
+                actor="test",
+                reason="retry",
+                now=NOW,
+            )
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM notification_outbox"
+            ).fetchone()[0],
+            "dead_letter",
+        )
+
+    def test_review_required_settled_event_cannot_be_claimed_or_requeued(self) -> None:
+        self.assertTrue(self.add(EVENT_SETTLED))
+        self.assertTrue(
+            self.store.insert_settlement(
+                "order-1", "review", 0.0, NOW, "conflict", True
+            )
+        )
+
+        self.assertIsNone(claim(self.store.connection, now=NOW))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status, last_error FROM notification_outbox"
+            ).fetchone()[0:2],
+            ("dead_letter", "settlement_manual_review"),
+        )
+        self.assertFalse(
+            requeue_dead_letter(
+                self.store.connection,
+                outbox_id=1,
+                actor="test",
+                reason="retry",
+                now=NOW,
+            )
+        )
+
     def test_fill_and_outbox_roll_back_together_on_notification_failure(self) -> None:
         order = self._order()
         self.assertTrue(
-            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+            self.store.insert_map_order(order, 1, strict_mapping_id=None)
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(

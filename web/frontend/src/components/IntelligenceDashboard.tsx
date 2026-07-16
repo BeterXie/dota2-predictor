@@ -41,6 +41,7 @@ import type {
   IntelligencePlayerMapScore,
   IntelligencePlayerPerformance,
   IntelligencePlayerPage,
+  IntelligencePlayerRanking,
   IntelligenceStateLabel,
   IntelligenceTeamPage,
   IntelligenceTeamProfile,
@@ -687,6 +688,7 @@ function MatchDetailPanel({
   const hasPlayerScores = value.playerScores.length > 0;
   const radiant = teamName(match.radiant_team_name, match.radiant_team_id, "天辉");
   const dire = teamName(match.dire_team_name, match.dire_team_id, "夜魇");
+  const scoreEvidence = collectScoreEvidence(value.playerScores);
 
   return (
     <main className="intel-match-detail" aria-live="polite">
@@ -705,6 +707,12 @@ function MatchDetailPanel({
         </div>
         <span className="intel-method-note">不合成未定义的比赛总分，保留各项可审计结果</span>
       </header>
+
+      <ScoreEvidenceStrip
+        benchmarkCutoffs={scoreEvidence.benchmarkCutoffs}
+        scoreVersions={scoreEvidence.scoreVersions}
+        source="本场逐局评分"
+      />
 
       <section className="intel-detail-section">
         <div className="intel-section-heading compact">
@@ -745,6 +753,41 @@ function MatchDetailPanel({
         <DraftPredictionTable predictions={value.draftPredictions} />
       </section>
     </main>
+  );
+}
+
+function ScoreEvidenceStrip({
+  benchmarkCutoffs,
+  missingCutoffNote = "评分行未提供基准截止",
+  scoreVersions,
+  source,
+}: {
+  benchmarkCutoffs: string[];
+  missingCutoffNote?: string;
+  scoreVersions: string[];
+  source: string;
+}) {
+  return (
+    <dl className="intel-score-evidence" aria-label={`${source}版本证据`}>
+      <div>
+        <dt>评分版本</dt>
+        <dd>
+          {scoreVersions.length
+            ? scoreVersions.map((value) => <code key={value}>{value}</code>)
+            : "尚未生成"}
+        </dd>
+      </div>
+      <div>
+        <dt>基准截止</dt>
+        <dd>
+          {benchmarkCutoffs.length
+            ? benchmarkCutoffs.map((value) => (
+              <code key={value} title={value}>{formatCutoff(value)}</code>
+            ))
+            : missingCutoffNote}
+        </dd>
+      </div>
+    </dl>
   );
 }
 
@@ -905,6 +948,7 @@ function PlayersView({
   position: string;
   searchDraft: string;
 }) {
+  const scoreEvidence = collectRankingEvidence(page?.data || []);
   return (
     <section className="intel-view-panel">
       <div className="intel-view-heading">
@@ -931,6 +975,12 @@ function PlayersView({
           </Select>
         </form>
       </div>
+      <ScoreEvidenceStrip
+        benchmarkCutoffs={scoreEvidence.benchmarkCutoffs}
+        scoreVersions={scoreEvidence.scoreVersions}
+        source="当前聚合排名"
+        missingCutoffNote="聚合接口未返回逐局基准截止"
+      />
       {error && !page ? <ErrorState message={error} /> : null}
       {error && page ? <div className="intel-stale-note">选手排名刷新失败，当前显示上一次成功结果</div> : null}
       {loading && !page ? <TableSkeleton /> : null}
@@ -1235,12 +1285,49 @@ function clientPagination(page: number, pageSize: number, total: number): Intell
   return { page: Math.min(page, totalPages), page_size: pageSize, total, total_pages: totalPages };
 }
 
+function collectScoreEvidence(scores: IntelligencePlayerMapScore[]): {
+  scoreVersions: string[];
+  benchmarkCutoffs: string[];
+} {
+  return {
+    scoreVersions: uniqueNonEmpty(scores.map((score) => score.score_version)),
+    benchmarkCutoffs: uniqueNonEmpty(scores.map((score) => score.benchmark_cutoff)),
+  };
+}
+
+function collectRankingEvidence(rows: IntelligencePlayerRanking[]): {
+  scoreVersions: string[];
+  benchmarkCutoffs: string[];
+} {
+  return {
+    scoreVersions: uniqueNonEmpty(rows.map((row) => row.score_version)),
+    benchmarkCutoffs: uniqueNonEmpty([
+      ...rows.flatMap((row) => row.benchmark_cutoffs || []),
+      ...rows.map((row) => row.benchmark_cutoff),
+      ...rows.map((row) => row.benchmark_cutoff_min),
+      ...rows.map((row) => row.benchmark_cutoff_max),
+    ]),
+  };
+}
+
+function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
+function formatCutoff(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : value.slice(0, 10);
+}
+
 function versionLabel(name: string): string {
   return {
     player_score: "选手评分",
     team_state: "局势标签",
     team_profile: "球队画像",
     draft_score: "阵容输入",
+    draft_model: "阵容模型",
+    draft_backtest: "阵容回测",
+    draft_features: "阵容特征",
   }[name] || name;
 }
 

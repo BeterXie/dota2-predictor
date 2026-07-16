@@ -139,6 +139,25 @@ def enqueue(
         _iso(created_at),
     )
     with _transaction(connection):
+        if event_type in {EVENT_FILLED, EVENT_SETTLED}:
+            if _strict_mapping_block_reason(connection, order_key) is not None:
+                return False
+            try:
+                blocked = connection.execute(
+                    """SELECT block_reason FROM vision_derived_invalidations
+                        WHERE dependent_type='shadow_order' AND dependent_key=?
+                        LIMIT 1""",
+                    (order_key,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                blocked = connection.execute(
+                    """SELECT 1 FROM vision_derived_invalidations
+                        WHERE dependent_type='shadow_order' AND dependent_key=?
+                        LIMIT 1""",
+                    (order_key,),
+                ).fetchone()
+            if blocked is not None:
+                return False
         cursor = connection.execute(
             """INSERT INTO notification_outbox
                (order_key, event_type, channel, status, recipient, message_id,
@@ -173,6 +192,143 @@ def enqueue(
         return False
 
 
+def _blocked_reason(connection: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+    """Return a sticky reason when a claimed event is no longer deliverable."""
+    try:
+        order_key, order_scoped = _notification_order_identity(row)
+        if not order_scoped:
+            return None
+        strict_mapping = _strict_mapping_block_reason(
+            connection,
+            order_key,
+            require_order=str(row["event_type"])
+            in {EVENT_MONITOR_ALERT, EVENT_MONITOR_RECOVERY},
+        )
+        if strict_mapping is not None:
+            return strict_mapping
+        legacy_invalidation = False
+        try:
+            invalidated = connection.execute(
+                """SELECT block_reason FROM vision_derived_invalidations
+                    WHERE dependent_type='shadow_order' AND dependent_key=?
+                    LIMIT 1""",
+                (order_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Databases created before stable gate codes remain draft-safe.
+            legacy_invalidation = True
+            invalidated = connection.execute(
+                """SELECT 1 FROM vision_derived_invalidations
+                    WHERE dependent_type='shadow_order' AND dependent_key=?
+                    LIMIT 1""",
+                (order_key,),
+            ).fetchone()
+        if invalidated is not None:
+            return (
+                "vision_draft_conflict"
+                if legacy_invalidation
+                else str(invalidated[0] or "vision_draft_conflict")
+            )
+        direct_conflict = connection.execute(
+            """SELECT 1
+                 FROM shadow_orders AS orders
+                 JOIN shadow_map_attempts AS attempt
+                   ON attempt.order_key=orders.order_key
+                 JOIN vision_draft_anchors AS anchor
+                   ON anchor.raybet_match_id=attempt.raybet_match_id
+                  AND anchor.map_number=attempt.map_number
+                WHERE orders.order_key=? AND anchor.status='conflict'
+                  AND (
+                        anchor.conflict_at IS NULL
+                        OR julianday(anchor.conflict_at) IS NULL
+                        OR julianday(orders.signal_transport_at) IS NULL
+                        OR julianday(anchor.conflict_at)
+                             <= julianday(orders.signal_transport_at)
+                        OR EXISTS (
+                             SELECT 1 FROM vision_draft_conflicts AS conflict
+                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                                AND conflict.map_number=anchor.map_number
+                                AND (
+                                      julianday(conflict.captured_at) IS NULL
+                                      OR julianday(conflict.captured_at)
+                                           <= julianday(orders.signal_transport_at)
+                                )
+                        )
+                  )
+                LIMIT 1""",
+            (order_key,),
+        ).fetchone()
+        if direct_conflict is not None:
+            return "vision_draft_conflict"
+        if str(row["event_type"]) == EVENT_SETTLED:
+            reviewed = connection.execute(
+                """SELECT 1 FROM settlements
+                    WHERE order_key=? AND review_required=1
+                    LIMIT 1""",
+                (order_key,),
+            ).fetchone()
+            if reviewed is not None:
+                return "settlement_manual_review"
+    except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        return "notification_gate_unavailable"
+    return None
+
+
+def _notification_order_identity(row: sqlite3.Row) -> tuple[str, bool]:
+    event_type = str(row["event_type"])
+    stored_order_key = str(row["order_key"])
+    if event_type in {EVENT_FILLED, EVENT_SETTLED}:
+        return stored_order_key, True
+    if event_type not in {EVENT_MONITOR_ALERT, EVENT_MONITOR_RECOVERY}:
+        return stored_order_key, False
+    payload = json.loads(str(row["payload_json"]))
+    if not isinstance(payload, dict) or payload.get("category") != "paper_signal":
+        return stored_order_key, False
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("paper signal notification source is unavailable")
+    paper_order_key = str(source.get("order_key") or "").strip()
+    if not paper_order_key:
+        raise ValueError("paper signal notification order key is unavailable")
+    return paper_order_key, True
+
+
+def _strict_mapping_block_reason(
+    connection: sqlite3.Connection,
+    order_key: str,
+    *,
+    require_order: bool = False,
+) -> str | None:
+    """Delegate notification checks to the persisted-order strict gate."""
+    from .storage import strict_order_mapping_block_reason
+
+    return strict_order_mapping_block_reason(
+        connection, order_key, require_order=require_order
+    )
+
+
+def _suppress_locked(
+    connection: sqlite3.Connection,
+    outbox_id: int,
+    reason: str,
+    *,
+    now: datetime,
+) -> None:
+    connection.execute(
+        """UPDATE notification_outbox
+              SET status='dead_letter', lease_token=NULL,
+                  lease_until=NULL, last_error=?, updated_at=?
+            WHERE outbox_id=? AND status IN ('pending', 'leased')""",
+        (reason, _iso(now), outbox_id),
+    )
+    connection.execute(
+        """INSERT INTO notification_outbox_audit
+           (outbox_id, action, actor, reason, created_at)
+           VALUES (?, 'blocked', 'notification_gate', ?, ?)""",
+        (outbox_id, reason, _iso(now)),
+    )
+
+
 def claim(
     connection: sqlite3.Connection,
     *,
@@ -186,17 +342,22 @@ def claim(
     token = uuid.uuid4().hex
     lease_until = now + timedelta(seconds=lease_seconds)
     with _transaction(connection):
-        row = connection.execute(
-            """SELECT * FROM notification_outbox
-                WHERE (status='pending' AND next_attempt_at IS NOT NULL
-                       AND next_attempt_at<=?)
-                   OR (status='leased' AND lease_until IS NOT NULL
-                       AND lease_until<=?)
-                ORDER BY next_attempt_at, outbox_id LIMIT 1""",
-            (_iso(now), _iso(now)),
-        ).fetchone()
-        if row is None:
-            return None
+        while True:
+            row = connection.execute(
+                """SELECT * FROM notification_outbox
+                    WHERE ((status='pending' AND next_attempt_at IS NOT NULL
+                            AND next_attempt_at<=?)
+                       OR (status='leased' AND lease_until IS NOT NULL
+                            AND lease_until<=?))
+                    ORDER BY next_attempt_at, outbox_id LIMIT 1""",
+                (_iso(now), _iso(now)),
+            ).fetchone()
+            if row is None:
+                return None
+            blocked = _blocked_reason(connection, row)
+            if blocked is None:
+                break
+            _suppress_locked(connection, int(row["outbox_id"]), blocked, now=now)
         changed = connection.execute(
             """UPDATE notification_outbox
                   SET status='leased', lease_token=?, lease_until=? ,
@@ -224,6 +385,17 @@ def mark_sent(
 ) -> bool:
     sent_at = sent_at or utc_now()
     with _transaction(connection):
+        row = connection.execute(
+            """SELECT * FROM notification_outbox
+                WHERE outbox_id=? AND status='leased' AND lease_token=?""",
+            (outbox_id, lease_token),
+        ).fetchone()
+        if row is None:
+            return False
+        blocked = _blocked_reason(connection, row)
+        if blocked is not None:
+            _suppress_locked(connection, outbox_id, blocked, now=sent_at)
+            return False
         cursor = connection.execute(
             """UPDATE notification_outbox
                   SET status='sent', sent_at=?, lease_token=NULL,
@@ -232,6 +404,30 @@ def mark_sent(
             (_iso(sent_at), _iso(sent_at), outbox_id, lease_token),
         )
         return cursor.rowcount == 1
+
+
+def ensure_sendable(
+    connection: sqlite3.Connection,
+    *,
+    outbox_id: int,
+    lease_token: str,
+    now: datetime | None = None,
+) -> bool:
+    """Recheck a lease immediately before SMTP I/O."""
+    now = now or utc_now()
+    with _transaction(connection):
+        row = connection.execute(
+            """SELECT * FROM notification_outbox
+                WHERE outbox_id=? AND status='leased' AND lease_token=?""",
+            (outbox_id, lease_token),
+        ).fetchone()
+        if row is None:
+            return False
+        blocked = _blocked_reason(connection, row)
+        if blocked is None:
+            return True
+        _suppress_locked(connection, outbox_id, blocked, now=now)
+        return False
 
 
 def mark_failure(
@@ -295,6 +491,22 @@ def requeue_dead_letter(
     actor = _safe_reason(actor)
     reason = _safe_reason(reason)
     with _transaction(connection):
+        row = connection.execute(
+            """SELECT * FROM notification_outbox
+                WHERE outbox_id=? AND status='dead_letter'""",
+            (outbox_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        blocked = _blocked_reason(connection, row)
+        if blocked is not None:
+            connection.execute(
+                """INSERT INTO notification_outbox_audit
+                   (outbox_id, action, actor, reason, created_at)
+                   VALUES (?, 'blocked', ?, ?, ?)""",
+                (outbox_id, actor, blocked, _iso(now)),
+            )
+            return False
         cursor = connection.execute(
             """UPDATE notification_outbox
                   SET status='pending', next_attempt_at=?, lease_token=NULL,
@@ -395,6 +607,7 @@ __all__ = [
     "TEMPLATE_VERSION",
     "canonical_payload",
     "claim",
+    "ensure_sendable",
     "enqueue",
     "mark_failure",
     "mark_sent",

@@ -55,6 +55,12 @@ export function MatchWorkspace({
   const observedAge = winner?.observed_at
     ? Math.max(0, (now - new Date(winner.observed_at).getTime()) / 1000)
     : null;
+  const vision = detail?.latest_vision;
+  const visionStatus = (detail || match).readiness.vision.status;
+  const trustedVision = vision?.confirmed === 1
+    && (visionStatus === "ready" || visionStatus === "delayed")
+    ? vision
+    : null;
 
   return (
     <main className="workspace" aria-live="polite">
@@ -104,10 +110,10 @@ export function MatchWorkspace({
         />
         <div className="quote-context">
           <span>{replay ? "历史回放" : "实时胜负盘"}</span>
-          <strong>{detail?.latest_vision?.map_number ? `第 ${detail.latest_vision.map_number} 局` : winner?.period || "局数待确认"}</strong>
+          <strong>{trustedVision?.map_number ? `第 ${trustedVision.map_number} 局` : winner?.period || "局数待确认"}</strong>
           <small>
-            {detail?.latest_vision?.game_clock_seconds != null
-              ? `可信时钟 ${formatClock(detail.latest_vision.game_clock_seconds)}`
+            {trustedVision?.game_clock_seconds != null
+              ? `可信时钟 ${formatClock(trustedVision.game_clock_seconds)}`
               : "暂无可信比赛时钟"}
           </small>
         </div>
@@ -147,6 +153,7 @@ export function MatchWorkspace({
                 decisions={detail?.decisions || []}
                 teamOne={match.team_one}
                 teamTwo={match.team_two}
+                preferLatestPeriod={replay}
                 preferredPeriod={winner?.period || null}
               />
             </Suspense>

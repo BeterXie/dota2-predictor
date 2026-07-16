@@ -232,10 +232,15 @@ def _count(
 ) -> int:
     if not _relation_exists(connection, relation):
         return 0
-    row = connection.execute(
-        f"SELECT COUNT({expression}) FROM {relation} {join} {where}",
-        (*join_params, *params),
-    ).fetchone()
+    try:
+        row = connection.execute(
+            f"SELECT COUNT({expression}) FROM {relation} {join} {where}",
+            (*join_params, *params),
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error) or "no such column" in str(error):
+            return 0
+        raise
     return int(row[0]) if row else 0
 
 
@@ -243,23 +248,34 @@ def _current_profile_rows(
     connection: sqlite3.Connection,
     scopes: CurrentDerivedScopes,
 ) -> list[sqlite3.Row]:
+    profile_columns = _relation_columns(connection, "team_style_profiles")
     if (
         not scopes.valid_profile_cutoffs
-        or not _relation_exists(connection, "team_style_profiles")
+        or not {
+            "team_id",
+            "profile_cutoff",
+            "profile_version",
+            "weighting_json",
+        }.issubset(profile_columns)
     ):
         return []
     state_hashes = current_state_input_hashes(connection, scopes)
     cutoff_payload = json.dumps(
         sorted(scopes.valid_profile_cutoffs), separators=(",", ":")
     )
+    stable_order = (
+        "profile.profile_id DESC"
+        if "profile_id" in profile_columns
+        else "profile.rowid DESC"
+    )
     try:
         rows = connection.execute(
-            """SELECT profile.* FROM team_style_profiles AS profile
+            f"""SELECT profile.* FROM team_style_profiles AS profile
                 JOIN json_each(?) AS cutoff
                   ON CAST(cutoff.value AS TEXT)=profile.profile_cutoff
                WHERE profile.profile_version=?
                ORDER BY profile.team_id, profile.profile_cutoff DESC,
-                        profile.profile_id DESC""",
+                        {stable_order}""",
             (cutoff_payload, PROFILE_VERSION),
         ).fetchall()
     except sqlite3.Error:
@@ -556,7 +572,8 @@ def get_overview() -> dict[str, Any]:
         )
 
         state_distribution: dict[str, int] = {}
-        if _relation_exists(connection, "team_map_states"):
+        state_columns = _relation_columns(connection, "team_map_states")
+        if {"match_id", "label", "label_version"}.issubset(state_columns):
             state_distribution = {
                 str(row["label"]): int(row["count"])
                 for row in connection.execute(
@@ -619,14 +636,26 @@ def list_matches(
     team_id: int | None = None,
 ) -> dict[str, Any]:
     with _database() as connection:
-        if not _relation_exists(connection, "matches"):
+        match_columns = _relation_columns(connection, "matches")
+        if "match_id" not in match_columns:
             return {"data": [], "pagination": _pagination(page, page_size, 0)}
 
         scopes = _current_scopes(connection)
         scope_join, scope_params = _scope_join(scopes, "m", "formal")
-        has_states = _relation_exists(connection, "team_map_states")
-        teams_join = _relation_exists(connection, "teams")
-        leagues_join = _relation_exists(connection, "leagues")
+        state_table_columns = _relation_columns(connection, "team_map_states")
+        has_states = {"match_id", "side", "label", "label_version"}.issubset(
+            state_table_columns
+        )
+        team_table_columns = _relation_columns(connection, "teams")
+        league_table_columns = _relation_columns(connection, "leagues")
+        teams_join = (
+            {"team_id", "name"}.issubset(team_table_columns)
+            and {"radiant_team_id", "dire_team_id"}.issubset(match_columns)
+        )
+        leagues_join = (
+            {"leagueid", "name"}.issubset(league_table_columns)
+            and "leagueid" in match_columns
+        )
         joins: list[str] = []
         params: list[Any] = []
         if has_states:
@@ -680,26 +709,26 @@ def list_matches(
             if leagues_join
             else "NULL AS league_name"
         )
-        state_columns = (
-            "radiant_state.team_id AS radiant_state_team_id, "
-            "radiant_state.label AS radiant_state_label, "
-            "radiant_state.duration_seconds AS radiant_state_duration_seconds, "
-            "radiant_state.max_lead AS radiant_state_max_lead, "
-            "radiant_state.max_deficit AS radiant_state_max_deficit, "
-            "radiant_state.curve_coverage AS radiant_state_curve_coverage, "
-            "dire_state.team_id AS dire_state_team_id, "
-            "dire_state.label AS dire_state_label, "
-            "dire_state.duration_seconds AS dire_state_duration_seconds, "
-            "dire_state.max_lead AS dire_state_max_lead, "
-            "dire_state.max_deficit AS dire_state_max_deficit, "
-            "dire_state.curve_coverage AS dire_state_curve_coverage"
-            if has_states
-            else "NULL AS radiant_state_team_id, NULL AS radiant_state_label, "
-            "NULL AS radiant_state_duration_seconds, NULL AS radiant_state_max_lead, "
-            "NULL AS radiant_state_max_deficit, NULL AS radiant_state_curve_coverage, "
-            "NULL AS dire_state_team_id, NULL AS dire_state_label, "
-            "NULL AS dire_state_duration_seconds, NULL AS dire_state_max_lead, "
-            "NULL AS dire_state_max_deficit, NULL AS dire_state_curve_coverage"
+        def state_column(table_alias: str, prefix: str, name: str) -> str:
+            output_name = f"{prefix}_state_{name}"
+            if has_states and name in state_table_columns:
+                return f"{table_alias}.{name} AS {output_name}"
+            return f"NULL AS {output_name}"
+
+        state_columns = ", ".join(
+            state_column(table_alias, prefix, name)
+            for table_alias, prefix in (
+                ("radiant_state", "radiant"),
+                ("dire_state", "dire"),
+            )
+            for name in (
+                "team_id",
+                "label",
+                "duration_seconds",
+                "max_lead",
+                "max_deficit",
+                "curve_coverage",
+            )
         )
         where = ["1=1"]
         params.extend(scope_params)
@@ -721,8 +750,11 @@ def list_matches(
             else:
                 where.append("0=1")
         if team_id is not None:
-            where.append("(m.radiant_team_id=? OR m.dire_team_id=?)")
-            params.extend((team_id, team_id))
+            if {"radiant_team_id", "dire_team_id"}.issubset(match_columns):
+                where.append("(m.radiant_team_id=? OR m.dire_team_id=?)")
+                params.extend((team_id, team_id))
+            else:
+                where.append("0=1")
 
         from_sql = "FROM matches AS m " + " ".join(joins)
         where_sql = "WHERE " + " AND ".join(where)
@@ -731,14 +763,29 @@ def list_matches(
                 f"SELECT COUNT(*) {from_sql} {where_sql}", tuple(params)
             ).fetchone()[0]
         )
+        def match_column(name: str) -> str:
+            return f"m.{name} AS {name}" if name in match_columns else f"NULL AS {name}"
+
+        match_select = ", ".join(
+            match_column(name)
+            for name in (
+                "match_id",
+                "radiant_team_id",
+                "dire_team_id",
+                "radiant_win",
+                "duration",
+                "start_time",
+                "leagueid",
+                "radiant_score",
+                "dire_score",
+            )
+        )
         rows = connection.execute(
-            f"""SELECT m.match_id, m.radiant_team_id, m.dire_team_id,
-                       m.radiant_win, m.duration, m.start_time, m.leagueid,
-                       m.radiant_score, m.dire_score,
+            f"""SELECT {match_select},
                        {team_columns}, {league_column},
                        {state_columns}
                   {from_sql} {where_sql}
-                 ORDER BY m.start_time DESC, m.match_id DESC
+                 ORDER BY start_time DESC, match_id DESC
                  LIMIT ? OFFSET ?""",
             (*params, page_size, (page - 1) * page_size),
         ).fetchall()
@@ -771,10 +818,19 @@ def list_matches(
 
 
 def _match_row(connection: sqlite3.Connection, match_id: int) -> dict[str, Any] | None:
-    if not _relation_exists(connection, "matches"):
+    match_columns = _relation_columns(connection, "matches")
+    if "match_id" not in match_columns:
         return None
-    teams_join = _relation_exists(connection, "teams")
-    leagues_join = _relation_exists(connection, "leagues")
+    team_columns = _relation_columns(connection, "teams")
+    league_columns = _relation_columns(connection, "leagues")
+    teams_join = (
+        {"team_id", "name"}.issubset(team_columns)
+        and {"radiant_team_id", "dire_team_id"}.issubset(match_columns)
+    )
+    leagues_join = (
+        {"leagueid", "name"}.issubset(league_columns)
+        and "leagueid" in match_columns
+    )
     joins: list[str] = []
     if teams_join:
         joins.extend(
@@ -785,19 +841,34 @@ def _match_row(connection: sqlite3.Connection, match_id: int) -> dict[str, Any] 
         )
     if leagues_join:
         joins.append("LEFT JOIN leagues AS league ON league.leagueid=m.leagueid")
-    team_columns = (
+    team_names = (
         "radiant_team.name AS radiant_team_name, dire_team.name AS dire_team_name"
         if teams_join
         else "NULL AS radiant_team_name, NULL AS dire_team_name"
     )
-    league_column = (
+    league_name = (
         "league.name AS league_name" if leagues_join else "NULL AS league_name"
     )
+    def match_column(name: str) -> str:
+        return f"m.{name} AS {name}" if name in match_columns else f"NULL AS {name}"
+
+    selected_columns = ", ".join(
+        match_column(name)
+        for name in (
+            "match_id",
+            "radiant_team_id",
+            "dire_team_id",
+            "radiant_win",
+            "duration",
+            "start_time",
+            "leagueid",
+            "radiant_score",
+            "dire_score",
+        )
+    )
     row = connection.execute(
-        f"""SELECT m.match_id, m.radiant_team_id, m.dire_team_id,
-                   m.radiant_win, m.duration, m.start_time, m.leagueid,
-                   m.radiant_score, m.dire_score,
-                   {team_columns}, {league_column}
+        f"""SELECT {selected_columns},
+                   {team_names}, {league_name}
               FROM matches AS m {' '.join(joins)}
              WHERE m.match_id=?""",
         (match_id,),
@@ -814,18 +885,42 @@ def _match_states(
     connection: sqlite3.Connection, match_id: int
 ) -> dict[str, dict[str, Any] | None]:
     result: dict[str, dict[str, Any] | None] = {"radiant": None, "dire": None}
-    if not _relation_exists(connection, "team_map_states"):
+    state_columns = _relation_columns(connection, "team_map_states")
+    if not {"match_id", "side", "label", "label_version"}.issubset(state_columns):
         return result
+    selected_columns = ", ".join(
+        f"state.{name} AS {name}" if name in state_columns else f"NULL AS {name}"
+        for name in (
+            "state_id",
+            "match_id",
+            "team_id",
+            "side",
+            "label",
+            "duration_seconds",
+            "max_lead",
+            "max_deficit",
+            "ahead_fraction",
+            "behind_fraction",
+            "even_fraction",
+            "signed_auc",
+            "absolute_auc",
+            "crossings_json",
+            "first_significant_lead_at",
+            "first_significant_deficit_at",
+            "closeout_seconds",
+            "objective_conversion_json",
+            "curve_coverage",
+            "source_versions_json",
+            "input_hash",
+            "label_version",
+            "created_at",
+        )
+    )
     rows = connection.execute(
-        """SELECT state_id, match_id, team_id, side, label, duration_seconds,
-                  max_lead, max_deficit, ahead_fraction, behind_fraction,
-                  even_fraction, signed_auc, absolute_auc, crossings_json,
-                  first_significant_lead_at, first_significant_deficit_at,
-                  closeout_seconds, objective_conversion_json, curve_coverage,
-                  source_versions_json, input_hash, label_version, created_at
-             FROM team_map_states
-            WHERE match_id=? AND label_version=?
-            ORDER BY side""",
+        f"""SELECT {selected_columns}
+             FROM team_map_states AS state
+            WHERE state.match_id=? AND state.label_version=?
+            ORDER BY state.side""",
         (match_id, LABEL_VERSION),
     ).fetchall()
     for row in rows:
@@ -934,7 +1029,8 @@ def _match_players(
     match_id: int,
     performance_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    if not _relation_exists(connection, "player_map_scores"):
+    score_columns = _relation_columns(connection, "player_map_scores")
+    if not {"match_id", "player_slot", "score_version"}.issubset(score_columns):
         return []
     performance_by_slot = {
         row["player_slot"]: row
@@ -944,14 +1040,29 @@ def _match_players(
             else _match_performance(connection, match_id)
         )
     }
+    def score_column(name: str) -> str:
+        return f"score.{name} AS {name}" if name in score_columns else f"NULL AS {name}"
+
+    selected_columns = ", ".join(
+        score_column(name)
+        for name in (
+            "player_slot",
+            "account_id",
+            "position",
+            "execution_score",
+            "result_adjusted_score",
+            "coverage",
+            "role_confidence",
+            "benchmark_cutoff",
+            "score_version",
+            "component_facts_json",
+            "component_scores_json",
+            "weights_json",
+            "explanation_json",
+        )
+    )
     rows = connection.execute(
-        """SELECT score.player_slot, score.account_id, score.position,
-                   score.execution_score,
-                   score.result_adjusted_score, score.coverage,
-                   score.role_confidence, score.benchmark_cutoff,
-                   score.score_version, score.component_facts_json,
-                   score.component_scores_json, score.weights_json,
-                   score.explanation_json
+        f"""SELECT {selected_columns}
               FROM player_map_scores AS score
              WHERE score.match_id=? AND score.score_version=?
              ORDER BY score.player_slot""",
@@ -1048,49 +1159,100 @@ def get_match(match_id: int) -> dict[str, Any] | None:
             else {"radiant": None, "dire": None}
         )
         player_performance = _match_performance(connection, match_id)
+        player_scores = (
+            _match_players(connection, match_id, player_performance)
+            if match_id in scopes.player
+            else []
+        )
+        draft_predictions = (
+            _match_draft_predictions(
+                connection, match_id, scopes.draft_predictions
+            )
+            if match_id in scopes.draft
+            else []
+        )
         return {
             "match": match,
+            # Keep the flat match fields and state alias for older read-only
+            # clients while the nested shape remains the canonical response.
+            **match,
+            "states": states,
             "radiant_state": states["radiant"],
             "dire_state": states["dire"],
             "player_performance": player_performance,
-            "player_scores": (
-                _match_players(connection, match_id, player_performance)
-                if match_id in scopes.player
-                else []
-            ),
-            "draft_predictions": (
-                _match_draft_predictions(
-                    connection, match_id, scopes.draft_predictions
-                )
-                if match_id in scopes.draft
-                else []
-            ),
+            "player_scores": player_scores,
+            "draft_predictions": draft_predictions,
+            "versions": {
+                "player_score": SCORE_VERSION,
+                "team_state": LABEL_VERSION,
+                "team_profile": PROFILE_VERSION,
+                "draft_score": SCORE_VERSION,
+                "draft_model": DRAFT_MODEL_VERSION,
+                "draft_backtest": BACKTEST_VERSION,
+                "draft_features": DRAFT_FEATURE_VERSION,
+            },
+            "cutoffs": {
+                "player_score": sorted(
+                    {
+                        str(row["benchmark_cutoff"])
+                        for row in player_scores
+                        if row.get("benchmark_cutoff") is not None
+                    }
+                ),
+                "draft_training": sorted(
+                    {
+                        str(row["training_cutoff"])
+                        for row in draft_predictions
+                        if row.get("training_cutoff") is not None
+                    }
+                ),
+                "draft_prediction": sorted(
+                    {
+                        str(row["prediction_cutoff"])
+                        for row in draft_predictions
+                        if row.get("prediction_cutoff") is not None
+                    }
+                ),
+            },
         }
 
 
 def _player_identities(connection: sqlite3.Connection) -> dict[int, str]:
-    if not _relation_exists(connection, "player_map_facts"):
+    fact_columns = _relation_columns(connection, "player_map_facts")
+    if not {"account_id", "facts_json"}.issubset(fact_columns):
         return {}
+    order_columns = []
+    if "created_at" in fact_columns:
+        order_columns.append("created_at DESC")
+    if "fact_id" in fact_columns:
+        order_columns.append("fact_id DESC")
+    if not order_columns:
+        order_columns.append("rowid DESC")
     rows = connection.execute(
-        """SELECT account_id,
+        f"""SELECT account_id,
                   COALESCE(json_extract(facts_json, '$.name'),
                            json_extract(facts_json, '$.personaname')) AS player_name
-             FROM (
-                   SELECT account_id, facts_json,
-                          ROW_NUMBER() OVER (
-                              PARTITION BY account_id
-                              ORDER BY created_at DESC, fact_id DESC
-                          ) AS identity_rank
-                     FROM player_map_facts
-                    WHERE account_id IS NOT NULL AND json_valid(facts_json)
+                 FROM (
+                       SELECT account_id, facts_json,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY account_id
+                                  ORDER BY {', '.join(order_columns)}
+                              ) AS identity_rank
+                         FROM player_map_facts
+                        WHERE account_id IS NOT NULL AND json_valid(facts_json)
                   )
             WHERE identity_rank=1"""
     ).fetchall()
-    return {
-        int(row["account_id"]): str(row["player_name"])
-        for row in rows
-        if row["player_name"]
-    }
+    identities: dict[int, str] = {}
+    for row in rows:
+        if not row["player_name"]:
+            continue
+        try:
+            account_id = int(row["account_id"])
+        except (TypeError, ValueError):
+            continue
+        identities[account_id] = str(row["player_name"])
+    return identities
 
 
 def list_players(
@@ -1101,7 +1263,19 @@ def list_players(
     search: str | None = None,
 ) -> dict[str, Any]:
     with _database() as connection:
-        if not _relation_exists(connection, "player_map_scores"):
+        score_columns = _relation_columns(connection, "player_map_scores")
+        required_score_columns = {
+            "match_id",
+            "account_id",
+            "position",
+            "execution_score",
+            "result_adjusted_score",
+            "coverage",
+            "role_confidence",
+            "score_version",
+            "explanation_json",
+        }
+        if not required_score_columns.issubset(score_columns):
             return {"data": [], "pagination": _pagination(page, page_size, 0)}
         scopes = _current_scopes(connection)
         scope_join, scope_params = _scope_join(scopes, "score", "player")
@@ -1117,10 +1291,16 @@ def list_players(
         if position is not None:
             where.append("score.position=?")
             params.append(position)
+        benchmark_column = (
+            "score.benchmark_cutoff AS benchmark_cutoff"
+            if "benchmark_cutoff" in score_columns
+            else "NULL AS benchmark_cutoff"
+        )
         rows = connection.execute(
             f"""SELECT score.account_id, score.position,
                        score.execution_score, score.result_adjusted_score,
-                       score.coverage, score.role_confidence
+                       score.coverage, score.role_confidence,
+                       {benchmark_column}
                   FROM player_map_scores AS score {scope_join}
                  WHERE {' AND '.join(where)}""",
             tuple(params),
@@ -1129,8 +1309,25 @@ def list_players(
 
     aggregates: dict[tuple[int, int], dict[str, Any]] = {}
     for row in rows:
-        account_id = int(row["account_id"])
-        player_position = int(row["position"])
+        if any(
+            row[field] is None
+            for field in (
+                "account_id",
+                "position",
+                "execution_score",
+                "result_adjusted_score",
+                "coverage",
+                "role_confidence",
+            )
+        ):
+            # A legacy row with incomplete numeric facts may still be shown in
+            # match detail, but it cannot enter a numeric leaderboard average.
+            continue
+        try:
+            account_id = int(row["account_id"])
+            player_position = int(row["position"])
+        except (TypeError, ValueError):
+            continue
         aggregate = aggregates.setdefault(
             (account_id, player_position),
             {
@@ -1141,6 +1338,7 @@ def list_players(
                 "result_total": 0.0,
                 "coverage_total": 0.0,
                 "confidence_total": 0.0,
+                "benchmark_cutoffs": set(),
             },
         )
         aggregate["map_count"] += 1
@@ -1148,6 +1346,8 @@ def list_players(
         aggregate["result_total"] += float(row["result_adjusted_score"])
         aggregate["coverage_total"] += float(row["coverage"])
         aggregate["confidence_total"] += float(row["role_confidence"])
+        if row["benchmark_cutoff"] is not None:
+            aggregate["benchmark_cutoffs"].add(str(row["benchmark_cutoff"]))
 
     leaderboard = []
     for aggregate in aggregates.values():
@@ -1167,6 +1367,17 @@ def list_players(
                 "average_coverage": round(aggregate["coverage_total"] / maps, 6),
                 "average_role_confidence": round(
                     aggregate["confidence_total"] / maps, 6
+                ),
+                "benchmark_cutoffs": sorted(aggregate["benchmark_cutoffs"]),
+                "benchmark_cutoff_min": (
+                    min(aggregate["benchmark_cutoffs"])
+                    if aggregate["benchmark_cutoffs"]
+                    else None
+                ),
+                "benchmark_cutoff_max": (
+                    max(aggregate["benchmark_cutoffs"])
+                    if aggregate["benchmark_cutoffs"]
+                    else None
                 ),
                 "score_version": SCORE_VERSION,
             }
@@ -1234,20 +1445,28 @@ def list_teams() -> dict[str, Any]:
         if not profiles:
             return {"data": []}
 
-        has_teams = _relation_exists(connection, "teams")
+        team_columns = _relation_columns(connection, "teams")
+        has_teams = "team_id" in team_columns
         teams: dict[int, dict[str, Any]] = {}
         if has_teams:
             team_ids = sorted({int(row["team_id"]) for row in profiles})
             placeholders = ",".join("?" for _ in team_ids)
+            selected_team_columns = ", ".join(
+                f"{name} AS {name}" if name in team_columns else f"NULL AS {name}"
+                for name in ("team_id", "name", "tag", "logo_url")
+            )
             for row in connection.execute(
-                f"""SELECT team_id, name, tag, logo_url FROM teams
-                     WHERE team_id IN ({placeholders})""",
+                f"""SELECT {selected_team_columns} FROM teams
+                      WHERE team_id IN ({placeholders})""",
                 tuple(team_ids),
             ).fetchall():
                 teams[int(row["team_id"])] = dict(row)
 
         state_counts: dict[int, dict[str, int]] = {}
-        if _relation_exists(connection, "team_map_states"):
+        state_columns = _relation_columns(connection, "team_map_states")
+        if {"match_id", "team_id", "label", "label_version"}.issubset(
+            state_columns
+        ):
             state_join, state_scope_params = _scope_join(
                 scopes, "state", "state"
             )
@@ -1265,7 +1484,8 @@ def list_teams() -> dict[str, Any]:
 
         data = []
         for row in profiles:
-            team_id = int(row["team_id"])
+            profile = dict(row)
+            team_id = int(profile["team_id"])
             team = teams.get(team_id, {})
             data.append(
                 {
@@ -1273,22 +1493,22 @@ def list_teams() -> dict[str, Any]:
                     "team_name": team.get("name"),
                     "team_tag": team.get("tag"),
                     "logo_url": team.get("logo_url"),
-                    "profile_cutoff": row["profile_cutoff"],
-                    "profile_version": row["profile_version"],
+                    "profile_cutoff": profile["profile_cutoff"],
+                    "profile_version": profile["profile_version"],
                     "opportunity_counts": _compact_profile_json(
-                        "opportunity_counts", row["opportunity_counts_json"]
+                        "opportunity_counts", profile.get("opportunity_counts_json")
                     ),
                     "posterior_rates": _compact_profile_json(
-                        "posterior_rates", row["posterior_rates_json"]
+                        "posterior_rates", profile.get("posterior_rates_json")
                     ),
                     "duration_quantiles": _compact_profile_json(
-                        "duration_quantiles", row["duration_quantiles_json"]
+                        "duration_quantiles", profile.get("duration_quantiles_json")
                     ),
                     "weighting": _compact_profile_json(
-                        "weighting", row["weighting_json"]
+                        "weighting", profile.get("weighting_json")
                     ),
-                    "effective_sample_size": row["effective_sample_size"],
-                    "created_at": row["created_at"],
+                    "effective_sample_size": profile.get("effective_sample_size"),
+                    "created_at": profile.get("created_at"),
                     "state_counts": state_counts.get(team_id, {}),
                 }
             )

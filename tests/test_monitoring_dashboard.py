@@ -10,12 +10,15 @@ from fastapi.testclient import TestClient
 from live_betting.health import record_health
 from live_betting.models import Market, OddsSnapshot
 from live_betting.storage import LiveBettingStore
+from live_betting.vision import VisionObservation
 from web import queries
 from web.app import app
 from web.monitoring import (
+    _current_winner,
     build_monitor_snapshot,
     current_markets,
     derive_health,
+    monitor_match_detail,
     monitor_cursor,
     winner_timeline,
 )
@@ -91,13 +94,14 @@ class MonitoringDashboardTests(unittest.TestCase):
         one: float,
         two: float | None,
         *,
+        match_id: str = "match-1",
         observation_key: str,
         period: str = "map_1",
         status: int = 1,
     ) -> None:
         snapshots = [
             OddsSnapshot(
-                "match-1",
+                match_id,
                 f"winner-{period}-one",
                 f"winner-{period}",
                 observed_at,
@@ -109,7 +113,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         if two is not None:
             snapshots.append(
                 OddsSnapshot(
-                    "match-1",
+                    match_id,
                     f"winner-{period}-two",
                     f"winner-{period}",
                     observed_at,
@@ -122,11 +126,38 @@ class MonitoringDashboardTests(unittest.TestCase):
             source="direct",
             observation_key=observation_key,
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id=match_id,
             observed_at=observed_at,
             normalized_state_hash="same-semantic-state",
             snapshots=snapshots,
         )
+
+    def add_decision(
+        self,
+        decision_key: str,
+        decided_at: datetime,
+        model_probability: float,
+        *,
+        map_number: int = 1,
+    ) -> None:
+        self.store.connection.execute(
+            """INSERT INTO strategy_decisions
+               (decision_key, raybet_match_id, map_number, decided_at,
+                underdog_side, market_probability, model_probability, edge,
+                data_quality, eligible, reason, contributions_json, input_ref,
+                strategy_version)
+               VALUES (?, 'match-1', ?, ?, 'team_one', 0.4, ?, ?, 0.9, 1,
+                       'eligible', '{}', ?, 'strategy-v1')""",
+            (
+                decision_key,
+                map_number,
+                decided_at.isoformat(),
+                model_probability,
+                model_probability - 0.4,
+                f"input-{decision_key}",
+            ),
+        )
+        self.store.connection.commit()
 
     def test_stale_healthy_heartbeat_is_derived_as_unhealthy(self) -> None:
         heartbeat = NOW - timedelta(minutes=5)
@@ -213,6 +244,200 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(match["readiness"]["odds"]["status"], "missing")
         self.assertEqual(match["readiness"]["mapping"]["status"], "missing")
 
+    def test_strict_mapping_impact_is_removed_from_summary_and_detail(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("older-valid", NOW - timedelta(seconds=20), 0.55)
+        self.add_decision("newer-impacted", NOW - timedelta(seconds=5), 0.75)
+        before = monitor_cursor(self.store.connection)
+        self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        self.store.connection.execute(
+            """INSERT INTO strict_live_mapping_impacts
+               (mapping_id, invalidation_id, dependent_type, dependent_key,
+                reason, recorded_at)
+               VALUES (1, 1, 'strategy_decision', 'newer-impacted',
+                       'mapping_invalidated', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.commit()
+        self.store.connection.execute("PRAGMA foreign_keys=ON")
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        self.assertNotEqual(before, monitor_cursor(self.store.connection))
+        self.assertEqual(
+            snapshot["matches"][0]["latest_decision"]["model_probability"],
+            0.55,
+        )
+        assert detail is not None
+        self.assertEqual(
+            [decision["decision_key"] for decision in detail["decisions"]],
+            ["older-valid"],
+        )
+
+    def test_decision_views_fail_closed_without_strict_impact_relation(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("decision-1", NOW - timedelta(seconds=5), 0.65)
+        self.store.connection.execute("DROP TABLE strict_live_mapping_impacts")
+        self.store.connection.commit()
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        match = snapshot["matches"][0]
+        self.assertIsNone(match["latest_decision"])
+        self.assertEqual(match["readiness"]["model"]["status"], "missing")
+        assert detail is not None
+        self.assertEqual(detail["decisions"], [])
+
+    def test_decision_views_fail_closed_with_malformed_strict_impact_relation(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        self.add_decision("decision-1", NOW - timedelta(seconds=5), 0.65)
+        self.store.connection.execute("DROP TABLE strict_live_mapping_impacts")
+        self.store.connection.execute(
+            "CREATE TABLE strict_live_mapping_impacts (dependent_type TEXT)"
+        )
+        self.store.connection.commit()
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        match = snapshot["matches"][0]
+        self.assertIsNone(match["latest_decision"])
+        self.assertEqual(match["readiness"]["model"]["status"], "missing")
+        assert detail is not None
+        self.assertEqual(detail["decisions"], [])
+
+    def test_decision_detail_excludes_vision_invalidated_and_conflicted_rows(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        self.add_decision("older-valid", NOW - timedelta(seconds=30), 0.55)
+        self.add_decision("vision-invalidated", NOW - timedelta(seconds=20), 0.65)
+        self.add_decision("draft-conflicted", NOW - timedelta(seconds=5), 0.75)
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('strategy_decision', 'vision-invalidated', 'match-1', 1,
+                       'bad_frame', 'vision_observation_invalidated', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_draft_anchors
+               (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
+                dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
+               VALUES ('match-1', 1, ?, '[]', '[]', ?, 'frame-conflict',
+                       'conflict', ?)""",
+            (
+                "a" * 64,
+                (NOW - timedelta(seconds=40)).isoformat(),
+                (NOW - timedelta(seconds=10)).isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        self.assertEqual(
+            snapshot["matches"][0]["latest_decision"]["model_probability"],
+            0.55,
+        )
+        assert detail is not None
+        self.assertEqual(
+            [decision["decision_key"] for decision in detail["decisions"]],
+            ["older-valid"],
+        )
+
+    def test_latest_vision_requires_a_confirmed_frame_after_invalidation(self) -> None:
+        self.add_match(status=2)
+        older = VisionObservation(
+            "match-1",
+            1,
+            NOW - timedelta(seconds=10),
+            110,
+            False,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            0.99,
+            0.99,
+            "frame-valid",
+            "game",
+        )
+        invalidated = VisionObservation(
+            "match-1",
+            1,
+            NOW - timedelta(seconds=5),
+            115,
+            False,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            0.99,
+            0.99,
+            "frame-invalidated",
+            "game",
+        )
+        self.store.insert_vision_observation(older)
+        self.store.insert_vision_observation(invalidated)
+        self.store.connection.execute(
+            """INSERT INTO vision_observation_invalidations
+               (raybet_match_id, captured_at, source_frame_ref,
+                invalidated_at, reason)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                "match-1",
+                invalidated.captured_at.isoformat(),
+                invalidated.source_frame_ref,
+                NOW.isoformat(),
+                "manual_bad_frame",
+            ),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_observations SET confirmed=0
+                WHERE raybet_match_id=? AND captured_at=? AND source_frame_ref=?""",
+            (
+                "match-1",
+                invalidated.captured_at.isoformat(),
+                invalidated.source_frame_ref,
+            ),
+        )
+        self.store.connection.commit()
+
+        blocked = build_monitor_snapshot(
+            self.store.connection,
+            now=NOW,
+        )["matches"][0]["latest_vision"]
+
+        self.assertIsNone(blocked)
+
+        restored = VisionObservation(
+            "match-1",
+            1,
+            NOW - timedelta(seconds=2),
+            118,
+            False,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            0.99,
+            0.99,
+            "frame-restored",
+            "game",
+        )
+        self.store.insert_vision_observation(restored)
+        self.store.connection.commit()
+
+        latest = build_monitor_snapshot(
+            self.store.connection,
+            now=NOW,
+        )["matches"][0]["latest_vision"]
+
+        self.assertEqual(latest["observed_at"], restored.captured_at.isoformat())
+        self.assertEqual(latest["game_clock_seconds"], 118)
+        self.assertEqual(latest["confirmed"], 1)
+
     def test_provider_status_two_is_live_only_while_fresh(self) -> None:
         self.add_match(status=2)
 
@@ -237,6 +462,117 @@ class MonitoringDashboardTests(unittest.TestCase):
         match = snapshot["matches"][0]
         self.assertEqual(match["lifecycle"], "degraded")
         self.assertTrue(match["history_eligible"])
+
+    def test_recent_transport_activity_blocks_history_archive_even_with_stale_metadata(self) -> None:
+        self.add_match(
+            status=2,
+            scheduled_at="2026-07-13 22:00:00",
+            updated_at=NOW - timedelta(days=1),
+        )
+        recent = NOW - timedelta(minutes=5)
+        self.add_winner_response(
+            recent,
+            2.0,
+            2.0,
+            observation_key="recent-transport",
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        match = snapshot["matches"][0]
+        self.assertEqual(match["lifecycle"], "degraded")
+        self.assertFalse(match["history_eligible"])
+        self.assertEqual(match["latest_odds_activity_at"], recent.isoformat())
+
+    def test_audit_only_transport_activity_also_blocks_history_archive(self) -> None:
+        self.add_match(
+            status=2,
+            scheduled_at="2026-07-13 22:00:00",
+            updated_at=NOW - timedelta(days=1),
+        )
+        recent = NOW - timedelta(minutes=2)
+        self.store.insert_transport_observation(
+            observation_key="recent-audit-only",
+            source="direct",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=recent,
+            normalized_state_hash="audit-only-state",
+            timing_status="on_time",
+            processing_status="audit_only",
+            normalized_change_count=0,
+        )
+        self.store.connection.commit()
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        match = snapshot["matches"][0]
+        self.assertFalse(match["history_eligible"])
+        self.assertEqual(match["latest_odds_activity_at"], recent.isoformat())
+
+    def test_invalid_match_activity_timestamp_fails_closed_for_history(self) -> None:
+        self.add_match(
+            status=2,
+            scheduled_at="2026-07-13 22:00:00",
+            updated_at=NOW - timedelta(days=1),
+        )
+        self.store.connection.execute(
+            "UPDATE raybet_matches SET updated_at='not-a-timestamp' WHERE raybet_match_id='match-1'"
+        )
+        self.store.connection.commit()
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertFalse(snapshot["matches"][0]["history_eligible"])
+
+    def test_history_and_live_summary_counts_use_their_view_filters(self) -> None:
+        self.add_match(
+            match_id="live",
+            status=2,
+            scheduled_at="2026-07-14 13:00:00",
+            updated_at=NOW,
+        )
+        self.add_match(
+            match_id="archived",
+            status=2,
+            scheduled_at="2026-07-13 22:00:00",
+            updated_at=NOW - timedelta(days=1),
+        )
+        self.add_match(
+            match_id="upcoming",
+            status=1,
+            scheduled_at="2026-07-15 22:00:00",
+            updated_at=NOW,
+        )
+
+        summary = build_monitor_snapshot(self.store.connection, now=NOW)["summary"]
+
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["degraded"], 1)
+        self.assertEqual(summary["live_view"]["total"], 2)
+        self.assertEqual(summary["live_view"]["degraded"], 0)
+        self.assertEqual(summary["live_view"]["live"], 1)
+        self.assertEqual(summary["live_view"]["upcoming"], 1)
+        self.assertEqual(summary["history_view"]["total"], 1)
+        self.assertEqual(summary["history_view"]["degraded"], 1)
+
+    def test_history_matches_are_sorted_newest_first(self) -> None:
+        self.add_match(
+            match_id="older",
+            status=5,
+            scheduled_at="2026-07-12 22:00:00",
+            updated_at=NOW - timedelta(days=2),
+        )
+        self.add_match(
+            match_id="newer",
+            status=5,
+            scheduled_at="2026-07-13 22:00:00",
+            updated_at=NOW - timedelta(days=1),
+        )
+
+        matches = build_monitor_snapshot(self.store.connection, now=NOW)["matches"]
+
+        self.assertEqual([row["raybet_match_id"] for row in matches], ["newer", "older"])
 
     def test_provider_status_five_is_ended(self) -> None:
         self.add_match(status=5)
@@ -316,6 +652,75 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(len(latest_markets), 1)
         self.assertEqual(latest_markets[0]["side"], "team_one")
         self.assertEqual(latest_markets[0]["received_at"], NOW.isoformat())
+
+    def test_transport_schema_error_does_not_fall_back_to_legacy_winner(self) -> None:
+        self.add_match(status=2)
+        self.add_winner_pair(NOW - timedelta(minutes=1), 2.0, 2.0, status=1)
+        self.store.connection.execute("DROP TABLE odds_response_outcomes")
+        self.store.connection.execute(
+            """CREATE TABLE odds_response_outcomes (
+                observation_key TEXT NOT NULL,
+                raybet_match_id TEXT NOT NULL,
+                odds_id TEXT NOT NULL,
+                odds_group_id TEXT,
+                received_at TEXT NOT NULL,
+                price REAL NOT NULL,
+                status TEXT,
+                market_type TEXT NOT NULL,
+                period TEXT NOT NULL,
+                side TEXT,
+                line REAL,
+                outcome_key TEXT NOT NULL,
+                supported INTEGER NOT NULL,
+                last_update TEXT,
+                raw_json TEXT NOT NULL
+            )"""
+        )
+        self.store.insert_transport_observation(
+            observation_key="malformed-response-schema",
+            source="direct",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=NOW,
+            normalized_state_hash="current-transport-state",
+            timing_status="on_time",
+            processing_status="processed",
+            normalized_change_count=0,
+        )
+        self.store.connection.commit()
+
+        winner = _current_winner(
+            self.store.connection,
+            "match-1",
+            provider_status="2",
+        )
+
+        self.assertIsNone(winner)
+
+    def test_malformed_transport_relation_does_not_fall_back_to_legacy_winner(self) -> None:
+        self.add_match(status=2)
+        self.add_winner_pair(NOW - timedelta(minutes=1), 2.0, 2.0, status=1)
+        self.store.connection.execute("DROP TABLE odds_transport_observations")
+        self.store.connection.execute(
+            """CREATE TABLE odds_transport_observations (
+                observation_key TEXT PRIMARY KEY,
+                observed_at TEXT NOT NULL
+            )"""
+        )
+        self.store.connection.execute(
+            """INSERT INTO odds_transport_observations
+               (observation_key, observed_at) VALUES (?, ?)""",
+            ("malformed-transport", NOW.isoformat()),
+        )
+        self.store.connection.commit()
+
+        winner = _current_winner(
+            self.store.connection,
+            "match-1",
+            provider_status="2",
+        )
+
+        self.assertIsNone(winner)
 
     def test_live_match_skips_explicitly_settled_maps(self) -> None:
         self.add_match(status=2)
@@ -405,6 +810,130 @@ class MonitoringDashboardTests(unittest.TestCase):
             snapshot_count,
         )
         self.assertNotEqual(before, monitor_cursor(self.store.connection))
+
+    def test_cursor_changes_for_vision_invalidation_and_confirmed_downgrade(self) -> None:
+        observation = VisionObservation(
+            "match-1",
+            1,
+            NOW - timedelta(seconds=5),
+            120,
+            False,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            0.99,
+            0.99,
+            "cursor-invalidated-frame",
+            "game",
+        )
+        self.store.insert_vision_observation(observation)
+        self.store.connection.commit()
+        before = monitor_cursor(self.store.connection)
+
+        self.store.connection.execute(
+            """INSERT INTO vision_observation_invalidations
+               (raybet_match_id, captured_at, source_frame_ref,
+                invalidated_at, reason)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                observation.raybet_match_id,
+                observation.captured_at.isoformat(),
+                observation.source_frame_ref,
+                NOW.isoformat(),
+                "cursor_regression",
+            ),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_observations SET confirmed=0
+                WHERE raybet_match_id=? AND captured_at=? AND source_frame_ref=?""",
+            (
+                observation.raybet_match_id,
+                observation.captured_at.isoformat(),
+                observation.source_frame_ref,
+            ),
+        )
+        self.store.connection.commit()
+
+        after = monitor_cursor(self.store.connection)
+        self.assertNotEqual(before, after)
+        self.assertEqual(after, monitor_cursor(self.store.connection))
+
+    def test_cursor_changes_for_draft_and_derived_invalidations(self) -> None:
+        observation = VisionObservation(
+            "match-1",
+            1,
+            NOW - timedelta(seconds=5),
+            120,
+            False,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            0.99,
+            0.99,
+            "cursor-conflict-frame",
+            "game",
+        )
+        self.store.insert_vision_observation(observation)
+        self.store.connection.commit()
+        before = monitor_cursor(self.store.connection)
+        anchor = self.store.connection.execute(
+            """SELECT draft_hash, radiant_hero_ids, dire_hero_ids
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id=? AND map_number=?""",
+            (observation.raybet_match_id, observation.map_number),
+        ).fetchone()
+
+        self.store.connection.execute(
+            """INSERT INTO vision_draft_conflicts
+               (raybet_match_id, map_number, captured_at, source_frame_ref,
+                observed_draft_hash, radiant_hero_ids, dire_hero_ids,
+                reason, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                observation.raybet_match_id,
+                observation.map_number,
+                NOW.isoformat(),
+                "cursor-conflict",
+                anchor["draft_hash"],
+                anchor["radiant_hero_ids"],
+                anchor["dire_hero_ids"],
+                "cursor_regression",
+                NOW.isoformat(),
+            ),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_draft_anchors
+                  SET status='conflict', conflict_at=?
+                WHERE raybet_match_id=? AND map_number=?""",
+            (
+                NOW.isoformat(),
+                observation.raybet_match_id,
+                observation.map_number,
+            ),
+        )
+        self.store.connection.commit()
+
+        conflict_cursor = monitor_cursor(self.store.connection)
+        self.assertNotEqual(before, conflict_cursor)
+
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "strategy_decision",
+                "cursor-decision",
+                observation.raybet_match_id,
+                observation.map_number,
+                "cursor_regression",
+                "vision_draft_conflict",
+                NOW.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+
+        derived_cursor = monitor_cursor(self.store.connection)
+        self.assertNotEqual(conflict_cursor, derived_cursor)
+        self.assertEqual(derived_cursor, monitor_cursor(self.store.connection))
 
     def test_monitor_api_exposes_bootstrap_and_match_detail(self) -> None:
         self.add_match()

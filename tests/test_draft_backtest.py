@@ -1190,6 +1190,74 @@ class DraftBacktestTests(unittest.TestCase):
                 (str(victim["run_id"]), int(victim["match_id"])), published
             )
 
+    def test_read_only_prediction_artifact_cache_invalidates_on_revision_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            with closing(sqlite3.connect(database)) as connection:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+
+            from event_intelligence import backtest
+
+            def read_keys() -> frozenset[tuple[str, int]]:
+                connection = sqlite3.connect(
+                    f"file:{database.as_posix()}?mode=ro", uri=True
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                try:
+                    return _current_draft_prediction_keys(connection, match_ids)
+                finally:
+                    connection.close()
+
+            with patch(
+                "event_intelligence.backtest.draft_prediction_artifacts",
+                wraps=backtest.draft_prediction_artifacts,
+            ) as artifact_loader:
+                first = read_keys()
+                second = read_keys()
+                self.assertEqual(second, first)
+                self.assertEqual(artifact_loader.call_count, 1)
+
+                with closing(sqlite3.connect(database)) as connection:
+                    connection.execute(
+                        """UPDATE draft_predictions
+                              SET probability=probability + 0.001
+                            WHERE rowid=(SELECT rowid FROM draft_predictions
+                                          WHERE probability IS NOT NULL LIMIT 1)"""
+                    )
+                    connection.commit()
+
+                third = read_keys()
+                self.assertEqual(artifact_loader.call_count, 2)
+                self.assertLess(len(third), len(first))
+
+                with closing(sqlite3.connect(database)) as connection:
+                    connection.execute(
+                        """UPDATE player_role_assignments
+                              SET input_hash=?
+                            WHERE match_id=9001
+                              AND purpose='expected_position'
+                              AND assignment_version=?""",
+                        (_hash("cache-dependency"), ASSIGNMENT_VERSION),
+                    )
+                    connection.commit()
+
+                read_keys()
+                self.assertEqual(artifact_loader.call_count, 3)
+
     def test_future_formal_map_does_not_invalidate_earlier_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = self._database(directory)

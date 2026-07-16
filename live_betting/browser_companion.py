@@ -128,6 +128,18 @@ def _strict_json_loads(body: bytes | str) -> Any:
     return json.loads(body, parse_constant=_reject_json_constant)
 
 
+async def _read_bounded_body(request: Request) -> bytes | None:
+    """Read a request body without allowing an unbounded chunked upload."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def create_app(
     config: CompanionConfig | None = None,
     *,
@@ -186,8 +198,8 @@ def create_app(
         )
         if access_error is not None:
             return access_error
-        body = await request.body()
-        if len(body) > MAX_BODY_BYTES:
+        body = await _read_bounded_body(request)
+        if body is None:
             return _error("body_too_large", 413)
         try:
             raw_batch = _strict_json_loads(body)
@@ -253,8 +265,8 @@ def create_app(
         )
         if access_error is not None:
             return access_error
-        body = await request.body()
-        if len(body) > MAX_BODY_BYTES:
+        body = await _read_bounded_body(request)
+        if body is None:
             return _error("body_too_large", 413)
         try:
             status_body = _strict_json_loads(body)

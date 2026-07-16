@@ -4,12 +4,18 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from live_betting.browser_companion import MAX_BODY_BYTES, CompanionConfig, create_app
+from live_betting.browser_companion import (
+    MAX_BODY_BYTES,
+    CompanionConfig,
+    _read_bounded_body,
+    create_app,
+)
 from live_betting.browser_contract import canonical_json, payload_sha256
 from live_betting.health import record_health
 from live_betting.storage import LiveBettingStore
@@ -308,6 +314,15 @@ class BrowserCompanionTests(unittest.TestCase):
         )
         self.assertEqual(rejected.status_code, 400)
         self.assertEqual(rejected.json()["code"], "invalid_batch")
+
+    def test_chunked_body_reader_enforces_limit_without_content_length(self) -> None:
+        class ChunkedRequest:
+            async def stream(self):
+                yield b"["
+                yield b"x" * MAX_BODY_BYTES
+                yield b"]"
+
+        self.assertIsNone(asyncio.run(_read_bounded_body(ChunkedRequest())))
 
     def test_forbidden_fields_and_content_type_are_rejected(self) -> None:
         event = browser_event()

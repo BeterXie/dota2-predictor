@@ -86,6 +86,7 @@ def watcher_command(
         "1",
         "--evidence-interval",
         "30",
+        "--refresh-url",
     ]
 
 

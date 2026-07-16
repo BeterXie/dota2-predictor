@@ -126,9 +126,56 @@ class ResearchLivePredictionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.store = LiveBettingStore(":memory:")
         self.store.init_schema()
+        self.insert_strict_mapping()
 
     def tearDown(self) -> None:
         self.store.close()
+
+    def insert_strict_mapping(self) -> None:
+        self.store.connection.execute(
+            "CREATE TABLE IF NOT EXISTS event_registry (event_id TEXT PRIMARY KEY)"
+        )
+        self.store.connection.execute(
+            "INSERT INTO event_registry (event_id) VALUES ('ewc-dota2-2026')"
+        )
+        identity_json = "{}"
+        identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        available_at = (NOW - timedelta(days=1)).isoformat()
+        self.store.connection.execute(
+            """INSERT INTO strict_live_map_mappings
+               (mapping_id, raybet_match_id, map_number, event_id,
+                team_one_id, team_two_id, canonical_team_one_id,
+                canonical_team_one_name, canonical_team_two_id,
+                canonical_team_two_name, canonical_identity_json,
+                canonical_identity_hash, crosswalk_evidence_json,
+                crosswalk_evidence_hash, stage_scope, scheduled_at_utc,
+                raybet_best_of, raybet_identity_json, raybet_identity_hash,
+                raybet_metadata_updated_at, source, evidence_json,
+                evidence_hash, mapping_version, acceptance_mode,
+                automatic_approval_id, accepted_by, accepted_at, recorded_at,
+                created_at)
+               VALUES (7, ?, 1, 'ewc-dota2-2026', 101, 202, 101, 'Alpha',
+                       202, 'Beta', ?, ?, ?, ?, 'main_event', ?, 3, ?, ?, ?,
+                       'test', ?, ?, 'test-v1', 'manual_exact', NULL, 'test',
+                       ?, ?, ?)""",
+            (
+                MATCH_ID,
+                identity_json,
+                identity_hash,
+                identity_json,
+                identity_hash,
+                available_at,
+                identity_json,
+                identity_hash,
+                available_at,
+                identity_json,
+                identity_hash,
+                available_at,
+                available_at,
+                available_at,
+            ),
+        )
+        self.store.connection.commit()
 
     def record_transport(
         self,
@@ -148,6 +195,30 @@ class ResearchLivePredictionTests(unittest.TestCase):
         )
         self.assertEqual(status, "on_time")
         return state_hash
+
+    def record_reconciliation(
+        self,
+        dota_match_id: int,
+        settled_at: datetime,
+        *,
+        status: str = "confirmed",
+        reason: str = "source_winners_agree",
+    ) -> None:
+        self.store.record_settlement_reconciliation(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=dota_match_id,
+            raybet_status="confirmed",
+            raybet_winner_side="team_two",
+            opendota_winner_side="team_two",
+            raybet_evidence_ref=f"raybet:final:{dota_match_id}",
+            opendota_evidence_ref=f"opendota:{dota_match_id}",
+            raybet_facts={"winner_side": "team_two"},
+            opendota_facts={"winner_side": "team_two"},
+            status=status,
+            reason=reason,
+            observed_at=settled_at,
+        )
 
     def test_settled_status_five_is_not_a_research_quote(self) -> None:
         settled = [replace(row, status=5) for row in snapshots(NOW)]
@@ -236,6 +307,7 @@ class ResearchLivePredictionTests(unittest.TestCase):
             evidence_ref="opendota:9001",
             settled_at=NOW + timedelta(hours=1),
         )
+        self.record_reconciliation(result.dota_match_id, result.settled_at)
         self.assertTrue(self.store.insert_map_result(result))
         self.assertEqual(
             self.store.connection.execute(
@@ -389,6 +461,197 @@ class ResearchLivePredictionTests(unittest.TestCase):
             0,
         )
 
+    def test_manual_review_reconciliation_removes_result_from_scoring(self) -> None:
+        rows = snapshots(NOW)
+        state_hash = self.record_transport("manual-review", NOW, rows)
+        prediction = record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=observation(NOW),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="manual-review",
+            transport_hash=state_hash,
+            transport_at=NOW,
+            created_at=NOW,
+        )
+        self.assertIsNotNone(prediction)
+        settled_at = NOW + timedelta(hours=1)
+        self.record_reconciliation(9_004, settled_at)
+        self.assertTrue(self.store.insert_map_result(SimpleNamespace(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=9_004,
+            winner_side="team_two",
+            team_one_kills=20,
+            team_two_kills=35,
+            duration_seconds=2_400,
+            evidence_ref="settlement-reconciliation:38408499:map:1",
+            settled_at=settled_at,
+        )))
+        self.assertEqual(research_summary(self.store.connection)["result_labels"], 1)
+
+        self.record_reconciliation(
+            9_004,
+            settled_at,
+            status="manual_review",
+            reason="strict_live_mapping_invalidated",
+        )
+
+        summary = research_summary(self.store.connection)
+        self.assertEqual(summary["result_labels"], 0)
+        self.assertEqual(summary["scorable_model_results"], 0)
+        self.assertEqual(summary["raw_result_labels"], 1)
+        self.assertEqual(summary["included_result_labels"], 0)
+        self.assertEqual(summary["excluded_result_labels"], 1)
+        self.assertEqual(
+            summary["result_label_audit"]["exclusion_reasons"][
+                "reconciliation_not_confirmed"
+            ],
+            1,
+        )
+
+    def test_mapping_invalidation_removes_confirmed_research_lineage(self) -> None:
+        rows = snapshots(NOW)
+        state_hash = self.record_transport("strict-invalidated", NOW, rows)
+        prediction = record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=observation(NOW),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="strict-invalidated",
+            transport_hash=state_hash,
+            transport_at=NOW,
+            created_at=NOW,
+        )
+        self.assertIsNotNone(prediction)
+        settled_at = NOW + timedelta(hours=1)
+        self.record_reconciliation(9_005, settled_at)
+        self.assertTrue(self.store.insert_map_result(SimpleNamespace(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            dota_match_id=9_005,
+            winner_side="team_two",
+            team_one_kills=20,
+            team_two_kills=35,
+            duration_seconds=2_400,
+            evidence_ref="settlement-reconciliation:38408499:map:1",
+            settled_at=settled_at,
+        )))
+        self.assertEqual(research_summary(self.store.connection)["result_labels"], 1)
+
+        self.store.connection.execute(
+            """INSERT INTO strict_live_map_mapping_invalidations
+               (mapping_id, reason, invalidated_by, invalidated_at, recorded_at)
+               VALUES (7, 'withdrawn evidence', 'test', ?, ?)""",
+            (settled_at.isoformat(), settled_at.isoformat()),
+        )
+        self.store.connection.commit()
+
+        summary = research_summary(self.store.connection)
+        self.assertEqual(summary["raw_predictions"], 1)
+        self.assertEqual(summary["included_predictions"], 0)
+        self.assertEqual(summary["excluded_predictions"], 1)
+        self.assertEqual(
+            summary["prediction_audit"]["exclusion_reasons"][
+                "strict_mapping_invalidated"
+            ],
+            1,
+        )
+        self.assertEqual(summary["raw_result_labels"], 1)
+        self.assertEqual(summary["included_result_labels"], 0)
+        self.assertEqual(summary["excluded_result_labels"], 1)
+        self.assertEqual(
+            summary["result_label_audit"]["exclusion_reasons"][
+                "strict_mapping_invalidated"
+            ],
+            1,
+        )
+
+    def test_missing_strict_invalidation_schema_is_audited_fail_closed(self) -> None:
+        rows = snapshots(NOW)
+        state_hash = self.record_transport("strict-schema-missing", NOW, rows)
+        self.assertIsNotNone(record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=observation(NOW),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="strict-schema-missing",
+            transport_hash=state_hash,
+            transport_at=NOW,
+            created_at=NOW,
+        ))
+        self.store.connection.execute(
+            "DROP TABLE strict_live_map_mapping_invalidations"
+        )
+        self.store.connection.commit()
+
+        summary = research_summary(self.store.connection)
+
+        self.assertEqual(summary["audit_status"], "unavailable")
+        self.assertIn(
+            "strict_live_map_mapping_invalidations_table_missing",
+            summary["unavailable_reasons"],
+        )
+        self.assertEqual(summary["raw_predictions"], 1)
+        self.assertEqual(summary["included_predictions"], 0)
+        self.assertEqual(summary["excluded_predictions"], 1)
+        self.assertIsNone(
+            summary["prediction_audit"]["exclusion_reasons"][
+                "strict_mapping_invalidated"
+            ]
+        )
+        self.assertEqual(
+            summary["prediction_audit"]["exclusion_reasons"][
+                "strict_mapping_unverifiable"
+            ],
+            1,
+        )
+
+    def test_vision_invalidation_has_an_explicit_prediction_denominator(self) -> None:
+        rows = snapshots(NOW)
+        state_hash = self.record_transport("vision-invalidated", NOW, rows)
+        prediction = record_research_prediction(
+            self.store,
+            snapshots=rows,
+            surface=build_market_surface(rows),
+            observation=observation(NOW),
+            draft_curve=curve(),
+            strict_mapping=Mapping(),
+            transport_key="vision-invalidated",
+            transport_hash=state_hash,
+            transport_at=NOW,
+            created_at=NOW,
+        )
+        self.assertIsNotNone(prediction)
+        assert prediction is not None
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('research_prediction', ?, ?, 1,
+                       'vision_observation_invalidated', ?)""",
+            (prediction.prediction_key, MATCH_ID, NOW.isoformat()),
+        )
+        self.store.connection.commit()
+
+        summary = research_summary(self.store.connection)
+
+        self.assertEqual(summary["raw_predictions"], 1)
+        self.assertEqual(summary["included_predictions"], 0)
+        self.assertEqual(summary["excluded_predictions"], 1)
+        self.assertEqual(
+            summary["prediction_audit"]["exclusion_reasons"][
+                "vision_invalidated"
+            ],
+            1,
+        )
+
     def test_first_later_winner_quote_labels_without_auxiliary_markets(self) -> None:
         first_rows = snapshots(NOW)
         first_hash = self.record_transport("first-winner", NOW, first_rows)
@@ -444,6 +707,8 @@ class ResearchLivePredictionTests(unittest.TestCase):
                 transport_at=observed_at,
                 created_at=observed_at,
             )
+        settled_at = NOW + timedelta(hours=1)
+        self.record_reconciliation(9_002, settled_at)
         self.assertTrue(self.store.insert_map_result(SimpleNamespace(
             raybet_match_id=MATCH_ID,
             map_number=1,
@@ -453,7 +718,7 @@ class ResearchLivePredictionTests(unittest.TestCase):
             team_two_kills=35,
             duration_seconds=2_400,
             evidence_ref="opendota:9002",
-            settled_at=NOW + timedelta(hours=1),
+            settled_at=settled_at,
         )))
         summary = research_summary(self.store.connection)
         self.assertEqual(len(summary["model_cohorts"]), 2)

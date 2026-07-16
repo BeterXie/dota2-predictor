@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Collection, Iterator, Mapping
+from typing import Callable, Collection, Iterator, Mapping
 
 from .benchmarks import BENCHMARK_VERSION
 from .player_scoring import score_version_for_role
@@ -22,6 +24,19 @@ from .team_states import LABEL_VERSION
 UTC = timezone.utc
 ROLE_VERSION = RECONSTRUCTED_ASSIGNMENT_VERSION
 SCORE_VERSION = score_version_for_role(ROLE_VERSION)
+
+
+# Web delivery readers repeatedly validate the same draft artifacts.  The
+# lineage revision pair is advanced by triggers whenever a dependency or
+# artifact row changes, so it is a stable, cheap invalidation token.  Keep
+# this cache strictly for query-only connections; writers must always rebuild
+# from their transaction snapshot.
+_DRAFT_ARTIFACT_CACHE_LOCK = threading.Lock()
+_DRAFT_ARTIFACT_CACHE: dict[
+    tuple[str, int, int],
+    dict[tuple[str, int], tuple[str, str]],
+] = {}
+_DRAFT_ARTIFACT_CACHE_MAX = 4
 
 
 @dataclass(frozen=True)
@@ -317,6 +332,66 @@ def _sha256_identity(value: object) -> str | None:
     return normalized
 
 
+def _read_only_draft_revision_key(
+    connection: sqlite3.Connection,
+) -> tuple[str, int, int] | None:
+    """Return a cache key only for a file-backed query-only snapshot."""
+    try:
+        if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
+            return None
+        database = connection.execute("PRAGMA database_list").fetchone()
+        path = str(database[2]) if database is not None else ""
+        if not path or path == ":memory:":
+            return None
+        try:
+            identity = os.stat(path)
+        except OSError:
+            return None
+        revision = connection.execute(
+            """SELECT dependency_revision, artifact_revision
+                 FROM draft_lineage_revisions
+                WHERE singleton=1"""
+        ).fetchone()
+        if revision is None:
+            return None
+        return (
+            f"{path}:{identity.st_dev}:{identity.st_ino}",
+            int(revision[0]),
+            int(revision[1]),
+        )
+    except (TypeError, ValueError, IndexError, OSError, sqlite3.Error):
+        return None
+
+
+def _draft_prediction_artifacts_for_read(
+    connection: sqlite3.Connection,
+    loader: Callable[
+        [sqlite3.Connection], dict[tuple[str, int], tuple[str, str]]
+    ],
+) -> dict[tuple[str, int], tuple[str, str]]:
+    """Reuse artifact fingerprints for an unchanged read-only lineage."""
+    key = _read_only_draft_revision_key(connection)
+    if key is None:
+        return loader(connection)
+    with _DRAFT_ARTIFACT_CACHE_LOCK:
+        cached = _DRAFT_ARTIFACT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    artifacts = loader(connection)
+    with _DRAFT_ARTIFACT_CACHE_LOCK:
+        # Keep at most the newest token for a database and a small global cap
+        # so repeated test/database lifecycles cannot grow this process-wide
+        # cache without bound.
+        for stale_key in tuple(_DRAFT_ARTIFACT_CACHE):
+            if stale_key[0] == key[0] and stale_key != key:
+                del _DRAFT_ARTIFACT_CACHE[stale_key]
+        while len(_DRAFT_ARTIFACT_CACHE) >= _DRAFT_ARTIFACT_CACHE_MAX:
+            _DRAFT_ARTIFACT_CACHE.pop(next(iter(_DRAFT_ARTIFACT_CACHE)))
+        _DRAFT_ARTIFACT_CACHE[key] = artifacts
+    return artifacts
+
+
 def _current_draft_prediction_keys(
     connection: sqlite3.Connection,
     match_ids: Collection[int],
@@ -360,7 +435,9 @@ def _current_draft_prediction_keys(
         if not draft_lineage_tracking_is_current(connection):
             current = frozenset()
         else:
-            artifacts = draft_prediction_artifacts(connection)
+            artifacts = _draft_prediction_artifacts_for_read(
+                connection, draft_prediction_artifacts
+            )
             rows = connection.execute(
                 """SELECT validation.run_id, validation.match_id,
                           validation.input_snapshot_hash,

@@ -905,7 +905,7 @@ def invalidate_strict_live_map_mapping(
     invalidated_by: str,
     invalidated_at: datetime,
 ) -> int:
-    """Append an invalidation and impact records; never mutate dependent rows."""
+    """Append an invalidation and atomically quarantine impacted order outputs."""
     mapping_id = _positive_integer(mapping_id, "mapping_id")
     reason = _required_text(reason, "reason")
     invalidated_by = _required_text(invalidated_by, "invalidated_by")
@@ -928,7 +928,13 @@ def invalidate_strict_live_map_mapping(
             (mapping_id,),
         ).fetchone()
         if existing is not None:
-            return int(existing[0])
+            invalidation_id = int(existing[0])
+            _quarantine_mapping_order_dependents(
+                connection,
+                invalidation_id=invalidation_id,
+                recorded_at=recorded_at,
+            )
+            return invalidation_id
         cursor = connection.execute(
             """INSERT INTO strict_live_map_mapping_invalidations
                (mapping_id, reason, invalidated_by, invalidated_at, recorded_at)
@@ -960,6 +966,11 @@ def invalidate_strict_live_map_mapping(
                     reason=reason,
                     recorded_at=recorded_at,
                 )
+        _quarantine_mapping_order_dependents(
+            connection,
+            invalidation_id=invalidation_id,
+            recorded_at=recorded_at,
+        )
         return invalidation_id
 
 
@@ -1578,7 +1589,11 @@ def _record_mapping_impacts(
     recorded_at: datetime,
 ) -> None:
     dependents: set[tuple[str, str]] = set()
-    if _table_exists(connection, "strategy_decisions"):
+    if _table_has_columns(
+        connection,
+        "strategy_decisions",
+        {"decision_key", "contributions_json", "raybet_match_id", "map_number"},
+    ):
         rows = connection.execute(
             """SELECT decision_key, contributions_json FROM strategy_decisions
                 WHERE raybet_match_id=? AND map_number=?""",
@@ -1594,7 +1609,11 @@ def _record_mapping_impacts(
                 continue
             if mapping_id == mapping.mapping_id:
                 dependents.add(("strategy_decision", str(row[0])))
-    if _table_exists(connection, "research_live_predictions"):
+    if _table_has_columns(
+        connection,
+        "research_live_predictions",
+        {"prediction_key", "strict_mapping_id"},
+    ):
         dependents.update(
             ("research_prediction", str(row[0]))
             for row in connection.execute(
@@ -1603,8 +1622,10 @@ def _record_mapping_impacts(
                 (mapping.mapping_id,),
             ).fetchall()
         )
-    if _table_exists(connection, "shadow_orders") and _table_has_column(
-        connection, "shadow_orders", "strict_mapping_id"
+    if _table_has_columns(
+        connection,
+        "shadow_orders",
+        {"order_key", "strict_mapping_id"},
     ):
         dependents.update(
             ("shadow_order", str(row[0]))
@@ -1630,6 +1651,96 @@ def _record_mapping_impacts(
             for dependent_type, dependent_key in sorted(dependents)
         ),
     )
+
+
+def _quarantine_mapping_order_dependents(
+    connection: sqlite3.Connection,
+    *,
+    invalidation_id: int,
+    recorded_at: datetime,
+) -> None:
+    order_keys = tuple(
+        str(row[0])
+        for row in connection.execute(
+            """SELECT dependent_key FROM strict_live_mapping_impacts
+                WHERE invalidation_id=? AND dependent_type='shadow_order'
+                ORDER BY dependent_key""",
+            (invalidation_id,),
+        ).fetchall()
+    )
+    if not order_keys:
+        return
+
+    recorded_at_iso = recorded_at.isoformat()
+    block_reason = "strict_mapping_invalidated"
+    if _table_has_columns(connection, "settlements", {"order_key", "review_required"}):
+        connection.executemany(
+            """UPDATE settlements SET review_required=1
+                WHERE order_key=? AND review_required=0""",
+            ((order_key,) for order_key in order_keys),
+        )
+
+    if _table_has_columns(
+        connection,
+        "shadow_map_attempts",
+        {"order_key", "raybet_match_id", "map_number"},
+    ) and _table_has_columns(
+        connection,
+        "settlement_reconciliations",
+        {"raybet_match_id", "map_number", "status", "reason", "updated_at"},
+    ):
+        for order_key in order_keys:
+            connection.execute(
+                """UPDATE settlement_reconciliations
+                      SET status='manual_review', reason=?, updated_at=?
+                    WHERE status!='manual_review'
+                      AND (raybet_match_id, map_number) IN (
+                          SELECT raybet_match_id, map_number
+                            FROM shadow_map_attempts WHERE order_key=?
+                      )""",
+                (block_reason, recorded_at_iso, order_key),
+            )
+
+    outbox_columns = {
+        "outbox_id",
+        "order_key",
+        "event_type",
+        "status",
+        "lease_token",
+        "lease_until",
+        "last_error",
+        "updated_at",
+    }
+    if not _table_has_columns(connection, "notification_outbox", outbox_columns):
+        return
+    audit_available = _table_has_columns(
+        connection,
+        "notification_outbox_audit",
+        {"outbox_id", "action", "actor", "reason", "created_at"},
+    )
+    for order_key in order_keys:
+        outbox_rows = connection.execute(
+            """SELECT outbox_id FROM notification_outbox
+                WHERE order_key=? AND status IN ('pending', 'leased')
+                ORDER BY outbox_id""",
+            (order_key,),
+        ).fetchall()
+        for row in outbox_rows:
+            outbox_id = int(row[0])
+            updated = connection.execute(
+                """UPDATE notification_outbox
+                      SET status='dead_letter', lease_token=NULL, lease_until=NULL,
+                          last_error=?, updated_at=?
+                    WHERE outbox_id=? AND status IN ('pending', 'leased')""",
+                (block_reason, recorded_at_iso, outbox_id),
+            )
+            if updated.rowcount == 1 and audit_available:
+                connection.execute(
+                    """INSERT INTO notification_outbox_audit
+                       (outbox_id, action, actor, reason, created_at)
+                       VALUES (?, 'blocked', 'strict_mapping_invalidation', ?, ?)""",
+                    (outbox_id, block_reason, recorded_at_iso),
+                )
 
 
 def _automatic_mappings_for_source(
@@ -1664,6 +1775,17 @@ def _table_has_column(
         str(row[1]) == column
         for row in connection.execute(f"PRAGMA table_info({table})")
     )
+
+
+def _table_has_columns(
+    connection: sqlite3.Connection, table: str, columns: set[str]
+) -> bool:
+    if not _table_exists(connection, table):
+        return False
+    existing = {
+        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    return columns <= existing
 
 
 def _mapping_causal_reason(

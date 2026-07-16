@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,177 @@ class MonitorAlertTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.directory.cleanup()
+
+    def _insert_strict_mapping(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        raybet_match_id: str,
+        map_number: int = 1,
+        acceptance_mode: str = "manual_exact",
+        automatic_approval_id: int | None = None,
+        accepted_at: datetime = NOW,
+    ) -> int:
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            cursor = connection.execute(
+                """INSERT INTO strict_live_map_mappings
+                   (raybet_match_id, map_number, event_id, team_one_id,
+                    team_two_id, canonical_team_one_id, canonical_team_one_name,
+                    canonical_team_two_id, canonical_team_two_name,
+                    canonical_identity_json, canonical_identity_hash,
+                    crosswalk_evidence_json, crosswalk_evidence_hash,
+                    stage_scope, scheduled_at_utc, raybet_best_of,
+                    raybet_identity_json, raybet_identity_hash,
+                    raybet_metadata_updated_at, source, evidence_json,
+                    evidence_hash, mapping_version, acceptance_mode,
+                    automatic_approval_id, accepted_by, accepted_at,
+                    recorded_at, created_at)
+                   VALUES (?, ?, 'event-test', 101, 202, 101, 'Alpha',
+                           202, 'Beta', '{}', ?, '{}', ?, 'main_event', ?, 3,
+                           '{}', ?, ?, 'test', '{}', ?, 'test-v1', ?, ?,
+                           'test', ?, ?, ?)""",
+                (
+                    raybet_match_id,
+                    map_number,
+                    "a" * 64,
+                    "b" * 64,
+                    NOW.isoformat(),
+                    "c" * 64,
+                    NOW.isoformat(),
+                    "d" * 64,
+                    acceptance_mode,
+                    automatic_approval_id,
+                    accepted_at.isoformat(),
+                    accepted_at.isoformat(),
+                    accepted_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.execute("PRAGMA foreign_keys=ON")
+        return int(cursor.lastrowid)
+
+    def _insert_pending_order(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        order_key: str = "order-alert",
+        raybet_match_id: str = "match-1",
+        model_probability: object = 0.58,
+        market_probability: object = 0.40,
+        signal_price: object = 2.5,
+        signal_at: datetime = NOW,
+        strict_mapping_id: int | None = None,
+        map_number: int = 1,
+        create_strict_mapping: bool = True,
+        insert_vision_anchor: bool = True,
+        vision_anchor_at: datetime | None = None,
+    ) -> int | None:
+        if strict_mapping_id is None and create_strict_mapping:
+            strict_mapping_id = self._insert_strict_mapping(
+                connection,
+                raybet_match_id=raybet_match_id,
+                map_number=map_number,
+            )
+        connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                order_key,
+                raybet_match_id,
+                strict_mapping_id,
+                f"odds-{order_key}",
+                "winner|map_1|team_one|",
+                signal_at.isoformat(),
+                model_probability,
+                market_probability,
+                signal_price,
+                f"transport-{order_key}",
+                signal_at.isoformat(),
+                (signal_at + timedelta(seconds=15)).isoformat(),
+                f"group-{order_key}",
+                "team_one",
+                1,
+                1.0,
+                "pending",
+            ),
+        )
+        connection.execute(
+            """INSERT INTO shadow_map_attempts
+               (raybet_match_id, map_number, order_key, status, created_at)
+               VALUES (?, ?, ?, 'pending', ?)""",
+            (raybet_match_id, map_number, order_key, signal_at.isoformat()),
+        )
+        if insert_vision_anchor:
+            connection.execute(
+                """INSERT INTO vision_draft_anchors
+                   (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
+                    dire_hero_ids, anchored_at, source_frame_ref, status,
+                    conflict_at)
+                   VALUES (?, ?, ?, '[]', '[]', ?, ?, 'anchored', NULL)""",
+                (
+                    raybet_match_id,
+                    map_number,
+                    "a" * 64,
+                    (
+                        vision_anchor_at or signal_at - timedelta(seconds=1)
+                    ).isoformat(),
+                    f"frame-{order_key}",
+                ),
+            )
+        connection.commit()
+        return strict_mapping_id
+
+    def _insert_automatic_approval(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_mapping_id: int,
+    ) -> int:
+        cursor = connection.execute(
+            """INSERT INTO strict_live_automatic_evidence_approvals
+               (source_mapping_id, raybet_match_id, event_id, team_one_id,
+                team_two_id, canonical_team_one_id, canonical_team_two_id,
+                raybet_identity_hash, canonical_identity_hash,
+                crosswalk_evidence_hash, evidence_hash, approved_by,
+                approved_at, recorded_at)
+               VALUES (?, 'match-source', 'event-test', 101, 202, 101, 202,
+                       ?, ?, ?, ?, 'test', ?, ?)""",
+            (
+                source_mapping_id,
+                "e" * 64,
+                "f" * 64,
+                "1" * 64,
+                "2" * 64,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+    def _assert_no_paper_signal(self, connection: sqlite3.Connection) -> None:
+        self.assertEqual(
+            connection.execute(
+                """SELECT COUNT(*) FROM monitor_alert_incidents
+                    WHERE status='active' AND category='paper_signal'"""
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            connection.execute(
+                """SELECT COUNT(*) FROM notification_outbox
+                    WHERE json_extract(payload_json, '$.category')='paper_signal'"""
+            ).fetchone()[0],
+            0,
+        )
 
     def test_operational_alert_uses_grace_dedupes_and_recovers(self) -> None:
         record_health(
@@ -120,27 +292,23 @@ class MonitorAlertTests(unittest.TestCase):
         )
 
     def test_paper_signal_opens_immediately_and_can_be_acknowledged(self) -> None:
-        self.store.connection.execute(
-            """INSERT INTO shadow_orders
-               (order_key, raybet_match_id, odds_id, market_key, signaled_at,
-                model_probability, market_probability, signal_price,
-                signal_transport_key, signal_transport_at, expires_at,
-                signal_odds_group_id, signal_outcome_key,
-                signal_identity_verified, stake, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "order-alert", "match-1", "odds-1", "winner|map_1|team_one|",
-                NOW.isoformat(), 0.58, 0.40, 2.5, "transport-1", NOW.isoformat(),
-                (NOW + timedelta(seconds=15)).isoformat(), "group-1", "team_one",
-                1, 1.0, "pending",
-            ),
-        )
-        self.store.connection.commit()
+        self._insert_pending_order(self.store.connection)
 
-        reconcile_alerts(self.store.connection, now=NOW, grace_seconds=30)
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW,
+            grace_seconds=30,
+            email_recipient="ops@example.com",
+        )
         alert = active_alerts(self.store.connection)[0]
 
         self.assertEqual(alert["category"], "paper_signal")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT order_key FROM notification_outbox"
+            ).fetchone()[0],
+            "order-alert",
+        )
         self.assertTrue(
             acknowledge_alert(
                 self.store.connection,
@@ -151,6 +319,505 @@ class MonitorAlertTests(unittest.TestCase):
         )
         acknowledged = active_alerts(self.store.connection)[0]
         self.assertIsNotNone(acknowledged["acknowledged_at"])
+
+    def test_paper_signal_fails_closed_when_lineage_relation_is_missing(self) -> None:
+        relations = (
+            "shadow_orders",
+            "shadow_map_attempts",
+            "vision_derived_invalidations",
+            "vision_draft_anchors",
+            "vision_draft_conflicts",
+            "strict_live_mapping_impacts",
+            "strict_live_map_mapping_invalidations",
+            "strict_live_map_mappings",
+            "strict_live_automatic_evidence_approvals",
+        )
+        for relation in relations:
+            with self.subTest(relation=relation):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = LiveBettingStore(Path(directory) / "alerts.db")
+                    try:
+                        store.init_schema()
+                        self._insert_pending_order(store.connection)
+                        store.connection.execute("PRAGMA foreign_keys=OFF")
+                        store.connection.execute(f'DROP TABLE "{relation}"')
+                        store.connection.commit()
+                        store.connection.execute("PRAGMA foreign_keys=ON")
+
+                        reconcile_alerts(
+                            store.connection,
+                            now=NOW,
+                            grace_seconds=0,
+                            email_recipient="ops@example.com",
+                        )
+
+                        self._assert_no_paper_signal(store.connection)
+                        row = store.connection.execute(
+                            """SELECT source_json FROM monitor_alert_incidents
+                                WHERE dedupe_key='operational:paper_signal_contract'
+                                  AND status='active'"""
+                        ).fetchone()
+                        self.assertIsNotNone(row)
+                        assert row is not None
+                        source = json.loads(str(row[0]))
+                        self.assertIn(
+                            f"missing_relation:{relation}", source["issues"]
+                        )
+                    finally:
+                        store.close()
+
+    def test_schema_outage_keeps_existing_paper_incident_unknown(self) -> None:
+        self._insert_pending_order(self.store.connection)
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW,
+            grace_seconds=0,
+            email_recipient="ops@example.com",
+        )
+        self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        self.store.connection.execute("DROP TABLE vision_draft_conflicts")
+        self.store.connection.commit()
+        self.store.connection.execute("PRAGMA foreign_keys=ON")
+
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW + timedelta(seconds=1),
+            grace_seconds=0,
+            email_recipient="ops@example.com",
+        )
+
+        paper = self.store.connection.execute(
+            """SELECT status, recovered_at FROM monitor_alert_incidents
+                WHERE dedupe_key='paper_signal:order-alert'"""
+        ).fetchone()
+        self.assertEqual(tuple(paper), ("active", None))
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM notification_outbox
+                    WHERE event_type='monitor_recovery'
+                      AND json_extract(payload_json, '$.category')='paper_signal'"""
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNotNone(
+            self.store.connection.execute(
+                """SELECT 1 FROM monitor_alert_incidents
+                    WHERE dedupe_key='operational:paper_signal_contract'
+                      AND status='active'"""
+                ).fetchone()
+        )
+        record = claim(
+            self.store.connection,
+            now=NOW + timedelta(seconds=1),
+        )
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.payload["category"], "operational")
+
+    def test_paper_signal_fails_closed_when_lineage_column_is_missing(self) -> None:
+        missing_columns = {
+            "shadow_orders": "strict_mapping_id",
+            "shadow_map_attempts": "map_number",
+            "vision_derived_invalidations": "dependent_key",
+            "vision_draft_anchors": "conflict_at",
+            "vision_draft_conflicts": "captured_at",
+            "strict_live_mapping_impacts": "dependent_key",
+            "strict_live_map_mapping_invalidations": "invalidation_id",
+            "strict_live_map_mappings": "acceptance_mode",
+            "strict_live_automatic_evidence_approvals": "source_mapping_id",
+        }
+        for relation, missing_column in missing_columns.items():
+            with self.subTest(relation=relation, column=missing_column):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = LiveBettingStore(Path(directory) / "alerts.db")
+                    try:
+                        store.init_schema()
+                        self._insert_pending_order(store.connection)
+                        columns = [
+                            str(row[1])
+                            for row in store.connection.execute(
+                                f'PRAGMA table_info("{relation}")'
+                            ).fetchall()
+                            if str(row[1]) != missing_column
+                        ]
+                        definitions = ", ".join(
+                            f'"{column}" TEXT' for column in columns
+                        )
+                        store.connection.execute("PRAGMA foreign_keys=OFF")
+                        store.connection.execute(f'DROP TABLE "{relation}"')
+                        store.connection.execute(
+                            f'CREATE TABLE "{relation}" ({definitions})'
+                        )
+                        store.connection.commit()
+                        store.connection.execute("PRAGMA foreign_keys=ON")
+
+                        reconcile_alerts(
+                            store.connection,
+                            now=NOW,
+                            grace_seconds=0,
+                            email_recipient="ops@example.com",
+                        )
+
+                        self._assert_no_paper_signal(store.connection)
+                        source = json.loads(
+                            str(
+                                store.connection.execute(
+                                    """SELECT source_json
+                                         FROM monitor_alert_incidents
+                                        WHERE dedupe_key=
+                                              'operational:paper_signal_contract'"""
+                                ).fetchone()[0]
+                            )
+                        )
+                        self.assertIn(
+                            f"missing_column:{relation}.{missing_column}",
+                            source["issues"],
+                        )
+                    finally:
+                        store.close()
+
+    def test_paper_signal_fails_closed_when_query_fails(self) -> None:
+        self._insert_pending_order(self.store.connection)
+
+        class FaultingConnection:
+            def __init__(self, wrapped: sqlite3.Connection) -> None:
+                self.wrapped = wrapped
+
+            def execute(
+                self, sql: str, parameters: tuple[object, ...] = ()
+            ) -> sqlite3.Cursor:
+                if (
+                    "FROM shadow_orders AS orders" in sql
+                    and "strict_live_mapping_impacts" in sql
+                ):
+                    raise sqlite3.OperationalError("injected paper query failure")
+                return self.wrapped.execute(sql, parameters)
+
+            def __enter__(self):
+                self.wrapped.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return self.wrapped.__exit__(exc_type, exc_value, traceback)
+
+            def __getattr__(self, name: str):
+                return getattr(self.wrapped, name)
+
+        reconcile_alerts(
+            FaultingConnection(self.store.connection),  # type: ignore[arg-type]
+            now=NOW,
+            grace_seconds=0,
+            email_recipient="ops@example.com",
+        )
+
+        self._assert_no_paper_signal(self.store.connection)
+        source = json.loads(
+            str(
+                self.store.connection.execute(
+                    """SELECT source_json FROM monitor_alert_incidents
+                        WHERE dedupe_key='operational:paper_signal_contract'"""
+                ).fetchone()[0]
+            )
+        )
+        self.assertEqual(source["reason"], "query_failed")
+
+    def test_paper_signal_fails_closed_when_numeric_payload_is_invalid(self) -> None:
+        self._insert_pending_order(
+            self.store.connection,
+            model_probability="not-a-number",
+        )
+
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW,
+            grace_seconds=0,
+            email_recipient="ops@example.com",
+        )
+
+        self._assert_no_paper_signal(self.store.connection)
+        source = json.loads(
+            str(
+                self.store.connection.execute(
+                    """SELECT source_json FROM monitor_alert_incidents
+                        WHERE dedupe_key='operational:paper_signal_contract'"""
+                ).fetchone()[0]
+            )
+        )
+        self.assertEqual(source["reason"], "invalid_payload")
+
+    def test_paper_signal_excludes_invalidated_and_conflicted_orders(self) -> None:
+        self._insert_pending_order(
+            self.store.connection,
+            order_key="order-invalidated",
+            raybet_match_id="match-invalidated",
+        )
+        self._insert_pending_order(
+            self.store.connection,
+            order_key="order-conflicted",
+            raybet_match_id="match-conflicted",
+            insert_vision_anchor=False,
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('shadow_order', ?, ?, 1, 'draft_conflict',
+                       'vision_draft_conflict', ?)""",
+            ("order-invalidated", "match-invalidated", NOW.isoformat()),
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_draft_anchors
+               (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
+                dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
+               VALUES (?, 1, ?, '[]', '[]', ?, 'frame-1', 'conflict', ?)""",
+            (
+                "match-conflicted",
+                "a" * 64,
+                (NOW - timedelta(seconds=10)).isoformat(),
+                (NOW + timedelta(seconds=10)).isoformat(),
+            ),
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_draft_conflicts
+               (raybet_match_id, map_number, captured_at, source_frame_ref,
+                observed_draft_hash, radiant_hero_ids, dire_hero_ids, reason,
+                recorded_at)
+               VALUES (?, 1, ?, 'frame-2', ?, '[]', '[]', 'mismatch', ?)""",
+            (
+                "match-conflicted",
+                (NOW - timedelta(seconds=1)).isoformat(),
+                "b" * 64,
+                NOW.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+
+        reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
+
+        self.assertEqual(active_alerts(self.store.connection), [])
+
+    def test_paper_signal_requires_verified_strict_mapping(self) -> None:
+        self._insert_pending_order(
+            self.store.connection,
+            order_key="order-null-mapping",
+            raybet_match_id="match-null-mapping",
+            create_strict_mapping=False,
+        )
+        self._insert_pending_order(
+            self.store.connection,
+            order_key="order-orphan-mapping",
+            raybet_match_id="match-orphan-mapping",
+            strict_mapping_id=999,
+        )
+
+        reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
+
+        self.assertEqual(active_alerts(self.store.connection), [])
+
+    def test_paper_signal_requires_a_vision_draft_anchor(self) -> None:
+        self._insert_pending_order(
+            self.store.connection,
+            insert_vision_anchor=False,
+        )
+
+        reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
+
+        self.assertEqual(active_alerts(self.store.connection), [])
+
+    def test_paper_signal_rejects_future_lineage_evidence(self) -> None:
+        future_mapping_id = self._insert_strict_mapping(
+            self.store.connection,
+            raybet_match_id="match-future-mapping",
+            accepted_at=NOW + timedelta(seconds=1),
+        )
+        self._insert_pending_order(
+            self.store.connection,
+            order_key="order-future-mapping",
+            raybet_match_id="match-future-mapping",
+            strict_mapping_id=future_mapping_id,
+        )
+        self._insert_pending_order(
+            self.store.connection,
+            order_key="order-future-anchor",
+            raybet_match_id="match-future-anchor",
+            vision_anchor_at=NOW + timedelta(seconds=1),
+        )
+
+        reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
+
+        self.assertEqual(active_alerts(self.store.connection), [])
+
+    def test_paper_signal_excludes_all_strict_mapping_invalidation_paths(self) -> None:
+        cases = ("direct", "impact", "automatic_source")
+        for case in cases:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = LiveBettingStore(Path(directory) / "alerts.db")
+                    try:
+                        store.init_schema()
+                        source_mapping_id = None
+                        strict_mapping_id = None
+                        if case == "automatic_source":
+                            source_mapping_id = self._insert_strict_mapping(
+                                store.connection,
+                                raybet_match_id="match-source",
+                            )
+                            approval_id = self._insert_automatic_approval(
+                                store.connection,
+                                source_mapping_id=source_mapping_id,
+                            )
+                            strict_mapping_id = self._insert_strict_mapping(
+                                store.connection,
+                                raybet_match_id="match-automatic_source",
+                                acceptance_mode="automatic_exact",
+                                automatic_approval_id=approval_id,
+                            )
+                        order_mapping_id = self._insert_pending_order(
+                            store.connection,
+                            order_key=f"order-{case}",
+                            raybet_match_id=f"match-{case}",
+                            strict_mapping_id=strict_mapping_id,
+                        )
+                        assert order_mapping_id is not None
+                        if case == "direct":
+                            store.connection.execute(
+                                """INSERT INTO strict_live_map_mapping_invalidations
+                                   (mapping_id, reason, invalidated_by,
+                                    invalidated_at, recorded_at)
+                                   VALUES (?, 'test', 'operator', ?, ?)""",
+                                (
+                                    order_mapping_id,
+                                    NOW.isoformat(),
+                                    NOW.isoformat(),
+                                ),
+                            )
+                        elif case == "impact":
+                            cause_mapping_id = self._insert_strict_mapping(
+                                store.connection,
+                                raybet_match_id="match-impact-cause",
+                            )
+                            cursor = store.connection.execute(
+                                """INSERT INTO strict_live_map_mapping_invalidations
+                                   (mapping_id, reason, invalidated_by,
+                                    invalidated_at, recorded_at)
+                                   VALUES (?, 'test', 'operator', ?, ?)""",
+                                (
+                                    cause_mapping_id,
+                                    NOW.isoformat(),
+                                    NOW.isoformat(),
+                                ),
+                            )
+                            store.connection.execute(
+                                """INSERT INTO strict_live_mapping_impacts
+                                   (mapping_id, invalidation_id, dependent_type,
+                                    dependent_key, reason, recorded_at)
+                                   VALUES (?, ?, 'shadow_order', ?, 'test', ?)""",
+                                (
+                                    order_mapping_id,
+                                    int(cursor.lastrowid),
+                                    "order-impact",
+                                    NOW.isoformat(),
+                                ),
+                            )
+                        else:
+                            assert source_mapping_id is not None
+                            store.connection.execute(
+                                """INSERT INTO strict_live_map_mapping_invalidations
+                                   (mapping_id, reason, invalidated_by,
+                                    invalidated_at, recorded_at)
+                                   VALUES (?, 'test', 'operator', ?, ?)""",
+                                (
+                                    source_mapping_id,
+                                    NOW.isoformat(),
+                                    NOW.isoformat(),
+                                ),
+                            )
+                        store.connection.commit()
+
+                        reconcile_alerts(
+                            store.connection,
+                            now=NOW,
+                            grace_seconds=0,
+                        )
+
+                        self.assertEqual(active_alerts(store.connection), [])
+                    finally:
+                        store.close()
+
+    def test_paper_signal_gate_and_enqueue_share_one_write_transaction(self) -> None:
+        self._insert_pending_order(self.store.connection)
+        contender = sqlite3.connect(self.database, timeout=0)
+        writer_errors: list[str] = []
+
+        class LockCheckingConnection:
+            def __init__(self, wrapped: sqlite3.Connection) -> None:
+                self.wrapped = wrapped
+                self.checked = False
+
+            def execute(
+                self, sql: str, parameters: tuple[object, ...] = ()
+            ) -> sqlite3.Cursor:
+                if not self.checked and "FROM shadow_orders AS orders" in sql:
+                    self.checked = True
+                    try:
+                        contender.execute(
+                            """INSERT INTO vision_derived_invalidations
+                               (dependent_type, dependent_key, raybet_match_id,
+                                map_number, reason, recorded_at)
+                               VALUES ('shadow_order', 'order-alert', 'match-1',
+                                       1, 'racing_invalidation', ?)""",
+                            (NOW.isoformat(),),
+                        )
+                        contender.commit()
+                    except sqlite3.OperationalError as exc:
+                        writer_errors.append(str(exc))
+                        contender.rollback()
+                return self.wrapped.execute(sql, parameters)
+
+            def __enter__(self):
+                self.wrapped.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return self.wrapped.__exit__(exc_type, exc_value, traceback)
+
+            def __getattr__(self, name: str):
+                return getattr(self.wrapped, name)
+
+        try:
+            reconcile_alerts(
+                LockCheckingConnection(  # type: ignore[arg-type]
+                    self.store.connection
+                ),
+                now=NOW,
+                grace_seconds=0,
+                email_recipient="ops@example.com",
+            )
+            self.assertTrue(any("locked" in error for error in writer_errors))
+            contender.execute(
+                """INSERT INTO vision_derived_invalidations
+                   (dependent_type, dependent_key, raybet_match_id, map_number,
+                    reason, recorded_at)
+                   VALUES ('shadow_order', 'order-alert', 'match-1', 1,
+                           'post_commit_invalidation', ?)""",
+                ((NOW + timedelta(seconds=1)).isoformat(),),
+            )
+            contender.commit()
+        finally:
+            contender.close()
+
+        self.assertIsNone(
+            claim(self.store.connection, now=NOW + timedelta(seconds=2))
+        )
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT order_key, status, last_error
+                         FROM notification_outbox"""
+                ).fetchone()
+            ),
+            ("order-alert", "dead_letter", "strict_mapping_unverified"),
+        )
 
     def test_email_outbox_uses_monitor_template_when_recipient_is_configured(self) -> None:
         record_health(

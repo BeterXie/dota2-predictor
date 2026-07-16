@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from live_betting.event_detector import detect_events
 from live_betting.alignment import align_snapshots
@@ -288,12 +289,15 @@ class StorageTests(unittest.TestCase):
                         normalized_state_hash=normalized_state_hash([row]),
                         snapshots=[row],
                     )
-                self.assertTrue(
-                    store.insert_map_order(first, 1, strict_mapping_id=1)
-                )
-                self.assertFalse(
-                    store.insert_map_order(second, 1, strict_mapping_id=1)
-                )
+                with patch.object(
+                    store, "_strict_mapping_context_block_reason", return_value=None
+                ):
+                    self.assertTrue(
+                        store.insert_map_order(first, 1, strict_mapping_id=1)
+                    )
+                    self.assertFalse(
+                        store.insert_map_order(second, 1, strict_mapping_id=1)
+                    )
                 count = store.connection.execute(
                     "SELECT COUNT(*) FROM shadow_orders"
                 ).fetchone()[0]

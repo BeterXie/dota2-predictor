@@ -34,6 +34,7 @@ import type {
   ControlSession,
   MappingRecord,
   MatchDetail,
+  MonitorLifecycleCounts,
   MonitorSnapshot,
 } from "./types";
 
@@ -112,6 +113,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (view !== "operations") {
+      setControlSession(null);
+      setComponents([]);
+      return;
+    }
     let controller: AbortController | null = null;
     let renewalTimer: number | null = null;
     let disposed = false;
@@ -137,10 +143,11 @@ export default function App() {
       controller?.abort();
       if (renewalTimer != null) window.clearTimeout(renewalTimer);
     };
-  }, []);
+  }, [view]);
 
   useEffect(() => {
     if (!controlSession) return;
+    if (view !== "operations") return;
     const controller = new AbortController();
     let disposed = false;
     let refreshing = false;
@@ -181,7 +188,7 @@ export default function App() {
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [controlSession]);
+  }, [controlSession, view]);
 
   useEffect(() => {
     if (!snapshot) return;
@@ -249,7 +256,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!selectedId) {
+    if (!selectedId || (view !== "live" && view !== "replay")) {
       setDetail(null);
       return;
     }
@@ -265,7 +272,7 @@ export default function App() {
       })
       .finally(() => setDetailLoading(false));
     return () => controller.abort();
-  }, [selectedId, snapshot?.cursor]);
+  }, [selectedId, snapshot?.cursor, view]);
 
   useEffect(() => {
     if (!snapshot || (view !== "live" && view !== "replay")) return;
@@ -278,7 +285,7 @@ export default function App() {
   }, [snapshot, view]);
 
   useEffect(() => {
-    if (!selectedId) {
+    if (!selectedId || view !== "operations") {
       setMappingState({ matchId: null, version: mappingVersion, records: [] });
       return;
     }
@@ -300,7 +307,7 @@ export default function App() {
       active = false;
       controller.abort();
     };
-  }, [selectedId, mappingVersion, snapshot?.mapping_revision]);
+  }, [selectedId, mappingVersion, snapshot?.mapping_revision, view]);
 
   useEffect(() => {
     const active = snapshot?.alerts || [];
@@ -326,6 +333,7 @@ export default function App() {
     () => (snapshot?.alerts || []).filter((item) => !item.acknowledged_at).length,
     [snapshot?.alerts],
   );
+  const viewSummary = snapshot ? summaryForView(snapshot.summary, view) : null;
 
   const changeView = (next: ViewMode) => {
     if (next === "replay" || next === "intelligence") {
@@ -530,9 +538,20 @@ export default function App() {
 
       {view !== "intelligence" && snapshot && (
         <section className="summary-bar" aria-label="赛事与系统摘要">
-          <SummaryItem label="滚球确认" value={snapshot.summary.live} tone="live" />
-          <SummaryItem label="数据降级" value={snapshot.summary.degraded} tone="warning" />
-          <SummaryItem label="即将开始" value={snapshot.summary.upcoming} />
+          <SummaryItem
+            label={view === "replay" ? "历史比赛" : "滚球确认"}
+            value={view === "replay" ? viewSummary?.total || 0 : viewSummary?.live || 0}
+            tone={view === "replay" ? "neutral" : "live"}
+          />
+          <SummaryItem
+            label={view === "replay" ? "历史降级" : "数据降级"}
+            value={viewSummary?.degraded || 0}
+            tone="warning"
+          />
+          <SummaryItem
+            label={view === "replay" ? "已完赛" : "即将开始"}
+            value={view === "replay" ? viewSummary?.ended || 0 : viewSummary?.upcoming || 0}
+          />
           <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
           <span className="snapshot-time">快照 {new Date(snapshot.generated_at).toLocaleTimeString("zh-CN", { hour12: false })}</span>
         </section>
@@ -627,9 +646,9 @@ function preferredMatch(
 ): string | null {
   const preferred = view === "replay"
     ? snapshot.matches.find(isHistoricalMatch)
-    : snapshot.matches.find((match) => !isHistoricalMatch(match) && match.lifecycle === "live")
-      || snapshot.matches.find((match) => !isHistoricalMatch(match) && match.lifecycle === "degraded")
-      || snapshot.matches.find((match) => !isHistoricalMatch(match) && match.lifecycle === "upcoming");
+    : snapshot.matches.find((match) => isLiveEligible(match) && match.lifecycle === "live")
+      || snapshot.matches.find((match) => isLiveEligible(match) && match.lifecycle === "degraded")
+      || snapshot.matches.find((match) => isLiveEligible(match) && match.lifecycle === "upcoming");
   return preferred?.raybet_match_id || null;
 }
 
@@ -638,12 +657,25 @@ function matchesForView(
   view: "live" | "replay",
 ): MonitorSnapshot["matches"] {
   return matches.filter((match) => (
-    view === "replay" ? isHistoricalMatch(match) : !isHistoricalMatch(match)
+    view === "replay" ? isHistoricalMatch(match) : isLiveEligible(match)
   ));
 }
 
+function summaryForView(
+  summary: MonitorSnapshot["summary"],
+  view: ViewMode,
+): MonitorLifecycleCounts {
+  if (view === "replay") return summary.history_view;
+  if (view === "live") return summary.live_view;
+  return summary;
+}
+
 function isHistoricalMatch(match: MonitorSnapshot["matches"][number]): boolean {
-  return match.lifecycle === "ended" || match.history_eligible === true;
+  return match.history_eligible === true;
+}
+
+function isLiveEligible(match: MonitorSnapshot["matches"][number]): boolean {
+  return match.history_eligible === false;
 }
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {

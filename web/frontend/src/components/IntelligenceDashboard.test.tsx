@@ -86,6 +86,9 @@ describe("IntelligenceDashboard", () => {
     fireEvent.click(screen.getByRole("tab", { name: /阵容校准/ }));
 
     expect((await screen.findAllByText("player-score-v3+observed-role=role-v1")).length).toBe(2);
+    expect(screen.getByText("阵容模型")).toBeInTheDocument();
+    expect(screen.getByText("阵容回测")).toBeInTheDocument();
+    expect(screen.getByText("阵容特征")).toBeInTheDocument();
     expect(screen.getByText("前瞻验证 尚未建立")).toBeInTheDocument();
     expect(screen.getByText(/ECE 90% bootstrap 上界不高于 0.15/)).toBeInTheDocument();
     expect(screen.getByText("ECE 90% 上界")).toBeInTheDocument();
@@ -210,6 +213,8 @@ describe("IntelligenceDashboard", () => {
     expect(screen.getAllByText("翻盘局").length).toBeGreaterThan(0);
     expect(screen.getAllByText("被翻盘局").length).toBeGreaterThan(0);
     expect(screen.getByText("78.2")).toBeInTheDocument();
+    expect(screen.getByText("player-score-v3+observed-role=role-v1")).toBeInTheDocument();
+    expect(screen.getByText("2026-07-01")).toBeInTheDocument();
     expect(screen.getByText("K/D/A 8 / 2 / 11")).toBeInTheDocument();
     expect(screen.getByText(/GPM\/XPM 650 \/ 720/)).toBeInTheDocument();
     expect(screen.getByText(/英雄\/建筑伤害 24,000 \/ 9,000/)).toBeInTheDocument();
@@ -218,6 +223,34 @@ describe("IntelligenceDashboard", () => {
     expect(screen.getByText("比赛局势分类")).toBeInTheDocument();
     expect(screen.queryByText("比赛局势评分")).not.toBeInTheDocument();
     expect(detailMock).toHaveBeenCalledWith(9001, expect.any(AbortSignal));
+  });
+
+  it("exposes and submits every supported team-state label", async () => {
+    matchesMock.mockResolvedValue({
+      data: [],
+      pagination,
+    });
+    renderDashboard();
+
+    const filter = await screen.findByRole("combobox", { name: "局势分类筛选" });
+    const labels = [
+      "comeback",
+      "throw",
+      "stomp",
+      "stomp_loss",
+      "advantage",
+      "disadvantage",
+      "even",
+      "state_unscorable",
+    ];
+    expect(filter.querySelectorAll("option")).toHaveLength(labels.length + 1);
+
+    for (const label of labels) {
+      fireEvent.change(filter, { target: { value: label } });
+      await waitFor(() => {
+        expect(matchesMock.mock.calls.some(([options]) => options?.label === label)).toBe(true);
+      });
+    }
   });
 
   it("prefers a completed intelligence match over a newer pending row", async () => {
@@ -305,6 +338,7 @@ describe("IntelligenceDashboard", () => {
         average_coverage: 0.97,
         average_role_confidence: 0.93,
         score_version: "player-score-v3+observed-role=role-v1",
+        benchmark_cutoff: "2026-07-01T00:00:00Z",
       }, {
         rank: 2,
         account_id: 44,
@@ -316,6 +350,7 @@ describe("IntelligenceDashboard", () => {
         average_coverage: 0.95,
         average_role_confidence: 0.9,
         score_version: "player-score-v3+observed-role=role-v1",
+        benchmark_cutoff: "2026-07-01T00:00:00Z",
       }],
       pagination: { ...pagination, total: 2 },
     });
@@ -345,6 +380,8 @@ describe("IntelligenceDashboard", () => {
     fireEvent.click(screen.getByRole("tab", { name: /选手评分/ }));
     expect(await screen.findAllByText("Northwind")).toHaveLength(2);
     expect(screen.getByText("84.3")).toBeInTheDocument();
+    expect(screen.getAllByText("player-score-v3+observed-role=role-v1").length).toBeGreaterThan(0);
+    expect(screen.getByText("2026-07-01")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("tab", { name: /球队画像/ }));
     expect(await screen.findByText("Aurora")).toBeInTheDocument();
@@ -429,6 +466,9 @@ function overview(): IntelligenceOverview {
       team_state: "team-state-v1",
       team_profile: "team-profile-v1",
       draft_score: "player-score-v3+observed-role=role-v1",
+      draft_model: "draft-logistic-l2-v1",
+      draft_backtest: "strict-draft-walk-forward-v1",
+      draft_features: "draft-features-v1",
     },
     coverage: {
       formal_maps: 526,

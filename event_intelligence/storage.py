@@ -324,6 +324,8 @@ CREATE TABLE IF NOT EXISTS draft_predictions (
     created_at TEXT NOT NULL,
     UNIQUE (run_id, match_id)
 );
+CREATE INDEX IF NOT EXISTS idx_draft_predictions_match
+    ON draft_predictions(match_id, run_id);
 
 CREATE TABLE IF NOT EXISTS draft_lineage_revisions (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -495,7 +497,11 @@ class IntelligenceStorage:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-        self.connection.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(
+            self.connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if journal_mode != "wal":
+            self.connection.execute("PRAGMA journal_mode=WAL")
         self._transaction_depth = 0
         self._savepoint_sequence = 0
 

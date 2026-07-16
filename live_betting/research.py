@@ -18,6 +18,7 @@ from .market_state import MarketSurface
 from .models import OddsSnapshot
 from .profiles.draft_curve import DraftCurve, DraftPoint, MAX_LANDMARK_AGE_MINUTES
 from .raybet_state import raybet_odds_is_open
+from .strict_read_gate import strict_read_gate, table_has_columns
 from .vision import VisionObservation
 
 if TYPE_CHECKING:
@@ -636,21 +637,86 @@ def _accuracy(rows: Sequence[tuple[float, int]]) -> float | None:
 
 
 def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
-    """Build read-only coverage and accuracy metrics from settled research rows."""
+    """Build fail-closed coverage and accuracy metrics from research rows."""
 
+    strict_gate = strict_read_gate(
+        connection,
+        mapping_id_sql="prediction.strict_mapping_id",
+        raybet_match_id_sql="prediction.raybet_match_id",
+        map_number_sql="prediction.map_number",
+        signal_at_sql="prediction.observed_at",
+        dependent_type="research_prediction",
+        dependent_key_sql="prediction.prediction_key",
+    )
+    vision_reason = _required_schema_reason(
+        connection,
+        "vision_derived_invalidations",
+        {"dependent_type", "dependent_key"},
+    )
+    vision_available = vision_reason is None
+    vision_invalidated_sql = (
+        "EXISTS ("
+        "SELECT 1 FROM vision_derived_invalidations AS invalidation "
+        "WHERE invalidation.dependent_type='research_prediction' "
+        "AND invalidation.dependent_key=prediction.prediction_key)"
+        if vision_available
+        else "0"
+    )
+    vision_included_sql = (
+        f"NOT ({vision_invalidated_sql})" if vision_available else "0"
+    )
+    included_prediction_sql = (
+        f"(({strict_gate.included_sql}) AND ({vision_included_sql}))"
+    )
+
+    prediction_unknown = list(strict_gate.unknown_reasons)
+    if vision_reason is not None:
+        prediction_unknown.append(vision_reason)
     try:
-        predictions = connection.execute(
-            """SELECT gate_status, gate_failures_json, raw_model_probability,
-                      market_probability
-                 FROM research_live_predictions AS prediction
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM vision_derived_invalidations AS invalidation
-                     WHERE invalidation.dependent_type='research_prediction'
-                       AND invalidation.dependent_key=prediction.prediction_key
-                )"""
+        prediction_audit_rows = connection.execute(
+            f"""SELECT prediction.gate_status,
+                       prediction.gate_failures_json,
+                       prediction.raw_model_probability,
+                       prediction.market_probability,
+                       CASE WHEN {strict_gate.invalidated_sql}
+                            THEN 1 ELSE 0 END AS strict_invalidated,
+                       CASE WHEN {strict_gate.unverifiable_sql}
+                            THEN 1 ELSE 0 END AS strict_unverifiable,
+                       CASE WHEN {vision_invalidated_sql}
+                            THEN 1 ELSE 0 END AS vision_invalidated,
+                       CASE WHEN {included_prediction_sql}
+                            THEN 1 ELSE 0 END AS included
+                  FROM research_live_predictions AS prediction"""
         ).fetchall()
     except sqlite3.OperationalError:
-        predictions = []
+        prediction_audit_rows = []
+        prediction_unknown.append("research_prediction_audit_query_failed")
+        raw_predictions = _safe_table_count(
+            connection, "research_live_predictions"
+        )
+        prediction_reason_counts = {
+            "strict_mapping_invalidated": None,
+            "strict_mapping_unverifiable": None,
+            "vision_invalidated": None,
+        }
+    else:
+        raw_predictions = len(prediction_audit_rows)
+        prediction_reason_counts = {
+            "strict_mapping_invalidated": (
+                sum(int(row[4]) for row in prediction_audit_rows)
+                if strict_gate.available
+                else None
+            ),
+            "strict_mapping_unverifiable": sum(
+                int(row[5]) for row in prediction_audit_rows
+            ),
+            "vision_invalidated": (
+                sum(int(row[6]) for row in prediction_audit_rows)
+                if vision_available
+                else None
+            ),
+        }
+    predictions = [row for row in prediction_audit_rows if int(row[7]) == 1]
     gate_statuses = Counter(str(row[0]) for row in predictions)
     gate_failures: Counter[str] = Counter()
     for row in predictions:
@@ -659,39 +725,154 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         except (TypeError, ValueError):
             reasons = ["invalid_gate_failure_json"]
         gate_failures.update(str(reason) for reason in reasons)
+
+    raw_price_labels = _safe_table_count(connection, "research_price_labels")
+    price_unknown = list(prediction_unknown)
     try:
-        price_rows = connection.execute(
-            """SELECT prediction.market_probability, prediction.market_price,
-                      label.market_probability, label.price
-                 FROM research_price_labels AS label
-                 JOIN research_live_predictions AS prediction
-                   ON prediction.prediction_key=label.prediction_key
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM vision_derived_invalidations AS invalidation
-                     WHERE invalidation.dependent_type='research_prediction'
-                       AND invalidation.dependent_key=prediction.prediction_key
-                )"""
-        ).fetchall()
-        result_rows = connection.execute(
-            """SELECT prediction.raw_model_probability,
-                      prediction.market_probability, label.selected_side_win,
-                      prediction.feature_hash, prediction.model_hash,
-                      prediction.calibration_hash,
-                      prediction.gate_status
-                  FROM research_result_labels AS label
-                 JOIN research_live_predictions AS prediction
-                    ON prediction.prediction_key=label.prediction_key
-                 WHERE julianday(prediction.observed_at) <
-                       julianday(label.settled_at)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM vision_derived_invalidations AS invalidation
-                        WHERE invalidation.dependent_type='research_prediction'
-                          AND invalidation.dependent_key=prediction.prediction_key
-                   )"""
+        price_audit_rows = connection.execute(
+            f"""SELECT prediction.market_probability,
+                       prediction.market_price,
+                       label.market_probability,
+                       label.price,
+                       CASE WHEN {strict_gate.invalidated_sql}
+                            THEN 1 ELSE 0 END AS strict_invalidated,
+                       CASE WHEN {strict_gate.unverifiable_sql}
+                            THEN 1 ELSE 0 END AS strict_unverifiable,
+                       CASE WHEN {vision_invalidated_sql}
+                            THEN 1 ELSE 0 END AS vision_invalidated,
+                       CASE WHEN {included_prediction_sql}
+                            THEN 1 ELSE 0 END AS included
+                  FROM research_price_labels AS label
+                  JOIN research_live_predictions AS prediction
+                    ON prediction.prediction_key=label.prediction_key"""
         ).fetchall()
     except sqlite3.OperationalError:
-        price_rows = []
-        result_rows = []
+        price_audit_rows = []
+        price_unknown.append("research_price_label_audit_query_failed")
+        price_reason_counts = {
+            "strict_mapping_invalidated": None,
+            "strict_mapping_unverifiable": None,
+            "vision_invalidated": None,
+            "prediction_lineage_unverifiable": None,
+        }
+    else:
+        price_reason_counts = {
+            "strict_mapping_invalidated": (
+                sum(int(row[4]) for row in price_audit_rows)
+                if strict_gate.available
+                else None
+            ),
+            "strict_mapping_unverifiable": sum(
+                int(row[5]) for row in price_audit_rows
+            ),
+            "vision_invalidated": (
+                sum(int(row[6]) for row in price_audit_rows)
+                if vision_available
+                else None
+            ),
+            "prediction_lineage_unverifiable": (
+                None
+                if raw_price_labels is None
+                else raw_price_labels - len(price_audit_rows)
+            ),
+        }
+    price_rows = [row for row in price_audit_rows if int(row[7]) == 1]
+
+    reconciliation_reason = _required_schema_reason(
+        connection,
+        "settlement_reconciliations",
+        {"raybet_match_id", "map_number", "dota_match_id", "status"},
+    )
+    reconciliation_available = reconciliation_reason is None
+    reconciliation_confirmed_sql = (
+        "EXISTS ("
+        "SELECT 1 FROM settlement_reconciliations AS reconciliation "
+        "WHERE reconciliation.raybet_match_id=prediction.raybet_match_id "
+        "AND reconciliation.map_number=prediction.map_number "
+        "AND reconciliation.dota_match_id=label.dota_match_id "
+        "AND reconciliation.status='confirmed')"
+        if reconciliation_available
+        else "0"
+    )
+    temporal_valid_sql = (
+        "(julianday(prediction.observed_at) IS NOT NULL "
+        "AND julianday(label.settled_at) IS NOT NULL "
+        "AND julianday(prediction.observed_at)<julianday(label.settled_at))"
+    )
+    included_result_sql = (
+        f"(({included_prediction_sql}) AND ({temporal_valid_sql}) "
+        f"AND ({reconciliation_confirmed_sql}))"
+    )
+    raw_result_labels = _safe_table_count(connection, "research_result_labels")
+    result_unknown = list(prediction_unknown)
+    if reconciliation_reason is not None:
+        result_unknown.append(reconciliation_reason)
+    try:
+        result_audit_rows = connection.execute(
+            f"""SELECT prediction.raw_model_probability,
+                       prediction.market_probability,
+                       label.selected_side_win,
+                       prediction.feature_hash,
+                       prediction.model_hash,
+                       prediction.calibration_hash,
+                       prediction.gate_status,
+                       CASE WHEN {strict_gate.invalidated_sql}
+                            THEN 1 ELSE 0 END AS strict_invalidated,
+                       CASE WHEN {strict_gate.unverifiable_sql}
+                            THEN 1 ELSE 0 END AS strict_unverifiable,
+                       CASE WHEN {vision_invalidated_sql}
+                            THEN 1 ELSE 0 END AS vision_invalidated,
+                       CASE WHEN {temporal_valid_sql}
+                            THEN 1 ELSE 0 END AS temporal_valid,
+                       CASE WHEN {reconciliation_confirmed_sql}
+                            THEN 1 ELSE 0 END AS reconciliation_confirmed,
+                       CASE WHEN {included_result_sql}
+                            THEN 1 ELSE 0 END AS included
+                  FROM research_result_labels AS label
+                  JOIN research_live_predictions AS prediction
+                    ON prediction.prediction_key=label.prediction_key"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        result_audit_rows = []
+        result_unknown.append("research_result_label_audit_query_failed")
+        result_reason_counts = {
+            "strict_mapping_invalidated": None,
+            "strict_mapping_unverifiable": None,
+            "vision_invalidated": None,
+            "temporal_invalid": None,
+            "reconciliation_not_confirmed": None,
+            "prediction_lineage_unverifiable": None,
+        }
+    else:
+        result_reason_counts = {
+            "strict_mapping_invalidated": (
+                sum(int(row[7]) for row in result_audit_rows)
+                if strict_gate.available
+                else None
+            ),
+            "strict_mapping_unverifiable": sum(
+                int(row[8]) for row in result_audit_rows
+            ),
+            "vision_invalidated": (
+                sum(int(row[9]) for row in result_audit_rows)
+                if vision_available
+                else None
+            ),
+            "temporal_invalid": sum(
+                int(row[10]) == 0 for row in result_audit_rows
+            ),
+            "reconciliation_not_confirmed": (
+                sum(int(row[11]) == 0 for row in result_audit_rows)
+                if reconciliation_available
+                else None
+            ),
+            "prediction_lineage_unverifiable": (
+                None
+                if raw_result_labels is None
+                else raw_result_labels - len(result_audit_rows)
+            ),
+        }
+    result_rows = [row for row in result_audit_rows if int(row[12]) == 1]
     cohort_points: dict[
         tuple[str | None, str | None, str | None, str],
         dict[str, list[tuple[float, int]]],
@@ -740,12 +921,50 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
     headline = passed_cohorts[0] if len(passed_cohorts) == 1 else None
     price_probability_moves = [float(row[2]) - float(row[0]) for row in price_rows]
     price_moves = [float(row[3]) - float(row[1]) for row in price_rows]
+    prediction_audit = _research_audit(
+        raw=raw_predictions,
+        included=len(predictions),
+        unknown_reasons=prediction_unknown,
+        reason_counts=prediction_reason_counts,
+        raw_key="raw_predictions",
+        included_key="included_predictions",
+        excluded_key="excluded_predictions",
+    )
+    price_audit = _research_audit(
+        raw=raw_price_labels,
+        included=len(price_rows),
+        unknown_reasons=price_unknown,
+        reason_counts=price_reason_counts,
+        raw_key="raw_price_labels",
+        included_key="included_price_labels",
+        excluded_key="excluded_price_labels",
+    )
+    result_audit = _research_audit(
+        raw=raw_result_labels,
+        included=len(result_rows),
+        unknown_reasons=result_unknown,
+        reason_counts=result_reason_counts,
+        raw_key="raw_result_labels",
+        included_key="included_result_labels",
+        excluded_key="excluded_result_labels",
+    )
+    unavailable_reasons = list(dict.fromkeys(
+        [*prediction_unknown, *price_unknown, *result_unknown]
+    ))
     return {
         "predictions": len(predictions),
+        "raw_predictions": raw_predictions,
+        "included_predictions": len(predictions),
+        "excluded_predictions": prediction_audit["excluded_predictions"],
+        "prediction_audit": prediction_audit,
         "with_raw_model_probability": sum(row[2] is not None for row in predictions),
         "gate_statuses": dict(sorted(gate_statuses.items())),
         "gate_failures": dict(sorted(gate_failures.items())),
         "successor_price_labels": len(price_rows),
+        "raw_successor_price_labels": raw_price_labels,
+        "included_successor_price_labels": len(price_rows),
+        "excluded_successor_price_labels": price_audit["excluded_price_labels"],
+        "price_label_audit": price_audit,
         "mean_successor_probability_move": (
             math.fsum(price_probability_moves) / len(price_probability_moves)
             if price_probability_moves
@@ -755,6 +974,10 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
             math.fsum(price_moves) / len(price_moves) if price_moves else None
         ),
         "result_labels": len(result_rows),
+        "raw_result_labels": raw_result_labels,
+        "included_result_labels": len(result_rows),
+        "excluded_result_labels": result_audit["excluded_result_labels"],
+        "result_label_audit": result_audit,
         "scorable_model_results": sum(
             int(cohort["results"]) for cohort in passed_cohorts
         ),
@@ -770,6 +993,56 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
             None if headline is None else headline["market_log_loss"]
         ),
         "actionability": ACTIONABILITY,
+        "audit_status": "available" if not unavailable_reasons else "unavailable",
+        "unavailable_reasons": unavailable_reasons,
+    }
+
+
+def _required_schema_reason(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: set[str],
+) -> str | None:
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return f"{table}_schema_inspection_failed"
+    if exists is None:
+        return f"{table}_table_missing"
+    if not table_has_columns(connection, table, columns):
+        return f"{table}_columns_missing"
+    return None
+
+
+def _safe_table_count(
+    connection: sqlite3.Connection, table: str
+) -> int | None:
+    try:
+        return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    except sqlite3.OperationalError:
+        return None
+
+
+def _research_audit(
+    *,
+    raw: int | None,
+    included: int,
+    unknown_reasons: Sequence[str],
+    reason_counts: dict[str, int | None],
+    raw_key: str,
+    included_key: str,
+    excluded_key: str,
+) -> dict[str, object]:
+    return {
+        "status": "available" if not unknown_reasons else "unavailable",
+        "unknown_reasons": list(dict.fromkeys(unknown_reasons)),
+        raw_key: raw,
+        included_key: included,
+        excluded_key: None if raw is None else raw - included,
+        "exclusion_reasons": reason_counts,
     }
 
 

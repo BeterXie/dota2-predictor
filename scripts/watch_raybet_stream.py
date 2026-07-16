@@ -7,6 +7,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import cv2
 
@@ -19,6 +20,7 @@ from live_betting.raybet_state import (  # noqa: E402
     infer_current_map_number,
     raybet_match_is_live,
 )
+from live_betting.raybet import RayBetClient  # noqa: E402
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
 from vision.clock_reader import ClockReader  # noqa: E402
 from vision.hero_recognizer import (  # noqa: E402
@@ -69,8 +71,42 @@ def _manual_map_number(payload: object, best_of: int | None) -> int | None:
     return map_number
 
 
+def _fresh_stream_payload(match_id: str) -> tuple[str, dict[str, object]]:
+    with RayBetClient() as client:
+        response = client.match_odds(match_id)
+    result = response.get("result")
+    if (
+        not isinstance(result, dict)
+        or str(result.get("id") or "") != match_id
+        or type(result.get("game_id")) is not int
+        or int(result["game_id"]) != 151
+    ):
+        raise ValueError(f"RayBet stream identity mismatch for {match_id}")
+    url = result.get("live_url")
+    if not isinstance(url, str):
+        raise ValueError(f"no fresh live URL found for RayBet match {match_id}")
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise ValueError(
+            f"invalid fresh live URL for RayBet match {match_id}"
+        ) from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"invalid fresh live URL for RayBet match {match_id}")
+    return url, result
+
+
 def match_source(
-    database: Path, match_id: str, map_override: int | None = None
+    database: Path,
+    match_id: str,
+    map_override: int | None = None,
+    *,
+    refresh_url: bool = False,
 ) -> tuple[str, int]:
     connection = connect_sqlite(database, read_only=True)
     try:
@@ -79,19 +115,23 @@ def match_source(
             "WHERE raybet_match_id=?",
             (match_id,),
         ).fetchone()
-        if not row or not row[0]:
+        if not row or (not row[0] and not refresh_url):
             raise ValueError(f"no live_url found for RayBet match {match_id}")
-        try:
-            payload = json.loads(str(row[1] or "{}"))
-        except (TypeError, ValueError):
-            payload = {}
+        if refresh_url:
+            url, payload = _fresh_stream_payload(match_id)
+        else:
+            url = str(row[0])
+            try:
+                payload = json.loads(str(row[1] or "{}"))
+            except (TypeError, ValueError):
+                payload = {}
         best_of = int(row[2]) if row[2] is not None else None
         if map_override is not None:
             if map_override < 1 or map_override > 10:
                 raise ValueError("map override must be between 1 and 10")
             if best_of is not None and map_override > best_of:
                 raise ValueError("map override exceeds the configured series length")
-            return str(row[0]), map_override
+            return url, map_override
         map_number = _manual_map_number(payload, best_of)
         if map_number is None and str(row[3]) == "2":
             try:
@@ -105,7 +145,7 @@ def match_source(
             raise ValueError(
                 f"cannot determine a unique current map for RayBet match {match_id}"
             )
-        return str(row[0]), map_number
+        return url, map_number
     finally:
         connection.close()
 
@@ -116,6 +156,7 @@ def resolve_source(
     database: Path | None,
     match_id: str,
     map_number: int | None,
+    refresh_url: bool = False,
 ) -> tuple[str, int]:
     if url:
         if map_number is None:
@@ -124,7 +165,12 @@ def resolve_source(
             raise ValueError("map number must be between 1 and 10")
         return url, map_number
     if database:
-        return match_source(database, match_id, map_override=map_number)
+        return match_source(
+            database,
+            match_id,
+            map_override=map_number,
+            refresh_url=refresh_url,
+        )
     raise ValueError("provide --url or --database")
 
 
@@ -189,6 +235,11 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--count", type=int)
     parser.add_argument("--evidence-interval", type=float, default=30.0)
+    parser.add_argument(
+        "--refresh-url",
+        action="store_true",
+        help="fetch an ephemeral signed stream URL instead of reading it from SQLite",
+    )
     args = parser.parse_args()
 
     try:
@@ -197,6 +248,7 @@ def main() -> int:
             database=args.database,
             match_id=args.match_id,
             map_number=args.map_number,
+            refresh_url=args.refresh_url,
         )
     except ValueError as error:
         parser.error(str(error))

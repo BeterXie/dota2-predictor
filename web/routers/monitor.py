@@ -13,6 +13,15 @@ from .. import monitoring, queries
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
 
 
+def _build_snapshot() -> dict[str, object]:
+    """Build one monitor snapshot off the async event loop."""
+    connection = queries.get_db()
+    try:
+        return monitoring.build_monitor_snapshot(connection)
+    finally:
+        connection.close()
+
+
 @router.get("/bootstrap")
 def bootstrap() -> dict[str, object]:
     connection = queries.get_db()
@@ -71,11 +80,7 @@ async def events(
         nonlocal previous
         last_heartbeat = time.monotonic()
         while not await request.is_disconnected():
-            connection = queries.get_db()
-            try:
-                snapshot = monitoring.build_monitor_snapshot(connection)
-            finally:
-                connection.close()
+            snapshot = await asyncio.to_thread(_build_snapshot)
             current = str(snapshot["cursor"])
             if current != previous:
                 payload = json.dumps(

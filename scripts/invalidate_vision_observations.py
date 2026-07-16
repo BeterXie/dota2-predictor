@@ -34,6 +34,30 @@ def _online_backup(database: Path, destination: Path) -> None:
     online_backup(database, destination)
 
 
+def _earliest_captured_at(rows: list[sqlite3.Row]) -> str | None:
+    """Return the earliest valid event-time cutoff for selected frames.
+
+    SQLite compares timestamp text lexically in the invalidation queries.  The
+    watcher normally stores canonical UTC ISO values, but an operator may be
+    repairing an older database with mixed offsets or malformed data.  A bad
+    timestamp must fail closed, so ``None`` deliberately asks the dependency
+    invalidator to treat every same-map dependent as affected.
+    """
+    parsed: list[datetime] = []
+    for row in rows:
+        value = str(row["captured_at"])
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            return None
+        parsed.append(timestamp.astimezone(UTC))
+    if not parsed:
+        return None
+    return min(parsed).isoformat()
+
+
 def invalidate(
     database: Path,
     *,
@@ -106,6 +130,19 @@ def invalidate(
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("vision observation changed during invalidation")
+            # A confirmed frame is a signal-creation input, not just display
+            # data.  Propagate this audit invalidation through every dependent
+            # lineage using the same event-time, fail-closed path as a draft
+            # conflict.  The cutoff is the earliest selected frame, so outputs
+            # before the bad evidence remain reproducible and valid.
+            store._invalidate_vision_dependents(
+                match_id,
+                map_number,
+                reason,
+                _earliest_captured_at(rows),
+                block_reason="vision_observation_invalidated",
+                block_actor="vision_invalidation",
+            )
     return len(rows)
 
 
@@ -120,32 +157,61 @@ def freeze_draft_map(
     with LiveBettingStore(database.resolve()) as store:
         store.init_schema()
         rows = store.connection.execute(
-            """SELECT captured_at, source_frame_ref,
-                      radiant_hero_ids, dire_hero_ids
-                 FROM vision_observations
-                WHERE raybet_match_id=? AND map_number=?
-                ORDER BY captured_at, source_frame_ref""",
+            """SELECT observation.captured_at, observation.source_frame_ref,
+                      observation.radiant_hero_ids, observation.dire_hero_ids
+                 FROM vision_observations AS observation
+                WHERE observation.raybet_match_id=?
+                  AND observation.map_number=?
+                  AND observation.confirmed=1
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM vision_observation_invalidations AS invalidation
+                       WHERE invalidation.raybet_match_id=observation.raybet_match_id
+                         AND invalidation.captured_at=observation.captured_at
+                         AND invalidation.source_frame_ref=observation.source_frame_ref
+                  )""",
             (match_id, map_number),
         ).fetchall()
-        valid: list[tuple[sqlite3.Row, str]] = []
+        valid: list[tuple[sqlite3.Row, str, datetime]] = []
         for row in rows:
             try:
                 radiant = json.loads(str(row["radiant_hero_ids"]))
                 dire = json.loads(str(row["dire_hero_ids"]))
-            except (TypeError, ValueError):
+                captured_at = datetime.fromisoformat(
+                    str(row["captured_at"]).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if len(radiant) != 5 or len(dire) != 5 or len(set(radiant + dire)) != 10:
+            if not isinstance(radiant, list) or not isinstance(dire, list):
+                continue
+            heroes = radiant + dire
+            if (
+                captured_at.tzinfo is None
+                or captured_at.utcoffset() is None
+                or not str(row["source_frame_ref"]).strip()
+                or len(radiant) != 5
+                or len(dire) != 5
+                or any(type(hero_id) is not int or hero_id <= 0 for hero_id in heroes)
+                or len(set(heroes)) != 10
+            ):
                 continue
             payload = json.dumps(
                 {"radiant": radiant, "dire": dire},
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            valid.append((row, hashlib.sha256(payload.encode("utf-8")).hexdigest()))
+            valid.append(
+                (
+                    row,
+                    hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                    captured_at.astimezone(UTC),
+                )
+            )
         if not valid:
-            raise ValueError("no complete draft observations found for map")
+            raise ValueError("no trusted complete draft observations found for map")
 
-        first, first_hash = valid[0]
+        valid.sort(key=lambda item: (item[2], str(item[0]["source_frame_ref"])))
+        first, first_hash, _first_captured_at = valid[0]
         with store.transaction():
             store.connection.execute(
                 """INSERT OR IGNORE INTO vision_draft_anchors
@@ -176,7 +242,7 @@ def freeze_draft_map(
                         WHERE raybet_match_id=? AND map_number=?""",
                     (recorded_at, match_id, map_number),
                 )
-            for row, draft_hash in valid:
+            for row, draft_hash, _captured_at in valid:
                 store.connection.execute(
                     """INSERT OR IGNORE INTO vision_draft_conflicts
                        (raybet_match_id, map_number, captured_at,
@@ -195,43 +261,16 @@ def freeze_draft_map(
                         recorded_at,
                     ),
                 )
-            for dependent_type, table, key_column in (
-                ("odds_alignment", "odds_alignments", "odds_snapshot_id"),
-                ("strategy_decision", "strategy_decisions", "decision_key"),
-                (
-                    "research_prediction",
-                    "research_live_predictions",
-                    "prediction_key",
-                ),
-                ("shadow_order", "shadow_orders", "order_key"),
-            ):
-                rows_for_type = store.connection.execute(
-                    f"""SELECT {key_column} FROM {table}
-                         WHERE raybet_match_id=?
-                           AND {('map_number=?' if table != 'shadow_orders' else 'strict_mapping_id IN (SELECT mapping_id FROM strict_live_map_mappings WHERE raybet_match_id=? AND map_number=?)')}""",
-                    (
-                        (match_id, map_number)
-                        if table != "shadow_orders"
-                        else (match_id, match_id, map_number)
-                    ),
-                ).fetchall()
-                store.connection.executemany(
-                    """INSERT OR IGNORE INTO vision_derived_invalidations
-                       (dependent_type, dependent_key, raybet_match_id,
-                        map_number, reason, recorded_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        (
-                            dependent_type,
-                            str(dependent[0]),
-                            match_id,
-                            map_number,
-                            reason,
-                            recorded_at,
-                        )
-                        for dependent in rows_for_type
-                    ),
-                )
+            # Reuse the same causal invalidation path as live ingestion.  The
+            # helper derives the earliest captured conflict cutoff from the
+            # append-only conflict rows and also upgrades settlements and
+            # blocks unsent notifications for invalid order lineage.
+            _has_conflict, conflict_cutoff = store._draft_conflict_state(
+                match_id, map_number
+            )
+            store._invalidate_draft_dependents(
+                match_id, map_number, reason, conflict_cutoff
+            )
             store.connection.execute(
                 "DELETE FROM odds_alignments WHERE raybet_match_id=? AND map_number=?",
                 (match_id, map_number),

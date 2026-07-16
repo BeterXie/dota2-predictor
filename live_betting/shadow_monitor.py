@@ -198,9 +198,18 @@ def persist_alignments(
                         AND anchor.conflict_at IS NOT NULL
                         AND julianday(anchor.conflict_at) IS NOT NULL
                         AND julianday(anchor.conflict_at)>julianday(?)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM vision_draft_conflicts AS conflict
+                             WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                               AND conflict.map_number=anchor.map_number
+                               AND (
+                                     julianday(conflict.captured_at) IS NULL
+                                     OR julianday(conflict.captured_at)<=julianday(?)
+                               )
+                        )
                     )
               )
-           ORDER BY observation.captured_at""", (match_id, cutoff, cutoff)
+           ORDER BY observation.captured_at""", (match_id, cutoff, cutoff, cutoff)
     )]
     aligned = align_snapshots(
         [(int(row["id"]), _snapshot(row)) for row in odds_rows], observations
@@ -615,9 +624,10 @@ def _process_pending_order(
     store: LiveBettingStore, *, as_of: datetime,
 ) -> ShadowOrder | None:
     for pending in _pending_orders(store):
-        if store.pending_order_has_draft_conflict(pending.order_key):
+        block_reason = store.pending_order_block_reason(pending.order_key)
+        if block_reason is not None:
             resolved = store.reject_pending_order(
-                pending, reason="vision_draft_conflict"
+                pending, reason=block_reason
             )
             if resolved is not None:
                 return resolved
@@ -744,13 +754,22 @@ def run_once(
                         AND anchor.conflict_at IS NOT NULL
                         AND julianday(anchor.conflict_at) IS NOT NULL
                         AND julianday(anchor.conflict_at)>julianday(?)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM vision_draft_conflicts AS conflict
+                             WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                               AND conflict.map_number=anchor.map_number
+                               AND (
+                                     julianday(conflict.captured_at) IS NULL
+                                     OR julianday(conflict.captured_at)<=julianday(?)
+                               )
+                        )
                     )
               )
             WHERE observation.confirmed=1
               AND observation.screen_state='game'
               AND julianday(observation.captured_at)<=julianday(?)
            ORDER BY observation.captured_at DESC LIMIT 1""",
-        (run_at.isoformat(), run_at.isoformat()),
+        (run_at.isoformat(), run_at.isoformat(), run_at.isoformat()),
     ).fetchone()
     if not row:
         return {"status": "waiting_for_confirmed_vision", "vision_ingested": ingested}
@@ -777,6 +796,15 @@ def run_once(
                         AND anchor.conflict_at IS NOT NULL
                         AND julianday(anchor.conflict_at) IS NOT NULL
                         AND julianday(anchor.conflict_at)>julianday(?)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM vision_draft_conflicts AS conflict
+                             WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                               AND conflict.map_number=anchor.map_number
+                               AND (
+                                     julianday(conflict.captured_at) IS NULL
+                                     OR julianday(conflict.captured_at)<=julianday(?)
+                               )
+                        )
                     )
               )
             WHERE observation.raybet_match_id=?
@@ -785,6 +813,7 @@ def run_once(
               AND julianday(observation.captured_at)<=julianday(?)
            ORDER BY observation.captured_at DESC LIMIT 1""",
         (
+            current_transport_at.isoformat(),
             current_transport_at.isoformat(),
             match_id,
             current_transport_at.isoformat(),
@@ -842,11 +871,21 @@ def run_once(
                         AND anchor.conflict_at IS NOT NULL
                         AND julianday(anchor.conflict_at) IS NOT NULL
                         AND julianday(anchor.conflict_at)>julianday(?)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM vision_draft_conflicts AS conflict
+                             WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                               AND conflict.map_number=anchor.map_number
+                               AND (
+                                     julianday(conflict.captured_at) IS NULL
+                                     OR julianday(conflict.captured_at)<=julianday(?)
+                               )
+                        )
                     )
               )
            ORDER BY observation.captured_at""",
         (
             match_id,
+            current_transport_at.isoformat(),
             current_transport_at.isoformat(),
             current_transport_at.isoformat(),
         ),

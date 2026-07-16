@@ -18,6 +18,7 @@ from typing import Any
 from .evaluation import brier_score, log_loss, shadow_summary
 from .health import read_health
 from .research import research_summary
+from .strict_read_gate import StrictReadGate, strict_read_gate, table_has_columns
 
 
 _COHORT_IDENTITY_FIELDS = (
@@ -31,6 +32,9 @@ _COHORT_IDENTITY_FIELDS = (
     "global_gate_ref",
 )
 _BOOTSTRAP_ITERATIONS = 1_000
+_STRICT_MAPPING_JSON_PATH = (
+    "$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id"
+)
 _STRATIFICATION_DEFINITIONS = {
     "team": "selected canonical team from strict mapping refs",
     "odds_bucket": "signal decimal price",
@@ -74,14 +78,76 @@ class _OrderRecord:
 
 def build_report(connection: sqlite3.Connection) -> dict[str, object]:
     connection.row_factory = sqlite3.Row
-    decisions = connection.execute(
-        """SELECT * FROM strategy_decisions AS decision
-            WHERE NOT EXISTS (
-                SELECT 1 FROM vision_derived_invalidations AS invalidation
-                 WHERE invalidation.dependent_type='strategy_decision'
-                   AND invalidation.dependent_key=decision.decision_key
-            )"""
-    ).fetchall()
+    invalidation_available = _table_exists(
+        connection, "vision_derived_invalidations"
+    )
+    decision_mapping_id_sql = (
+        "CASE WHEN json_valid(decision.contributions_json) "
+        f"THEN json_extract(decision.contributions_json, '{_STRICT_MAPPING_JSON_PATH}') "
+        "ELSE NULL END"
+    )
+    decision_legacy_mapping_sql = (
+        "CASE WHEN json_valid(decision.contributions_json) THEN "
+        f"json_type(decision.contributions_json, '{_STRICT_MAPPING_JSON_PATH}') "
+        "IS NULL OR "
+        f"json_type(decision.contributions_json, '{_STRICT_MAPPING_JSON_PATH}')="
+        "'null' ELSE 0 END"
+    )
+    decision_strict_gate = strict_read_gate(
+        connection,
+        mapping_id_sql=decision_mapping_id_sql,
+        raybet_match_id_sql="decision.raybet_match_id",
+        map_number_sql="decision.map_number",
+        signal_at_sql="decision.decided_at",
+        dependent_type="strategy_decision",
+        dependent_key_sql="decision.decision_key",
+        legacy_mapping_sql=decision_legacy_mapping_sql,
+    )
+    invalidation_filter = (
+        "NOT EXISTS ("
+        "SELECT 1 FROM vision_derived_invalidations AS invalidation "
+        "WHERE invalidation.dependent_type='strategy_decision' "
+        "AND invalidation.dependent_key=decision.decision_key)"
+        if invalidation_available
+        else "0"
+    )
+    strict_decision_filter = decision_strict_gate.included_sql
+    try:
+        decisions = connection.execute(
+            f"""SELECT * FROM strategy_decisions AS decision
+            WHERE {invalidation_filter}
+              AND {strict_decision_filter}
+              AND NOT EXISTS (
+                SELECT 1 FROM vision_draft_anchors AS anchor
+                 WHERE anchor.raybet_match_id=decision.raybet_match_id
+                   AND anchor.map_number=decision.map_number
+                   AND anchor.status='conflict'
+                   AND (
+                         anchor.conflict_at IS NULL
+                         OR julianday(anchor.conflict_at) IS NULL
+                         OR julianday(decision.decided_at) IS NULL
+                         OR julianday(anchor.conflict_at)<=julianday(decision.decided_at)
+                         OR EXISTS (
+                              SELECT 1 FROM vision_draft_conflicts AS conflict
+                               WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                                 AND conflict.map_number=anchor.map_number
+                                 AND (
+                                       julianday(conflict.captured_at) IS NULL
+                                       OR julianday(conflict.captured_at)
+                                            <=julianday(decision.decided_at)
+                                 )
+                         )
+                   )
+                )"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # A legacy/malformed draft schema must not release rows into metrics.
+        decisions = connection.execute(
+            f"""SELECT * FROM strategy_decisions AS decision
+                WHERE {invalidation_filter}
+                  AND {strict_decision_filter}
+                  AND 0"""
+        ).fetchall()
     reasons = Counter(str(row["reason"]) for row in decisions)
     reconciliation_available = _table_exists(
         connection, "settlement_reconciliations"
@@ -98,29 +164,108 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         if reconciliation_available
         else ""
     )
-    orders = connection.execute(
-        f"""SELECT o.*, attempt.map_number AS attempt_map_number,
+    order_invalidation_filter = (
+        "NOT EXISTS ("
+        "SELECT 1 FROM vision_derived_invalidations AS invalidation "
+        "WHERE invalidation.dependent_type='shadow_order' "
+        "AND invalidation.dependent_key=o.order_key)"
+        if invalidation_available
+        else "0"
+    )
+    order_strict_gate = strict_read_gate(
+        connection,
+        mapping_id_sql="o.strict_mapping_id",
+        raybet_match_id_sql="o.raybet_match_id",
+        map_number_sql="attempt.map_number",
+        signal_at_sql="o.signal_transport_at",
+        dependent_type="shadow_order",
+        dependent_key_sql="o.order_key",
+    )
+    strict_order_filter = order_strict_gate.included_sql
+    mapping_projection_available = table_has_columns(
+        connection,
+        "strict_live_map_mappings",
+        {
+            "mapping_id",
+            "event_id",
+            "canonical_team_one_id",
+            "canonical_team_one_name",
+            "canonical_team_two_id",
+            "canonical_team_two_name",
+        },
+    )
+    mapping_projection = (
+        "mapping.event_id AS strict_event_id, "
+        "mapping.canonical_team_one_id, "
+        "mapping.canonical_team_one_name, "
+        "mapping.canonical_team_two_id, "
+        "mapping.canonical_team_two_name"
+        if mapping_projection_available
+        else "NULL AS strict_event_id, NULL AS canonical_team_one_id, "
+        "NULL AS canonical_team_one_name, NULL AS canonical_team_two_id, "
+        "NULL AS canonical_team_two_name"
+    )
+    mapping_join = (
+        "LEFT JOIN strict_live_map_mappings AS mapping "
+        "ON mapping.mapping_id=o.strict_mapping_id"
+        if mapping_projection_available
+        else ""
+    )
+    try:
+        orders = connection.execute(
+            f"""SELECT o.*, attempt.map_number AS attempt_map_number,
                   settlement.result, settlement.return_units,
                   settlement.settled_at, settlement.review_required,
-                  mapping.event_id AS strict_event_id,
-                  mapping.canonical_team_one_id,
-                  mapping.canonical_team_one_name,
-                  mapping.canonical_team_two_id,
-                  mapping.canonical_team_two_name,
+                  {mapping_projection},
                   {reconciliation_select}
              FROM shadow_orders AS o
              JOIN shadow_map_attempts AS attempt ON attempt.order_key=o.order_key
              LEFT JOIN settlements AS settlement
                ON settlement.order_key=o.order_key
-             LEFT JOIN strict_live_map_mappings AS mapping
-               ON mapping.mapping_id=o.strict_mapping_id
+             {mapping_join}
              {reconciliation_join}
-            WHERE NOT EXISTS (
-                SELECT 1 FROM vision_derived_invalidations AS invalidation
-                 WHERE invalidation.dependent_type='shadow_order'
-                   AND invalidation.dependent_key=o.order_key
-            )"""
-    ).fetchall()
+            WHERE {order_invalidation_filter}
+              AND {strict_order_filter}
+              AND NOT EXISTS (
+                SELECT 1 FROM vision_draft_anchors AS anchor
+                 WHERE anchor.raybet_match_id=o.raybet_match_id
+                   AND anchor.map_number=attempt.map_number
+                   AND anchor.status='conflict'
+                   AND (
+                         anchor.conflict_at IS NULL
+                         OR julianday(anchor.conflict_at) IS NULL
+                         OR julianday(o.signal_transport_at) IS NULL
+                         OR julianday(anchor.conflict_at)<=julianday(o.signal_transport_at)
+                         OR EXISTS (
+                              SELECT 1 FROM vision_draft_conflicts AS conflict
+                               WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                                 AND conflict.map_number=anchor.map_number
+                                 AND (
+                                       julianday(conflict.captured_at) IS NULL
+                                       OR julianday(conflict.captured_at)
+                                            <=julianday(o.signal_transport_at)
+                                 )
+                         )
+                   )
+                )"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        orders = connection.execute(
+            f"""SELECT o.*, attempt.map_number AS attempt_map_number,
+                  settlement.result, settlement.return_units,
+                  settlement.settled_at, settlement.review_required,
+                  {mapping_projection},
+                  {reconciliation_select}
+             FROM shadow_orders AS o
+             JOIN shadow_map_attempts AS attempt ON attempt.order_key=o.order_key
+             LEFT JOIN settlements AS settlement
+               ON settlement.order_key=o.order_key
+             {mapping_join}
+            {reconciliation_join}
+             WHERE {order_invalidation_filter}
+               AND {strict_order_filter}
+               AND 0"""
+        ).fetchall()
     decision_index = _decision_index(decisions)
     cohorts = _evaluation_cohorts(
         orders,
@@ -137,6 +282,17 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         else:
             settled += 1
         summary_rows.append(summary)
+    order_audit = _order_audit_counts(
+        connection,
+        included_order_count=len(orders),
+        scored_order_count=settled,
+        strict_gate=order_strict_gate,
+    )
+    decision_audit = _decision_audit_counts(
+        connection,
+        included_decision_count=len(decisions),
+        strict_gate=decision_strict_gate,
+    )
     headline = cohorts[0] if len(cohorts) == 1 and cohorts[0]["identity_complete"] else None
     outbox = _group_counts(connection, "notification_outbox", "status")
     reconciliation = _settlement_reconciliation_counts(connection)
@@ -157,9 +313,30 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         strict_counts = {"accepted_mappings": 0, "mapping_audits": 0}
     return {
         "decision_count": len(decisions),
-        "invalidated_decision_count": _invalidated_count(
-            connection, "strategy_decision"
-        ),
+        "decision_audit": decision_audit,
+        "raw_decision_count": decision_audit["raw_decisions"],
+        "included_decision_count": decision_audit["included_decisions"],
+        "invalidated_decision_count": decision_audit["invalidated_decisions"],
+        "strict_mapping_invalidated_decision_count": decision_audit[
+            "strict_mapping_invalidated_decisions"
+        ],
+        "strict_mapping_unverifiable_decision_count": decision_audit[
+            "strict_mapping_unverifiable_decisions"
+        ],
+        "draft_conflict_decision_count": decision_audit[
+            "draft_conflict_decisions"
+        ],
+        "order_audit": order_audit,
+        # Flat aliases keep the two safety-critical counts discoverable for
+        # consumers that do not yet understand the nested audit object.
+        "invalidated_order_count": order_audit["invalidated_orders"],
+        "strict_mapping_invalidated_order_count": order_audit[
+            "strict_mapping_invalidated_orders"
+        ],
+        "strict_mapping_unverifiable_order_count": order_audit[
+            "strict_mapping_unverifiable_orders"
+        ],
+        "review_required_order_count": order_audit["review_required_orders"],
         "eligible_decisions": sum(int(row["eligible"]) for row in decisions),
         "decision_reasons": dict(sorted(reasons.items())),
         "orders": shadow_summary(summary_rows),
@@ -480,6 +657,16 @@ def _vision_quality_index(
                                OR julianday(anchor.conflict_at) IS NULL
                                OR julianday(anchor.conflict_at)<=
                                   julianday(observation.captured_at)
+                               OR EXISTS (
+                                    SELECT 1 FROM vision_draft_conflicts AS conflict
+                                     WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                                       AND conflict.map_number=anchor.map_number
+                                       AND (
+                                             julianday(conflict.captured_at) IS NULL
+                                             OR julianday(conflict.captured_at)<=
+                                                julianday(observation.captured_at)
+                                       )
+                               )
                          )
                   )
                   AND NOT EXISTS (
@@ -1048,7 +1235,9 @@ def _settlement_reconciliation_counts(
     return counts
 
 
-def _invalidated_count(connection: sqlite3.Connection, dependent_type: str) -> int:
+def _invalidated_count(
+    connection: sqlite3.Connection, dependent_type: str
+) -> int | None:
     try:
         return int(
             connection.execute(
@@ -1058,7 +1247,301 @@ def _invalidated_count(connection: sqlite3.Connection, dependent_type: str) -> i
             ).fetchone()[0]
         )
     except sqlite3.OperationalError:
-        return 0
+        return None
+
+
+def _decision_audit_counts(
+    connection: sqlite3.Connection,
+    *,
+    included_decision_count: int,
+    strict_gate: StrictReadGate,
+) -> dict[str, object]:
+    """Expose raw and excluded decision denominators without changing metrics."""
+    invalidation_available = _table_exists(
+        connection, "vision_derived_invalidations"
+    )
+    conflict_available = (
+        _table_exists(connection, "vision_draft_anchors")
+        and _table_exists(connection, "vision_draft_conflicts")
+    )
+    unknown_reasons: list[str] = []
+    if not invalidation_available:
+        unknown_reasons.append("vision_derived_invalidations_table_missing")
+    if not conflict_available:
+        unknown_reasons.append("vision_draft_conflict_tables_missing")
+    unknown_reasons.extend(strict_gate.unknown_reasons)
+    invalidated_expr = (
+        "EXISTS ("
+        "SELECT 1 FROM vision_derived_invalidations AS invalidation "
+        "WHERE invalidation.dependent_type='strategy_decision' "
+        "AND invalidation.dependent_key=decision.decision_key)"
+        if invalidation_available
+        else "0"
+    )
+    conflict_expr = (
+        "EXISTS ("
+        "SELECT 1 FROM vision_draft_anchors AS anchor "
+        "WHERE anchor.raybet_match_id=decision.raybet_match_id "
+        "AND anchor.map_number=decision.map_number "
+        "AND anchor.status='conflict' "
+        "AND ("
+        "anchor.conflict_at IS NULL "
+        "OR julianday(anchor.conflict_at) IS NULL "
+        "OR julianday(decision.decided_at) IS NULL "
+        "OR julianday(anchor.conflict_at)<=julianday(decision.decided_at) "
+        "OR EXISTS ("
+        "SELECT 1 FROM vision_draft_conflicts AS conflict "
+        "WHERE conflict.raybet_match_id=anchor.raybet_match_id "
+        "AND conflict.map_number=anchor.map_number "
+        "AND (julianday(conflict.captured_at) IS NULL "
+        "OR julianday(conflict.captured_at)<=julianday(decision.decided_at))"
+        ")"
+        ")"
+        ")"
+        if conflict_available
+        else "0"
+    )
+    strict_mapping_expr = strict_gate.invalidated_sql
+    strict_unverifiable_expr = strict_gate.unverifiable_sql
+    try:
+        row = connection.execute(
+            f"""WITH decision_audit AS (
+                    SELECT decision.decision_key,
+                           CASE WHEN {invalidated_expr}
+                                THEN 1 ELSE 0 END AS invalidated,
+                           CASE WHEN {conflict_expr}
+                                THEN 1 ELSE 0 END AS draft_conflict,
+                           CASE WHEN {strict_mapping_expr}
+                                THEN 1 ELSE 0 END AS strict_mapping_invalidated,
+                           CASE WHEN {strict_unverifiable_expr}
+                                THEN 1 ELSE 0 END AS strict_mapping_unverifiable
+                      FROM strategy_decisions AS decision
+                )
+                SELECT COUNT(*) AS raw_decisions,
+                       COALESCE(SUM(invalidated), 0) AS invalidated_decisions,
+                       COALESCE(SUM(draft_conflict), 0)
+                            AS draft_conflict_decisions,
+                       COALESCE(SUM(strict_mapping_invalidated), 0)
+                            AS strict_mapping_invalidated_decisions,
+                       COALESCE(SUM(strict_mapping_unverifiable), 0)
+                            AS strict_mapping_unverifiable_decisions,
+                       COALESCE(SUM(
+                           CASE WHEN invalidated=1 OR draft_conflict=1
+                                     OR strict_mapping_invalidated=1
+                                     OR strict_mapping_unverifiable=1
+                                THEN 1 ELSE 0 END
+                       ), 0) AS excluded_decisions
+                  FROM decision_audit"""
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is None:
+        unknown_reasons.append("decision_audit_query_failed")
+        raw = invalidated = draft_conflict = strict_mapping_invalidated = None
+        strict_mapping_unverifiable = excluded = None
+    else:
+        raw = int(row["raw_decisions"])
+        invalidated = int(row["invalidated_decisions"])
+        draft_conflict = int(row["draft_conflict_decisions"])
+        strict_mapping_invalidated = int(
+            row["strict_mapping_invalidated_decisions"]
+        )
+        strict_mapping_unverifiable = int(
+            row["strict_mapping_unverifiable_decisions"]
+        )
+        excluded = int(row["excluded_decisions"])
+        if not invalidation_available:
+            invalidated = None
+        if not conflict_available:
+            draft_conflict = None
+        if not strict_gate.available:
+            strict_mapping_invalidated = None
+        if (
+            invalidated is None
+            or draft_conflict is None
+            or strict_mapping_invalidated is None
+        ):
+            excluded = (
+                raw - included_decision_count
+                if not strict_gate.available and raw is not None
+                else None
+            )
+    return {
+        "status": "available" if not unknown_reasons else "unavailable",
+        "unknown_reasons": unknown_reasons,
+        "raw_decisions": raw,
+        "included_decisions": int(included_decision_count),
+        "excluded_decisions": excluded,
+        "invalidated_decisions": invalidated,
+        "draft_conflict_decisions": draft_conflict,
+        "strict_mapping_invalidated_decisions": strict_mapping_invalidated,
+        "strict_mapping_unverifiable_decisions": strict_mapping_unverifiable,
+        "exclusion_reasons": {
+            "vision_derived_invalidation": invalidated,
+            "vision_draft_conflict": draft_conflict,
+            "strict_mapping_invalidated": strict_mapping_invalidated,
+            "strict_mapping_unverifiable": strict_mapping_unverifiable,
+        },
+    }
+
+
+def _order_audit_counts(
+    connection: sqlite3.Connection,
+    *,
+    included_order_count: int,
+    scored_order_count: int,
+    strict_gate: StrictReadGate,
+) -> dict[str, object]:
+    """Return report denominators and fail-closed order audit counts.
+
+    Evaluation deliberately omits orders whose causal vision evidence was
+    invalidated or whose signal predates a draft conflict.  Those rows still
+    need an explicit denominator and reason count so a report cannot make an
+    invalidation look like an ordinary missing order.  Review-required orders
+    remain in the operational order list but are excluded from scored
+    outcomes; count them independently for the same reason.  Missing audit
+    tables or a failed audit query produce ``unavailable``/``null`` values,
+    never a fabricated zero.
+    """
+    invalidation_available = _table_exists(
+        connection, "vision_derived_invalidations"
+    )
+    conflict_available = (
+        _table_exists(connection, "vision_draft_anchors")
+        and _table_exists(connection, "vision_draft_conflicts")
+    )
+    unknown_reasons: list[str] = []
+    if not invalidation_available:
+        unknown_reasons.append("vision_derived_invalidations_table_missing")
+    if not conflict_available:
+        unknown_reasons.append("vision_draft_conflict_tables_missing")
+    unknown_reasons.extend(strict_gate.unknown_reasons)
+    invalidated_expr = (
+        "EXISTS ("
+        "SELECT 1 FROM vision_derived_invalidations AS invalidation "
+        "WHERE invalidation.dependent_type='shadow_order' "
+        "AND invalidation.dependent_key=o.order_key)"
+        if invalidation_available
+        else "0"
+    )
+    conflict_expr = (
+        "EXISTS ("
+        "SELECT 1 FROM vision_draft_anchors AS anchor "
+        "WHERE anchor.raybet_match_id=o.raybet_match_id "
+        "AND anchor.map_number=attempt.map_number "
+        "AND anchor.status='conflict' "
+        "AND ("
+        "anchor.conflict_at IS NULL "
+        "OR julianday(anchor.conflict_at) IS NULL "
+        "OR julianday(o.signal_transport_at) IS NULL "
+        "OR julianday(anchor.conflict_at)<=julianday(o.signal_transport_at) "
+        "OR EXISTS ("
+        "SELECT 1 FROM vision_draft_conflicts AS conflict "
+        "WHERE conflict.raybet_match_id=anchor.raybet_match_id "
+        "AND conflict.map_number=anchor.map_number "
+        "AND (julianday(conflict.captured_at) IS NULL "
+        "OR julianday(conflict.captured_at)<=julianday(o.signal_transport_at))"
+        ")"
+        ")"
+        ")"
+        if conflict_available
+        else "0"
+    )
+    strict_mapping_expr = strict_gate.invalidated_sql
+    strict_unverifiable_expr = strict_gate.unverifiable_sql
+    try:
+        row = connection.execute(
+            f"""WITH order_audit AS (
+                    SELECT o.order_key,
+                           CASE WHEN {invalidated_expr}
+                                THEN 1 ELSE 0 END AS invalidated,
+                           CASE WHEN {conflict_expr}
+                                THEN 1 ELSE 0 END AS draft_conflict,
+                           CASE WHEN {strict_mapping_expr}
+                                THEN 1 ELSE 0 END AS strict_mapping_invalidated,
+                           CASE WHEN {strict_unverifiable_expr}
+                                THEN 1 ELSE 0 END AS strict_mapping_unverifiable,
+                           settlement.review_required,
+                           settlement.result
+                      FROM shadow_orders AS o
+                      JOIN shadow_map_attempts AS attempt
+                        ON attempt.order_key=o.order_key
+                      LEFT JOIN settlements AS settlement
+                        ON settlement.order_key=o.order_key
+                )
+                SELECT COUNT(*) AS total_orders,
+                       COALESCE(SUM(invalidated), 0) AS invalidated_orders,
+                       COALESCE(SUM(draft_conflict), 0) AS draft_conflict_orders,
+                       COALESCE(SUM(strict_mapping_invalidated), 0)
+                           AS strict_mapping_invalidated_orders,
+                       COALESCE(SUM(strict_mapping_unverifiable), 0)
+                           AS strict_mapping_unverifiable_orders,
+                       COALESCE(SUM(
+                           CASE WHEN invalidated=1 OR draft_conflict=1
+                                     OR strict_mapping_invalidated=1
+                                     OR strict_mapping_unverifiable=1
+                                THEN 1 ELSE 0 END
+                       ), 0) AS excluded_orders,
+                       COALESCE(SUM(
+                           CASE WHEN review_required=1 OR result='review'
+                                THEN 1 ELSE 0 END
+                       ), 0) AS review_required_orders
+                  FROM order_audit"""
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is None:
+        unknown_reasons.append("order_audit_query_failed")
+        total = invalidated = draft_conflict = None
+        strict_mapping_invalidated = strict_mapping_unverifiable = None
+        excluded = review_required = None
+    else:
+        total = int(row["total_orders"])
+        invalidated = int(row["invalidated_orders"])
+        draft_conflict = int(row["draft_conflict_orders"])
+        strict_mapping_invalidated = int(
+            row["strict_mapping_invalidated_orders"]
+        )
+        strict_mapping_unverifiable = int(
+            row["strict_mapping_unverifiable_orders"]
+        )
+        excluded = int(row["excluded_orders"])
+        review_required = int(row["review_required_orders"])
+        if not invalidation_available:
+            invalidated = None
+        if not conflict_available:
+            draft_conflict = None
+        if not strict_gate.available:
+            strict_mapping_invalidated = None
+        if (
+            invalidated is None
+            or draft_conflict is None
+            or strict_mapping_invalidated is None
+        ):
+            excluded = (
+                total - included_order_count
+                if not strict_gate.available and total is not None
+                else None
+            )
+    return {
+        "status": "available" if not unknown_reasons else "unavailable",
+        "unknown_reasons": unknown_reasons,
+        "total_orders": total,
+        "included_orders": int(included_order_count),
+        "scored_orders": int(scored_order_count),
+        "excluded_orders": excluded,
+        "invalidated_orders": invalidated,
+        "draft_conflict_orders": draft_conflict,
+        "strict_mapping_invalidated_orders": strict_mapping_invalidated,
+        "strict_mapping_unverifiable_orders": strict_mapping_unverifiable,
+        "review_required_orders": review_required,
+        "exclusion_reasons": {
+            "vision_derived_invalidation": invalidated,
+            "vision_draft_conflict": draft_conflict,
+            "strict_mapping_invalidated": strict_mapping_invalidated,
+            "strict_mapping_unverifiable": strict_mapping_unverifiable,
+        },
+    }
 
 
 def _drawdown(rows: Sequence[Mapping[str, object]]) -> float:

@@ -112,6 +112,9 @@ def build_monitor_snapshot(
     health = derive_health(connection, now=checked_at)
     matches = monitor_matches(connection, now=checked_at)
     alerts = active_alerts(connection)
+    all_counts = _lifecycle_counts(matches)
+    live_view = [item for item in matches if not _is_historical_match(item)]
+    history_view = [item for item in matches if _is_historical_match(item)]
     return {
         "generated_at": checked_at.isoformat(),
         "cursor": monitor_cursor(connection),
@@ -120,11 +123,12 @@ def build_monitor_snapshot(
         "matches": matches,
         "alerts": alerts,
         "summary": {
-            "total": len(matches),
-            "upcoming": sum(item["lifecycle"] == "upcoming" for item in matches),
-            "live": sum(item["lifecycle"] == "live" for item in matches),
-            "degraded": sum(item["lifecycle"] == "degraded" for item in matches),
-            "ended": sum(item["lifecycle"] == "ended" for item in matches),
+            **all_counts,
+            # Keep the original all-match counters for older clients.  The
+            # view-specific counters prevent a history-eligible degraded match
+            # from inflating the live dashboard's degraded badge.
+            "live_view": _lifecycle_counts(live_view),
+            "history_view": _lifecycle_counts(history_view),
             "unhealthy_components": sum(
                 item["status"] in {"degraded", "unhealthy", "stopped"}
                 for item in health
@@ -162,7 +166,7 @@ def monitor_matches(
     output.sort(
         key=lambda item: (
             lifecycle_order.get(str(item["lifecycle"]), 9),
-            str(item.get("scheduled_at") or ""),
+            _match_time_sort_value(item, descending=_is_historical_match(item)),
             str(item["raybet_match_id"]),
         )
     )
@@ -329,7 +333,23 @@ def monitor_cursor(connection: sqlite3.Connection) -> str:
         "match": _max_value(connection, "raybet_matches", "updated_at"),
         "odds": _max_value(connection, "odds_snapshots", "id"),
         "transport": _latest_transport_identity(connection),
-        "vision": _max_value(connection, "vision_observations", "captured_at"),
+        "vision": _vision_revision(connection),
+        "vision_invalidation": _append_only_revision(
+            connection,
+            "vision_observation_invalidations",
+            time_column="invalidated_at",
+        ),
+        "vision_draft_conflict": _append_only_revision(
+            connection,
+            "vision_draft_conflicts",
+            id_column="conflict_id",
+            time_column="recorded_at",
+        ),
+        "vision_derived_invalidation": _append_only_revision(
+            connection,
+            "vision_derived_invalidations",
+            time_column="recorded_at",
+        ),
         "decision": _max_value(connection, "strategy_decisions", "decided_at"),
         "health": _max_value(connection, "service_health", "updated_at"),
         "mapping": mapping_revision(connection),
@@ -341,6 +361,12 @@ def monitor_cursor(connection: sqlite3.Connection) -> str:
 
 
 def mapping_revision(connection: sqlite3.Connection) -> str:
+    try:
+        impact_revision = _max_value(
+            connection, "strict_live_mapping_impacts", "impact_id"
+        )
+    except sqlite3.OperationalError:
+        impact_revision = "unavailable"
     values = {
         "mapping": _max_value(connection, "strict_live_map_mappings", "mapping_id"),
         "approval": _max_value(
@@ -349,6 +375,7 @@ def mapping_revision(connection: sqlite3.Connection) -> str:
         "invalidation": _max_value(
             connection, "strict_live_map_mapping_invalidations", "invalidation_id"
         ),
+        "impact": impact_revision,
     }
     payload = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -390,33 +417,46 @@ def _monitor_match(
               AND anchor.map_number=observation.map_number
               AND (
                     anchor.status='anchored'
-                    OR (
-                        anchor.status='conflict'
-                        AND anchor.conflict_at IS NOT NULL
-                        AND julianday(anchor.conflict_at) IS NOT NULL
-                        AND julianday(anchor.conflict_at)>julianday(?)
-                    )
+                     OR (
+                         anchor.status='conflict'
+                         AND anchor.conflict_at IS NOT NULL
+                         AND julianday(anchor.conflict_at) IS NOT NULL
+                         AND julianday(anchor.conflict_at)>julianday(?)
+                         AND NOT EXISTS (
+                             SELECT 1 FROM vision_draft_conflicts AS conflict
+                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                                AND conflict.map_number=anchor.map_number
+                                AND (
+                                      julianday(conflict.captured_at) IS NULL
+                                      OR julianday(conflict.captured_at)<=julianday(?)
+                                )
+                         )
+                     )
               )
             WHERE observation.raybet_match_id=?
               AND julianday(observation.captured_at)<=julianday(?)
-            ORDER BY observation.captured_at DESC LIMIT 1""",
-        (now.isoformat(), match_id, now.isoformat()),
-    )
-    latest_decision = _latest_row(
-        connection,
-        """SELECT decided_at AS observed_at, map_number, model_probability,
-                  market_probability, edge, eligible, reason, strategy_version
-             FROM strategy_decisions AS decision
-            WHERE raybet_match_id=?
               AND NOT EXISTS (
-                  SELECT 1 FROM vision_derived_invalidations AS invalidation
-                   WHERE invalidation.dependent_type='strategy_decision'
-                     AND invalidation.dependent_key=decision.decision_key
+                  SELECT 1
+                    FROM vision_observation_invalidations AS invalidation
+                    JOIN vision_observations AS invalidated
+                      ON invalidated.raybet_match_id=invalidation.raybet_match_id
+                     AND invalidated.captured_at=invalidation.captured_at
+                     AND invalidated.source_frame_ref=invalidation.source_frame_ref
+                   WHERE invalidated.raybet_match_id=observation.raybet_match_id
+                     AND invalidated.map_number=observation.map_number
+                     AND (
+                           julianday(invalidation.captured_at) IS NULL
+                           OR julianday(observation.captured_at) IS NULL
+                           OR julianday(invalidation.captured_at)>=
+                              julianday(observation.captured_at)
+                     )
               )
-            ORDER BY decided_at DESC LIMIT 1""",
-        (match_id,),
+            ORDER BY observation.captured_at DESC LIMIT 1""",
+         (now.isoformat(), now.isoformat(), match_id, now.isoformat()),
     )
+    latest_decision = _latest_strategy_decision(connection, match_id)
     mapping_readiness = _mapping_readiness(connection, match_id, now)
+    latest_odds_activity = _latest_odds_activity(connection, match_id)
 
     odds_readiness = _freshness(latest_odds, now, warning=15.0, stale=60.0)
     vision_readiness = _freshness(latest_vision, now, warning=20.0, stale=120.0)
@@ -445,6 +485,7 @@ def _monitor_match(
         lifecycle,
         row["scheduled_at"],
         row["updated_at"],
+        odds_activity_at=latest_odds_activity,
         checked_at=now,
     )
     return {
@@ -457,6 +498,9 @@ def _monitor_match(
         "provider_status": str(row["status"] or ""),
         "live_url": row["live_url"],
         "updated_at": row["updated_at"],
+        "latest_odds_activity_at": (
+            latest_odds_activity.isoformat() if latest_odds_activity else None
+        ),
         "lifecycle": lifecycle,
         "history_eligible": history_eligible,
         "winner": current_winner,
@@ -524,29 +568,53 @@ def _current_winner(
                 WHERE raybet_match_id=? LIMIT 1""",
             (raybet_match_id,),
         ).fetchone() is not None
-        quotes = _rows(
-            connection,
-            """SELECT outcome.observation_key, outcome.odds_group_id,
+    except sqlite3.OperationalError:
+        try:
+            transport_relation_exists = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                    WHERE type IN ('table', 'view')
+                      AND name='odds_transport_observations'"""
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            return None
+        if transport_relation_exists:
+            return None
+        has_transport = False
+
+    if has_transport:
+        try:
+            quotes = _rows(
+                connection,
+                """WITH recent_transport AS (
+                   SELECT observation_key, observed_at
+                     FROM odds_transport_observations
+                    WHERE raybet_match_id=?
+                      AND timing_status='on_time'
+                      AND processing_status='processed'
+                    ORDER BY observed_at DESC, observation_key DESC
+                    LIMIT 16
+               )
+               SELECT outcome.observation_key, outcome.odds_group_id,
                       outcome.side, outcome.price, outcome.status,
-                      outcome.period, transport.observed_at AS received_at,
+                      outcome.period, recent_transport.observed_at AS received_at,
                       outcome.odds_id AS id
-                 FROM odds_transport_observations AS transport
+                 FROM recent_transport
                  JOIN odds_response_outcomes AS outcome
-                   ON outcome.observation_key=transport.observation_key
+                      INDEXED BY sqlite_autoindex_odds_response_outcomes_1
+                   ON outcome.observation_key=recent_transport.observation_key
                 WHERE outcome.raybet_match_id=?
                   AND outcome.market_type='winner'
                   AND outcome.supported=1
-                  AND transport.timing_status='on_time'
-                  AND transport.processing_status='processed'
-                ORDER BY transport.observed_at DESC,
-                         transport.observation_key DESC, outcome.odds_id DESC""",
-            (raybet_match_id,),
-        )
-    except sqlite3.OperationalError:
-        has_transport = False
-        quotes = []
-    exact_responses = has_transport
-    if not exact_responses:
+                ORDER BY recent_transport.observed_at DESC,
+                         recent_transport.observation_key DESC,
+                         outcome.odds_id DESC""",
+                (raybet_match_id, raybet_match_id),
+            )
+        except sqlite3.OperationalError:
+            # Once exact transport membership exists, a malformed response
+            # schema cannot be replaced by carried-forward legacy snapshots.
+            return None
+    else:
         quotes = _rows(
             connection,
             """SELECT NULL AS observation_key, odds_group_id,
@@ -556,6 +624,7 @@ def _current_winner(
                 ORDER BY received_at DESC, id DESC""",
             (raybet_match_id,),
         )
+    exact_responses = has_transport
     if not quotes:
         return None
     grouped: dict[tuple[str, str, str], dict[str, sqlite3.Row]] = defaultdict(dict)
@@ -645,26 +714,110 @@ def _strategy_decisions(
     connection: sqlite3.Connection,
     raybet_match_id: str,
 ) -> list[dict[str, Any]]:
-    return [
-        dict(row)
-        for row in _rows(
-            connection,
+    try:
+        rows = connection.execute(
             """SELECT decision.decision_key, decision.map_number,
                       decision.decided_at, decision.underdog_side,
                       market_probability, model_probability, edge, data_quality,
                       eligible, decision.reason, contributions_json, input_ref,
-                      strategy_version,
-                      CASE WHEN invalidation.dependent_key IS NULL THEN 0 ELSE 1 END
-                          AS vision_invalidated
+                      strategy_version
                  FROM strategy_decisions AS decision
-                 LEFT JOIN vision_derived_invalidations AS invalidation
-                   ON invalidation.dependent_type='strategy_decision'
-                  AND invalidation.dependent_key=decision.decision_key
                 WHERE decision.raybet_match_id=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vision_derived_invalidations AS invalidation
+                       WHERE invalidation.dependent_type='strategy_decision'
+                         AND invalidation.dependent_key=decision.decision_key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM strict_live_mapping_impacts AS impact
+                       WHERE impact.dependent_type='strategy_decision'
+                         AND impact.dependent_key=decision.decision_key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM vision_draft_anchors AS anchor
+                       WHERE anchor.raybet_match_id=decision.raybet_match_id
+                         AND anchor.map_number=decision.map_number
+                         AND anchor.status='conflict'
+                         AND (
+                               anchor.conflict_at IS NULL
+                               OR julianday(anchor.conflict_at) IS NULL
+                               OR julianday(decision.decided_at) IS NULL
+                               OR julianday(anchor.conflict_at)<=
+                                  julianday(decision.decided_at)
+                               OR EXISTS (
+                                    SELECT 1
+                                      FROM vision_draft_conflicts AS conflict
+                                     WHERE conflict.raybet_match_id=
+                                           anchor.raybet_match_id
+                                       AND conflict.map_number=anchor.map_number
+                                       AND (
+                                             julianday(conflict.captured_at) IS NULL
+                                             OR julianday(conflict.captured_at)<=
+                                                julianday(decision.decided_at)
+                                       )
+                               )
+                         )
+                  )
                 ORDER BY decision.decided_at, decision.decision_key""",
             (raybet_match_id,),
-        )
-    ]
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(row) for row in rows]
+
+
+def _latest_strategy_decision(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+) -> sqlite3.Row | None:
+    try:
+        return connection.execute(
+            """SELECT decided_at AS observed_at, map_number, model_probability,
+                      market_probability, edge, eligible, reason, strategy_version
+                 FROM strategy_decisions AS decision
+                WHERE decision.raybet_match_id=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vision_derived_invalidations AS invalidation
+                       WHERE invalidation.dependent_type='strategy_decision'
+                         AND invalidation.dependent_key=decision.decision_key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM strict_live_mapping_impacts AS impact
+                       WHERE impact.dependent_type='strategy_decision'
+                         AND impact.dependent_key=decision.decision_key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM vision_draft_anchors AS anchor
+                       WHERE anchor.raybet_match_id=decision.raybet_match_id
+                         AND anchor.map_number=decision.map_number
+                         AND anchor.status='conflict'
+                         AND (
+                               anchor.conflict_at IS NULL
+                               OR julianday(anchor.conflict_at) IS NULL
+                               OR julianday(decision.decided_at) IS NULL
+                               OR julianday(anchor.conflict_at)<=
+                                  julianday(decision.decided_at)
+                               OR EXISTS (
+                                    SELECT 1
+                                      FROM vision_draft_conflicts AS conflict
+                                     WHERE conflict.raybet_match_id=
+                                           anchor.raybet_match_id
+                                       AND conflict.map_number=anchor.map_number
+                                       AND (
+                                             julianday(conflict.captured_at) IS NULL
+                                             OR julianday(conflict.captured_at)<=
+                                                julianday(decision.decided_at)
+                                       )
+                               )
+                         )
+                  )
+                ORDER BY decision.decided_at DESC LIMIT 1""",
+            (raybet_match_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
 
 
 def _vision_timeline(
@@ -740,6 +893,7 @@ def _history_eligible(
     scheduled_at: object,
     updated_at: object,
     *,
+    odds_activity_at: datetime | None = None,
     checked_at: datetime,
 ) -> bool:
     """Expose old odds for replay without claiming provider settlement."""
@@ -748,13 +902,94 @@ def _history_eligible(
     if lifecycle != "degraded":
         return False
     scheduled = _parse_schedule(scheduled_at)
-    activity = _parse_time(updated_at)
-    if scheduled is None or activity is None:
+    metadata_activity = _parse_time(updated_at)
+    if updated_at is not None and metadata_activity is None:
+        # An unparseable provider timestamp is not evidence of staleness.
         return False
+    activity_candidates = [
+        value
+        for value in (metadata_activity, odds_activity_at)
+        if value is not None
+    ]
+    if scheduled is None or not activity_candidates:
+        return False
+    activity = max(activity_candidates)
     return (
         scheduled <= checked_at - _HISTORY_SCHEDULE_GRACE
         and activity <= checked_at - _HISTORY_ACTIVITY_GRACE
     )
+
+
+def _latest_odds_activity(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+) -> datetime | None:
+    """Return the newest immutable odds activity for archive gating.
+
+    ``updated_at`` belongs to the match-list metadata and can remain stale
+    while the odds page continues emitting responses.  Both transport rows
+    and legacy normalized snapshots are considered; processing failures still
+    count as activity so a broken feed cannot be silently archived.
+    """
+
+    candidates: list[datetime] = []
+    transport = _latest_row(
+        connection,
+        """SELECT observed_at
+             FROM odds_transport_observations
+            WHERE raybet_match_id=?
+            ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
+        (raybet_match_id,),
+    )
+    if transport is not None:
+        parsed = _parse_time(transport["observed_at"])
+        if parsed is not None:
+            candidates.append(parsed)
+    snapshot = _latest_row(
+        connection,
+        """SELECT received_at
+             FROM odds_snapshots
+            WHERE raybet_match_id=?
+            ORDER BY received_at DESC, id DESC LIMIT 1""",
+        (raybet_match_id,),
+    )
+    if snapshot is not None:
+        parsed = _parse_time(snapshot["received_at"])
+        if parsed is not None:
+            candidates.append(parsed)
+    return max(candidates) if candidates else None
+
+
+def _is_historical_match(match: dict[str, Any]) -> bool:
+    return str(match.get("lifecycle")) == "ended" or bool(
+        match.get("history_eligible")
+    )
+
+
+def _lifecycle_counts(matches: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "total": len(matches),
+        "upcoming": sum(item.get("lifecycle") == "upcoming" for item in matches),
+        "live": sum(item.get("lifecycle") == "live" for item in matches),
+        "degraded": sum(item.get("lifecycle") == "degraded" for item in matches),
+        "ended": sum(item.get("lifecycle") == "ended" for item in matches),
+    }
+
+
+def _match_time_sort_value(
+    match: dict[str, Any],
+    *,
+    descending: bool,
+) -> float:
+    parsed = _parse_schedule(match.get("scheduled_at"))
+    if parsed is None:
+        parsed = _parse_time(match.get("updated_at"))
+    if parsed is None:
+        parsed = _parse_time(match.get("latest_odds_activity_at"))
+    if parsed is None:
+        return float("inf") if descending else float("-inf")
+    timestamp = parsed.timestamp()
+    return -timestamp if descending else timestamp
 
 
 def _parse_schedule(value: object) -> datetime | None:
@@ -816,6 +1051,49 @@ def _latest_transport_identity(connection: sqlite3.Connection) -> list[str] | No
     if row is None:
         return None
     return [str(row["observed_at"]), str(row["observation_key"])]
+
+
+def _vision_revision(connection: sqlite3.Connection) -> list[Any] | None:
+    try:
+        row = connection.execute(
+            """SELECT COUNT(*) AS row_count,
+                      COALESCE(SUM(CASE WHEN confirmed=1 THEN 1 ELSE 0 END), 0)
+                          AS confirmed_count,
+                      MAX(captured_at) AS latest_captured_at,
+                      MAX(CASE WHEN confirmed=1 THEN captured_at END)
+                          AS latest_confirmed_at
+                 FROM vision_observations"""
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return None
+        raise
+    if row is None:
+        return None
+    return [int(row[0]), int(row[1]), row[2], row[3]]
+
+
+def _append_only_revision(
+    connection: sqlite3.Connection,
+    table: str,
+    *,
+    time_column: str,
+    id_column: str = "rowid",
+) -> list[Any] | None:
+    try:
+        row = connection.execute(
+            f"""SELECT COUNT(*) AS row_count,
+                       MAX({id_column}) AS latest_id,
+                       MAX({time_column}) AS latest_at
+                  FROM {table}"""
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return None
+        raise
+    if row is None:
+        return None
+    return [int(row[0]), row[1], row[2]]
 
 
 def _rows(

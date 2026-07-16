@@ -14,7 +14,7 @@ from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
-from live_betting.shadow_monitor import _observation, run_once
+from live_betting.shadow_monitor import _observation, persist_alignments, run_once
 from live_betting.storage import LiveBettingStore
 from live_betting.strict_eligibility import (
     accept_strict_live_map_mapping,
@@ -146,6 +146,20 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         )
         init_strict_live_eligibility_schema(self.store.connection)
         self.store.connection.commit()
+        self.strict_mapping_context_patch = patch.object(
+            self.store,
+            "_strict_mapping_context_block_reason",
+            return_value=None,
+        )
+        self.strict_mapping_order_patch = patch.object(
+            self.store,
+            "_strict_mapping_block_reason_for_order",
+            return_value=None,
+        )
+        self.strict_mapping_context_patch.start()
+        self.strict_mapping_order_patch.start()
+        self.addCleanup(self.strict_mapping_order_patch.stop)
+        self.addCleanup(self.strict_mapping_context_patch.stop)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -167,7 +181,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         )
         return rows
 
-    def insert_pending(self, signaled_at: datetime) -> None:
+    def insert_pending(self, signaled_at: datetime) -> ShadowOrder:
         signal = self.record_transport(signaled_at, key="signal")[0]
         market = signal.market
         order = ShadowOrder(
@@ -189,6 +203,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         self.assertTrue(
             self.store.insert_map_order(order, 1, strict_mapping_id=1)
         )
+        return order
 
     def test_pending_fill_is_processed_without_any_vision(self) -> None:
         self.insert_pending(NOW)
@@ -416,6 +431,150 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         self.assertNotEqual(result["status"], "waiting_for_confirmed_vision")
         self.assertEqual(result["status"], "no_signal")
         self.assertEqual(result["reason"], "strict_live_ineligible")
+
+    def test_storage_rejects_decision_at_or_after_draft_conflict(self) -> None:
+        original = observation(NOW, frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=1),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        base = dict(
+            raybet_match_id="match-1",
+            map_number=1,
+            underdog_side="team_one",
+            market_probability=0.4,
+            model_probability=0.5,
+            edge=0.1,
+            data_quality=0.8,
+            eligible=True,
+            reason="eligible",
+            contributions={"draft": 0.1},
+            input_ref="input-1",
+            strategy_version="strategy-1",
+        )
+        self.assertTrue(
+            self.store.insert_decision(
+                SimpleNamespace(
+                    **base,
+                    decision_key="decision-before-conflict",
+                    decided_at=NOW,
+                )
+            )
+        )
+        self.assertFalse(
+            self.store.insert_decision(
+                SimpleNamespace(
+                    **{**base, "decision_key": "decision-after-conflict"},
+                    decided_at=NOW + timedelta(seconds=1),
+                )
+            )
+        )
+
+    def test_out_of_order_conflict_uses_earliest_capture_cutoff(self) -> None:
+        original = observation(NOW, frame="original")
+        first_conflict = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=10),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict-late",
+        )
+        earlier_conflict = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=5),
+            radiant_hero_ids=(1, 2, 3, 4, 7),
+            dire_hero_ids=(5, 6, 8, 9, 10),
+            source_frame_ref="conflict-earlier",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(first_conflict)
+        self.store.insert_vision_observation(earlier_conflict)
+        decision = SimpleNamespace(
+            decision_key="decision-out-of-order",
+            raybet_match_id="match-1",
+            map_number=1,
+            decided_at=NOW + timedelta(seconds=7),
+            underdog_side="team_one",
+            market_probability=0.4,
+            model_probability=0.5,
+            edge=0.1,
+            data_quality=0.8,
+            eligible=True,
+            reason="eligible",
+            contributions={"draft": 0.1},
+            input_ref="input-1",
+            strategy_version="strategy-1",
+        )
+
+        self.assertFalse(self.store.insert_decision(decision))
+
+    def test_out_of_order_conflict_is_excluded_from_causal_alignment_reads(self) -> None:
+        original = observation(NOW, frame="original")
+        first_conflict = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=10),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict-late",
+        )
+        earlier_conflict = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=5),
+            radiant_hero_ids=(1, 2, 3, 4, 7),
+            dire_hero_ids=(5, 6, 8, 9, 10),
+            source_frame_ref="conflict-earlier",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(first_conflict)
+        self.store.insert_vision_observation(earlier_conflict)
+        self.record_transport(NOW + timedelta(seconds=7), key="before-late-conflict")
+
+        self.assertEqual(
+            persist_alignments(
+                self.store, "match-1", as_of=NOW + timedelta(seconds=7)
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM odds_alignments"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_pending_successor_rechecks_conflict_before_filling(self) -> None:
+        order = self.insert_pending(NOW)
+        original = observation(NOW - timedelta(seconds=2), frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW - timedelta(seconds=1),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.record_transport(NOW + timedelta(seconds=2), key="successor")
+
+        resolved = self.store.process_pending_successor(
+            order, watermark=NOW + timedelta(seconds=2)
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.status, "rejected")
+        self.assertEqual(resolved.rejection_reason, "vision_draft_conflict")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM shadow_orders WHERE order_key='order-1'"
+            ).fetchone()[0],
+            "rejected",
+        )
 
     def test_transport_uses_latest_prior_vision_not_a_future_frame(self) -> None:
         self.store.insert_vision_observation(observation(NOW, frame="old"))

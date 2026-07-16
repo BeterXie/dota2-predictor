@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from live_betting.notifications import claim, mark_failure, mark_sent  # noqa: E402
+from live_betting.notifications import (  # noqa: E402
+    claim,
+    ensure_sendable,
+    mark_failure,
+    mark_sent,
+)
 from live_betting.health import record_health  # noqa: E402
 from live_betting.smtp_delivery import (  # noqa: E402
     SMTPConfig,
@@ -34,6 +39,15 @@ def run_once(store: LiveBettingStore, config: SMTPConfig) -> dict[str, object]:
     if record is None:
         return {"status": "idle"}
     assert record.lease_token is not None
+    if not ensure_sendable(
+        store.connection,
+        outbox_id=record.outbox_id,
+        lease_token=record.lease_token,
+    ):
+        return {
+            "status": "suppressed",
+            "outbox_id": record.outbox_id,
+        }
     try:
         send_message(record, config)
     except Exception as error:  # noqa: BLE001 - classify without logging secrets

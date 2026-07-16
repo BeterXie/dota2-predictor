@@ -15,10 +15,11 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from .models import LiveEvent, LiveFrame, Market, OddsSnapshot, ProviderMatch, ShadowOrder
 from .pricing import market_key
+from .sanitize import sanitize_raybet_payload
 from .strategy import attempt_fill, is_open
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 SCHEMA_SQL = """
@@ -485,6 +486,7 @@ CREATE TABLE IF NOT EXISTS vision_derived_invalidations (
     raybet_match_id TEXT NOT NULL,
     map_number INTEGER NOT NULL,
     reason TEXT NOT NULL,
+    block_reason TEXT NOT NULL DEFAULT 'vision_draft_conflict',
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (dependent_type, dependent_key)
 );
@@ -742,6 +744,103 @@ END;
 """
 
 
+def strict_mapping_context_block_reason(
+    connection: sqlite3.Connection,
+    *,
+    strict_mapping_id: int,
+    raybet_match_id: str,
+    map_number: int,
+    signal_transport_at: datetime | str,
+) -> str | None:
+    """Return a stable gate code for one causally bound strict mapping."""
+    try:
+        transport_at = (
+            signal_transport_at
+            if isinstance(signal_transport_at, datetime)
+            else datetime.fromisoformat(str(signal_transport_at).replace("Z", "+00:00"))
+        )
+        if transport_at.tzinfo is None or transport_at.utcoffset() is None:
+            return "strict_mapping_unverified"
+        transport_at = transport_at.astimezone(timezone.utc)
+        from .strict_eligibility import query_strict_live_eligibility
+
+        eligibility = query_strict_live_eligibility(
+            connection,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            transport_observed_at=transport_at,
+        )
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        return "strict_mapping_gate_unavailable"
+    if not eligibility.eligible:
+        if eligibility.reason in {
+            "mapping_invalidated",
+            "automatic_exact_approval_invalidated",
+        }:
+            return "strict_mapping_invalidated"
+        if eligibility.reason.endswith("_schema_missing"):
+            return "strict_mapping_gate_unavailable"
+        return "strict_mapping_unverified"
+    if (
+        eligibility.mapping is None
+        or eligibility.mapping.mapping_id != strict_mapping_id
+    ):
+        return "strict_mapping_unverified"
+    return None
+
+
+def strict_order_mapping_block_reason(
+    connection: sqlite3.Connection,
+    order_key: str,
+    *,
+    require_order: bool = False,
+) -> str | None:
+    """Apply the shared strict gate to a persisted order's causal inputs."""
+    try:
+        order = connection.execute(
+            """SELECT strict_mapping_id, raybet_match_id, signal_transport_at
+                 FROM shadow_orders WHERE order_key=?""",
+            (order_key,),
+        ).fetchone()
+    except sqlite3.Error:
+        return "strict_mapping_gate_unavailable"
+    if order is None:
+        return "strict_mapping_unverified" if require_order else None
+    if order["strict_mapping_id"] is None:
+        return None
+    try:
+        attempt = connection.execute(
+            "SELECT map_number FROM shadow_map_attempts WHERE order_key=?",
+            (order_key,),
+        ).fetchone()
+        if attempt is None:
+            return "strict_mapping_unverified"
+        impacted = connection.execute(
+            """SELECT 1 FROM strict_live_mapping_impacts
+                WHERE dependent_type='shadow_order' AND dependent_key=?
+                LIMIT 1""",
+            (order_key,),
+        ).fetchone()
+    except sqlite3.Error:
+        return "strict_mapping_gate_unavailable"
+    if impacted is not None:
+        return "strict_mapping_invalidated"
+    try:
+        strict_mapping_id = int(order["strict_mapping_id"])
+        map_number = int(attempt["map_number"])
+    except (TypeError, ValueError, OverflowError):
+        return "strict_mapping_unverified"
+    if strict_mapping_id <= 0 or map_number <= 0:
+        return "strict_mapping_unverified"
+    return strict_mapping_context_block_reason(
+        connection,
+        strict_mapping_id=strict_mapping_id,
+        raybet_match_id=str(order["raybet_match_id"]),
+        map_number=map_number,
+        signal_transport_at=order["signal_transport_at"],
+    )
+
+
 class LiveBettingStore:
     def __init__(
         self,
@@ -759,7 +858,11 @@ class LiveBettingStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
-        self.connection.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(
+            self.connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if journal_mode != "wal":
+            self.connection.execute("PRAGMA journal_mode=WAL")
         self._transaction_depth = 0
         self._savepoint_sequence = 0
 
@@ -777,6 +880,7 @@ class LiveBettingStore:
         self._reject_future_schema()
         self.connection.executescript(SCHEMA_SQL)
         self._migrate_shadow_order_signal_fields()
+        self._migrate_vision_derived_invalidation_fields()
         self.connection.commit()
         columns = {row[1] for row in self.connection.execute(
             "PRAGMA table_info(vision_observations)"
@@ -1056,6 +1160,21 @@ class LiveBettingStore:
             """
         )
 
+    def _migrate_vision_derived_invalidation_fields(self) -> None:
+        """Add a stable gate code to invalidation rows from older schemas."""
+        columns = {
+            str(row[1])
+            for row in self.connection.execute(
+                "PRAGMA table_info(vision_derived_invalidations)"
+            )
+        }
+        if "block_reason" not in columns:
+            self.connection.execute(
+                """ALTER TABLE vision_derived_invalidations
+                   ADD COLUMN block_reason TEXT NOT NULL
+                   DEFAULT 'vision_draft_conflict'"""
+            )
+
     @staticmethod
     def json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -1132,6 +1251,253 @@ class LiveBettingStore:
             return value.isoformat()
         return str(value)
 
+    def _draft_conflict_state(
+        self, raybet_match_id: str, map_number: int,
+    ) -> tuple[bool, str | None]:
+        """Return whether a map has a draft conflict and its earliest cutoff.
+
+        Conflict rows can arrive out of capture order.  The anchor keeps its
+        original identity immutable, so causal readers derive the cutoff from
+        every append-only conflict row and fail closed on malformed timestamps.
+        """
+        try:
+            anchor = self.connection.execute(
+                """SELECT status, conflict_at FROM vision_draft_anchors
+                    WHERE raybet_match_id=? AND map_number=?""",
+                (raybet_match_id, map_number),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return True, None
+        if anchor is None or str(anchor["status"]) != "conflict":
+            return False, None
+        values: list[str] = []
+        if anchor["conflict_at"] is not None:
+            values.append(str(anchor["conflict_at"]))
+        try:
+            rows = self.connection.execute(
+                """SELECT captured_at FROM vision_draft_conflicts
+                    WHERE raybet_match_id=? AND map_number=?
+                    ORDER BY conflict_id""",
+                (raybet_match_id, map_number),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return True, None
+        values.extend(str(row["captured_at"]) for row in rows)
+        if not values:
+            return True, None
+        parsed: list[tuple[datetime, str]] = []
+        for value in values:
+            try:
+                timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return True, None
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                return True, None
+            parsed.append((timestamp.astimezone(timezone.utc), timestamp.astimezone(timezone.utc).isoformat()))
+        return True, min(parsed)[1]
+
+    def _draft_conflict_at_or_before(
+        self,
+        raybet_match_id: str,
+        map_number: int,
+        at: datetime | str | None,
+    ) -> bool:
+        conflicted, cutoff = self._draft_conflict_state(raybet_match_id, map_number)
+        if conflicted:
+            if cutoff is None or at is None:
+                return True
+            try:
+                target = datetime.fromisoformat(
+                    self._iso(at).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                return True
+            if target.tzinfo is None or target.utcoffset() is None:
+                return True
+            if datetime.fromisoformat(cutoff) <= target.astimezone(timezone.utc):
+                return True
+        return self._vision_observation_invalidated_at_or_before(
+            raybet_match_id, map_number, at
+        )
+
+    def _vision_observation_invalidated_at_or_before(
+        self,
+        raybet_match_id: str,
+        map_number: int,
+        at: datetime | str | None,
+    ) -> bool:
+        """Fail closed when no trusted frame survives an observation audit.
+
+        An invalidated frame does not permanently poison a map: a later
+        confirmed frame can restore the causal stream.  Until such a frame is
+        present at the requested event-time cutoff, new derived writes remain
+        blocked.
+        """
+        try:
+            rows = self.connection.execute(
+                """SELECT invalidation.captured_at
+                     FROM vision_observation_invalidations AS invalidation
+                     JOIN vision_observations AS observation
+                       ON observation.raybet_match_id=invalidation.raybet_match_id
+                      AND observation.captured_at=invalidation.captured_at
+                      AND observation.source_frame_ref=invalidation.source_frame_ref
+                    WHERE invalidation.raybet_match_id=?
+                      AND observation.map_number=?""",
+                (raybet_match_id, map_number),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # A missing or unreadable audit table cannot prove that the
+            # lineage is clean.  All causal writers must fail closed until
+            # schema repair/migration has completed.
+            return True
+        if not rows:
+            return False
+        if at is None:
+            return True
+        try:
+            target = datetime.fromisoformat(
+                self._iso(at).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return True
+        if target.tzinfo is None or target.utcoffset() is None:
+            return True
+        target = target.astimezone(timezone.utc)
+        invalidated: list[datetime] = []
+        for row in rows:
+            try:
+                captured = datetime.fromisoformat(
+                    str(row["captured_at"]).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                return True
+            if captured.tzinfo is None or captured.utcoffset() is None:
+                return True
+            captured = captured.astimezone(timezone.utc)
+            if captured <= target:
+                invalidated.append(captured)
+        if not invalidated:
+            return False
+        latest_invalidated = max(invalidated)
+        try:
+            valid_rows = self.connection.execute(
+                """SELECT observation.captured_at
+                     FROM vision_observations AS observation
+                    WHERE observation.raybet_match_id=?
+                      AND observation.map_number=?
+                      AND observation.confirmed=1
+                      AND julianday(observation.captured_at)<=julianday(?)
+                      AND NOT EXISTS (
+                           SELECT 1
+                             FROM vision_observation_invalidations AS invalidation
+                            WHERE invalidation.raybet_match_id=observation.raybet_match_id
+                              AND invalidation.captured_at=observation.captured_at
+                              AND invalidation.source_frame_ref=observation.source_frame_ref
+                      )
+                    ORDER BY observation.captured_at DESC""",
+                (raybet_match_id, map_number, target.isoformat()),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return True
+        for row in valid_rows:
+            try:
+                captured = datetime.fromisoformat(
+                    str(row["captured_at"]).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                return True
+            if captured.tzinfo is None or captured.utcoffset() is None:
+                return True
+            if captured.astimezone(timezone.utc) > latest_invalidated:
+                return False
+        return True
+
+    def _vision_derived_block_reason(self, order_key: str) -> str | None:
+        try:
+            row = self.connection.execute(
+                """SELECT block_reason FROM vision_derived_invalidations
+                    WHERE dependent_type='shadow_order' AND dependent_key=?
+                    LIMIT 1""",
+                (order_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Legacy databases may not have the stable gate-code column yet.
+            # The row itself is still a durable invalidation, so preserve the
+            # conservative draft-conflict fence until migration runs.
+            try:
+                row = self.connection.execute(
+                    """SELECT 1 FROM vision_derived_invalidations
+                        WHERE dependent_type='shadow_order'
+                          AND dependent_key=?
+                        LIMIT 1""",
+                    (order_key,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return "vision_draft_conflict"
+            return "vision_draft_conflict" if row is not None else None
+        if row is None:
+            return None
+        return str(row["block_reason"] or "vision_draft_conflict")
+
+    def vision_block_reason_for_order(self, order_key: str) -> str | None:
+        """Return the stable vision gate code that blocks one order lineage."""
+        derived = self._vision_derived_block_reason(order_key)
+        if derived is not None:
+            return derived
+        try:
+            row = self.connection.execute(
+                """SELECT orders.raybet_match_id, attempt.map_number,
+                          orders.signal_transport_at
+                     FROM shadow_orders AS orders
+                     JOIN shadow_map_attempts AS attempt
+                       ON attempt.order_key=orders.order_key
+                    WHERE orders.order_key=?""",
+                (order_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return "vision_draft_conflict"
+        if row is None:
+            return None
+        if self._vision_observation_invalidated_at_or_before(
+            str(row["raybet_match_id"]),
+            int(row["map_number"]),
+            row["signal_transport_at"],
+        ):
+            return "vision_observation_invalidated"
+        if self._draft_conflict_at_or_before(
+            str(row["raybet_match_id"]),
+            int(row["map_number"]),
+            row["signal_transport_at"],
+        ):
+            return "vision_draft_conflict"
+        return None
+
+    def _strict_mapping_context_block_reason(
+        self,
+        *,
+        strict_mapping_id: int,
+        raybet_match_id: str,
+        map_number: int,
+        signal_transport_at: datetime | str,
+    ) -> str | None:
+        return strict_mapping_context_block_reason(
+            self.connection,
+            strict_mapping_id=strict_mapping_id,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            signal_transport_at=signal_transport_at,
+        )
+
+    def _strict_mapping_block_reason_for_order(self, order_key: str) -> str | None:
+        return strict_order_mapping_block_reason(self.connection, order_key)
+
+    def order_block_reason(self, order_key: str) -> str | None:
+        """Return the first stable safety gate that blocks an order lineage."""
+        strict = self._strict_mapping_block_reason_for_order(order_key)
+        if strict is not None:
+            return strict
+        return self.vision_block_reason_for_order(order_key)
+
     @staticmethod
     def _scalar(value: Any) -> Any:
         return value.value if isinstance(value, Enum) else value
@@ -1146,14 +1512,21 @@ class LiveBettingStore:
               raw_json=excluded.raw_json, updated_at=excluded.updated_at""",
             (match.provider, match.provider_match_id, match.tournament, match.team_one,
              match.team_two, match.scheduled_at.isoformat() if match.scheduled_at else None,
-             match.best_of, match.status, self.json(match.raw), updated_at.isoformat()),
+             match.best_of, match.status, self.json(sanitize_raybet_payload(match.raw)),
+             updated_at.isoformat()),
         )
 
     def upsert_raybet_match(self, row: dict[str, Any], updated_at: datetime) -> None:
-        teams = sorted(row.get("team") or [], key=lambda item: int(item.get("pos") or 0))
+        safe_row = sanitize_raybet_payload(row)
+        if not isinstance(safe_row, dict):
+            raise ValueError("RayBet match payload must be an object")
+        teams = sorted(
+            safe_row.get("team") or [],
+            key=lambda item: int(item.get("pos") or 0),
+        )
         team_one = str(teams[0].get("team_name") or "") if teams else ""
         team_two = str(teams[1].get("team_name") or "") if len(teams) > 1 else ""
-        round_name = str(row.get("round") or "").lower()
+        round_name = str(safe_row.get("round") or "").lower()
         best_of = int(round_name[2:]) if round_name.startswith("bo") and round_name[2:].isdigit() else None
         self.execute(
             """INSERT INTO raybet_matches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1163,19 +1536,34 @@ class LiveBettingStore:
               best_of=excluded.best_of, status=excluded.status,
               live_url=excluded.live_url, raw_json=excluded.raw_json,
               updated_at=excluded.updated_at""",
-            (str(row.get("id")), str(row.get("tournament_name") or ""), team_one, team_two,
-             row.get("start_time"), best_of, str(row.get("status") or ""),
-             row.get("live_url"), self.json(row), updated_at.isoformat()),
+            (
+                str(safe_row.get("id")),
+                str(safe_row.get("tournament_name") or ""),
+                team_one,
+                team_two,
+                safe_row.get("start_time"),
+                best_of,
+                str(safe_row.get("status") or ""),
+                safe_row.get("live_url"),
+                self.json(safe_row),
+                updated_at.isoformat(),
+            ),
         )
 
     def insert_browser_raybet_match(
         self, row: dict[str, Any], updated_at: datetime
     ) -> bool:
         """Insert sanitized browser metadata without replacing direct-owned data."""
-        teams = sorted(row.get("team") or [], key=lambda item: int(item.get("pos") or 0))
+        safe_row = sanitize_raybet_payload(row)
+        if not isinstance(safe_row, dict):
+            raise ValueError("RayBet browser metadata must be an object")
+        teams = sorted(
+            safe_row.get("team") or [],
+            key=lambda item: int(item.get("pos") or 0),
+        )
         team_one = str(teams[0].get("team_name") or "") if teams else ""
         team_two = str(teams[1].get("team_name") or "") if len(teams) > 1 else ""
-        round_name = str(row.get("round") or "").lower()
+        round_name = str(safe_row.get("round") or "").lower()
         best_of = (
             int(round_name[2:])
             if round_name.startswith("bo") and round_name[2:].isdigit()
@@ -1186,9 +1574,17 @@ class LiveBettingStore:
             (raybet_match_id, tournament, team_one, team_two, scheduled_at, best_of,
              status, live_url, raw_json, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
-            (str(row.get("id")), str(row.get("tournament_name") or ""),
-             team_one, team_two, row.get("start_time"), best_of,
-             str(row.get("status") or ""), self.json({}), updated_at.isoformat()),
+            (
+                str(safe_row.get("id")),
+                str(safe_row.get("tournament_name") or ""),
+                team_one,
+                team_two,
+                safe_row.get("start_time"),
+                best_of,
+                str(safe_row.get("status") or ""),
+                self.json({}),
+                updated_at.isoformat(),
+            ),
         )
         return cursor.rowcount == 1
 
@@ -1449,7 +1845,7 @@ class LiveBettingStore:
             int(market.supported),
             snapshot.last_update,
             json.dumps(
-                snapshot.raw,
+                sanitize_raybet_payload(snapshot.raw),
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -1493,7 +1889,7 @@ class LiveBettingStore:
               self._iso(snapshot.received_at), snapshot.price, str(snapshot.status),
              market.market_type, market.period, market.side, market.line,
              market.outcome_key, int(market.supported), snapshot.last_update,
-             self.json(snapshot.raw)),
+             self.json(sanitize_raybet_payload(snapshot.raw))),
         )
         return cursor.rowcount == 1
 
@@ -1635,7 +2031,15 @@ class LiveBettingStore:
             if persisted_identity != requested_identity:
                 raise ValueError("shadow order does not match persisted signal identity")
 
-            signal_is_valid = self._signal_identity_matches(order)
+            map_row = self.connection.execute(
+                """SELECT raybet_match_id, map_number
+                     FROM shadow_map_attempts
+                    WHERE order_key=? AND status='pending'""",
+                (order.order_key,),
+            ).fetchone()
+            block_reason = self.order_block_reason(order.order_key) if map_row else None
+            draft_conflict = block_reason is not None
+            signal_is_valid = not draft_conflict and self._signal_identity_matches(order)
             successor = None
             if signal_is_valid:
                 successor = self.connection.execute(
@@ -1654,7 +2058,13 @@ class LiveBettingStore:
                 ).fetchone()
 
             resolved: ShadowOrder | None = None
-            if not signal_is_valid:
+            if draft_conflict:
+                resolved = replace(
+                    order,
+                    status="rejected",
+                    rejection_reason=block_reason or "vision_draft_conflict",
+                )
+            elif not signal_is_valid:
                 resolved = replace(
                     order,
                     status="rejected",
@@ -1796,8 +2206,20 @@ class LiveBettingStore:
     def insert_order(self, order: ShadowOrder) -> bool:
         if not self._signal_identity_matches(order):
             return False
-        cursor = self.execute(
-            """INSERT OR IGNORE INTO shadow_orders
+        with self.transaction():
+            map_row = self.connection.execute(
+                """SELECT map_number FROM shadow_map_attempts
+                    WHERE order_key=?""",
+                (order.order_key,),
+            ).fetchone()
+            if map_row is not None and self._draft_conflict_at_or_before(
+                order.raybet_match_id,
+                int(map_row["map_number"]),
+                order.signal_transport_at,
+            ):
+                return False
+            cursor = self.connection.execute(
+                """INSERT OR IGNORE INTO shadow_orders
             (order_key, raybet_match_id, odds_id, market_key, signaled_at,
              model_probability, market_probability, signal_price,
              signal_transport_key, signal_transport_at, expires_at,
@@ -1805,19 +2227,19 @@ class LiveBettingStore:
              signal_identity_verified, stake, status, fill_price, filled_at,
              rejection_reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (order.order_key, order.raybet_match_id, order.odds_id,
-             market_key(order.market.market_type, order.market.period,
-                        order.market.side, order.market.line),
-             order.signaled_at.isoformat(), order.model_probability,
-             order.market_probability, order.signal_price,
-             order.signal_transport_key, self._iso(order.signal_transport_at),
-             self._iso(order.expires_at), order.signal_odds_group_id,
-             order.signal_outcome_key, int(order.signal_identity_verified),
-             order.stake, order.status,
-             order.fill_price, self._iso(order.filled_at) if order.filled_at else None,
-             order.rejection_reason),
-        )
-        return cursor.rowcount == 1
+                (order.order_key, order.raybet_match_id, order.odds_id,
+                 market_key(order.market.market_type, order.market.period,
+                            order.market.side, order.market.line),
+                 order.signaled_at.isoformat(), order.model_probability,
+                 order.market_probability, order.signal_price,
+                 order.signal_transport_key, self._iso(order.signal_transport_at),
+                 self._iso(order.expires_at), order.signal_odds_group_id,
+                 order.signal_outcome_key, int(order.signal_identity_verified),
+                 order.stake, order.status,
+                 order.fill_price, self._iso(order.filled_at) if order.filled_at else None,
+                 order.rejection_reason),
+            )
+            return cursor.rowcount == 1
 
     def update_order(self, order: ShadowOrder) -> None:
         self.execute(
@@ -1919,10 +2341,9 @@ class LiveBettingStore:
                                 observation.map_number,
                             ),
                         )
-                    conflict_cutoff = (
-                        captured_at
-                        if anchor["status"] != "conflict"
-                        else anchor["conflict_at"]
+                    _has_conflict, conflict_cutoff = self._draft_conflict_state(
+                        observation.raybet_match_id,
+                        int(observation.map_number),
                     )
                     self._invalidate_draft_dependents(
                         observation.raybet_match_id,
@@ -1957,14 +2378,21 @@ class LiveBettingStore:
             )
             return cursor.rowcount == 1
 
-    def _invalidate_draft_dependents(
+    def _invalidate_vision_dependents(
         self,
         raybet_match_id: str,
         map_number: int,
         reason: str,
         conflict_at: str | None,
+        *,
+        block_reason: str,
+        block_actor: str,
     ) -> None:
-        """Append fail-closed invalidations when a map draft is conflicted."""
+        """Append fail-closed invalidations for a causal vision cutoff."""
+        if not block_reason.strip():
+            raise ValueError("block_reason is required")
+        if not block_actor.strip():
+            raise ValueError("block_actor is required")
         recorded_at = datetime.now(timezone.utc).isoformat()
         dependent_queries = (
             (
@@ -1979,6 +2407,8 @@ class LiveBettingStore:
                             julianday(?) IS NULL
                             OR julianday(snapshot.received_at) IS NULL
                             OR julianday(snapshot.received_at)>=julianday(?)
+                            OR julianday(alignment.observation_captured_at) IS NULL
+                            OR julianday(alignment.observation_captured_at)>=julianday(?)
                       )""",
             ),
             (
@@ -2006,14 +2436,21 @@ class LiveBettingStore:
             try:
                 rows = self.connection.execute(
                     query,
-                    (raybet_match_id, map_number, conflict_at, conflict_at),
+                    (
+                        (raybet_match_id, map_number, conflict_at, conflict_at, conflict_at)
+                        if dependent_type == "odds_alignment"
+                        else (raybet_match_id, map_number, conflict_at, conflict_at)
+                    ),
                 ).fetchall()
             except sqlite3.OperationalError:
+                if dependent_type == "strategy_decision":
+                    raise
                 continue
             self.connection.executemany(
                 """INSERT OR IGNORE INTO vision_derived_invalidations
                    (dependent_type, dependent_key, raybet_match_id, map_number,
-                    reason, recorded_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                    reason, block_reason, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     (
                         dependent_type,
@@ -2021,35 +2458,100 @@ class LiveBettingStore:
                         raybet_match_id,
                         map_number,
                         reason,
+                        block_reason,
                         recorded_at,
                     )
                     for row in rows
                 ),
             )
-        try:
-            rows = self.connection.execute(
-                """SELECT orders.order_key
-                     FROM shadow_orders AS orders
-                     JOIN shadow_map_attempts AS attempt
-                       ON attempt.order_key=orders.order_key
-                    WHERE attempt.raybet_match_id=? AND attempt.map_number=?
-                      AND (
-                            julianday(?) IS NULL
-                            OR julianday(orders.signal_transport_at) IS NULL
-                            OR julianday(orders.signal_transport_at)>=julianday(?)
-                      )""",
-                (raybet_match_id, map_number, conflict_at, conflict_at),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return
+        rows = self.connection.execute(
+            """SELECT orders.order_key
+                 FROM shadow_orders AS orders
+                 JOIN shadow_map_attempts AS attempt
+                   ON attempt.order_key=orders.order_key
+                WHERE attempt.raybet_match_id=? AND attempt.map_number=?
+                  AND (
+                        julianday(?) IS NULL
+                        OR julianday(orders.signal_transport_at) IS NULL
+                        OR julianday(orders.signal_transport_at)>=julianday(?)
+                  )""",
+            (raybet_match_id, map_number, conflict_at, conflict_at),
+        ).fetchall()
+        order_keys = [str(row[0]) for row in rows]
         self.connection.executemany(
             """INSERT OR IGNORE INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
-                reason, recorded_at) VALUES ('shadow_order', ?, ?, ?, ?, ?)""",
+                reason, block_reason, recorded_at)
+                VALUES ('shadow_order', ?, ?, ?, ?, ?, ?)""",
             (
-                (str(row[0]), raybet_match_id, map_number, reason, recorded_at)
-                for row in rows
+                (
+                    order_key,
+                    raybet_match_id,
+                    map_number,
+                    reason,
+                    block_reason,
+                    recorded_at,
+                )
+                for order_key in order_keys
             ),
+        )
+        for order_key in order_keys:
+            self.connection.execute(
+                """UPDATE settlements
+                      SET review_required=1
+                    WHERE order_key=?""",
+                (order_key,),
+            )
+            self.connection.execute(
+                """UPDATE settlement_reconciliations
+                          SET status='manual_review',
+                              reason=CASE WHEN status='manual_review'
+                                          THEN reason
+                                          ELSE ? END,
+                              updated_at=?
+                        WHERE raybet_match_id=? AND map_number=?""",
+                (block_reason, recorded_at, raybet_match_id, map_number),
+            )
+            outbox_rows = self.connection.execute(
+                """SELECT outbox_id FROM notification_outbox
+                    WHERE order_key=? AND event_type IN ('filled', 'settled')
+                      AND status IN ('pending', 'leased')""",
+                (order_key,),
+            ).fetchall()
+            for outbox_row in outbox_rows:
+                outbox_id = int(outbox_row[0])
+                self.connection.execute(
+                    """UPDATE notification_outbox
+                          SET status='dead_letter', lease_token=NULL,
+                              lease_until=NULL,
+                              last_error=?,
+                              updated_at=?
+                        WHERE outbox_id=?
+                          AND status IN ('pending', 'leased')""",
+                    (block_reason, recorded_at, outbox_id),
+                )
+                self.connection.execute(
+                    """INSERT INTO notification_outbox_audit
+                       (outbox_id, action, actor, reason, created_at)
+                       VALUES (?, 'blocked', ?, ?, ?)""",
+                    (outbox_id, block_actor, reason, recorded_at),
+                )
+
+    def _invalidate_draft_dependents(
+        self,
+        raybet_match_id: str,
+        map_number: int,
+        reason: str,
+        conflict_at: str | None,
+    ) -> None:
+        """Append fail-closed invalidations for a draft conflict."""
+        self._invalidate_vision_dependents(
+            raybet_match_id,
+            map_number,
+            reason,
+            conflict_at,
+            block_reason="vision_draft_conflict",
+            block_actor="vision_conflict",
         )
 
     def insert_alignment(self, alignment: Any) -> bool:
@@ -2075,6 +2577,28 @@ class LiveBettingStore:
                 if tuple(existing) != values:
                     raise ValueError("odds alignment identity conflict")
                 return False
+            if alignment.map_number is not None:
+                snapshot = self.connection.execute(
+                    "SELECT received_at FROM odds_snapshots WHERE id=?",
+                    (alignment.odds_snapshot_id,),
+                ).fetchone()
+                blocked = self._draft_conflict_at_or_before(
+                    str(alignment.raybet_match_id),
+                    int(alignment.map_number),
+                    alignment.observation_captured_at,
+                )
+                if snapshot is not None:
+                    blocked = blocked or self._draft_conflict_at_or_before(
+                        str(alignment.raybet_match_id),
+                        int(alignment.map_number),
+                        snapshot["received_at"],
+                    )
+                elif self._draft_conflict_state(
+                    str(alignment.raybet_match_id), int(alignment.map_number)
+                )[0]:
+                    blocked = True
+                if blocked:
+                    return False
             self.connection.execute(
                 """INSERT INTO odds_alignments VALUES
                 (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -2108,6 +2632,12 @@ class LiveBettingStore:
                 if tuple(existing) != values:
                     raise ValueError("strategy decision identity conflict")
                 return False
+            if self._draft_conflict_at_or_before(
+                str(decision.raybet_match_id),
+                int(decision.map_number),
+                decision.decided_at,
+            ):
+                return False
             self.connection.execute(
                 """INSERT INTO strategy_decisions VALUES
                 (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -2117,8 +2647,15 @@ class LiveBettingStore:
 
     def insert_research_prediction(self, prediction: Any) -> bool:
         """Append one non-actionable live prediction without touching order tables."""
-        cursor = self.execute(
-            """INSERT INTO research_live_predictions
+        with self.transaction():
+            if self._draft_conflict_at_or_before(
+                str(prediction.raybet_match_id),
+                int(prediction.map_number),
+                prediction.observed_at,
+            ):
+                return False
+            cursor = self.connection.execute(
+                """INSERT INTO research_live_predictions
                (prediction_key, schema_version, raybet_match_id, map_number,
                 observed_at, game_clock_seconds, game_minute, selected_side,
                 market_probability, market_price, raw_model_probability,
@@ -2131,41 +2668,41 @@ class LiveBettingStore:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(prediction_key) DO NOTHING""",
-            (
-                prediction.prediction_key,
-                prediction.schema_version,
-                prediction.raybet_match_id,
-                prediction.map_number,
-                self._iso(prediction.observed_at),
-                prediction.game_clock_seconds,
-                prediction.game_minute,
-                prediction.selected_side,
-                prediction.market_probability,
-                prediction.market_price,
-                prediction.raw_model_probability,
-                prediction.feature_hash,
-                prediction.model_hash,
-                prediction.calibration_hash,
-                prediction.transport_key,
-                prediction.transport_hash,
-                self.json(list(prediction.radiant_hero_ids)),
-                self.json(list(prediction.dire_hero_ids)),
-                prediction.radiant_team_side,
-                prediction.strict_mapping_id,
-                prediction.clock_source,
-                prediction.clock_trust,
-                prediction.manual_clock_event_id,
-                prediction.manual_clock_seconds,
-                prediction.manual_clock_trust,
-                prediction.manual_clock_validation,
-                prediction.actionability,
-                prediction.gate_status,
-                self.json(list(prediction.gate_failures)),
-                prediction.input_context_hash,
-                self._iso(prediction.created_at),
-            ),
-        )
-        return cursor.rowcount == 1
+                (
+                    prediction.prediction_key,
+                    prediction.schema_version,
+                    prediction.raybet_match_id,
+                    prediction.map_number,
+                    self._iso(prediction.observed_at),
+                    prediction.game_clock_seconds,
+                    prediction.game_minute,
+                    prediction.selected_side,
+                    prediction.market_probability,
+                    prediction.market_price,
+                    prediction.raw_model_probability,
+                    prediction.feature_hash,
+                    prediction.model_hash,
+                    prediction.calibration_hash,
+                    prediction.transport_key,
+                    prediction.transport_hash,
+                    self.json(list(prediction.radiant_hero_ids)),
+                    self.json(list(prediction.dire_hero_ids)),
+                    prediction.radiant_team_side,
+                    prediction.strict_mapping_id,
+                    prediction.clock_source,
+                    prediction.clock_trust,
+                    prediction.manual_clock_event_id,
+                    prediction.manual_clock_seconds,
+                    prediction.manual_clock_trust,
+                    prediction.manual_clock_validation,
+                    prediction.actionability,
+                    prediction.gate_status,
+                    self.json(list(prediction.gate_failures)),
+                    prediction.input_context_hash,
+                    self._iso(prediction.created_at),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def insert_research_price_label(self, label: Any) -> bool:
         cursor = self.execute(
@@ -2229,25 +2766,40 @@ class LiveBettingStore:
         return row is not None
 
     def pending_order_has_draft_conflict(self, order_key: str) -> bool:
+        return self.pending_order_block_reason(order_key) is not None
+
+    def pending_order_block_reason(self, order_key: str) -> str | None:
         row = self.connection.execute(
-            """SELECT 1 FROM shadow_orders AS orders
+            """SELECT orders.raybet_match_id, attempt.map_number,
+                      orders.signal_transport_at
+                 FROM shadow_orders AS orders
                  JOIN shadow_map_attempts AS attempt
                    ON attempt.order_key=orders.order_key
-                 JOIN vision_draft_anchors AS anchor
-                   ON anchor.raybet_match_id=attempt.raybet_match_id
-                  AND anchor.map_number=attempt.map_number
                 WHERE attempt.order_key=? AND attempt.status='pending'
-                  AND anchor.status='conflict'
-                  AND (
-                        anchor.conflict_at IS NULL
-                        OR julianday(anchor.conflict_at) IS NULL
-                        OR julianday(orders.signal_transport_at) IS NULL
-                        OR julianday(anchor.conflict_at)<=
-                           julianday(orders.signal_transport_at)
-                  )""",
+            """,
             (order_key,),
         ).fetchone()
-        return row is not None
+        if row is None:
+            return None
+        strict = self._strict_mapping_block_reason_for_order(order_key)
+        if strict is not None:
+            return strict
+        derived = self._vision_derived_block_reason(order_key)
+        if derived is not None:
+            return derived
+        if self._vision_observation_invalidated_at_or_before(
+            str(row["raybet_match_id"]),
+            int(row["map_number"]),
+            row["signal_transport_at"],
+        ):
+            return "vision_observation_invalidated"
+        if self._draft_conflict_at_or_before(
+            str(row["raybet_match_id"]),
+            int(row["map_number"]),
+            row["signal_transport_at"],
+        ):
+            return "vision_draft_conflict"
+        return None
 
     def reject_pending_order(
         self,
@@ -2286,32 +2838,29 @@ class LiveBettingStore:
         order: ShadowOrder,
         map_number: int,
         *,
-        strict_mapping_id: int,
+        strict_mapping_id: int | None = None,
     ) -> bool:
         """Atomically reserve a map and persist its only shadow order."""
-        if isinstance(strict_mapping_id, bool) or strict_mapping_id <= 0:
+        if strict_mapping_id is not None and (
+            isinstance(strict_mapping_id, bool) or strict_mapping_id <= 0
+        ):
             raise ValueError("strict_mapping_id must be a positive integer")
         if not self._signal_identity_matches(order):
             return False
         with self.transaction():
-            conflicted = self.connection.execute(
-                """SELECT 1 FROM vision_draft_anchors
-                     WHERE raybet_match_id=? AND map_number=?
-                       AND status='conflict'
-                       AND (
-                             conflict_at IS NULL
-                             OR julianday(conflict_at) IS NULL
-                             OR julianday(?) IS NULL
-                             OR julianday(conflict_at)<=julianday(?)
-                       )""",
-                (
-                    order.raybet_match_id,
-                    map_number,
-                    self._iso(order.signal_transport_at),
-                    self._iso(order.signal_transport_at),
-                ),
-            ).fetchone()
-            if conflicted is not None:
+            if strict_mapping_id is not None:
+                if self._strict_mapping_context_block_reason(
+                    strict_mapping_id=strict_mapping_id,
+                    raybet_match_id=order.raybet_match_id,
+                    map_number=map_number,
+                    signal_transport_at=order.signal_transport_at,
+                ) is not None:
+                    return False
+            if self._draft_conflict_at_or_before(
+                order.raybet_match_id,
+                map_number,
+                order.signal_transport_at,
+            ):
                 return False
             reserved = self.connection.execute(
                 """INSERT OR IGNORE INTO shadow_map_attempts
@@ -2380,6 +2929,22 @@ class LiveBettingStore:
         raybet_facts_json = self.json(raybet_facts)
         opendota_facts_json = self.json(opendota_facts)
         with self.transaction():
+            lineage = self.connection.execute(
+                """SELECT orders.order_key, orders.signal_transport_at
+                     FROM shadow_orders AS orders
+                     JOIN shadow_map_attempts AS attempt
+                       ON attempt.order_key=orders.order_key
+                    WHERE attempt.raybet_match_id=? AND attempt.map_number=?""",
+                (raybet_match_id, map_number),
+            ).fetchall()
+            blocked_reason = None
+            for row in lineage:
+                candidate = self.order_block_reason(str(row["order_key"]))
+                if candidate is not None:
+                    blocked_reason = candidate
+                    break
+            if status != "manual_review" and blocked_reason is not None:
+                status, reason = "manual_review", blocked_reason
             evidence_rows = (
                 (
                     "raybet",
@@ -2572,6 +3137,9 @@ class LiveBettingStore:
         settled_at: datetime, evidence_ref: str, review_required: bool = False,
     ) -> bool:
         with self.transaction():
+            if not review_required:
+                if self.order_block_reason(order_key) is not None:
+                    return False
             cursor = self.connection.execute(
                 """INSERT OR IGNORE INTO settlements VALUES (?, ?, ?, ?, ?, ?)""",
                 (order_key, result, return_units, settled_at.isoformat(), evidence_ref,

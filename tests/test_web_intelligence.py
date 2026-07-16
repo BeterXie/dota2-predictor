@@ -722,6 +722,135 @@ class IntelligenceApiTests(unittest.TestCase):
             self.client.get("/api/intelligence/matches/999").status_code, 404
         )
 
+    def test_match_detail_exposes_delivery_versions_and_cutoff_contract(self) -> None:
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(payload["versions"]["player_score"], SCORE_VERSION)
+        self.assertEqual(payload["versions"]["team_state"], LABEL_VERSION)
+        self.assertEqual(payload["versions"]["draft_model"], DRAFT_MODEL_VERSION)
+        self.assertTrue(any(value.startswith("2026-07-13") for value in payload["cutoffs"]["player_score"]))
+        self.assertTrue(any(value.startswith("2026-07-13") for value in payload["cutoffs"]["draft_training"]))
+        self.assertTrue(any(value.startswith("2026-07-13") for value in payload["cutoffs"]["draft_prediction"]))
+        self.assertEqual(payload["states"]["radiant"]["label"], "comeback")
+        self.assertEqual(payload["match_id"], 1)
+        self.assertEqual(payload["player_performance"][0]["performance"]["kills"], 8)
+
+    def test_match_detail_keeps_independent_performance_when_score_columns_are_legacy(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """ALTER TABLE player_map_scores RENAME TO player_map_scores_current;
+               CREATE TABLE player_map_scores (
+                   match_id INTEGER,
+                   player_slot INTEGER,
+                   account_id INTEGER,
+                   position INTEGER,
+                   execution_score REAL,
+                   result_adjusted_score REAL,
+                   coverage REAL,
+                   role_confidence REAL,
+                   score_version TEXT
+               );
+               INSERT INTO player_map_scores
+                   (match_id, player_slot, account_id, position,
+                    execution_score, result_adjusted_score, coverage,
+                    role_confidence, score_version)
+               SELECT match_id, player_slot, account_id, position,
+                      execution_score, result_adjusted_score, coverage,
+                      role_confidence, score_version
+                 FROM player_map_scores_current;"""
+        )
+        connection.commit()
+        connection.close()
+
+        response = self.client.get("/api/intelligence/matches/1")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(len(payload["player_performance"]), 2)
+        self.assertEqual(payload["player_performance"][0]["performance"]["kills"], 8)
+        self.assertEqual(len(payload["player_scores"]), 10)
+        self.assertEqual(payload["player_scores"][0]["performance"]["kills"], 8)
+        self.assertEqual(payload["player_scores"][0]["component_facts"], {})
+
+    def test_match_detail_nulls_missing_legacy_match_columns(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """ALTER TABLE matches RENAME TO matches_current;
+               CREATE TABLE matches (
+                   match_id INTEGER PRIMARY KEY,
+                   radiant_team_id INTEGER,
+                   dire_team_id INTEGER,
+                   radiant_win INTEGER,
+                   start_time INTEGER
+               );
+               INSERT INTO matches
+                   (match_id, radiant_team_id, dire_team_id, radiant_win, start_time)
+               SELECT match_id, radiant_team_id, dire_team_id, radiant_win, start_time
+                 FROM matches_current;"""
+        )
+        connection.commit()
+        connection.close()
+
+        list_response = self.client.get("/api/intelligence/matches")
+        response = self.client.get("/api/intelligence/matches/1")
+
+        self.assertEqual(list_response.status_code, 200, list_response.text)
+        self.assertIsNone(list_response.json()["data"][0]["duration"])
+        self.assertIsNone(list_response.json()["data"][0]["radiant_score"])
+        self.assertEqual(response.status_code, 200, response.text)
+        match = response.json()["match"]
+        self.assertIsNone(match["duration"])
+        self.assertIsNone(match["radiant_score"])
+        self.assertIsNone(match["dire_score"])
+
+    def test_match_detail_nulls_missing_legacy_state_columns(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """ALTER TABLE team_map_states RENAME TO team_map_states_current;
+               CREATE TABLE team_map_states (
+                   match_id INTEGER,
+                   team_id INTEGER,
+                   side TEXT,
+                   label TEXT,
+                   label_version TEXT
+               );
+               INSERT INTO team_map_states (match_id, team_id, side, label, label_version)
+               SELECT match_id, team_id, side, label, label_version
+                 FROM team_map_states_current;"""
+        )
+        connection.commit()
+        connection.close()
+
+        response = self.client.get("/api/intelligence/matches/1")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        state = response.json()["radiant_state"]
+        self.assertEqual(state["label"], "comeback")
+        self.assertIsNone(state["curve_coverage"])
+
+    def test_player_leaderboard_degrades_when_legacy_facts_lack_created_at(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """ALTER TABLE player_map_facts RENAME TO player_map_facts_current;
+               CREATE TABLE player_map_facts (
+                   fact_id INTEGER PRIMARY KEY,
+                   match_id INTEGER,
+                   player_slot INTEGER,
+                   account_id INTEGER,
+                   facts_json TEXT
+               );
+               INSERT INTO player_map_facts (fact_id, match_id, player_slot, account_id, facts_json)
+               SELECT fact_id, match_id, player_slot, account_id, facts_json
+                 FROM player_map_facts_current;"""
+        )
+        connection.commit()
+        connection.close()
+
+        response = self.client.get("/api/intelligence/players")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["pagination"]["total"], 3)
+
     def test_match_detail_omits_performance_for_legacy_player_schema(self) -> None:
         connection = sqlite3.connect(self.path)
         connection.executescript(
@@ -830,6 +959,12 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(first["pagination"]["total"], 3)
         self.assertEqual(first["data"][0]["account_id"], 202)
         self.assertEqual(first["data"][0]["average_execution_score"], 85.0)
+        self.assertEqual(
+            first["data"][0]["benchmark_cutoffs"], ["2026-07-13T00:00:00+00:00"]
+        )
+        self.assertEqual(
+            first["data"][0]["benchmark_cutoff_min"], "2026-07-13T00:00:00+00:00"
+        )
 
         position_one = self.client.get(
             "/api/intelligence/players", params={"position": 1, "search": "Alice"}

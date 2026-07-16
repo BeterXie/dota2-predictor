@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,9 +16,64 @@ class LiveReportCohortTests(unittest.TestCase):
     def setUp(self) -> None:
         self.store = LiveBettingStore(":memory:")
         self.store.init_schema()
+        self.store.connection.execute(
+            "CREATE TABLE IF NOT EXISTS event_registry (event_id TEXT PRIMARY KEY)"
+        )
 
     def tearDown(self) -> None:
         self.store.close()
+
+    def insert_strict_mapping(
+        self,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        event_id: str,
+        available_at: str | None = None,
+    ) -> int:
+        self.store.connection.execute(
+            "INSERT OR IGNORE INTO event_registry (event_id) VALUES (?)",
+            (event_id,),
+        )
+        identity_json = "{}"
+        identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        available_at = available_at or (NOW - timedelta(days=1)).isoformat()
+        cursor = self.store.connection.execute(
+            """INSERT INTO strict_live_map_mappings
+               (raybet_match_id, map_number, event_id, team_one_id, team_two_id,
+                canonical_team_one_id, canonical_team_one_name,
+                canonical_team_two_id, canonical_team_two_name,
+                canonical_identity_json, canonical_identity_hash,
+                crosswalk_evidence_json, crosswalk_evidence_hash, stage_scope,
+                scheduled_at_utc, raybet_best_of, raybet_identity_json,
+                raybet_identity_hash, raybet_metadata_updated_at, source,
+                evidence_json, evidence_hash, mapping_version, acceptance_mode,
+                automatic_approval_id, accepted_by, accepted_at, recorded_at,
+                created_at)
+               VALUES (?, ?, ?, 101, 202, 10, 'Canonical One',
+                       20, 'Canonical Two', ?, ?, ?, ?, 'main_event', ?, 5,
+                       ?, ?, ?, 'test', ?, ?, 'test-v1', 'manual_exact', NULL,
+                       'test', ?, ?, ?)""",
+            (
+                raybet_match_id,
+                map_number,
+                event_id,
+                identity_json,
+                identity_hash,
+                identity_json,
+                identity_hash,
+                available_at,
+                identity_json,
+                identity_hash,
+                available_at,
+                identity_json,
+                identity_hash,
+                available_at,
+                available_at,
+                available_at,
+            ),
+        )
+        return int(cursor.lastrowid)
 
     def test_empty_report_has_no_synthetic_evaluation_evidence(self) -> None:
         report = build_report(self.store.connection)
@@ -45,10 +101,17 @@ class LiveReportCohortTests(unittest.TestCase):
         fill_price: float | None = 3.0,
         order_status: str = "filled",
         rejection_reason: str | None = None,
+        strict_available_at: str | None = None,
     ) -> None:
         match_id = series_id or f"match-{index}"
         order_key = f"order-{index}"
         decided_at = NOW + timedelta(seconds=index)
+        strict_mapping_id = self.insert_strict_mapping(
+            raybet_match_id=match_id,
+            map_number=map_number,
+            event_id=event_id,
+            available_at=strict_available_at,
+        )
         captured_at = decided_at - timedelta(seconds=latency_seconds)
         probability = 0.7
         outcome = index % 2 == 0
@@ -71,7 +134,7 @@ class LiveReportCohortTests(unittest.TestCase):
                 "draft_landmark": landmark,
                 "strict_live_eligibility": {
                     "mapping_refs": {
-                        "strict_mapping_id": 7,
+                        "strict_mapping_id": strict_mapping_id,
                         "strict_event_id": event_id,
                         "strict_canonical_team_one_id": 10,
                         "strict_canonical_team_one_name": "Canonical One",
@@ -133,12 +196,13 @@ class LiveReportCohortTests(unittest.TestCase):
                 expires_at, signal_odds_group_id, signal_outcome_key,
                 signal_identity_verified, stake, status, fill_price, filled_at,
                 rejection_reason)
-               VALUES (?, ?, 7, ?, 'winner|map_1|team_two|', ?, ?, 0.4,
+               VALUES (?, ?, ?, ?, 'winner|map_1|team_two|', ?, ?, 0.4,
                        ?, ?, ?, ?, 'winner-group', 'team_two', 1, 1.0,
                        ?, ?, ?, ?)""",
             (
                 order_key,
                 match_id,
+                strict_mapping_id,
                 f"odds-{index}",
                 decided_at.isoformat(),
                 probability,
@@ -388,6 +452,108 @@ class LiveReportCohortTests(unittest.TestCase):
             {"pending": 1, "confirmed": 0, "manual_review": 1},
         )
 
+    def test_order_audit_counts_invalidated_orders_separately_from_evaluation(self) -> None:
+        self.insert_settled_order(1)
+        self.insert_settled_order(2)
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+                       'vision_draft_conflict', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.execute(
+            """UPDATE settlements
+                  SET result='review', review_required=1
+                WHERE order_key='order-2'"""
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        audit = report["order_audit"]
+
+        self.assertEqual(audit["status"], "available")
+        self.assertEqual(audit["unknown_reasons"], [])
+        self.assertEqual(audit["total_orders"], 2)
+        self.assertEqual(audit["included_orders"], 1)
+        self.assertEqual(audit["scored_orders"], 0)
+        self.assertEqual(audit["excluded_orders"], 1)
+        self.assertEqual(audit["invalidated_orders"], 1)
+        self.assertEqual(audit["draft_conflict_orders"], 0)
+        self.assertEqual(audit["review_required_orders"], 1)
+        self.assertEqual(report["invalidated_order_count"], 1)
+        self.assertEqual(report["review_required_order_count"], 1)
+        self.assertEqual(
+            audit["exclusion_reasons"],
+            {
+                "vision_derived_invalidation": 1,
+                "vision_draft_conflict": 0,
+                "strict_mapping_invalidated": 0,
+                "strict_mapping_unverifiable": 0,
+            },
+        )
+        self.assertEqual(report["orders"]["signals"], 1)
+        self.assertEqual(report["settled_orders"], 0)
+
+    def test_decision_audit_counts_vision_invalidation(self) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('strategy_decision', 'decision-1', 'match-1', 1,
+                       'vision_observation_invalidated', ?)""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        audit = report["decision_audit"]
+
+        self.assertEqual(audit["status"], "available")
+        self.assertEqual(audit["raw_decisions"], 1)
+        self.assertEqual(audit["included_decisions"], 0)
+        self.assertEqual(audit["excluded_decisions"], 1)
+        self.assertEqual(audit["invalidated_decisions"], 1)
+        self.assertEqual(audit["draft_conflict_decisions"], 0)
+        self.assertEqual(report["raw_decision_count"], 1)
+        self.assertEqual(report["included_decision_count"], 0)
+        self.assertEqual(report["invalidated_decision_count"], 1)
+
+    def test_order_audit_counts_temporal_draft_conflict_exclusion(self) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.execute(
+            """INSERT INTO vision_draft_anchors
+               (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
+                dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
+               VALUES ('match-1', 1, ?, '[1,2,3,4,5]', '[6,7,8,9,10]',
+                       ?, 'anchor-frame', 'conflict', ?)""",
+            ("a" * 64, NOW.isoformat(), NOW.isoformat()),
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        audit = report["order_audit"]
+
+        self.assertEqual(audit["status"], "available")
+        self.assertEqual(audit["total_orders"], 1)
+        self.assertEqual(audit["included_orders"], 0)
+        self.assertEqual(audit["scored_orders"], 0)
+        self.assertEqual(audit["excluded_orders"], 1)
+        self.assertEqual(audit["invalidated_orders"], 0)
+        self.assertEqual(audit["draft_conflict_orders"], 1)
+        self.assertEqual(report["orders"]["signals"], 0)
+
+        decision_audit = report["decision_audit"]
+        self.assertEqual(decision_audit["status"], "available")
+        self.assertEqual(decision_audit["raw_decisions"], 1)
+        self.assertEqual(decision_audit["included_decisions"], 0)
+        self.assertEqual(decision_audit["excluded_decisions"], 1)
+        self.assertEqual(decision_audit["invalidated_decisions"], 0)
+        self.assertEqual(decision_audit["draft_conflict_decisions"], 1)
+        self.assertEqual(report["draft_conflict_decision_count"], 1)
+
     def test_pre_migration_missing_reconciliation_table_fails_closed(self) -> None:
         self.insert_settled_order(1)
         self.store.connection.execute("DROP TABLE settlement_reconciliations")
@@ -400,6 +566,135 @@ class LiveReportCohortTests(unittest.TestCase):
         self.assertEqual(
             report["settlement_reconciliation"],
             {"pending": 0, "confirmed": 0, "manual_review": 0},
+        )
+
+    def test_order_audit_marks_missing_conflict_table_unknown(self) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.execute("DROP TABLE vision_draft_conflicts")
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        audit = report["order_audit"]
+
+        self.assertEqual(audit["status"], "unavailable")
+        self.assertIn(
+            "vision_draft_conflict_tables_missing", audit["unknown_reasons"]
+        )
+        self.assertEqual(audit["total_orders"], 1)
+        self.assertEqual(audit["included_orders"], 0)
+        self.assertEqual(audit["scored_orders"], 0)
+        self.assertIsNone(audit["draft_conflict_orders"])
+        self.assertIsNone(audit["excluded_orders"])
+        self.assertEqual(report["settled_orders"], 0)
+
+    def test_order_audit_marks_missing_invalidation_table_unknown(self) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.execute("DROP TABLE vision_derived_invalidations")
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        audit = report["order_audit"]
+
+        self.assertEqual(audit["status"], "unavailable")
+        self.assertIn(
+            "vision_derived_invalidations_table_missing", audit["unknown_reasons"]
+        )
+        self.assertEqual(audit["total_orders"], 1)
+        self.assertEqual(audit["included_orders"], 0)
+        self.assertEqual(audit["scored_orders"], 0)
+        self.assertIsNone(audit["invalidated_orders"])
+        self.assertIsNone(audit["excluded_orders"])
+        self.assertIsNone(report["invalidated_decision_count"])
+        decision_audit = report["decision_audit"]
+        self.assertEqual(decision_audit["status"], "unavailable")
+        self.assertIn(
+            "vision_derived_invalidations_table_missing",
+            decision_audit["unknown_reasons"],
+        )
+        self.assertEqual(decision_audit["raw_decisions"], 1)
+        self.assertEqual(decision_audit["included_decisions"], 0)
+        self.assertIsNone(decision_audit["invalidated_decisions"])
+        self.assertIsNone(decision_audit["excluded_decisions"])
+
+    def test_order_audit_marks_missing_anchor_table_fail_closed(self) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.execute("DROP TABLE vision_draft_anchors")
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        audit = report["order_audit"]
+
+        self.assertEqual(audit["status"], "unavailable")
+        self.assertIn(
+            "vision_draft_conflict_tables_missing", audit["unknown_reasons"]
+        )
+        self.assertEqual(audit["total_orders"], 1)
+        self.assertEqual(audit["included_orders"], 0)
+        self.assertEqual(audit["scored_orders"], 0)
+        self.assertEqual(report["settled_orders"], 0)
+        self.assertEqual(report["invalidated_order_count"], 0)
+
+    def test_strict_schema_loss_excludes_mapped_rows_without_impact_fallback(
+        self,
+    ) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.execute(
+            "DROP TABLE strict_live_map_mapping_invalidations"
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+
+        self.assertEqual(report["decision_count"], 0)
+        self.assertEqual(report["orders"]["signals"], 0)
+        for audit, raw_key, unverifiable_key in (
+            (
+                report["decision_audit"],
+                "raw_decisions",
+                "strict_mapping_unverifiable_decisions",
+            ),
+            (
+                report["order_audit"],
+                "total_orders",
+                "strict_mapping_unverifiable_orders",
+            ),
+        ):
+            self.assertEqual(audit["status"], "unavailable")
+            self.assertIn(
+                "strict_live_map_mapping_invalidations_table_missing",
+                audit["unknown_reasons"],
+            )
+            self.assertEqual(audit[raw_key], 1)
+            self.assertEqual(audit["excluded_decisions" if raw_key == "raw_decisions" else "excluded_orders"], 1)
+            self.assertIsNone(
+                audit[
+                    "strict_mapping_invalidated_decisions"
+                    if raw_key == "raw_decisions"
+                    else "strict_mapping_invalidated_orders"
+                ]
+            )
+            self.assertEqual(audit[unverifiable_key], 1)
+
+    def test_naive_strict_mapping_timestamp_is_unverifiable(self) -> None:
+        self.insert_settled_order(
+            1,
+            strict_available_at=(NOW - timedelta(days=1))
+            .replace(tzinfo=None)
+            .isoformat(),
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+
+        self.assertEqual(report["decision_count"], 0)
+        self.assertEqual(report["orders"]["signals"], 0)
+        self.assertEqual(
+            report["decision_audit"]["strict_mapping_unverifiable_decisions"],
+            1,
+        )
+        self.assertEqual(
+            report["order_audit"]["strict_mapping_unverifiable_orders"],
+            1,
         )
 
 

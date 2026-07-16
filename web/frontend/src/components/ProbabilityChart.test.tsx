@@ -14,4 +14,8 @@ describe("resolvePeriod", () => {
     expect(resolvePeriod(periods, null, "map_2")).toBe("map_2");
     expect(resolvePeriod(periods, "map_3", "map_2")).toBe("map_3");
   });
+
+  it("opens historical replay on the latest observed map when no period is pinned", () => {
+    expect(resolvePeriod(periods, null, null, true)).toBe("map_3");
+  });
 });

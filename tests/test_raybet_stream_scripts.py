@@ -7,6 +7,8 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -17,7 +19,7 @@ from scripts.supervise_raybet_streams import (
     record_supervisor_health,
     watcher_command,
 )
-from scripts.invalidate_vision_observations import invalidate
+from scripts.invalidate_vision_observations import freeze_draft_map, invalidate
 from scripts.watch_raybet_stream import (
     DEFAULT_OBSERVATION_DIR as WATCHER_OBSERVATION_DIR,
     ROOT,
@@ -31,6 +33,7 @@ from scripts.watch_raybet_stream import (
 from contracts.live_observation import LiveObservation
 from vision.map_state import ConfirmedClock
 from live_betting.storage import LiveBettingStore
+from live_betting.vision import VisionObservation
 
 
 def test_visual_supervisor_cli_constructs_parser() -> None:
@@ -161,6 +164,45 @@ def test_match_source_prefers_manual_current_index(tmp_path: Path) -> None:
     assert match_source(database, "42") == ("https://stream.test/live.m3u8", 3)
 
 
+def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
+    tmp_path: Path,
+) -> None:
+    raw = {
+        "team": [
+            {"score": {"manualControlData": {"currentIndex": 1}}},
+            {"score": {"manualControlData": {"currentIndex": 1}}},
+        ]
+    }
+    database = _source_database(tmp_path, raw, [])
+    signed = "https://stream.test/live.m3u8?auth_key=EPHEMERAL_TOKEN"
+    response = {
+        "result": {
+            "id": 42,
+            "game_id": 151,
+            "live_url": signed,
+            "team": [
+                {"score": {"manualControlData": {"currentIndex": 1}}},
+                {"score": {"manualControlData": {"currentIndex": 1}}},
+            ],
+        }
+    }
+    with patch("scripts.watch_raybet_stream.RayBetClient") as client_type:
+        client = client_type.return_value.__enter__.return_value
+        client.match_odds.return_value = response
+        assert match_source(database, "42", refresh_url=True) == (signed, 1)
+        client.match_odds.assert_called_once_with("42")
+
+    connection = sqlite3.connect(database)
+    try:
+        stored = connection.execute(
+            "SELECT live_url, raw_json FROM raybet_matches WHERE raybet_match_id='42'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert stored[0] == "https://stream.test/live.m3u8"
+    assert "EPHEMERAL_TOKEN" not in stored[1]
+
+
 def test_match_source_uses_settled_maps_not_open_future_markets(
     tmp_path: Path,
 ) -> None:
@@ -240,6 +282,7 @@ def test_supervisor_does_not_override_inferred_map_number(tmp_path: Path) -> Non
         tmp_path / "evidence",
     )
     assert "--map-number" not in command
+    assert "--refresh-url" in command
     assert str(tmp_path / "observations" / "42.jsonl") in command
 
 
@@ -373,6 +416,289 @@ def test_vision_invalidation_is_audited_and_online_backed_up(
         ).fetchone()[0] == 1
     finally:
         verification.close()
+
+
+def test_freeze_draft_map_rejects_unconfirmed_frame(tmp_path: Path) -> None:
+    database = tmp_path / "live.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.connection.execute(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                clock_confidence, draft_confidence, source_frame_ref,
+                screen_state, confirmed)
+               VALUES ('42', 1, '2026-07-11T17:07:38+00:00', 600, 0,
+                       '[1,2,3,4,5]', '[6,7,8,9,10]', 'team_one',
+                       0.94, 0.96, 'unconfirmed.jpg', 'game', 0)"""
+        )
+        store.connection.commit()
+
+    with pytest.raises(ValueError, match="no trusted complete draft"):
+        freeze_draft_map(database, match_id="42", map_number=1, reason="audit")
+
+
+def test_freeze_draft_map_rejects_invalidated_frame(tmp_path: Path) -> None:
+    database = tmp_path / "live.db"
+    captured_at = "2026-07-11T17:07:38+00:00"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.connection.execute(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                clock_confidence, draft_confidence, source_frame_ref,
+                screen_state, confirmed)
+               VALUES ('42', 1, ?, 600, 0, '[1,2,3,4,5]',
+                       '[6,7,8,9,10]', 'team_one', 0.94, 0.96,
+                       'invalidated.jpg', 'game', 1)""",
+            (captured_at,),
+        )
+        store.connection.execute(
+            """INSERT INTO vision_observation_invalidations
+               (raybet_match_id, captured_at, source_frame_ref,
+                invalidated_at, reason)
+               VALUES ('42', ?, 'invalidated.jpg', ?, 'bad frame')""",
+            (captured_at, captured_at),
+        )
+        store.connection.commit()
+
+    with pytest.raises(ValueError, match="no trusted complete draft"):
+        freeze_draft_map(database, match_id="42", map_number=1, reason="audit")
+
+
+def test_freeze_draft_map_uses_trusted_frame_and_preserves_anchor(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live.db"
+    captured_at = datetime(2026, 7, 11, 17, 7, 38, tzinfo=timezone.utc)
+    observation = VisionObservation(
+        "42",
+        1,
+        captured_at,
+        600,
+        False,
+        (1, 2, 3, 4, 5),
+        (6, 7, 8, 9, 10),
+        0.94,
+        0.96,
+        "trusted.jpg",
+        "game",
+        "team_one",
+    )
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        assert store.insert_vision_observation(observation)
+        before = tuple(store.connection.execute(
+            """SELECT draft_hash, radiant_hero_ids, dire_hero_ids,
+                      anchored_at, source_frame_ref
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id='42' AND map_number=1"""
+        ).fetchone())
+
+    assert freeze_draft_map(
+        database,
+        match_id="42",
+        map_number=1,
+        reason="operator freeze",
+    ) == 1
+
+    with LiveBettingStore(database) as store:
+        after = store.connection.execute(
+            """SELECT draft_hash, radiant_hero_ids, dire_hero_ids,
+                      anchored_at, source_frame_ref, status
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id='42' AND map_number=1"""
+        ).fetchone()
+        assert tuple(after[:5]) == before
+        assert after[5] == "conflict"
+        assert store.connection.execute(
+            """SELECT COUNT(*) FROM vision_draft_conflicts
+                WHERE raybet_match_id='42' AND map_number=1
+                  AND source_frame_ref='trusted.jpg'"""
+        ).fetchone()[0] == 1
+
+
+def test_vision_invalidation_propagates_to_post_frame_lineage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live.db"
+    backup = tmp_path / "backups" / "before.db"
+    before = datetime(2026, 7, 11, 17, 7, 38, tzinfo=timezone.utc)
+    invalid = before + timedelta(seconds=10)
+    after = invalid + timedelta(seconds=1)
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        for captured_at, frame in (
+            (before.isoformat(), "before.jpg"),
+            (invalid.isoformat(), "invalid.jpg"),
+        ):
+            store.connection.execute(
+                """INSERT INTO vision_observations
+                   (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                    is_paused, radiant_hero_ids, dire_hero_ids,
+                    radiant_team_side, clock_confidence, draft_confidence,
+                    source_frame_ref, screen_state, confirmed)
+                   VALUES ('42', 1, ?, 1392, 0, '[1,2,3,4,5]',
+                           '[6,7,8,9,10]', 'team_one', 0.94, 0.96,
+                           ?, 'game', 1)""",
+                (captured_at, frame),
+            )
+        for key, decided_at in (
+            ("decision-before", before),
+            ("decision-after", after),
+        ):
+            store.connection.execute(
+                """INSERT INTO strategy_decisions
+                   (decision_key, raybet_match_id, map_number, decided_at,
+                    underdog_side, market_probability, model_probability,
+                    edge, data_quality, eligible, reason, contributions_json,
+                    input_ref, strategy_version)
+                   VALUES (?, '42', 1, ?, 'team_two', 0.4, 0.5,
+                           0.1, 0.8, 1, 'eligible', '{}', ?, 'strategy-v1')""",
+                (key, decided_at.isoformat(), f"input-{key}"),
+            )
+        store.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status, fill_price, filled_at,
+                rejection_reason)
+               VALUES ('order-after', '42', NULL, 'odds-1',
+                       'winner|map_1|team_two|', ?, 0.5, 0.4, 3.0,
+                       'transport-after', ?, ?, 'group-1', 'team_two',
+                       1, 1.0, 'filled', 3.0, ?, NULL)""",
+            (
+                after.isoformat(),
+                after.isoformat(),
+                (after + timedelta(seconds=15)).isoformat(),
+                (after + timedelta(seconds=2)).isoformat(),
+            ),
+        )
+        store.connection.execute(
+            """INSERT INTO shadow_map_attempts
+               (raybet_match_id, map_number, order_key, status, created_at)
+               VALUES ('42', 1, 'order-after', 'filled', ?)""",
+            (after.isoformat(),),
+        )
+        store.connection.execute(
+            """INSERT INTO settlements
+               (order_key, result, return_units, settled_at, evidence_ref,
+                review_required)
+               VALUES ('order-after', 'win', 2.0, ?, 'result:42:1', 0)""",
+            ((after + timedelta(hours=1)).isoformat(),),
+        )
+        store.connection.execute(
+            """INSERT INTO settlement_reconciliations
+               (raybet_match_id, map_number, dota_match_id,
+                raybet_winner_side, opendota_winner_side,
+                raybet_evidence_ref, opendota_evidence_ref, status, reason,
+                first_observed_at, updated_at)
+               VALUES ('42', 1, 4242, 'team_two', 'team_two',
+                       'raybet:42:1', 'opendota:4242', 'confirmed', 'matched',
+                       ?, ?)""",
+            (after.isoformat(), after.isoformat()),
+        )
+        store.connection.execute(
+            """INSERT INTO notification_outbox
+               (order_key, event_type, channel, status, recipient, message_id,
+                payload_json, statistics_cutoff, template_version,
+                attempt_count, next_attempt_at, created_at, updated_at)
+               VALUES ('order-after', 'filled', 'email', 'pending',
+                       'test@example.com', 'message-1', '{}', ?, 'v1',
+                       0, ?, ?, ?)""",
+            (
+                after.isoformat(),
+                after.isoformat(),
+                after.isoformat(),
+                after.isoformat(),
+            ),
+        )
+        store.connection.commit()
+
+    count = invalidate(
+        database,
+        match_id="42",
+        map_number=1,
+        clock_seconds=1392,
+        after=before.isoformat(),
+        reason="stale_clock_republished_with_new_capture_time",
+        backup=backup,
+    )
+
+    assert count == 1
+    with LiveBettingStore(database) as store:
+        invalidations = store.connection.execute(
+            """SELECT dependent_type, dependent_key
+                 FROM vision_derived_invalidations
+                ORDER BY dependent_type, dependent_key"""
+        ).fetchall()
+        assert [tuple(row) for row in invalidations] == [
+            ("shadow_order", "order-after"),
+            ("strategy_decision", "decision-after"),
+        ]
+        assert store.connection.execute(
+            """SELECT COUNT(*) FROM vision_derived_invalidations
+                WHERE dependent_type='strategy_decision'
+                  AND dependent_key='decision-before'"""
+        ).fetchone()[0] == 0
+        settlement = store.connection.execute(
+            """SELECT result, return_units, review_required FROM settlements
+                WHERE order_key='order-after'"""
+        ).fetchone()
+        assert tuple(settlement) == ("win", 2.0, 1)
+        reconciliation = store.connection.execute(
+            """SELECT status, reason FROM settlement_reconciliations
+                WHERE raybet_match_id='42' AND map_number=1"""
+        ).fetchone()
+        assert tuple(reconciliation) == (
+            "manual_review",
+            "vision_observation_invalidated",
+        )
+        outbox = store.connection.execute(
+            """SELECT status, last_error FROM notification_outbox
+                WHERE order_key='order-after'"""
+        ).fetchone()
+        assert tuple(outbox) == ("dead_letter", "vision_observation_invalidated")
+        blocked = SimpleNamespace(
+            decision_key="decision-new-blocked",
+            raybet_match_id="42",
+            map_number=1,
+            decided_at=after,
+            underdog_side="team_one",
+            market_probability=0.4,
+            model_probability=0.5,
+            edge=0.1,
+            data_quality=0.8,
+            eligible=True,
+            reason="eligible",
+            contributions={},
+            input_ref="new-input",
+            strategy_version="strategy-v1",
+        )
+        assert not store.insert_decision(blocked)
+        store.connection.execute(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids,
+                radiant_team_side, clock_confidence, draft_confidence,
+                source_frame_ref, screen_state, confirmed)
+               VALUES ('42', 1, ?, 1393, 0, '[1,2,3,4,5]',
+                       '[6,7,8,9,10]', 'team_one', 0.94, 0.96,
+                       'replacement.jpg', 'game', 1)""",
+                ((after + timedelta(seconds=1)).isoformat(),),
+        )
+        store.connection.commit()
+        replacement = SimpleNamespace(
+            **{
+                **blocked.__dict__,
+                "decision_key": "decision-after-replacement",
+                "decided_at": after + timedelta(seconds=2),
+            }
+        )
+        assert store.insert_decision(replacement)
 
 
 class FakeProcess:

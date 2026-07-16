@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -66,6 +67,136 @@ END;
 
 _OBSERVATION_AUDIT_SECONDS = 60
 
+_PAPER_SIGNAL_REQUIRED_COLUMNS = {
+    "shadow_orders": {
+        "order_key",
+        "raybet_match_id",
+        "strict_mapping_id",
+        "market_key",
+        "model_probability",
+        "market_probability",
+        "signal_price",
+        "signaled_at",
+        "signal_transport_at",
+        "status",
+    },
+    "shadow_map_attempts": {"order_key", "raybet_match_id", "map_number"},
+    "vision_derived_invalidations": {"dependent_type", "dependent_key"},
+    "vision_draft_anchors": {
+        "raybet_match_id",
+        "map_number",
+        "status",
+        "conflict_at",
+        "anchored_at",
+        "source_frame_ref",
+    },
+    "vision_draft_conflicts": {"raybet_match_id", "map_number", "captured_at"},
+    "strict_live_mapping_impacts": {"dependent_type", "dependent_key"},
+    "strict_live_map_mapping_invalidations": {"invalidation_id", "mapping_id"},
+    "strict_live_map_mappings": {
+        "mapping_id",
+        "raybet_match_id",
+        "map_number",
+        "acceptance_mode",
+        "automatic_approval_id",
+        "accepted_at",
+    },
+    "strict_live_automatic_evidence_approvals": {
+        "approval_id",
+        "source_mapping_id",
+        "approved_at",
+    },
+}
+
+_PAPER_SIGNAL_QUERY = """
+    SELECT orders.order_key, orders.raybet_match_id, orders.market_key,
+           orders.model_probability, orders.market_probability,
+           orders.signal_price, orders.signaled_at
+     FROM shadow_orders AS orders
+     WHERE orders.status='pending'
+       AND julianday(orders.signaled_at) IS NOT NULL
+       AND julianday(orders.signal_transport_at) IS NOT NULL
+       AND NOT EXISTS (
+             SELECT 1 FROM strict_live_mapping_impacts AS impact
+              WHERE impact.dependent_type='shadow_order'
+                AND impact.dependent_key=orders.order_key
+       )
+       AND (
+             orders.strict_mapping_id IS NOT NULL
+             AND EXISTS (
+                  SELECT 1
+                    FROM strict_live_map_mappings AS mapping
+                    JOIN shadow_map_attempts AS strict_attempt
+                      ON strict_attempt.order_key=orders.order_key
+                     AND strict_attempt.raybet_match_id=mapping.raybet_match_id
+                     AND strict_attempt.map_number=mapping.map_number
+                    LEFT JOIN strict_live_map_mapping_invalidations AS direct
+                      ON direct.mapping_id=mapping.mapping_id
+                    LEFT JOIN strict_live_automatic_evidence_approvals AS approval
+                      ON approval.approval_id=mapping.automatic_approval_id
+                    LEFT JOIN strict_live_map_mapping_invalidations AS source
+                      ON source.mapping_id=approval.source_mapping_id
+                   WHERE mapping.mapping_id=orders.strict_mapping_id
+                     AND mapping.raybet_match_id=orders.raybet_match_id
+                     AND julianday(mapping.accepted_at) IS NOT NULL
+                     AND julianday(mapping.accepted_at)<=
+                         julianday(orders.signal_transport_at)
+                     AND direct.invalidation_id IS NULL
+                     AND source.invalidation_id IS NULL
+                     AND mapping.acceptance_mode IN
+                         ('manual_exact', 'automatic_exact')
+                     AND (
+                           mapping.acceptance_mode='manual_exact'
+                           OR (
+                                approval.approval_id IS NOT NULL
+                                AND julianday(approval.approved_at) IS NOT NULL
+                                AND julianday(approval.approved_at)<=
+                                    julianday(orders.signal_transport_at)
+                           )
+                     )
+             )
+       )
+       AND NOT EXISTS (
+             SELECT 1 FROM vision_derived_invalidations AS invalidation
+              WHERE invalidation.dependent_type='shadow_order'
+                AND invalidation.dependent_key=orders.order_key
+       )
+       AND EXISTS (
+             SELECT 1
+               FROM shadow_map_attempts AS attempt
+               JOIN vision_draft_anchors AS anchor
+                 ON anchor.raybet_match_id=attempt.raybet_match_id
+                AND anchor.map_number=attempt.map_number
+              WHERE attempt.order_key=orders.order_key
+                AND anchor.source_frame_ref!=''
+                AND julianday(anchor.anchored_at) IS NOT NULL
+                AND julianday(anchor.anchored_at)<=
+                    julianday(orders.signal_transport_at)
+                AND (
+                      anchor.status='anchored'
+                      OR (
+                           anchor.status='conflict'
+                           AND anchor.conflict_at IS NOT NULL
+                           AND julianday(anchor.conflict_at) IS NOT NULL
+                           AND julianday(anchor.conflict_at)>
+                               julianday(orders.signal_transport_at)
+                           AND NOT EXISTS (
+                                SELECT 1
+                                  FROM vision_draft_conflicts AS conflict
+                                 WHERE conflict.raybet_match_id=
+                                       anchor.raybet_match_id
+                                   AND conflict.map_number=anchor.map_number
+                                   AND (
+                                         julianday(conflict.captured_at) IS NULL
+                                         OR julianday(conflict.captured_at)<=
+                                            julianday(orders.signal_transport_at)
+                                   )
+                           )
+                      )
+                )
+       )
+"""
+
 
 def init_alert_schema(connection: sqlite3.Connection) -> None:
     _migrate_notification_outbox(connection)
@@ -85,14 +216,15 @@ def reconcile_alerts(
     if grace_seconds < 0:
         raise ValueError("grace_seconds must be non-negative")
     init_alert_schema(connection)
-    conditions = _conditions(connection, health)
     email_recipient = (
         str(email_recipient).strip()
         if email_recipient is not None
         else os.environ.get("DOTA2_ALERT_EMAIL_RECIPIENT", "").strip()
     )
     now_iso = now.isoformat()
+    connection.execute("BEGIN IMMEDIATE")
     with connection:
+        conditions, paper_signal_available = _conditions(connection, health)
         for dedupe_key, condition in conditions.items():
             active = connection.execute(
                 """SELECT incident_id FROM monitor_alert_incidents
@@ -201,10 +333,14 @@ def reconcile_alerts(
 
         placeholders = ",".join("?" for _ in conditions)
         active_rows = connection.execute(
-            "SELECT incident_id, dedupe_key, category, severity, title, body FROM monitor_alert_incidents WHERE status='active'"
+            """SELECT incident_id, dedupe_key, category, severity, title, body,
+                      source_json
+                 FROM monitor_alert_incidents WHERE status='active'"""
         ).fetchall()
         for row in active_rows:
             if str(row[1]) in conditions:
+                continue
+            if str(row[2]) == "paper_signal" and not paper_signal_available:
                 continue
             incident_id = int(row[0])
             connection.execute(
@@ -222,7 +358,7 @@ def reconcile_alerts(
                     "severity": str(row[3]),
                     "title": str(row[4]),
                     "body": str(row[5]),
-                    "source": {"dedupe_key": str(row[1])},
+                    "source": _alert_source(row[6], str(row[1])),
                 },
                 now=now,
                 recipient=email_recipient,
@@ -305,7 +441,7 @@ def acknowledge_alert(
 def _conditions(
     connection: sqlite3.Connection,
     health: Sequence[Mapping[str, Any]] | None,
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], bool]:
     if health is None:
         try:
             rows = connection.execute(
@@ -344,29 +480,143 @@ def _conditions(
             "body": last_error,
             "source": {"component": component, "status": status, "last_error": last_error},
         }
-    if _table_exists(connection, "shadow_orders"):
-        for row in connection.execute(
-            """SELECT order_key, raybet_match_id, market_key, model_probability,
-                      market_probability, signal_price, signaled_at
-                 FROM shadow_orders WHERE status='pending'"""
-        ).fetchall():
-            order_key = str(row[0])
-            conditions[f"paper_signal:{order_key}"] = {
-                "category": "paper_signal",
-                "severity": "warning",
-                "title": f"纸面信号 {row[1]}",
-                "body": f"{row[2]} @ {float(row[5]):.2f}",
-                "source": {
-                    "order_key": order_key,
-                    "raybet_match_id": str(row[1]),
-                    "market_key": str(row[2]),
-                    "model_probability": float(row[3]),
-                    "market_probability": float(row[4]),
-                    "signal_price": float(row[5]),
-                    "signaled_at": str(row[6]),
-                },
-            }
-    return conditions
+    paper_conditions, paper_signal_available = _paper_signal_conditions(connection)
+    conditions.update(paper_conditions)
+    return conditions, paper_signal_available
+
+
+def _paper_signal_conditions(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    try:
+        schema_issues = _paper_signal_schema_issues(connection)
+    except sqlite3.Error as exc:
+        return (
+            _paper_signal_contract_failure(
+                "schema_inspection_failed",
+                [f"{type(exc).__name__}: {exc}"],
+            ),
+            False,
+        )
+    if schema_issues:
+        return (
+            _paper_signal_contract_failure("schema_incomplete", schema_issues),
+            False,
+        )
+
+    try:
+        rows = connection.execute(_PAPER_SIGNAL_QUERY).fetchall()
+    except sqlite3.Error as exc:
+        return (
+            _paper_signal_contract_failure(
+                "query_failed",
+                [f"{type(exc).__name__}: {exc}"],
+            ),
+            False,
+        )
+
+    signal_conditions: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        order_key = str(row[0])
+        try:
+            model_probability = _paper_signal_probability(
+                row[3], "model_probability"
+            )
+            market_probability = _paper_signal_probability(
+                row[4], "market_probability"
+            )
+            signal_price = _paper_signal_price(row[5])
+        except (TypeError, ValueError, OverflowError) as exc:
+            return (
+                _paper_signal_contract_failure(
+                    "invalid_payload",
+                    [f"order_key={order_key}: {exc}"],
+                ),
+                False,
+            )
+        signal_conditions[f"paper_signal:{order_key}"] = {
+            "category": "paper_signal",
+            "severity": "warning",
+            "title": f"纸面信号 {row[1]}",
+            "body": f"{row[2]} @ {signal_price:.2f}",
+            "source": {
+                "order_key": order_key,
+                "raybet_match_id": str(row[1]),
+                "market_key": str(row[2]),
+                "model_probability": model_probability,
+                "market_probability": market_probability,
+                "signal_price": signal_price,
+                "signaled_at": str(row[6]),
+            },
+        }
+    return signal_conditions, True
+
+
+def _alert_source(value: Any, dedupe_key: str) -> dict[str, Any]:
+    try:
+        source = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        source = None
+    if isinstance(source, dict):
+        return source
+    return {"dedupe_key": dedupe_key}
+
+
+def _paper_signal_schema_issues(connection: sqlite3.Connection) -> list[str]:
+    issues: list[str] = []
+    for relation, required_columns in _PAPER_SIGNAL_REQUIRED_COLUMNS.items():
+        relation_row = connection.execute(
+            """SELECT type FROM sqlite_master
+                 WHERE type IN ('table', 'view') AND name=?""",
+            (relation,),
+        ).fetchone()
+        if relation_row is None:
+            issues.append(f"missing_relation:{relation}")
+            continue
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                f'PRAGMA table_info("{relation}")'
+            ).fetchall()
+        }
+        for column in sorted(required_columns - columns):
+            issues.append(f"missing_column:{relation}.{column}")
+    return issues
+
+
+def _paper_signal_contract_failure(
+    reason: str,
+    issues: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    issue_list = list(issues)
+    return {
+        "operational:paper_signal_contract": {
+            "category": "operational",
+            "severity": "critical",
+            "title": "纸面信号数据契约异常",
+            "body": "paper_signal suppressed: " + "; ".join(issue_list),
+            "source": {
+                "component": "paper_signal",
+                "status": "unavailable",
+                "reason": reason,
+                "issues": issue_list,
+            },
+        }
+    }
+
+
+def _paper_signal_probability(value: Any, field: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise ValueError(f"{field} must be finite and between 0 and 1")
+    return number
+
+
+def _paper_signal_price(value: Any) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 1.0:
+        raise ValueError("signal_price must be finite and greater than 1")
+    return number
 
 
 def _enqueue_email(
@@ -380,9 +630,15 @@ def _enqueue_email(
 ) -> None:
     if not recipient:
         return
+    source = condition["source"]
+    outbox_order_key = f"monitor-incident-{incident_id}"
+    if condition["category"] == "paper_signal" and isinstance(source, Mapping):
+        paper_order_key = str(source.get("order_key") or "").strip()
+        if paper_order_key:
+            outbox_order_key = paper_order_key
     enqueue(
         connection,
-        order_key=f"monitor-incident-{incident_id}",
+        order_key=outbox_order_key,
         event_type=event_type,
         payload={
             "incident_id": incident_id,
@@ -390,7 +646,7 @@ def _enqueue_email(
             "severity": condition["severity"],
             "title": condition["title"],
             "body": condition["body"],
-            "source": condition["source"],
+            "source": source,
             "event_type": event_type,
         },
         stats_cutoff_at=now,
@@ -507,12 +763,6 @@ def _migrate_notification_outbox(connection: sqlite3.Connection) -> None:
             connection.execute("RELEASE notification_outbox_monitor_migration")
         else:
             connection.commit()
-
-
-def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
-    return connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone() is not None
 
 
 def _aware(value: datetime) -> datetime:

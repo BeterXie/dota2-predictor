@@ -17,6 +17,7 @@ from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
 from .models import utc_now
 from .raybet import RayBetClient
+from .sanitize import sanitize_raybet_payload
 from .storage import LiveBettingStore
 
 
@@ -36,6 +37,7 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 
 
 def _write_raw(raw_dir: Path, match_id: str, payload: Any, now: datetime) -> Path:
+    payload = sanitize_raybet_payload(payload)
     path = raw_dir / now.strftime("%Y-%m-%d") / match_id
     path.mkdir(parents=True, exist_ok=True)
     canonical = json.dumps(
@@ -50,6 +52,7 @@ def _write_raw(raw_dir: Path, match_id: str, payload: Any, now: datetime) -> Pat
 
 
 def _fingerprint(payload: dict[str, Any]) -> str:
+    payload = sanitize_raybet_payload(payload)
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -83,7 +86,7 @@ def collect_once(
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
     _write_raw(raw_dir, "_match_list", {"result": list_rows}, utc_now())
     for list_row in list_rows:
-        payload = client.match_odds(str(list_row.get("id")))
+        payload = sanitize_raybet_payload(client.match_odds(str(list_row.get("id"))))
         observed_at = utc_now()
         result = payload.get("result") or {}
         match_id = str(result.get("id"))
@@ -142,7 +145,7 @@ def collect_completed_once(
         if not match_id.isdigit():
             continue
         try:
-            payload = client.match_odds(match_id)
+            payload = sanitize_raybet_payload(client.match_odds(match_id))
             result = payload.get("result")
             if (
                 not isinstance(result, dict)

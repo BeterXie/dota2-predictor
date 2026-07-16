@@ -73,6 +73,13 @@ class IntelligenceStorageTests(unittest.TestCase):
                         "SELECT 1 FROM sqlite_master WHERE type='view' AND name='formal_map_eligibility'"
                     ).fetchone()
                 )
+                self.assertIsNotNone(
+                    storage.connection.execute(
+                        """SELECT 1 FROM sqlite_master
+                             WHERE type='index'
+                               AND name='idx_draft_predictions_match'"""
+                    ).fetchone()
+                )
 
     def test_foreign_keys_and_checked_states_are_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

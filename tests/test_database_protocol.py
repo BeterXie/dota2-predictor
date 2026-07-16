@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import live_betting.database_protocol as database_protocol
+import live_betting.storage as live_storage
 from event_intelligence.storage import (
     CURRENT_SCHEMA_VERSION as INTELLIGENCE_VERSION,
     IntelligenceStorage,
@@ -433,6 +434,77 @@ def test_live_store_itself_rejects_a_future_schema(tmp_path: Path) -> None:
             ).fetchone()
             is None
         )
+
+
+def test_live_v1_schema_migrates_to_v2_and_is_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "live-v1.db"
+    connection = connect(database)
+    connection.executescript(
+        """CREATE TABLE live_schema_version (
+               version INTEGER PRIMARY KEY,
+               applied_at TEXT NOT NULL
+           );
+           INSERT INTO live_schema_version VALUES (1, 'v1');
+           CREATE TABLE vision_derived_invalidations (
+               dependent_type TEXT NOT NULL CHECK (dependent_type IN
+                   ('odds_alignment', 'strategy_decision', 'research_prediction',
+                    'shadow_order')),
+               dependent_key TEXT NOT NULL,
+               raybet_match_id TEXT NOT NULL,
+               map_number INTEGER NOT NULL,
+               reason TEXT NOT NULL,
+               recorded_at TEXT NOT NULL,
+               PRIMARY KEY (dependent_type, dependent_key)
+           );
+           INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+           VALUES ('shadow_order', 'legacy-order', 'match-1', 1,
+                   'legacy conflict', '2026-07-15T12:00:00+00:00');"""
+    )
+    connection.close()
+
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.init_schema()
+        columns = {
+            str(row[1])
+            for row in store.connection.execute(
+                "PRAGMA table_info(vision_derived_invalidations)"
+            )
+        }
+        assert "block_reason" in columns
+        assert tuple(store.connection.execute(
+            """SELECT reason, block_reason
+                 FROM vision_derived_invalidations
+                WHERE dependent_key='legacy-order'"""
+        ).fetchone()) == ("legacy conflict", "vision_draft_conflict")
+        assert [
+            int(row[0])
+            for row in store.connection.execute(
+                "SELECT version FROM live_schema_version ORDER BY version"
+            )
+        ] == [1, 2]
+
+
+def test_version_one_binary_rejects_live_v2_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "live-v2.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+    monkeypatch.setattr(live_storage, "CURRENT_SCHEMA_VERSION", 1)
+
+    with LiveBettingStore(database) as legacy_store:
+        with pytest.raises(RuntimeError, match="version 2 is newer than supported"):
+            legacy_store.init_schema()
+        assert [
+            int(row[0])
+            for row in legacy_store.connection.execute(
+                "SELECT version FROM live_schema_version ORDER BY version"
+            )
+        ] == [2]
 
 
 def test_existing_database_restores_backup_when_intelligence_init_fails_after_live(

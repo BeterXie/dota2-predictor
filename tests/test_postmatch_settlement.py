@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from event_intelligence.raw_archive import RawArchive
 from live_betting.postmatch_monitor import (
     StoredMapResult,
+    _latest_exact_raybet_final,
     _reconcile_and_settle,
     _refresh_raybet_final,
     _vision_drafts,
+    label_once,
 )
-from live_betting.raybet import parse_raybet_map_final
+from live_betting.raybet import RayBetMapFinal, parse_raybet_map_final
 from live_betting.settlement import reconcile_map_winners
 from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
@@ -226,6 +230,35 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
         self.store.close()
         self.tempdir.cleanup()
 
+    def latest_stored_raybet_final(
+        self, payload: dict[str, object]
+    ) -> RayBetMapFinal:
+        odds = payload.get("odds")
+        self.assertIsInstance(odds, list)
+        assert isinstance(odds, list)
+        for index, row in enumerate(odds):
+            self.assertIsInstance(row, dict)
+            assert isinstance(row, dict)
+            row.setdefault("odds", 2.0 + index / 100)
+        response = {"result": payload}
+
+        class Client:
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                return response
+
+        _refresh_raybet_final(
+            self.store,
+            RawArchive(Path(self.tempdir.name) / "raybet-raw"),
+            Client(),  # type: ignore[arg-type]
+            "1001",
+        )
+        final = _latest_exact_raybet_final(
+            self.store, "1001", 1, team_ids=(101, 202)
+        )
+        self.assertIsNotNone(final)
+        assert final is not None
+        return final
+
     def insert_filled_order(
         self,
         *,
@@ -266,6 +299,110 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
             "opendota:9001", NOW,
         )
 
+    def test_latest_exact_final_preserves_score_without_normalized_rows(self) -> None:
+        payload = raybet_final_payload()
+        odds = payload["odds"]
+        assert isinstance(odds, list)
+        for row in odds:
+            assert isinstance(row, dict)
+            row["odds"] = 1.0
+
+        final = self.latest_stored_raybet_final(payload)
+
+        self.assertEqual(final.status, "confirmed")
+        self.assertEqual(final.winner_side, "team_one")
+        self.assertEqual(final.score_winner_side, "team_one")
+
+    def test_latest_exact_score_market_conflict_requires_review(self) -> None:
+        self.insert_filled_order()
+        final = self.latest_stored_raybet_final(
+            raybet_final_payload(
+                score_winner="team_two", market_winner="team_one"
+            )
+        )
+
+        self.assertEqual(final.status, "conflict")
+        self.assertEqual(final.reason, "raybet_score_market_conflict")
+        outcome = _reconcile_and_settle(
+            self.store, self.opendota_result(), final
+        )
+
+        self.assertEqual(outcome, {"status": "manual_review", "orders_settled": 0})
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT status, reason FROM settlement_reconciliations"
+            ).fetchone()),
+            ("manual_review", "raybet_score_market_conflict"),
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT result, review_required FROM settlements"
+            ).fetchone()),
+            ("review", 1),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM map_results"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_latest_exact_final_aggregates_conflicting_winner_groups(self) -> None:
+        payload = raybet_final_payload()
+        odds = payload["odds"]
+        assert isinstance(odds, list)
+        odds.extend(
+            [
+                {
+                    "odds_id": "winner-two-group-one",
+                    "odds_group_id": "winner-group-2",
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "team_id": 101,
+                    "status": 5,
+                    "win": 0,
+                },
+                {
+                    "odds_id": "winner-two-group-two",
+                    "odds_group_id": "winner-group-2",
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "team_id": 202,
+                    "status": 5,
+                    "win": 1,
+                },
+            ]
+        )
+
+        final = self.latest_stored_raybet_final(payload)
+
+        self.assertEqual(final.status, "conflict")
+        self.assertEqual(final.reason, "raybet_winner_market_conflict")
+
+    def test_latest_exact_final_includes_unsupported_winner_rows(self) -> None:
+        payload = raybet_final_payload()
+        odds = payload["odds"]
+        assert isinstance(odds, list)
+        odds.append(
+            {
+                "odds_id": "winner-unknown",
+                "odds_group_id": "winner-group-2",
+                "match_stage": "r1",
+                "group_short_name": "Winner",
+                "tag": "win",
+                "team_id": 303,
+                "status": 5,
+                "win": 0,
+            }
+        )
+
+        final = self.latest_stored_raybet_final(payload)
+
+        self.assertEqual(final.status, "conflict")
+        self.assertEqual(final.reason, "raybet_winner_market_invalid")
+
     def test_postmatch_draft_matching_fails_closed_after_anchor_conflict(self) -> None:
         original = VisionObservation(
             "1001", 1, NOW, 600, False,
@@ -281,6 +418,321 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
         self.store.insert_vision_observation(conflicting)
 
         self.assertEqual(_vision_drafts(self.store.connection, "1001"), {})
+
+    def test_postmatch_draft_matching_recovers_with_same_draft_replacement(self) -> None:
+        original = VisionObservation(
+            "1001", 1, NOW, 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original-invalidated", "game", "team_one",
+        )
+        replacement_at = NOW + timedelta(seconds=2)
+        replacement = VisionObservation(
+            "1001", 1, replacement_at, 602, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "same-draft-replacement", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.connection.execute(
+            """INSERT INTO vision_observation_invalidations
+               (raybet_match_id, captured_at, source_frame_ref,
+                invalidated_at, reason)
+               VALUES ('1001', ?, 'original-invalidated', ?, 'bad frame')""",
+            (NOW.isoformat(), (NOW + timedelta(seconds=1)).isoformat()),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_observations SET confirmed=0
+                WHERE raybet_match_id='1001'
+                  AND source_frame_ref='original-invalidated'"""
+        )
+        self.store.connection.commit()
+        self.store.insert_vision_observation(replacement)
+
+        self.assertEqual(
+            _vision_drafts(self.store.connection, "1001"),
+            {1: {frozenset(range(1, 11))}},
+        )
+        self.assertEqual(
+            _vision_drafts(
+                self.store.connection,
+                "1001",
+                causal_cutoffs={1: NOW + timedelta(seconds=1)},
+            ),
+            {},
+        )
+
+    def test_postmatch_draft_recovery_requires_post_invalidation_lineage(self) -> None:
+        earlier_same_draft = VisionObservation(
+            "1001", 1, NOW - timedelta(seconds=1), 599, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "earlier-same-draft", "game", "team_one",
+        )
+        original = VisionObservation(
+            "1001", 1, NOW, 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original-invalidated", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(earlier_same_draft)
+        self.store.connection.execute(
+            """INSERT INTO vision_observation_invalidations
+               (raybet_match_id, captured_at, source_frame_ref,
+                invalidated_at, reason)
+               VALUES ('1001', ?, 'original-invalidated', ?, 'bad frame')""",
+            (NOW.isoformat(), (NOW + timedelta(seconds=1)).isoformat()),
+        )
+        self.store.connection.execute(
+            """UPDATE vision_observations SET confirmed=0
+                WHERE raybet_match_id='1001'
+                  AND source_frame_ref='original-invalidated'"""
+        )
+        self.store.connection.commit()
+
+        self.assertEqual(_vision_drafts(self.store.connection, "1001"), {})
+
+    def test_settlement_fails_closed_when_filled_order_was_after_draft_conflict(self) -> None:
+        self.insert_filled_order()
+        original = VisionObservation(
+            "1001", 1, NOW - timedelta(seconds=2), 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original", "game", "team_one",
+        )
+        conflicting = VisionObservation(
+            "1001", 1, NOW - timedelta(seconds=1), 601, False,
+            (1, 2, 3, 4, 6), (5, 7, 8, 9, 10),
+            0.95, 0.95, "conflict", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        final = parse_raybet_map_final(raybet_final_payload(), 1, observed_at=NOW)
+
+        outcome = _reconcile_and_settle(self.store, self.opendota_result(), final)
+
+        self.assertEqual(outcome, {"status": "manual_review", "orders_settled": 0})
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT status, reason FROM settlement_reconciliations"
+            ).fetchone()),
+            ("manual_review", "vision_draft_conflict"),
+        )
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM settlements").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT result, review_required FROM settlements"
+            ).fetchone()),
+            ("review", 1),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_late_draft_conflict_upgrades_existing_settlement_to_review(self) -> None:
+        self.insert_filled_order()
+        final = parse_raybet_map_final(raybet_final_payload(), 1, observed_at=NOW)
+        result = self.opendota_result()
+        self.assertEqual(
+            _reconcile_and_settle(self.store, result, final),
+            {"status": "confirmed", "orders_settled": 1},
+        )
+
+        original = VisionObservation(
+            "1001", 1, NOW - timedelta(seconds=2), 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original-late", "game", "team_one",
+        )
+        conflicting = VisionObservation(
+            "1001", 1, NOW - timedelta(seconds=1), 601, False,
+            (1, 2, 3, 4, 6), (5, 7, 8, 9, 10),
+            0.95, 0.95, "conflict-late", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT status, reason FROM settlement_reconciliations"
+            ).fetchone()),
+            ("manual_review", "vision_draft_conflict"),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT review_required FROM settlements WHERE order_key='order-1'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_future_draft_conflict_does_not_rewrite_prior_signal_settlement(self) -> None:
+        self.insert_filled_order()
+        original = VisionObservation(
+            "1001", 1, NOW, 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original-future", "game", "team_one",
+        )
+        conflicting = VisionObservation(
+            "1001", 1, NOW + timedelta(seconds=10), 610, False,
+            (1, 2, 3, 4, 6), (5, 7, 8, 9, 10),
+            0.95, 0.95, "conflict-future", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        result = StoredMapResult(
+            "1001", 1, 9001, "team_one", 30, 20, 2400,
+            "opendota:9001", NOW + timedelta(seconds=20),
+        )
+        final = parse_raybet_map_final(
+            raybet_final_payload(), 1, observed_at=result.settled_at
+        )
+
+        outcome = _reconcile_and_settle(self.store, result, final)
+
+        self.assertEqual(outcome, {"status": "confirmed", "orders_settled": 1})
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT review_required FROM settlements WHERE order_key='order-1'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_label_once_settles_prior_signal_through_future_conflict(self) -> None:
+        self.insert_filled_order()
+        original = VisionObservation(
+            "1001", 1, NOW, 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original-label", "game", "team_one",
+        )
+        conflicting = VisionObservation(
+            "1001", 1, NOW + timedelta(seconds=10), 610, False,
+            (1, 2, 3, 4, 6), (5, 7, 8, 9, 10),
+            0.95, 0.95, "conflict-label", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.store.connection.execute(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                clock_confidence, draft_confidence, source_frame_ref,
+                screen_state, confirmed)
+               VALUES ('1001', 1, ?, 620, 0, '[11,12,13,14,15]',
+                       '[16,17,18,19,20]', 'team_one', 0.99, 0.99,
+                       'untrusted-late-confirmed', 'game', 1)""",
+            ((NOW + timedelta(seconds=20)).isoformat(),),
+        )
+        payload = raybet_final_payload()
+        self.store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, scheduled_at, raw_json, updated_at)
+               VALUES ('1001', ?, ?, ?)""",
+            (NOW.isoformat(), json.dumps(payload), NOW.isoformat()),
+        )
+        self.store.connection.execute(
+            """CREATE TABLE IF NOT EXISTS event_registry (
+                   event_id TEXT PRIMARY KEY
+               )"""
+        )
+        self.store.connection.execute(
+            "INSERT INTO event_registry (event_id) VALUES ('event-1')"
+        )
+        hash_value = "a" * 64
+        self.store.connection.execute(
+            """INSERT INTO strict_live_map_mappings
+               (raybet_match_id, map_number, event_id, team_one_id, team_two_id,
+                canonical_team_one_id, canonical_team_one_name,
+                canonical_team_two_id, canonical_team_two_name,
+                canonical_identity_json, canonical_identity_hash,
+                crosswalk_evidence_json, crosswalk_evidence_hash, stage_scope,
+                scheduled_at_utc, raybet_best_of, raybet_identity_json,
+                raybet_identity_hash, raybet_metadata_updated_at, source,
+                evidence_json, evidence_hash, mapping_version, acceptance_mode,
+                automatic_approval_id, accepted_by, accepted_at, recorded_at,
+                created_at)
+               VALUES ('1001', 1, 'event-1', 101, 202, 101, 'One', 202, 'Two',
+                       '{}', ?, '{}', ?, 'main_event', ?, 3, '{}', ?, ?, 'test',
+                       '{}', ?, 'test-v1', 'manual_exact', NULL, 'test', ?, ?, ?)""",
+            (
+                hash_value,
+                hash_value,
+                NOW.isoformat(),
+                hash_value,
+                NOW.isoformat(),
+                hash_value,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+
+        class FakeOpenDotaClient:
+            async def get_team_matches(self, team_id: int) -> list[dict[str, int]]:
+                self.team_id = team_id
+                return [{"match_id": 9001, "start_time": int(NOW.timestamp())}]
+
+            async def get_match(self, match_id: int) -> dict[str, object]:
+                self.match_id = match_id
+                return {
+                    "match_id": 9001,
+                    "radiant_team_id": 101,
+                    "dire_team_id": 202,
+                    "radiant_win": True,
+                    "radiant_score": 30,
+                    "dire_score": 20,
+                    "duration": 2400,
+                    "players": [{"hero_id": hero_id} for hero_id in range(1, 11)],
+                }
+
+        with tempfile.TemporaryDirectory() as archive_dir:
+            outcome = asyncio.run(
+                label_once(
+                    self.store,
+                    FakeOpenDotaClient(),  # type: ignore[arg-type]
+                    RawArchive(Path(archive_dir)),
+                    "1001",
+                    101,
+                    "team_one",
+                )
+            )
+
+        self.assertEqual(
+            outcome,
+            {
+                "status": "labeled",
+                "maps": 1,
+                "orders_settled": 1,
+                "settlement_pending": 0,
+                "settlement_manual_review": 0,
+            },
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT result, review_required FROM settlements WHERE order_key='order-1'"
+            ).fetchone()),
+            ("win", 0),
+        )
+
+    def test_existing_review_settlement_cannot_be_reconciled_as_confirmed(self) -> None:
+        self.insert_filled_order()
+        self.assertTrue(
+            self.store.insert_settlement(
+                "order-1", "review", 0.0, NOW, "legacy-review", True
+            )
+        )
+        final = parse_raybet_map_final(raybet_final_payload(), 1, observed_at=NOW)
+
+        outcome = _reconcile_and_settle(self.store, self.opendota_result(), final)
+
+        self.assertEqual(outcome, {"status": "manual_review", "orders_settled": 0})
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT status, reason FROM settlement_reconciliations"
+            ).fetchone()),
+            ("manual_review", "existing_settlement_review"),
+        )
 
     def test_raybet_final_refresh_archives_before_normalization(self) -> None:
         payload = raybet_final_payload()

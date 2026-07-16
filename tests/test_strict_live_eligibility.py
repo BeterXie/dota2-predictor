@@ -11,6 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from event_intelligence.storage import IntelligenceStorage
+from live_betting.markets import normalized_state_hash
+from live_betting.models import Market, OddsSnapshot, ShadowOrder
+from live_betting.notifications import claim
+from live_betting.report import build_report
 from live_betting.storage import LiveBettingStore
 from live_betting.strict_eligibility import (
     StrictMappingConflictError,
@@ -22,6 +26,7 @@ from live_betting.strict_eligibility import (
     query_strict_live_eligibility,
     record_strict_live_mapping_candidate,
 )
+from web.alerts import init_alert_schema
 from web.monitoring import build_monitor_snapshot, monitor_cursor
 
 
@@ -121,6 +126,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         init_strict_live_eligibility_schema(self.connection)
+        init_alert_schema(self.connection)
         self.clock = patch(
             "live_betting.strict_eligibility._utc_now", return_value=RECORDED_AT
         )
@@ -190,6 +196,262 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             map_number=map_number,
             transport_observed_at=at,
         )
+
+    def create_pending_order(
+        self,
+        mapping_id: int,
+        *,
+        order_key: str = "strict-order",
+        map_number: int = 1,
+        signal_at: datetime = RECORDED_AT,
+        expected_insert: bool = True,
+    ) -> ShadowOrder:
+        signal = OddsSnapshot(
+            "match-1",
+            f"{order_key}-winner-one",
+            f"{order_key}-winner-group",
+            signal_at,
+            2.5,
+            1,
+            Market(
+                "winner", f"map_{map_number}", "team_one", None, "team_one", True
+            ),
+        )
+        order = ShadowOrder(
+            order_key=order_key,
+            raybet_match_id="match-1",
+            odds_id=signal.odds_id,
+            market=signal.market,
+            signaled_at=signal_at,
+            model_probability=0.6,
+            market_probability=0.4,
+            signal_price=signal.price,
+            signal_transport_key=f"{order_key}:signal",
+            signal_transport_at=signal_at,
+            expires_at=signal_at + timedelta(seconds=15),
+            signal_odds_group_id=signal.odds_group_id,
+            signal_outcome_key=signal.market.outcome_key,
+            signal_identity_verified=True,
+        )
+        with LiveBettingStore(self.path) as store:
+            store.store_odds_observation(
+                source="direct",
+                observation_key=order.signal_transport_key,
+                source_event_id=None,
+                raybet_match_id=order.raybet_match_id,
+                observed_at=signal_at,
+                normalized_state_hash=normalized_state_hash([signal]),
+                snapshots=[signal],
+            )
+            self.assertEqual(
+                store.insert_map_order(
+                    order, map_number, strict_mapping_id=mapping_id
+                ),
+                expected_insert,
+            )
+        return order
+
+    def create_confirmed_order_outputs(
+        self, order: ShadowOrder, *, map_number: int, dota_match_id: int
+    ) -> None:
+        successor_at = order.signal_transport_at + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            order.raybet_match_id,
+            order.odds_id,
+            order.signal_odds_group_id,
+            successor_at,
+            order.signal_price,
+            1,
+            order.market,
+        )
+        with LiveBettingStore(self.path) as store:
+            store.store_odds_observation(
+                source="direct",
+                observation_key=f"{order.order_key}:successor",
+                source_event_id=None,
+                raybet_match_id=order.raybet_match_id,
+                observed_at=successor_at,
+                normalized_state_hash=normalized_state_hash([successor]),
+                snapshots=[successor],
+            )
+            resolved = store.process_pending_successor(
+                order, watermark=successor_at
+            )
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertEqual(resolved.status, "filled")
+            reconciliation = store.record_settlement_reconciliation(
+                raybet_match_id=order.raybet_match_id,
+                map_number=map_number,
+                dota_match_id=dota_match_id,
+                raybet_status="confirmed",
+                raybet_winner_side="team_one",
+                opendota_winner_side="team_one",
+                raybet_evidence_ref=f"raybet:{dota_match_id}",
+                opendota_evidence_ref=f"opendota:{dota_match_id}",
+                raybet_facts={"winner": "team_one"},
+                opendota_facts={"winner": "team_one"},
+                status="confirmed",
+                reason="sources_agree",
+                observed_at=successor_at,
+            )
+            self.assertEqual(reconciliation["status"], "confirmed")
+            self.assertTrue(
+                store.enqueue_notification(
+                    order_key=order.order_key,
+                    event_type="monitor_alert",
+                    payload={
+                        "category": "paper_signal",
+                        "source": {"order_key": order.order_key},
+                    },
+                    stats_cutoff_at=successor_at,
+                    created_at=successor_at,
+                )
+            )
+            self.assertTrue(
+                store.insert_settlement(
+                    order.order_key,
+                    "win",
+                    order.signal_price,
+                    successor_at,
+                    f"opendota:{dota_match_id}",
+                )
+            )
+            store.connection.execute(
+                """UPDATE notification_outbox
+                      SET status='leased', lease_token='test-lease', lease_until=?
+                    WHERE order_key=? AND event_type='filled'""",
+                (
+                    (successor_at + timedelta(minutes=5)).isoformat(),
+                    order.order_key,
+                ),
+            )
+            store.connection.commit()
+
+    def assert_invalidation_quarantines_order(
+        self,
+        *,
+        invalidated_mapping_id: int,
+        impacted_mapping_id: int,
+        order: ShadowOrder,
+    ) -> None:
+        invalidation_id = invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=invalidated_mapping_id,
+            reason="operator withdrew mapping evidence",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+        settlement = self.connection.execute(
+            """SELECT result, review_required FROM settlements
+                WHERE order_key=?""",
+            (order.order_key,),
+        ).fetchone()
+        self.assertEqual(tuple(settlement), ("win", 1))
+        reconciliation = self.connection.execute(
+            """SELECT status, reason, updated_at FROM settlement_reconciliations
+                WHERE raybet_match_id=? AND map_number=?""",
+            (order.raybet_match_id, int(order.market.period.removeprefix("map_"))),
+        ).fetchone()
+        self.assertEqual(
+            tuple(reconciliation)[:2],
+            ("manual_review", "strict_mapping_invalidated"),
+        )
+        outbox = [
+            tuple(row)
+            for row in self.connection.execute(
+                """SELECT event_type, status, lease_token, lease_until, last_error
+                     FROM notification_outbox WHERE order_key=?
+                     ORDER BY event_type""",
+                (order.order_key,),
+            )
+        ]
+        self.assertEqual(
+            outbox,
+            [
+                ("filled", "dead_letter", None, None, "strict_mapping_invalidated"),
+                (
+                    "monitor_alert",
+                    "dead_letter",
+                    None,
+                    None,
+                    "strict_mapping_invalidated",
+                ),
+                ("settled", "dead_letter", None, None, "strict_mapping_invalidated"),
+            ],
+        )
+        self.assertEqual(
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    """SELECT action, actor, reason
+                         FROM notification_outbox_audit ORDER BY audit_id"""
+                )
+            ],
+            [
+                (
+                    "blocked",
+                    "strict_mapping_invalidation",
+                    "strict_mapping_invalidated",
+                )
+            ]
+            * 3,
+        )
+        impact = self.connection.execute(
+            """SELECT mapping_id, invalidation_id FROM strict_live_mapping_impacts
+                WHERE dependent_type='shadow_order' AND dependent_key=?""",
+            (order.order_key,),
+        ).fetchone()
+        self.assertEqual(tuple(impact), (impacted_mapping_id, invalidation_id))
+
+        before_repeat = (
+            tuple(settlement),
+            tuple(reconciliation),
+            outbox,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox_audit"
+            ).fetchone()[0],
+        )
+        repeated = invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=invalidated_mapping_id,
+            reason="operator withdrew mapping evidence",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+        after_repeat = (
+            tuple(
+                self.connection.execute(
+                    "SELECT result, review_required FROM settlements WHERE order_key=?",
+                    (order.order_key,),
+                ).fetchone()
+            ),
+            tuple(
+                self.connection.execute(
+                    """SELECT status, reason, updated_at
+                         FROM settlement_reconciliations
+                        WHERE raybet_match_id=? AND map_number=?""",
+                    (
+                        order.raybet_match_id,
+                        int(order.market.period.removeprefix("map_")),
+                    ),
+                ).fetchone()
+            ),
+            [
+                tuple(row)
+                for row in self.connection.execute(
+                    """SELECT event_type, status, lease_token, lease_until, last_error
+                         FROM notification_outbox WHERE order_key=?
+                         ORDER BY event_type""",
+                    (order.order_key,),
+                )
+            ],
+            self.connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox_audit"
+            ).fetchone()[0],
+        )
+        self.assertEqual(repeated, invalidation_id)
+        self.assertEqual(after_repeat, before_repeat)
 
     def test_schema_is_additive_and_accepted_identity_is_immutable(self) -> None:
         self.connection.execute("CREATE TABLE unrelated (value TEXT)")
@@ -386,6 +648,50 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.assertFalse(result.eligible)
         self.assertEqual(result.reason, "raybet_metadata_drift")
         self.assertEqual(result.mapping_refs["strict_raybet_identity_hash"], mapping.raybet_identity_hash)
+
+    def test_order_insert_rechecks_mapping_at_signal_transport_time(self) -> None:
+        mapping = self.accept()
+
+        self.create_pending_order(
+            mapping.mapping_id,
+            order_key="backdated-signal-order",
+            signal_at=RECORDED_AT - timedelta(microseconds=1),
+            expected_insert=False,
+        )
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM shadow_orders WHERE order_key='backdated-signal-order'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM shadow_map_attempts
+                    WHERE order_key='backdated-signal-order'"""
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_order_insert_rechecks_current_raybet_metadata(self) -> None:
+        mapping = self.accept()
+        self.upsert_raybet(
+            raybet_payload(team_one_id=503, team_one_name="Gamma"),
+            updated_at=RECORDED_AT,
+        )
+
+        self.create_pending_order(
+            mapping.mapping_id,
+            order_key="metadata-drift-order",
+            expected_insert=False,
+        )
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM shadow_orders WHERE order_key='metadata-drift-order'"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_crosswalk_evidence_and_canonical_teams_are_required(self) -> None:
         missing_crosswalk = evidence()
@@ -988,6 +1294,282 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                      FROM strict_live_map_mapping_supersessions"""
             ).fetchone()),
             (mapping.mapping_id, replacement.mapping_id),
+        )
+
+    def test_mapping_invalidation_rejects_pending_order_before_successor(self) -> None:
+        mapping = self.accept()
+        order = self.create_pending_order(mapping.mapping_id)
+        invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            reason="operator withdrew mapping evidence",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+        successor_at = RECORDED_AT + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            "match-1",
+            order.odds_id,
+            order.signal_odds_group_id,
+            successor_at,
+            2.5,
+            1,
+            order.market,
+        )
+
+        with LiveBettingStore(self.path) as store:
+            store.store_odds_observation(
+                source="direct",
+                observation_key="strict-order:successor",
+                source_event_id=None,
+                raybet_match_id=order.raybet_match_id,
+                observed_at=successor_at,
+                normalized_state_hash=normalized_state_hash([successor]),
+                snapshots=[successor],
+            )
+            self.assertEqual(
+                store.pending_order_block_reason(order.order_key),
+                "strict_mapping_invalidated",
+            )
+            resolved = store.process_pending_successor(
+                order, watermark=successor_at
+            )
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertEqual(resolved.status, "rejected")
+            self.assertEqual(
+                resolved.rejection_reason, "strict_mapping_invalidated"
+            )
+            report = build_report(store.connection)
+
+        self.assertEqual(report["orders"]["signals"], 0)
+        self.assertEqual(
+            report["order_audit"]["strict_mapping_invalidated_orders"], 1
+        )
+
+    def test_mapping_invalidation_suppresses_fill_mail_and_settlement(self) -> None:
+        mapping = self.accept()
+        order = self.create_pending_order(mapping.mapping_id, order_key="filled-order")
+        successor_at = RECORDED_AT + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            "match-1",
+            order.odds_id,
+            order.signal_odds_group_id,
+            successor_at,
+            2.5,
+            1,
+            order.market,
+        )
+        with LiveBettingStore(self.path) as store:
+            store.store_odds_observation(
+                source="direct",
+                observation_key="filled-order:successor",
+                source_event_id=None,
+                raybet_match_id=order.raybet_match_id,
+                observed_at=successor_at,
+                normalized_state_hash=normalized_state_hash([successor]),
+                snapshots=[successor],
+            )
+            resolved = store.process_pending_successor(
+                order, watermark=successor_at
+            )
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertEqual(resolved.status, "filled")
+
+        invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            reason="operator withdrew mapping evidence",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+
+        with LiveBettingStore(self.path) as store:
+            self.assertIsNone(claim(store.connection, now=successor_at))
+            outbox = store.connection.execute(
+                "SELECT status, last_error FROM notification_outbox"
+            ).fetchone()
+            self.assertEqual(
+                tuple(outbox),
+                ("dead_letter", "strict_mapping_invalidated"),
+            )
+            self.assertFalse(
+                store.insert_settlement(
+                    order.order_key,
+                    "win",
+                    2.5,
+                    successor_at + timedelta(hours=1),
+                    "test-result",
+                )
+            )
+
+    def test_direct_invalidation_immediately_quarantines_existing_outputs(self) -> None:
+        mapping = self.accept()
+        order = self.create_pending_order(
+            mapping.mapping_id, order_key="direct-quarantine-order"
+        )
+        self.create_confirmed_order_outputs(order, map_number=1, dota_match_id=1001)
+
+        self.assert_invalidation_quarantines_order(
+            invalidated_mapping_id=mapping.mapping_id,
+            impacted_mapping_id=mapping.mapping_id,
+            order=order,
+        )
+
+    def test_source_invalidation_quarantines_automatic_mapping_outputs(self) -> None:
+        source = self.accept(map_number=1)
+        approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=source.mapping_id,
+            approved_by="operator-b",
+            approved_at=ACCEPTED_AT,
+        )
+        automatic = self.accept(
+            map_number=2,
+            acceptance_mode="automatic_exact",
+            accepted_by="automatic-mapper",
+        )
+        order = self.create_pending_order(
+            automatic.mapping_id,
+            order_key="automatic-quarantine-order",
+            map_number=2,
+        )
+        self.create_confirmed_order_outputs(order, map_number=2, dota_match_id=1002)
+
+        self.assert_invalidation_quarantines_order(
+            invalidated_mapping_id=source.mapping_id,
+            impacted_mapping_id=automatic.mapping_id,
+            order=order,
+        )
+
+    def test_invalidation_preserves_existing_manual_review_reason(self) -> None:
+        mapping = self.accept()
+        order = self.create_pending_order(
+            mapping.mapping_id, order_key="manual-review-order"
+        )
+        self.create_confirmed_order_outputs(order, map_number=1, dota_match_id=1003)
+        self.connection.execute(
+            """UPDATE settlement_reconciliations
+                  SET status='manual_review', reason='existing_manual_reason'
+                WHERE raybet_match_id='match-1' AND map_number=1"""
+        )
+        self.connection.commit()
+
+        invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            reason="operator withdrew mapping evidence",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    """SELECT status, reason FROM settlement_reconciliations
+                        WHERE raybet_match_id='match-1' AND map_number=1"""
+                ).fetchone()
+            ),
+            ("manual_review", "existing_manual_reason"),
+        )
+
+    def test_non_null_mapping_gate_fails_closed_when_unverifiable(self) -> None:
+        mapping = self.accept()
+        order = self.create_pending_order(mapping.mapping_id)
+        with LiveBettingStore(self.path) as store:
+            self.assertEqual(
+                store._strict_mapping_context_block_reason(
+                    strict_mapping_id=mapping.mapping_id + 10_000,
+                    raybet_match_id="match-1",
+                    map_number=1,
+                    signal_transport_at=RECORDED_AT,
+                ),
+                "strict_mapping_unverified",
+            )
+        self.connection.execute("DROP TABLE strict_live_mapping_impacts")
+        self.connection.commit()
+
+        with LiveBettingStore(self.path) as store:
+            self.assertEqual(
+                store.pending_order_block_reason(order.order_key),
+                "strict_mapping_gate_unavailable",
+            )
+
+    def test_null_mapping_legacy_order_keeps_settlement_and_notification_semantics(
+        self,
+    ) -> None:
+        self.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status, fill_price, filled_at)
+               VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "legacy-null-mapping",
+                "match-1",
+                "legacy-odds",
+                "winner|map_1|team_one|",
+                RECORDED_AT.isoformat(),
+                0.6,
+                0.4,
+                2.5,
+                "legacy-transport",
+                RECORDED_AT.isoformat(),
+                (RECORDED_AT + timedelta(seconds=15)).isoformat(),
+                "legacy-group",
+                "team_one",
+                1,
+                1.0,
+                "filled",
+                2.5,
+                RECORDED_AT.isoformat(),
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)",
+            (
+                "match-1",
+                1,
+                "legacy-null-mapping",
+                "filled",
+                RECORDED_AT.isoformat(),
+            ),
+        )
+        self.connection.commit()
+
+        with LiveBettingStore(self.path) as store:
+            self.assertIsNone(store.order_block_reason("legacy-null-mapping"))
+            self.assertTrue(
+                store.insert_settlement(
+                    "legacy-null-mapping",
+                    "win",
+                    2.5,
+                    RECORDED_AT,
+                    "legacy-result",
+                )
+            )
+            self.assertTrue(
+                store.enqueue_notification(
+                    order_key="legacy-null-mapping",
+                    event_type="monitor_alert",
+                    payload={
+                        "category": "paper_signal",
+                        "source": {"order_key": "legacy-null-mapping"},
+                    },
+                    stats_cutoff_at=RECORDED_AT,
+                    created_at=RECORDED_AT,
+                )
+            )
+            first = claim(store.connection, now=RECORDED_AT)
+            second = claim(store.connection, now=RECORDED_AT)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(
+            {first.event_type, second.event_type}, {"settled", "monitor_alert"}
         )
 
     def test_replacement_invalidation_does_not_claim_prior_shadow_order(self) -> None:

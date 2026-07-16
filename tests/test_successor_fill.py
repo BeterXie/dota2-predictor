@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import tempfile
 import unittest
@@ -44,6 +45,7 @@ class SuccessorFillTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "live.db"
         self.store = LiveBettingStore(self.path)
         self.store.init_schema()
+        self.strict_mapping_id = None
 
     def tearDown(self) -> None:
         self.store.close()
@@ -61,6 +63,50 @@ class SuccessorFillTests(unittest.TestCase):
             normalized_state_hash=normalized_state_hash(rows),
             snapshots=rows,
         )
+
+    def insert_strict_mapping(self) -> int:
+        self.store.connection.execute(
+            "CREATE TABLE IF NOT EXISTS event_registry (event_id TEXT PRIMARY KEY)"
+        )
+        self.store.connection.execute(
+            "INSERT INTO event_registry (event_id) VALUES ('event-test')"
+        )
+        identity_json = "{}"
+        identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        cursor = self.store.connection.execute(
+            """INSERT INTO strict_live_map_mappings
+               (raybet_match_id, map_number, event_id, team_one_id, team_two_id,
+                canonical_team_one_id, canonical_team_one_name,
+                canonical_team_two_id, canonical_team_two_name,
+                canonical_identity_json, canonical_identity_hash,
+                crosswalk_evidence_json, crosswalk_evidence_hash, stage_scope,
+                scheduled_at_utc, raybet_best_of, raybet_identity_json,
+                raybet_identity_hash, raybet_metadata_updated_at, source,
+                evidence_json, evidence_hash, mapping_version, acceptance_mode,
+                automatic_approval_id, accepted_by, accepted_at, recorded_at,
+                created_at)
+               VALUES (?, 1, 'event-test', 101, 202, 101, 'Alpha', 202, 'Beta',
+                       ?, ?, ?, ?, 'main_event', ?, 3, ?, ?, ?, 'test', ?, ?,
+                       'test-v1', 'manual_exact', NULL, 'test', ?, ?, ?)""",
+            (
+                MATCH_ID,
+                identity_json,
+                identity_hash,
+                identity_json,
+                identity_hash,
+                (NOW - timedelta(days=1)).isoformat(),
+                identity_json,
+                identity_hash,
+                (NOW - timedelta(days=1)).isoformat(),
+                identity_json,
+                identity_hash,
+                (NOW - timedelta(days=1)).isoformat(),
+                (NOW - timedelta(days=1)).isoformat(),
+                (NOW - timedelta(days=1)).isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+        return int(cursor.lastrowid)
 
     def pending_order(self) -> ShadowOrder:
         signal = snapshot(NOW)
@@ -82,13 +128,15 @@ class SuccessorFillTests(unittest.TestCase):
             signal_identity_verified=True,
         )
         self.assertTrue(
-            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
         )
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT strict_mapping_id FROM shadow_orders WHERE order_key='order-1'"
             ).fetchone()[0],
-            1,
+            self.strict_mapping_id,
         )
         return order
 
