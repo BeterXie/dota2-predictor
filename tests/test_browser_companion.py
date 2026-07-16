@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from live_betting.browser_companion import MAX_BODY_BYTES, CompanionConfig, create_app
-from live_betting.browser_contract import payload_sha256
+from live_betting.browser_contract import canonical_json, payload_sha256
 from live_betting.health import record_health
 from live_betting.storage import LiveBettingStore
 
@@ -139,6 +140,50 @@ class BrowserCompanionTests(unittest.TestCase):
         self.assertEqual(status.json()["duplicate_count"], 1)
         self.assertEqual(status.json()["known_dota_match_count"], 1)
         self.assertEqual(self.client.get("/v1/status").status_code, 405)
+
+    def test_conflicting_retry_is_rejected_and_counted(self) -> None:
+        first_event = browser_event()
+        first = self.client.post(
+            "/v1/events",
+            content=json.dumps([first_event], separators=(",", ":")).encode(),
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+
+        conflict = browser_event()
+        conflict["payload"]["result"]["odds"][0]["odds"] = 3.0
+        conflict["payload_hash"] = payload_sha256(conflict["payload"])
+        conflict["payload_bytes"] = len(canonical_json(conflict["payload"]))
+        response = self.client.post(
+            "/v1/events",
+            content=json.dumps([conflict], separators=(",", ":")).encode(),
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["results"][0]["status"], "rejected")
+        self.assertEqual(response.json()["results"][0]["reason"], "event_id_conflict")
+        status = self.client.post(
+            "/v1/status", content=b"{}", headers=self.headers(content_type=True)
+        )
+        self.assertEqual(status.json()["rejection_count"], 1)
+
+    def test_database_unavailable_is_stable_and_not_acknowledged(self) -> None:
+        class FailingIngestor:
+            def ingest(self, _store, _event):
+                raise sqlite3.OperationalError("database is locked")
+
+        app = create_app(
+            CompanionConfig(database=self.database, extension_origin=ORIGIN),
+            ingestor=FailingIngestor(),  # type: ignore[arg-type]
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/events",
+                content=json.dumps([browser_event()], separators=(",", ":")).encode(),
+                headers=self.headers(content_type=True),
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "database_unavailable")
 
     def test_status_requires_empty_json_and_reports_fresh_shadow(self) -> None:
         for body in (b"", b"[]", b'{"unexpected":true}', b"null", b"not-json"):

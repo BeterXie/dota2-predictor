@@ -25,4 +25,5 @@ test("batch and acknowledgement preserve unacknowledged order", () => {
 test("retry is bounded", () => {
   assert.equal(retryDelayMs(0, () => 0.5), 1000);
   assert.equal(retryDelayMs(20, () => 0.5), 60000);
+  assert.equal(retryDelayMs(20, () => 1), 60000);
 });

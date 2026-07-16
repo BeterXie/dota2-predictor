@@ -223,9 +223,31 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertEqual(fresh["matches"][0]["lifecycle"], "live")
         self.assertEqual(stale["matches"][0]["lifecycle"], "degraded")
+        self.assertFalse(stale["matches"][0]["history_eligible"])
+
+    def test_long_stale_match_is_replayable_without_claiming_it_ended(self) -> None:
+        self.add_match(
+            status=2,
+            scheduled_at="2026-07-13 22:00:00",
+            updated_at=NOW - timedelta(days=1),
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        match = snapshot["matches"][0]
+        self.assertEqual(match["lifecycle"], "degraded")
+        self.assertTrue(match["history_eligible"])
 
     def test_provider_status_five_is_ended(self) -> None:
         self.add_match(status=5)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["matches"][0]["lifecycle"], "ended")
+        self.assertTrue(snapshot["matches"][0]["history_eligible"])
+
+    def test_provider_completed_list_status_three_is_ended(self) -> None:
+        self.add_match(status=3)
 
         snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
 

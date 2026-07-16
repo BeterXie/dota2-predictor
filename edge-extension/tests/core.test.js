@@ -111,6 +111,24 @@ test("redaction removes identity and prototype-pollution keys", () => {
   assert.equal(result.redactedKeys, 8);
 });
 
+test("redaction removes authorization-material key variants", () => {
+  const { sanitizeCandidate } = loadCore();
+  const input = {
+    public: true,
+    "API-Key": "x",
+    access_key: "x",
+    privateKey: "x",
+    password: "x",
+    passwd: "x",
+    credential: "x",
+    "url.signature": "x",
+  };
+  const result = sanitizeCandidate(input);
+  assert.equal(result.ok, true);
+  assert.deepEqual(plain(result.value), {public: true});
+  assert.equal(result.redactedKeys, 7);
+});
+
 test("redaction skips accessors without invoking page-owned code", () => {
   const { sanitizeCandidate } = loadCore();
   let invoked = false;

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Sequence
 
-from .browser_contract import BrowserEvent, EventType
+from .browser_contract import BrowserEvent, EventType, Transport
 from .markets import normalized_state_hash, snapshots_from_payload
 from .models import OddsSnapshot
 from .storage import LiveBettingStore
@@ -30,6 +30,12 @@ MAX_FUTURE_CAPTURE_SKEW = timedelta(seconds=5)
 
 
 def _validated_odds_result(event: BrowserEvent) -> dict[str, object]:
+    if event.transport in {Transport.FETCH, Transport.XHR} and event.source_path not in {
+        "/v2/odds", "/odds"
+    }:
+        raise BrowserNormalizationError("odds source path is not an odds endpoint")
+    if event.transport is Transport.PAGE_STATE:
+        raise BrowserNormalizationError("page-state transport cannot normalize odds")
     result = event.payload.get("result")
     if not isinstance(result, dict):
         raise BrowserNormalizationError("missing odds result")
@@ -75,6 +81,10 @@ class BrowserEventIngestor:
                 event, received_at=received_at, recognized=recognized,
             )
             if not inserted:
+                if not store.browser_event_identity_matches(event):
+                    return BrowserIngestResult(
+                        event.event_id, "rejected", "error", "event_id_conflict"
+                    )
                 return BrowserIngestResult(
                     event.event_id, "duplicate", "duplicate", "duplicate_event_id"
                 )
@@ -105,15 +115,18 @@ class BrowserEventIngestor:
                         raise BrowserNormalizationError("odds parser failed") from error
                     if any(row.raybet_match_id != event.raybet_match_id for row in snapshots):
                         raise BrowserNormalizationError("normalized match id mismatch")
-                    timing_status, change_count = store.store_odds_observation(
-                        source="browser",
-                        observation_key=event.event_id,
-                        source_event_id=event.event_id,
-                        raybet_match_id=event.raybet_match_id or "",
-                        observed_at=event.captured_at_utc,
-                        normalized_state_hash=state_hash,
-                        snapshots=snapshots,
-                    )
+                    try:
+                        timing_status, change_count = store.store_odds_observation(
+                            source="browser",
+                            observation_key=event.event_id,
+                            source_event_id=event.event_id,
+                            raybet_match_id=event.raybet_match_id or "",
+                            observed_at=event.captured_at_utc,
+                            normalized_state_hash=state_hash,
+                            snapshots=snapshots,
+                        )
+                    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as error:
+                        raise BrowserNormalizationError("odds normalization failed") from error
             except BrowserNormalizationError:
                 store.update_browser_event_status(
                     event.event_id, "error", "normalization_failed"

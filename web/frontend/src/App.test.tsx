@@ -118,6 +118,7 @@ const match = (raybet_match_id: string): MonitorMatch => ({
   live_url: null,
   updated_at: "2026-07-15T00:00:00+00:00",
   lifecycle: "degraded",
+  history_eligible: false,
   winner: null,
   latest_vision: null,
   latest_decision: null,
@@ -287,6 +288,27 @@ describe("App data recovery and ownership", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
     expect(screen.getByRole("button", { name: "select-ended" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
+  });
+
+  it("moves long-stale replay evidence out of the live list without relabeling it ended", async () => {
+    const archivedMatch: MonitorMatch = {
+      ...match("archived"),
+      history_eligible: true,
+      lifecycle: "degraded",
+    };
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      matches: [match("live"), archivedMatch],
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "select-live" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-archived" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(screen.getByRole("button", { name: "select-archived" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
   });
 

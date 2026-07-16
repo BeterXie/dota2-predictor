@@ -16,11 +16,32 @@ import rfc8785
 SCHEMA_VERSION = 1
 DOTA2_GAME_ID = 151
 MAX_PAYLOAD_BYTES = 256 * 1024
+MAX_RAW_PAYLOAD_BYTES = 1024 * 1024
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
 MATCH_RE = re.compile(r"^[0-9]{1,32}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+CAPTURE_REASONS = frozenset(
+    {
+        "binary_payload",
+        "cycle",
+        "diagnostic_untrusted",
+        "invalid_candidate",
+        "invalid_envelope",
+        "invalid_manual_control",
+        "max_array_items",
+        "max_depth",
+        "max_nodes",
+        "max_object_keys",
+        "max_string_bytes",
+        "non_json_value",
+        "payload_too_large",
+        "raw_payload_too_large",
+        "unknown_endpoint",
+        "unknown_structure",
+    }
+)
 RAYBET_ORIGINS = frozenset(
     {
         "https://ray086.com",
@@ -68,6 +89,13 @@ _FORBIDDEN_KEY_PARTS = (
     "secret",
     "session",
     "csrf",
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "password",
+    "passwd",
+    "credential",
+    "signature",
     "user",
     "member",
     "account",
@@ -208,7 +236,9 @@ class BrowserEvent(BaseModel):
     @field_validator("capture_reason")
     @classmethod
     def validate_reason(cls, value: str | None) -> str | None:
-        if value is not None and not REASON_RE.fullmatch(value):
+        if value is not None and (
+            not REASON_RE.fullmatch(value) or value not in CAPTURE_REASONS
+        ):
             raise ValueError("invalid capture reason")
         return value
 
@@ -229,6 +259,17 @@ class BrowserEvent(BaseModel):
         encoded = canonical_json(self.payload)
         if len(encoded) > MAX_PAYLOAD_BYTES:
             raise ValueError("payload exceeds 256 KiB")
+        metadata_only = not self.payload and self.capture_reason is not None
+        if not metadata_only and self.payload_bytes != len(encoded):
+            raise ValueError("payload_bytes does not match canonical payload size")
+        if self.capture_reason == "payload_too_large" and (
+            self.payload_bytes <= MAX_PAYLOAD_BYTES or self.payload
+        ):
+            raise ValueError("payload_too_large must carry the full size and no payload")
+        if self.capture_reason == "raw_payload_too_large" and (
+            self.payload_bytes <= MAX_RAW_PAYLOAD_BYTES or self.payload
+        ):
+            raise ValueError("raw_payload_too_large must carry a lower-bound size")
         unverifiable_oversize_hash = (
             self.capture_reason == "payload_too_large" and not self.payload
         )

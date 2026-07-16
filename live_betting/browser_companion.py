@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -204,36 +205,42 @@ def create_app(
         results: list[dict[str, Any]] = []
         duplicate_count = 0
         rejection_count = 0
-        with LiveBettingStore(config.database) as store:
-            for item in raw_batch:
-                event_id = _safe_event_id(item)
-                try:
-                    event = _model_event(item)
-                except (ValueError, TypeError):
-                    rejection_count += 1
+        try:
+            with LiveBettingStore(config.database) as store:
+                for item in raw_batch:
+                    event_id = _safe_event_id(item)
+                    try:
+                        event = _model_event(item)
+                    except (ValueError, TypeError):
+                        rejection_count += 1
+                        results.append({
+                            "event_id": event_id,
+                            "status": "rejected",
+                            "reason": "invalid_event",
+                        })
+                        continue
+                    if event.extension_version != SUPPORTED_EXTENSION_VERSION:
+                        rejection_count += 1
+                        results.append({
+                            "event_id": event.event_id,
+                            "status": "rejected",
+                            "reason": "unsupported_extension_version",
+                        })
+                        continue
+                    result = ingestor.ingest(store, event)
+                    if result.outcome == "duplicate":
+                        duplicate_count += 1
+                    elif result.outcome == "rejected":
+                        rejection_count += 1
                     results.append({
-                        "event_id": event_id,
-                        "status": "rejected",
-                        "reason": "invalid_event",
+                        "event_id": result.event_id,
+                        "status": result.outcome,
+                        "processing_status": result.processing_status,
+                        "reason": result.reason,
                     })
-                    continue
-                if event.extension_version != SUPPORTED_EXTENSION_VERSION:
-                    rejection_count += 1
-                    results.append({
-                        "event_id": event.event_id,
-                        "status": "rejected",
-                        "reason": "unsupported_extension_version",
-                    })
-                    continue
-                result = ingestor.ingest(store, event)
-                if result.outcome == "duplicate":
-                    duplicate_count += 1
-                results.append({
-                    "event_id": result.event_id,
-                    "status": result.outcome,
-                    "processing_status": result.processing_status,
-                    "reason": result.reason,
-                })
+        except sqlite3.OperationalError:
+            stats.add(rejections=1)
+            return _error("database_unavailable", 503)
         stats.add(duplicates=duplicate_count, rejections=rejection_count)
         return JSONResponse(
             {"protocol_version": PROTOCOL_VERSION, "results": results}

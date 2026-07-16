@@ -323,6 +323,15 @@ class RayBetClient:
                 combined[str(row.get("id"))] = row
         return sorted(combined.values(), key=lambda row: str(row.get("start_time") or ""))
 
+    def completed_matches(self, *, max_pages: int = 10) -> list[dict[str, Any]]:
+        """Return Dota 2 rows from RayBet's completed-match list (type 4).
+
+        Completed rows are intentionally kept separate from ``live_matches``:
+        they are used for final-result/odds evidence and must never become live
+        strategy inputs merely because the provider still exposes the row.
+        """
+        return self.matches(match_type=4, max_pages=max_pages)
+
     def match_odds(self, match_id: int | str) -> dict[str, Any]:
         payload = self._get("/odds", {"match_id": str(match_id)})
         if not isinstance(payload.get("result"), dict):

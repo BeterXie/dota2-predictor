@@ -1237,6 +1237,40 @@ class LiveBettingStore:
         )
         return cursor.rowcount == 1
 
+    def browser_event_identity_matches(self, event: Mapping[str, Any] | Any) -> bool:
+        """Check immutable retry identity before treating an event ID as duplicate."""
+        event_id = str(self._event_value(event, "event_id"))
+        row = self.connection.execute(
+            """SELECT schema_version, capture_session_id, captured_at, transport,
+                      event_type, raybet_match_id, game_id, page_origin, page_path,
+                      source_path, payload_hash, payload_bytes, capture_reason,
+                      extension_version
+                 FROM browser_events WHERE event_id=?""",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        captured_at = self._event_value(
+            event, "captured_at_utc", self._event_value(event, "captured_at")
+        )
+        expected = (
+            int(self._event_value(event, "schema_version")),
+            str(self._event_value(event, "capture_session_id")),
+            self._iso(captured_at),
+            str(self._scalar(self._event_value(event, "transport"))),
+            str(self._scalar(self._event_value(event, "event_type"))),
+            self._event_value(event, "raybet_match_id"),
+            self._event_value(event, "game_id"),
+            str(self._event_value(event, "page_origin")),
+            str(self._event_value(event, "page_path")),
+            str(self._event_value(event, "source_path")),
+            str(self._event_value(event, "payload_hash")),
+            int(self._event_value(event, "payload_bytes")),
+            self._event_value(event, "capture_reason"),
+            str(self._event_value(event, "extension_version")),
+        )
+        return tuple(row) == expected
+
     def update_browser_event_status(
         self, event_id: str, status: str, reason: str | None = None
     ) -> bool:
@@ -1340,17 +1374,19 @@ class LiveBettingStore:
                     (observation_key,),
                 ).fetchall()
                 if not persisted_outcomes:
-                    self._insert_response_outcomes(observation_key, snapshots)
-                else:
-                    actual_outcomes = [tuple(row) for row in persisted_outcomes]
-                    expected_outcomes = sorted(
-                        (self._response_outcome_values(snapshot) for snapshot in snapshots),
-                        key=lambda values: str(values[1]),
-                    )
-                    if actual_outcomes != expected_outcomes:
+                    if snapshots:
                         raise ValueError(
                             "observation key response membership or payload differs"
                         )
+                actual_outcomes = [tuple(row) for row in persisted_outcomes]
+                expected_outcomes = sorted(
+                    (self._response_outcome_values(snapshot) for snapshot in snapshots),
+                    key=lambda values: str(values[1]),
+                )
+                if actual_outcomes != expected_outcomes:
+                    raise ValueError(
+                        "observation key response membership or payload differs"
+                    )
                 return str(existing["timing_status"]), 0
 
             timing_status = self.observation_timing_status(raybet_match_id, observed_at)

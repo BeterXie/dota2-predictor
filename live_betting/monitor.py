@@ -61,6 +61,15 @@ def _direct_observation_key(
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def completed_refresh_due(
+    completed_rows: list[dict[str, Any]] | None,
+    monotonic_now: float,
+    next_refresh: float,
+) -> bool:
+    """Return whether the low-frequency completed feed should be fetched."""
+    return completed_rows is None or monotonic_now >= next_refresh
+
+
 def collect_once(
     store: LiveBettingStore,
     client: RayBetClient,
@@ -101,6 +110,102 @@ def collect_once(
     return {"matches": len(list_rows), "odds": odds_count, "changed": changed_count}
 
 
+def collect_completed_once(
+    store: LiveBettingStore,
+    client: RayBetClient,
+    raw_dir: Path,
+    completed_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, int]:
+    """Archive final odds for the low-frequency RayBet completed feed.
+
+    RayBet exposes completed matches through ``match_type=4``.  They are
+    deliberately collected outside ``collect_once`` so the live 3-second loop
+    does not repeatedly enumerate and fetch the whole historical list.  A
+    completed response is still stored as an ordinary immutable transport
+    observation; its provider row carries status ``3`` and is therefore
+    available to post-match reconciliation and the historical UI.
+    """
+    rows = completed_rows if completed_rows is not None else client.completed_matches()
+    odds_count = 0
+    changed_count = 0
+    error_count = 0
+    list_observed_at = utc_now()
+    _write_raw(
+        raw_dir,
+        "_completed_match_list",
+        {"result": rows},
+        list_observed_at,
+    )
+    fetched_matches = 0
+    for list_row in rows:
+        match_id = str(list_row.get("id") or "")
+        if not match_id.isdigit():
+            continue
+        try:
+            payload = client.match_odds(match_id)
+            result = payload.get("result")
+            if (
+                not isinstance(result, dict)
+                or str(result.get("id") or "") != match_id
+                or type(result.get("game_id")) is not int
+                or int(result["game_id"]) != 151
+            ):
+                # Keep the list archive for audit, but never let an identity-
+                # mismatched response enter normalized odds or overwrite metadata.
+                error_count += 1
+                continue
+            observed_at = utc_now()
+            fingerprint = _fingerprint(payload)
+            _write_raw(raw_dir, match_id, payload, observed_at)
+            snapshots = snapshots_from_payload(payload, received_at=observed_at)
+            # The completed list contract uses status=3.  Some odds responses omit
+            # the parent match status, so carry the completed-list status through to
+            # the normalized metadata without changing the archived response.
+            stored_result = dict(result)
+            if stored_result.get("status") in (None, ""):
+                stored_result["status"] = list_row.get("status", 3)
+            with store.transaction():
+                store.upsert_raybet_match(stored_result, observed_at)
+                _, changes = store.store_odds_observation(
+                    source="direct",
+                    observation_key=_direct_observation_key(
+                        match_id, observed_at, fingerprint
+                    ),
+                    source_event_id=None,
+                    raybet_match_id=match_id,
+                    observed_at=observed_at,
+                    normalized_state_hash=normalized_state_hash(snapshots),
+                    snapshots=snapshots,
+                )
+                changed_count += changes
+            odds_count += len(snapshots)
+            fetched_matches += 1
+        except Exception as error:
+            error_count += 1
+            logger.warning(
+                "completed RayBet fetch failed for match_id=%s (%s)",
+                match_id,
+                type(error).__name__,
+            )
+    completed_at = utc_now()
+    if error_count:
+        store.record_collector(
+            "raybet_completed",
+            success_at=completed_at if fetched_matches else None,
+            error_at=completed_at,
+            error=f"{error_count} completed match(s) failed",
+        )
+    else:
+        store.record_collector("raybet_completed", success_at=completed_at)
+    return {
+        "matches": fetched_matches,
+        "listed": len(rows),
+        "odds": odds_count,
+        "changed": changed_count,
+        "errors": error_count,
+    }
+
+
 def run(args: argparse.Namespace) -> int:
     load_dotenv()
     db_path = Path(args.database)
@@ -122,16 +227,66 @@ def run(args: argparse.Namespace) -> int:
         list_rows: list[dict[str, Any]] | None = None
         raw_fingerprints: dict[str, str] = {}
         next_list_refresh = 0.0
+        completed_rows: list[dict[str, Any]] | None = None
+        next_completed_refresh = 0.0
         while True:
             try:
                 monotonic_now = time.monotonic()
                 if list_rows is None or monotonic_now >= next_list_refresh:
                     list_rows = client.live_matches()
                     next_list_refresh = monotonic_now + args.list_interval
+                completed_refresh_needed = False
+                completed_summary = {
+                    "matches": 0,
+                    "listed": len(completed_rows or []),
+                    "odds": 0,
+                    "changed": 0,
+                    "errors": 0,
+                }
+                if completed_refresh_due(
+                    completed_rows, monotonic_now, next_completed_refresh
+                ):
+                    next_completed_refresh = (
+                        monotonic_now + args.completed_interval
+                    )
+                    try:
+                        completed_rows = client.completed_matches()
+                    except Exception as error:
+                        completed_rows = completed_rows or []
+                        completed_summary["errors"] = 1
+                        completed_at = utc_now()
+                        store.record_collector(
+                            "raybet_completed",
+                            error_at=completed_at,
+                            error=f"completed list failed: {type(error).__name__}",
+                        )
+                        logger.warning(
+                            "completed RayBet list refresh failed (%s)",
+                            type(error).__name__,
+                        )
+                    else:
+                        completed_refresh_needed = True
                 summary = collect_once(
                     store, client, raw_dir, list_rows=list_rows,
                     raw_fingerprints=raw_fingerprints,
                 )
+                if completed_refresh_needed:
+                    try:
+                        completed_summary = collect_completed_once(
+                            store, client, raw_dir, completed_rows=completed_rows
+                        )
+                    except Exception as error:
+                        completed_summary["errors"] = 1
+                        completed_at = utc_now()
+                        store.record_collector(
+                            "raybet_completed",
+                            error_at=completed_at,
+                            error=f"completed collection failed: {type(error).__name__}",
+                        )
+                        logger.warning(
+                            "completed RayBet collection failed (%s)",
+                            type(error).__name__,
+                        )
                 failures = 0
                 succeeded_at = utc_now()
                 record_health(
@@ -140,11 +295,16 @@ def run(args: argparse.Namespace) -> int:
                     "healthy",
                     heartbeat_at=succeeded_at,
                     success_at=succeeded_at,
-                    details={"source": "worker", **summary},
+                    details={
+                        "source": "worker",
+                        **summary,
+                        "completed": completed_summary,
+                    },
                 )
                 logger.info(
-                    "collected matches=%d odds=%d changed=%d",
+                    "collected matches=%d odds=%d changed=%d completed=%d",
                     summary["matches"], summary["odds"], summary["changed"],
+                    completed_summary["matches"],
                 )
             except Exception as exc:
                 failures += 1
@@ -174,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-dir", default=str(ROOT / "data" / "live_betting" / "raw"))
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--list-interval", type=float, default=15.0)
+    parser.add_argument("--completed-interval", type=float, default=300.0)
     parser.add_argument("--max-backoff", type=float, default=300.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(

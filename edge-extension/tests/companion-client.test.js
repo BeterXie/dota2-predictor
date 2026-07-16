@@ -10,7 +10,7 @@ test("event request sends the exact JSON body with direct-mode headers", async (
     return {
       ok: true,
       status: 200,
-      json: async () => ({protocol_version: 1, results: []}),
+      json: async () => ({protocol_version: 1, results: [{event_id: "a", status: "accepted"}]}),
     };
   };
   await sendEventBatch([{event_id: "a"}], fetchImpl);
@@ -67,6 +67,26 @@ test("event acknowledgement rejects unsupported companion protocol versions", as
       (error) => error.name === "CompanionError"
         && error.status === 200
         && error.code === "unsupported_protocol_version",
+    );
+  }
+});
+
+test("event acknowledgement fails closed for missing, foreign, or duplicate IDs", async () => {
+  for (const results of [
+    [],
+    [{event_id: "b", status: "accepted"}],
+    [{event_id: "a", status: "accepted"}, {event_id: "a", status: "duplicate"}],
+    [{event_id: "a", status: "unknown"}],
+  ]) {
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({protocol_version: 1, results}),
+    });
+    await assert.rejects(
+      sendEventBatch([{event_id: "a"}], fetchImpl),
+      (error) => error.name === "CompanionError"
+        && error.code === "invalid_protocol_response",
     );
   }
 });

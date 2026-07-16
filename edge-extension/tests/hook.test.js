@@ -104,6 +104,8 @@ test("fetch return value is unchanged and early capture flushes after bridge rea
   assert.equal(candidate.transport, "fetch");
   assert.equal(candidate.raybet_match_id, "42");
   assert.equal(candidate.body_text, payload);
+  assert.equal(candidate.source_url, "https://cfinfo.365raylinks.com/v2/odds");
+  assert.equal(candidate.source_url.includes("token"), false);
   const diagnostics = messages.filter((item) => item.channel === "dota2-raybet-diagnostic-v1");
   assert.ok(diagnostics.some((item) => item.kind === "hook_initialized"));
   const observed = diagnostics.find((item) => item.kind === "transport_observed");

@@ -8,6 +8,7 @@
 
 const FORBIDDEN_PARTS = Object.freeze([
   "cookie", "authorization", "bearer", "token", "secret", "session", "csrf",
+  "apikey", "accesskey", "privatekey", "password", "passwd", "credential", "signature",
   "user", "member", "account", "profile", "username", "phone", "email", "identity",
   "balance", "wallet", "currency", "deposit", "withdrawal", "rebate", "transaction",
   "device", "fingerprint", "advertising", "analytics", "persistentclient", "clientid",

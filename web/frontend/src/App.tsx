@@ -626,10 +626,10 @@ function preferredMatch(
   view: "live" | "replay",
 ): string | null {
   const preferred = view === "replay"
-    ? snapshot.matches.find((match) => match.lifecycle === "ended")
-    : snapshot.matches.find((match) => match.lifecycle === "live")
-      || snapshot.matches.find((match) => match.lifecycle === "degraded")
-      || snapshot.matches.find((match) => match.lifecycle === "upcoming");
+    ? snapshot.matches.find(isHistoricalMatch)
+    : snapshot.matches.find((match) => !isHistoricalMatch(match) && match.lifecycle === "live")
+      || snapshot.matches.find((match) => !isHistoricalMatch(match) && match.lifecycle === "degraded")
+      || snapshot.matches.find((match) => !isHistoricalMatch(match) && match.lifecycle === "upcoming");
   return preferred?.raybet_match_id || null;
 }
 
@@ -638,8 +638,12 @@ function matchesForView(
   view: "live" | "replay",
 ): MonitorSnapshot["matches"] {
   return matches.filter((match) => (
-    view === "replay" ? match.lifecycle === "ended" : match.lifecycle !== "ended"
+    view === "replay" ? isHistoricalMatch(match) : !isHistoricalMatch(match)
   ));
+}
+
+function isHistoricalMatch(match: MonitorSnapshot["matches"][number]): boolean {
+  return match.lifecycle === "ended" || match.history_eligible === true;
 }
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {

@@ -65,6 +65,7 @@ export interface MonitorMatch {
   live_url: string | null;
   updated_at: string;
   lifecycle: Lifecycle;
+  history_eligible?: boolean;
   winner: WinnerQuote | null;
   latest_vision: VisionPoint | null;
   latest_decision: StrategyDecision | null;

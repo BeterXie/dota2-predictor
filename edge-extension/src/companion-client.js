@@ -39,6 +39,34 @@ function requireProtocolVersion(payload, response) {
   return payload;
 }
 
+function requireEventAcknowledgements(payload, response, events) {
+  const expectedIds = new Set(events.map((event) => event?.event_id));
+  const seenIds = new Set();
+  if (!Array.isArray(payload.results) || payload.results.length !== events.length
+      || expectedIds.size !== events.length) {
+    throw new CompanionError(
+      "Companion returned an invalid acknowledgement set",
+      response.status,
+      "invalid_protocol_response",
+    );
+  }
+  for (const result of payload.results) {
+    const eventId = result?.event_id;
+    if (typeof eventId !== "string"
+        || !expectedIds.has(eventId)
+        || seenIds.has(eventId)
+        || !["accepted", "duplicate", "rejected"].includes(result?.status)) {
+      throw new CompanionError(
+        "Companion returned an invalid event acknowledgement",
+        response.status,
+        "invalid_protocol_response",
+      );
+    }
+    seenIds.add(eventId);
+  }
+  return payload;
+}
+
 export async function sendEventBatch(events, fetchImpl = fetch) {
   const body = JSON.stringify(events);
   const response = await fetchImpl(`${BASE_URL}/v1/events`, {
@@ -49,7 +77,8 @@ export async function sendEventBatch(events, fetchImpl = fetch) {
     },
     body,
   });
-  return requireProtocolVersion(await parseResponse(response), response);
+  const payload = requireProtocolVersion(await parseResponse(response), response);
+  return requireEventAcknowledgements(payload, response, events);
 }
 
 export async function fetchCompanionStatus(fetchImpl = fetch) {

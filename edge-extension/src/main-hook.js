@@ -46,16 +46,25 @@
     return Boolean(url && ALLOWED_HOSTS.has(url.hostname));
   }
 
+  function publicSourceUrl(value) {
+    const url = value instanceof URL ? value : parseUrl(value);
+    return url ? `${url.origin}${url.pathname}` : "";
+  }
+
   function relevantHttpUrl(url) {
     return allowedUrl(url) && (url.pathname === "/v2/match" || url.pathname === "/v2/odds");
   }
 
   function candidateString(candidate) {
+    const safeCandidate = {...candidate};
+    if (Object.hasOwn(safeCandidate, "source_url")) {
+      safeCandidate.source_url = publicSourceUrl(safeCandidate.source_url);
+    }
     return JSON.stringify({
       channel: HOOK_CHANNEL,
       sequence: sequence += 1,
       captured_at_utc: new Date().toISOString(),
-      ...candidate,
+      ...safeCandidate,
     });
   }
 
@@ -86,7 +95,7 @@
     if (bytes > RAW_LIMIT + 16 * 1024) {
       serialized = candidateString({
         transport: candidate.transport,
-        source_url: candidate.source_url,
+        source_url: publicSourceUrl(candidate.source_url),
         raybet_match_id: candidate.raybet_match_id || null,
         body_text: null,
         raw_bytes: candidate.raw_bytes || bytes,
@@ -148,7 +157,7 @@
     const url = parseUrl(sourceUrl);
     emitCandidate({
       transport,
-      source_url: url ? url.href : String(sourceUrl || ""),
+      source_url: publicSourceUrl(url),
       raybet_match_id: url?.searchParams.get("match_id") || activeDotaMatchId,
       body_text: bodyText,
       raw_bytes: rawBytes,

@@ -86,6 +86,12 @@ class BrowserContractTests(unittest.TestCase):
 
     def test_backend_rejects_all_extension_identity_and_prototype_keys(self) -> None:
         keys = (
+            "API-Key",
+            "access_key",
+            "privateKey",
+            "password",
+            "credential",
+            "url.signature",
             "persistent_client",
             "visitorId",
             "browser-id",
@@ -153,6 +159,17 @@ class BrowserContractTests(unittest.TestCase):
         )
         parsed = self.parse(event)
         self.assertEqual(parsed.payload_hash, "c" * 64)
+
+    def test_capture_reason_is_a_stable_code_and_payload_bytes_are_exact(self) -> None:
+        unknown_reason = valid_event()
+        unknown_reason["capture_reason"] = "secret-value"
+        with self.assertRaises(ValidationError):
+            self.parse(unknown_reason)
+
+        wrong_size = valid_event()
+        wrong_size["payload_bytes"] += 1
+        with self.assertRaises(ValidationError):
+            self.parse(wrong_size)
 
 
 if __name__ == "__main__":

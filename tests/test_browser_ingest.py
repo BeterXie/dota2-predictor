@@ -38,6 +38,7 @@ def odds_payload(tournament: str = "Browser Cup", price: str = "2.10") -> dict:
 def event(
     event_id: str, captured_at: datetime = NOW, *, event_type: str = "odds",
     payload: dict | None = None, capture_reason: str | None = None,
+    transport: str = "fetch", source_path: str = "/v2/odds",
 ) -> BrowserEvent:
     payload = odds_payload() if payload is None else payload
     value = {
@@ -47,8 +48,8 @@ def event(
         "captured_at_utc": captured_at.isoformat().replace("+00:00", "Z"),
         "page_origin": "https://www.ray086.com",
         "page_path": "/sports/esports",
-        "source_path": "/v2/odds",
-        "transport": "fetch",
+        "source_path": source_path,
+        "transport": transport,
         "event_type": event_type,
         "raybet_match_id": "38407985" if event_type != "match_list" else None,
         "game_id": 151,
@@ -94,6 +95,19 @@ class BrowserIngestTests(unittest.TestCase):
         self.assertEqual((duplicate.outcome, duplicate.processing_status), ("duplicate", "duplicate"))
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM browser_events"), 1)
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM odds_transport_observations"), 1)
+
+    def test_reused_event_id_with_different_immutable_content_is_rejected(self) -> None:
+        event_id = "b" * 64
+        self.ingestor.ingest(self.store, event(event_id))
+        conflict = self.ingestor.ingest(
+            self.store, event(event_id, payload=odds_payload(price="3.10"))
+        )
+        self.assertEqual(
+            (conflict.outcome, conflict.processing_status, conflict.reason),
+            ("rejected", "error", "event_id_conflict"),
+        )
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM browser_events"), 1)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM odds_snapshots"), 1)
 
     def test_non_complete_event_types_are_audit_only(self) -> None:
         match_payload = {"matches": [{"id": "38407985", "game_id": 151}]}
@@ -148,6 +162,35 @@ class BrowserIngestTests(unittest.TestCase):
 
         ingestor = BrowserEventIngestor(parser=fail, clock=lambda: NOW)
         result = ingestor.ingest(self.store, event("e" * 64))
+        self.assertEqual(
+            (result.outcome, result.processing_status, result.reason),
+            ("accepted", "error", "normalization_failed"),
+        )
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM raybet_matches"), 0)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM odds_transport_observations"), 0)
+        row = self.store.connection.execute(
+            "SELECT processing_status, processing_reason FROM browser_events"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("error", "normalization_failed"))
+
+    def test_page_state_odds_cannot_enter_normalization(self) -> None:
+        item = event(
+            "e" * 64,
+            transport="page_state",
+            source_path="/manualControlData",
+        )
+        result = self.ingestor.ingest(self.store, item)
+        self.assertEqual(
+            (result.outcome, result.processing_status, result.reason),
+            ("accepted", "error", "normalization_failed"),
+        )
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM browser_events"), 1)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM odds_snapshots"), 0)
+
+    def test_odds_membership_error_rolls_back_savepoint_but_keeps_error_audit(self) -> None:
+        payload = odds_payload()
+        payload["result"]["odds"].append(dict(payload["result"]["odds"][0]))
+        result = self.ingestor.ingest(self.store, event("e" * 64, payload=payload))
         self.assertEqual(
             (result.outcome, result.processing_status, result.reason),
             ("accepted", "error", "normalization_failed"),

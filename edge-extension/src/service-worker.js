@@ -129,14 +129,7 @@ async function initialize() {
 }
 
 function acknowledgedIds(payload) {
-  if (Array.isArray(payload.results)) {
-    return payload.results.map((item) => item.event_id).filter(Boolean);
-  }
-  return [
-    ...(payload.accepted || []),
-    ...(payload.duplicates || []),
-    ...(payload.rejected || []),
-  ];
+  return payload.results.map((item) => item.event_id);
 }
 
 async function scheduleRetry(error) {

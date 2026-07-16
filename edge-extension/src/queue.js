@@ -48,5 +48,6 @@ export function acknowledge(events, eventIds) {
 
 export function retryDelayMs(attempt, random = Math.random) {
   const base = Math.min(60_000, 1000 * 2 ** Math.max(0, attempt));
-  return Math.max(1000, Math.round(base * (0.8 + random() * 0.4)));
+  const jittered = Math.round(base * (0.8 + random() * 0.4));
+  return Math.min(60_000, Math.max(1000, jittered));
 }

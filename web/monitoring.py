@@ -18,8 +18,10 @@ from .alerts import active_alerts
 
 _LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _OPEN_MATCH_STATUSES = {"1", "2", "open", "active", "running"}
-_ENDED_MATCH_STATUSES = {"5", "ended", "finished", "settled", "closed"}
+_ENDED_MATCH_STATUSES = {"3", "5", "ended", "finished", "settled", "closed"}
 _UPCOMING_MATCH_STATUSES = {"1", "upcoming", "scheduled", "not_started"}
+_HISTORY_SCHEDULE_GRACE = timedelta(hours=12)
+_HISTORY_ACTIVITY_GRACE = timedelta(minutes=15)
 _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
     "shadow_worker": 45.0,
@@ -423,6 +425,12 @@ def _monitor_match(
     current_winner = _current_winner(
         connection, match_id, provider_status=str(row["status"] or "")
     )
+    history_eligible = _history_eligible(
+        lifecycle,
+        row["scheduled_at"],
+        row["updated_at"],
+        checked_at=now,
+    )
     return {
         "raybet_match_id": match_id,
         "tournament": row["tournament"],
@@ -434,6 +442,7 @@ def _monitor_match(
         "live_url": row["live_url"],
         "updated_at": row["updated_at"],
         "lifecycle": lifecycle,
+        "history_eligible": history_eligible,
         "winner": current_winner,
         "latest_vision": dict(latest_vision) if latest_vision else None,
         "latest_decision": dict(latest_decision) if latest_decision else None,
@@ -708,6 +717,28 @@ def _lifecycle(
     if normalized in _OPEN_MATCH_STATUSES:
         return "degraded"
     return "degraded"
+
+
+def _history_eligible(
+    lifecycle: str,
+    scheduled_at: object,
+    updated_at: object,
+    *,
+    checked_at: datetime,
+) -> bool:
+    """Expose old odds for replay without claiming provider settlement."""
+    if lifecycle == "ended":
+        return True
+    if lifecycle != "degraded":
+        return False
+    scheduled = _parse_schedule(scheduled_at)
+    activity = _parse_time(updated_at)
+    if scheduled is None or activity is None:
+        return False
+    return (
+        scheduled <= checked_at - _HISTORY_SCHEDULE_GRACE
+        and activity <= checked_at - _HISTORY_ACTIVITY_GRACE
+    )
 
 
 def _parse_schedule(value: object) -> datetime | None:
