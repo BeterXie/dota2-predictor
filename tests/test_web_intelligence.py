@@ -742,6 +742,24 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["player_scores"][0]["hero_name"], "Axe")
         self.assertIsNone(payload["player_scores"][0]["performance"])
 
+    def test_match_detail_degrades_on_malformed_legacy_json(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE player_map_facts SET facts_json='not-json' WHERE match_id=1 AND player_slot=0"
+        )
+        connection.execute(
+            "UPDATE draft_model_runs SET configuration_json='not-json' WHERE run_id='current'"
+        )
+        connection.commit()
+        connection.close()
+
+        response = self.client.get("/api/intelligence/matches/1")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertIsNone(payload["player_performance"][0]["player_name"])
+        self.assertEqual(payload["draft_predictions"], [])
+
     def test_match_detail_accepts_validated_prospective_v3_run(self) -> None:
         prospective_role_version = "role-assignment-v1-prospective"
         connection = sqlite3.connect(self.path)

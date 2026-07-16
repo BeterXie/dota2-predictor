@@ -83,6 +83,7 @@ describe("IntelligenceDashboard", () => {
       ],
     });
     renderDashboard();
+    fireEvent.click(screen.getByRole("tab", { name: /阵容校准/ }));
 
     expect((await screen.findAllByText("player-score-v3+observed-role=role-v1")).length).toBe(2);
     expect(screen.getByText("前瞻验证 尚未建立")).toBeInTheDocument();
@@ -359,9 +360,15 @@ describe("IntelligenceDashboard", () => {
     }));
     const view = renderDashboard();
 
+    expect(overviewMock).not.toHaveBeenCalled();
+    expect(await screen.findByText("没有符合条件的历史比赛")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: /阵容校准/ }));
+    await waitFor(() => expect(overviewMock).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("progressbar", { name: "正在加载历史情报总览" })).toBeInTheDocument();
     rejectOverview?.(new Error("database unavailable"));
     expect(await screen.findByRole("alert")).toHaveTextContent("database unavailable");
+
+    fireEvent.click(screen.getByRole("tab", { name: /比赛复盘/ }));
     expect(await screen.findByText("没有符合条件的历史比赛")).toBeInTheDocument();
 
     view.unmount();

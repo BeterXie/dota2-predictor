@@ -10,12 +10,13 @@ const lifecycleOrder: Lifecycle[] = ["live", "degraded", "upcoming", "ended"];
 
 interface MatchRailProps {
   matches: MonitorMatch[];
+  mode: "live" | "history";
   selectedId: string | null;
   onSelect: (matchId: string) => void;
   now: number;
 }
 
-export function MatchRail({ matches, selectedId, onSelect, now }: MatchRailProps) {
+export function MatchRail({ matches, mode, selectedId, onSelect, now }: MatchRailProps) {
   const [query, setQuery] = useState("");
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
@@ -34,8 +35,8 @@ export function MatchRail({ matches, selectedId, onSelect, now }: MatchRailProps
     <aside className="match-rail" aria-label="赛事列表">
       <div className="rail-header">
         <div>
-          <h2>赛事</h2>
-          <span>{matches.length} 场已发现</span>
+          <h2>{mode === "history" ? "历史赛事" : "滚球赛事"}</h2>
+          <span>{matches.length} 场</span>
         </div>
         <Input
           aria-label="搜索赛事"
@@ -98,7 +99,7 @@ export function MatchRail({ matches, selectedId, onSelect, now }: MatchRailProps
         {!filtered.length && (
           <div className="rail-empty">
             <MagnifyingGlass size={24} aria-hidden="true" />
-            <span>没有匹配的赛事</span>
+            <span>{query ? "没有匹配的赛事" : mode === "history" ? "暂无历史比赛" : "暂无滚球赛事"}</span>
           </div>
         )}
       </nav>

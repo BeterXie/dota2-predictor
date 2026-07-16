@@ -31,8 +31,24 @@ vi.mock("@fluentui/react-components", () => ({
     "aria-label"?: string;
     checked?: boolean;
   }) => <input aria-label={ariaLabel} checked={checked} readOnly type="checkbox" />,
-  Tab: ({ children }: { children: ReactNode }) => <button>{children}</button>,
-  TabList: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  Tab: ({ children, value }: { children: ReactNode; value: string }) => (
+    <button data-tab-value={value}>{children}</button>
+  ),
+  TabList: ({ children, onTabSelect }: {
+    children: ReactNode;
+    onTabSelect?: (event: unknown, data: { value: string }) => void;
+  }) => (
+    <div
+      onClick={(event) => {
+        const tab = (event.target as HTMLElement).closest<HTMLButtonElement>(
+          "button[data-tab-value]",
+        );
+        if (tab?.dataset.tabValue) onTabSelect?.(event, { value: tab.dataset.tabValue });
+      }}
+    >
+      {children}
+    </div>
+  ),
 }));
 vi.mock("./components/MatchRail", () => ({
   MatchRail: ({ matches, onSelect }: {
@@ -48,7 +64,14 @@ vi.mock("./components/MatchRail", () => ({
     </nav>
   ),
 }));
-vi.mock("./components/MatchWorkspace", () => ({ MatchWorkspace: () => <main /> }));
+vi.mock("./components/MatchWorkspace", () => ({
+  MatchWorkspace: ({ replay }: { replay: boolean }) => (
+    <main>{replay ? "odds-replay" : "live-workspace"}</main>
+  ),
+}));
+vi.mock("./components/IntelligenceDashboard", () => ({
+  IntelligenceDashboard: () => <section>opendota-postmatch</section>,
+}));
 vi.mock("./components/OperationsPanel", () => ({
   OperationsPanel: ({ alerts, components, controlMessage, match, mappings, onAcknowledge }: {
     alerts: AlertIncident[];
@@ -184,6 +207,7 @@ describe("App data recovery and ownership", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    window.history.replaceState(null, "", "/");
     api.fetchBootstrap.mockResolvedValue(snapshot);
     api.fetchMatchDetail.mockImplementation((matchId: string) => (
       Promise.resolve({ ...match(matchId), winner_timeline: [], decisions: [], vision: [], markets: [] })
@@ -209,11 +233,61 @@ describe("App data recovery and ownership", () => {
   it("never exposes mappings from the previously selected match", async () => {
     render(<App />);
 
+    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
     expect(await screen.findByText("mapping-101")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "滚球列表" }));
     fireEvent.click(screen.getByRole("button", { name: "select-b" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
 
     expect(await screen.findByTestId("selected-match")).toHaveTextContent("b");
     expect(screen.queryByText("mapping-101")).not.toBeInTheDocument();
+  });
+
+  it("separates live matches, historical evidence, and operations", async () => {
+    render(<App />);
+
+    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    expect(screen.queryByTestId("selected-match")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(screen.getByRole("button", { name: "赔率复盘" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
+    expect(screen.getByText("odds-replay")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "OpenDota 赛后情报" }));
+    expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
+    expect(screen.queryByText("odds-replay")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    expect(await screen.findByTestId("selected-match")).toHaveTextContent("none");
+    expect(screen.queryByText("opendota-postmatch")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-a" })).not.toBeInTheDocument();
+  });
+
+  it("keeps legacy history deep links working", async () => {
+    window.history.replaceState(null, "", "/?view=intelligence");
+
+    render(<App />);
+
+    expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
+  });
+
+  it("keeps live and ended match lists isolated", async () => {
+    const endedMatch: MonitorMatch = { ...match("ended"), lifecycle: "ended" };
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      matches: [match("live"), endedMatch],
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "select-live" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-ended" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(screen.getByRole("button", { name: "select-ended" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
   });
 
   it("retries the initial bootstrap after a transient failure", async () => {
@@ -237,6 +311,7 @@ describe("App data recovery and ownership", () => {
       });
 
       expect(api.fetchBootstrap).toHaveBeenCalledTimes(2);
+      fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
       expect(screen.getByTestId("selected-match")).toHaveTextContent("a");
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     } finally {
@@ -251,6 +326,7 @@ describe("App data recovery and ownership", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
     expect(screen.getByText("component-raybet_collector-stopped")).toBeInTheDocument();
 
     await act(async () => {
@@ -291,6 +367,7 @@ describe("App data recovery and ownership", () => {
     api.acknowledgeAlert.mockResolvedValue({ acknowledged: false });
     render(<App />);
 
+    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
     expect(await screen.findByText("incident-77-unacknowledged")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "ack-first-alert" }));
 

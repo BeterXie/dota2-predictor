@@ -72,6 +72,15 @@ summary:focus-visible {
   backdrop-filter: blur(10px);
 }
 
+.history-mode-bar {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
 .brand-lockup,
 .topbar-status,
 .match-header-actions,
@@ -236,15 +245,26 @@ summary:focus-visible {
   font-size: 12px;
 }
 
+.view-loading {
+  display: grid;
+  min-height: 320px;
+  place-items: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
 .cockpit-grid {
   display: grid;
-  grid-template-columns: minmax(240px, 286px) minmax(520px, 1fr) minmax(286px, 330px);
+  grid-template-columns: minmax(240px, 286px) minmax(520px, 1fr);
   align-items: start;
   min-height: calc(100dvh - 103px);
 }
 
-.match-rail,
-.operations-panel {
+.cockpit-grid.history-replay {
+  min-height: calc(100dvh - 145px);
+}
+
+.match-rail {
   position: sticky;
   top: 103px;
   max-height: calc(100dvh - 103px);
@@ -881,6 +901,35 @@ summary:focus-visible {
   background: var(--surface);
 }
 
+.operations-view {
+  width: 100%;
+  max-width: 1600px;
+  min-height: calc(100dvh - 103px);
+  margin: 0 auto;
+}
+
+.operations-view .operations-panel {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  max-height: none;
+  overflow: visible;
+  border-left: 0;
+}
+
+.operations-view .operations-section {
+  border-right: 1px solid var(--border);
+  border-bottom: 0;
+}
+
+.operations-view .operations-section:nth-of-type(4) {
+  border-right: 0;
+}
+
+.operations-view .mail-state {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border);
+}
+
 .operations-section {
   padding: 14px 13px;
   border-bottom: 1px solid var(--border);
@@ -1195,6 +1244,11 @@ summary:focus-visible {
     overflow-x: auto;
   }
 
+  .history-mode-bar {
+    overflow-x: auto;
+    padding-inline: 12px;
+  }
+
   .snapshot-time {
     display: none;
   }
@@ -1264,9 +1318,22 @@ summary:focus-visible {
     display: block;
   }
 
+  .operations-view .operations-panel {
+    display: block;
+  }
+
   .operations-section {
     border-right: 0;
     border-bottom: 1px solid var(--border);
+  }
+
+  .operations-view .operations-section {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .operations-view .mail-state {
+    border-top: 0;
   }
 }
 

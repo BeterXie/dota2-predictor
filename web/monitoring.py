@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from live_betting.raybet_state import raybet_match_is_live
+from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
 from live_betting.strict_eligibility import query_strict_live_eligibility
 
 from .alerts import active_alerts
@@ -24,6 +24,7 @@ _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
     "shadow_worker": 45.0,
 }
+_OPTIONAL_UNCONFIGURED_COMPONENTS = {"mail", "mail_worker"}
 
 
 def utc_now() -> datetime:
@@ -125,7 +126,10 @@ def build_monitor_snapshot(
             "unhealthy_components": sum(
                 item["status"] in {"degraded", "unhealthy", "stopped"}
                 for item in health
-                if item["component"] in _EXPECTED_HEALTH_COMPONENTS
+                if not (
+                    item["component"] in _OPTIONAL_UNCONFIGURED_COMPONENTS
+                    and item["last_error"] == "configuration_missing"
+                )
             ),
             "active_alerts": len(alerts),
         },
@@ -202,8 +206,8 @@ def winner_timeline(
 ) -> list[dict[str, Any]]:
     rows = _rows(
         connection,
-        """SELECT odds.id, odds.received_at, odds.price, odds.status,
-                  odds.period, odds.side, odds.odds_id,
+            """SELECT odds.id, odds.received_at, odds.price, odds.status,
+                      odds.period, odds.side, odds.odds_id, odds.odds_group_id,
                   alignment.map_number, alignment.game_clock_seconds,
                   alignment.method AS alignment_method,
                   alignment.lag_seconds, alignment.usable AS alignment_usable
@@ -215,16 +219,20 @@ def winner_timeline(
             ORDER BY odds.received_at, odds.period, odds.id""",
         (raybet_match_id,),
     )
-    grouped: dict[tuple[str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
+    grouped: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
     for row in rows:
         side = str(row["side"] or "")
         if side not in {"team_one", "team_two"}:
             continue
-        key = (str(row["received_at"]), str(row["period"]))
+        key = (
+            str(row["received_at"]),
+            str(row["period"]),
+            str(row["odds_group_id"] or ""),
+        )
         grouped[key][side] = row
 
     points: list[dict[str, Any]] = []
-    for (observed_at, period), quotes in sorted(grouped.items()):
+    for (observed_at, period, _odds_group_id), quotes in sorted(grouped.items()):
         if set(quotes) != {"team_one", "team_two"}:
             continue
         prices = {side: float(quotes[side]["price"]) for side in quotes}
@@ -271,21 +279,46 @@ def current_markets(
     connection: sqlite3.Connection,
     raybet_match_id: str,
 ) -> list[dict[str, Any]]:
-    rows = _rows(
-        connection,
-        """WITH ranked AS (
-               SELECT *, ROW_NUMBER() OVER (
-                   PARTITION BY odds_id ORDER BY received_at DESC, id DESC
-               ) AS rank
-               FROM odds_snapshots WHERE raybet_match_id=?
-           )
-           SELECT odds_id, odds_group_id, received_at, price, status,
-                  market_type, period, side, line, outcome_key, supported
-             FROM ranked WHERE rank=1
-            ORDER BY CASE WHEN market_type='winner' THEN 0 ELSE 1 END,
-                     period, market_type, odds_group_id, outcome_key""",
-        (raybet_match_id,),
-    )
+    if _has_transport_observations(connection, raybet_match_id):
+        rows = _rows(
+            connection,
+            """WITH latest AS (
+                   SELECT observation_key
+                     FROM odds_transport_observations
+                    WHERE raybet_match_id=?
+                      AND timing_status='on_time'
+                      AND processing_status='processed'
+                    ORDER BY observed_at DESC, observation_key DESC LIMIT 1
+               )
+               SELECT outcome.odds_id, outcome.odds_group_id,
+                      outcome.received_at, outcome.price, outcome.status,
+                      outcome.market_type, outcome.period, outcome.side,
+                      outcome.line, outcome.outcome_key, outcome.supported
+                 FROM latest
+                 JOIN odds_response_outcomes AS outcome
+                   ON outcome.observation_key=latest.observation_key
+                WHERE outcome.raybet_match_id=?
+                ORDER BY CASE WHEN outcome.market_type='winner' THEN 0 ELSE 1 END,
+                         outcome.period, outcome.market_type,
+                         outcome.odds_group_id, outcome.outcome_key""",
+            (raybet_match_id, raybet_match_id),
+        )
+    else:
+        rows = _rows(
+            connection,
+            """WITH ranked AS (
+                   SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY odds_id ORDER BY received_at DESC, id DESC
+                   ) AS rank
+                   FROM odds_snapshots WHERE raybet_match_id=?
+               )
+               SELECT odds_id, odds_group_id, received_at, price, status,
+                      market_type, period, side, line, outcome_key, supported
+                 FROM ranked WHERE rank=1
+                ORDER BY CASE WHEN market_type='winner' THEN 0 ELSE 1 END,
+                         period, market_type, odds_group_id, outcome_key""",
+            (raybet_match_id,),
+        )
     return [dict(row) for row in rows]
 
 
@@ -293,6 +326,7 @@ def monitor_cursor(connection: sqlite3.Connection) -> str:
     values = {
         "match": _max_value(connection, "raybet_matches", "updated_at"),
         "odds": _max_value(connection, "odds_snapshots", "id"),
+        "transport": _latest_transport_identity(connection),
         "vision": _max_value(connection, "vision_observations", "captured_at"),
         "decision": _max_value(connection, "strategy_decisions", "decided_at"),
         "health": _max_value(connection, "service_health", "updated_at"),
@@ -325,12 +359,23 @@ def _monitor_match(
     health: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     match_id = str(row["raybet_match_id"])
-    latest_odds = _latest_row(
-        connection,
-        """SELECT received_at AS observed_at FROM odds_snapshots
-            WHERE raybet_match_id=? ORDER BY received_at DESC, id DESC LIMIT 1""",
-        (match_id,),
-    )
+    if _has_transport_observations(connection, match_id):
+        latest_odds = _latest_row(
+            connection,
+            """SELECT observed_at FROM odds_transport_observations
+                WHERE raybet_match_id=?
+                  AND timing_status='on_time'
+                  AND processing_status='processed'
+                ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
+            (match_id,),
+        )
+    else:
+        latest_odds = _latest_row(
+            connection,
+            """SELECT received_at AS observed_at FROM odds_snapshots
+                WHERE raybet_match_id=? ORDER BY received_at DESC, id DESC LIMIT 1""",
+            (match_id,),
+        )
     latest_vision = _latest_row(
         connection,
         """SELECT captured_at AS observed_at, map_number, game_clock_seconds,
@@ -513,36 +558,37 @@ def _current_winner(
         current_key = (current[0], current[1]) if current is not None else None
         if current_key is None or candidate_key > current_key:
             by_period[period] = (observed_at, response_key, sides)
-    complete_periods = [
+    paired_periods = [
         period
         for period in sorted(by_period, key=_period_sort_key)
     ]
-    if not complete_periods:
+    if not paired_periods:
         return {"observed_at": str(quotes[0]["received_at"]), "complete": False}
 
     normalized_status = provider_status.casefold()
-    if normalized_status in _UPCOMING_MATCH_STATUSES and "map_1" in by_period:
+    if normalized_status in _ENDED_MATCH_STATUSES:
+        eligible_periods = [
+            period
+            for period in paired_periods
+            if all(str(quote["status"]) == "5" for quote in by_period[period][2].values())
+        ]
+    else:
+        eligible_periods = [
+            period
+            for period in paired_periods
+            if all(
+                raybet_odds_is_open(quote["status"])
+                for quote in by_period[period][2].values()
+            )
+        ]
+    if not eligible_periods:
+        return {"observed_at": str(quotes[0]["received_at"]), "complete": False}
+    if normalized_status in _UPCOMING_MATCH_STATUSES and "map_1" in eligible_periods:
         period = "map_1"
     elif normalized_status in _ENDED_MATCH_STATUSES:
-        settled_periods = [
-            period
-            for period in complete_periods
-            if all(
-                str(quote["status"]) == "5"
-                for quote in by_period[period][2].values()
-            )
-        ]
-        period = settled_periods[-1] if settled_periods else complete_periods[-1]
+        period = eligible_periods[-1]
     else:
-        unsettled_periods = [
-            period
-            for period in complete_periods
-            if not all(
-                str(quote["status"]) == "5"
-                for quote in by_period[period][2].values()
-            )
-        ]
-        period = unsettled_periods[0] if unsettled_periods else complete_periods[-1]
+        period = eligible_periods[0]
 
     observed_at, _response_key, by_side = by_period[period]
     if set(by_side) != {"team_one", "team_two"}:
@@ -692,6 +738,37 @@ def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("monitor timestamps must include a timezone")
     return value.astimezone(timezone.utc)
+
+
+def _has_transport_observations(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+) -> bool:
+    return bool(
+        _scalar(
+            connection,
+            """SELECT EXISTS(
+                   SELECT 1 FROM odds_transport_observations
+                    WHERE raybet_match_id=?
+               )""",
+            (raybet_match_id,),
+            default=0,
+        )
+    )
+
+
+def _latest_transport_identity(connection: sqlite3.Connection) -> list[str] | None:
+    row = _latest_row(
+        connection,
+        """SELECT observed_at, observation_key
+             FROM odds_transport_observations
+            WHERE timing_status='on_time' AND processing_status='processed'
+            ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
+        (),
+    )
+    if row is None:
+        return None
+    return [str(row["observed_at"]), str(row["observation_key"])]
 
 
 def _rows(

@@ -860,12 +860,17 @@ class SQLiteIngestAdapter:
                 ),
             )
             self.connection.execute(
-                """INSERT OR IGNORE INTO raw_source_observations
+                """INSERT INTO raw_source_observations
                    (observation_id, artifact_id, content_hash, source, artifact_use,
                     endpoint, sanitized_request_identity, source_at, received_at,
                     first_usable_at, schema_fingerprint, event_id, match_id,
                     http_status, created_at)
-                   VALUES (?, ?, ?, ?, 'primary', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, 'primary', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(observation_id) DO UPDATE SET
+                     first_usable_at=COALESCE(
+                         raw_source_observations.first_usable_at,
+                         excluded.first_usable_at
+                     )""",
                 (
                     receipt.observation_id,
                     artifact_key,

@@ -9,7 +9,7 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 import uvicorn
@@ -119,6 +119,14 @@ def _model_event(item: Any) -> BrowserEvent:
     return BrowserEvent.model_validate_json(encoded)
 
 
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def _strict_json_loads(body: bytes | str) -> Any:
+    return json.loads(body, parse_constant=_reject_json_constant)
+
+
 def create_app(
     config: CompanionConfig | None = None,
     *,
@@ -181,8 +189,8 @@ def create_app(
         if len(body) > MAX_BODY_BYTES:
             return _error("body_too_large", 413)
         try:
-            raw_batch = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            raw_batch = _strict_json_loads(body)
+        except (UnicodeDecodeError, ValueError):
             stats.add(rejections=1)
             return _error("invalid_json", 400)
         forbidden = find_forbidden_batch_key(raw_batch)
@@ -242,8 +250,8 @@ def create_app(
         if len(body) > MAX_BODY_BYTES:
             return _error("body_too_large", 413)
         try:
-            status_body = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            status_body = _strict_json_loads(body)
+        except (UnicodeDecodeError, ValueError):
             stats.add(rejections=1)
             return _error("invalid_json", 400)
         if type(status_body) is not dict or status_body != {}:

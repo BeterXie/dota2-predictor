@@ -14,6 +14,7 @@ from web import queries
 from web.app import app
 from web.monitoring import (
     build_monitor_snapshot,
+    current_markets,
     derive_health,
     monitor_cursor,
     winner_timeline,
@@ -178,6 +179,28 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(mail["status"], "degraded")
         self.assertEqual(mail["last_error"], "configuration_missing")
 
+    def test_non_optional_worker_health_is_counted(self) -> None:
+        for component in ("raybet_worker", "shadow_worker"):
+            record_health(
+                self.store.connection,
+                component,
+                "healthy",
+                heartbeat_at=NOW,
+                success_at=NOW,
+            )
+        record_health(
+            self.store.connection,
+            "vision_worker",
+            "unhealthy",
+            heartbeat_at=NOW,
+            error_at=NOW,
+            error="capture_failed",
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["summary"]["unhealthy_components"], 1)
+
     def test_snapshot_keeps_unconfirmed_matches_and_marks_missing_readiness(self) -> None:
         self.add_match()
 
@@ -259,6 +282,18 @@ class MonitoringDashboardTests(unittest.TestCase):
         winner = snapshot["matches"][0]["winner"]
         self.assertEqual(winner["observed_at"], latest_complete.isoformat())
         self.assertEqual(winner["prices"], {"team_one": 2.0, "team_two": 2.0})
+        self.assertEqual(
+            snapshot["matches"][0]["readiness"]["odds"],
+            {
+                "status": "ready",
+                "observed_at": NOW.isoformat(),
+                "age_seconds": 0.0,
+            },
+        )
+        latest_markets = current_markets(self.store.connection, "match-1")
+        self.assertEqual(len(latest_markets), 1)
+        self.assertEqual(latest_markets[0]["side"], "team_one")
+        self.assertEqual(latest_markets[0]["received_at"], NOW.isoformat())
 
     def test_live_match_skips_explicitly_settled_maps(self) -> None:
         self.add_match(status=2)
@@ -268,6 +303,14 @@ class MonitoringDashboardTests(unittest.TestCase):
         snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
 
         self.assertEqual(snapshot["matches"][0]["winner"]["period"], "map_2")
+
+    def test_closed_winner_pair_is_not_reported_as_complete(self) -> None:
+        self.add_match(status=2)
+        self.add_winner_pair(NOW, 2.0, 2.0, status=4)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertFalse(snapshot["matches"][0]["winner"]["complete"])
 
     def test_ended_match_uses_last_settled_map_not_future_market(self) -> None:
         self.add_match(status=5)
@@ -292,6 +335,27 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertAlmostEqual(timeline[1]["probabilities"]["team_one"], 0.25)
         self.assertAlmostEqual(timeline[1]["probabilities"]["team_two"], 0.75)
 
+    def test_winner_timeline_does_not_pair_different_market_groups(self) -> None:
+        self.add_match()
+        for odds_id, group_id, side in (
+            ("group-a-one", "group-a", "team_one"),
+            ("group-b-two", "group-b", "team_two"),
+        ):
+            self.store.insert_odds(
+                OddsSnapshot(
+                    "match-1",
+                    odds_id,
+                    group_id,
+                    NOW,
+                    2.0,
+                    1,
+                    Market("winner", "map_1", side, None, side, True),
+                )
+            )
+        self.store.connection.commit()
+
+        self.assertEqual(winner_timeline(self.store.connection, "match-1"), [])
+
     def test_cursor_changes_only_after_monitor_data_changes(self) -> None:
         self.add_match()
         before = monitor_cursor(self.store.connection)
@@ -299,6 +363,25 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.add_winner_pair(NOW, 2.0, 2.0)
 
+        self.assertNotEqual(before, monitor_cursor(self.store.connection))
+
+    def test_cursor_changes_for_an_unchanged_complete_transport(self) -> None:
+        self.add_match()
+        first = NOW - timedelta(seconds=6)
+        self.add_winner_response(first, 2.0, 2.0, observation_key="response-1")
+        before = monitor_cursor(self.store.connection)
+        snapshot_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM odds_snapshots WHERE raybet_match_id='match-1'"
+        ).fetchone()[0]
+
+        self.add_winner_response(NOW, 2.0, 2.0, observation_key="response-2")
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM odds_snapshots WHERE raybet_match_id='match-1'"
+            ).fetchone()[0],
+            snapshot_count,
+        )
         self.assertNotEqual(before, monitor_cursor(self.store.connection))
 
     def test_monitor_api_exposes_bootstrap_and_match_detail(self) -> None:

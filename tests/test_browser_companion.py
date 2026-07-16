@@ -162,6 +162,20 @@ class BrowserCompanionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["shadow_strategy_active"])
 
+    def test_non_finite_json_constants_are_rejected_as_invalid_json(self) -> None:
+        for body in (b"[NaN]", b"[Infinity]", b"[-Infinity]"):
+            response = self.client.post(
+                "/v1/events", content=body, headers=self.headers(content_type=True)
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["code"], "invalid_json")
+
+        response = self.client.post(
+            "/v1/status", content=b"{\"value\":NaN}", headers=self.headers(content_type=True)
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["code"], "invalid_json")
+
     def test_origin_and_version_are_required(self) -> None:
         body = json.dumps([browser_event()], separators=(",", ":")).encode()
         for headers, expected in (

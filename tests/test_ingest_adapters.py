@@ -381,6 +381,36 @@ class IngestAdapterTests(unittest.TestCase):
             "pgl-wallachia-s8-2026",
         )
 
+    def test_raw_observation_can_be_promoted_once_to_first_usable(self) -> None:
+        payload = completed_payload()
+        self.discover()
+        initial = self.archive.archive_json(
+            source="opendota",
+            endpoint=f"/api/matches/{payload['match_id']}",
+            request_identity=f"/api/matches/{payload['match_id']}",
+            payload_bytes=canonical_json_bytes(payload),
+            observed_at=NOW,
+            match_id=payload["match_id"],
+            status_code=200,
+        )
+        promoted = self.archive.archive_json(
+            source="opendota",
+            endpoint=f"/api/matches/{payload['match_id']}",
+            request_identity=f"/api/matches/{payload['match_id']}",
+            payload_bytes=canonical_json_bytes(payload),
+            observed_at=NOW,
+            match_id=payload["match_id"],
+            status_code=200,
+            first_usable_at=NOW + timedelta(seconds=1),
+        )
+
+        self.assertEqual(initial.observation_id, promoted.observation_id)
+        row = self.storage.connection.execute(
+            "SELECT first_usable_at FROM raw_source_observations WHERE observation_id=?",
+            (initial.observation_id,),
+        ).fetchone()
+        self.assertEqual(row["first_usable_at"], (NOW + timedelta(seconds=1)).isoformat())
+
     def test_same_payload_hash_from_two_sources_has_two_artifacts(self) -> None:
         payload = completed_payload()
         self.discover()

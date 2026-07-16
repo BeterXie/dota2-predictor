@@ -58,16 +58,23 @@ PLAYER_PERFORMANCE_FIELDS = (
     "kda",
 )
 DRAFT_VERSION_PREDICATE = """run.model_version=?
-AND json_extract(run.configuration_json, '$.backtest_version')=?
-AND json_extract(run.configuration_json, '$.feature_version')=?
+AND json_valid(run.configuration_json)
+AND CASE WHEN json_valid(run.configuration_json)
+         THEN json_extract(run.configuration_json, '$.backtest_version') END=?
+AND CASE WHEN json_valid(run.configuration_json)
+         THEN json_extract(run.configuration_json, '$.feature_version') END=?
 AND (
     (run.availability_mode=?
-     AND json_extract(run.configuration_json, '$.assignment_version')=?
-     AND json_extract(run.configuration_json, '$.score_version')=?)
+     AND CASE WHEN json_valid(run.configuration_json)
+              THEN json_extract(run.configuration_json, '$.assignment_version') END=?
+     AND CASE WHEN json_valid(run.configuration_json)
+              THEN json_extract(run.configuration_json, '$.score_version') END=?)
     OR
     (run.availability_mode=?
-     AND json_extract(run.configuration_json, '$.assignment_version')=?
-     AND json_extract(run.configuration_json, '$.score_version')=?)
+     AND CASE WHEN json_valid(run.configuration_json)
+              THEN json_extract(run.configuration_json, '$.assignment_version') END=?
+     AND CASE WHEN json_valid(run.configuration_json)
+              THEN json_extract(run.configuration_json, '$.score_version') END=?)
 )"""
 PROSPECTIVE_ROLE_VERSION = PROSPECTIVE_ASSIGNMENT_VERSION
 DRAFT_COHORTS = (
@@ -872,8 +879,9 @@ def _match_performance(
         "hero.localized_name AS hero_name" if has_heroes else "NULL AS hero_name"
     )
     identity_column = (
+        "CASE WHEN json_valid(fact.facts_json) THEN "
         "COALESCE(json_extract(fact.facts_json, '$.name'), "
-        "json_extract(fact.facts_json, '$.personaname')) AS player_name"
+        "json_extract(fact.facts_json, '$.personaname')) END AS player_name"
         if has_facts
         else "NULL AS player_name"
     )
@@ -993,17 +1001,18 @@ def _match_draft_predictions(
         connection, "draft_predictions"
     ):
         return []
-    rows = connection.execute(
+    try:
+        rows = connection.execute(
             f"""SELECT run.run_id, run.model_version, run.model_kind,
                       run.horizon_minutes,
                       run.availability_mode, run.training_cutoff,
                       run.status AS model_status,
-                      json_extract(
-                          run.configuration_json, '$.assignment_version'
-                      ) AS assignment_version,
-                      json_extract(
-                          run.configuration_json, '$.score_version'
-                      ) AS score_version,
+                      CASE WHEN json_valid(run.configuration_json) THEN
+                          json_extract(run.configuration_json, '$.assignment_version')
+                      END AS assignment_version,
+                      CASE WHEN json_valid(run.configuration_json) THEN
+                          json_extract(run.configuration_json, '$.score_version')
+                      END AS score_version,
                       prediction.prediction_cutoff, prediction.cutoff_source,
                       prediction.probability, prediction.uncertainty,
                       prediction.support, prediction.eventual_radiant_win,
@@ -1016,6 +1025,8 @@ def _match_draft_predictions(
                          run.availability_mode""",
             (match_id, *DRAFT_VERSION_PARAMS),
         ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {key: value for key, value in dict(row).items() if key != "run_id"}
         for row in rows

@@ -12,6 +12,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from event_intelligence.benchmarks import BENCHMARK_VERSION
+from event_intelligence.incremental import (
+    ROLE_VERSION,
+    SCORE_VERSION,
+    current_derived_scopes,
+    current_state_input_hashes,
+    profile_weighting_is_current,
+)
+from event_intelligence.team_profiles import PROFILE_VERSION
+
 from .alignment import align_snapshots
 from .comeback import no_signal_decision
 from .health import record_health
@@ -188,68 +198,90 @@ def _parse_utc(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+
 def _latest_versioned_style(
     connection: sqlite3.Connection,
     team_id: int,
     cutoff: datetime,
+    *,
+    valid_profile_cutoffs: frozenset[str] | None = None,
+    state_hashes: dict[int, frozenset[str]] | None = None,
 ) -> TeamStyleProfile:
+    if valid_profile_cutoffs is not None and not valid_profile_cutoffs:
+        return _neutral_style()
     cutoff_iso = cutoff.isoformat()
+    cutoff_filter = ""
+    parameters: list[object] = [team_id, cutoff_iso, cutoff_iso, PROFILE_VERSION]
+    if valid_profile_cutoffs is not None:
+        placeholders = ",".join("?" for _ in valid_profile_cutoffs)
+        cutoff_filter = f" AND profile_cutoff IN ({placeholders})"
+        parameters.extend(sorted(valid_profile_cutoffs))
     try:
-        row = connection.execute(
-            """SELECT * FROM team_style_profiles
+        rows = connection.execute(
+            f"""SELECT * FROM team_style_profiles
                WHERE team_id=? AND profile_cutoff<=? AND created_at<=?
-               ORDER BY profile_cutoff DESC, created_at DESC, profile_id DESC
-               LIMIT 1""",
-            (team_id, cutoff_iso, cutoff_iso),
-        ).fetchone()
+                 AND profile_version=?{cutoff_filter}
+               ORDER BY profile_cutoff DESC, created_at DESC, profile_id DESC""",
+            tuple(parameters),
+        ).fetchall()
     except sqlite3.OperationalError:
         return _neutral_style()
-    if row is None:
-        return _neutral_style()
-    try:
-        rates = {
-            str(item["metric"]): item
-            for item in json.loads(str(row["posterior_rates_json"]))
-        }
-        durations = {
-            str(item["group"]): item
-            for item in json.loads(str(row["duration_quantiles_json"]))
-        }
-        weighting = json.loads(str(row["weighting_json"]))
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return _neutral_style()
+    for row in rows:
+        try:
+            rates = {
+                str(item["metric"]): item
+                for item in json.loads(str(row["posterior_rates_json"]))
+            }
+            durations = {
+                str(item["group"]): item
+                for item in json.loads(str(row["duration_quantiles_json"]))
+            }
+            weighting = json.loads(str(row["weighting_json"]))
+            if state_hashes is not None and not profile_weighting_is_current(
+                row["weighting_json"], state_hashes
+            ):
+                continue
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
 
-    def rate(metric: str, default: float) -> float:
-        value = rates.get(metric, {}).get("mean")
-        return float(value) if isinstance(value, (int, float)) else default
+        def rate(metric: str, default: float) -> float:
+            value = rates.get(metric, {}).get("mean")
+            return float(value) if isinstance(value, (int, float)) else default
 
-    duration_values = [
-        float(value["p50"])
-        for key, value in durations.items()
-        if key in {"win", "loss", "even"}
-        and isinstance(value.get("p50"), (int, float))
-    ]
-    effective_sample_size = max(0.0, float(row["effective_sample_size"]))
-    quality = min(1.0, (effective_sample_size / 100.0) ** 0.5)
-    maps = weighting.get("maps", []) if isinstance(weighting, dict) else []
-    return _VersionedTeamStyle(
-        team_id=team_id,
-        matches=len(maps) if isinstance(maps, list) else 0,
-        comeback_rate=rate("comeback_after_5000_deficit", 0.18),
-        throw_rate=rate("throw_after_5000_lead", 0.16),
-        closeout_rate=rate("closeout_after_5000_lead", 0.84),
-        late_game_rate=rate("reach_40_minutes", 0.35),
-        average_duration_minutes=(
-            sum(duration_values) / len(duration_values) / 60.0
-            if duration_values
-            else 36.0
-        ),
-        quality=quality,
-        profile_cutoff=str(row["profile_cutoff"]),
-        profile_version=str(row["profile_version"]),
-        input_hash=str(row["input_hash"]),
-        effective_sample_size=effective_sample_size,
-    )
+        duration_values = [
+            float(value["p50"])
+            for key, value in durations.items()
+            if key in {"win", "loss", "even"}
+            and isinstance(value.get("p50"), (int, float))
+        ]
+        effective_sample_size = max(0.0, float(row["effective_sample_size"]))
+        quality = min(1.0, (effective_sample_size / 100.0) ** 0.5)
+        maps = weighting.get("maps", []) if isinstance(weighting, dict) else []
+        return _VersionedTeamStyle(
+            team_id=team_id,
+            matches=len(maps) if isinstance(maps, list) else 0,
+            comeback_rate=rate("comeback_after_5000_deficit", 0.18),
+            throw_rate=rate("throw_after_5000_lead", 0.16),
+            closeout_rate=rate("closeout_after_5000_lead", 0.84),
+            late_game_rate=rate("reach_40_minutes", 0.35),
+            average_duration_minutes=(
+                sum(duration_values) / len(duration_values) / 60.0
+                if duration_values
+                else 36.0
+            ),
+            quality=quality,
+            profile_cutoff=str(row["profile_cutoff"]),
+            profile_version=str(row["profile_version"]),
+            input_hash=str(row["input_hash"]),
+            effective_sample_size=effective_sample_size,
+        )
+    return _neutral_style()
 
 
 def _latest_completed_roster(
@@ -305,12 +337,29 @@ def _versioned_player_form(
     cutoff: datetime,
     *,
     half_life_days: float = 30.0,
+    allowed_match_ids: frozenset[int] | None = None,
 ) -> PlayerForm:
     if not account_ids:
+        return _neutral_form()
+    if allowed_match_ids is not None and not allowed_match_ids:
         return _neutral_form()
     cutoff_epoch = int(cutoff.timestamp())
     cutoff_iso = cutoff.isoformat()
     placeholders = ",".join("?" for _ in account_ids)
+    lineage_join = ""
+    lineage_filter = ""
+    lineage_parameters: tuple[str, ...] = ()
+    if allowed_match_ids is not None:
+        lineage_join = "JOIN strict_derived_status AS derived ON derived.match_id=score.match_id"
+        lineage_filter = """
+                     AND derived.source_content_hash=status.latest_raw_content_hash
+                     AND derived.role_assignment_version=?
+                     AND derived.score_version=?
+                     AND derived.profile_version=?
+                     AND derived.normalizer_version=status.normalizer_version
+                     AND derived.benchmark_version=?
+                     AND derived.profile_context_hash IS NOT NULL"""
+        lineage_parameters = (ROLE_VERSION, SCORE_VERSION, PROFILE_VERSION, BENCHMARK_VERSION)
     try:
         rows = connection.execute(
             f"""WITH available AS (
@@ -325,13 +374,16 @@ def _versioned_player_form(
                    JOIN matches AS m ON m.match_id=score.match_id
                    JOIN match_ingest_status AS status
                      ON status.match_id=score.match_id
+                   {lineage_join}
                    WHERE score.account_id IN ({placeholders})
+                     AND score.score_version=?
                      AND score.position IS NOT NULL
                      AND m.duration IS NOT NULL
                      AND m.start_time + m.duration < ?
                      AND score.created_at<=?
                      AND score.benchmark_cutoff<=?
                      AND status.player_readiness='ready'
+                     {lineage_filter}
                ), ranked AS (
                    SELECT available.*, ROW_NUMBER() OVER (
                        PARTITION BY account_id
@@ -341,7 +393,14 @@ def _versioned_player_form(
                )
                SELECT * FROM ranked WHERE recent_rank<=20
                ORDER BY completed_at DESC, match_id DESC, player_slot""",
-            (*account_ids, cutoff_epoch, cutoff_iso, cutoff_iso),
+            (
+                *account_ids,
+                SCORE_VERSION,
+                cutoff_epoch,
+                cutoff_iso,
+                cutoff_iso,
+                *lineage_parameters,
+            ),
         ).fetchall()
     except sqlite3.OperationalError:
         return _neutral_form()
@@ -351,6 +410,8 @@ def _versioned_player_form(
     weighted_values: list[tuple[float, float, str]] = []
     refs: list[tuple[int, int, str, str, str]] = []
     for row in rows:
+        if allowed_match_ids is not None and int(row["match_id"]) not in allowed_match_ids:
+            continue
         age_days = max(0.0, (cutoff_epoch - int(row["completed_at"])) / 86400.0)
         time_weight = 0.5 ** (age_days / half_life_days)
         reliability = max(
@@ -406,9 +467,33 @@ def _profiles(
         return _neutral_style(), _neutral_form()
     cutoff = datetime.fromtimestamp(as_of, tz=timezone.utc)
     roster = _latest_completed_roster(connection, team_id, as_of)
+    valid_profile_cutoffs: frozenset[str] | None = None
+    allowed_match_ids: frozenset[int] | None = None
+    state_hashes: dict[int, frozenset[str]] | None = None
+    if _table_exists(connection, "strict_derived_status"):
+        try:
+            scopes = current_derived_scopes(connection)
+            if not scopes.available:
+                return _neutral_style(), _neutral_form()
+            valid_profile_cutoffs = scopes.valid_profile_cutoffs
+            allowed_match_ids = scopes.player
+            state_hashes = current_state_input_hashes(connection, scopes)
+        except (KeyError, TypeError, ValueError, sqlite3.Error):
+            return _neutral_style(), _neutral_form()
     return (
-        _latest_versioned_style(connection, team_id, cutoff),
-        _versioned_player_form(connection, roster, cutoff),
+        _latest_versioned_style(
+            connection,
+            team_id,
+            cutoff,
+            valid_profile_cutoffs=valid_profile_cutoffs,
+            state_hashes=state_hashes,
+        ),
+        _versioned_player_form(
+            connection,
+            roster,
+            cutoff,
+            allowed_match_ids=allowed_match_ids,
+        ),
     )
 
 

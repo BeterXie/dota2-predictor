@@ -6,6 +6,8 @@ import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from event_intelligence.incremental import SCORE_VERSION
+from event_intelligence.team_profiles import PROFILE_VERSION
 from live_betting.models import Market, OddsSnapshot
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint, build_draft_curve
@@ -591,11 +593,12 @@ class VersionedLiveProfileTests(unittest.TestCase):
             ]
         )
         connection.executemany(
-            "INSERT INTO team_style_profiles VALUES (?, 10, ?, 'team-v', ?, ?, ?, 25, ?, ?)",
+            "INSERT INTO team_style_profiles VALUES (?, 10, ?, ?, ?, ?, ?, 25, ?, ?)",
             (
                 (
                     1,
                     earlier.isoformat(),
+                    PROFILE_VERSION,
                     rates(0.6),
                     durations,
                     json.dumps({"maps": [{"match_id": 1}]}),
@@ -605,6 +608,7 @@ class VersionedLiveProfileTests(unittest.TestCase):
                 (
                     2,
                     (NOW - timedelta(minutes=30)).isoformat(),
+                    PROFILE_VERSION,
                     rates(0.99),
                     durations,
                     json.dumps({"maps": [{"match_id": 2}]}),
@@ -634,7 +638,7 @@ class VersionedLiveProfileTests(unittest.TestCase):
             )
             connection.execute(
                 """INSERT INTO player_map_scores VALUES
-                   (?, 1, ?, ?, ?, 60, 1, 1, ?, ?, 'score-v', ?)""",
+                   (?, 1, ?, ?, ?, 60, 1, 1, ?, ?, ?, ?)""",
                 (
                     index + 1,
                     index,
@@ -642,6 +646,7 @@ class VersionedLiveProfileTests(unittest.TestCase):
                     index + 1,
                     earlier.isoformat(),
                     f"score-{index}",
+                    SCORE_VERSION,
                     earlier.isoformat(),
                 ),
             )

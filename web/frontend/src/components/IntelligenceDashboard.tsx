@@ -48,7 +48,7 @@ import type {
 } from "../types";
 import "../intelligence.css";
 
-export type IntelligenceMode = "matches" | "players" | "teams";
+export type IntelligenceMode = "matches" | "players" | "teams" | "drafts";
 
 interface IntelligenceDashboardProps {
   initialMode?: IntelligenceMode;
@@ -94,7 +94,7 @@ export function IntelligenceDashboard({
 }: IntelligenceDashboardProps) {
   const [mode, setMode] = useState<IntelligenceMode>(initialMode);
   const [overview, setOverview] = useState<IntelligenceOverview | null>(null);
-  const [overviewLoading, setOverviewLoading] = useState(true);
+  const [overviewLoading, setOverviewLoading] = useState(false);
   const [overviewError, setOverviewError] = useState<string | null>(null);
   const [overviewRefresh, setOverviewRefresh] = useState(0);
   const [dataRefresh, setDataRefresh] = useState(0);
@@ -126,6 +126,7 @@ export function IntelligenceDashboard({
   const [teamError, setTeamError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (mode !== "drafts") return;
     const controller = new AbortController();
     setOverviewLoading(true);
     fetchIntelligenceOverview(controller.signal)
@@ -142,7 +143,7 @@ export function IntelligenceDashboard({
         if (!controller.signal.aborted) setOverviewLoading(false);
       });
     return () => controller.abort();
-  }, [overviewRefresh]);
+  }, [mode, overviewRefresh]);
 
   useEffect(() => {
     if (mode !== "matches") return;
@@ -297,13 +298,6 @@ export function IntelligenceDashboard({
         </Button>
       </header>
 
-      <OverviewPanel
-        error={overviewError}
-        loading={overviewLoading}
-        onRetry={() => setOverviewRefresh((value) => value + 1)}
-        overview={overview}
-      />
-
       <div className="intel-mode-bar">
         <TabList
           aria-label="历史情报视图"
@@ -314,8 +308,18 @@ export function IntelligenceDashboard({
           <Tab icon={<Sword size={17} />} value="matches">比赛复盘</Tab>
           <Tab icon={<Medal size={17} />} value="players">选手评分</Tab>
           <Tab icon={<Users size={17} />} value="teams">球队画像</Tab>
+          <Tab icon={<ChartBar size={17} />} value="drafts">阵容校准</Tab>
         </TabList>
       </div>
+
+      {mode === "drafts" && (
+        <OverviewPanel
+          error={overviewError}
+          loading={overviewLoading}
+          onRetry={() => setOverviewRefresh((value) => value + 1)}
+          overview={overview}
+        />
+      )}
 
       {mode === "matches" && (
         <MatchesView
@@ -448,10 +452,16 @@ function OverviewPanel({
           </div>
         </div>
 
-        {!prospective && (
+        {!prospective && reconstructed && (
           <div className="intel-quality-warning" role="status">
             <WarningCircle size={17} weight="fill" aria-hidden="true" />
             当前只有历史重建回测，不能视为真实前瞻表现。
+          </div>
+        )}
+        {!prospective && !reconstructed && (
+          <div className="intel-quality-warning" role="status">
+            <WarningCircle size={17} weight="fill" aria-hidden="true" />
+            历史重建和真实前瞻数据都尚未建立，当前没有可验收的阵容概率。
           </div>
         )}
         {failures.length > 0 && (

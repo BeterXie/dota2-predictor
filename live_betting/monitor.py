@@ -35,12 +35,17 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
-def _write_raw(raw_dir: Path, match_id: str, payload: dict[str, Any], now: datetime) -> Path:
+def _write_raw(raw_dir: Path, match_id: str, payload: Any, now: datetime) -> Path:
     path = raw_dir / now.strftime("%Y-%m-%d") / match_id
     path.mkdir(parents=True, exist_ok=True)
-    target = path / f"{now.strftime('%H%M%S_%f')}.json.gz"
-    with gzip.open(target, "wt", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    target = path / f"{now.strftime('%H%M%S_%f')}_{digest}.json.gz"
+    if not target.exists():
+        with gzip.open(target, "wb") as handle:
+            handle.write(canonical)
     return target
 
 
@@ -67,15 +72,15 @@ def collect_once(
     odds_count = 0
     changed_count = 0
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
+    _write_raw(raw_dir, "_match_list", {"result": list_rows}, utc_now())
     for list_row in list_rows:
         payload = client.match_odds(str(list_row.get("id")))
         observed_at = utc_now()
         result = payload.get("result") or {}
         match_id = str(result.get("id"))
         fingerprint = _fingerprint(payload)
-        if raw_fingerprints.get(match_id) != fingerprint:
-            _write_raw(raw_dir, match_id, payload, observed_at)
-            raw_fingerprints[match_id] = fingerprint
+        _write_raw(raw_dir, match_id, payload, observed_at)
+        raw_fingerprints[match_id] = fingerprint
         snapshots = snapshots_from_payload(payload, received_at=observed_at)
         with store.transaction():
             store.upsert_raybet_match(result, observed_at)

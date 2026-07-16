@@ -270,6 +270,45 @@ class EventTimeTests(unittest.TestCase):
 
 
 class OwnershipAndAtomicityTests(unittest.TestCase):
+    def test_direct_collector_archives_each_list_and_odds_response(self) -> None:
+        payload = {
+            "result": {
+                "id": "match-1",
+                "team": [
+                    {"team_id": 1, "pos": 1, "team_name": "One"},
+                    {"team_id": 2, "pos": 2, "team_name": "Two"},
+                ],
+                "odds": [
+                    {"id": "one", "team_id": 1, "match_stage": "r1",
+                     "group_short_name": "Winner", "tag": "win", "odds": "2.0", "status": 1},
+                    {"id": "two", "team_id": 2, "match_stage": "r1",
+                     "group_short_name": "Winner", "tag": "win", "odds": "1.8", "status": 1},
+                ],
+            }
+        }
+
+        class Client:
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                return payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                with patch(
+                    "live_betting.monitor.utc_now",
+                    side_effect=tuple(
+                        NOW + timedelta(seconds=offset) for offset in range(6)
+                    ),
+                ):
+                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "match-1"}], raw_fingerprints={})
+                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "match-1"}], raw_fingerprints={})
+
+            list_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "_match_list").glob("*.json.gz"))
+            odds_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "match-1").glob("*.json.gz"))
+            self.assertEqual(len(list_files), 2)
+            self.assertEqual(len(odds_files), 2)
+
     def test_browser_match_is_insert_only(self) -> None:
         direct = {
             "id": "match-1", "tournament_name": "Direct Cup", "live_url": "https://video",

@@ -5,10 +5,11 @@ import {
   Broadcast,
   ClockCounterClockwise,
   Database,
+  GearSix,
   Pulse,
   SpeakerHigh,
 } from "@phosphor-icons/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   acknowledgeAlert,
@@ -25,7 +26,6 @@ import {
 } from "./api";
 import { MatchRail } from "./components/MatchRail";
 import { MatchWorkspace } from "./components/MatchWorkspace";
-import { IntelligenceDashboard } from "./components/IntelligenceDashboard";
 import { OperationsPanel } from "./components/OperationsPanel";
 import type {
   ConnectionState,
@@ -37,7 +37,15 @@ import type {
   MonitorSnapshot,
 } from "./types";
 
-type ViewMode = "live" | "replay" | "intelligence";
+type HistoryView = "replay" | "intelligence";
+type PrimaryView = "live" | "history" | "operations";
+type ViewMode = "live" | HistoryView | "operations";
+
+const IntelligenceDashboard = lazy(() =>
+  import("./components/IntelligenceDashboard").then((module) => ({
+    default: module.IntelligenceDashboard,
+  })),
+);
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<MonitorSnapshot | null>(null);
@@ -48,6 +56,9 @@ export default function App() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [view, setView] = useState<ViewMode>(initialView);
+  const historyViewRef = useRef<HistoryView>(
+    view === "intelligence" ? "intelligence" : "replay",
+  );
   const [now, setNow] = useState(Date.now());
   const [controlSession, setControlSession] = useState<ControlSession | null>(null);
   const [components, setComponents] = useState<ControlComponent[]>([]);
@@ -79,7 +90,10 @@ export default function App() {
           if (disposed) return;
           cursorRef.current = data.cursor;
           setSnapshot(data);
-          setSelectedId((current) => current || preferredMatch(data, "live"));
+          setSelectedId((current) => current || preferredMatch(
+            data,
+            view === "replay" ? "replay" : "live",
+          ));
           setError(null);
         })
         .catch((reason: Error) => {
@@ -254,6 +268,16 @@ export default function App() {
   }, [selectedId, snapshot?.cursor]);
 
   useEffect(() => {
+    if (!snapshot || (view !== "live" && view !== "replay")) return;
+    const visible = matchesForView(snapshot.matches, view);
+    setSelectedId((current) => (
+      current && visible.some((match) => match.raybet_match_id === current)
+        ? current
+        : preferredMatch(snapshot, view)
+    ));
+  }, [snapshot, view]);
+
+  useEffect(() => {
     if (!selectedId) {
       setMappingState({ matchId: null, version: mappingVersion, records: [] });
       return;
@@ -291,6 +315,9 @@ export default function App() {
   }, [browserAlerts, snapshot?.alerts, soundEnabled]);
 
   const matches = snapshot?.matches || [];
+  const railMatches = view === "replay" || view === "live"
+    ? matchesForView(matches, view)
+    : [];
   const selectedMatch = matches.find((match) => match.raybet_match_id === selectedId) || null;
   const mappings = mappingState.matchId === selectedId && mappingState.version === mappingVersion
     ? mappingState.records
@@ -301,6 +328,9 @@ export default function App() {
   );
 
   const changeView = (next: ViewMode) => {
+    if (next === "replay" || next === "intelligence") {
+      historyViewRef.current = next;
+    }
     setView(next);
     const query = new URLSearchParams(window.location.search);
     if (next === "live") query.delete("view");
@@ -311,10 +341,20 @@ export default function App() {
       "",
       `${window.location.pathname}${search ? `?${search}` : ""}${window.location.hash}`,
     );
-    if (snapshot && next !== "intelligence") {
+    if (snapshot && (next === "live" || next === "replay")) {
       setSelectedId(preferredMatch(snapshot, next));
     }
   };
+
+  const changePrimaryView = (next: PrimaryView) => {
+    changeView(next === "history" ? historyViewRef.current : next);
+  };
+
+  const primaryView: PrimaryView = view === "live"
+    ? "live"
+    : view === "operations"
+      ? "operations"
+      : "history";
 
   const runControl = async (
     component: ControlComponent["component"],
@@ -437,14 +477,14 @@ export default function App() {
         </div>
 
         <TabList
-          aria-label="监控视图"
-          selectedValue={view}
-          onTabSelect={(_, data) => changeView(data.value as ViewMode)}
+          aria-label="主视图"
+          selectedValue={primaryView}
+          onTabSelect={(_, data) => changePrimaryView(data.value as PrimaryView)}
           size="small"
         >
-          <Tab icon={<Broadcast size={17} />} value="live">实时监控</Tab>
-          <Tab icon={<ClockCounterClockwise size={17} />} value="replay">历史复盘</Tab>
-          <Tab icon={<Database size={17} />} value="intelligence">历史智库</Tab>
+          <Tab icon={<Broadcast size={17} />} value="live">滚球列表</Tab>
+          <Tab icon={<ClockCounterClockwise size={17} />} value="history">历史比赛</Tab>
+          <Tab icon={<GearSix size={17} />} value="operations">系统运行</Tab>
         </TabList>
 
         <div className="topbar-status">
@@ -474,59 +514,77 @@ export default function App() {
         </div>
       </header>
 
+      {(view === "replay" || view === "intelligence") && (
+        <div className="history-mode-bar">
+          <TabList
+            aria-label="历史比赛内容"
+            selectedValue={view}
+            onTabSelect={(_, data) => changeView(data.value as HistoryView)}
+            size="small"
+          >
+            <Tab icon={<ClockCounterClockwise size={17} />} value="replay">赔率复盘</Tab>
+            <Tab icon={<Database size={17} />} value="intelligence">OpenDota 赛后情报</Tab>
+          </TabList>
+        </div>
+      )}
+
+      {view !== "intelligence" && snapshot && (
+        <section className="summary-bar" aria-label="赛事与系统摘要">
+          <SummaryItem label="滚球确认" value={snapshot.summary.live} tone="live" />
+          <SummaryItem label="数据降级" value={snapshot.summary.degraded} tone="warning" />
+          <SummaryItem label="即将开始" value={snapshot.summary.upcoming} />
+          <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
+          <span className="snapshot-time">快照 {new Date(snapshot.generated_at).toLocaleTimeString("zh-CN", { hour12: false })}</span>
+        </section>
+      )}
+
+      {view !== "intelligence" && error && (
+        <div className="global-error" role="alert">
+          <strong>监控连接异常</strong>
+          <span>{error}</span>
+        </div>
+      )}
+
       {view === "intelligence" ? (
-        <IntelligenceDashboard />
+        <Suspense fallback={<div className="view-loading" role="status">正在加载赛后情报</div>}>
+          <IntelligenceDashboard />
+        </Suspense>
+      ) : view === "operations" ? (
+        <div className="operations-view">
+          <OperationsPanel
+            alerts={snapshot?.alerts || []}
+            busyKey={controlBusy}
+            components={components}
+            controlMessage={controlMessage}
+            controlsEnabled={Boolean(controlSession)}
+            health={snapshot?.health || []}
+            mappings={mappings}
+            match={selectedMatch}
+            onAcknowledge={acknowledge}
+            onApproveMapping={approveMapping}
+            onControl={runControl}
+            onCreateAutomaticMap={addAutomaticMap}
+            onInvalidateMapping={invalidateSelectedMapping}
+          />
+        </div>
       ) : (
-        <>
-          {snapshot && (
-            <section className="summary-bar" aria-label="赛事与系统摘要">
-              <SummaryItem label="滚球确认" value={snapshot.summary.live} tone="live" />
-              <SummaryItem label="数据降级" value={snapshot.summary.degraded} tone="warning" />
-              <SummaryItem label="即将开始" value={snapshot.summary.upcoming} />
-              <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
-              <span className="snapshot-time">快照 {new Date(snapshot.generated_at).toLocaleTimeString("zh-CN", { hour12: false })}</span>
-            </section>
-          )}
-
-          {error && (
-            <div className="global-error" role="alert">
-              <strong>监控连接异常</strong>
-              <span>{error}</span>
-            </div>
-          )}
-
-          <div className="cockpit-grid">
-            <MatchRail
-              matches={matches}
-              now={now}
-              onSelect={setSelectedId}
-              selectedId={selectedId}
-            />
-            <MatchWorkspace
-              detail={detail?.raybet_match_id === selectedId ? detail : null}
-              error={detailError}
-              loading={detailLoading}
-              match={selectedMatch}
-              now={now}
-              replay={view === "replay"}
-            />
-            <OperationsPanel
-              alerts={snapshot?.alerts || []}
-              busyKey={controlBusy}
-              components={components}
-              controlMessage={controlMessage}
-              controlsEnabled={Boolean(controlSession)}
-              health={snapshot?.health || []}
-              mappings={mappings}
-              match={selectedMatch}
-              onAcknowledge={acknowledge}
-              onApproveMapping={approveMapping}
-              onControl={runControl}
-              onCreateAutomaticMap={addAutomaticMap}
-              onInvalidateMapping={invalidateSelectedMapping}
-            />
-          </div>
-        </>
+        <div className={`cockpit-grid ${view === "replay" ? "history-replay" : ""}`}>
+          <MatchRail
+            matches={railMatches}
+            mode={view === "replay" ? "history" : "live"}
+            now={now}
+            onSelect={setSelectedId}
+            selectedId={selectedId}
+          />
+          <MatchWorkspace
+            detail={detail?.raybet_match_id === selectedId ? detail : null}
+            error={detailError}
+            loading={detailLoading}
+            match={selectedMatch}
+            now={now}
+            replay={view === "replay"}
+          />
+        </div>
       )}
     </div>
   );
@@ -538,7 +596,11 @@ function errorText(reason: unknown, fallback: string): string {
 
 function initialView(): ViewMode {
   const requested = new URLSearchParams(window.location.search).get("view");
-  return requested === "replay" || requested === "intelligence" ? requested : "live";
+  return requested === "replay"
+    || requested === "intelligence"
+    || requested === "operations"
+    ? requested
+    : "live";
 }
 
 function playAlertTone(critical: boolean): void {
@@ -561,14 +623,23 @@ function playAlertTone(critical: boolean): void {
 
 function preferredMatch(
   snapshot: MonitorSnapshot,
-  view: Exclude<ViewMode, "intelligence">,
+  view: "live" | "replay",
 ): string | null {
   const preferred = view === "replay"
     ? snapshot.matches.find((match) => match.lifecycle === "ended")
     : snapshot.matches.find((match) => match.lifecycle === "live")
       || snapshot.matches.find((match) => match.lifecycle === "degraded")
       || snapshot.matches.find((match) => match.lifecycle === "upcoming");
-  return preferred?.raybet_match_id || snapshot.matches[0]?.raybet_match_id || null;
+  return preferred?.raybet_match_id || null;
+}
+
+function matchesForView(
+  matches: MonitorSnapshot["matches"],
+  view: "live" | "replay",
+): MonitorSnapshot["matches"] {
+  return matches.filter((match) => (
+    view === "replay" ? match.lifecycle === "ended" : match.lifecycle !== "ended"
+  ));
 }
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {

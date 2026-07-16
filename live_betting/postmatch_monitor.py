@@ -20,6 +20,7 @@ from event_intelligence.registry import EventRegistry
 from event_intelligence.storage import IntelligenceStorage
 
 from .health import record_health
+from .markets import normalized_state_hash, snapshots_from_payload
 from .models import Market
 from .raybet import RayBetClient, RayBetMapFinal, parse_raybet_map_final
 from .settlement import MapResult, reconcile_map_winners, settle
@@ -102,6 +103,95 @@ def _opendota_evidence_ref(detail: dict, dota_match_id: int) -> str:
     ).encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     return f"opendota:{dota_match_id}:sha256:{digest}"
+
+
+def _raybet_observation_key(
+    match_id: str, observed_at: datetime, payload: dict[str, object]
+) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(
+        f"direct\n{match_id}\n{observed_at.isoformat()}\n{digest}".encode("utf-8")
+    ).hexdigest()
+
+
+def _latest_exact_raybet_final(
+    store: LiveBettingStore,
+    match_id: str,
+    map_number: int,
+    *,
+    team_ids: tuple[int, int],
+) -> RayBetMapFinal | None:
+    """Resolve a map from the newest complete immutable transport response."""
+    try:
+        rows = store.connection.execute(
+            """SELECT transport.observation_key, transport.observed_at,
+                      outcome.odds_group_id, outcome.side, outcome.raw_json
+                 FROM odds_transport_observations AS transport
+                 JOIN odds_response_outcomes AS outcome
+                   ON outcome.observation_key=transport.observation_key
+                WHERE outcome.raybet_match_id=?
+                  AND outcome.market_type='winner'
+                  AND outcome.period=?
+                  AND outcome.supported=1
+                  AND transport.timing_status='on_time'
+                  AND transport.processing_status='processed'
+                ORDER BY transport.observed_at DESC,
+                         transport.observation_key DESC,
+                         outcome.odds_group_id, outcome.side""",
+            (match_id, f"map_{map_number}"),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    observation_times: dict[str, str] = {}
+    observation_order: list[str] = []
+    for row in rows:
+        observation_key = str(row["observation_key"])
+        if observation_key not in observation_times:
+            observation_times[observation_key] = str(row["observed_at"])
+            observation_order.append(observation_key)
+        group_key = (observation_key, str(row["odds_group_id"] or ""))
+        grouped.setdefault(group_key, []).append(row)
+    for observation_key in observation_order:
+        for (candidate_key, _group_id), members in grouped.items():
+            if candidate_key != observation_key or {str(row["side"]) for row in members} != {
+                "team_one", "team_two"
+            }:
+                continue
+            odds: list[dict[str, object]] = []
+            for row in members:
+                try:
+                    raw = json.loads(str(row["raw_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    odds = []
+                    break
+                if not isinstance(raw, dict):
+                    odds = []
+                    break
+                odds.append(raw)
+            if len(odds) != 2:
+                continue
+            final = parse_raybet_map_final(
+                {
+                    "id": match_id,
+                    "game_id": 151,
+                    "team": [
+                        {"pos": 1, "team_id": team_ids[0]},
+                        {"pos": 2, "team_id": team_ids[1]},
+                    ],
+                    "odds": odds,
+                },
+                map_number,
+                observed_at=datetime.fromisoformat(observation_times[observation_key]),
+                expected_match_id=match_id,
+                expected_team_ids=team_ids,
+            )
+            if final.status in {"confirmed", "conflict"}:
+                return final
+    return None
 
 
 def _winner_order_rows(
@@ -324,7 +414,8 @@ async def label_once(
         raybet_observed_at = raybet_observed_at.replace(tzinfo=timezone.utc)
     if raybet_client is not None and unresolved_maps:
         try:
-            refreshed = raybet_client.match_odds(match_id).get("result")
+            refreshed_response = raybet_client.match_odds(match_id)
+            refreshed = refreshed_response.get("result")
         except Exception as error:
             logger.warning(
                 "RayBet final refresh failed for match_id=%s (%s)",
@@ -342,12 +433,36 @@ async def label_once(
             raybet_observed_at = datetime.now(timezone.utc)
             with store.transaction():
                 store.upsert_raybet_match(refreshed, raybet_observed_at)
+                snapshots = snapshots_from_payload(
+                    refreshed_response, received_at=raybet_observed_at
+                )
+                store.store_odds_observation(
+                    source="direct",
+                    observation_key=_raybet_observation_key(
+                        match_id, raybet_observed_at, refreshed_response
+                    ),
+                    source_event_id=None,
+                    raybet_match_id=match_id,
+                    observed_at=raybet_observed_at,
+                    normalized_state_hash=normalized_state_hash(snapshots),
+                    snapshots=snapshots,
+                )
             raybet_payload = refreshed
     drafts = _vision_drafts(store.connection, match_id)
     if not drafts:
         return {"status": "waiting_for_confirmed_draft"}
     scheduled = _scheduled_timestamp(match["scheduled_at"])
     summaries = await client.get_team_matches(team_id)
+    summary_observed_at = datetime.now(timezone.utc)
+    raw_archive.archive_json(
+        source="opendota",
+        endpoint=f"/api/teams/{team_id}/matches",
+        request_identity=f"/api/teams/{team_id}/matches",
+        payload_bytes=canonical_json_bytes(summaries),
+        observed_at=summary_observed_at,
+        match_id=None,
+        status_code=200,
+    )
     candidates = [
         row
         for row in summaries
@@ -361,10 +476,12 @@ async def label_once(
         dota_match_id = int(summary["match_id"])
         detail = await client.get_match(dota_match_id)
         observed_at = datetime.now(timezone.utc)
+        detail_endpoint = f"/api/matches/{dota_match_id}"
+        detail_request_identity = detail_endpoint
         raw_archive.archive_json(
             source="opendota",
-            endpoint=f"/api/matches/{dota_match_id}",
-            request_identity=f"/api/matches/{dota_match_id}",
+            endpoint=detail_endpoint,
+            request_identity=detail_request_identity,
             payload_bytes=canonical_json_bytes(detail),
             observed_at=observed_at,
             match_id=dota_match_id,
@@ -410,12 +527,27 @@ async def label_once(
         if type(duration) is not int or duration <= 0:
             raise ValueError("OpenDota map duration is incomplete or invalid")
         settled_at = datetime.now(timezone.utc)
+        raw_archive.archive_json(
+            source="opendota",
+            endpoint=detail_endpoint,
+            request_identity=detail_request_identity,
+            payload_bytes=canonical_json_bytes(detail),
+            observed_at=observed_at,
+            match_id=dota_match_id,
+            status_code=200,
+            first_usable_at=settled_at,
+        )
         result = StoredMapResult(
             match_id, map_number, dota_match_id, winner_side,
             team_one_kills, team_two_kills, duration,
             _opendota_evidence_ref(detail, dota_match_id), settled_at,
         )
-        raybet_final = parse_raybet_map_final(
+        raybet_final = _latest_exact_raybet_final(
+            store,
+            match_id,
+            map_number,
+            team_ids=raybet_team_ids,
+        ) or parse_raybet_map_final(
             raybet_payload,
             map_number,
             observed_at=raybet_observed_at,
