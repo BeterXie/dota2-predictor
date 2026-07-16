@@ -37,6 +37,29 @@ def valid_event() -> dict:
     }
 
 
+def valid_video_event() -> dict:
+    payload = {
+        "result": {
+            "state": "playing",
+            "currentTime": 120.0,
+            "playback_url": "wss://cfinfo.365raylinks.com/live/38407985.m3u8",
+        }
+    }
+    event = valid_event()
+    event.update(
+        {
+            "event_id": "d" * 64,
+            "source_path": "/live",
+            "transport": "websocket",
+            "event_type": "video",
+            "payload": payload,
+            "payload_hash": payload_sha256(payload),
+            "payload_bytes": len(canonical_json(payload)),
+        }
+    )
+    return event
+
+
 class BrowserContractTests(unittest.TestCase):
     def parse(self, value: dict) -> BrowserEvent:
         return BrowserEvent.model_validate_json(json.dumps(value))
@@ -170,6 +193,21 @@ class BrowserContractTests(unittest.TestCase):
         wrong_size["payload_bytes"] += 1
         with self.assertRaises(ValidationError):
             self.parse(wrong_size)
+
+    def test_video_payload_is_shape_checked_again_at_the_companion(self) -> None:
+        self.parse(valid_video_event())
+        for field, value in {
+            "state": "token=secret",
+            "currentTime": "bearer secret",
+            "playback_url": "wss://cfinfo.365raylinks.com/live/x.m3u8?token=secret",
+        }.items():
+            with self.subTest(field=field):
+                event = valid_video_event()
+                event["payload"] = {"result": {field: value}}
+                event["payload_hash"] = payload_sha256(event["payload"])
+                event["payload_bytes"] = len(canonical_json(event["payload"]))
+                with self.assertRaises(ValidationError):
+                    self.parse(event)
 
 
 if __name__ == "__main__":

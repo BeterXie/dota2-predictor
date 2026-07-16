@@ -46,6 +46,7 @@ test("classic scripts load in order and expose the shared API", () => {
   ]);
   assert.equal(typeof api.sanitizeCandidate, "function");
   assert.equal(typeof api.classifyCandidate, "function");
+  assert.equal(typeof api.extractVideoPayload, "function");
 });
 
 test("canonical JSON is stable across object insertion order", () => {
@@ -303,6 +304,61 @@ test("allowlisted WSS live payloads use market structure instead of HTTP paths",
   assert.equal(result.events[0].eventType, "odds");
   assert.equal(result.events[0].sourcePath, "/live");
   assert.equal(result.events[0].payload.result.id, 410001);
+});
+
+test("video classification keeps only public playback state and strips signed URLs", () => {
+  const { classifyCandidate, createClassificationState, extractVideoPayload } = loadCore();
+  const payload = {
+    result: {
+      state: "playing",
+      currentTime: 912,
+      duration: 3600,
+      playback_url: "wss://cfinfo.365raylinks.com/live/410001.m3u8?token=fixture-token&expires=9",
+      authorization: "must-not-be-retained",
+      headers: { authorization: "must-not-be-retained" },
+    },
+  };
+  const safe = extractVideoPayload(payload);
+  assert.deepEqual(plain(safe), {
+    result: {
+      state: "playing",
+      currentTime: 912,
+      duration: 3600,
+      playback_url: "wss://cfinfo.365raylinks.com/live/410001.m3u8",
+    },
+  });
+  const result = classifyCandidate({
+    sourceUrl: "https://cfinfo.365raylinks.com/live?match_id=410001",
+    transport: "fetch",
+    raybetMatchId: "410001",
+    payload,
+  }, createClassificationState(["410001"]));
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0].eventType, "video");
+  assert.equal(JSON.stringify(result.events[0]).includes("fixture-token"), false);
+  assert.equal(JSON.stringify(result.events[0]).includes("authorization"), false);
+});
+
+test("video state-only payloads use constrained values and reject injected text", () => {
+  const { classifyCandidate, createClassificationState, extractVideoPayload } = loadCore();
+  const stateOnly = extractVideoPayload({result: {state: "playing"}});
+  assert.deepEqual(plain(stateOnly), {result: {state: "playing"}});
+  const malicious = extractVideoPayload({
+    result: {
+      state: "token=secret",
+      currentTime: "bearer SECRET",
+      width: 1920,
+      quality: "ultra-secret",
+    },
+  });
+  assert.equal(malicious, null);
+  const result = classifyCandidate({
+    sourcePath: "/live",
+    transport: "websocket",
+    raybetMatchId: "410001",
+    payload: {result: {state: "playing"}},
+  }, createClassificationState(["410001"]));
+  assert.equal(result.events[0].eventType, "video");
 });
 
 test("metadata-only unknown events cannot establish a trusted match", () => {

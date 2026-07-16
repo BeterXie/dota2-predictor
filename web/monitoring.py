@@ -380,11 +380,27 @@ def _monitor_match(
         )
     latest_vision = _latest_row(
         connection,
-        """SELECT captured_at AS observed_at, map_number, game_clock_seconds,
-                  screen_state, confirmed, clock_confidence, draft_confidence
-             FROM vision_observations WHERE raybet_match_id=?
-            ORDER BY captured_at DESC LIMIT 1""",
-        (match_id,),
+        """SELECT observation.captured_at AS observed_at,
+                  observation.map_number, observation.game_clock_seconds,
+                  observation.screen_state, observation.confirmed,
+                  observation.clock_confidence, observation.draft_confidence
+             FROM vision_observations AS observation
+             JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=observation.raybet_match_id
+              AND anchor.map_number=observation.map_number
+              AND (
+                    anchor.status='anchored'
+                    OR (
+                        anchor.status='conflict'
+                        AND anchor.conflict_at IS NOT NULL
+                        AND julianday(anchor.conflict_at) IS NOT NULL
+                        AND julianday(anchor.conflict_at)>julianday(?)
+                    )
+              )
+            WHERE observation.raybet_match_id=?
+              AND julianday(observation.captured_at)<=julianday(?)
+            ORDER BY observation.captured_at DESC LIMIT 1""",
+        (now.isoformat(), match_id, now.isoformat()),
     )
     latest_decision = _latest_row(
         connection,

@@ -1861,7 +1861,8 @@ class LiveBettingStore:
                 )
                 draft_hash = hashlib.sha256(draft_payload.encode("utf-8")).hexdigest()
                 anchor = self.connection.execute(
-                    """SELECT draft_hash, status FROM vision_draft_anchors
+                    """SELECT draft_hash, status, conflict_at
+                         FROM vision_draft_anchors
                         WHERE raybet_match_id=? AND map_number=?""",
                     (observation.raybet_match_id, observation.map_number),
                 ).fetchone()
@@ -1918,6 +1919,17 @@ class LiveBettingStore:
                                 observation.map_number,
                             ),
                         )
+                    conflict_cutoff = (
+                        captured_at
+                        if anchor["status"] != "conflict"
+                        else anchor["conflict_at"]
+                    )
+                    self._invalidate_draft_dependents(
+                        observation.raybet_match_id,
+                        int(observation.map_number),
+                        reason,
+                        conflict_cutoff,
+                    )
                     stored_confirmed = False
             cursor = self.connection.execute(
                 """INSERT OR IGNORE INTO vision_observations
@@ -1945,31 +1957,163 @@ class LiveBettingStore:
             )
             return cursor.rowcount == 1
 
-    def insert_alignment(self, alignment: Any) -> bool:
-        cursor = self.execute(
-            """INSERT OR REPLACE INTO odds_alignments VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (alignment.odds_snapshot_id, alignment.raybet_match_id,
-             alignment.map_number, alignment.game_clock_seconds,
-             alignment.observation_captured_at.isoformat()
-             if alignment.observation_captured_at else None,
-             alignment.method, alignment.lag_seconds, int(alignment.usable),
-             alignment.reason),
+    def _invalidate_draft_dependents(
+        self,
+        raybet_match_id: str,
+        map_number: int,
+        reason: str,
+        conflict_at: str | None,
+    ) -> None:
+        """Append fail-closed invalidations when a map draft is conflicted."""
+        recorded_at = datetime.now(timezone.utc).isoformat()
+        dependent_queries = (
+            (
+                "odds_alignment",
+                """SELECT alignment.odds_snapshot_id
+                     FROM odds_alignments AS alignment
+                     JOIN odds_snapshots AS snapshot
+                       ON snapshot.id=alignment.odds_snapshot_id
+                    WHERE alignment.raybet_match_id=?
+                      AND alignment.map_number=?
+                      AND (
+                            julianday(?) IS NULL
+                            OR julianday(snapshot.received_at) IS NULL
+                            OR julianday(snapshot.received_at)>=julianday(?)
+                      )""",
+            ),
+            (
+                "strategy_decision",
+                """SELECT decision_key FROM strategy_decisions
+                    WHERE raybet_match_id=? AND map_number=?
+                      AND (
+                            julianday(?) IS NULL
+                            OR julianday(decided_at) IS NULL
+                            OR julianday(decided_at)>=julianday(?)
+                      )""",
+            ),
+            (
+                "research_prediction",
+                """SELECT prediction_key FROM research_live_predictions
+                    WHERE raybet_match_id=? AND map_number=?
+                      AND (
+                            julianday(?) IS NULL
+                            OR julianday(observed_at) IS NULL
+                            OR julianday(observed_at)>=julianday(?)
+                      )""",
+            ),
         )
-        return cursor.rowcount == 1
+        for dependent_type, query in dependent_queries:
+            try:
+                rows = self.connection.execute(
+                    query,
+                    (raybet_match_id, map_number, conflict_at, conflict_at),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            self.connection.executemany(
+                """INSERT OR IGNORE INTO vision_derived_invalidations
+                   (dependent_type, dependent_key, raybet_match_id, map_number,
+                    reason, recorded_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    (
+                        dependent_type,
+                        str(row[0]),
+                        raybet_match_id,
+                        map_number,
+                        reason,
+                        recorded_at,
+                    )
+                    for row in rows
+                ),
+            )
+        try:
+            rows = self.connection.execute(
+                """SELECT orders.order_key
+                     FROM shadow_orders AS orders
+                     JOIN shadow_map_attempts AS attempt
+                       ON attempt.order_key=orders.order_key
+                    WHERE attempt.raybet_match_id=? AND attempt.map_number=?
+                      AND (
+                            julianday(?) IS NULL
+                            OR julianday(orders.signal_transport_at) IS NULL
+                            OR julianday(orders.signal_transport_at)>=julianday(?)
+                      )""",
+                (raybet_match_id, map_number, conflict_at, conflict_at),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        self.connection.executemany(
+            """INSERT OR IGNORE INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at) VALUES ('shadow_order', ?, ?, ?, ?, ?)""",
+            (
+                (str(row[0]), raybet_match_id, map_number, reason, recorded_at)
+                for row in rows
+            ),
+        )
+
+    def insert_alignment(self, alignment: Any) -> bool:
+        values = (
+            alignment.odds_snapshot_id,
+            alignment.raybet_match_id,
+            alignment.map_number,
+            alignment.game_clock_seconds,
+            alignment.observation_captured_at.isoformat()
+            if alignment.observation_captured_at
+            else None,
+            alignment.method,
+            alignment.lag_seconds,
+            int(alignment.usable),
+            alignment.reason,
+        )
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM odds_alignments WHERE odds_snapshot_id=?",
+                (alignment.odds_snapshot_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise ValueError("odds alignment identity conflict")
+                return False
+            self.connection.execute(
+                """INSERT INTO odds_alignments VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            return True
 
     def insert_decision(self, decision: Any) -> bool:
-        cursor = self.execute(
-            """INSERT OR IGNORE INTO strategy_decisions VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (decision.decision_key, decision.raybet_match_id, decision.map_number,
-             decision.decided_at.isoformat(), decision.underdog_side,
-             decision.market_probability, decision.model_probability,
-             decision.edge, decision.data_quality, int(decision.eligible),
-             decision.reason, self.json(decision.contributions),
-             decision.input_ref, decision.strategy_version),
+        values = (
+            decision.decision_key,
+            decision.raybet_match_id,
+            decision.map_number,
+            decision.decided_at.isoformat(),
+            decision.underdog_side,
+            decision.market_probability,
+            decision.model_probability,
+            decision.edge,
+            decision.data_quality,
+            int(decision.eligible),
+            decision.reason,
+            self.json(decision.contributions),
+            decision.input_ref,
+            decision.strategy_version,
         )
-        return cursor.rowcount == 1
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (decision.decision_key,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise ValueError("strategy decision identity conflict")
+                return False
+            self.connection.execute(
+                """INSERT INTO strategy_decisions VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            return True
 
     def insert_research_prediction(self, prediction: Any) -> bool:
         """Append one non-actionable live prediction without touching order tables."""
@@ -2084,6 +2228,59 @@ class LiveBettingStore:
         ).fetchone()
         return row is not None
 
+    def pending_order_has_draft_conflict(self, order_key: str) -> bool:
+        row = self.connection.execute(
+            """SELECT 1 FROM shadow_orders AS orders
+                 JOIN shadow_map_attempts AS attempt
+                   ON attempt.order_key=orders.order_key
+                 JOIN vision_draft_anchors AS anchor
+                   ON anchor.raybet_match_id=attempt.raybet_match_id
+                  AND anchor.map_number=attempt.map_number
+                WHERE attempt.order_key=? AND attempt.status='pending'
+                  AND anchor.status='conflict'
+                  AND (
+                        anchor.conflict_at IS NULL
+                        OR julianday(anchor.conflict_at) IS NULL
+                        OR julianday(orders.signal_transport_at) IS NULL
+                        OR julianday(anchor.conflict_at)<=
+                           julianday(orders.signal_transport_at)
+                  )""",
+            (order_key,),
+        ).fetchone()
+        return row is not None
+
+    def reject_pending_order(
+        self,
+        order: ShadowOrder,
+        *,
+        reason: str,
+    ) -> ShadowOrder | None:
+        """Atomically reject one persisted pending order without scheduling mail."""
+        if not reason.strip():
+            raise ValueError("rejection reason is required")
+        resolved = replace(
+            order,
+            status="rejected",
+            fill_price=None,
+            filled_at=None,
+            rejection_reason=reason,
+        )
+        with self.transaction():
+            cursor = self.connection.execute(
+                """UPDATE shadow_orders
+                      SET status='rejected', fill_price=NULL, filled_at=NULL,
+                          rejection_reason=?
+                    WHERE order_key=? AND status='pending'""",
+                (reason, order.order_key),
+            )
+            if cursor.rowcount != 1:
+                return None
+            if not self.update_map_attempt(
+                order.order_key, "rejected", expected_status="pending"
+            ):
+                raise RuntimeError("pending order has no matching pending map attempt")
+        return resolved
+
     def insert_map_order(
         self,
         order: ShadowOrder,
@@ -2097,6 +2294,25 @@ class LiveBettingStore:
         if not self._signal_identity_matches(order):
             return False
         with self.transaction():
+            conflicted = self.connection.execute(
+                """SELECT 1 FROM vision_draft_anchors
+                     WHERE raybet_match_id=? AND map_number=?
+                       AND status='conflict'
+                       AND (
+                             conflict_at IS NULL
+                             OR julianday(conflict_at) IS NULL
+                             OR julianday(?) IS NULL
+                             OR julianday(conflict_at)<=julianday(?)
+                       )""",
+                (
+                    order.raybet_match_id,
+                    map_number,
+                    self._iso(order.signal_transport_at),
+                    self._iso(order.signal_transport_at),
+                ),
+            ).fetchone()
+            if conflicted is not None:
+                return False
             reserved = self.connection.execute(
                 """INSERT OR IGNORE INTO shadow_map_attempts
                    VALUES (?, ?, ?, ?, ?)""",

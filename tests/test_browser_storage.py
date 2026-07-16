@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
@@ -64,6 +65,51 @@ def browser_event(event_id: str, captured_at: datetime) -> dict[str, object]:
 
 
 class BrowserSchemaTests(unittest.TestCase):
+    def test_alignment_and_decision_duplicate_keys_are_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                alignment = SimpleNamespace(
+                    odds_snapshot_id=1,
+                    raybet_match_id="1001",
+                    map_number=1,
+                    game_clock_seconds=600,
+                    observation_captured_at=NOW,
+                    method="nearest_prior",
+                    lag_seconds=1.0,
+                    usable=True,
+                    reason=None,
+                )
+                self.assertTrue(store.insert_alignment(alignment))
+                self.assertFalse(store.insert_alignment(alignment))
+                with self.assertRaisesRegex(ValueError, "alignment identity"):
+                    store.insert_alignment(
+                        SimpleNamespace(**{**vars(alignment), "usable": False})
+                    )
+
+                decision = SimpleNamespace(
+                    decision_key="decision-1",
+                    raybet_match_id="1001",
+                    map_number=1,
+                    decided_at=NOW,
+                    underdog_side="team_one",
+                    market_probability=0.4,
+                    model_probability=0.5,
+                    edge=0.1,
+                    data_quality=0.8,
+                    eligible=True,
+                    reason="eligible",
+                    contributions={"draft": 0.1},
+                    input_ref="input-1",
+                    strategy_version="strategy-1",
+                )
+                self.assertTrue(store.insert_decision(decision))
+                self.assertFalse(store.insert_decision(decision))
+                with self.assertRaisesRegex(ValueError, "decision identity"):
+                    store.insert_decision(
+                        SimpleNamespace(**{**vars(decision), "edge": 0.2})
+                    )
+
     def test_completed_refresh_is_not_due_between_low_frequency_ticks(self) -> None:
         self.assertTrue(completed_refresh_due(None, 0.0, 300.0))
         self.assertFalse(completed_refresh_due([{"id": "match-1"}], 3.0, 300.0))
@@ -83,6 +129,27 @@ class BrowserSchemaTests(unittest.TestCase):
                 [{"id": "1001", "status": 3}],
             )
             matches.assert_called_once_with(match_type=4, max_pages=4)
+
+    def test_raybet_match_list_skips_malformed_rows(self) -> None:
+        class Session:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {}
+
+        client = RayBetClient(client=Session())
+        with patch.object(
+            client,
+            "match_page",
+            return_value=[
+                None,
+                {"game_id": "not-a-number", "id": 1},
+                {"game_id": 151, "id": "not-a-match-id"},
+                {"game_id": 151, "id": 1001, "status": 2},
+            ],
+        ):
+            self.assertEqual(
+                client.matches(match_type=1, max_pages=1),
+                [{"game_id": 151, "id": 1001, "status": 2}],
+            )
 
     def test_transaction_rollback_and_legacy_autocommit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

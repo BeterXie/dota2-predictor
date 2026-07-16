@@ -52,7 +52,8 @@
   }
 
   function relevantHttpUrl(url) {
-    return allowedUrl(url) && (url.pathname === "/v2/match" || url.pathname === "/v2/odds");
+    return allowedUrl(url) && ["/v2/match", "/v2/odds", "/live", "/video", "/playback", "/v2/video"]
+      .includes(url.pathname);
   }
 
   function candidateString(candidate) {

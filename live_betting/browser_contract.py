@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from datetime import datetime, timezone
 from enum import Enum
@@ -49,6 +50,26 @@ RAYBET_ORIGINS = frozenset(
         "https://cfinfo.365raylinks.com",
         "https://iminfo.esportsworldlink.com",
     }
+)
+RAYBET_VIDEO_HOSTS = frozenset(urlsplit(origin).hostname for origin in RAYBET_ORIGINS)
+VIDEO_FIELDS = frozenset(
+    {
+        "state", "status", "playing", "paused", "live", "current_time", "currentTime",
+        "duration", "position", "quality", "width", "height", "url", "src",
+        "stream_url", "playback_url",
+    }
+)
+VIDEO_PRIMARY_FIELDS = frozenset(
+    {
+        "state", "status", "playing", "paused", "live", "current_time", "currentTime",
+        "duration", "url", "src", "stream_url", "playback_url",
+    }
+)
+VIDEO_NUMERIC_FIELDS = frozenset(
+    {"current_time", "currentTime", "duration", "position", "width", "height"}
+)
+VIDEO_STATE_VALUES = frozenset(
+    {"buffering", "ended", "error", "idle", "loading", "paused", "playing", "ready", "stopped"}
 )
 
 
@@ -292,6 +313,8 @@ class BrowserEvent(BaseModel):
             raise ValueError("event type requires a RayBet match id")
         if self.event_type is EventType.UNKNOWN and self.payload:
             raise ValueError("unknown events must be metadata-only")
+        if self.event_type is EventType.VIDEO:
+            _validate_video_payload(self.payload)
         if (
             self.capture_reason in {"payload_too_large", "raw_payload_too_large"}
             and self.payload
@@ -327,3 +350,46 @@ def find_forbidden_batch_key(value: Any) -> str | None:
                 if any(part in normalized for part in _FORBIDDEN_KEY_PARTS):
                     return str(key)
     return None
+
+
+def _validate_video_payload(payload: dict[str, Any]) -> None:
+    result = payload.get("result")
+    if not isinstance(result, dict) or isinstance(result, list):
+        raise ValueError("video payload must contain a result object")
+    if "odds" in result or "team" in result:
+        raise ValueError("video payload cannot contain market or team arrays")
+    if set(result) - VIDEO_FIELDS:
+        raise ValueError("video payload contains an unsupported field")
+    if not VIDEO_PRIMARY_FIELDS.intersection(result):
+        raise ValueError("video payload lacks a playback marker")
+    for key, value in result.items():
+        if key in {"state", "status"}:
+            if not isinstance(value, str) or value.casefold() not in VIDEO_STATE_VALUES:
+                raise ValueError("video state is not allowlisted")
+        elif key in {"playing", "paused", "live"}:
+            if not isinstance(value, bool):
+                raise ValueError("video boolean state is invalid")
+        elif key in VIDEO_NUMERIC_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("video numeric state is invalid")
+            if not math.isfinite(float(value)) or not 0 <= float(value) <= 86_400:
+                raise ValueError("video numeric state is out of range")
+        elif key == "quality":
+            if not isinstance(value, str) or value.casefold() not in {
+                "auto", "low", "medium", "high", "source"
+            }:
+                raise ValueError("video quality is not allowlisted")
+        elif key in {"url", "src", "stream_url", "playback_url"}:
+            if not isinstance(value, str):
+                raise ValueError("video URL is invalid")
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme not in {"https", "wss"}
+                or parsed.hostname not in RAYBET_VIDEO_HOSTS
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or (parsed.port not in {None, 443})
+            ):
+                raise ValueError("video URL must be public and sanitized")

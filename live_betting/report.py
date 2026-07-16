@@ -471,6 +471,18 @@ def _vision_quality_index(
                       json_extract(requested.value, '$.frame_ref')
                 WHERE observation.confirmed=1
                   AND NOT EXISTS (
+                      SELECT 1 FROM vision_draft_anchors AS anchor
+                       WHERE anchor.raybet_match_id=observation.raybet_match_id
+                         AND anchor.map_number=observation.map_number
+                         AND anchor.status='conflict'
+                         AND (
+                               anchor.conflict_at IS NULL
+                               OR julianday(anchor.conflict_at) IS NULL
+                               OR julianday(anchor.conflict_at)<=
+                                  julianday(observation.captured_at)
+                         )
+                  )
+                  AND NOT EXISTS (
                       SELECT 1 FROM vision_observation_invalidations AS invalidation
                        WHERE invalidation.raybet_match_id=observation.raybet_match_id
                          AND invalidation.captured_at=observation.captured_at

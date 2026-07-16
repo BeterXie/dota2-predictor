@@ -308,6 +308,115 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 ("0" * 64,),
             )
 
+    def test_draft_conflict_hides_confirmed_frames_from_live_monitor(self) -> None:
+        original = observation(NOW, frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=1),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.record_transport(NOW + timedelta(seconds=2), key="after-conflict")
+
+        result = run_once(
+            self.store, Mock(), MISSING_VISION,
+            now=NOW + timedelta(seconds=3),
+        )
+
+        self.assertEqual(result["status"], "waiting_for_confirmed_vision")
+
+    def test_draft_conflict_rejects_pending_order_before_successor_fill(self) -> None:
+        original = observation(NOW - timedelta(seconds=2), frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW - timedelta(seconds=1),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict",
+        )
+        self.insert_pending(NOW)
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.record_transport(NOW + timedelta(seconds=2), key="successor")
+
+        result = run_once(
+            self.store, Mock(), MISSING_VISION,
+            now=NOW + timedelta(seconds=3),
+        )
+
+        self.assertEqual(result["status"], "shadow_rejected")
+        row = self.store.connection.execute(
+            "SELECT status, rejection_reason FROM shadow_orders WHERE order_key='order-1'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("rejected", "vision_draft_conflict"))
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM vision_derived_invalidations
+                   WHERE dependent_type='shadow_order' AND dependent_key='order-1'"""
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_future_draft_conflict_does_not_reject_prior_pending_order(self) -> None:
+        original = observation(NOW, frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=10),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="future-conflict",
+        )
+        self.insert_pending(NOW)
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.record_transport(NOW + timedelta(seconds=2), key="successor")
+
+        result = run_once(
+            self.store, Mock(), MISSING_VISION,
+            now=NOW + timedelta(seconds=3),
+        )
+
+        self.assertEqual(result["status"], "shadow_filled")
+        row = self.store.connection.execute(
+            "SELECT status, filled_at FROM shadow_orders WHERE order_key='order-1'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("filled", (NOW + timedelta(seconds=2)).isoformat()))
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM vision_derived_invalidations
+                   WHERE dependent_type='shadow_order' AND dependent_key='order-1'"""
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_future_draft_conflict_keeps_cutoff_vision_usable(self) -> None:
+        original = observation(NOW, frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=10),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="future-conflict",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+        self.store.upsert_raybet_match(
+            raybet_metadata(), NOW - timedelta(minutes=2)
+        )
+        self.record_transport(NOW + timedelta(seconds=2), key="before-conflict")
+
+        result = run_once(
+            self.store, Mock(), MISSING_VISION,
+            now=NOW + timedelta(seconds=3),
+        )
+
+        self.assertNotEqual(result["status"], "waiting_for_confirmed_vision")
+        self.assertEqual(result["status"], "no_signal")
+        self.assertEqual(result["reason"], "strict_live_ineligible")
+
     def test_transport_uses_latest_prior_vision_not_a_future_frame(self) -> None:
         self.store.insert_vision_observation(observation(NOW, frame="old"))
         self.record_transport(NOW + timedelta(seconds=1), key="before-new-frame")

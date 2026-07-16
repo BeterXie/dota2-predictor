@@ -21,6 +21,25 @@ const WS_MARKET_FIELDS = Object.freeze([
   "odds_id", "odds_group_id", "value", "win", "status", "last_update",
   "group_name", "group_short_name", "tag", "tab", "match_stage", "team_id", "name",
 ]);
+const VIDEO_FIELDS = Object.freeze([
+  "state", "status", "playing", "paused", "live", "current_time", "currentTime",
+  "duration", "position", "quality", "width", "height", "url", "src",
+  "stream_url", "playback_url",
+]);
+const VIDEO_URL_FIELDS = new Set(["url", "src", "stream_url", "playback_url"]);
+const VIDEO_MARKER_FIELDS = new Set([
+  "state", "status", "current_time", "currentTime", "duration", "url", "src",
+  "stream_url", "playback_url", "playing", "paused", "live",
+]);
+const VIDEO_PATHS = new Set(["/live", "/video", "/playback", "/v2/video"]);
+const VIDEO_STATE_VALUES = new Set([
+  "buffering", "ended", "error", "idle", "loading", "paused", "playing", "ready",
+  "stopped",
+]);
+const VIDEO_NUMERIC_FIELDS = new Set([
+  "current_time", "currentTime", "duration", "position", "width", "height",
+]);
+const VIDEO_AUX_FIELDS = new Set(["position", "quality", "width", "height"]);
 
 function scalar(value) {
   return value === null || ["string", "number", "boolean"].includes(typeof value);
@@ -119,6 +138,61 @@ function extractWebSocketMarketPayload(payload) {
   return output;
 }
 
+function publicVideoUrl(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    const url = new URL(value, "https://www.ray086.com/");
+    if (!['https:', 'wss:'].includes(url.protocol) || !RAYBET_HOSTS.includes(url.hostname)
+        || (url.port && url.port !== "443") || url.username || url.password) return null;
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+function extractVideoPayload(payload) {
+  const nested = payload?.result;
+  const result = nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested : payload;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  if (!Array.from(VIDEO_MARKER_FIELDS).some((field) => Object.hasOwn(result, field))) {
+    return null;
+  }
+  if (Array.isArray(result.odds) || Array.isArray(result.team)) return null;
+  const safeResult = {};
+  for (const field of VIDEO_FIELDS) {
+    if (!Object.hasOwn(result, field) || !scalar(result[field])) continue;
+    if (VIDEO_URL_FIELDS.has(field)) {
+      const sanitized = publicVideoUrl(result[field]);
+      if (sanitized !== null) safeResult[field] = sanitized;
+    } else if (VIDEO_NUMERIC_FIELDS.has(field)) {
+      const value = Number(result[field]);
+      if (Number.isFinite(value) && value >= 0 && value <= 86_400) {
+        safeResult[field] = value;
+      }
+    } else if (field === "playing" || field === "paused" || field === "live") {
+      if (typeof result[field] === "boolean") safeResult[field] = result[field];
+    } else if (field === "state" || field === "status") {
+      const value = String(result[field]).toLowerCase();
+      if (VIDEO_STATE_VALUES.has(value)) safeResult[field] = value;
+    } else if (field === "quality") {
+      const value = String(result[field]).toLowerCase();
+      if (["auto", "low", "medium", "high", "source"].includes(value)) {
+        safeResult[field] = value;
+      }
+    } else {
+      safeResult[field] = result[field];
+    }
+  }
+  const hasPrimary = Array.from(VIDEO_MARKER_FIELDS).some(
+    (field) => Object.hasOwn(safeResult, field),
+  );
+  if (!hasPrimary) return null;
+  for (const field of VIDEO_AUX_FIELDS) delete safeResult[field];
+  if (Object.keys(safeResult).length === 0) return null;
+  return {result: safeResult};
+}
+
 function classifyCandidate(candidate, state = createClassificationState()) {
   const sourcePath = sourcePathFrom(candidate?.sourceUrl ?? candidate?.sourcePath);
   const payload = candidate?.payload;
@@ -167,6 +241,22 @@ function classifyCandidate(candidate, state = createClassificationState()) {
   if (!raybetMatchId) return { events: [], ignoredReason: "missing_match_id" };
 
   const oddsEndpoint = sourcePath.endsWith("/v2/odds") || sourcePath === "/odds";
+  if (VIDEO_PATHS.has(sourcePath)) {
+    const safePayload = extractVideoPayload(payload);
+    if (safePayload) {
+      state.dotaMatchIds.add(raybetMatchId);
+      return {
+        events: [{
+          eventType: "video",
+          gameId: DOTA2_GAME_ID,
+          raybetMatchId,
+          sourcePath,
+          payload: safePayload,
+        }],
+        ignoredReason: null,
+      };
+    }
+  }
   const websocketMarket = candidate.transport === "websocket"
     ? extractWebSocketMarketPayload(payload) : null;
   if (oddsEndpoint || websocketMarket) {
@@ -224,6 +314,7 @@ function classifyCandidate(candidate, state = createClassificationState()) {
     extractMatchRow,
     extractOddsPayload,
     extractWebSocketMarketPayload,
+    extractVideoPayload,
     classifyCandidate,
   });
 })(globalThis);

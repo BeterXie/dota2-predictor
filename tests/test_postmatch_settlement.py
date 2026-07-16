@@ -7,10 +7,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from live_betting.postmatch_monitor import StoredMapResult, _reconcile_and_settle
+from event_intelligence.raw_archive import RawArchive
+from live_betting.postmatch_monitor import (
+    StoredMapResult,
+    _reconcile_and_settle,
+    _refresh_raybet_final,
+    _vision_drafts,
+)
 from live_betting.raybet import parse_raybet_map_final
 from live_betting.settlement import reconcile_map_winners
 from live_betting.storage import LiveBettingStore
+from live_betting.vision import VisionObservation
 
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
@@ -258,6 +265,81 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
             "1001", 1, 9001, winner, 30, 20, 2400,
             "opendota:9001", NOW,
         )
+
+    def test_postmatch_draft_matching_fails_closed_after_anchor_conflict(self) -> None:
+        original = VisionObservation(
+            "1001", 1, NOW, 600, False,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "original", "game", "team_one",
+        )
+        conflicting = VisionObservation(
+            "1001", 1, NOW.replace(second=13), 601, False,
+            (1, 2, 3, 4, 6), (5, 7, 8, 9, 10),
+            0.95, 0.95, "conflict", "game", "team_one",
+        )
+        self.store.insert_vision_observation(original)
+        self.store.insert_vision_observation(conflicting)
+
+        self.assertEqual(_vision_drafts(self.store.connection, "1001"), {})
+
+    def test_raybet_final_refresh_archives_before_normalization(self) -> None:
+        payload = raybet_final_payload()
+        payload["odds"] = [
+            {**row, "odds": 2.0 if row["team_id"] == 101 else 1.8}
+            for row in payload["odds"]  # type: ignore[union-attr]
+        ]
+        response = {"result": payload}
+
+        class Client:
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                self.match_id = match_id
+                return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = RawArchive(Path(directory) / "raw")
+            refreshed, observed_at = _refresh_raybet_final(
+                self.store, archive, Client(), "1001"
+            )
+            self.assertEqual(refreshed["id"], "1001")
+            self.assertIsNotNone(observed_at)
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM odds_transport_observations "
+                    "WHERE raybet_match_id='1001'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM odds_response_outcomes "
+                    "WHERE raybet_match_id='1001'"
+                ).fetchone()[0],
+                2,
+            )
+            files = list((Path(directory) / "raw" / "raybet").rglob("*.json.gz"))
+            self.assertEqual(len(files), 1)
+
+    def test_raybet_identity_conflict_is_archived_but_not_normalized(self) -> None:
+        response = {"result": {**raybet_final_payload(), "id": "9999"}}
+
+        class Client:
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = RawArchive(Path(directory) / "raw")
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                _refresh_raybet_final(self.store, archive, Client(), "1001")
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM odds_transport_observations"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                len(list((Path(directory) / "raw" / "raybet").rglob("*.json.gz"))),
+                1,
+            )
 
     def test_agreement_persists_evidence_settlement_and_result_mail(self) -> None:
         self.insert_filled_order()

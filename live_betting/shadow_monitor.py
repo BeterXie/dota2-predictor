@@ -160,17 +160,47 @@ def ingest_vision(store: LiveBettingStore, path: Path) -> int:
     )
 
 
-def persist_alignments(store: LiveBettingStore, match_id: str) -> int:
+def _as_of_iso(as_of: datetime | None) -> str:
+    """Return a strict UTC cutoff for causal reads."""
+    resolved = as_of or datetime.now(timezone.utc)
+    if resolved.tzinfo is None or resolved.utcoffset() is None:
+        raise ValueError("as_of must be timezone-aware")
+    return resolved.astimezone(timezone.utc).isoformat()
+
+
+def persist_alignments(
+    store: LiveBettingStore,
+    match_id: str,
+    as_of: datetime | None = None,
+) -> int:
+    cutoff = _as_of_iso(as_of)
     odds_rows = store.connection.execute(
         """SELECT o.* FROM odds_snapshots o LEFT JOIN odds_alignments a
              ON a.odds_snapshot_id=o.id
-           WHERE o.raybet_match_id=? AND a.odds_snapshot_id IS NULL
+           WHERE o.raybet_match_id=?
+             AND a.odds_snapshot_id IS NULL
+             AND julianday(o.received_at)<=julianday(?)
            ORDER BY o.received_at, o.id LIMIT 2000""",
-        (match_id,),
+        (match_id, cutoff),
     ).fetchall()
     observations = [_observation(row) for row in store.connection.execute(
-        """SELECT * FROM vision_observations WHERE raybet_match_id=?
-           ORDER BY captured_at""", (match_id,)
+        """SELECT observation.* FROM vision_observations AS observation
+             LEFT JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=observation.raybet_match_id
+              AND anchor.map_number=observation.map_number
+            WHERE observation.raybet_match_id=?
+              AND julianday(observation.captured_at)<=julianday(?)
+              AND (
+                    observation.map_number IS NULL
+                    OR anchor.status='anchored'
+                    OR (
+                        anchor.status='conflict'
+                        AND anchor.conflict_at IS NOT NULL
+                        AND julianday(anchor.conflict_at) IS NOT NULL
+                        AND julianday(anchor.conflict_at)>julianday(?)
+                    )
+              )
+           ORDER BY observation.captured_at""", (match_id, cutoff, cutoff)
     )]
     aligned = align_snapshots(
         [(int(row["id"]), _snapshot(row)) for row in odds_rows], observations
@@ -585,6 +615,13 @@ def _process_pending_order(
     store: LiveBettingStore, *, as_of: datetime,
 ) -> ShadowOrder | None:
     for pending in _pending_orders(store):
+        if store.pending_order_has_draft_conflict(pending.order_key):
+            resolved = store.reject_pending_order(
+                pending, reason="vision_draft_conflict"
+            )
+            if resolved is not None:
+                return resolved
+            continue
         watermark = store.processed_transport_watermark(
             pending.raybet_match_id, as_of=as_of
         )
@@ -680,16 +717,40 @@ def run_once(
     now: datetime | None = None,
 ) -> dict[str, object]:
     run_at = now or datetime.now(timezone.utc)
+    try:
+        ingested = ingest_vision(store, vision_path)
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        # A malformed vision line must not prevent a previously pending shadow
+        # order from resolving from its persisted odds successor.
+        logger.warning("vision ingestion skipped malformed input (%s)", type(error).__name__)
+        ingested = 0
     pending = _process_pending_order(store, as_of=run_at)
     if pending is not None:
-        return {"status": f"shadow_{pending.status}", "order_key": pending.order_key}
-
-    ingested = ingest_vision(store, vision_path)
+        return {
+            "status": f"shadow_{pending.status}",
+            "order_key": pending.order_key,
+            "vision_ingested": ingested,
+        }
     row = store.connection.execute(
-        """SELECT * FROM vision_observations WHERE confirmed=1 AND screen_state='game'
-             AND captured_at<=?
-           ORDER BY captured_at DESC LIMIT 1""",
-        (run_at.isoformat(),),
+        """SELECT observation.*
+             FROM vision_observations AS observation
+             JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=observation.raybet_match_id
+              AND anchor.map_number=observation.map_number
+              AND (
+                    anchor.status='anchored'
+                    OR (
+                        anchor.status='conflict'
+                        AND anchor.conflict_at IS NOT NULL
+                        AND julianday(anchor.conflict_at) IS NOT NULL
+                        AND julianday(anchor.conflict_at)>julianday(?)
+                    )
+              )
+            WHERE observation.confirmed=1
+              AND observation.screen_state='game'
+              AND julianday(observation.captured_at)<=julianday(?)
+           ORDER BY observation.captured_at DESC LIMIT 1""",
+        (run_at.isoformat(), run_at.isoformat()),
     ).fetchone()
     if not row:
         return {"status": "waiting_for_confirmed_vision", "vision_ingested": ingested}
@@ -704,11 +765,30 @@ def run_once(
         return {"status": "waiting_for_fresh_odds"}
 
     causal_row = store.connection.execute(
-        """SELECT * FROM vision_observations
-           WHERE raybet_match_id=? AND confirmed=1 AND screen_state='game'
-             AND captured_at<=?
-           ORDER BY captured_at DESC LIMIT 1""",
-        (match_id, current_transport_at.isoformat()),
+        """SELECT observation.*
+             FROM vision_observations AS observation
+             JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=observation.raybet_match_id
+              AND anchor.map_number=observation.map_number
+              AND (
+                    anchor.status='anchored'
+                    OR (
+                        anchor.status='conflict'
+                        AND anchor.conflict_at IS NOT NULL
+                        AND julianday(anchor.conflict_at) IS NOT NULL
+                        AND julianday(anchor.conflict_at)>julianday(?)
+                    )
+              )
+            WHERE observation.raybet_match_id=?
+              AND observation.confirmed=1
+              AND observation.screen_state='game'
+              AND julianday(observation.captured_at)<=julianday(?)
+           ORDER BY observation.captured_at DESC LIMIT 1""",
+        (
+            current_transport_at.isoformat(),
+            match_id,
+            current_transport_at.isoformat(),
+        ),
     ).fetchone()
     if not causal_row:
         return {
@@ -716,7 +796,7 @@ def run_once(
             "reason": "no_prior_confirmed_observation",
         }
     map_number = int(causal_row["map_number"])
-    aligned = persist_alignments(store, match_id)
+    aligned = persist_alignments(store, match_id, as_of=current_transport_at)
     snapshots = market_state_for_transport(
         store.connection, current_transport, match_id, map_number
     )
@@ -747,9 +827,29 @@ def run_once(
     )
 
     observations = [_observation(item) for item in store.connection.execute(
-        """SELECT * FROM vision_observations WHERE raybet_match_id=?
-           ORDER BY captured_at""",
-        (match_id,),
+        """SELECT observation.*
+             FROM vision_observations AS observation
+             LEFT JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=observation.raybet_match_id
+              AND anchor.map_number=observation.map_number
+            WHERE observation.raybet_match_id=?
+              AND julianday(observation.captured_at)<=julianday(?)
+              AND (
+                    observation.map_number IS NULL
+                    OR anchor.status='anchored'
+                    OR (
+                        anchor.status='conflict'
+                        AND anchor.conflict_at IS NOT NULL
+                        AND julianday(anchor.conflict_at) IS NOT NULL
+                        AND julianday(anchor.conflict_at)>julianday(?)
+                    )
+              )
+           ORDER BY observation.captured_at""",
+        (
+            match_id,
+            current_transport_at.isoformat(),
+            current_transport_at.isoformat(),
+        ),
     )]
     observation, alignment_reason = _aligned_transport_observation(
         snapshots, current_transport_at, observations

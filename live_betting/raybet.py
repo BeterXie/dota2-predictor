@@ -308,9 +308,17 @@ class RayBetClient:
             if not page_rows:
                 break
             for row in page_rows:
-                if int(row.get("game_id") or 0) != DOTA2_GAME_ID:
+                if not isinstance(row, dict):
                     continue
-                match_id = str(row.get("id"))
+                try:
+                    game_id = int(row.get("game_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if game_id != DOTA2_GAME_ID:
+                    continue
+                match_id = str(row.get("id") or "")
+                if not match_id.isdigit():
+                    continue
                 if match_id not in seen:
                     rows.append(row)
                     seen.add(match_id)

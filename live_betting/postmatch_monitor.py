@@ -21,6 +21,7 @@ from event_intelligence.storage import IntelligenceStorage
 
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
+from .monitor import _write_raw
 from .models import Market
 from .raybet import RayBetClient, RayBetMapFinal, parse_raybet_map_final
 from .settlement import MapResult, reconcile_map_winners, settle
@@ -56,9 +57,16 @@ def _scheduled_timestamp(value: str | None) -> int:
 def _vision_drafts(connection: sqlite3.Connection, match_id: str) -> dict[int, set[frozenset[int]]]:
     output: dict[int, set[frozenset[int]]] = {}
     rows = connection.execute(
-        """SELECT map_number, radiant_hero_ids, dire_hero_ids
-           FROM vision_observations
-           WHERE raybet_match_id=? AND confirmed=1 AND map_number IS NOT NULL""",
+        """SELECT observation.map_number, observation.radiant_hero_ids,
+                  observation.dire_hero_ids
+             FROM vision_observations AS observation
+             JOIN vision_draft_anchors AS anchor
+               ON anchor.raybet_match_id=observation.raybet_match_id
+              AND anchor.map_number=observation.map_number
+              AND anchor.status='anchored'
+            WHERE observation.raybet_match_id=?
+              AND observation.confirmed=1
+              AND observation.map_number IS NOT NULL""",
         (match_id,),
     )
     for map_number, radiant, dire in rows:
@@ -115,6 +123,49 @@ def _raybet_observation_key(
     return hashlib.sha256(
         f"direct\n{match_id}\n{observed_at.isoformat()}\n{digest}".encode("utf-8")
     ).hexdigest()
+
+
+class RayBetFinalRefreshIdentityError(ValueError):
+    """The archived final response does not belong to the requested match."""
+
+
+def _refresh_raybet_final(
+    store: LiveBettingStore,
+    raw_archive: RawArchive,
+    raybet_client: RayBetClient,
+    match_id: str,
+) -> tuple[dict[str, object], datetime]:
+    """Archive and normalize one final RayBet response atomically.
+
+    The raw response is written before identity validation so an invalid
+    provider response remains auditable without entering normalized state.
+    """
+    response = raybet_client.match_odds(match_id)
+    observed_at = datetime.now(timezone.utc)
+    _write_raw(raw_archive.root / "raybet", match_id, response, observed_at)
+    result = response.get("result") if isinstance(response, dict) else None
+    if (
+        not isinstance(result, dict)
+        or str(result.get("id") or "") != match_id
+        or type(result.get("game_id")) is not int
+        or int(result["game_id"]) != 151
+    ):
+        raise RayBetFinalRefreshIdentityError(
+            f"RayBet final response identity mismatch for {match_id}"
+        )
+    with store.transaction():
+        store.upsert_raybet_match(result, observed_at)
+        snapshots = snapshots_from_payload(response, received_at=observed_at)
+        store.store_odds_observation(
+            source="direct",
+            observation_key=_raybet_observation_key(match_id, observed_at, response),
+            source_event_id=None,
+            raybet_match_id=match_id,
+            observed_at=observed_at,
+            normalized_state_hash=normalized_state_hash(snapshots),
+            snapshots=snapshots,
+        )
+    return result, observed_at
 
 
 def _latest_exact_raybet_final(
@@ -414,8 +465,11 @@ async def label_once(
         raybet_observed_at = raybet_observed_at.replace(tzinfo=timezone.utc)
     if raybet_client is not None and unresolved_maps:
         try:
-            refreshed_response = raybet_client.match_odds(match_id)
-            refreshed = refreshed_response.get("result")
+            refreshed, raybet_observed_at = _refresh_raybet_final(
+                store, raw_archive, raybet_client, match_id
+            )
+        except RayBetFinalRefreshIdentityError:
+            return {"status": "raybet_final_refresh_identity_conflict"}
         except Exception as error:
             logger.warning(
                 "RayBet final refresh failed for match_id=%s (%s)",
@@ -423,30 +477,6 @@ async def label_once(
                 type(error).__name__,
             )
         else:
-            if (
-                not isinstance(refreshed, dict)
-                or str(refreshed.get("id") or "") != match_id
-                or type(refreshed.get("game_id")) is not int
-                or int(refreshed["game_id"]) != 151
-            ):
-                return {"status": "raybet_final_refresh_identity_conflict"}
-            raybet_observed_at = datetime.now(timezone.utc)
-            with store.transaction():
-                store.upsert_raybet_match(refreshed, raybet_observed_at)
-                snapshots = snapshots_from_payload(
-                    refreshed_response, received_at=raybet_observed_at
-                )
-                store.store_odds_observation(
-                    source="direct",
-                    observation_key=_raybet_observation_key(
-                        match_id, raybet_observed_at, refreshed_response
-                    ),
-                    source_event_id=None,
-                    raybet_match_id=match_id,
-                    observed_at=raybet_observed_at,
-                    normalized_state_hash=normalized_state_hash(snapshots),
-                    snapshots=snapshots,
-                )
             raybet_payload = refreshed
     drafts = _vision_drafts(store.connection, match_id)
     if not drafts:
@@ -637,6 +667,10 @@ def main() -> int:
                                    FROM raybet_matches AS r
                                    JOIN vision_observations AS v
                                      ON v.raybet_match_id=r.raybet_match_id
+                                   JOIN vision_draft_anchors AS anchor
+                                     ON anchor.raybet_match_id=v.raybet_match_id
+                                    AND anchor.map_number=v.map_number
+                                    AND anchor.status='anchored'
                                    JOIN strict_live_map_mappings AS mapping
                                      ON mapping.raybet_match_id=r.raybet_match_id
                                    LEFT JOIN strict_live_map_mapping_invalidations
