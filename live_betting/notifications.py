@@ -15,9 +15,16 @@ from typing import Any, Iterator, Mapping
 CHANNEL_EMAIL = "email"
 EVENT_FILLED = "filled"
 EVENT_SETTLED = "settled"
+EVENT_MONITOR_ALERT = "monitor_alert"
+EVENT_MONITOR_RECOVERY = "monitor_recovery"
 TEMPLATE_VERSION = "dota2-shadow-email-v2"
+MONITOR_TEMPLATE_VERSION = "dota2-monitor-email-v1"
 DEFAULT_RECIPIENT = "599084618@qq.com"
 RETRY_DELAYS = (60, 300, 1800, 7200, 43200)
+
+
+class NotificationConflictError(ValueError):
+    """Raised when one logical notification key has different immutable data."""
 
 
 @dataclass(frozen=True)
@@ -133,15 +140,37 @@ def enqueue(
     )
     with _transaction(connection):
         cursor = connection.execute(
-            """INSERT OR IGNORE INTO notification_outbox
+            """INSERT INTO notification_outbox
                (order_key, event_type, channel, status, recipient, message_id,
                 payload_json, statistics_cutoff, template_version, lease_token,
                 lease_until, attempt_count, next_attempt_at, last_error, sent_at,
                 created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(order_key, event_type, channel) DO NOTHING""",
             values,
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 1:
+            return True
+        existing = connection.execute(
+            """SELECT recipient, message_id, payload_json, statistics_cutoff,
+                      template_version, created_at
+                 FROM notification_outbox
+                WHERE order_key=? AND event_type=? AND channel=?""",
+            (order_key, event_type, channel),
+        ).fetchone()
+        expected = (
+            recipient,
+            message_id,
+            payload_json,
+            _iso(stats_cutoff_at),
+            template_version,
+            _iso(created_at),
+        )
+        if existing is None or tuple(existing) != expected:
+            raise NotificationConflictError(
+                "notification logical key conflicts with immutable payload"
+            )
+        return False
 
 
 def claim(
@@ -357,6 +386,10 @@ __all__ = [
     "DEFAULT_RECIPIENT",
     "EVENT_FILLED",
     "EVENT_SETTLED",
+    "EVENT_MONITOR_ALERT",
+    "EVENT_MONITOR_RECOVERY",
+    "MONITOR_TEMPLATE_VERSION",
+    "NotificationConflictError",
     "OutboxRecord",
     "RETRY_DELAYS",
     "TEMPLATE_VERSION",

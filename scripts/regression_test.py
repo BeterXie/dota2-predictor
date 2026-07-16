@@ -19,6 +19,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import prematch.scorer as _scorer
+from live_betting.database_protocol import online_backup
+from shared.sqlite import connect as connect_sqlite
 
 
 COMPONENT_KEYS = tuple(_scorer._DEFAULT_WEIGHTS)
@@ -30,8 +32,7 @@ CAUSAL_BACKTEST_WEIGHTS = {
 
 def get_matches(db_path: str) -> list[dict]:
     """Fetch all matches with hero picks and player account IDs from the database."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(db_path, read_only=True, row_factory=sqlite3.Row)
 
     matches = conn.execute(
         """SELECT match_id, radiant_team_id, dire_team_id, radiant_win, start_time
@@ -142,16 +143,16 @@ def run_time_split_test(
     weights = _causal_backtest_weights(weights)
 
     import tempfile
-    import shutil
 
     # Create a temp DB with only training-period data
     tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp_db.close()
 
-    shutil.copy2(db_path, tmp_db.name)
+    Path(tmp_db.name).unlink()
+    online_backup(Path(db_path), Path(tmp_db.name))
 
     # Remove future matches from temp DB
-    conn = sqlite3.connect(tmp_db.name)
+    conn = connect_sqlite(tmp_db.name)
     test_match_ids = [m["match_id"] for m in test_matches]
     for mid in test_match_ids:
         conn.execute("DELETE FROM match_players WHERE match_id = ?", (mid,))
@@ -229,7 +230,6 @@ def run_rolling_test(
     availability time in the current schema.
     """
     import tempfile
-    import shutil
 
     if window < 1:
         raise ValueError("window must be at least one")
@@ -241,10 +241,11 @@ def run_rolling_test(
     # Create base DB with hero_matchups and heroes (static data only)
     tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp_db.close()
-    shutil.copy2(db_path, tmp_db.name)
+    Path(tmp_db.name).unlink()
+    online_backup(Path(db_path), Path(tmp_db.name))
 
     # Remove ALL matches from temp DB (will add back per-iteration)
-    conn = sqlite3.connect(tmp_db.name)
+    conn = connect_sqlite(tmp_db.name)
     conn.execute("DELETE FROM match_players")
     conn.execute("DELETE FROM picks_bans")
     conn.execute("DELETE FROM teamfights")
@@ -320,9 +321,8 @@ def run_rolling_test(
 
 def _insert_match_into_db(src_db: str, dst_db: str, match_id: int) -> None:
     """Copy a single match and its related data from src to dst DB."""
-    src = sqlite3.connect(src_db)
-    src.row_factory = sqlite3.Row
-    dst = sqlite3.connect(dst_db)
+    src = connect_sqlite(src_db, read_only=True, row_factory=sqlite3.Row)
+    dst = connect_sqlite(dst_db)
 
     # Insert match
     row = src.execute("SELECT * FROM matches WHERE match_id = ?", (match_id,)).fetchone()
@@ -375,7 +375,7 @@ def _insert_match_into_db(src_db: str, dst_db: str, match_id: int) -> None:
 
 def _trim_old_matches(db_path: str, oldest_to_keep: int) -> None:
     """Delete matches older than the given match_id from the DB."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path)
     conn.execute("DELETE FROM match_players WHERE match_id = ?", (oldest_to_keep,))
     conn.execute("DELETE FROM matches WHERE match_id = ?", (oldest_to_keep,))
     conn.commit()

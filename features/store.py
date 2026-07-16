@@ -1,9 +1,9 @@
 """Write feature DataFrames to Parquet files and DB materialized tables."""
 
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
+from shared.sqlite import connect as connect_sqlite
 
 
 _PARQUET_DTYPE_MAP = {
@@ -149,7 +149,7 @@ def to_db_materialized(
     # "match_feature_cache" -> "match_features", etc.
     feature_name = table_name.replace("_feature_cache", "_features")
     typed_df = _apply_dtypes(df, feature_name)
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path)
     try:
         typed_df.to_sql(table_name, conn, if_exists="replace", index=False)
     finally:

@@ -22,7 +22,7 @@ def snapshot(
     *,
     odds_id: str = TARGET_ID,
     price: float = 2.0,
-    status: str | int | None = 5,
+    status: str | int | None = 1,
     side: str = "team_one",
     odds_group_id: str = "winner",
     outcome_key: str | None = None,
@@ -81,7 +81,15 @@ class SuccessorFillTests(unittest.TestCase):
             signal_outcome_key=signal.market.outcome_key,
             signal_identity_verified=True,
         )
-        self.assertTrue(self.store.insert_map_order(order, 1))
+        self.assertTrue(
+            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT strict_mapping_id FROM shadow_orders WHERE order_key='order-1'"
+            ).fetchone()[0],
+            1,
+        )
         return order
 
     def statuses(self) -> tuple[str, str, str | None]:
@@ -187,7 +195,9 @@ class SuccessorFillTests(unittest.TestCase):
             signal_outcome_key=signal.market.outcome_key,
             signal_identity_verified=True,
         )
-        self.assertFalse(self.store.insert_map_order(wrong_price, 1))
+        self.assertFalse(
+            self.store.insert_map_order(wrong_price, 1, strict_mapping_id=1)
+        )
 
         closed_at = NOW + timedelta(seconds=1)
         closed = snapshot(closed_at, status="suspended")
@@ -208,7 +218,9 @@ class SuccessorFillTests(unittest.TestCase):
             signal_outcome_key=closed.market.outcome_key,
             signal_identity_verified=True,
         )
-        self.assertFalse(self.store.insert_map_order(closed_order, 1))
+        self.assertFalse(
+            self.store.insert_map_order(closed_order, 1, strict_mapping_id=1)
+        )
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM shadow_map_attempts"
@@ -272,7 +284,7 @@ class SuccessorFillTests(unittest.TestCase):
     def test_closed_first_successor_rejects_market_closed(self) -> None:
         order = self.pending_order()
         at = NOW + timedelta(seconds=2)
-        self.observe("closed", at, [snapshot(at, status="suspended")])
+        self.observe("closed", at, [snapshot(at, status=5)])
 
         resolved = self.store.process_pending_successor(order, watermark=at)
 
@@ -531,10 +543,11 @@ class ShadowOrderMigrationTests(unittest.TestCase):
                     "signal_identity_verified",
                 ):
                     self.assertEqual(columns[name], (1, None))
+                self.assertEqual(columns["strict_mapping_id"], (0, None))
                 row = store.connection.execute(
                     """SELECT signal_transport_key, signal_transport_at, expires_at,
                               signal_odds_group_id, signal_outcome_key,
-                              signal_identity_verified
+                              signal_identity_verified, strict_mapping_id
                          FROM shadow_orders WHERE order_key='legacy-order'"""
                 ).fetchone()
                 self.assertEqual(str(row[0]), "legacy:legacy-order")
@@ -545,6 +558,7 @@ class ShadowOrderMigrationTests(unittest.TestCase):
                 self.assertIsNone(row[3])
                 self.assertIsNone(row[4])
                 self.assertEqual(int(row[5]), 0)
+                self.assertIsNone(row[6])
 
 
 if __name__ == "__main__":

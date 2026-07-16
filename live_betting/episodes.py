@@ -41,7 +41,10 @@ def chronological_split(
     ordered = sorted(maps.values(), key=lambda group: min(row.decision_at for row in group))
     train_end = int(len(ordered) * train_fraction)
     validation_end = int(len(ordered) * (train_fraction + validation_fraction))
-    flatten = lambda groups: [row for group in groups for row in group]
+
+    def flatten(groups: list[list[EpisodeRow]]) -> list[EpisodeRow]:
+        return [row for group in groups for row in group]
+
     return (
         flatten(ordered[:train_end]),
         flatten(ordered[train_end:validation_end]),

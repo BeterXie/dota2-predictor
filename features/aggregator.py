@@ -14,9 +14,6 @@ import numpy as np
 import pandas as pd
 
 from shared.queries import (
-    compute_h2h,
-    compute_hero_patch_stats,
-    compute_team_rolling,
     connect as _connect,
     empty_team_rolling,
 )

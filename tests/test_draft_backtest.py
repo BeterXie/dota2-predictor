@@ -9,17 +9,29 @@ from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import event_intelligence.incremental as incremental
+import event_intelligence.report as intelligence_report
 from event_intelligence.backtest import (
     EvaluationPoint,
     _profile_state,
+    draft_dependency_fingerprint,
+    draft_lineage_tracking_is_current,
+    draft_prediction_artifacts,
+    ensure_draft_lineage_tracking,
     evaluate_points,
     load_draft_corpus,
+    persist_draft_prediction_validations,
     run_strict_draft_backtest,
 )
 from event_intelligence.draft_features import (
     AvailabilityMode,
     build_draft_feature_snapshot,
+)
+from event_intelligence.incremental import (
+    _current_draft_prediction_keys,
+    refresh_draft_prediction_validations,
 )
 from event_intelligence.player_scoring import score_version_for_role
 from event_intelligence.storage import IntelligenceStorage
@@ -282,6 +294,658 @@ class DraftBacktestTests(unittest.TestCase):
             fixture.close()
         return path
 
+    def test_event_registry_writes_advance_draft_dependency_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory, count=1)
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                ensure_draft_lineage_tracking(connection)
+
+                def revision() -> int:
+                    return int(
+                        connection.execute(
+                            """SELECT dependency_revision
+                                 FROM draft_lineage_revisions WHERE singleton=1"""
+                        ).fetchone()[0]
+                    )
+
+                source = list(
+                    connection.execute(
+                        "SELECT * FROM event_registry WHERE event_id=?", (EVENT_ID,)
+                    ).fetchone()
+                )
+                source[0] = "draft-lineage-test-event"
+                source[1] = "Draft Lineage Test Event"
+                source[6] = 99_999_999
+                placeholders = ", ".join("?" for _ in source)
+
+                before = revision()
+                connection.execute(
+                    f"INSERT INTO event_registry VALUES ({placeholders})",  # noqa: S608
+                    source,
+                )
+                after_insert = revision()
+                connection.execute(
+                    """UPDATE event_registry SET canonical_name=?
+                         WHERE event_id='draft-lineage-test-event'""",
+                    ("Renamed Draft Lineage Test Event",),
+                )
+                after_update = revision()
+                connection.execute(
+                    """DELETE FROM event_registry
+                         WHERE event_id='draft-lineage-test-event'"""
+                )
+                after_delete = revision()
+            finally:
+                connection.close()
+
+            self.assertGreater(after_insert, before)
+            self.assertGreater(after_update, after_insert)
+            self.assertGreater(after_delete, after_update)
+
+    def test_event_without_maps_does_not_invalidate_existing_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                source = dict(
+                    connection.execute(
+                        "SELECT * FROM event_registry WHERE event_id=?", (EVENT_ID,)
+                    ).fetchone()
+                )
+                source.update(
+                    {
+                        "event_id": "historical-empty-event",
+                        "canonical_name": "Historical Empty Event",
+                        "main_event_start_at": "2020-01-01T00:00:00+00:00",
+                        "main_event_end_at": "2020-01-02T00:00:00+00:00",
+                        "opendota_league_id": 99_999_998,
+                    }
+                )
+                columns = tuple(source)
+                connection.execute(
+                    f"INSERT INTO event_registry ({', '.join(columns)}) "  # noqa: S608
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    tuple(source[column] for column in columns),
+                )
+                latest_change = int(
+                    connection.execute(
+                        """SELECT affected_from_unix FROM draft_lineage_changes
+                            ORDER BY dependency_revision DESC LIMIT 1"""
+                    ).fetchone()[0]
+                )
+                current = _current_draft_prediction_keys(connection, match_ids)
+            finally:
+                connection.close()
+
+            self.assertGreater(latest_change, 2**62)
+            self.assertEqual(len(current), 60)
+
+    def test_validation_persist_requires_generation_dependency_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory, count=1)
+            with closing(sqlite3.connect(database)) as connection:
+                with self.assertRaises(TypeError):
+                    persist_draft_prediction_validations(connection, ())
+                with self.assertRaisesRegex(ValueError, "fingerprint"):
+                    persist_draft_prediction_validations(
+                        connection,
+                        (),
+                        expected_dependency_fingerprint=None,  # type: ignore[arg-type]
+                        expected_dependency_revision=None,  # type: ignore[arg-type]
+                    )
+
+    def test_lineage_tracking_rejects_and_repairs_same_name_noop_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory, count=1)
+            connection = sqlite3.connect(database)
+            try:
+                ensure_draft_lineage_tracking(connection)
+                trigger_name = "draft_lineage_dependency_event_registry_update"
+                before = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+                connection.execute(
+                    f'''CREATE TRIGGER "{trigger_name}"
+                          AFTER UPDATE ON event_registry
+                          BEGIN SELECT 1; END'''
+                )
+
+                self.assertFalse(draft_lineage_tracking_is_current(connection))
+                ensure_draft_lineage_tracking(connection)
+                repaired = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                self.assertTrue(draft_lineage_tracking_is_current(connection))
+                self.assertGreater(repaired, before)
+
+                connection.execute(
+                    """UPDATE event_registry SET prize_pool_usd=prize_pool_usd+1
+                         WHERE event_id=?""",
+                    (EVENT_ID,),
+                )
+                self.assertGreater(
+                    int(
+                        connection.execute(
+                            """SELECT dependency_revision
+                                 FROM draft_lineage_revisions WHERE singleton=1"""
+                        ).fetchone()[0]
+                    ),
+                    repaired,
+                )
+            finally:
+                connection.close()
+
+    def test_lineage_journal_rejects_insert_or_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                revision = int(
+                    connection.execute(
+                        "SELECT MAX(dependency_revision) FROM draft_lineage_changes"
+                    ).fetchone()[0]
+                )
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                    connection.execute(
+                        """INSERT OR REPLACE INTO draft_lineage_changes
+                           (dependency_revision, affected_from_unix,
+                            source_relation, operation, changed_at)
+                           VALUES (?, ?, 'attack', 'UPDATE', '2099-01-01')""",
+                        (revision, 4_102_444_800),
+                    )
+                connection.rollback()
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                tracking_current = draft_lineage_tracking_is_current(connection)
+                current = _current_draft_prediction_keys(connection, match_ids)
+            finally:
+                connection.close()
+
+            self.assertTrue(tracking_current)
+            self.assertEqual(len(current), 60)
+
+    def test_schema_init_is_idempotent_after_lineage_guards_are_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            with IntelligenceStorage(database) as storage:
+                storage.init_schema(seed_events=False)
+            connection = sqlite3.connect(database)
+            try:
+                tracking_current = draft_lineage_tracking_is_current(connection)
+                validation_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM draft_prediction_validations"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+
+            self.assertTrue(tracking_current)
+            self.assertEqual(validation_count, 60)
+
+    def test_lineage_journal_gap_fails_closed_and_clears_proofs_on_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                connection.execute(
+                    'DROP TRIGGER "draft_lineage_changes_no_delete"'
+                )
+                connection.execute(
+                    """DELETE FROM draft_lineage_changes
+                        WHERE dependency_revision=(
+                            SELECT MAX(dependency_revision)
+                              FROM draft_lineage_changes
+                        )"""
+                )
+                connection.commit()
+                self.assertFalse(draft_lineage_tracking_is_current(connection))
+                self.assertEqual(
+                    _current_draft_prediction_keys(connection, match_ids),
+                    frozenset(),
+                )
+                ensure_draft_lineage_tracking(connection)
+                validations = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM draft_prediction_validations"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+
+            self.assertEqual(validations, 0)
+
+    def test_missing_revision_row_invalidates_existing_draft_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                self.assertGreater(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM draft_prediction_validations"
+                    ).fetchone()[0],
+                    0,
+                )
+                connection.execute("DELETE FROM draft_lineage_revisions")
+                connection.commit()
+
+                self.assertFalse(draft_lineage_tracking_is_current(connection))
+                ensure_draft_lineage_tracking(connection)
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM draft_prediction_validations"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+            self.assertEqual(remaining, 0)
+
+    def test_malformed_revision_table_is_rebuilt_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                proof_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_prediction_validations LIMIT 1"""
+                    ).fetchone()[0]
+                )
+                artifact_revision = int(
+                    connection.execute(
+                        """SELECT artifact_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                connection.execute("DROP TABLE draft_lineage_revisions")
+                connection.execute(
+                    """CREATE TABLE draft_lineage_revisions (
+                        singleton INTEGER,
+                        dependency_revision INTEGER,
+                        artifact_revision INTEGER,
+                        updated_at TEXT
+                    )"""
+                )
+                connection.executemany(
+                    "INSERT INTO draft_lineage_revisions VALUES (1, ?, ?, ?)",
+                    (
+                        (proof_revision, artifact_revision, "2026-01-01"),
+                        (proof_revision + 100, artifact_revision + 100, "2026-01-02"),
+                    ),
+                )
+                connection.commit()
+
+                self.assertFalse(draft_lineage_tracking_is_current(connection))
+                self.assertEqual(
+                    _current_draft_prediction_keys(connection, match_ids),
+                    frozenset(),
+                )
+                ensure_draft_lineage_tracking(connection)
+                rows = connection.execute(
+                    """SELECT singleton, dependency_revision, artifact_revision
+                         FROM draft_lineage_revisions"""
+                ).fetchall()
+                validations = connection.execute(
+                    "SELECT COUNT(*) FROM draft_prediction_validations"
+                ).fetchone()[0]
+                tracking_repaired = draft_lineage_tracking_is_current(connection)
+            finally:
+                connection.close()
+
+            self.assertTrue(tracking_repaired)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(int(rows[0][0]), 1)
+            self.assertGreaterEqual(int(rows[0][1]), 1)
+            self.assertGreaterEqual(int(rows[0][2]), 1)
+            self.assertEqual(validations, 0)
+
+    def test_noncausal_and_nonready_status_writes_do_not_advance_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory, count=1)
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                ensure_draft_lineage_tracking(connection)
+
+                def revision() -> int:
+                    return int(
+                        connection.execute(
+                            """SELECT dependency_revision
+                                 FROM draft_lineage_revisions WHERE singleton=1"""
+                        ).fetchone()[0]
+                    )
+
+                before_revision = revision()
+                before_fingerprint = draft_dependency_fingerprint(connection)
+                connection.execute(
+                    """UPDATE match_ingest_status
+                          SET retry_count=retry_count+1,
+                              updated_at='2026-12-31T00:00:00+00:00'
+                        WHERE match_id=9001"""
+                )
+                self.assertEqual(revision(), before_revision)
+                self.assertEqual(
+                    draft_dependency_fingerprint(connection), before_fingerprint
+                )
+
+                source = dict(
+                    connection.execute(
+                        "SELECT * FROM match_ingest_status WHERE match_id=9001"
+                    ).fetchone()
+                )
+                source["match_id"] = 99_999
+                source["draft_readiness"] = "pending"
+                columns = tuple(source)
+                quoted = ", ".join(f'"{column}"' for column in columns)
+                placeholders = ", ".join("?" for _ in columns)
+                connection.execute(
+                    f"INSERT INTO match_ingest_status ({quoted}) "  # noqa: S608
+                    f"VALUES ({placeholders})",
+                    tuple(source[column] for column in columns),
+                )
+                connection.execute(
+                    """UPDATE match_ingest_status SET series_id=series_id+1
+                         WHERE match_id=99999"""
+                )
+                connection.execute(
+                    "DELETE FROM match_ingest_status WHERE match_id=99999"
+                )
+                self.assertEqual(revision(), before_revision)
+                self.assertEqual(
+                    draft_dependency_fingerprint(connection), before_fingerprint
+                )
+
+                connection.execute(
+                    """UPDATE match_ingest_status SET series_id=series_id+1
+                         WHERE match_id=9001"""
+                )
+                self.assertGreater(revision(), before_revision)
+                self.assertNotEqual(
+                    draft_dependency_fingerprint(connection), before_fingerprint
+                )
+            finally:
+                connection.close()
+
+    def test_player_fact_availability_change_advances_dependency_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory, count=1)
+            connection = sqlite3.connect(database)
+            try:
+                ensure_draft_lineage_tracking(connection)
+                before_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                before_fingerprint = draft_dependency_fingerprint(connection)
+                connection.execute(
+                    """UPDATE player_map_facts
+                          SET first_usable_at='2027-01-01T00:00:00+00:00'
+                        WHERE match_id=9001 AND player_slot=0"""
+                )
+                after_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                after_fingerprint = draft_dependency_fingerprint(connection)
+            finally:
+                connection.close()
+
+            self.assertGreater(after_revision, before_revision)
+            self.assertNotEqual(after_fingerprint, before_fingerprint)
+
+    def test_drifted_formal_views_fail_closed_and_are_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                self.assertEqual(
+                    len(_current_draft_prediction_keys(connection, match_ids)), 60
+                )
+                view_sql = {
+                    str(row[0]): str(row[1])
+                    for row in connection.execute(
+                        """SELECT name, sql FROM sqlite_master
+                             WHERE type='view' AND name IN
+                                   ('formal_events', 'formal_map_eligibility')"""
+                    ).fetchall()
+                }
+                before_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                connection.execute("DROP VIEW formal_map_eligibility")
+                connection.execute(
+                    view_sql["formal_map_eligibility"] + " AND m.match_id != 9001"
+                )
+                connection.commit()
+
+                self.assertFalse(draft_lineage_tracking_is_current(connection))
+                self.assertEqual(
+                    _current_draft_prediction_keys(connection, match_ids),
+                    frozenset(),
+                )
+                ensure_draft_lineage_tracking(connection)
+                repaired_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                self.assertTrue(draft_lineage_tracking_is_current(connection))
+                self.assertGreater(repaired_revision, before_revision)
+                self.assertEqual(
+                    _current_draft_prediction_keys(connection, match_ids),
+                    frozenset(),
+                )
+
+                connection.execute("DROP VIEW formal_map_eligibility")
+                connection.execute("DROP VIEW formal_events")
+                connection.execute(
+                    view_sql["formal_events"].replace("'approved'", "'APPROVED'")
+                )
+                connection.execute(view_sql["formal_map_eligibility"])
+                connection.commit()
+                self.assertFalse(draft_lineage_tracking_is_current(connection))
+                ensure_draft_lineage_tracking(connection)
+                self.assertTrue(draft_lineage_tracking_is_current(connection))
+                self.assertGreater(
+                    int(
+                        connection.execute(
+                            """SELECT dependency_revision
+                                 FROM draft_lineage_revisions WHERE singleton=1"""
+                        ).fetchone()[0]
+                    ),
+                    repaired_revision,
+                )
+            finally:
+                connection.close()
+
+    def test_status_referenced_raw_rows_do_not_require_row_match_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory, count=1)
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                ensure_draft_lineage_tracking(connection)
+                original = connection.execute(
+                    """SELECT latest_raw_artifact_id, latest_raw_content_hash
+                         FROM match_ingest_status WHERE match_id=9001"""
+                ).fetchone()
+                content_hash = _hash("status-referenced-null-match")
+                artifact_id = f"opendota:{content_hash}"
+                connection.execute(
+                    """INSERT INTO raw_source_artifacts
+                       (artifact_id, content_hash, source, artifact_use, endpoint,
+                        sanitized_request_identity, storage_path, uncompressed_bytes,
+                        compressed_bytes, received_at, first_usable_at,
+                        schema_fingerprint, event_id, match_id, created_at)
+                       SELECT ?, ?, source, artifact_use, endpoint,
+                              sanitized_request_identity, storage_path || '.null-match',
+                              uncompressed_bytes, compressed_bytes, received_at,
+                              first_usable_at, schema_fingerprint, event_id, NULL,
+                              created_at
+                         FROM raw_source_artifacts WHERE artifact_id=?""",
+                    (artifact_id, content_hash, original["latest_raw_artifact_id"]),
+                )
+                connection.execute(
+                    """UPDATE match_ingest_status
+                          SET latest_raw_artifact_id=?, latest_raw_content_hash=?
+                        WHERE match_id=9001""",
+                    (artifact_id, content_hash),
+                )
+                before_fingerprint = draft_dependency_fingerprint(connection)
+                before_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+
+                connection.execute(
+                    """UPDATE raw_source_artifacts SET endpoint=endpoint || '?changed=1'
+                         WHERE artifact_id=?""",
+                    (artifact_id,),
+                )
+                endpoint_fingerprint = draft_dependency_fingerprint(connection)
+                endpoint_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """UPDATE raw_source_artifacts
+                          SET first_usable_at='2026-01-02T00:00:00+00:00'
+                        WHERE artifact_id=?""",
+                    (artifact_id,),
+                )
+                artifact_fingerprint = draft_dependency_fingerprint(connection)
+                artifact_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """INSERT INTO raw_source_observations
+                       (observation_id, artifact_id, content_hash, source,
+                        artifact_use, endpoint, sanitized_request_identity,
+                        received_at, first_usable_at, schema_fingerprint,
+                        event_id, match_id, created_at)
+                       VALUES ('null-match-observation', ?, ?, 'opendota',
+                               'primary', '/api/null-match', 'GET /api/null-match',
+                               '2026-01-01T00:00:00+00:00',
+                               '2026-01-01T00:00:00+00:00', 'test-schema',
+                               ?, NULL, '2026-01-01T00:00:00+00:00')""",
+                    (artifact_id, content_hash, EVENT_ID),
+                )
+                observation_fingerprint = draft_dependency_fingerprint(connection)
+                observation_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+
+            self.assertEqual(endpoint_fingerprint, before_fingerprint)
+            self.assertEqual(endpoint_revision, before_revision)
+            self.assertNotEqual(artifact_fingerprint, endpoint_fingerprint)
+            self.assertGreater(artifact_revision, endpoint_revision)
+            self.assertNotEqual(observation_fingerprint, artifact_fingerprint)
+            self.assertGreater(observation_revision, artifact_revision)
+
     def test_loader_is_strict_exact_and_never_uses_target_observed_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = self._database(directory, excluded=True)
@@ -394,6 +1058,624 @@ class DraftBacktestTests(unittest.TestCase):
             self.assertEqual(len(rows), 60)
             self.assertTrue(all(row[3] == row[4] for row in rows))
             self.assertEqual(len({(row[0], row[1], row[2]) for row in rows}), 60)
+
+    def test_current_prediction_keys_rebuild_input_snapshot_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                current = _current_draft_prediction_keys(connection, match_ids)
+                self.assertEqual(len(current), 60)
+                initial_revisions = tuple(
+                    connection.execute(
+                        """SELECT dependency_revision, artifact_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()
+                )
+
+                source = connection.execute(
+                    """SELECT prediction.run_id, prediction.match_id
+                         FROM draft_predictions AS prediction LIMIT 1"""
+                ).fetchone()
+                connection.execute(
+                    """INSERT INTO draft_model_runs
+                       SELECT 'unvalidated-run', model_version, model_kind,
+                              horizon_minutes, availability_mode, training_cutoff,
+                              feature_schema_hash, configuration_json, metrics_json,
+                              status, created_at
+                         FROM draft_model_runs WHERE run_id=?""",
+                    (source["run_id"],),
+                )
+                connection.execute(
+                    """INSERT INTO draft_predictions
+                       (run_id, match_id, prediction_cutoff, cutoff_source,
+                        input_snapshot_hash, probability, uncertainty, support,
+                        eventual_radiant_win, status, created_at)
+                       SELECT 'unvalidated-run', match_id, prediction_cutoff,
+                              cutoff_source, input_snapshot_hash, probability,
+                              uncertainty, support, eventual_radiant_win, status,
+                              created_at
+                         FROM draft_predictions
+                        WHERE run_id=? AND match_id=?""",
+                    (source["run_id"], source["match_id"]),
+                )
+                self.assertEqual(
+                    len(_current_draft_prediction_keys(connection, match_ids)),
+                    60,
+                )
+                cloned_revisions = tuple(
+                    connection.execute(
+                        """SELECT dependency_revision, artifact_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()
+                )
+                self.assertEqual(cloned_revisions[0], initial_revisions[0])
+                self.assertGreater(cloned_revisions[1], initial_revisions[1])
+
+                victim = connection.execute(
+                    """SELECT run_id, match_id FROM draft_predictions
+                         WHERE probability IS NOT NULL AND run_id!='unvalidated-run'
+                           AND match_id!=9006
+                         LIMIT 1"""
+                ).fetchone()
+                connection.execute(
+                    """UPDATE draft_predictions SET probability=probability
+                        WHERE run_id=? AND match_id=?""",
+                    (victim["run_id"], victim["match_id"]),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT artifact_revision FROM draft_lineage_revisions
+                             WHERE singleton=1"""
+                    ).fetchone()[0],
+                    cloned_revisions[1],
+                )
+                connection.execute(
+                    """UPDATE draft_predictions
+                          SET probability=CASE WHEN probability < 0.5
+                                               THEN probability + 0.01
+                                               ELSE probability - 0.01 END
+                        WHERE run_id=? AND match_id=?""",
+                    (victim["run_id"], victim["match_id"]),
+                )
+                self.assertEqual(
+                    len(_current_draft_prediction_keys(connection, match_ids)),
+                    59,
+                )
+
+                connection.execute(
+                    """UPDATE player_role_assignments SET input_hash=?
+                         WHERE match_id=9006 AND purpose='expected_position'
+                           AND assignment_version=?""",
+                    (_hash("changed-target-role"), ASSIGNMENT_VERSION),
+                )
+                self.assertGreater(
+                    connection.execute(
+                        """SELECT dependency_revision FROM draft_lineage_revisions
+                             WHERE singleton=1"""
+                    ).fetchone()[0],
+                    initial_revisions[0],
+                )
+                changed = _current_draft_prediction_keys(connection, match_ids)
+                connection.commit()
+                rebuilt = refresh_draft_prediction_validations(
+                    connection, match_ids
+                )
+                published = _current_draft_prediction_keys(connection, match_ids)
+            finally:
+                connection.close()
+
+            self.assertEqual(len(changed), 49)
+            self.assertFalse(any(match_id == 9006 for _, match_id in changed))
+            self.assertNotIn(
+                (str(victim["run_id"]), int(victim["match_id"])), changed
+            )
+            self.assertEqual(rebuilt, published)
+            self.assertEqual(len(published), 49)
+            self.assertFalse(any(match_id == 9006 for _, match_id in published))
+            self.assertNotIn(
+                (str(victim["run_id"]), int(victim["match_id"])), published
+            )
+
+    def test_future_formal_map_does_not_invalidate_earlier_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            with closing(sqlite3.connect(database)) as connection:
+                proof_revision = int(
+                    connection.execute(
+                        """SELECT MIN(dependency_revision)
+                             FROM draft_prediction_validations"""
+                    ).fetchone()[0]
+                )
+                before_fingerprint = draft_dependency_fingerprint(connection)
+
+            fixture = DraftBacktestFixture(database)
+            try:
+                future_match_id = fixture.add_map(7)
+            finally:
+                fixture.close()
+
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                current_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                changes = connection.execute(
+                    """SELECT affected_from_unix FROM draft_lineage_changes
+                        WHERE dependency_revision>?""",
+                    (proof_revision,),
+                ).fetchall()
+                after_fingerprint = draft_dependency_fingerprint(connection)
+                current = _current_draft_prediction_keys(connection, match_ids)
+            finally:
+                connection.close()
+
+            self.assertIn(future_match_id, match_ids)
+            self.assertGreater(current_revision, proof_revision)
+            self.assertNotEqual(before_fingerprint, after_fingerprint)
+            self.assertTrue(changes)
+            self.assertTrue(all(row[0] is not None for row in changes))
+            self.assertEqual(len(current), 60)
+
+    def test_change_before_prediction_cutoff_invalidates_affected_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                connection.execute(
+                    """UPDATE player_role_assignments SET input_hash=?
+                         WHERE match_id=9001 AND purpose='expected_position'
+                           AND assignment_version=?""",
+                    (_hash("changed-earliest-target-role"), ASSIGNMENT_VERSION),
+                )
+                current = _current_draft_prediction_keys(connection, match_ids)
+            finally:
+                connection.close()
+
+            self.assertEqual(current, frozenset())
+
+    def test_persisted_cutoff_before_map_start_is_used_for_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                victim = connection.execute(
+                    """SELECT run_id, match_id FROM draft_predictions
+                         WHERE match_id=9006 LIMIT 1"""
+                ).fetchone()
+                started_at = int(
+                    connection.execute(
+                        "SELECT start_time FROM matches WHERE match_id=9006"
+                    ).fetchone()[0]
+                )
+                earlier_cutoff = datetime.fromtimestamp(
+                    started_at - 3600, UTC
+                ).isoformat()
+                connection.execute(
+                    """UPDATE draft_predictions SET prediction_cutoff=?
+                         WHERE run_id=? AND match_id=?""",
+                    (earlier_cutoff, victim["run_id"], victim["match_id"]),
+                )
+                connection.execute(
+                    "UPDATE draft_model_runs SET training_cutoff=? WHERE run_id=?",
+                    (earlier_cutoff, victim["run_id"]),
+                )
+                artifact = draft_prediction_artifacts(connection)[
+                    (str(victim["run_id"]), int(victim["match_id"]))
+                ]
+                connection.execute(
+                    """UPDATE draft_prediction_validations
+                          SET input_snapshot_hash=?, artifact_fingerprint=?
+                        WHERE run_id=? AND match_id=?""",
+                    (*artifact, victim["run_id"], victim["match_id"]),
+                )
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                self.assertIn(
+                    (str(victim["run_id"]), int(victim["match_id"])),
+                    _current_draft_prediction_keys(connection, match_ids),
+                )
+
+                connection.execute(
+                    """UPDATE player_role_assignments SET input_hash=?
+                         WHERE match_id=9006 AND purpose='expected_position'
+                           AND assignment_version=?""",
+                    (_hash("changed-before-recorded-draft"), ASSIGNMENT_VERSION),
+                )
+                current = _current_draft_prediction_keys(connection, match_ids)
+                latest_change = connection.execute(
+                    """SELECT affected_from_unix FROM draft_lineage_changes
+                        ORDER BY dependency_revision DESC LIMIT 1"""
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+            self.assertEqual(
+                latest_change,
+                int(datetime.fromisoformat(earlier_cutoff).timestamp()),
+            )
+            self.assertNotIn(
+                (str(victim["run_id"]), int(victim["match_id"])), current
+            )
+
+    def test_partial_validation_refresh_preserves_other_match_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                refreshed = refresh_draft_prediction_validations(connection, {9006})
+                validation_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM draft_prediction_validations"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+
+            self.assertEqual(len(refreshed), 10)
+            self.assertEqual(validation_count, 60)
+
+    def test_refresh_rejects_artifact_change_between_rebuild_and_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                victim = connection.execute(
+                    """SELECT run_id, match_id FROM draft_predictions
+                         WHERE probability IS NOT NULL LIMIT 1"""
+                ).fetchone()
+                original_rebuild = incremental._rebuild_current_draft_prediction_keys
+
+                def rebuild_then_mutate(
+                    active: sqlite3.Connection,
+                    candidates: set[int],
+                ) -> frozenset[tuple[str, int]]:
+                    rebuilt = original_rebuild(active, candidates)
+                    with closing(sqlite3.connect(database, timeout=10)) as writer:
+                        writer.execute(
+                            """UPDATE draft_predictions
+                                  SET probability=CASE WHEN probability < 0.5
+                                                       THEN probability + 0.01
+                                                       ELSE probability - 0.01 END
+                                WHERE run_id=? AND match_id=?""",
+                            (victim["run_id"], victim["match_id"]),
+                        )
+                        writer.commit()
+                    return rebuilt
+
+                with patch(
+                    "event_intelligence.incremental._rebuild_current_draft_prediction_keys",
+                    side_effect=rebuild_then_mutate,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "artifacts changed"):
+                        refresh_draft_prediction_validations(connection, match_ids)
+
+                published = _current_draft_prediction_keys(connection, match_ids)
+            finally:
+                connection.close()
+
+            self.assertNotIn(
+                (str(victim["run_id"]), int(victim["match_id"])), published
+            )
+
+    def test_refresh_allows_only_future_dependency_change_during_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                original_rebuild = incremental._rebuild_current_draft_prediction_keys
+
+                def rebuild_then_add_future(
+                    active: sqlite3.Connection,
+                    candidates: set[int],
+                ) -> frozenset[tuple[str, int]]:
+                    rebuilt = original_rebuild(active, candidates)
+                    fixture = DraftBacktestFixture(database)
+                    try:
+                        fixture.add_map(7)
+                    finally:
+                        fixture.close()
+                    return rebuilt
+
+                with patch(
+                    "event_intelligence.incremental._rebuild_current_draft_prediction_keys",
+                    side_effect=rebuild_then_add_future,
+                ):
+                    refreshed = refresh_draft_prediction_validations(
+                        connection, match_ids
+                    )
+                current_revision = int(
+                    connection.execute(
+                        """SELECT dependency_revision
+                             FROM draft_lineage_revisions WHERE singleton=1"""
+                    ).fetchone()[0]
+                )
+                proof_revisions = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT dependency_revision FROM draft_prediction_validations"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+
+            self.assertEqual(len(refreshed), 60)
+            self.assertEqual(proof_revisions, {current_revision})
+
+    def test_refresh_rejects_historical_dependency_change_during_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                original_rebuild = incremental._rebuild_current_draft_prediction_keys
+
+                def rebuild_then_change_history(
+                    active: sqlite3.Connection,
+                    candidates: set[int],
+                ) -> frozenset[tuple[str, int]]:
+                    rebuilt = original_rebuild(active, candidates)
+                    with closing(sqlite3.connect(database, timeout=10)) as writer:
+                        writer.execute(
+                            """UPDATE player_role_assignments SET input_hash=?
+                                 WHERE match_id=9006
+                                   AND purpose='expected_position'
+                                   AND assignment_version=?""",
+                            (_hash("concurrent-history-change"), ASSIGNMENT_VERSION),
+                        )
+                        writer.commit()
+                    return rebuilt
+
+                with patch(
+                    "event_intelligence.incremental._rebuild_current_draft_prediction_keys",
+                    side_effect=rebuild_then_change_history,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "dependencies changed"):
+                        refresh_draft_prediction_validations(connection, match_ids)
+            finally:
+                connection.close()
+
+    def test_rolled_back_artifact_revision_does_not_authenticate_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+                rows = connection.execute(
+                    """SELECT run_id, match_id FROM draft_predictions
+                         WHERE probability IS NOT NULL LIMIT 2"""
+                ).fetchall()
+                victim, other = rows
+
+                connection.execute(
+                    """UPDATE draft_predictions
+                          SET probability=CASE WHEN probability < 0.5
+                                               THEN probability + 0.01
+                                               ELSE probability - 0.01 END
+                        WHERE run_id=? AND match_id=?""",
+                    (other["run_id"], other["match_id"]),
+                )
+                _current_draft_prediction_keys(connection, match_ids)
+                connection.rollback()
+
+                connection.execute(
+                    """UPDATE draft_predictions
+                          SET probability=CASE WHEN probability < 0.5
+                                               THEN probability + 0.02
+                                               ELSE probability - 0.02 END
+                        WHERE run_id=? AND match_id=?""",
+                    (victim["run_id"], victim["match_id"]),
+                )
+                current = _current_draft_prediction_keys(connection, match_ids)
+                connection.rollback()
+            finally:
+                connection.close()
+
+            self.assertNotIn(
+                (str(victim["run_id"]), int(victim["match_id"])), current
+            )
+
+    def test_intelligence_report_reads_proof_and_prediction_in_one_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            run_strict_draft_backtest(
+                database,
+                availability_mode=AvailabilityMode.RECONSTRUCTED,
+                assignment_version=ASSIGNMENT_VERSION,
+                min_samples=2,
+            )
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                victim = connection.execute(
+                    """SELECT run_id, match_id, probability
+                         FROM draft_predictions
+                         WHERE probability IS NOT NULL LIMIT 1"""
+                ).fetchone()
+                original_probability = float(victim["probability"])
+                changed_probability = (
+                    original_probability + 0.01
+                    if original_probability < 0.5
+                    else original_probability - 0.01
+                )
+                original_draft_rows = intelligence_report._draft_rows
+                observed: list[float] = []
+                match_ids = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT match_id FROM formal_map_eligibility"
+                    ).fetchall()
+                }
+
+                def current_draft_scopes(
+                    active: sqlite3.Connection,
+                ) -> incremental.CurrentDerivedScopes:
+                    keys = _current_draft_prediction_keys(active, match_ids)
+                    return incremental.CurrentDerivedScopes(
+                        available=True,
+                        formal=frozenset(match_ids),
+                        current=frozenset(match_ids),
+                        draft=frozenset(match_id for _, match_id in keys),
+                        draft_predictions=keys,
+                    )
+
+                def mutate_then_read(
+                    active: sqlite3.Connection,
+                    prediction_keys: set[tuple[str, int]],
+                ) -> list[dict[str, object]]:
+                    with closing(sqlite3.connect(database, timeout=10)) as writer:
+                        writer.execute(
+                            """UPDATE draft_predictions SET probability=?
+                                 WHERE run_id=? AND match_id=?""",
+                            (
+                                changed_probability,
+                                victim["run_id"],
+                                victim["match_id"],
+                            ),
+                        )
+                        writer.commit()
+                    rows = original_draft_rows(active, prediction_keys)
+                    observed.extend(
+                        float(row["probability"])
+                        for row in rows
+                        if row["run_id"] == victim["run_id"]
+                        and row["match_id"] == victim["match_id"]
+                    )
+                    return rows
+
+                with patch(
+                    "event_intelligence.report.current_derived_scopes",
+                    side_effect=current_draft_scopes,
+                ), patch(
+                    "event_intelligence.report._draft_rows",
+                    side_effect=mutate_then_read,
+                ):
+                    intelligence_report.build_intelligence_report(connection)
+            finally:
+                connection.close()
+
+            self.assertEqual(observed, [original_probability])
+            with closing(sqlite3.connect(database)) as verification:
+                self.assertEqual(
+                    float(
+                        verification.execute(
+                            """SELECT probability FROM draft_predictions
+                                 WHERE run_id=? AND match_id=?""",
+                            (victim["run_id"], victim["match_id"]),
+                        ).fetchone()[0]
+                    ),
+                    changed_probability,
+                )
 
     def test_physical_future_row_shuffle_does_not_change_predictions(self) -> None:
         with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:

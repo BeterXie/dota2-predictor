@@ -87,7 +87,7 @@ def latest_market_state(
            )
            SELECT * FROM ranked o
            WHERE state_rank=1
-             AND o.status IN ('1', '5', 'open', 'active', 'running')""",
+             AND o.status IN ('1', 'open', 'active', 'running')""",
         (match_id, period, as_of.isoformat()),
     ).fetchall()
     snapshots = [_snapshot(row) for row in rows]
@@ -106,13 +106,18 @@ def latest_market_state(
 
 
 def _observation(row: sqlite3.Row) -> VisionObservation:
+    stored_confirmed = (
+        bool(row["confirmed"]) if "confirmed" in row.keys() else True
+    )
     return VisionObservation(
         str(row["raybet_match_id"]), row["map_number"],
         datetime.fromisoformat(str(row["captured_at"])), row["game_clock_seconds"],
         None if row["is_paused"] is None else bool(row["is_paused"]),
         tuple(json.loads(row["radiant_hero_ids"])),
-        tuple(json.loads(row["dire_hero_ids"])), float(row["clock_confidence"]),
-        float(row["draft_confidence"]), str(row["source_frame_ref"]),
+        tuple(json.loads(row["dire_hero_ids"])),
+        float(row["clock_confidence"]) if stored_confirmed else 0.0,
+        float(row["draft_confidence"]) if stored_confirmed else 0.0,
+        str(row["source_frame_ref"]),
         str(row["screen_state"]), row["radiant_team_side"],
     )
 
@@ -713,6 +718,9 @@ def run_once(
         observation.radiant_hero_ids,
         observation.dire_hero_ids,
         as_of,
+        raybet_match_id=match_id,
+        map_number=map_number,
+        strict_mapping_id=strict.mapping.mapping_id,
     )
     research = record_research_prediction(
         store,
@@ -823,7 +831,11 @@ def run_once(
         input_refs=intelligence_refs,
     )
     _persist_decision(store, result.decision)
-    if result.order and store.insert_map_order(result.order, map_number):
+    if result.order and store.insert_map_order(
+        result.order,
+        map_number,
+        strict_mapping_id=strict.mapping.mapping_id,
+    ):
         return {
             "status": "shadow_pending", "order_key": result.order.order_key,
             "model_probability": result.decision.model_probability,
@@ -847,10 +859,14 @@ def main() -> int:
     parser.add_argument("--vision-jsonl", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
     strategy = ComebackShadowStrategy()
     with LiveBettingStore(args.database) as store:
-        store.init_schema()
+        if not getattr(args, "schema_prepared", False):
+            store.init_schema()
         started_at = datetime.now(timezone.utc)
         record_health(
             store.connection,

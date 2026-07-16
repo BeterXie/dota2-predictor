@@ -8,15 +8,21 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from event_intelligence.report import build_intelligence_report  # noqa: E402
+from live_betting.browser_companion import PROTOCOL_VERSION  # noqa: E402
+from live_betting.database_protocol import (  # noqa: E402
+    prepare_database,
+    verify_prepared_database,
+)
 from live_betting.health import record_health  # noqa: E402
 from live_betting.report import build_report  # noqa: E402
 from live_betting.smtp_delivery import (  # noqa: E402
@@ -30,14 +36,34 @@ WORKER_COMPONENTS = {
     "raybet": "raybet_worker",
     "shadow": "shadow_worker",
     "mail": "mail_worker",
+    "vision": "vision_worker",
+    "strict_ingest": "strict_ingest_worker",
+    "postmatch": "postmatch_worker",
 }
-ACTIVE_COMMANDS = {"raybet": "collector", "shadow": "shadow", "mail": "mail"}
+ACTIVE_COMMANDS = {
+    "raybet": "collector",
+    "shadow": "shadow",
+    "mail": "mail",
+    "vision": "vision",
+    "strict_ingest": "strict_ingest",
+    "postmatch": "postmatch",
+}
 WORKER_MAX_AGE = {
     "raybet": timedelta(seconds=45),
     "shadow": timedelta(seconds=45),
     "mail": timedelta(seconds=90),
+    "vision": timedelta(seconds=90),
+    "strict_ingest": timedelta(seconds=90),
+    "postmatch": timedelta(seconds=150),
 }
 COLLECTOR_MAX_AGE = timedelta(seconds=60)
+DATABASE_AUDIT_MAX_AGE = timedelta(minutes=15)
+DATABASE_FAILURE_RECHECK = timedelta(seconds=60)
+COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
+_DATABASE_HEALTH_CACHE: dict[
+    str,
+    tuple[datetime, tuple[str, str | None, dict[str, Any]]],
+] = {}
 
 
 class SingleInstanceLock:
@@ -155,7 +181,7 @@ def _worker_health(
 def _database_health(connection: Any) -> tuple[str, str | None, dict[str, Any]]:
     integrity = [
         str(row[0])
-        for row in connection.execute("PRAGMA integrity_check").fetchall()
+        for row in connection.execute("PRAGMA quick_check").fetchall()
     ]
     foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
     details = {
@@ -167,6 +193,44 @@ def _database_health(connection: Any) -> tuple[str, str | None, dict[str, Any]]:
     if foreign_key_issues:
         return "unhealthy", "foreign_key_check_failed", details
     return "healthy", None, details
+
+
+def _periodic_database_health(
+    connection: Any,
+    now: datetime,
+) -> tuple[str, str | None, dict[str, Any]]:
+    database_row = connection.execute(
+        "PRAGMA database_list"
+    ).fetchone()
+    database_key = str(database_row[2]) if database_row and database_row[2] else str(
+        id(connection)
+    )
+    cached = _DATABASE_HEALTH_CACHE.get(database_key)
+    if cached is not None:
+        checked_at, result = cached
+        max_age = (
+            DATABASE_AUDIT_MAX_AGE
+            if result[0] == "healthy"
+            else DATABASE_FAILURE_RECHECK
+        )
+        age = max(0.0, (now - checked_at).total_seconds())
+        if age <= max_age.total_seconds():
+            status, reason, details = result
+            return status, reason, {
+                **details,
+                "audit_checked_at": checked_at.isoformat(),
+                "audit_age_seconds": round(age, 3),
+                "audit_cached": True,
+            }
+    result = _database_health(connection)
+    _DATABASE_HEALTH_CACHE[database_key] = (now, result)
+    status, reason, details = result
+    return status, reason, {
+        **details,
+        "audit_checked_at": now.isoformat(),
+        "audit_age_seconds": 0.0,
+        "audit_cached": False,
+    }
 
 
 def _collector_health(
@@ -201,6 +265,45 @@ def _collector_health(
     return "healthy", "collection_fresh"
 
 
+def _probe_companion() -> Mapping[str, Any]:
+    with urllib.request.urlopen(COMPANION_HEALTH_URL, timeout=1.0) as response:
+        if response.status != 200:
+            raise RuntimeError(f"companion health returned HTTP {response.status}")
+        payload = json.loads(response.read())
+    if not isinstance(payload, dict):
+        raise RuntimeError("companion health returned a non-object")
+    return payload
+
+
+def _companion_health(
+    active: bool,
+    probe: Callable[[], Mapping[str, Any]],
+    *,
+    initial: bool = False,
+) -> tuple[str, str, dict[str, Any]]:
+    if not active:
+        return "stopped", "not_started_by_supervisor", {}
+    try:
+        payload = dict(probe())
+    except Exception as error:
+        return (
+            "starting" if initial else "unhealthy",
+            "awaiting_companion_health" if initial else "companion_unreachable",
+            {
+                "error_type": type(error).__name__,
+            },
+        )
+    details = {
+        "protocol_version": payload.get("protocol_version"),
+        "service_state": payload.get("state"),
+    }
+    if payload.get("protocol_version") != PROTOCOL_VERSION:
+        return "unhealthy", "companion_protocol_mismatch", details
+    if payload.get("state") != "ok":
+        return "degraded", "companion_not_ready", details
+    return "healthy", "companion_reachable", details
+
+
 def _record_component(
     connection: Any,
     component: str,
@@ -228,13 +331,18 @@ def service_once(
     report_path: Path | None = None,
     *,
     active_components: set[str] | None = None,
+    companion_probe: Callable[[], Mapping[str, Any]] = _probe_companion,
+    initialize_schema: bool = True,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     active_components = set(active_components or ())
     with LiveBettingStore(database) as store:
-        store.init_schema()
+        if initialize_schema:
+            store.init_schema()
         connection = store.connection
-        database_status, database_reason, database_details = _database_health(connection)
+        database_status, database_reason, database_details = _periodic_database_health(
+            connection, now
+        )
         _record_component(
             connection,
             "database",
@@ -303,11 +411,11 @@ def service_once(
             "pending_due": pending_notifications,
             "expired_leases": expired_leases,
         })
-        if mail_worker_status == "unhealthy":
+        if not smtp_configured:
+            mail_status, mail_error = "degraded", "configuration_missing"
+        elif mail_worker_status == "unhealthy":
             mail_status = "unhealthy"
             mail_error = str(mail_details.get("reason", "worker_unavailable"))
-        elif not smtp_configured:
-            mail_status, mail_error = "degraded", "configuration_missing"
         elif mail_worker_status == "healthy" and (
             dead_letters or pending_notifications or expired_leases
         ):
@@ -323,15 +431,50 @@ def service_once(
             reason=mail_error,
             details=mail_details,
         )
+
+        for component in ("vision", "strict_ingest", "postmatch"):
+            status, details = _worker_health(
+                connection, component, now, active_components
+            )
+            _record_component(
+                connection,
+                component,
+                status,
+                now,
+                reason=str(details.get("reason", "worker_unavailable")),
+                details=details,
+            )
+
+        previous_companion = connection.execute(
+            "SELECT status FROM service_health WHERE component='companion'"
+        ).fetchone()
+        companion_status, companion_reason, companion_details = _companion_health(
+            "companion" in active_components,
+            companion_probe,
+            initial=(
+                previous_companion is None
+                or str(previous_companion["status"]) == "stopped"
+            ),
+        )
+        _record_component(
+            connection,
+            "companion",
+            companion_status,
+            now,
+            reason=companion_reason,
+            details=companion_details,
+        )
         report = build_report(connection)
         intelligence = build_intelligence_report(connection)
         result = {"shadow": report, "intelligence": intelligence}
         if report_path:
             report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(
+            temporary = report_path.with_name(f".{report_path.name}.tmp")
+            temporary.write_text(
                 json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n",
                 encoding="utf-8",
             )
+            os.replace(temporary, report_path)
         return result
 
 
@@ -345,6 +488,7 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "live_betting.monitor",
             "--database",
             str(args.database),
+            "--schema-prepared",
         ]
     if args.start_companion:
         commands["companion"] = [
@@ -353,6 +497,7 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "live_betting.browser_companion",
             "--database",
             str(args.database),
+            "--schema-prepared",
         ]
     if args.start_shadow:
         if not args.vision_jsonl:
@@ -364,6 +509,15 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             str(args.database),
             "--vision-jsonl",
             str(args.vision_jsonl),
+            "--schema-prepared",
+        ]
+    if getattr(args, "start_vision", False):
+        commands["vision"] = [
+            python,
+            "scripts/supervise_raybet_streams.py",
+            "--database",
+            str(args.database),
+            "--schema-prepared",
         ]
     if args.start_mail:
         commands["mail"] = [
@@ -371,6 +525,24 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "scripts/run_notification_worker.py",
             "--database",
             str(args.database),
+            "--schema-prepared",
+        ]
+    if args.start_strict_ingest:
+        commands["strict_ingest"] = [
+            python,
+            "scripts/run_strict_event_ingest.py",
+            "--database",
+            str(args.database),
+            "--schema-prepared",
+        ]
+    if args.start_postmatch:
+        commands["postmatch"] = [
+            python,
+            "scripts/run_postmatch_labeler.py",
+            "--database",
+            str(args.database),
+            "--all",
+            "--schema-prepared",
         ]
     return commands
 
@@ -385,7 +557,16 @@ def main() -> int:
     parser.add_argument("--start-collector", action="store_true")
     parser.add_argument("--start-companion", action="store_true")
     parser.add_argument("--start-shadow", action="store_true")
+    parser.add_argument("--start-vision", action="store_true")
     parser.add_argument("--start-mail", action="store_true")
+    parser.add_argument("--start-strict-ingest", action="store_true")
+    parser.add_argument("--start-postmatch", action="store_true")
+    parser.add_argument("--backup-dir", type=Path)
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="take a verified backup and run additive schema migrations",
+    )
     parser.add_argument("--vision-jsonl", type=Path)
     args = parser.parse_args()
     lock_path = args.lock or args.database.with_suffix(".service.lock")
@@ -396,6 +577,14 @@ def main() -> int:
     children: dict[str, subprocess.Popen[bytes]] = {}
     try:
         with SingleInstanceLock(lock_path):
+            preparation = (
+                prepare_database(
+                    args.database,
+                    args.backup_dir or args.database.parent / "backups",
+                )
+                if args.migrate
+                else verify_prepared_database(args.database)
+            )
             while True:
                 for name, command in commands.items():
                     child = children.get(name)
@@ -411,9 +600,21 @@ def main() -> int:
                     args.database,
                     args.report,
                     active_components=set(commands),
+                    initialize_schema=False,
                 )
                 print(json.dumps({"status": "ok", "components": list(commands),
-                                  "pending": result["shadow"]["orders"]["signals"]},
+                                  "pending": result["shadow"]["orders"]["signals"],
+                                  "backup": (
+                                      str(preparation.backup)
+                                      if preparation.backup is not None
+                                      else None
+                                  ),
+                                  "schema_versions": {
+                                      "live": preparation.live_schema_version,
+                                      "intelligence": (
+                                          preparation.intelligence_schema_version
+                                      ),
+                                  }},
                                  ensure_ascii=False))
                 if args.once:
                     break

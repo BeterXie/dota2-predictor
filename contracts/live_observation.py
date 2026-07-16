@@ -8,10 +8,17 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+SCHEMA_VERSION = 1
+
+
 class LiveObservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = Field(default=1, ge=1, le=1)
+    schema_version: int = Field(
+        default=SCHEMA_VERSION,
+        ge=SCHEMA_VERSION,
+        le=SCHEMA_VERSION,
+    )
     raybet_match_id: str = Field(min_length=1)
     map_number: int | None = Field(default=None, ge=1, le=10)
     captured_at_utc: datetime

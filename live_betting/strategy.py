@@ -8,14 +8,14 @@ from datetime import datetime, timedelta
 
 from .models import ModelQuote, OddsSnapshot, ShadowOrder
 from .pricing import market_key
+from .raybet_state import raybet_odds_is_open
 
 
-OPEN_STATUSES = {1, 5, "1", "5", "open", "active", "running"}
 SIGNAL_EXPIRY = timedelta(seconds=15)
 
 
 def is_open(status: str | int | None) -> bool:
-    return status in OPEN_STATUSES
+    return raybet_odds_is_open(status)
 
 
 def make_order(

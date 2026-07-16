@@ -8,14 +8,15 @@ import sqlite3
 
 import numpy as np
 import pandas as pd
+from shared.sqlite import configure_connection
 
 _WINDOW_SIZES: tuple[int, ...] = (10, 20, 50)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
-    return conn
+    return configure_connection(conn)
 
 
 def safe_float(value) -> float:
@@ -166,7 +167,7 @@ def compute_team_historical_averages(
     db_path: str, team_id: int, n_matches: int = 20,
 ) -> dict:
     """Compute per-match team stat averages over the team's recent matches."""
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         df = pd.read_sql_query(
             """
@@ -221,7 +222,7 @@ def compute_team_historical_averages(
 
 def get_current_patch(db_path: str) -> int:
     """Return the latest patch number from the database, or 0 if empty."""
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         row = conn.execute(
             "SELECT patch FROM matches WHERE patch IS NOT NULL "

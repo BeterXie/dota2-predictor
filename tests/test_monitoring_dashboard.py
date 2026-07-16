@@ -40,6 +40,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         *,
         status: int = 1,
         scheduled_at: str = "2026-07-14 22:00:00",
+        updated_at: datetime = NOW,
     ) -> None:
         self.store.upsert_raybet_match(
             {
@@ -53,27 +54,78 @@ class MonitoringDashboardTests(unittest.TestCase):
                     {"id": 22, "pos": 2, "team_name": "Dire Five"},
                 ],
             },
-            NOW,
+            updated_at,
         )
         self.store.connection.commit()
 
-    def add_winner_pair(self, observed_at: datetime, one: float, two: float) -> None:
+    def add_winner_pair(
+        self,
+        observed_at: datetime,
+        one: float,
+        two: float,
+        *,
+        period: str = "map_1",
+        status: int = 5,
+    ) -> None:
         for odds_id, side, price in (
-            ("winner-one", "team_one", one),
-            ("winner-two", "team_two", two),
+            (f"winner-{period}-one", "team_one", one),
+            (f"winner-{period}-two", "team_two", two),
         ):
             self.store.insert_odds(
                 OddsSnapshot(
                     "match-1",
                     odds_id,
-                    "winner-map-1",
+                    f"winner-{period}",
                     observed_at,
                     price,
-                    5,
-                    Market("winner", "map_1", side, None, side, True),
+                    status,
+                    Market("winner", period, side, None, side, True),
                 )
             )
         self.store.connection.commit()
+
+    def add_winner_response(
+        self,
+        observed_at: datetime,
+        one: float,
+        two: float | None,
+        *,
+        observation_key: str,
+        period: str = "map_1",
+        status: int = 1,
+    ) -> None:
+        snapshots = [
+            OddsSnapshot(
+                "match-1",
+                f"winner-{period}-one",
+                f"winner-{period}",
+                observed_at,
+                one,
+                status,
+                Market("winner", period, "team_one", None, "team_one", True),
+            )
+        ]
+        if two is not None:
+            snapshots.append(
+                OddsSnapshot(
+                    "match-1",
+                    f"winner-{period}-two",
+                    f"winner-{period}",
+                    observed_at,
+                    two,
+                    status,
+                    Market("winner", period, "team_two", None, "team_two", True),
+                )
+            )
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key=observation_key,
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=observed_at,
+            normalized_state_hash="same-semantic-state",
+            snapshots=snapshots,
+        )
 
     def test_stale_healthy_heartbeat_is_derived_as_unhealthy(self) -> None:
         heartbeat = NOW - timedelta(minutes=5)
@@ -93,6 +145,39 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(row["freshness"], "stale")
         self.assertEqual(row["age_seconds"], 300.0)
 
+    def test_optional_unconfigured_mail_is_not_counted_as_an_abnormal_process(self) -> None:
+        for component in ("raybet_worker", "shadow_worker"):
+            record_health(
+                self.store.connection,
+                component,
+                "healthy",
+                heartbeat_at=NOW,
+                success_at=NOW,
+            )
+        record_health(
+            self.store.connection,
+            "mail",
+            "degraded",
+            heartbeat_at=NOW,
+            error_at=NOW,
+            error="configuration_missing",
+        )
+        record_health(
+            self.store.connection,
+            "mail_worker",
+            "degraded",
+            heartbeat_at=NOW - timedelta(days=1),
+            error_at=NOW - timedelta(days=1),
+            error="configuration_missing",
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["summary"]["unhealthy_components"], 0)
+        mail = next(item for item in snapshot["health"] if item["component"] == "mail")
+        self.assertEqual(mail["status"], "degraded")
+        self.assertEqual(mail["last_error"], "configuration_missing")
+
     def test_snapshot_keeps_unconfirmed_matches_and_marks_missing_readiness(self) -> None:
         self.add_match()
 
@@ -104,6 +189,94 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(match["lifecycle"], "degraded")
         self.assertEqual(match["readiness"]["odds"]["status"], "missing")
         self.assertEqual(match["readiness"]["mapping"]["status"], "missing")
+
+    def test_provider_status_two_is_live_only_while_fresh(self) -> None:
+        self.add_match(status=2)
+
+        fresh = build_monitor_snapshot(self.store.connection, now=NOW)
+        stale = build_monitor_snapshot(
+            self.store.connection, now=NOW + timedelta(seconds=91)
+        )
+
+        self.assertEqual(fresh["matches"][0]["lifecycle"], "live")
+        self.assertEqual(stale["matches"][0]["lifecycle"], "degraded")
+
+    def test_provider_status_five_is_ended(self) -> None:
+        self.add_match(status=5)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["matches"][0]["lifecycle"], "ended")
+
+    def test_upcoming_match_defaults_to_first_unsettled_map(self) -> None:
+        self.add_match(scheduled_at="2026-07-15 22:00:00")
+        for period, status in (("map_1", 1), ("map_2", 1), ("map_3", 4)):
+            self.add_winner_pair(NOW, 2.0, 2.0, period=period, status=status)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["matches"][0]["winner"]["period"], "map_1")
+
+    def test_upcoming_match_uses_map_one_when_periods_arrive_separately(self) -> None:
+        self.add_match(scheduled_at="2026-07-15 22:00:00")
+        self.add_winner_pair(
+            NOW - timedelta(seconds=8), 2.0, 2.0, period="map_1", status=1
+        )
+        self.add_winner_pair(NOW, 2.0, 2.0, period="map_2", status=1)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        winner = snapshot["matches"][0]["winner"]
+        self.assertEqual(winner["period"], "map_1")
+        self.assertEqual(
+            winner["observed_at"], (NOW - timedelta(seconds=8)).isoformat()
+        )
+
+    def test_winner_uses_latest_complete_response_even_when_quotes_are_unchanged(self) -> None:
+        self.add_match(scheduled_at="2026-07-15 22:00:00")
+        first = NOW - timedelta(seconds=12)
+        latest_complete = NOW - timedelta(seconds=6)
+        self.add_winner_response(first, 2.0, 2.0, observation_key="response-1")
+        self.add_winner_response(
+            latest_complete,
+            2.0,
+            2.0,
+            observation_key="response-2",
+        )
+        self.add_winner_response(
+            NOW,
+            2.2,
+            None,
+            observation_key="response-3-incomplete",
+        )
+
+        latest_snapshot = self.store.connection.execute(
+            "SELECT MAX(received_at) FROM odds_snapshots WHERE raybet_match_id='match-1'"
+        ).fetchone()[0]
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(latest_snapshot, NOW.isoformat())
+        winner = snapshot["matches"][0]["winner"]
+        self.assertEqual(winner["observed_at"], latest_complete.isoformat())
+        self.assertEqual(winner["prices"], {"team_one": 2.0, "team_two": 2.0})
+
+    def test_live_match_skips_explicitly_settled_maps(self) -> None:
+        self.add_match(status=2)
+        for period, status in (("map_1", 5), ("map_2", 1), ("map_3", 1)):
+            self.add_winner_pair(NOW, 2.0, 2.0, period=period, status=status)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["matches"][0]["winner"]["period"], "map_2")
+
+    def test_ended_match_uses_last_settled_map_not_future_market(self) -> None:
+        self.add_match(status=5)
+        for period, status in (("map_1", 5), ("map_2", 5), ("map_3", 4)):
+            self.add_winner_pair(NOW, 2.0, 2.0, period=period, status=status)
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["matches"][0]["winner"]["period"], "map_2")
 
     def test_winner_timeline_uses_only_observed_points_and_devigged_probability(self) -> None:
         self.add_match()

@@ -18,9 +18,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import sqlite3
 import tempfile
-import shutil
 
 import prematch.scorer as S
+from live_betting.database_protocol import online_backup
+from shared.sqlite import connect as connect_sqlite
 
 COMPONENT_KEYS = ["hero_matchup", "team_form", "draft_profile", "player_skill", "early_game"]
 
@@ -70,9 +71,10 @@ def compute_rolling_scores(db_path, matches, window=150):
     # Build temp DB with static data only
     tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp_db.close()
-    shutil.copy2(db_path, tmp_db.name)
+    Path(tmp_db.name).unlink()
+    online_backup(Path(db_path), Path(tmp_db.name))
 
-    tmp = sqlite3.connect(tmp_db.name)
+    tmp = connect_sqlite(tmp_db.name)
     for table in ["match_players", "picks_bans", "teamfights", "teamfight_players",
                    "gold_advantage", "xp_advantage", "objectives", "chat", "matches"]:
         tmp.execute(f"DELETE FROM {table}")
@@ -189,9 +191,8 @@ def evaluate(scores, weights, sigmoid_scale=1.0):
 
 
 def _copy_match(src_db, dst_db, match_id):
-    src = sqlite3.connect(src_db)
-    src.row_factory = sqlite3.Row
-    dst = sqlite3.connect(dst_db)
+    src = connect_sqlite(src_db, read_only=True, row_factory=sqlite3.Row)
+    dst = connect_sqlite(dst_db)
     row = src.execute("SELECT * FROM matches WHERE match_id=?", (match_id,)).fetchone()
     if row:
         cols = list(row.keys())
@@ -205,7 +206,7 @@ def _copy_match(src_db, dst_db, match_id):
 
 
 def _delete_match(db_path, match_id):
-    connection = sqlite3.connect(db_path)
+    connection = connect_sqlite(db_path)
     connection.execute("DELETE FROM match_players WHERE match_id=?", (match_id,))
     connection.execute("DELETE FROM matches WHERE match_id=?", (match_id,))
     connection.commit()

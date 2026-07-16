@@ -4,7 +4,6 @@ import pickle
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBClassifier

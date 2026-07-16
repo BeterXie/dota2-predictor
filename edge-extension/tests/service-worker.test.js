@@ -43,6 +43,7 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
     if (url.endsWith("/v1/status")) return jsonResponse({protocol_version: 1});
     const events = JSON.parse(init.body);
     return jsonResponse({
+      protocol_version: 1,
       results: events.map((event) => ({event_id: event.event_id, status: "accepted"})),
     });
   };
@@ -203,6 +204,72 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
   assert.equal(persisted.queue.length, 1);
   const retryWait = Math.max(0, persisted.nextRetryAt - Date.now()) + 100;
   await new Promise((resolve) => setTimeout(resolve, retryWait));
+
+  globalThis.fetch = previousFetch;
+  delete globalThis.chrome;
+});
+
+test("service worker keeps an incompatible companion disconnected", async () => {
+  const local = storageArea();
+  const session = storageArea();
+  const messageListeners = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (url.endsWith("/v1/status")) return jsonResponse({protocol_version: 2});
+    const events = JSON.parse(init.body);
+    return jsonResponse({
+      protocol_version: 2,
+      results: events.map((event) => ({event_id: event.event_id, status: "accepted"})),
+    });
+  };
+  globalThis.chrome = {
+    storage: {local, session},
+    runtime: {
+      onMessage: {addListener: (listener) => messageListeners.push(listener)},
+      onInstalled: {addListener: () => undefined},
+      onStartup: {addListener: () => undefined},
+    },
+    alarms: {
+      onAlarm: {addListener: () => undefined},
+      async create() { return undefined; },
+      async clear() { return true; },
+    },
+    tabs: {
+      async query() { return []; },
+      async sendMessage() { return undefined; },
+    },
+  };
+
+  await import(`../src/service-worker.js?protocol-test=${Date.now()}`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const send = (message, sender = {url: "https://ray086.com/esports"}) => new Promise((resolve) => {
+    messageListeners[0](message, sender, resolve);
+  });
+  await send({
+    action: "raybet.capture.event",
+    source_origin: "https://ray086.com",
+    event: {
+      event_id: "5".repeat(64),
+      event_type: "odds",
+      captured_at_utc: "2026-07-16T00:00:00.000Z",
+      raybet_match_id: "42",
+      payload: {},
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const failedState = session.values.get("raybetMonitorSession");
+  assert.equal(failedState.companion.connected, false);
+  assert.equal(failedState.queue.length, 1);
+
+  const status = await send({action: "raybet.popup.getStatus"}, {});
+  assert.equal(status.remote, null);
+  assert.deepEqual(status.companion, {
+    reachable: true,
+    connected: false,
+    lastError: "unsupported_protocol_version",
+  });
+
+  await send({action: "raybet.popup.setPaused", paused: true}, {});
 
   globalThis.fetch = previousFetch;
   delete globalThis.chrome;

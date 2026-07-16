@@ -219,7 +219,7 @@ def completed_match_processing_result(
     assessments = tuple(vars(facts.readiness).values())
     retryable = any(
         assessment.status is ComponentStatus.RETRYABLE for assessment in assessments
-    )
+    ) or facts.readiness.team_state.status is ComponentStatus.UNSCORABLE
     review_required = any(
         assessment.status is ComponentStatus.REVIEW_REQUIRED
         for assessment in assessments

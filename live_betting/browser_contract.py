@@ -14,6 +14,7 @@ import rfc8785
 
 
 SCHEMA_VERSION = 1
+DOTA2_GAME_ID = 151
 MAX_PAYLOAD_BYTES = 256 * 1024
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -236,9 +237,9 @@ class BrowserEvent(BaseModel):
             and hashlib.sha256(encoded).hexdigest() != self.payload_hash
         ):
             raise ValueError("payload hash mismatch")
-        if self.game_id not in (None, 151):
+        if self.game_id not in (None, DOTA2_GAME_ID):
             raise ValueError("only Dota 2 game_id=151 is accepted")
-        if self.event_type is not EventType.UNKNOWN and self.game_id != 151:
+        if self.event_type is not EventType.UNKNOWN and self.game_id != DOTA2_GAME_ID:
             raise ValueError("recognized events require game_id=151")
         match_bound = {
             EventType.ODDS,

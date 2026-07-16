@@ -12,6 +12,7 @@ from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import (
     EVENT_FILLED,
     EVENT_SETTLED,
+    NotificationConflictError,
     RETRY_DELAYS,
     claim,
     enqueue,
@@ -69,6 +70,49 @@ class NotificationOutboxTests(unittest.TestCase):
             self.store.connection.execute(
                 "UPDATE notification_outbox SET payload_json='{}' WHERE outbox_id=1"
             )
+
+    def test_logical_key_rejects_divergent_immutable_content(self) -> None:
+        self.assertTrue(self.add())
+        cases = (
+            {"payload": {**self.payload(), "value": 2}},
+            {"recipient": "other@example.com"},
+            {"template_version": "different-template"},
+            {"stats_cutoff_at": NOW + timedelta(seconds=1)},
+            {"created_at": NOW + timedelta(seconds=1)},
+        )
+        defaults = {
+            "payload": self.payload(),
+            "recipient": "599084618@qq.com",
+            "template_version": "dota2-shadow-email-v2",
+            "stats_cutoff_at": NOW,
+            "created_at": NOW,
+        }
+        for override in cases:
+            with self.subTest(override=override):
+                with self.assertRaises(NotificationConflictError):
+                    enqueue(
+                        self.store.connection,
+                        order_key="order-1",
+                        event_type=EVENT_FILLED,
+                        **{**defaults, **override},
+                    )
+
+    def test_invalid_event_constraint_is_not_silently_ignored(self) -> None:
+        with self.assertRaises(sqlite3.IntegrityError):
+            enqueue(
+                self.store.connection,
+                order_key="order-invalid",
+                event_type="unsupported",
+                payload={"event": "unsupported"},
+                stats_cutoff_at=NOW,
+                created_at=NOW,
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_simulation_markers_cannot_be_overridden(self) -> None:
         payload = simulation_payload(
@@ -252,6 +296,51 @@ class NotificationOutboxTests(unittest.TestCase):
             "dead_letter",
         )
 
+    def test_worker_records_actual_send_completion_time(self) -> None:
+        self.assertTrue(self.add())
+        completed_at = NOW + timedelta(seconds=12)
+        with (
+            patch("scripts.run_notification_worker.send_message"),
+            patch("scripts.run_notification_worker.datetime") as clock,
+        ):
+            clock.now.side_effect = [NOW, completed_at]
+            result = run_notification_once(
+                self.store,
+                SMTPConfig("sender@qq.com", "not-a-real-credential"),
+            )
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(
+            datetime.fromisoformat(str(self.store.connection.execute(
+                "SELECT sent_at FROM notification_outbox"
+            ).fetchone()[0])),
+            completed_at,
+        )
+
+    def test_worker_retry_delay_starts_when_smtp_failure_finishes(self) -> None:
+        self.assertTrue(self.add())
+        failed_at = NOW + timedelta(seconds=12)
+        with (
+            patch(
+                "scripts.run_notification_worker.send_message",
+                side_effect=OSError("network unavailable"),
+            ),
+            patch("scripts.run_notification_worker.datetime") as clock,
+        ):
+            clock.now.side_effect = [NOW, failed_at]
+            result = run_notification_once(
+                self.store,
+                SMTPConfig("sender@qq.com", "not-a-real-credential"),
+            )
+
+        self.assertEqual(result["status"], "retry_scheduled")
+        self.assertEqual(
+            datetime.fromisoformat(str(self.store.connection.execute(
+                "SELECT next_attempt_at FROM notification_outbox"
+            ).fetchone()[0])),
+            failed_at + timedelta(seconds=RETRY_DELAYS[0]),
+        )
+
     def _order(self) -> ShadowOrder:
         signal = OddsSnapshot(
             "match-1",
@@ -259,7 +348,7 @@ class NotificationOutboxTests(unittest.TestCase):
             "winner-group",
             NOW,
             2.0,
-            5,
+            1,
             Market("winner", "map_1", "team_one", None, "team_one", True),
         )
         self.store.store_odds_observation(
@@ -290,10 +379,12 @@ class NotificationOutboxTests(unittest.TestCase):
 
     def test_fill_and_settlement_schedule_notifications_atomically(self) -> None:
         order = self._order()
-        self.assertTrue(self.store.insert_map_order(order, 1))
+        self.assertTrue(
+            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+        )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1", "winner-one", "winner-group", successor_at, 1.99, 5,
+            "match-1", "winner-one", "winner-group", successor_at, 1.99, 1,
             order.market,
         )
         self.store.store_odds_observation(
@@ -338,10 +429,12 @@ class NotificationOutboxTests(unittest.TestCase):
 
     def test_fill_and_outbox_roll_back_together_on_notification_failure(self) -> None:
         order = self._order()
-        self.assertTrue(self.store.insert_map_order(order, 1))
+        self.assertTrue(
+            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+        )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1", "winner-one", "winner-group", successor_at, 1.99, 5,
+            "match-1", "winner-one", "winner-group", successor_at, 1.99, 1,
             order.market,
         )
         self.store.store_odds_observation(

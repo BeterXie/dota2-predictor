@@ -187,7 +187,7 @@ async function deliverQueued() {
         state.retryAttempt = 0;
         state.nextRetryAt = null;
         state.state = state.paused ? "paused" : "capturing";
-        state.companion = {reachable: true, connected: true, lastError: null};
+        state.companion = {reachable: true, connected: false, lastError: null};
         await writeState(state);
       });
       clearTimeout(retryTimer);
@@ -399,7 +399,12 @@ async function handleMessage(message, sender) {
         return writeState(current);
       });
       await broadcastCaptureState(state);
-      if (!state.paused) void deliverQueued();
+      if (state.paused) {
+        clearTimeout(retryTimer);
+        await chrome.alarms.clear(RETRY_ALARM);
+      } else {
+        void deliverQueued();
+      }
       return {paused: state.paused};
     }
     case "raybet.options.get":

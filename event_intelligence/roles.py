@@ -14,6 +14,10 @@ from .raw_archive import canonical_json_bytes
 
 
 ASSIGNMENT_VERSION = "role-assignment-v1"
+RECONSTRUCTED_ASSIGNMENT_VERSION = (
+    f"{ASSIGNMENT_VERSION}-reconstructed-walk-forward"
+)
+PROSPECTIVE_ASSIGNMENT_VERSION = f"{ASSIGNMENT_VERSION}-prospective"
 ROLE_DEPENDENT_CONFIDENCE = 0.7
 POSITIONS = (1, 2, 3, 4, 5)
 

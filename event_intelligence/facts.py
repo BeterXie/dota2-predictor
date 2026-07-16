@@ -491,7 +491,9 @@ def extract_completed_match_facts(
         parse_reason,
         basic_reason,
         "" if gold_complete else "gold_timeline_incomplete",
-        unscorable=state_window_too_short and source_parsed and basic_result,
+        unscorable=(state_window_too_short or not gold_complete)
+        and source_parsed
+        and basic_result,
     )
     objective_analysis = _assessment(
         parse_reason,

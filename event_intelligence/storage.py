@@ -11,7 +11,8 @@ from typing import Any, Iterator, Sequence
 
 
 BUSY_TIMEOUT_MS = 5_000
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 8
+CUTOFF_LINEAGE_SCHEMA_VERSION = 8
 
 
 SCHEMA_SQL = """
@@ -324,6 +325,54 @@ CREATE TABLE IF NOT EXISTS draft_predictions (
     UNIQUE (run_id, match_id)
 );
 
+CREATE TABLE IF NOT EXISTS draft_lineage_revisions (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
+    artifact_revision INTEGER NOT NULL CHECK (artifact_revision >= 1),
+    updated_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO draft_lineage_revisions
+    (singleton, dependency_revision, artifact_revision, updated_at)
+VALUES (1, 1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+CREATE TABLE IF NOT EXISTS draft_lineage_changes (
+    dependency_revision INTEGER PRIMARY KEY CHECK (dependency_revision >= 1),
+    affected_from_unix INTEGER
+        CHECK (affected_from_unix IS NULL OR affected_from_unix > 0),
+    source_relation TEXT NOT NULL,
+    operation TEXT NOT NULL
+        CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE', 'REPAIR', 'INITIALIZE')),
+    changed_at TEXT NOT NULL
+);
+INSERT INTO draft_lineage_changes
+    (dependency_revision, affected_from_unix,
+     source_relation, operation, changed_at)
+SELECT 1, NULL, '__tracking__', 'INITIALIZE', updated_at
+  FROM draft_lineage_revisions
+ WHERE singleton=1
+   AND NOT EXISTS (
+       SELECT 1 FROM draft_lineage_changes WHERE dependency_revision=1
+   );
+
+CREATE TABLE IF NOT EXISTS draft_prediction_validations (
+    run_id TEXT NOT NULL,
+    match_id INTEGER NOT NULL,
+    input_snapshot_hash TEXT NOT NULL
+        CHECK (length(input_snapshot_hash) = 64),
+    artifact_fingerprint TEXT NOT NULL
+        CHECK (length(artifact_fingerprint) = 64),
+    dependency_fingerprint TEXT NOT NULL
+        CHECK (length(dependency_fingerprint) = 64),
+    dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
+    validation_version TEXT NOT NULL,
+    validated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, match_id),
+    FOREIGN KEY (run_id, match_id)
+        REFERENCES draft_predictions(run_id, match_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_draft_prediction_validations_fingerprint
+    ON draft_prediction_validations(validation_version, dependency_fingerprint);
+
 CREATE TABLE IF NOT EXISTS notification_outbox (
     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_key TEXT NOT NULL,
@@ -386,7 +435,8 @@ CREATE TABLE IF NOT EXISTS strict_derived_status (
     profile_cutoff TEXT NOT NULL,
     derived_at TEXT NOT NULL,
     normalizer_version TEXT NOT NULL,
-    benchmark_version TEXT NOT NULL
+    benchmark_version TEXT NOT NULL,
+    profile_context_hash TEXT NOT NULL CHECK (length(profile_context_hash) = 64)
 );
 
 CREATE VIEW IF NOT EXISTS formal_events AS
@@ -430,15 +480,18 @@ class IntelligenceStorage:
         path: str | Path,
         *,
         busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
         self.path = str(path)
         self.busy_timeout_ms = busy_timeout_ms
-        self.connection = sqlite3.connect(
-            self.path,
-            timeout=busy_timeout_ms / 1_000,
+        self.connection = (
+            connection
+            if connection is not None
+            else sqlite3.connect(self.path, timeout=busy_timeout_ms / 1_000)
         )
+        self._owns_connection = connection is None
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
@@ -453,7 +506,8 @@ class IntelligenceStorage:
         self.close()
 
     def close(self) -> None:
-        self.connection.close()
+        if self._owns_connection:
+            self.connection.close()
 
     def init_schema(self, *, seed_events: bool = True) -> None:
         self._reject_future_schema()
@@ -505,6 +559,18 @@ class IntelligenceStorage:
             raise RuntimeError("incomplete intelligence schema statement")
 
     def _migrate_schema(self) -> None:
+        prior_schema = self.connection.execute(
+            "SELECT MAX(version) FROM intelligence_schema_version"
+        ).fetchone()
+        prior_version = prior_schema[0] if prior_schema is not None else None
+        if (
+            prior_version is not None
+            and int(prior_version) < CUTOFF_LINEAGE_SCHEMA_VERSION
+        ):
+            # Pre-v8 proofs have no cutoff-scoped change journal and cannot be
+            # promoted safely. The immutable runs/predictions remain intact.
+            self.connection.execute("DELETE FROM draft_prediction_validations")
+
         columns = {
             str(row[1])
             for row in self.connection.execute("PRAGMA table_info(match_ingest_status)")
@@ -549,6 +615,36 @@ class IntelligenceStorage:
         if "benchmark_version" not in derived_columns:
             self.connection.execute(
                 "ALTER TABLE strict_derived_status ADD COLUMN benchmark_version TEXT"
+            )
+        if "profile_context_hash" not in derived_columns:
+            # Existing lineage cannot prove which registry metadata was used.
+            # Leave this nullable so the incremental pipeline invalidates it
+            # instead of blessing potentially stale profiles during migration.
+            self.connection.execute(
+                """ALTER TABLE strict_derived_status
+                   ADD COLUMN profile_context_hash TEXT
+                   CHECK (profile_context_hash IS NULL OR
+                          length(profile_context_hash) = 64)"""
+            )
+
+        validation_columns = {
+            str(row[1])
+            for row in self.connection.execute(
+                "PRAGMA table_info(draft_prediction_validations)"
+            )
+        }
+        if validation_columns and "artifact_fingerprint" not in validation_columns:
+            self.connection.execute(
+                """ALTER TABLE draft_prediction_validations
+                   ADD COLUMN artifact_fingerprint TEXT
+                   CHECK (artifact_fingerprint IS NULL OR
+                          length(artifact_fingerprint) = 64)"""
+            )
+        if validation_columns and "dependency_revision" not in validation_columns:
+            self.connection.execute(
+                """ALTER TABLE draft_prediction_validations
+                   ADD COLUMN dependency_revision INTEGER
+                   CHECK (dependency_revision IS NULL OR dependency_revision >= 1)"""
             )
 
         artifact_columns = {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -17,7 +18,14 @@ from .pricing import market_key
 from .strategy import attempt_fill, is_open
 
 
+CURRENT_SCHEMA_VERSION = 1
+
+
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS live_schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS provider_matches (
     provider TEXT NOT NULL,
     provider_match_id TEXT NOT NULL,
@@ -241,6 +249,7 @@ CREATE TABLE IF NOT EXISTS model_quotes (
 CREATE TABLE IF NOT EXISTS shadow_orders (
     order_key TEXT PRIMARY KEY,
     raybet_match_id TEXT NOT NULL,
+    strict_mapping_id INTEGER,
     odds_id TEXT NOT NULL,
     market_key TEXT NOT NULL,
     signaled_at TEXT NOT NULL,
@@ -268,10 +277,54 @@ CREATE TABLE IF NOT EXISTS settlements (
     evidence_ref TEXT NOT NULL,
     review_required INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS settlement_result_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL CHECK (map_number > 0),
+    dota_match_id INTEGER,
+    source TEXT NOT NULL CHECK (source IN ('raybet', 'opendota')),
+    status TEXT NOT NULL CHECK (status IN ('confirmed', 'pending', 'conflict')),
+    winner_side TEXT CHECK (winner_side IN ('team_one', 'team_two')),
+    evidence_ref TEXT NOT NULL,
+    facts_json TEXT NOT NULL CHECK (json_valid(facts_json)),
+    observed_at TEXT NOT NULL,
+    UNIQUE (raybet_match_id, map_number, source, evidence_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_result_evidence_map
+    ON settlement_result_evidence(raybet_match_id, map_number, source, observed_at);
+CREATE TRIGGER IF NOT EXISTS settlement_result_evidence_no_update
+BEFORE UPDATE ON settlement_result_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'settlement result evidence is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS settlement_result_evidence_no_delete
+BEFORE DELETE ON settlement_result_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'settlement result evidence is append-only');
+END;
+CREATE TABLE IF NOT EXISTS settlement_reconciliations (
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL CHECK (map_number > 0),
+    dota_match_id INTEGER NOT NULL,
+    raybet_winner_side TEXT CHECK (raybet_winner_side IN ('team_one', 'team_two')),
+    opendota_winner_side TEXT NOT NULL
+        CHECK (opendota_winner_side IN ('team_one', 'team_two')),
+    raybet_evidence_ref TEXT NOT NULL,
+    opendota_evidence_ref TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'confirmed', 'manual_review')),
+    reason TEXT NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (raybet_match_id, map_number)
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_reconciliations_dota_match
+    ON settlement_reconciliations(dota_match_id);
 CREATE TABLE IF NOT EXISTS notification_outbox (
     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_key TEXT NOT NULL,
-    event_type TEXT NOT NULL CHECK (event_type IN ('filled', 'settled')),
+    event_type TEXT NOT NULL CHECK (event_type IN
+        ('filled', 'settled', 'monitor_alert', 'monitor_recovery')),
     channel TEXT NOT NULL DEFAULT 'email',
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'leased', 'sent', 'dead_letter')),
@@ -350,6 +403,101 @@ CREATE TABLE IF NOT EXISTS vision_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_vision_match_map_time
     ON vision_observations(raybet_match_id, map_number, captured_at);
+CREATE TABLE IF NOT EXISTS vision_observation_invalidations (
+    raybet_match_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    source_frame_ref TEXT NOT NULL,
+    invalidated_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY (raybet_match_id, captured_at, source_frame_ref),
+    FOREIGN KEY (raybet_match_id, captured_at, source_frame_ref)
+        REFERENCES vision_observations(
+            raybet_match_id, captured_at, source_frame_ref
+        )
+);
+CREATE TRIGGER IF NOT EXISTS vision_observation_invalidations_immutable_update
+BEFORE UPDATE ON vision_observation_invalidations
+BEGIN
+    SELECT RAISE(ABORT, 'vision invalidation audit is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS vision_observation_invalidations_immutable_delete
+BEFORE DELETE ON vision_observation_invalidations
+BEGIN
+    SELECT RAISE(ABORT, 'vision invalidation audit is immutable');
+END;
+CREATE TABLE IF NOT EXISTS vision_draft_anchors (
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL CHECK (map_number > 0),
+    draft_hash TEXT NOT NULL CHECK (length(draft_hash) = 64),
+    radiant_hero_ids TEXT NOT NULL,
+    dire_hero_ids TEXT NOT NULL,
+    anchored_at TEXT NOT NULL,
+    source_frame_ref TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('anchored', 'conflict')),
+    conflict_at TEXT,
+    PRIMARY KEY (raybet_match_id, map_number)
+);
+CREATE TABLE IF NOT EXISTS vision_draft_conflicts (
+    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    source_frame_ref TEXT NOT NULL,
+    observed_draft_hash TEXT NOT NULL CHECK (length(observed_draft_hash) = 64),
+    radiant_hero_ids TEXT NOT NULL,
+    dire_hero_ids TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (raybet_match_id, map_number, captured_at, source_frame_ref),
+    FOREIGN KEY (raybet_match_id, map_number)
+        REFERENCES vision_draft_anchors(raybet_match_id, map_number)
+);
+CREATE TRIGGER IF NOT EXISTS vision_draft_anchor_identity_immutable
+BEFORE UPDATE ON vision_draft_anchors
+WHEN OLD.raybet_match_id IS NOT NEW.raybet_match_id
+  OR OLD.map_number IS NOT NEW.map_number
+  OR OLD.draft_hash IS NOT NEW.draft_hash
+  OR OLD.radiant_hero_ids IS NOT NEW.radiant_hero_ids
+  OR OLD.dire_hero_ids IS NOT NEW.dire_hero_ids
+  OR OLD.anchored_at IS NOT NEW.anchored_at
+  OR OLD.source_frame_ref IS NOT NEW.source_frame_ref
+  OR OLD.status='conflict'
+  OR NEW.status!='conflict'
+  OR NEW.conflict_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'vision draft anchor is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS vision_draft_conflicts_immutable_update
+BEFORE UPDATE ON vision_draft_conflicts
+BEGIN
+    SELECT RAISE(ABORT, 'vision draft conflict is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS vision_draft_conflicts_immutable_delete
+BEFORE DELETE ON vision_draft_conflicts
+BEGIN
+    SELECT RAISE(ABORT, 'vision draft conflict is immutable');
+END;
+CREATE TABLE IF NOT EXISTS vision_derived_invalidations (
+    dependent_type TEXT NOT NULL CHECK (dependent_type IN
+        ('odds_alignment', 'strategy_decision', 'research_prediction',
+         'shadow_order')),
+    dependent_key TEXT NOT NULL,
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (dependent_type, dependent_key)
+);
+CREATE TRIGGER IF NOT EXISTS vision_derived_invalidations_immutable_update
+BEFORE UPDATE ON vision_derived_invalidations
+BEGIN
+    SELECT RAISE(ABORT, 'vision derived invalidation is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS vision_derived_invalidations_immutable_delete
+BEFORE DELETE ON vision_derived_invalidations
+BEGIN
+    SELECT RAISE(ABORT, 'vision derived invalidation is immutable');
+END;
 CREATE TABLE IF NOT EXISTS odds_alignments (
     odds_snapshot_id INTEGER PRIMARY KEY,
     raybet_match_id TEXT NOT NULL,
@@ -379,6 +527,74 @@ CREATE TABLE IF NOT EXISTS strategy_decisions (
     input_ref TEXT NOT NULL,
     strategy_version TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prospective_draft_curves (
+    curve_key TEXT PRIMARY KEY CHECK (length(curve_key)=64),
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL CHECK (map_number > 0),
+    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id > 0),
+    lineup_hash TEXT NOT NULL CHECK (length(lineup_hash)=64),
+    radiant_hero_ids_json TEXT NOT NULL,
+    dire_hero_ids_json TEXT NOT NULL,
+    prediction_cutoff TEXT NOT NULL,
+    first_usable_at TEXT NOT NULL,
+    availability_mode TEXT NOT NULL CHECK (availability_mode='prospective'),
+    created_at TEXT NOT NULL,
+    UNIQUE (raybet_match_id, map_number, strict_mapping_id, lineup_hash,
+            first_usable_at, curve_key)
+);
+CREATE INDEX IF NOT EXISTS idx_prospective_draft_curve_target
+    ON prospective_draft_curves(
+        raybet_match_id, map_number, strict_mapping_id, lineup_hash,
+        first_usable_at
+    );
+CREATE TABLE IF NOT EXISTS prospective_draft_landmarks (
+    landmark_key TEXT PRIMARY KEY CHECK (length(landmark_key)=64),
+    curve_key TEXT NOT NULL REFERENCES prospective_draft_curves(curve_key),
+    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes IN (10, 20, 30, 40, 50)),
+    radiant_probability REAL NOT NULL CHECK (radiant_probability BETWEEN 0.0 AND 1.0),
+    scaling_edge REAL NOT NULL,
+    synergy_edge REAL NOT NULL,
+    quality REAL NOT NULL CHECK (quality BETWEEN 0.0 AND 1.0),
+    validation_status TEXT NOT NULL
+        CHECK (validation_status IN ('passed', 'failed', 'insufficient_evidence')),
+    support INTEGER NOT NULL CHECK (support >= 0),
+    calibration_ref TEXT NOT NULL,
+    input_refs_json TEXT NOT NULL,
+    uncertainty REAL CHECK (uncertainty IS NULL OR uncertainty BETWEEN 0.0 AND 0.5),
+    validation_reason TEXT,
+    feature_hash TEXT NOT NULL CHECK (length(feature_hash)=64),
+    model_hash TEXT NOT NULL CHECK (length(model_hash)=64),
+    calibration_hash TEXT NOT NULL CHECK (length(calibration_hash)=64),
+    global_calibration_passed INTEGER NOT NULL
+        CHECK (global_calibration_passed IN (0, 1)),
+    global_gate_ref TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    model_kind TEXT NOT NULL CHECK (model_kind='pure_draft'),
+    availability_mode TEXT NOT NULL CHECK (availability_mode='prospective'),
+    input_snapshot_hash TEXT NOT NULL CHECK (length(input_snapshot_hash)=64),
+    created_at TEXT NOT NULL,
+    UNIQUE (curve_key, horizon_minutes)
+);
+CREATE TRIGGER IF NOT EXISTS prospective_draft_curves_immutable_update
+BEFORE UPDATE ON prospective_draft_curves
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft curve is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS prospective_draft_curves_immutable_delete
+BEFORE DELETE ON prospective_draft_curves
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft curve is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS prospective_draft_landmarks_immutable_update
+BEFORE UPDATE ON prospective_draft_landmarks
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft landmark is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS prospective_draft_landmarks_immutable_delete
+BEFORE DELETE ON prospective_draft_landmarks
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft landmark is immutable');
+END;
 CREATE TABLE IF NOT EXISTS shadow_map_attempts (
     raybet_match_id TEXT NOT NULL,
     map_number INTEGER NOT NULL,
@@ -527,17 +743,29 @@ END;
 
 
 class LiveBettingStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         self.path = str(path)
-        self.connection = sqlite3.connect(self.path)
+        self.connection = (
+            connection
+            if connection is not None
+            else sqlite3.connect(self.path, timeout=5.0)
+        )
+        self._owns_connection = connection is None
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA busy_timeout=5000")
         self.connection.execute("PRAGMA journal_mode=WAL")
         self._transaction_depth = 0
         self._savepoint_sequence = 0
 
     def close(self) -> None:
-        self.connection.close()
+        if self._owns_connection:
+            self.connection.close()
 
     def __enter__(self) -> "LiveBettingStore":
         return self
@@ -546,8 +774,10 @@ class LiveBettingStore:
         self.close()
 
     def init_schema(self) -> None:
+        self._reject_future_schema()
         self.connection.executescript(SCHEMA_SQL)
         self._migrate_shadow_order_signal_fields()
+        self.connection.commit()
         columns = {row[1] for row in self.connection.execute(
             "PRAGMA table_info(vision_observations)"
         )}
@@ -558,7 +788,29 @@ class LiveBettingStore:
         from .strict_eligibility import init_strict_live_eligibility_schema
 
         init_strict_live_eligibility_schema(self.connection)
+        self.connection.execute(
+            """INSERT OR IGNORE INTO live_schema_version (version, applied_at)
+               VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+            (CURRENT_SCHEMA_VERSION,),
+        )
         self.connection.commit()
+
+    def _reject_future_schema(self) -> None:
+        exists = self.connection.execute(
+            """SELECT 1 FROM sqlite_master
+                 WHERE type='table' AND name='live_schema_version'"""
+        ).fetchone()
+        if exists is None:
+            return
+        row = self.connection.execute(
+            "SELECT MAX(version) FROM live_schema_version"
+        ).fetchone()
+        version = row[0] if row is not None else None
+        if version is not None and int(version) > CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database live schema version {version} is newer than supported "
+                f"version {CURRENT_SCHEMA_VERSION}"
+            )
 
     def _migrate_shadow_order_signal_fields(self) -> None:
         """Add strict signal identity to databases created by earlier versions."""
@@ -570,6 +822,7 @@ class LiveBettingStore:
             for row in self.connection.execute("PRAGMA table_info(shadow_orders)")
         }
         additive_columns = {
+            "strict_mapping_id": "INTEGER",
             "signal_transport_key": "TEXT NOT NULL DEFAULT ''",
             "signal_transport_at": "TEXT NOT NULL DEFAULT ''",
             "expires_at": "TEXT NOT NULL DEFAULT ''",
@@ -667,12 +920,40 @@ class LiveBettingStore:
                 ),
             )
 
+        self.connection.execute(
+            """UPDATE shadow_orders
+                  SET strict_mapping_id=(
+                      SELECT CAST(json_extract(
+                                 decision.contributions_json,
+                                 '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
+                             ) AS INTEGER)
+                        FROM shadow_map_attempts AS attempt
+                        JOIN strategy_decisions AS decision
+                          ON decision.raybet_match_id=attempt.raybet_match_id
+                         AND decision.map_number=attempt.map_number
+                       WHERE attempt.order_key=shadow_orders.order_key
+                         AND decision.decided_at=shadow_orders.signaled_at
+                         AND decision.model_probability=shadow_orders.model_probability
+                         AND decision.market_probability=shadow_orders.market_probability
+                         AND decision.eligible=1
+                         AND json_valid(decision.contributions_json)
+                         AND CAST(json_extract(
+                                 decision.contributions_json,
+                                 '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
+                             ) AS INTEGER)>0
+                       ORDER BY decision.decision_key
+                       LIMIT 1
+                  )
+                WHERE strict_mapping_id IS NULL"""
+        )
+
         signal_columns = {
             str(row[1]): (int(row[3]), row[4])
             for row in self.connection.execute("PRAGMA table_info(shadow_orders)")
             if str(row[1]) in additive_columns
         }
         expected_columns = {
+            "strict_mapping_id": (0, None),
             "signal_transport_key": (1, None),
             "signal_transport_at": (1, None),
             "expires_at": (1, None),
@@ -686,6 +967,7 @@ class LiveBettingStore:
                 """CREATE TABLE shadow_orders_strict_migration (
                     order_key TEXT PRIMARY KEY,
                     raybet_match_id TEXT NOT NULL,
+                    strict_mapping_id INTEGER,
                     odds_id TEXT NOT NULL,
                     market_key TEXT NOT NULL,
                     signaled_at TEXT NOT NULL,
@@ -708,14 +990,16 @@ class LiveBettingStore:
             )
             self.connection.execute(
                 """INSERT INTO shadow_orders_strict_migration
-                    (order_key, raybet_match_id, odds_id, market_key, signaled_at,
+                    (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                     market_key, signaled_at,
                      model_probability, market_probability, signal_price,
                      signal_transport_key, signal_transport_at, expires_at,
                      signal_odds_group_id, signal_outcome_key,
                      signal_identity_verified, stake, status, fill_price,
                      filled_at, rejection_reason)
-                    SELECT order_key, raybet_match_id, odds_id, market_key,
-                           signaled_at, model_probability, market_probability,
+                    SELECT order_key, raybet_match_id, strict_mapping_id,
+                           odds_id, market_key, signaled_at,
+                           model_probability, market_probability,
                            signal_price, signal_transport_key,
                            signal_transport_at, expires_at,
                            signal_odds_group_id, signal_outcome_key,
@@ -755,6 +1039,7 @@ class LiveBettingStore:
             CREATE TRIGGER shadow_orders_signal_identity_immutable
             BEFORE UPDATE ON shadow_orders
             WHEN OLD.raybet_match_id IS NOT NEW.raybet_match_id
+              OR OLD.strict_mapping_id IS NOT NEW.strict_mapping_id
               OR OLD.odds_id IS NOT NEW.odds_id
               OR OLD.market_key IS NOT NEW.market_key
               OR OLD.signaled_at IS NOT NEW.signaled_at
@@ -1526,23 +1811,103 @@ class LiveBettingStore:
         )
 
     def insert_vision_observation(self, observation: Any) -> bool:
-        cursor = self.execute(
-            """INSERT OR IGNORE INTO vision_observations
-            (raybet_match_id, map_number, captured_at, game_clock_seconds,
-             is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
-             clock_confidence, draft_confidence, source_frame_ref, screen_state,
-             confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (observation.raybet_match_id, observation.map_number,
-             observation.captured_at.isoformat(), observation.game_clock_seconds,
-             None if observation.is_paused is None else int(observation.is_paused),
-             self.json(list(observation.radiant_hero_ids)),
-             self.json(list(observation.dire_hero_ids)),
-             observation.radiant_team_side,
-             observation.clock_confidence, observation.draft_confidence,
-             observation.source_frame_ref, observation.screen_state,
-             int(observation.is_confirmed)),
-        )
-        return cursor.rowcount == 1
+        captured_at = observation.captured_at.isoformat()
+        radiant_json = self.json(list(observation.radiant_hero_ids))
+        dire_json = self.json(list(observation.dire_hero_ids))
+        stored_confirmed = bool(observation.is_confirmed)
+        with self.transaction():
+            if stored_confirmed and observation.map_number is not None:
+                draft_payload = self.json(
+                    {
+                        "radiant": list(observation.radiant_hero_ids),
+                        "dire": list(observation.dire_hero_ids),
+                    }
+                )
+                draft_hash = hashlib.sha256(draft_payload.encode("utf-8")).hexdigest()
+                anchor = self.connection.execute(
+                    """SELECT draft_hash, status FROM vision_draft_anchors
+                        WHERE raybet_match_id=? AND map_number=?""",
+                    (observation.raybet_match_id, observation.map_number),
+                ).fetchone()
+                if anchor is None:
+                    self.connection.execute(
+                        """INSERT INTO vision_draft_anchors
+                           (raybet_match_id, map_number, draft_hash,
+                            radiant_hero_ids, dire_hero_ids, anchored_at,
+                            source_frame_ref, status, conflict_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 'anchored', NULL)""",
+                        (
+                            observation.raybet_match_id,
+                            observation.map_number,
+                            draft_hash,
+                            radiant_json,
+                            dire_json,
+                            captured_at,
+                            observation.source_frame_ref,
+                        ),
+                    )
+                elif anchor["status"] == "conflict" or anchor["draft_hash"] != draft_hash:
+                    reason = (
+                        "map_draft_already_in_conflict"
+                        if anchor["status"] == "conflict"
+                        else "confirmed_draft_identity_changed"
+                    )
+                    self.connection.execute(
+                        """INSERT OR IGNORE INTO vision_draft_conflicts
+                           (raybet_match_id, map_number, captured_at,
+                            source_frame_ref, observed_draft_hash,
+                            radiant_hero_ids, dire_hero_ids, reason, recorded_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            observation.raybet_match_id,
+                            observation.map_number,
+                            captured_at,
+                            observation.source_frame_ref,
+                            draft_hash,
+                            radiant_json,
+                            dire_json,
+                            reason,
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                    if anchor["status"] != "conflict":
+                        self.connection.execute(
+                            """UPDATE vision_draft_anchors
+                                  SET status='conflict', conflict_at=?
+                                WHERE raybet_match_id=? AND map_number=?
+                                  AND status='anchored'""",
+                            (
+                                captured_at,
+                                observation.raybet_match_id,
+                                observation.map_number,
+                            ),
+                        )
+                    stored_confirmed = False
+            cursor = self.connection.execute(
+                """INSERT OR IGNORE INTO vision_observations
+                (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                 is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                 clock_confidence, draft_confidence, source_frame_ref, screen_state,
+                 confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    observation.raybet_match_id,
+                    observation.map_number,
+                    captured_at,
+                    observation.game_clock_seconds,
+                    None
+                    if observation.is_paused is None
+                    else int(observation.is_paused),
+                    radiant_json,
+                    dire_json,
+                    observation.radiant_team_side,
+                    observation.clock_confidence,
+                    observation.draft_confidence,
+                    observation.source_frame_ref,
+                    observation.screen_state,
+                    int(stored_confirmed),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def insert_alignment(self, alignment: Any) -> bool:
         cursor = self.execute(
@@ -1683,8 +2048,16 @@ class LiveBettingStore:
         ).fetchone()
         return row is not None
 
-    def insert_map_order(self, order: ShadowOrder, map_number: int) -> bool:
+    def insert_map_order(
+        self,
+        order: ShadowOrder,
+        map_number: int,
+        *,
+        strict_mapping_id: int,
+    ) -> bool:
         """Atomically reserve a map and persist its only shadow order."""
+        if isinstance(strict_mapping_id, bool) or strict_mapping_id <= 0:
+            raise ValueError("strict_mapping_id must be a positive integer")
         if not self._signal_identity_matches(order):
             return False
         with self.transaction():
@@ -1698,14 +2071,16 @@ class LiveBettingStore:
                 return False
             self.connection.execute(
                 """INSERT INTO shadow_orders
-                (order_key, raybet_match_id, odds_id, market_key, signaled_at,
+                (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                 market_key, signaled_at,
                  model_probability, market_probability, signal_price,
                  signal_transport_key, signal_transport_at, expires_at,
                  signal_odds_group_id, signal_outcome_key,
                  signal_identity_verified, stake, status, fill_price, filled_at,
                  rejection_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (order.order_key, order.raybet_match_id, order.odds_id,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (order.order_key, order.raybet_match_id, strict_mapping_id,
+                 order.odds_id,
                  market_key(order.market.market_type, order.market.period,
                             order.market.side, order.market.line),
                  order.signaled_at.isoformat(), order.model_probability,
@@ -1730,6 +2105,195 @@ class LiveBettingStore:
              result.settled_at.isoformat()),
         )
         return cursor.rowcount == 1
+
+    def record_settlement_reconciliation(
+        self,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        dota_match_id: int,
+        raybet_status: str,
+        raybet_winner_side: str | None,
+        opendota_winner_side: str,
+        raybet_evidence_ref: str,
+        opendota_evidence_ref: str,
+        raybet_facts: Mapping[str, object],
+        opendota_facts: Mapping[str, object],
+        status: str,
+        reason: str,
+        observed_at: datetime,
+    ) -> sqlite3.Row:
+        """Persist both source facts and a sticky fail-closed resolution."""
+        observed = self._iso(observed_at)
+        raybet_facts_json = self.json(raybet_facts)
+        opendota_facts_json = self.json(opendota_facts)
+        with self.transaction():
+            evidence_rows = (
+                (
+                    "raybet",
+                    raybet_status,
+                    raybet_winner_side,
+                    raybet_evidence_ref,
+                    raybet_facts_json,
+                ),
+                (
+                    "opendota",
+                    "confirmed",
+                    opendota_winner_side,
+                    opendota_evidence_ref,
+                    opendota_facts_json,
+                ),
+            )
+            for source, source_status, winner, evidence_ref, facts_json in evidence_rows:
+                cursor = self.connection.execute(
+                    """INSERT OR IGNORE INTO settlement_result_evidence
+                       (raybet_match_id, map_number, dota_match_id, source, status,
+                        winner_side, evidence_ref, facts_json, observed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        raybet_match_id,
+                        map_number,
+                        dota_match_id,
+                        source,
+                        source_status,
+                        winner,
+                        evidence_ref,
+                        facts_json,
+                        observed,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    existing_evidence = self.connection.execute(
+                        """SELECT status, winner_side, facts_json
+                             FROM settlement_result_evidence
+                            WHERE raybet_match_id=? AND map_number=?
+                              AND source=? AND evidence_ref=?""",
+                        (raybet_match_id, map_number, source, evidence_ref),
+                    ).fetchone()
+                    if existing_evidence is None or tuple(existing_evidence) != (
+                        source_status,
+                        winner,
+                        facts_json,
+                    ):
+                        raise ValueError("settlement evidence reference was reused")
+
+            existing = self.connection.execute(
+                """SELECT * FROM settlement_reconciliations
+                    WHERE raybet_match_id=? AND map_number=?""",
+                (raybet_match_id, map_number),
+            ).fetchone()
+            linked_elsewhere = self.connection.execute(
+                """SELECT raybet_match_id, map_number
+                     FROM settlement_reconciliations
+                    WHERE dota_match_id=?
+                      AND (raybet_match_id!=? OR map_number!=?)""",
+                (dota_match_id, raybet_match_id, map_number),
+            ).fetchall()
+            link_conflict = bool(linked_elsewhere)
+            if link_conflict:
+                self.connection.execute(
+                    """UPDATE settlement_reconciliations
+                          SET status='manual_review',
+                              reason=CASE
+                                WHEN status='manual_review' THEN reason
+                                ELSE 'opendota_match_link_conflict'
+                              END,
+                              updated_at=?
+                        WHERE dota_match_id=?
+                          AND (raybet_match_id!=? OR map_number!=?)""",
+                    (observed, dota_match_id, raybet_match_id, map_number),
+                )
+                for linked in linked_elsewhere:
+                    self.connection.execute(
+                        """UPDATE settlements SET review_required=1
+                            WHERE order_key IN (
+                                SELECT order_key FROM shadow_map_attempts
+                                 WHERE raybet_match_id=? AND map_number=?
+                            )""",
+                        (linked["raybet_match_id"], linked["map_number"]),
+                    )
+
+            effective_status = "manual_review" if link_conflict else status
+            effective_reason = (
+                "opendota_match_link_conflict" if link_conflict else reason
+            )
+            effective_dota_match_id = dota_match_id
+            effective_raybet_winner = raybet_winner_side
+            effective_opendota_winner = opendota_winner_side
+            effective_raybet_ref = raybet_evidence_ref
+            effective_opendota_ref = opendota_evidence_ref
+            if existing is not None and existing["status"] == "manual_review":
+                effective_status = "manual_review"
+                effective_reason = str(existing["reason"])
+                effective_dota_match_id = int(existing["dota_match_id"])
+                effective_raybet_winner = existing["raybet_winner_side"]
+                effective_opendota_winner = str(existing["opendota_winner_side"])
+                effective_raybet_ref = str(existing["raybet_evidence_ref"])
+                effective_opendota_ref = str(existing["opendota_evidence_ref"])
+            elif existing is not None and existing["status"] == "confirmed" and (
+                effective_status != "confirmed"
+                or existing["raybet_winner_side"] != raybet_winner_side
+                or existing["opendota_winner_side"] != opendota_winner_side
+                or int(existing["dota_match_id"]) != dota_match_id
+            ):
+                effective_status = "manual_review"
+                effective_reason = (
+                    "opendota_match_link_conflict"
+                    if link_conflict
+                    else "source_result_changed"
+                )
+                effective_dota_match_id = int(existing["dota_match_id"])
+                effective_raybet_winner = existing["raybet_winner_side"]
+                effective_opendota_winner = str(existing["opendota_winner_side"])
+                effective_raybet_ref = str(existing["raybet_evidence_ref"])
+                effective_opendota_ref = str(existing["opendota_evidence_ref"])
+
+            self.connection.execute(
+                """INSERT INTO settlement_reconciliations
+                   (raybet_match_id, map_number, dota_match_id,
+                    raybet_winner_side, opendota_winner_side,
+                    raybet_evidence_ref, opendota_evidence_ref, status, reason,
+                    first_observed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(raybet_match_id, map_number) DO UPDATE SET
+                     dota_match_id=excluded.dota_match_id,
+                     raybet_winner_side=excluded.raybet_winner_side,
+                     opendota_winner_side=excluded.opendota_winner_side,
+                     raybet_evidence_ref=excluded.raybet_evidence_ref,
+                     opendota_evidence_ref=excluded.opendota_evidence_ref,
+                     status=excluded.status,
+                     reason=excluded.reason,
+                     updated_at=excluded.updated_at""",
+                (
+                    raybet_match_id,
+                    map_number,
+                    effective_dota_match_id,
+                    effective_raybet_winner,
+                    effective_opendota_winner,
+                    effective_raybet_ref,
+                    effective_opendota_ref,
+                    effective_status,
+                    effective_reason,
+                    observed,
+                    observed,
+                ),
+            )
+            if effective_status == "manual_review":
+                self.connection.execute(
+                    """UPDATE settlements SET review_required=1
+                        WHERE order_key IN (
+                            SELECT order_key FROM shadow_map_attempts
+                             WHERE raybet_match_id=? AND map_number=?
+                        )""",
+                    (raybet_match_id, map_number),
+                )
+            row = self.connection.execute(
+                """SELECT * FROM settlement_reconciliations
+                    WHERE raybet_match_id=? AND map_number=?""",
+                (raybet_match_id, map_number),
+            ).fetchone()
+            assert row is not None
+            return row
 
     def enqueue_notification(
         self,

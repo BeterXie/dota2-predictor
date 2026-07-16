@@ -11,6 +11,7 @@ import sqlite3
 from typing import Any
 
 import numpy as np
+from shared.sqlite import connect as connect_sqlite
 
 # Default weights when all data is available
 _DEFAULT_WEIGHTS = {
@@ -33,9 +34,7 @@ _DRAFT_DIMENSION_WEIGHTS = {
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_sqlite(db_path, read_only=True, row_factory=sqlite3.Row)
 
 
 # ---------------------------------------------------------------------------

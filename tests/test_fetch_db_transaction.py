@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from fetch.db import Database
 
@@ -209,6 +210,9 @@ class FetchDatabaseTransactionTests(unittest.TestCase):
         connection = sqlite3.connect(":memory:")
         connection.execute("PRAGMA foreign_keys=ON")
         database = Database(connection=connection)
+        configured = database.connect()
+        self.assertEqual(configured.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+        self.assertEqual(configured.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         database.init_db()
         seed_hero(connection, 1)
 
@@ -224,6 +228,13 @@ class FetchDatabaseTransactionTests(unittest.TestCase):
         database.close()
         self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
         connection.close()
+
+    def test_migration_does_not_hide_lock_or_io_errors(self) -> None:
+        connection = Mock()
+        connection.execute.side_effect = sqlite3.OperationalError("database is locked")
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+            Database._migrate(connection)
 
 
 if __name__ == "__main__":

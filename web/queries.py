@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shared.sqlite import connect as connect_sqlite
+
 logger = logging.getLogger(__name__)
 
 # Use the web config.yaml path, falling back to env var, then computed default.
@@ -23,11 +25,7 @@ def init_db(db_path: str | None = None) -> None:
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return connect_sqlite(DB_PATH, row_factory=sqlite3.Row, wal=True)
 
 
 def _safe_execute(query: str, params: tuple = (), fetch: str = "all") -> Any:

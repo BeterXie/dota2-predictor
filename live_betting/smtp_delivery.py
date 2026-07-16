@@ -9,7 +9,14 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Mapping
 
-from .notifications import EVENT_FILLED, EVENT_SETTLED, OutboxRecord
+from .notifications import (
+    EVENT_FILLED,
+    EVENT_MONITOR_ALERT,
+    EVENT_SETTLED,
+    MONITOR_TEMPLATE_VERSION,
+    OutboxRecord,
+    TEMPLATE_VERSION,
+)
 
 
 SMTP_HOST = "smtp.qq.com"
@@ -52,7 +59,7 @@ _RESULT_LABELS = {
     "loss": "输",
 }
 _LEGACY_TEMPLATE_VERSION = "dota2-shadow-email-v1"
-_CURRENT_TEMPLATE_VERSION = "dota2-shadow-email-v2"
+_CURRENT_TEMPLATE_VERSION = TEMPLATE_VERSION
 
 
 class SMTPConfigurationError(RuntimeError):
@@ -86,7 +93,12 @@ class SMTPConfig:
 
 def build_message(record: OutboxRecord, config: SMTPConfig) -> EmailMessage:
     payload = record.payload
-    if record.template_version == _LEGACY_TEMPLATE_VERSION:
+    if record.template_version == MONITOR_TEMPLATE_VERSION:
+        event_label = (
+            "监控告警" if record.event_type == EVENT_MONITOR_ALERT else "监控恢复"
+        )
+        subject_text = f"[Dota 2 监控] {event_label}："
+    elif record.template_version == _LEGACY_TEMPLATE_VERSION:
         event_label = (
             "filled shadow order"
             if record.event_type == EVENT_FILLED
@@ -98,7 +110,11 @@ def build_message(record: OutboxRecord, config: SMTPConfig) -> EmailMessage:
         subject_text = f"[Dota 2 模拟] {event_label}："
     else:
         raise ValueError(f"unsupported SMTP template: {record.template_version}")
-    match = _payload_text(payload, "raybet_match_id", "unknown-match")
+    match = _payload_text(
+        payload,
+        "raybet_match_id",
+        _payload_text(payload, "title", "monitor"),
+    )
     subject = sanitize_header(f"{subject_text}{match}", "subject")
     message = EmailMessage()
     message["From"] = sanitize_header(config.sender, "sender")
@@ -112,6 +128,24 @@ def build_message(record: OutboxRecord, config: SMTPConfig) -> EmailMessage:
 def render_body(record: OutboxRecord) -> str:
     """Render only immutable stored payload; retries cannot change statistics."""
     payload = record.payload
+    if record.template_version == MONITOR_TEMPLATE_VERSION:
+        event_label = (
+            "监控告警" if record.event_type == EVENT_MONITOR_ALERT else "监控恢复"
+        )
+        source = payload.get("source", {})
+        return "\n".join(
+            (
+                "Dota 2 本机监控通知",
+                f"事件：{event_label}",
+                f"级别：{payload.get('severity', 'unknown')}",
+                f"标题：{payload.get('title', '')}",
+                f"详情：{payload.get('body', '')}",
+                f"来源：{source}",
+                f"事件编号：{payload.get('incident_id', '')}",
+                f"统计数据截止时间：{record.stats_cutoff_at.isoformat()}",
+                "",
+            )
+        )
     if record.template_version == _LEGACY_TEMPLATE_VERSION:
         lines = [
             "Dota 2 live shadow notification",

@@ -150,6 +150,35 @@ class StrategyTests(unittest.TestCase):
         rejected = attempt_fill(order, self.snapshot(NOW + timedelta(seconds=3), 1.80))
         self.assertEqual((rejected.status, rejected.rejection_reason), ("rejected", "slippage"))
 
+    def test_settled_status_five_cannot_signal_or_fill(self) -> None:
+        snapshot = self.snapshot(NOW)
+        quote = ModelQuote(
+            "m", "game", snapshot.market, 0.60, 0.50, 0.10, NOW, "v1", "frame1"
+        )
+        self.assertIsNone(
+            make_order(
+                quote,
+                self.snapshot(NOW, status=5),
+                min_edge=0.05,
+                signal_transport_key="settled-signal",
+                signal_transport_at=NOW,
+            )
+        )
+        order = make_order(
+            quote,
+            snapshot,
+            min_edge=0.05,
+            signal_transport_key="signal",
+            signal_transport_at=NOW,
+        )
+        rejected = attempt_fill(
+            order, self.snapshot(NOW + timedelta(seconds=3), status=5)
+        )
+        self.assertEqual(
+            (rejected.status, rejected.rejection_reason),
+            ("rejected", "market_closed"),
+        )
+
     def test_devig_sums_to_one(self) -> None:
         probabilities = devig([1.90, 1.95])
         self.assertAlmostEqual(sum(probabilities), 1.0)
@@ -259,8 +288,12 @@ class StorageTests(unittest.TestCase):
                         normalized_state_hash=normalized_state_hash([row]),
                         snapshots=[row],
                     )
-                self.assertTrue(store.insert_map_order(first, 1))
-                self.assertFalse(store.insert_map_order(second, 1))
+                self.assertTrue(
+                    store.insert_map_order(first, 1, strict_mapping_id=1)
+                )
+                self.assertFalse(
+                    store.insert_map_order(second, 1, strict_mapping_id=1)
+                )
                 count = store.connection.execute(
                     "SELECT COUNT(*) FROM shadow_orders"
                 ).fetchone()[0]
@@ -385,6 +418,30 @@ class AlignmentTests(unittest.TestCase):
         )
         self.assertEqual([row.reason for row in aligned], ["map_mismatch", "observation_gap"])
 
+    def test_unconfirmed_or_paused_frame_is_a_causal_barrier(self) -> None:
+        confirmed = self.observation(NOW)
+        unconfirmed = VisionObservation(
+            "m", 1, NOW + timedelta(seconds=2), None, None,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.0, 0.95, "uncertain", "game",
+        )
+        paused = VisionObservation(
+            "m", 1, NOW + timedelta(seconds=4), 604, True,
+            (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+            0.95, 0.95, "paused", "game",
+        )
+        aligned = align_snapshots(
+            [
+                (1, self.snapshot(NOW + timedelta(seconds=1))),
+                (2, self.snapshot(NOW + timedelta(seconds=3))),
+                (3, self.snapshot(NOW + timedelta(seconds=5))),
+            ],
+            [confirmed, unconfirmed, paused],
+        )
+        self.assertTrue(aligned[0].usable)
+        self.assertEqual(aligned[1].reason, "pause_state_unknown")
+        self.assertEqual(aligned[2].reason, "stream_paused")
+
 
 class ProfileTests(unittest.TestCase):
     def test_two_starter_changes_sharply_downweight_history(self) -> None:
@@ -473,6 +530,10 @@ class ComebackStrategyTests(unittest.TestCase):
                     calibration_hash="3" * 64,
                     global_calibration_passed=True,
                     global_gate_ref="test:global-passed",
+                    model_version="draft-logistic-l2-v1",
+                    model_kind="pure_draft",
+                    availability_mode="prospective",
+                    input_snapshot_hash="5" * 64,
                 )
                 for minute in (10, 20, 30, 40, 50)
             )),
@@ -580,7 +641,7 @@ class ComebackStrategyTests(unittest.TestCase):
             OddsSnapshot(
                 row.raybet_match_id, row.odds_id, row.odds_group_id,
                 row.received_at, row.price,
-                0 if row.odds_id == "duration-over" else row.status,
+                5 if row.odds_id == "duration-over" else row.status,
                 row.market, row.last_update, row.raw,
             )
             for row in current

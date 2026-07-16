@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from shared.sqlite import connect as connect_sqlite
 
 from .feature_builder import build_features
 from .output import _sanitize, format_output, save_prediction
@@ -25,8 +26,7 @@ def _load_config() -> dict:
 
 
 def _validate_team_exists(db_path: str, team_id: int) -> None:
-    import sqlite3
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     try:
         row = conn.execute("SELECT 1 FROM matches WHERE radiant_team_id = ? OR dire_team_id = ? LIMIT 1",
                            (team_id, team_id)).fetchone()

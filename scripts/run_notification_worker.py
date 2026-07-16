@@ -1,4 +1,4 @@
-"""Deliver simulation notifications from the transactional outbox."""
+"""Deliver outbox notifications with at-least-once SMTP semantics."""
 
 from __future__ import annotations
 
@@ -38,13 +38,14 @@ def run_once(store: LiveBettingStore, config: SMTPConfig) -> dict[str, object]:
         send_message(record, config)
     except Exception as error:  # noqa: BLE001 - classify without logging secrets
         transient, reason = classify_error(error)
+        failed_at = datetime.now(timezone.utc)
         updated = mark_failure(
             store.connection,
             outbox_id=record.outbox_id,
             lease_token=record.lease_token,
             transient=transient,
             reason=reason,
-            now=now,
+            now=failed_at,
         )
         if not updated:
             status = "lease_lost"
@@ -64,11 +65,12 @@ def run_once(store: LiveBettingStore, config: SMTPConfig) -> dict[str, object]:
             "updated": updated,
             "reason": reason,
         }
+    completed_at = datetime.now(timezone.utc)
     updated = mark_sent(
         store.connection,
         outbox_id=record.outbox_id,
         lease_token=record.lease_token,
-        sent_at=now,
+        sent_at=completed_at,
     )
     return {"status": "sent" if updated else "lease_lost", "outbox_id": record.outbox_id}
 
@@ -78,9 +80,13 @@ def main() -> int:
     parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
     parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
     with LiveBettingStore(args.database) as store:
-        store.init_schema()
+        if not getattr(args, "schema_prepared", False):
+            store.init_schema()
         try:
             config = SMTPConfig.from_environment()
         except SMTPConfigurationError:

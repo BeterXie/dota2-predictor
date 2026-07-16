@@ -7,17 +7,22 @@ import json
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any
 from zoneinfo import ZoneInfo
+
+from live_betting.raybet_state import raybet_match_is_live
+from live_betting.strict_eligibility import query_strict_live_eligibility
+
+from .alerts import active_alerts
 
 
 _LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
-_OPEN_MATCH_STATUSES = {"1", "5", "open", "active", "running"}
-_ENDED_MATCH_STATUSES = {"2", "ended", "finished", "settled", "closed"}
+_OPEN_MATCH_STATUSES = {"1", "2", "open", "active", "running"}
+_ENDED_MATCH_STATUSES = {"5", "ended", "finished", "settled", "closed"}
+_UPCOMING_MATCH_STATUSES = {"1", "upcoming", "scheduled", "not_started"}
 _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
     "shadow_worker": 45.0,
-    "mail_worker": 90.0,
 }
 
 
@@ -103,11 +108,14 @@ def build_monitor_snapshot(
     checked_at = _aware_utc(now or utc_now())
     health = derive_health(connection, now=checked_at)
     matches = monitor_matches(connection, now=checked_at)
+    alerts = active_alerts(connection)
     return {
         "generated_at": checked_at.isoformat(),
         "cursor": monitor_cursor(connection),
+        "mapping_revision": mapping_revision(connection),
         "health": health,
         "matches": matches,
+        "alerts": alerts,
         "summary": {
             "total": len(matches),
             "upcoming": sum(item["lifecycle"] == "upcoming" for item in matches),
@@ -119,6 +127,7 @@ def build_monitor_snapshot(
                 for item in health
                 if item["component"] in _EXPECTED_HEALTH_COMPONENTS
             ),
+            "active_alerts": len(alerts),
         },
     }
 
@@ -287,11 +296,26 @@ def monitor_cursor(connection: sqlite3.Connection) -> str:
         "vision": _max_value(connection, "vision_observations", "captured_at"),
         "decision": _max_value(connection, "strategy_decisions", "decided_at"),
         "health": _max_value(connection, "service_health", "updated_at"),
-        "mapping": _max_value(connection, "strict_live_map_mappings", "mapping_id"),
+        "mapping": mapping_revision(connection),
         "control": _max_value(connection, "monitor_control_audit", "audit_id"),
+        "alerts": _max_value(connection, "monitor_alert_audit", "audit_id"),
     }
     payload = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def mapping_revision(connection: sqlite3.Connection) -> str:
+    values = {
+        "mapping": _max_value(connection, "strict_live_map_mappings", "mapping_id"),
+        "approval": _max_value(
+            connection, "strict_live_automatic_evidence_approvals", "approval_id"
+        ),
+        "invalidation": _max_value(
+            connection, "strict_live_map_mapping_invalidations", "invalidation_id"
+        ),
+    }
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _monitor_match(
@@ -319,28 +343,23 @@ def _monitor_match(
         connection,
         """SELECT decided_at AS observed_at, map_number, model_probability,
                   market_probability, edge, eligible, reason, strategy_version
-             FROM strategy_decisions WHERE raybet_match_id=?
+             FROM strategy_decisions AS decision
+            WHERE raybet_match_id=?
+              AND NOT EXISTS (
+                  SELECT 1 FROM vision_derived_invalidations AS invalidation
+                   WHERE invalidation.dependent_type='strategy_decision'
+                     AND invalidation.dependent_key=decision.decision_key
+              )
             ORDER BY decided_at DESC LIMIT 1""",
         (match_id,),
     )
-    mapping_count = int(
-        _scalar(
-            connection,
-            "SELECT COUNT(*) FROM strict_live_map_mappings WHERE raybet_match_id=?",
-            (match_id,),
-            default=0,
-        )
-    )
+    mapping_readiness = _mapping_readiness(connection, match_id, now)
 
     odds_readiness = _freshness(latest_odds, now, warning=15.0, stale=60.0)
     vision_readiness = _freshness(latest_vision, now, warning=20.0, stale=120.0)
     if latest_vision and not bool(latest_vision["confirmed"]):
         vision_readiness["status"] = "unconfirmed"
     decision_readiness = _freshness(latest_decision, now, warning=30.0, stale=120.0)
-    mapping_readiness = {
-        "status": "ready" if mapping_count else "missing",
-        "count": mapping_count,
-    }
     shadow_health = health.get("shadow_worker", {"status": "stopped"})
     strategy_readiness = {
         "status": (
@@ -351,11 +370,14 @@ def _monitor_match(
     lifecycle = _lifecycle(
         str(row["status"] or ""),
         row["scheduled_at"],
+        row["updated_at"],
         latest_vision,
         vision_readiness,
         checked_at=now,
     )
-    current_winner = _current_winner(connection, match_id)
+    current_winner = _current_winner(
+        connection, match_id, provider_status=str(row["status"] or "")
+    )
     return {
         "raybet_match_id": match_id,
         "tournament": row["tournament"],
@@ -380,31 +402,149 @@ def _monitor_match(
     }
 
 
+def _mapping_readiness(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    try:
+        rows = connection.execute(
+            """SELECT mapping.map_number
+                 FROM strict_live_map_mappings AS mapping
+                WHERE mapping.raybet_match_id=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM strict_live_map_mapping_invalidations AS invalidation
+                       WHERE invalidation.mapping_id=mapping.mapping_id
+                  )
+                ORDER BY mapping.map_number""",
+            (raybet_match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    if not rows:
+        return {"status": "missing", "count": 0, "total_count": 0, "reasons": []}
+    results = [
+        query_strict_live_eligibility(
+            connection,
+            raybet_match_id=raybet_match_id,
+            map_number=int(row[0]),
+            transport_observed_at=now,
+        )
+        for row in rows
+    ]
+    valid_count = sum(result.eligible for result in results)
+    reasons = sorted({result.reason for result in results if not result.eligible})
+    return {
+        "status": "ready" if valid_count == len(rows) else "invalid",
+        "count": valid_count,
+        "total_count": len(rows),
+        "reasons": reasons,
+    }
+
+
 def _current_winner(
     connection: sqlite3.Connection,
     raybet_match_id: str,
+    *,
+    provider_status: str,
 ) -> dict[str, Any] | None:
-    row = connection.execute(
-        """SELECT received_at FROM odds_snapshots
-            WHERE raybet_match_id=? AND market_type='winner' AND supported=1
-            ORDER BY received_at DESC, id DESC LIMIT 1""",
-        (raybet_match_id,),
-    ).fetchone()
-    if row is None:
+    try:
+        has_transport = connection.execute(
+            """SELECT 1 FROM odds_transport_observations
+                WHERE raybet_match_id=? LIMIT 1""",
+            (raybet_match_id,),
+        ).fetchone() is not None
+        quotes = _rows(
+            connection,
+            """SELECT outcome.observation_key, outcome.odds_group_id,
+                      outcome.side, outcome.price, outcome.status,
+                      outcome.period, transport.observed_at AS received_at,
+                      outcome.odds_id AS id
+                 FROM odds_transport_observations AS transport
+                 JOIN odds_response_outcomes AS outcome
+                   ON outcome.observation_key=transport.observation_key
+                WHERE outcome.raybet_match_id=?
+                  AND outcome.market_type='winner'
+                  AND outcome.supported=1
+                  AND transport.timing_status='on_time'
+                  AND transport.processing_status='processed'
+                ORDER BY transport.observed_at DESC,
+                         transport.observation_key DESC, outcome.odds_id DESC""",
+            (raybet_match_id,),
+        )
+    except sqlite3.OperationalError:
+        has_transport = False
+        quotes = []
+    exact_responses = has_transport
+    if not exact_responses:
+        quotes = _rows(
+            connection,
+            """SELECT NULL AS observation_key, odds_group_id,
+                      side, price, status, period, received_at, id
+                 FROM odds_snapshots
+                WHERE raybet_match_id=? AND market_type='winner' AND supported=1
+                ORDER BY received_at DESC, id DESC""",
+            (raybet_match_id,),
+        )
+    if not quotes:
         return None
-    observed_at = str(row["received_at"])
-    quotes = _rows(
-        connection,
-        """SELECT side, price, status, period FROM odds_snapshots
-            WHERE raybet_match_id=? AND market_type='winner' AND supported=1
-              AND received_at=? ORDER BY id""",
-        (raybet_match_id, observed_at),
-    )
-    by_side: dict[str, sqlite3.Row] = {}
+    grouped: dict[tuple[str, str, str], dict[str, sqlite3.Row]] = defaultdict(dict)
     for quote in quotes:
         side = str(quote["side"] or "")
         if side in {"team_one", "team_two"}:
-            by_side[side] = quote
+            response_key = (
+                str(quote["observation_key"])
+                if exact_responses
+                else str(quote["received_at"])
+            )
+            key = (
+                str(quote["period"] or ""),
+                response_key,
+                str(quote["odds_group_id"] or ""),
+            )
+            grouped[key].setdefault(side, quote)
+    by_period: dict[str, tuple[str, str, dict[str, sqlite3.Row]]] = {}
+    for (period, response_key, _group_id), sides in grouped.items():
+        if set(sides) != {"team_one", "team_two"}:
+            continue
+        observed_at = str(next(iter(sides.values()))["received_at"])
+        current = by_period.get(period)
+        candidate_key = (observed_at, response_key)
+        current_key = (current[0], current[1]) if current is not None else None
+        if current_key is None or candidate_key > current_key:
+            by_period[period] = (observed_at, response_key, sides)
+    complete_periods = [
+        period
+        for period in sorted(by_period, key=_period_sort_key)
+    ]
+    if not complete_periods:
+        return {"observed_at": str(quotes[0]["received_at"]), "complete": False}
+
+    normalized_status = provider_status.casefold()
+    if normalized_status in _UPCOMING_MATCH_STATUSES and "map_1" in by_period:
+        period = "map_1"
+    elif normalized_status in _ENDED_MATCH_STATUSES:
+        settled_periods = [
+            period
+            for period in complete_periods
+            if all(
+                str(quote["status"]) == "5"
+                for quote in by_period[period][2].values()
+            )
+        ]
+        period = settled_periods[-1] if settled_periods else complete_periods[-1]
+    else:
+        unsettled_periods = [
+            period
+            for period in complete_periods
+            if not all(
+                str(quote["status"]) == "5"
+                for quote in by_period[period][2].values()
+            )
+        ]
+        period = unsettled_periods[0] if unsettled_periods else complete_periods[-1]
+
+    observed_at, _response_key, by_side = by_period[period]
     if set(by_side) != {"team_one", "team_two"}:
         return {"observed_at": observed_at, "complete": False}
     prices = {side: float(by_side[side]["price"]) for side in by_side}
@@ -414,13 +554,20 @@ def _current_winner(
     total = sum(inverse.values())
     return {
         "observed_at": observed_at,
-        "period": str(next(iter(by_side.values()))["period"]),
+        "period": period,
         "complete": True,
         "prices": prices,
         "probabilities": {
             side: round(value / total, 8) for side, value in inverse.items()
         },
     }
+
+
+def _period_sort_key(period: str) -> tuple[int, int | str]:
+    prefix, separator, suffix = period.partition("_")
+    if prefix == "map" and separator and suffix.isdigit():
+        return (0, int(suffix))
+    return (1, period)
 
 
 def _strategy_decisions(
@@ -431,12 +578,19 @@ def _strategy_decisions(
         dict(row)
         for row in _rows(
             connection,
-            """SELECT decision_key, map_number, decided_at, underdog_side,
+            """SELECT decision.decision_key, decision.map_number,
+                      decision.decided_at, decision.underdog_side,
                       market_probability, model_probability, edge, data_quality,
-                      eligible, reason, contributions_json, input_ref,
-                      strategy_version
-                 FROM strategy_decisions WHERE raybet_match_id=?
-                ORDER BY decided_at, decision_key""",
+                      eligible, decision.reason, contributions_json, input_ref,
+                      strategy_version,
+                      CASE WHEN invalidation.dependent_key IS NULL THEN 0 ELSE 1 END
+                          AS vision_invalidated
+                 FROM strategy_decisions AS decision
+                 LEFT JOIN vision_derived_invalidations AS invalidation
+                   ON invalidation.dependent_type='strategy_decision'
+                  AND invalidation.dependent_key=decision.decision_key
+                WHERE decision.raybet_match_id=?
+                ORDER BY decision.decided_at, decision.decision_key""",
             (raybet_match_id,),
         )
     ]
@@ -484,6 +638,7 @@ def _freshness(
 def _lifecycle(
     provider_status: str,
     scheduled_at: object,
+    updated_at: object,
     latest_vision: sqlite3.Row | None,
     vision_readiness: dict[str, Any],
     *,
@@ -492,6 +647,8 @@ def _lifecycle(
     normalized = provider_status.casefold()
     if normalized in _ENDED_MATCH_STATUSES:
         return "ended"
+    if raybet_match_is_live(provider_status, updated_at, now=checked_at):
+        return "live"
     if (
         latest_vision is not None
         and bool(latest_vision["confirmed"])
@@ -605,6 +762,7 @@ __all__ = [
     "build_monitor_snapshot",
     "current_markets",
     "derive_health",
+    "mapping_revision",
     "monitor_cursor",
     "monitor_match_detail",
     "monitor_matches",

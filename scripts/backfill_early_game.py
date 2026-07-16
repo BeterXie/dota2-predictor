@@ -14,7 +14,6 @@ import argparse
 import asyncio
 import logging
 import os
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -25,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fetch.client import OpenDotaClient
 from fetch.parser import parse_players
 from fetch.db import Database
+from shared.sqlite import connect as connect_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def resolve_db_path(cfg: dict) -> str:
 
 def get_pending_matches(db_path: str, limit: int | None = None) -> list[int]:
     """Get match IDs that need early-game backfill."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     rows = conn.execute(
         """SELECT match_id FROM matches
            WHERE EXISTS (SELECT 1 FROM match_players mp WHERE mp.match_id = matches.match_id)
@@ -67,7 +67,7 @@ def get_pending_matches(db_path: str, limit: int | None = None) -> list[int]:
 
 def update_player_early_game(db_path: str, match_id: int, players: list[dict]) -> int:
     """Update existing match_players rows with early-game fields."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path)
     updated = 0
     for p in players:
         conn.execute(
@@ -143,7 +143,7 @@ async def backfill(cfg: dict, limit: int | None = None) -> None:
     logger.info("Backfill complete: %d success, %d failed.", success, fail)
 
     # Stats
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     total_players = conn.execute("SELECT COUNT(*) FROM match_players").fetchone()[0]
     with_10min = conn.execute(
         "SELECT COUNT(*) FROM match_players WHERE gold_10min IS NOT NULL"

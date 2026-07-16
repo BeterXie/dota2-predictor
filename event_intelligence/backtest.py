@@ -69,6 +69,1041 @@ MODEL_KINDS = ("pure_draft", "context_adjusted")
 BACKTEST_VERSION = "strict-draft-walk-forward-v1"
 BOOTSTRAP_SAMPLES = 1_000
 CALIBRATION_BINS = 5
+DRAFT_VALIDATION_VERSION = "draft-input-lineage-v4"
+
+_DRAFT_DEPENDENCY_QUERIES = (
+    (
+        "formal_events",
+        """SELECT event_id, canonical_name, main_event_start_at
+             FROM formal_events""",
+    ),
+    (
+        "formal_map_eligibility",
+        """SELECT eligible.match_id, eligible.event_id,
+                  eligible.draft_readiness
+             FROM formal_map_eligibility AS eligible
+             WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "match_ingest_status",
+        """SELECT status.match_id, status.event_id, status.series_id,
+                  status.map_number, status.normalizer_version,
+                  status.latest_raw_artifact_id,
+                  status.latest_raw_content_hash
+             FROM match_ingest_status AS status
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "matches",
+        """SELECT match.match_id, match.start_time, match.duration,
+                  match.radiant_win, match.radiant_team_id,
+                  match.dire_team_id, match.patch
+             FROM matches AS match
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "raw_source_artifacts",
+        """SELECT artifact.artifact_id, artifact.content_hash,
+                  artifact.source, artifact.first_usable_at
+             FROM raw_source_artifacts AS artifact
+             JOIN match_ingest_status AS status
+               ON status.latest_raw_artifact_id=artifact.artifact_id
+              AND status.latest_raw_content_hash=artifact.content_hash
+             JOIN formal_map_eligibility AS eligible
+               ON eligible.match_id=status.match_id
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "raw_source_observations",
+        """SELECT observation.observation_id, observation.artifact_id,
+                  observation.content_hash, observation.first_usable_at
+             FROM raw_source_observations AS observation
+             JOIN match_ingest_status AS status
+               ON status.latest_raw_artifact_id=observation.artifact_id
+              AND status.latest_raw_content_hash=observation.content_hash
+             JOIN formal_map_eligibility AS eligible
+               ON eligible.match_id=status.match_id
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "player_map_facts",
+        """SELECT facts.match_id, facts.player_slot, facts.account_id,
+                  facts.team_id, facts.hero_id, facts.is_radiant,
+                  facts.facts_json, facts.source_content_hash,
+                  facts.fact_version, facts.first_usable_at
+             FROM player_map_facts AS facts
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "match_players",
+        """SELECT player.match_id, player.account_id, player.player_slot,
+                  player.hero_id, player.is_radiant, player.team_id
+             FROM match_players AS player
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "picks_bans",
+        """SELECT pick.id, pick.match_id, pick.hero_id, pick.is_pick,
+                  pick.team, pick.ord
+             FROM picks_bans AS pick
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "player_role_assignments",
+        """SELECT role.match_id, role.player_slot, role.account_id,
+                  role.team_id, role.purpose, role.position,
+                  role.assignment_source, role.confidence, role.input_cutoff,
+                  role.input_hash, role.assignment_version, role.created_at
+             FROM player_role_assignments AS role
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "player_map_scores",
+        """SELECT score.match_id, score.player_slot, score.execution_score,
+                  score.benchmark_cutoff, score.input_hash,
+                  score.score_version, score.created_at
+             FROM player_map_scores AS score
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+    (
+        "team_map_states",
+        """SELECT state.match_id, state.side, state.label,
+                  state.duration_seconds, state.max_lead, state.max_deficit,
+                  state.ahead_fraction, state.behind_fraction,
+                  state.even_fraction, state.signed_auc, state.absolute_auc,
+                  state.crossings_json, state.first_significant_lead_at,
+                  state.first_significant_deficit_at, state.closeout_seconds,
+                  state.objective_conversion_json, state.curve_coverage,
+                  state.source_versions_json, state.input_hash,
+                  state.label_version, state.created_at
+             FROM team_map_states AS state
+             JOIN formal_map_eligibility AS eligible USING(match_id)
+            WHERE eligible.draft_readiness='ready'""",
+    ),
+)
+_DRAFT_DEPENDENCY_TABLES = (
+    "event_registry",
+    *(
+        relation
+        for relation, _ in _DRAFT_DEPENDENCY_QUERIES
+        if relation not in {"formal_events", "formal_map_eligibility"}
+    ),
+)
+_DRAFT_ARTIFACT_TABLES = ("draft_model_runs", "draft_predictions")
+_DRAFT_TRACKED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "event_registry": (
+        "event_id",
+        "canonical_name",
+        "tier",
+        "prize_pool_usd",
+        "main_event_start_at",
+        "scope_policy_version",
+        "scope",
+        "evidence_status",
+        "approval_status",
+        "included_stages_json",
+        "excluded_categories_json",
+        "include_internal_lcq",
+        "excludes_qualifiers",
+        "excludes_division_2",
+        "excludes_exhibitions",
+        "excludes_forfeits",
+        "excludes_void_remakes",
+    ),
+    "match_ingest_status": (
+        "match_id",
+        "event_id",
+        "series_id",
+        "map_number",
+        "stage_scope",
+        "stage_in_scope",
+        "has_valid_result",
+        "is_exhibition",
+        "is_forfeit",
+        "is_void_remake",
+        "draft_readiness",
+        "latest_raw_artifact_id",
+        "latest_raw_content_hash",
+        "normalizer_version",
+    ),
+    "matches": (
+        "match_id",
+        "start_time",
+        "duration",
+        "radiant_win",
+        "radiant_team_id",
+        "dire_team_id",
+        "patch",
+    ),
+    "raw_source_artifacts": (
+        "artifact_id",
+        "content_hash",
+        "source",
+        "first_usable_at",
+    ),
+    "raw_source_observations": (
+        "observation_id",
+        "artifact_id",
+        "content_hash",
+        "first_usable_at",
+    ),
+    "match_players": (
+        "match_id",
+        "account_id",
+        "player_slot",
+        "hero_id",
+        "is_radiant",
+        "team_id",
+    ),
+    "picks_bans": ("id", "match_id", "hero_id", "is_pick", "team", "ord"),
+    "player_map_facts": (
+        "match_id",
+        "player_slot",
+        "account_id",
+        "team_id",
+        "hero_id",
+        "is_radiant",
+        "facts_json",
+        "source_content_hash",
+        "fact_version",
+        "first_usable_at",
+    ),
+    "player_role_assignments": (
+        "match_id",
+        "player_slot",
+        "account_id",
+        "team_id",
+        "purpose",
+        "position",
+        "assignment_source",
+        "confidence",
+        "input_cutoff",
+        "input_hash",
+        "assignment_version",
+        "created_at",
+    ),
+    "player_map_scores": (
+        "match_id",
+        "player_slot",
+        "execution_score",
+        "benchmark_cutoff",
+        "input_hash",
+        "score_version",
+        "created_at",
+    ),
+    "team_map_states": (
+        "match_id",
+        "side",
+        "label",
+        "duration_seconds",
+        "max_lead",
+        "max_deficit",
+        "ahead_fraction",
+        "behind_fraction",
+        "even_fraction",
+        "signed_auc",
+        "absolute_auc",
+        "crossings_json",
+        "first_significant_lead_at",
+        "first_significant_deficit_at",
+        "closeout_seconds",
+        "objective_conversion_json",
+        "curve_coverage",
+        "source_versions_json",
+        "input_hash",
+        "label_version",
+        "created_at",
+    ),
+}
+_DRAFT_TRACKING_RELATIONS = frozenset(
+    {
+        *_DRAFT_DEPENDENCY_TABLES,
+        *_DRAFT_ARTIFACT_TABLES,
+        "draft_lineage_changes",
+        "draft_lineage_revisions",
+        "draft_prediction_validations",
+        "formal_events",
+        "formal_map_eligibility",
+    }
+)
+_DRAFT_VIEW_DEFINITIONS = {
+    "formal_events": """CREATE VIEW formal_events AS
+SELECT *
+FROM event_registry
+WHERE scope = 'formal_main_event'
+  AND approval_status = 'approved'
+  AND evidence_status = 'manually_audited'
+  AND tier = 'tier_1'
+  AND prize_pool_usd >= 1000000""",
+    "formal_map_eligibility": """CREATE VIEW formal_map_eligibility AS
+SELECT
+    m.match_id,
+    m.event_id,
+    e.opendota_league_id,
+    m.stage_scope,
+    m.ingest_state,
+    m.player_readiness,
+    m.state_readiness,
+    m.draft_readiness
+FROM match_ingest_status AS m
+JOIN formal_events AS e ON e.event_id = m.event_id
+WHERE m.stage_in_scope = 1
+  AND m.has_valid_result = 1
+  AND m.is_exhibition = 0
+  AND m.is_forfeit = 0
+  AND m.is_void_remake = 0
+  AND (
+      m.stage_scope = 'main_event'
+      OR (m.stage_scope = 'internal_lcq' AND e.include_internal_lcq = 1)
+    )""",
+}
+_DRAFT_REVISION_TABLE_SQL = """CREATE TABLE draft_lineage_revisions (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
+    artifact_revision INTEGER NOT NULL CHECK (artifact_revision >= 1),
+    updated_at TEXT NOT NULL
+)"""
+_DRAFT_CHANGE_TABLE_SQL = """CREATE TABLE draft_lineage_changes (
+    dependency_revision INTEGER PRIMARY KEY CHECK (dependency_revision >= 1),
+    affected_from_unix INTEGER
+        CHECK (affected_from_unix IS NULL OR affected_from_unix > 0),
+    source_relation TEXT NOT NULL,
+    operation TEXT NOT NULL
+        CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE', 'REPAIR', 'INITIALIZE')),
+    changed_at TEXT NOT NULL
+)"""
+_DRAFT_CHANGE_GUARD_TRIGGERS = {
+    "draft_lineage_changes_no_update": """CREATE TRIGGER "draft_lineage_changes_no_update"
+BEFORE UPDATE ON draft_lineage_changes
+BEGIN
+  SELECT RAISE(ABORT, 'draft lineage changes are immutable');
+END""",
+    "draft_lineage_changes_no_delete": """CREATE TRIGGER "draft_lineage_changes_no_delete"
+BEFORE DELETE ON draft_lineage_changes
+BEGIN
+  SELECT RAISE(ABORT, 'draft lineage changes are immutable');
+END""",
+    "draft_lineage_changes_append_only": """CREATE TRIGGER "draft_lineage_changes_append_only"
+BEFORE INSERT ON draft_lineage_changes
+WHEN EXISTS (
+    SELECT 1 FROM draft_lineage_changes AS existing
+     WHERE existing.dependency_revision=NEW.dependency_revision
+) OR NEW.dependency_revision IS NOT (
+    SELECT dependency_revision FROM draft_lineage_revisions WHERE singleton=1
+)
+BEGIN
+  SELECT RAISE(ABORT, 'draft lineage changes are append-only');
+END""",
+}
+_DRAFT_NO_IMPACT_UNIX = 9_223_372_036_854_775_807
+
+
+def _normalized_sql(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _drop_schema_relation(connection: sqlite3.Connection, name: str) -> None:
+    row = connection.execute(
+        """SELECT type FROM sqlite_master
+             WHERE type IN ('table', 'view') AND name=?""",
+        (name,),
+    ).fetchone()
+    if row is not None:
+        kind = str(row[0]).upper()
+        connection.execute(f'DROP {kind} "{name}"')
+
+
+def _draft_views_are_current(connection: sqlite3.Connection) -> bool:
+    installed = {
+        str(row[0]): _normalized_sql(row[1])
+        for row in connection.execute(
+            """SELECT name, sql FROM sqlite_master
+                 WHERE type='view' AND name IN
+                       ('formal_events', 'formal_map_eligibility')"""
+        ).fetchall()
+    }
+    return all(
+        installed.get(name) == _normalized_sql(sql)
+        for name, sql in _DRAFT_VIEW_DEFINITIONS.items()
+    )
+
+
+def _draft_revision_state_is_current(connection: sqlite3.Connection) -> bool:
+    schemas = {
+        str(row[0]): _normalized_sql(row[1])
+        for row in connection.execute(
+            """SELECT name, sql FROM sqlite_master
+                 WHERE type='table' AND name IN
+                       ('draft_lineage_revisions', 'draft_lineage_changes')"""
+        ).fetchall()
+    }
+    if (
+        schemas.get("draft_lineage_revisions")
+        != _normalized_sql(_DRAFT_REVISION_TABLE_SQL)
+        or schemas.get("draft_lineage_changes")
+        != _normalized_sql(_DRAFT_CHANGE_TABLE_SQL)
+    ):
+        return False
+    try:
+        revisions = connection.execute(
+            """SELECT singleton, dependency_revision, artifact_revision
+                 FROM draft_lineage_revisions"""
+        ).fetchall()
+        changes = connection.execute(
+            """SELECT dependency_revision, affected_from_unix,
+                      source_relation, operation, changed_at
+                 FROM draft_lineage_changes
+                ORDER BY dependency_revision"""
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if not (
+        len(revisions) == 1
+        and type(revisions[0][0]) is int
+        and int(revisions[0][0]) == 1
+        and type(revisions[0][1]) is int
+        and int(revisions[0][1]) >= 1
+        and type(revisions[0][2]) is int
+        and int(revisions[0][2]) >= 1
+    ):
+        return False
+    dependency_revision = int(revisions[0][1])
+    if len(changes) != dependency_revision:
+        return False
+    for expected_revision, row in enumerate(changes, start=1):
+        affected_from = row[1]
+        if (
+            type(row[0]) is not int
+            or int(row[0]) != expected_revision
+            or (
+                affected_from is not None
+                and (type(affected_from) is not int or int(affected_from) <= 0)
+            )
+            or not isinstance(row[2], str)
+            or not str(row[2])
+            or row[3] not in {"INSERT", "UPDATE", "DELETE", "REPAIR", "INITIALIZE"}
+            or not isinstance(row[4], str)
+            or not str(row[4])
+        ):
+            return False
+    return (
+        changes[0][1] is None
+        and changes[0][2] == "__tracking__"
+        and changes[0][3] == "INITIALIZE"
+    )
+
+
+def _draft_trigger_name(kind: str, table: str, operation: str) -> str:
+    return f"draft_lineage_{kind}_{table}_{operation.lower()}"
+
+
+def draft_lineage_trigger_names() -> frozenset[str]:
+    return frozenset(_DRAFT_CHANGE_GUARD_TRIGGERS) | frozenset(
+        _draft_trigger_name(kind, table, operation)
+        for kind, tables in (
+            ("dependency", _DRAFT_DEPENDENCY_TABLES),
+            ("artifact", _DRAFT_ARTIFACT_TABLES),
+        )
+        for table in tables
+        for operation in ("INSERT", "UPDATE", "DELETE")
+    )
+
+
+def _draft_trigger_scope(table: str, operation: str) -> str:
+    def formal_event(reference: str) -> str:
+        return (
+            f"({reference}.scope='formal_main_event' "
+            f"AND {reference}.approval_status='approved' "
+            f"AND {reference}.evidence_status='manually_audited' "
+            f"AND {reference}.tier='tier_1' "
+            f"AND {reference}.prize_pool_usd>=1000000)"
+        )
+
+    def formal_status(reference: str) -> str:
+        return (
+            "EXISTS (SELECT 1 FROM event_registry AS event "
+            f"WHERE event.event_id={reference}.event_id "
+            "AND event.scope='formal_main_event' "
+            "AND event.approval_status='approved' "
+            "AND event.evidence_status='manually_audited' "
+            "AND event.tier='tier_1' AND event.prize_pool_usd>=1000000 "
+            f"AND {reference}.stage_in_scope=1 "
+            f"AND {reference}.has_valid_result=1 "
+            f"AND {reference}.is_exhibition=0 "
+            f"AND {reference}.is_forfeit=0 "
+            f"AND {reference}.is_void_remake=0 "
+            f"AND {reference}.draft_readiness='ready' "
+            f"AND ({reference}.stage_scope='main_event' OR "
+            f"({reference}.stage_scope='internal_lcq' "
+            "AND event.include_internal_lcq=1)))"
+        )
+
+    def eligible(reference: str) -> str:
+        return (
+            "EXISTS (SELECT 1 FROM formal_map_eligibility AS eligible "
+            f"WHERE eligible.match_id={reference}.match_id "
+            "AND eligible.draft_readiness='ready')"
+        )
+
+    def current_raw(reference: str) -> str:
+        return (
+            "EXISTS (SELECT 1 FROM match_ingest_status AS status "
+            "JOIN formal_map_eligibility AS eligible "
+            "ON eligible.match_id=status.match_id "
+            f"WHERE status.latest_raw_artifact_id={reference}.artifact_id "
+            f"AND status.latest_raw_content_hash={reference}.content_hash "
+            "AND eligible.draft_readiness='ready')"
+        )
+
+    if table in _DRAFT_ARTIFACT_TABLES:
+        return "1"
+    if table == "event_registry":
+        scoped = formal_event
+    elif table == "match_ingest_status":
+        scoped = formal_status
+    elif table in {"raw_source_artifacts", "raw_source_observations"}:
+        scoped = current_raw
+    else:
+        scoped = eligible
+    if operation == "INSERT":
+        return scoped("NEW")
+    if operation == "DELETE":
+        return scoped("OLD")
+    return f"({scoped('OLD')} OR {scoped('NEW')})"
+
+
+def _draft_change_impact(table: str, reference: str) -> str:
+    def valid_start(value: str) -> str:
+        return (
+            f"(CASE WHEN typeof({value})='integer' AND {value}>0 "
+            f"THEN {value} END)"
+        )
+
+    def match_cutoff(match_id: str, stored_start: str) -> str:
+        return (
+            "(SELECT MIN(candidate.affected_from) FROM ("
+            f"SELECT {valid_start(stored_start)} AS affected_from "
+            "UNION ALL "
+            "SELECT CAST(strftime('%s', prediction.prediction_cutoff) AS INTEGER) "
+            "FROM draft_predictions AS prediction "
+            f"WHERE prediction.match_id={match_id} "
+            "AND CAST(strftime('%s', prediction.prediction_cutoff) AS INTEGER)>0"
+            ") AS candidate WHERE candidate.affected_from>0)"
+        )
+
+    def status_matches_cutoff(predicate: str) -> str:
+        return (
+            "(SELECT MIN(candidate.affected_from) FROM ("
+            "SELECT match.start_time AS affected_from "
+            "FROM match_ingest_status AS status "
+            "JOIN matches AS match ON match.match_id=status.match_id "
+            f"WHERE {predicate} AND typeof(match.start_time)='integer' "
+            "AND match.start_time>0 "
+            "UNION ALL "
+            "SELECT CAST(strftime('%s', prediction.prediction_cutoff) AS INTEGER) "
+            "FROM match_ingest_status AS status "
+            "JOIN draft_predictions AS prediction "
+            "ON prediction.match_id=status.match_id "
+            f"WHERE {predicate} AND CAST(strftime('%s', "
+            "prediction.prediction_cutoff) AS INTEGER)>0"
+            ") AS candidate WHERE candidate.affected_from>0)"
+        )
+
+    if table == "event_registry":
+        related = status_matches_cutoff(
+            f"status.event_id={reference}.event_id "
+            "AND status.draft_readiness='ready' "
+            "AND status.stage_in_scope=1 "
+            "AND status.has_valid_result=1 "
+            "AND status.is_exhibition=0 "
+            "AND status.is_forfeit=0 "
+            "AND status.is_void_remake=0 "
+            "AND status.stage_scope IN ('main_event', 'internal_lcq')"
+        )
+        return f"COALESCE({related}, {_DRAFT_NO_IMPACT_UNIX})"
+    if table == "matches":
+        return match_cutoff(
+            f"{reference}.match_id",
+            f"{reference}.start_time",
+        )
+    if table == "match_ingest_status":
+        stored_start = (
+            "(SELECT match.start_time FROM matches AS match "
+            f"WHERE match.match_id={reference}.match_id "
+            "AND typeof(match.start_time)='integer' AND match.start_time>0)"
+        )
+        return match_cutoff(
+            f"{reference}.match_id",
+            f"COALESCE({stored_start}, {valid_start(f'{reference}.start_time')})",
+        )
+    if table in {"raw_source_artifacts", "raw_source_observations"}:
+        return status_matches_cutoff(
+            f"status.latest_raw_artifact_id={reference}.artifact_id "
+            f"AND status.latest_raw_content_hash={reference}.content_hash"
+        )
+    stored_start = (
+        "(SELECT match.start_time FROM matches AS match "
+        f"WHERE match.match_id={reference}.match_id "
+        "AND typeof(match.start_time)='integer' AND match.start_time>0)"
+    )
+    return match_cutoff(f"{reference}.match_id", stored_start)
+
+
+def _draft_trigger_impact(table: str, operation: str) -> str:
+    if operation == "INSERT":
+        return _draft_change_impact(table, "NEW")
+    if operation == "DELETE":
+        return _draft_change_impact(table, "OLD")
+    old_scope = _draft_trigger_scope(table, "DELETE")
+    new_scope = _draft_trigger_scope(table, "INSERT")
+    old_impact = _draft_change_impact(table, "OLD")
+    new_impact = _draft_change_impact(table, "NEW")
+    return (
+        f"CASE WHEN ({old_scope}) AND ({new_scope}) THEN "
+        f"CASE WHEN ({old_impact}) IS NULL OR ({new_impact}) IS NULL "
+        f"THEN NULL ELSE min(({old_impact}), ({new_impact})) END "
+        f"WHEN ({old_scope}) THEN ({old_impact}) ELSE ({new_impact}) END"
+    )
+
+
+def _draft_trigger_definitions(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[str, str]]:
+    definitions: dict[str, tuple[str, str]] = {}
+    for kind, tables, revision_column in (
+        ("dependency", _DRAFT_DEPENDENCY_TABLES, "dependency_revision"),
+        ("artifact", _DRAFT_ARTIFACT_TABLES, "artifact_revision"),
+    ):
+        for table in tables:
+            available_columns = tuple(
+                str(row[1])
+                for row in connection.execute(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            )
+            columns = _DRAFT_TRACKED_COLUMNS.get(table, available_columns)
+            if not available_columns or not set(columns).issubset(available_columns):
+                raise RuntimeError(f"draft lineage table has no columns: {table}")
+            changed = " OR ".join(
+                f'OLD."{column}" IS NOT NEW."{column}"' for column in columns
+            )
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                condition = _draft_trigger_scope(table, operation)
+                if operation == "UPDATE":
+                    condition = f"({condition}) AND ({changed})"
+                name = _draft_trigger_name(kind, table, operation)
+                impact = (
+                    _draft_trigger_impact(table, operation)
+                    if kind == "dependency"
+                    else None
+                )
+                change_insert = (
+                    ""
+                    if impact is None
+                    else f"""
+                           INSERT INTO draft_lineage_changes
+                               (dependency_revision, affected_from_unix,
+                                source_relation, operation, changed_at)
+                           SELECT dependency_revision, ({impact}),
+                                  '{table}', '{operation}', updated_at
+                             FROM draft_lineage_revisions
+                            WHERE singleton=1;"""
+                )
+                definitions[name] = (
+                    revision_column,
+                    f'''CREATE TRIGGER "{name}"
+                         AFTER {operation} ON "{table}"
+                         WHEN {condition}
+                         BEGIN
+                           UPDATE draft_lineage_revisions
+                              SET {revision_column}={revision_column}+1,
+                                  updated_at=strftime(
+                                      '%Y-%m-%dT%H:%M:%fZ', 'now'
+                                  )
+                            WHERE singleton=1;
+                           {change_insert}
+                         END''',
+                )
+    return definitions
+
+
+def _advance_draft_revision(
+    connection: sqlite3.Connection,
+    revision_column: str,
+) -> None:
+    connection.execute(
+        f"""UPDATE draft_lineage_revisions
+               SET {revision_column}={revision_column}+1,
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE singleton=1"""
+    )
+    if revision_column == "dependency_revision":
+        connection.execute(
+            """INSERT INTO draft_lineage_changes
+                   (dependency_revision, affected_from_unix,
+                    source_relation, operation, changed_at)
+               SELECT dependency_revision, NULL, '__schema__', 'REPAIR', updated_at
+                 FROM draft_lineage_revisions
+                WHERE singleton=1"""
+        )
+
+
+def ensure_draft_lineage_tracking(connection: sqlite3.Connection) -> None:
+    """Install narrow revision triggers once all cross-owned tables exist."""
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        existing = {
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master
+                     WHERE type IN ('table', 'view')"""
+            ).fetchall()
+        }
+        repairable = {
+            "draft_lineage_changes",
+            "draft_lineage_revisions",
+            "formal_events",
+            "formal_map_eligibility",
+        }
+        missing = sorted((_DRAFT_TRACKING_RELATIONS - repairable) - existing)
+        if missing:
+            raise RuntimeError(f"draft lineage tracking lacks relations: {missing}")
+
+        revision_repaired = not _draft_revision_state_is_current(connection)
+        if revision_repaired:
+            connection.execute("DELETE FROM draft_prediction_validations")
+            for name in draft_lineage_trigger_names():
+                connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+            _drop_schema_relation(connection, "draft_lineage_changes")
+            _drop_schema_relation(connection, "draft_lineage_revisions")
+            connection.execute(_DRAFT_REVISION_TABLE_SQL)
+            connection.execute(_DRAFT_CHANGE_TABLE_SQL)
+            connection.execute(
+                """INSERT INTO draft_lineage_revisions
+                   (singleton, dependency_revision, artifact_revision, updated_at)
+                   VALUES (1, 1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.execute(
+                """INSERT INTO draft_lineage_changes
+                       (dependency_revision, affected_from_unix,
+                        source_relation, operation, changed_at)
+                   SELECT 1, NULL, '__tracking__', 'INITIALIZE', updated_at
+                     FROM draft_lineage_revisions WHERE singleton=1"""
+            )
+
+        views_repaired = not _draft_views_are_current(connection)
+        if views_repaired:
+            _drop_schema_relation(connection, "formal_map_eligibility")
+            _drop_schema_relation(connection, "formal_events")
+            connection.execute(_DRAFT_VIEW_DEFINITIONS["formal_events"])
+            connection.execute(_DRAFT_VIEW_DEFINITIONS["formal_map_eligibility"])
+
+        definitions = _draft_trigger_definitions(connection)
+        installed = {
+            str(row[0]): "" if row[1] is None else str(row[1]).strip()
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ).fetchall()
+        }
+        repaired_revisions = (
+            {"dependency_revision"} if views_repaired else set()
+        )
+        for name, (revision_column, sql) in definitions.items():
+            if installed.get(name) == sql.strip():
+                continue
+            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+            connection.execute(sql)
+            repaired_revisions.add(revision_column)
+        for name, sql in _DRAFT_CHANGE_GUARD_TRIGGERS.items():
+            if installed.get(name) == sql.strip():
+                continue
+            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+            connection.execute(sql)
+            repaired_revisions.add("dependency_revision")
+        for revision_column in sorted(repaired_revisions):
+            _advance_draft_revision(connection, revision_column)
+        if owns_transaction:
+            connection.commit()
+    except BaseException:
+        if owns_transaction:
+            connection.rollback()
+        raise
+
+
+def draft_lineage_tracking_is_current(connection: sqlite3.Connection) -> bool:
+    try:
+        existing = {
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master
+                     WHERE type IN ('table', 'view')"""
+            ).fetchall()
+        }
+        if not _DRAFT_TRACKING_RELATIONS.issubset(existing):
+            return False
+        if not _draft_revision_state_is_current(connection):
+            return False
+        if not _draft_views_are_current(connection):
+            return False
+        definitions = _draft_trigger_definitions(connection)
+        installed = {
+            str(row[0]): "" if row[1] is None else str(row[1]).strip()
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ).fetchall()
+        }
+    except (RuntimeError, sqlite3.Error):
+        return False
+    return all(
+        installed.get(name) == sql.strip()
+        for name, (_, sql) in definitions.items()
+    ) and all(
+        installed.get(name) == sql.strip()
+        for name, sql in _DRAFT_CHANGE_GUARD_TRIGGERS.items()
+    )
+
+_DRAFT_ARTIFACT_FIELDS = (
+    "run_id",
+    "model_version",
+    "model_kind",
+    "horizon_minutes",
+    "availability_mode",
+    "training_cutoff",
+    "feature_schema_hash",
+    "configuration_json",
+    "metrics_json",
+    "run_status",
+    "match_id",
+    "prediction_cutoff",
+    "cutoff_source",
+    "input_snapshot_hash",
+    "probability",
+    "uncertainty",
+    "support",
+    "eventual_radiant_win",
+    "prediction_status",
+)
+
+
+def _fingerprint_value(value: object) -> bytes:
+    if value is None:
+        return b"N"
+    if isinstance(value, bytes):
+        return b"B" + value
+    if isinstance(value, int):
+        return b"I" + str(value).encode("ascii")
+    if isinstance(value, float):
+        return b"F" + value.hex().encode("ascii")
+    if isinstance(value, str):
+        return b"S" + value.encode("utf-8")
+    raise TypeError(f"unsupported SQLite value for draft fingerprint: {type(value)!r}")
+
+
+def _fingerprint_row(row: Sequence[object]) -> bytes:
+    encoded = bytearray()
+    for value in row:
+        field = _fingerprint_value(value)
+        encoded.extend(len(field).to_bytes(8, "big"))
+        encoded.extend(field)
+    return bytes(encoded)
+
+
+def draft_prediction_artifact_fingerprint(values: Mapping[str, object]) -> str:
+    payload = _fingerprint_row(
+        (*_DRAFT_ARTIFACT_FIELDS, *(values[field] for field in _DRAFT_ARTIFACT_FIELDS))
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def draft_prediction_artifacts(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, int], tuple[str, str]]:
+    rows = connection.execute(
+        """SELECT run.run_id, run.model_version, run.model_kind,
+                  run.horizon_minutes, run.availability_mode,
+                  run.training_cutoff, run.feature_schema_hash,
+                  run.configuration_json, run.metrics_json,
+                  run.status AS run_status, prediction.match_id,
+                  prediction.prediction_cutoff, prediction.cutoff_source,
+                  prediction.input_snapshot_hash, prediction.probability,
+                  prediction.uncertainty, prediction.support,
+                  prediction.eventual_radiant_win,
+                  prediction.status AS prediction_status
+             FROM draft_predictions AS prediction
+             JOIN draft_model_runs AS run ON run.run_id=prediction.run_id"""
+    ).fetchall()
+    result: dict[tuple[str, int], tuple[str, str]] = {}
+    for row in rows:
+        payload = dict(row)
+        key = (str(payload["run_id"]), int(payload["match_id"]))
+        result[key] = (
+            str(payload["input_snapshot_hash"]),
+            draft_prediction_artifact_fingerprint(payload),
+        )
+    return result
+
+
+def persisted_draft_artifact_fingerprint(row: PersistedRun) -> str:
+    return draft_prediction_artifact_fingerprint(
+        {
+            "run_id": row.run_id,
+            "model_version": row.model_version,
+            "model_kind": row.model_kind,
+            "horizon_minutes": row.horizon_minutes,
+            "availability_mode": row.availability_mode,
+            "training_cutoff": row.training_cutoff,
+            "feature_schema_hash": row.feature_schema_hash,
+            "configuration_json": row.configuration_json,
+            "metrics_json": row.metrics_json,
+            "run_status": row.status,
+            "match_id": row.match_id,
+            "prediction_cutoff": row.prediction_cutoff,
+            "cutoff_source": row.cutoff_source,
+            "input_snapshot_hash": row.input_snapshot_hash,
+            "probability": row.probability,
+            "uncertainty": row.uncertainty,
+            "support": row.support,
+            "eventual_radiant_win": row.eventual_radiant_win,
+            "prediction_status": row.prediction_status,
+        }
+    )
+
+
+def _dependency_fingerprint(
+    connection: sqlite3.Connection,
+    queries: Sequence[tuple[str, str]],
+) -> str:
+    digest = hashlib.sha256()
+    for relation, query in queries:
+        cursor = connection.execute(query)
+        columns = tuple(str(item[0]) for item in cursor.description or ())
+        header = _fingerprint_row((relation, *columns))
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        rows = sorted(_fingerprint_row(tuple(row)) for row in cursor.fetchall())
+        digest.update(len(rows).to_bytes(8, "big"))
+        for row in rows:
+            digest.update(len(row).to_bytes(8, "big"))
+            digest.update(row)
+    return digest.hexdigest()
+
+
+def draft_dependency_fingerprint(connection: sqlite3.Connection) -> str:
+    """Hash every current database row that can affect a draft snapshot."""
+    return _dependency_fingerprint(connection, _DRAFT_DEPENDENCY_QUERIES)
+
+
+def persist_draft_prediction_validations(
+    connection: sqlite3.Connection,
+    runs: Sequence[PersistedRun],
+    *,
+    expected_dependency_fingerprint: str,
+    expected_dependency_revision: int,
+) -> None:
+    if (
+        not isinstance(expected_dependency_fingerprint, str)
+        or len(expected_dependency_fingerprint) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_dependency_fingerprint
+        )
+    ):
+        raise ValueError("expected dependency fingerprint must be lowercase SHA-256")
+    if (
+        isinstance(expected_dependency_revision, bool)
+        or not isinstance(expected_dependency_revision, int)
+        or expected_dependency_revision < 1
+    ):
+        raise ValueError("expected dependency revision must be a positive integer")
+    if not runs:
+        return
+    ensure_draft_lineage_tracking(connection)
+    now = datetime.now(UTC).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if not draft_lineage_tracking_is_current(connection):
+            raise RuntimeError("draft lineage tracking changed while runs were rebuilding")
+        dependency_fingerprint = draft_dependency_fingerprint(connection)
+        revision_row = connection.execute(
+            """SELECT dependency_revision FROM draft_lineage_revisions
+                 WHERE singleton=1"""
+        ).fetchone()
+        if revision_row is None:
+            raise RuntimeError("draft dependency revision is unavailable")
+        dependency_revision = int(revision_row[0])
+        if dependency_revision < expected_dependency_revision:
+            raise RuntimeError("draft dependency revision moved backwards")
+        cutoffs = (
+            _parse_utc(row.prediction_cutoff, "prediction cutoff") for row in runs
+        )
+        cutoff_values = tuple(value for value in cutoffs if value is not None)
+        if len(cutoff_values) != len(runs):
+            raise RuntimeError("draft run has an invalid prediction cutoff")
+        maximum_cutoff_unix = max(int(value.timestamp()) for value in cutoff_values)
+        relevant_change = connection.execute(
+            """SELECT 1 FROM draft_lineage_changes
+                WHERE dependency_revision>?
+                  AND (affected_from_unix IS NULL OR affected_from_unix<=?)
+                LIMIT 1""",
+            (expected_dependency_revision, maximum_cutoff_unix),
+        ).fetchone()
+        if relevant_change is not None:
+            raise RuntimeError("draft dependencies changed while runs were rebuilding")
+        if (
+            dependency_revision == expected_dependency_revision
+            and dependency_fingerprint != expected_dependency_fingerprint
+        ):
+            raise RuntimeError("draft dependencies changed while runs were rebuilding")
+        artifacts = draft_prediction_artifacts(connection)
+        if any(
+            artifacts.get((row.run_id, row.match_id))
+            != (
+                row.input_snapshot_hash,
+                persisted_draft_artifact_fingerprint(row),
+            )
+            for row in runs
+        ):
+            raise RuntimeError("draft artifacts changed while runs were rebuilding")
+        connection.executemany(
+            """INSERT INTO draft_prediction_validations
+               (run_id, match_id, input_snapshot_hash, artifact_fingerprint,
+                dependency_fingerprint, dependency_revision,
+                validation_version, validated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(run_id, match_id) DO UPDATE SET
+                   input_snapshot_hash=excluded.input_snapshot_hash,
+                   artifact_fingerprint=excluded.artifact_fingerprint,
+                   dependency_fingerprint=excluded.dependency_fingerprint,
+                   dependency_revision=excluded.dependency_revision,
+                   validation_version=excluded.validation_version,
+                   validated_at=excluded.validated_at""",
+            (
+                (
+                    row.run_id,
+                    row.match_id,
+                    row.input_snapshot_hash,
+                    persisted_draft_artifact_fingerprint(row),
+                    dependency_fingerprint,
+                    dependency_revision,
+                    DRAFT_VALIDATION_VERSION,
+                    now,
+                )
+                for row in runs
+            ),
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 @dataclass(frozen=True)
@@ -1102,18 +2137,9 @@ def _style_snapshot(
     )
 
 
-def _prepare_runs(
-    corpus: DraftCorpus,
-    *,
-    min_samples: int,
-    l2_regularization: float,
-) -> tuple[
-    tuple[PersistedRun, ...],
-    tuple[SliceReport, ...],
-    tuple[EventSliceReport, ...],
-]:
+def _draft_snapshot_rows(corpus: DraftCorpus) -> tuple[_SnapshotRow, ...]:
     history = tuple(row.evidence for row in corpus.maps)
-    snapshot_rows = []
+    rows: list[_SnapshotRow] = []
     for row in sorted(
         corpus.targets,
         key=lambda value: (value.target.prediction_cutoff, value.match_id),
@@ -1126,14 +2152,34 @@ def _prepare_runs(
             radiant_style=_style_snapshot(corpus, target, target.radiant),
             dire_style=_style_snapshot(corpus, target, target.dire),
         )
-        styled_game = replace(row, target=styled_target)
-        snapshot_rows.append(
+        rows.append(
             _SnapshotRow(
-                styled_game,
+                replace(row, target=styled_target),
                 build_draft_feature_snapshot(styled_target, history),
             )
         )
-    snapshots = tuple(snapshot_rows)
+    return tuple(rows)
+
+
+def draft_snapshot_hashes(corpus: DraftCorpus) -> dict[int, str]:
+    """Rebuild current target input identities for persisted-run validation."""
+    return {
+        row.game.match_id: row.snapshot.input_hash
+        for row in _draft_snapshot_rows(corpus)
+    }
+
+
+def _prepare_runs(
+    corpus: DraftCorpus,
+    *,
+    min_samples: int,
+    l2_regularization: float,
+) -> tuple[
+    tuple[PersistedRun, ...],
+    tuple[SliceReport, ...],
+    tuple[EventSliceReport, ...],
+]:
+    snapshots = _draft_snapshot_rows(corpus)
     runs: list[PersistedRun] = []
     points: dict[tuple[str, int], list[EvaluationPoint]] = {
         (kind, horizon): [] for kind in MODEL_KINDS for horizon in HORIZONS
@@ -1543,17 +2589,43 @@ def run_strict_draft_backtest(
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
     try:
-        corpus = load_draft_corpus(
-            connection,
-            availability_mode=availability_mode,
-            assignment_version=assignment_version,
-        )
-        runs, slices, event_slices = _prepare_runs(
-            corpus,
-            min_samples=min_samples,
-            l2_regularization=float(l2_regularization),
-        )
+        expected_fingerprint = None
+        expected_revision = None
+        if not dry_run:
+            ensure_draft_lineage_tracking(connection)
+        connection.execute("BEGIN")
+        try:
+            if not dry_run:
+                expected_fingerprint = draft_dependency_fingerprint(connection)
+                revision_row = connection.execute(
+                    """SELECT dependency_revision FROM draft_lineage_revisions
+                         WHERE singleton=1"""
+                ).fetchone()
+                if revision_row is None:
+                    raise RuntimeError("draft dependency revision is unavailable")
+                expected_revision = int(revision_row[0])
+            corpus = load_draft_corpus(
+                connection,
+                availability_mode=availability_mode,
+                assignment_version=assignment_version,
+            )
+            runs, slices, event_slices = _prepare_runs(
+                corpus,
+                min_samples=min_samples,
+                l2_regularization=float(l2_regularization),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         counts = persist_runs(connection, runs, dry_run=dry_run)
+        if not dry_run:
+            persist_draft_prediction_validations(
+                connection,
+                runs,
+                expected_dependency_fingerprint=expected_fingerprint,
+                expected_dependency_revision=expected_revision,
+            )
         return BacktestReport(
             backtest_version=BACKTEST_VERSION,
             availability_mode=availability_mode.value,

@@ -85,6 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=ROOT / "data" / "reports" / "strict_event_coverage_latest.json",
     )
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
     return parser
 
 
@@ -126,9 +129,11 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
 
     storage = IntelligenceStorage(args.database)
     try:
-        storage.init_schema()
+        if not getattr(args, "schema_prepared", False):
+            storage.init_schema()
         legacy_database = Database(connection=storage.connection)
-        legacy_database.init_db()
+        if not getattr(args, "schema_prepared", False):
+            legacy_database.init_db()
         registry_impl = EventRegistry(storage)
         registry = RegistryIngestAdapter(registry_impl)
         store = SQLiteIngestAdapter(storage, registry_impl, legacy_database)
@@ -240,7 +245,7 @@ async def run(
                         error_at=failed_at,
                     )
                 except Exception:
-                    logger.exception("Failed to persist strict_ingest health")
+                    logger.exception("Failed to persist strict_ingest_worker health")
                 raise
             print(_report_json(report), flush=True)
             if direct_one_shot or args.scheduler_once:
@@ -299,7 +304,7 @@ def _record_runtime_health(
     error_text = None if error is None else str(error)
     record_health(
         runtime.health_connection,
-        "strict_ingest",
+        "strict_ingest_worker",
         status,
         heartbeat_at=heartbeat_at,
         success_at=heartbeat_at if successful else None,

@@ -31,7 +31,7 @@ def snapshot(
         "winner-group",
         observed_at,
         price,
-        5,
+        1,
         Market("winner", "map_1", side, None, side, True),
         last_update=f"{price:.2f}",
     )

@@ -157,7 +157,9 @@ class CompletedMatchFactsTests(unittest.TestCase):
         self.assertIsNone(facts.players[0].gold_at_10)
         self.assertEqual(facts.readiness.player_scoring.status, ComponentStatus.RETRYABLE)
         self.assertEqual(facts.readiness.draft_model.status, ComponentStatus.RETRYABLE)
-        self.assertEqual(facts.readiness.team_state.status, ComponentStatus.RETRYABLE)
+        self.assertEqual(
+            facts.readiness.team_state.status, ComponentStatus.UNSCORABLE
+        )
         self.assertEqual(
             facts.readiness.objective_analysis.status,
             ComponentStatus.RETRYABLE,

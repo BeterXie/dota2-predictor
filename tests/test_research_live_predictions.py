@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -20,6 +20,7 @@ from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot
 from live_betting.profiles.draft_curve import DraftCurve, DraftPoint
 from live_betting.research import (
+    _winner_quotes,
     append_research_successor_price_labels,
     manual_clock_evidence,
     record_research_prediction,
@@ -69,7 +70,7 @@ def snapshots(
             group,
             at,
             price,
-            5,
+            1,
             Market(market_type, "map_1", side, line, f"{side}:{line}", True),
         )
         for odds_id, group, market_type, side, line, price in definitions
@@ -112,6 +113,10 @@ def curve(*, global_passed: bool = True, model_hash: str = "2" * 64) -> DraftCur
                 calibration_hash="3" * 64,
                 global_calibration_passed=global_passed,
                 global_gate_ref="global-gate:passed" if global_passed else "",
+                model_version="draft-logistic-l2-v1",
+                model_kind="pure_draft",
+                availability_mode="prospective",
+                input_snapshot_hash="5" * 64,
             ),
         )
     )
@@ -143,6 +148,11 @@ class ResearchLivePredictionTests(unittest.TestCase):
         )
         self.assertEqual(status, "on_time")
         return state_hash
+
+    def test_settled_status_five_is_not_a_research_quote(self) -> None:
+        settled = [replace(row, status=5) for row in snapshots(NOW)]
+        with self.assertRaisesRegex(ValueError, "complete winner market"):
+            _winner_quotes(settled)
 
     def test_research_labels_are_append_only_and_never_create_shadow_orders(
         self,
@@ -447,6 +457,9 @@ class ResearchLivePredictionTests(unittest.TestCase):
         )))
         summary = research_summary(self.store.connection)
         self.assertEqual(len(summary["model_cohorts"]), 2)
+        self.assertTrue(all(
+            cohort["identity_complete"] for cohort in summary["model_cohorts"]
+        ))
         self.assertEqual(summary["scorable_model_results"], 2)
         self.assertIsNone(summary["model_accuracy"])
         self.assertIsNone(summary["model_brier_score"])

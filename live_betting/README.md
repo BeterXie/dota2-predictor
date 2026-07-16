@@ -108,20 +108,41 @@ python scripts/run_notification_worker.py --database data/dota2.db --once
 ```
 
 The worker uses `smtp.qq.com:465` with certificate-verified implicit TLS. A
-missing SMTP configuration reports `mail_unhealthy` and does not stop odds
+missing SMTP configuration reports `mail_degraded` and does not stop odds
 collection or shadow evaluation. Every message states that no real wager was
 placed.
 
-Run the local health/report supervisor once (safe for verification) or keep it
-running with only explicitly selected components:
+After installing code that changes the database schema, stop Web and all workers,
+then run the explicit migration phase. This is the only supervisor mode that
+takes a full online backup:
+
+```powershell
+python scripts/run_dota_shadow_service.py --migrate --once --database data/dota2.db
+```
+
+Routine verification and restarts use a read-only schema preflight:
 
 ```powershell
 python scripts/run_dota_shadow_service.py --once --database data/dota2.db
 ```
 
-The supervisor uses a single-instance lock, writes component health and strict
-coverage reports, and leaves collection, shadow, and mail workers stopped until
-their `--start-*` flags are supplied.
+To run the complete passive shadow pipeline:
+
+```powershell
+python scripts/run_dota_shadow_service.py --database data/dota2.db `
+  --start-collector --start-companion --start-shadow --start-vision `
+  --start-strict-ingest --start-postmatch `
+  --vision-jsonl data/live_betting/live_observations
+```
+
+The supervisor takes its single-instance lock and verifies exact schema versions,
+required tables, and migration-critical columns before starting workers. Routine
+starts never create a backup or mutate the schema. `--migrate` creates a verified
+SQLite online backup under `data/backups` before additive migrations;
+`--backup-dir` can place that migration snapshot on another local volume. The
+supervisor reports companion reachability plus independent strict ingest and
+post-match worker health. Components remain stopped until their `--start-*`
+flags are supplied. Add `--start-mail` only after SMTP is configured.
 
 `strategy_decisions` retains rejected decisions and their reasons. A result is
 descriptive below 100 settled shadow orders and remains provisional below 500.

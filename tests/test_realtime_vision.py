@@ -181,6 +181,17 @@ def test_clock_tracker_confirms_pause_and_rejects_invalid_clock() -> None:
     assert paused is not None and paused.is_paused
 
 
+def test_clock_tracker_recovers_only_after_confirming_a_forward_jump() -> None:
+    tracker = MapStateTracker(confirmations=2, pause_frames=2)
+    assert tracker.update(ClockReading(100, 0.95, "1:40")) is None
+    assert tracker.update(ClockReading(101, 0.95, "1:41")) is not None
+    assert tracker.update(ClockReading(130, 0.95, "2:10")) is None
+    recovered = tracker.update(ClockReading(131, 0.95, "2:11"))
+    assert recovered is not None
+    assert recovered.seconds == 131
+    assert not recovered.is_paused
+
+
 def test_black_frame_is_transition() -> None:
     state, confidence = classify_screen_state(
         np.zeros((100, 200, 3), dtype=np.uint8), CLOCK_LAYOUT
@@ -244,7 +255,13 @@ def test_draft_needs_temporal_agreement() -> None:
     reading = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.7)
     assert tracker.update(reading) is None
     confirmed = tracker.update(reading)
-    assert confirmed is not None and confirmed.confidence >= 0.9
+    assert confirmed is not None and confirmed.confidence == 0.7
+    changed = DraftReading((1, 2, 3, 4, 6), (5, 7, 8, 9, 10), 0.95)
+    assert tracker.update(changed) is None
+    switched = tracker.update(changed)
+    assert switched is not None
+    assert switched.radiant_hero_ids == changed.radiant_hero_ids
+    assert switched.confidence == 0.95
 
 
 def test_hls_capture_reads_frame() -> None:

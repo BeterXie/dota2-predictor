@@ -19,6 +19,7 @@ interface ProbabilityChartProps {
   decisions: StrategyDecision[];
   teamOne: string;
   teamTwo: string;
+  preferredPeriod?: string | null;
 }
 
 type SeriesPoint = [number, number | null];
@@ -38,15 +39,14 @@ export function ProbabilityChart({
   decisions,
   teamOne,
   teamTwo,
+  preferredPeriod,
 }: ProbabilityChartProps) {
   const periods = useMemo(
     () => Array.from(new Set(timeline.map((point) => point.period))),
     [timeline],
   );
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
-  const period = selectedPeriod && periods.includes(selectedPeriod)
-    ? selectedPeriod
-    : periods.at(-1) || null;
+  const period = resolvePeriod(periods, selectedPeriod, preferredPeriod);
   const points = useMemo(
     () => timeline.filter((point) => !period || point.period === period),
     [period, timeline],
@@ -221,4 +221,14 @@ function withGaps(
 function periodLabel(period: string): string {
   const number = period.match(/\d+/)?.[0];
   return number ? `第 ${number} 局` : period;
+}
+
+export function resolvePeriod(
+  periods: string[],
+  selectedPeriod: string | null,
+  preferredPeriod?: string | null,
+): string | null {
+  if (selectedPeriod && periods.includes(selectedPeriod)) return selectedPeriod;
+  if (preferredPeriod && periods.includes(preferredPeriod)) return preferredPeriod;
+  return periods[0] || null;
 }

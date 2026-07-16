@@ -15,6 +15,7 @@ import httpx
 import numpy as np
 
 from live_betting.raybet import SITE_URL
+from shared.sqlite import connect as connect_sqlite
 from vision.image_features import compute_phash
 from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
 
@@ -110,7 +111,7 @@ class TeamSideRecognizer:
 
     @staticmethod
     def from_database(database: Path, match_id: str) -> "TeamSideRecognizer | None":
-        connection = sqlite3.connect(database)
+        connection = connect_sqlite(database, read_only=True)
         try:
             match = connection.execute(
                 "SELECT team_one, team_two, raw_json FROM raybet_matches "

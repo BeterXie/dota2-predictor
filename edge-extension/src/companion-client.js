@@ -1,5 +1,6 @@
 const BASE_URL = "http://127.0.0.1:8765";
 const EXTENSION_VERSION = "0.1.0";
+const PROTOCOL_VERSION = 1;
 
 export class CompanionError extends Error {
   constructor(message, status = 0, code = "companion_error") {
@@ -27,6 +28,17 @@ async function parseResponse(response) {
   return payload;
 }
 
+function requireProtocolVersion(payload, response) {
+  if (payload.protocol_version !== PROTOCOL_VERSION) {
+    throw new CompanionError(
+      `Unsupported companion protocol version: ${String(payload.protocol_version)}`,
+      response.status,
+      "unsupported_protocol_version",
+    );
+  }
+  return payload;
+}
+
 export async function sendEventBatch(events, fetchImpl = fetch) {
   const body = JSON.stringify(events);
   const response = await fetchImpl(`${BASE_URL}/v1/events`, {
@@ -37,7 +49,7 @@ export async function sendEventBatch(events, fetchImpl = fetch) {
     },
     body,
   });
-  return parseResponse(response);
+  return requireProtocolVersion(await parseResponse(response), response);
 }
 
 export async function fetchCompanionStatus(fetchImpl = fetch) {
@@ -49,7 +61,11 @@ export async function fetchCompanionStatus(fetchImpl = fetch) {
     },
     body: "{}",
   });
-  return parseResponse(response);
+  return requireProtocolVersion(await parseResponse(response), response);
 }
 
-export const companionConstants = Object.freeze({BASE_URL, EXTENSION_VERSION});
+export const companionConstants = Object.freeze({
+  BASE_URL,
+  EXTENSION_VERSION,
+  PROTOCOL_VERSION,
+});

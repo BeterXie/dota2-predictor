@@ -28,6 +28,7 @@ MAX_BODY_BYTES = 1024 * 1024
 MAX_BATCH_EVENTS = 50
 AUTH_HEADERS = "Content-Type, X-Dota-Extension-Version"
 SUPPORTED_EXTENSION_VERSION = "0.1.0"
+PROTOCOL_VERSION = 1
 DEFAULT_EXTENSION_ORIGIN = os.environ.get(
     "DOTA2_BROWSER_EXTENSION_ORIGIN",
     "chrome-extension://gfccbmpmpgicjfleahjbokeifhjnemam",
@@ -123,17 +124,25 @@ def create_app(
     *,
     ingestor: BrowserEventIngestor | None = None,
     limiter: SlidingWindowRateLimiter | None = None,
+    initialize_schema: bool = True,
 ) -> FastAPI:
     config = config or CompanionConfig()
     ingestor = ingestor or BrowserEventIngestor()
     limiter = limiter or SlidingWindowRateLimiter()
     stats = RuntimeStats()
 
-    config.database.parent.mkdir(parents=True, exist_ok=True)
-    with LiveBettingStore(config.database) as store:
-        store.init_schema()
+    if initialize_schema:
+        config.database.parent.mkdir(parents=True, exist_ok=True)
+        with LiveBettingStore(config.database) as store:
+            store.init_schema()
 
-    app = FastAPI(title="Dota 2 Browser Companion", version="1.0.0", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title="Dota 2 Browser Companion",
+        version="1.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.config = config
 
     @app.middleware("http")
@@ -159,7 +168,7 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"protocol_version": 1, "state": "ok"}
+        return {"protocol_version": PROTOCOL_VERSION, "state": "ok"}
 
     @app.post("/v1/events")
     async def events(request: Request) -> Response:
@@ -188,7 +197,6 @@ def create_app(
         duplicate_count = 0
         rejection_count = 0
         with LiveBettingStore(config.database) as store:
-            store.init_schema()
             for item in raw_batch:
                 event_id = _safe_event_id(item)
                 try:
@@ -219,7 +227,9 @@ def create_app(
                     "reason": result.reason,
                 })
         stats.add(duplicates=duplicate_count, rejections=rejection_count)
-        return JSONResponse({"results": results})
+        return JSONResponse(
+            {"protocol_version": PROTOCOL_VERSION, "results": results}
+        )
 
     @app.post("/v1/status")
     async def status(request: Request) -> Response:
@@ -228,6 +238,17 @@ def create_app(
         )
         if access_error is not None:
             return access_error
+        body = await request.body()
+        if len(body) > MAX_BODY_BYTES:
+            return _error("body_too_large", 413)
+        try:
+            status_body = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            stats.add(rejections=1)
+            return _error("invalid_json", 400)
+        if type(status_body) is not dict or status_body != {}:
+            stats.add(rejections=1)
+            return _error("invalid_status_body", 400)
         with LiveBettingStore(config.database) as store:
             latest = store.connection.execute(
                 "SELECT MAX(received_at) FROM browser_events"
@@ -242,16 +263,24 @@ def create_app(
                 "SELECT COUNT(DISTINCT raybet_match_id) FROM browser_events "
                 "WHERE raybet_match_id IS NOT NULL"
             ).fetchone()[0])
+            shadow_active = store.connection.execute(
+                """SELECT 1 FROM service_health
+                    WHERE component='shadow'
+                      AND status IN ('healthy', 'degraded')
+                      AND last_heartbeat_at IS NOT NULL
+                      AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 <= 90
+                    LIMIT 1"""
+            ).fetchone() is not None
         duplicates, rejections = stats.snapshot()
         payload = {
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "latest_accepted_at": latest,
             "event_type_counts": counts,
             "duplicate_count": duplicates,
             "rejection_count": rejections,
             "known_dota_match_count": match_count,
             "database_health": "ok",
-            "shadow_strategy_active": False,
+            "shadow_strategy_active": shadow_active,
         }
         report_url = config.safe_report_url()
         if report_url:
@@ -266,14 +295,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", type=Path, default=CompanionConfig().database)
     parser.add_argument("--extension-origin", default=DEFAULT_EXTENSION_ORIGIN)
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = CompanionConfig(database=args.database, extension_origin=args.extension_origin)
-    with LiveBettingStore(config.database) as database:
-        database.init_schema()
+    if not getattr(args, "schema_prepared", False):
+        with LiveBettingStore(config.database) as database:
+            database.init_schema()
     if args.check_config:
         print(json.dumps({
             "host": HOST,
@@ -283,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 0
     print(f"Direct extension origin: {config.extension_origin}", flush=True)
-    app = create_app(config)
+    app = create_app(config, initialize_schema=False)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     return 0
 

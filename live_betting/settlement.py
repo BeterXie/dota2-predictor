@@ -16,6 +16,26 @@ class MapResult:
     first_to_kills: dict[int, str]
 
 
+def reconcile_map_winners(
+    *,
+    raybet_status: str,
+    raybet_winner: str | None,
+    opendota_winner: str | None,
+) -> tuple[str, str]:
+    """Return the fail-closed state for normalized independent map results."""
+    if raybet_status == "conflict":
+        return "manual_review", "raybet_final_conflict"
+    if raybet_status != "confirmed" or raybet_winner is None:
+        return "pending", "raybet_final_missing"
+    if raybet_winner not in {"team_one", "team_two"}:
+        return "manual_review", "raybet_winner_invalid"
+    if opendota_winner not in {"team_one", "team_two"}:
+        return "pending", "opendota_winner_missing"
+    if raybet_winner != opendota_winner:
+        return "manual_review", "winner_conflict"
+    return "confirmed", "sources_consistent"
+
+
 def _asian_return(margin: float, line: float, price: float) -> tuple[str, float]:
     adjusted = margin + line
     if line * 2 % 1 == 0:

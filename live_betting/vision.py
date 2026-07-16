@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from contracts.live_observation import SCHEMA_VERSION
+
 
 @dataclass(frozen=True)
 class VisionObservation:
@@ -38,7 +40,7 @@ class VisionObservation:
 
 
 def parse_observation(payload: dict) -> VisionObservation:
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"unsupported vision schema: {payload.get('schema_version')}")
     captured = datetime.fromisoformat(str(payload["captured_at_utc"]).replace("Z", "+00:00"))
     if captured.tzinfo is None:

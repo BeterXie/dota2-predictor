@@ -5,6 +5,8 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from shared.sqlite import configure_connection
+
 from .parser import (
     parse_chat,
     parse_gold_adv,
@@ -268,9 +270,9 @@ class Database:
             if self.db_path is None:
                 raise RuntimeError("injected database connection is unavailable")
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self.db_path)
+            self._conn = sqlite3.connect(self.db_path, timeout=5.0)
             self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
+        configure_connection(self._conn)
         return self._conn
 
     def close(self) -> None:
@@ -316,8 +318,9 @@ class Database:
         for sql in migrations:
             try:
                 conn.execute(sql)
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).casefold():
+                    raise
 
     def is_fetched(self, match_id: int) -> bool:
         conn = self.connect()

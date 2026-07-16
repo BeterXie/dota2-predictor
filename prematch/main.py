@@ -17,8 +17,17 @@ import sys
 from pathlib import Path
 
 import yaml
+from shared.sqlite import connect as connect_sqlite
 
 from .scorer import predict_match
+
+_WEIGHT_KEYS = (
+    "hero_matchup",
+    "team_form",
+    "draft_profile",
+    "player_skill",
+    "early_game",
+)
 
 
 def _load_config() -> dict:
@@ -49,8 +58,7 @@ def _parse_hero_list(raw: str, side: str) -> list[int]:
 
 
 def _validate_team_exists(db_path: str, team_id: int) -> None:
-    import sqlite3
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     try:
         row = conn.execute(
             "SELECT 1 FROM matches WHERE radiant_team_id = ? OR dire_team_id = ? LIMIT 1",
@@ -74,10 +82,18 @@ def _run_scorer(
     dire_heroes: list[int],
     db_path: str,
     predictions_dir: str,
+    weights: dict[str, float] | None = None,
 ) -> None:
     """Run prediction using the heuristic scoring system."""
     print("Computing prediction scores from hero matchups, team form, H2H...")
-    result = predict_match(db_path, radiant_id, dire_id, radiant_heroes, dire_heroes)
+    result = predict_match(
+        db_path,
+        radiant_id,
+        dire_id,
+        radiant_heroes,
+        dire_heroes,
+        weights=weights,
+    )
 
     # Output
     print(f"\n  Radiant win probability: {result['radiant_win_prob']:.2%}")
@@ -134,6 +150,21 @@ def _format_factors(result: dict) -> list[dict]:
         })
     factors.sort(key=lambda x: x["impact"], reverse=True)
     return factors
+
+
+def _parse_weights(raw: str) -> dict[str, float]:
+    """Parse the five scorer weights in the documented component order."""
+    values = [part.strip() for part in raw.split(",")]
+    if len(values) != len(_WEIGHT_KEYS):
+        raise ValueError(
+            f"--weights requires {len(_WEIGHT_KEYS)} comma-separated values "
+            f"({','.join(_WEIGHT_KEYS)})"
+        )
+    try:
+        parsed = [float(value) for value in values]
+    except ValueError as exc:
+        raise ValueError("--weights values must be numbers") from exc
+    return dict(zip(_WEIGHT_KEYS, parsed))
 
 
 def _run_ml(
@@ -200,7 +231,7 @@ def main():
     )
     parser.add_argument(
         "--weights", type=str, default=None,
-        help="Custom weights: hero_matchup,team_form,h2h,team_strength (comma-sep)",
+        help="Custom weights: hero_matchup,team_form,draft_profile,player_skill,early_game (comma-sep)",
     )
     args = parser.parse_args()
 
@@ -230,14 +261,13 @@ def main():
                 radiant_heroes, dire_heroes,
                 db_path, models_dir, predictions_dir)
     else:
-        custom_weights = None
-        if args.weights:
-            keys = ["hero_matchup", "team_form", "h2h", "team_strength"]
-            vals = [float(v) for v in args.weights.split(",")]
-            custom_weights = dict(zip(keys, vals))
+        try:
+            custom_weights = _parse_weights(args.weights) if args.weights else None
+        except ValueError as exc:
+            parser.error(str(exc))
         _run_scorer(args.radiant, args.dire, args.league,
                     radiant_heroes, dire_heroes,
-                    db_path, predictions_dir)
+                    db_path, predictions_dir, custom_weights)
 
 
 if __name__ == "__main__":

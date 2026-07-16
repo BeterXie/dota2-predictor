@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 
 from .. import queries
 from ..schemas import LeagueBase, MatchSummary, PaginatedResponse, PaginationMeta

@@ -7,7 +7,6 @@ model bundle to data/models/.
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +30,7 @@ def main() -> None:
         action="store_true",
         help="Run Optuna hyperparameter tuning (not yet implemented)",
     )
-    args = parser.parse_args()
+    parser.parse_args()
 
     # Load config
     config_path = _resolve_path("config.yaml")

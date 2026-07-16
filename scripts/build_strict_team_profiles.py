@@ -98,6 +98,7 @@ def _load_strict_maps(connection: sqlite3.Connection) -> tuple[StrictMap, ...]:
            LEFT JOIN raw_source_artifacts AS a
              ON a.artifact_id = s.latest_raw_artifact_id
             AND a.content_hash = s.latest_raw_content_hash
+          WHERE f.state_readiness IN ('ready', 'unscorable')
            ORDER BY m.start_time, f.match_id"""
     ).fetchall()
     result = []

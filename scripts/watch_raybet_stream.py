@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +15,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from contracts.live_observation import LiveObservation  # noqa: E402
+from live_betting.raybet_state import (  # noqa: E402
+    infer_current_map_number,
+    raybet_match_is_live,
+)
+from shared.sqlite import connect as connect_sqlite  # noqa: E402
 from vision.clock_reader import ClockReader  # noqa: E402
 from vision.hero_recognizer import (  # noqa: E402
     DraftReading,
@@ -30,8 +33,6 @@ from vision.stream_capture import HLSStreamCapture  # noqa: E402
 from vision.team_side import TeamSideRecognizer, TeamSideTracker  # noqa: E402
 
 
-MAP_RE = re.compile(r"map_(\d+)")
-OPEN_STATUSES = ("1", "5", "open", "active", "running")
 COMPLETION_CHECK_INTERVAL = 15
 LIVE_BETTING_DATA = ROOT / "data" / "live_betting"
 DEFAULT_OBSERVATION_DIR = LIVE_BETTING_DATA / "live_observations"
@@ -68,36 +69,13 @@ def _manual_map_number(payload: object, best_of: int | None) -> int | None:
     return map_number
 
 
-def _unique_open_map(connection: sqlite3.Connection, match_id: str) -> int | None:
-    rows = connection.execute(
-        """WITH latest AS (
-               SELECT odds_id, period, status,
-                      ROW_NUMBER() OVER (
-                          PARTITION BY odds_id
-                          ORDER BY received_at DESC, id DESC
-                      ) AS rank
-                 FROM odds_snapshots
-                WHERE raybet_match_id=? AND market_type='winner'
-           )
-           SELECT DISTINCT period FROM latest
-            WHERE rank=1 AND status IN (?, ?, ?, ?, ?)""",
-        (match_id, *OPEN_STATUSES),
-    ).fetchall()
-    maps = {
-        int(match.group(1))
-        for row in rows
-        if (match := MAP_RE.fullmatch(str(row[0]))) is not None
-    }
-    return maps.pop() if len(maps) == 1 else None
-
-
 def match_source(
     database: Path, match_id: str, map_override: int | None = None
 ) -> tuple[str, int]:
-    connection = sqlite3.connect(database)
+    connection = connect_sqlite(database, read_only=True)
     try:
         row = connection.execute(
-            "SELECT live_url, raw_json, best_of FROM raybet_matches "
+            "SELECT live_url, raw_json, best_of, status FROM raybet_matches "
             "WHERE raybet_match_id=?",
             (match_id,),
         ).fetchone()
@@ -115,8 +93,14 @@ def match_source(
                 raise ValueError("map override exceeds the configured series length")
             return str(row[0]), map_override
         map_number = _manual_map_number(payload, best_of)
-        if map_number is None:
-            map_number = _unique_open_map(connection, match_id)
+        if map_number is None and str(row[3]) == "2":
+            try:
+                map_number = infer_current_map_number(payload, best_of)
+            except ValueError as error:
+                raise ValueError(
+                    f"cannot determine a unique current map for RayBet match "
+                    f"{match_id}: {error}"
+                ) from error
         if map_number is None or (best_of is not None and map_number > best_of):
             raise ValueError(
                 f"cannot determine a unique current map for RayBet match {match_id}"
@@ -144,13 +128,16 @@ def resolve_source(
     raise ValueError("provide --url or --database")
 
 
-def match_is_complete(database: Path, match_id: str) -> bool:
-    connection = sqlite3.connect(database)
+def match_is_complete(
+    database: Path, match_id: str, *, now: datetime | None = None
+) -> bool:
+    connection = connect_sqlite(database, read_only=True)
     try:
         row = connection.execute(
-            "SELECT status FROM raybet_matches WHERE raybet_match_id=?", (match_id,)
+            "SELECT status, updated_at FROM raybet_matches WHERE raybet_match_id=?",
+            (match_id,),
         ).fetchone()
-        return bool(row and str(row[0]) == "2")
+        return not row or not raybet_match_is_live(row[0], row[1], now=now)
     finally:
         connection.close()
 
@@ -162,7 +149,9 @@ def completion_check_due(sample_count: int) -> bool:
 def _meaningful(previous: LiveObservation | None, current: LiveObservation) -> bool:
     if previous is None or previous.screen_state != current.screen_state:
         return True
-    if current.is_confirmed and not previous.is_confirmed:
+    if current.is_confirmed != previous.is_confirmed:
+        return True
+    if current.is_paused != previous.is_paused:
         return True
     if current.map_number != previous.map_number:
         return True
@@ -172,6 +161,19 @@ def _meaningful(previous: LiveObservation | None, current: LiveObservation) -> b
     ):
         return abs(current.game_clock_seconds - previous.game_clock_seconds) >= 5
     return False
+
+
+def current_frame_clock_fields(
+    confirmed_clock: ConfirmedClock | None,
+) -> tuple[int | None, bool | None, float]:
+    """Expose only a confirmation produced from the current video frame."""
+    if confirmed_clock is None:
+        return None, None, 0.0
+    return (
+        confirmed_clock.seconds,
+        confirmed_clock.is_paused,
+        confirmed_clock.confidence,
+    )
 
 
 def main() -> int:
@@ -230,6 +232,7 @@ def main() -> int:
             ):
                 break
             state, _ = classify_screen_state(frame.image)
+            confirmed_clock: ConfirmedClock | None = None
             if state == "game":
                 raw_clock = clock_reader.read(frame.image)
                 if (
@@ -249,12 +252,11 @@ def main() -> int:
                     side_tracker.reset()
                 outside_game_frames = 0
                 confirmed_clock = clock_tracker.update(raw_clock)
-                confirmed_draft = None
-                if last_draft is None:
-                    confirmed_draft = draft_tracker.update(
-                        hero_reader.read(frame.image)
-                    )
-                last_clock = confirmed_clock or last_clock
+                confirmed_draft = draft_tracker.update(
+                    hero_reader.read(frame.image)
+                )
+                if confirmed_clock is not None:
+                    last_clock = confirmed_clock
                 last_draft = confirmed_draft or last_draft
                 if radiant_team_side is None and side_reader is not None:
                     side = side_tracker.update(side_reader.read(frame.image))
@@ -265,24 +267,21 @@ def main() -> int:
             captured = datetime.fromtimestamp(frame.captured_at, timezone.utc)
             frame_name = f"{args.match_id}_{captured.strftime('%Y%m%dT%H%M%S_%fZ')}.jpg"
             frame_path = evidence_dir / frame_name
+            clock_seconds, is_paused, clock_confidence = current_frame_clock_fields(
+                confirmed_clock if state == "game" else None
+            )
             observation = LiveObservation(
                 raybet_match_id=args.match_id,
                 map_number=map_number if state == "game" else None,
                 captured_at_utc=captured,
-                game_clock_seconds=(
-                    last_clock.seconds if state == "game" and last_clock else None
-                ),
-                is_paused=(
-                    last_clock.is_paused if state == "game" and last_clock else None
-                ),
+                game_clock_seconds=clock_seconds,
+                is_paused=is_paused,
                 radiant_hero_ids=(
                     list(last_draft.radiant_hero_ids) if last_draft else []
                 ),
                 dire_hero_ids=(list(last_draft.dire_hero_ids) if last_draft else []),
                 radiant_team_side=radiant_team_side,
-                clock_confidence=(
-                    last_clock.confidence if state == "game" and last_clock else 0.0
-                ),
+                clock_confidence=clock_confidence,
                 draft_confidence=last_draft.confidence if last_draft else 0.0,
                 source_frame_ref=f"stream:{frame.source_hash}:{frame.sequence}",
                 screen_state=state,

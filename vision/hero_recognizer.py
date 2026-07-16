@@ -99,7 +99,7 @@ class HeroRecognizer:
             score = float(matrix[slot, hero_index])
             alternatives = np.delete(matrix[slot], hero_index)
             margin = score - float(alternatives.max())
-            if score < 0.60 or margin < -0.015:
+            if score < 0.62 or margin < 0.025:
                 return DraftReading((), (), score)
             ids.append(int(self.ids[hero_index]))
             confidences.append(score)
@@ -127,5 +127,5 @@ class DraftTracker:
         return DraftReading(
             reading.radiant_hero_ids,
             reading.dire_hero_ids,
-            min(0.99, 0.75 + min(row.confidence for row in self._recent) * 0.25),
+            min(row.confidence for row in self._recent),
         )

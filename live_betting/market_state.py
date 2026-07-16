@@ -7,9 +7,7 @@ from dataclasses import dataclass
 
 from .engine import price_groups
 from .models import OddsSnapshot
-
-
-_OPEN_STATUSES = {"1", "5", "open", "active", "running"}
+from .raybet_state import raybet_odds_is_open
 
 
 @dataclass(frozen=True)
@@ -48,7 +46,7 @@ def _complete_groups(
         and all(
             row.market.supported
             and row.price > 1
-            and str(row.status).lower() in _OPEN_STATUSES
+            and raybet_odds_is_open(row.status)
             for row in rows
         )
     ]

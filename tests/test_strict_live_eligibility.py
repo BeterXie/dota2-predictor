@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from event_intelligence.storage import IntelligenceStorage
@@ -15,10 +16,13 @@ from live_betting.strict_eligibility import (
     StrictMappingConflictError,
     StrictMappingError,
     accept_strict_live_map_mapping,
+    approve_automatic_exact_evidence,
     init_strict_live_eligibility_schema,
+    invalidate_strict_live_map_mapping,
     query_strict_live_eligibility,
     record_strict_live_mapping_candidate,
 )
+from web.monitoring import build_monitor_snapshot, monitor_cursor
 
 
 EVENT_ID = "pgl-wallachia-s8-2026"
@@ -228,6 +232,43 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 (mapping.mapping_id,),
             )
         self.connection.rollback()
+
+    def test_legacy_schema_migration_does_not_commit_caller_transaction(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                """CREATE TABLE strict_live_map_mappings (
+                       mapping_id INTEGER PRIMARY KEY,
+                       raybet_match_id TEXT NOT NULL,
+                       map_number INTEGER NOT NULL,
+                       UNIQUE (raybet_match_id, map_number)
+                   )"""
+            )
+            connection.execute("CREATE TABLE unrelated (value TEXT)")
+            connection.commit()
+            connection.execute("INSERT INTO unrelated VALUES ('uncommitted')")
+
+            with self.assertRaisesRegex(
+                StrictMappingError,
+                "strict_mapping_schema_migration_requires_clean_transaction",
+            ):
+                init_strict_live_eligibility_schema(connection)
+
+            self.assertTrue(connection.in_transaction)
+            connection.rollback()
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM unrelated").fetchone()[0],
+                0,
+            )
+            self.assertNotIn(
+                "automatic_exact",
+                str(connection.execute(
+                    """SELECT sql FROM sqlite_master
+                        WHERE type='table' AND name='strict_live_map_mappings'"""
+                ).fetchone()[0]),
+            )
+        finally:
+            connection.close()
 
     def test_unknown_candidate_and_fuzzy_are_never_eligible(self) -> None:
         self.assertEqual(self.query().reason, "accepted_mapping_missing")
@@ -558,6 +599,445 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
         self.assertEqual(self.connection.total_changes, before)
         self.assertEqual(json.loads(mapping.evidence_json), supplied)
+
+    def test_automatic_exact_requires_preapproved_manual_exact_evidence(self) -> None:
+        with self.assertRaisesRegex(
+            StrictMappingError, "automatic_exact_evidence_not_preapproved"
+        ):
+            self.accept(map_number=2, acceptance_mode="automatic_exact")
+
+        manual = self.accept(map_number=1)
+        approval_id = approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=manual.mapping_id,
+            approved_by="operator-b",
+            approved_at=ACCEPTED_AT,
+        )
+        automatic = self.accept(
+            map_number=2,
+            acceptance_mode="automatic_exact",
+            accepted_by="automatic-mapper",
+        )
+
+        self.assertGreater(approval_id, 0)
+        self.assertEqual(automatic.acceptance_mode, "automatic_exact")
+        self.assertEqual(automatic.automatic_approval_id, approval_id)
+        self.assertTrue(self.query(map_number=2).eligible)
+        self.assertEqual(
+            self.query(map_number=2).mapping_refs["strict_mapping_acceptance_mode"],
+            "automatic_exact",
+        )
+
+    def test_monitor_cursor_tracks_mapping_approval_and_invalidation(self) -> None:
+        mapping = self.accept()
+        before_approval = build_monitor_snapshot(
+            self.connection, now=RECORDED_AT
+        )
+
+        approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=mapping.mapping_id,
+            approved_by="operator-b",
+            approved_at=ACCEPTED_AT,
+        )
+        after_approval = build_monitor_snapshot(self.connection, now=RECORDED_AT)
+
+        self.assertNotEqual(before_approval["cursor"], after_approval["cursor"])
+        self.assertNotEqual(
+            before_approval["mapping_revision"], after_approval["mapping_revision"]
+        )
+        before_invalidation = monitor_cursor(self.connection)
+        invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            reason="mapping evidence was withdrawn",
+            invalidated_by="operator-c",
+            invalidated_at=RECORDED_AT,
+        )
+        self.assertNotEqual(before_invalidation, monitor_cursor(self.connection))
+
+    def test_automatic_request_cannot_reuse_manual_mapping_as_idempotent(self) -> None:
+        manual = self.accept()
+
+        with self.assertRaisesRegex(
+            StrictMappingError, "automatic_exact_evidence_not_preapproved"
+        ):
+            self.accept(acceptance_mode="automatic_exact")
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM strict_live_map_mappings"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            tuple(self.connection.execute(
+                """SELECT match_method, decision, reason
+                     FROM strict_live_map_mapping_audit ORDER BY audit_id DESC LIMIT 1"""
+            ).fetchone()),
+            (
+                "automatic_exact",
+                "rejected",
+                "automatic_exact_evidence_not_preapproved",
+            ),
+        )
+        self.assertEqual(manual.acceptance_mode, "manual_exact")
+
+    def test_automatic_idempotency_requires_same_approval_lineage(self) -> None:
+        manual = self.accept(map_number=1)
+        approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=manual.mapping_id,
+            approved_by="operator-b",
+            approved_at=ACCEPTED_AT,
+        )
+        automatic = self.accept(
+            map_number=2,
+            acceptance_mode="automatic_exact",
+            accepted_by="automatic-mapper",
+        )
+        repeated = self.accept(
+            map_number=2,
+            acceptance_mode="automatic_exact",
+            accepted_by="automatic-mapper",
+        )
+        self.assertEqual(repeated, automatic)
+
+        invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=manual.mapping_id,
+            reason="replace approval source",
+            invalidated_by="operator-c",
+            invalidated_at=RECORDED_AT,
+        )
+        replacement = self.accept(map_number=1, accepted_by="operator-d")
+        approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=replacement.mapping_id,
+            approved_by="operator-e",
+            approved_at=ACCEPTED_AT,
+        )
+
+        with self.assertRaisesRegex(
+            StrictMappingConflictError, "accepted_mapping_rebind_forbidden"
+        ):
+            self.accept(
+                map_number=2,
+                acceptance_mode="automatic_exact",
+                accepted_by="automatic-mapper",
+            )
+
+    def test_source_invalidation_flags_automatic_mapping_dependents(self) -> None:
+        manual = self.accept(map_number=1)
+        approve_automatic_exact_evidence(
+            self.connection,
+            source_mapping_id=manual.mapping_id,
+            approved_by="operator-b",
+            approved_at=ACCEPTED_AT,
+        )
+        automatic = self.accept(
+            map_number=2,
+            acceptance_mode="automatic_exact",
+            accepted_by="automatic-mapper",
+        )
+        self.connection.execute(
+            """INSERT INTO strategy_decisions VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "decision-map-2", "match-1", 2, RECORDED_AT.isoformat(),
+                "team_one", 0.4, 0.5, 0.1, 1.0, 1, "test",
+                json.dumps({"__inputs__": {"strict_live_eligibility": {
+                    "mapping_refs": {"strict_mapping_id": automatic.mapping_id}
+                }}}),
+                "input-ref", "test-version",
+            ),
+        )
+        self.connection.commit()
+
+        invalidation_id = invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=manual.mapping_id,
+            reason="source evidence was withdrawn",
+            invalidated_by="operator-c",
+            invalidated_at=RECORDED_AT,
+        )
+        self.connection.execute(
+            """INSERT INTO strategy_decisions VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "decision-map-2-late", "match-1", 2, RECORDED_AT.isoformat(),
+                "team_one", 0.4, 0.5, 0.1, 1.0, 1, "test",
+                json.dumps({"__inputs__": {"strict_live_eligibility": {
+                    "mapping_refs": {"strict_mapping_id": automatic.mapping_id}
+                }}}),
+                "input-ref-late", "test-version",
+            ),
+        )
+        self.connection.commit()
+
+        result = self.query(map_number=2)
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "automatic_exact_approval_invalidated")
+        self.assertEqual(
+            {tuple(row) for row in self.connection.execute(
+                """SELECT mapping_id, invalidation_id, dependent_type, dependent_key
+                     FROM strict_live_mapping_impacts"""
+            )},
+            {
+                (
+                    automatic.mapping_id,
+                    invalidation_id,
+                    "strategy_decision",
+                    "decision-map-2",
+                ),
+                (
+                    automatic.mapping_id,
+                    invalidation_id,
+                    "strategy_decision",
+                    "decision-map-2-late",
+                ),
+            },
+        )
+
+    def test_late_direct_dependents_after_invalidation_are_flagged(self) -> None:
+        mapping = self.accept()
+        invalidation_id = invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            reason="mapping invalidated before output commit",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+        mapping_inputs = {"__inputs__": {"strict_live_eligibility": {
+            "mapping_refs": {"strict_mapping_id": mapping.mapping_id}
+        }}}
+        self.connection.execute(
+            """INSERT INTO strategy_decisions VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "late-decision", "match-1", 1, RECORDED_AT.isoformat(),
+                "team_one", 0.4, 0.5, 0.1, 1.0, 1, "test",
+                json.dumps(mapping_inputs), "late-input", "test-version",
+            ),
+        )
+        self.connection.execute(
+            """INSERT INTO odds_transport_observations
+               (observation_key, source, source_event_id, raybet_match_id,
+                observed_at, normalized_state_hash, timing_status,
+                processing_status, normalized_change_count)
+               VALUES (?, 'direct', NULL, ?, ?, ?, 'on_time', 'processed', 0)""",
+            (
+                "late-transport",
+                "match-1",
+                RECORDED_AT.isoformat(),
+                "a" * 64,
+            ),
+        )
+        self.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "late-order", "match-1", mapping.mapping_id, "odds-1",
+                "winner|map_1|team_one|", RECORDED_AT.isoformat(), 0.5, 0.4,
+                2.5, "late-transport", RECORDED_AT.isoformat(),
+                (RECORDED_AT + timedelta(seconds=15)).isoformat(),
+                "group-1", "team_one", 1, 1.0, "pending",
+            ),
+        )
+        self.connection.commit()
+        prediction = SimpleNamespace(
+            prediction_key="late-prediction",
+            schema_version="research-live-v1",
+            raybet_match_id="match-1",
+            map_number=1,
+            observed_at=RECORDED_AT,
+            game_clock_seconds=600,
+            game_minute=10.0,
+            selected_side="team_one",
+            market_probability=0.5,
+            market_price=2.0,
+            raw_model_probability=0.5,
+            feature_hash=None,
+            model_hash=None,
+            calibration_hash=None,
+            transport_key="late-transport",
+            transport_hash="a" * 64,
+            radiant_hero_ids=(1, 2, 3, 4, 5),
+            dire_hero_ids=(6, 7, 8, 9, 10),
+            radiant_team_side="team_one",
+            strict_mapping_id=mapping.mapping_id,
+            clock_source="vision",
+            clock_trust="trusted_vision",
+            manual_clock_event_id=None,
+            manual_clock_seconds=None,
+            manual_clock_trust="not_observed",
+            manual_clock_validation="not_observed",
+            actionability="research_only",
+            gate_status="failed",
+            gate_failures=("mapping_invalidated",),
+            input_context_hash="b" * 64,
+            created_at=RECORDED_AT,
+        )
+        with LiveBettingStore(self.path) as store:
+            self.assertTrue(store.insert_research_prediction(prediction))
+
+        self.assertEqual(
+            {tuple(row) for row in self.connection.execute(
+                """SELECT mapping_id, invalidation_id, dependent_type, dependent_key
+                     FROM strict_live_mapping_impacts"""
+            )},
+            {
+                (
+                    mapping.mapping_id,
+                    invalidation_id,
+                    "strategy_decision",
+                    "late-decision",
+                ),
+                (
+                    mapping.mapping_id,
+                    invalidation_id,
+                    "research_prediction",
+                    "late-prediction",
+                ),
+                (
+                    mapping.mapping_id,
+                    invalidation_id,
+                    "shadow_order",
+                    "late-order",
+                ),
+            },
+        )
+
+    def test_invalidation_is_append_only_and_flags_dependent_outputs(self) -> None:
+        mapping = self.accept()
+        mapping_refs = {"strict_mapping_id": mapping.mapping_id}
+        self.connection.execute(
+            """INSERT INTO strategy_decisions VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "decision-1", "match-1", 1, RECORDED_AT.isoformat(), "team_one",
+                0.4, 0.5, 0.1, 1.0, 1, "test",
+                json.dumps({"__inputs__": {"strict_live_eligibility": {
+                    "mapping_refs": mapping_refs
+                }}}),
+                "input-ref", "test-version",
+            ),
+        )
+        self.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at,
+                model_probability, market_probability, signal_price,
+                signal_transport_key, signal_transport_at, expires_at,
+                signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "order-1", "match-1", mapping.mapping_id, "odds-1",
+                "winner|map_1|team_one|",
+                RECORDED_AT.isoformat(), 0.5, 0.4, 2.5, "transport-1",
+                RECORDED_AT.isoformat(), (RECORDED_AT + timedelta(seconds=10)).isoformat(),
+                "group-1", "team_one", 1, 1.0, "pending",
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)",
+            ("match-1", 1, "order-1", "pending", RECORDED_AT.isoformat()),
+        )
+        self.connection.commit()
+
+        invalidation_id = invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            reason="operator corrected canonical identity",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+
+        result = self.query()
+        self.assertGreater(invalidation_id, 0)
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "mapping_invalidated")
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM strict_live_map_mappings").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            {tuple(row) for row in self.connection.execute(
+                "SELECT dependent_type, dependent_key FROM strict_live_mapping_impacts"
+            )},
+            {("strategy_decision", "decision-1"), ("shadow_order", "order-1")},
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            self.connection.execute(
+                "UPDATE strict_live_map_mapping_invalidations SET reason='changed'"
+            )
+        self.connection.rollback()
+
+        replacement = self.accept(accepted_by="operator-c")
+        self.assertNotEqual(replacement.mapping_id, mapping.mapping_id)
+        self.assertTrue(self.query().eligible)
+        self.assertEqual(
+            tuple(self.connection.execute(
+                """SELECT previous_mapping_id, replacement_mapping_id
+                     FROM strict_live_map_mapping_supersessions"""
+            ).fetchone()),
+            (mapping.mapping_id, replacement.mapping_id),
+        )
+
+    def test_replacement_invalidation_does_not_claim_prior_shadow_order(self) -> None:
+        original = self.accept()
+        self.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "original-order", "match-1", original.mapping_id, "odds-1",
+                "winner|map_1|team_one|", RECORDED_AT.isoformat(), 0.5, 0.4,
+                2.5, "transport-original", RECORDED_AT.isoformat(),
+                (RECORDED_AT + timedelta(seconds=15)).isoformat(),
+                "group-1", "team_one", 1, 1.0, "pending",
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)",
+            ("match-1", 1, "original-order", "pending", RECORDED_AT.isoformat()),
+        )
+        self.connection.commit()
+        original_invalidation = invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=original.mapping_id,
+            reason="replace original mapping",
+            invalidated_by="operator-b",
+            invalidated_at=RECORDED_AT,
+        )
+        replacement = self.accept(accepted_by="operator-c")
+
+        invalidate_strict_live_map_mapping(
+            self.connection,
+            mapping_id=replacement.mapping_id,
+            reason="replace the replacement mapping",
+            invalidated_by="operator-d",
+            invalidated_at=RECORDED_AT,
+        )
+
+        self.assertEqual(
+            [tuple(row) for row in self.connection.execute(
+                """SELECT mapping_id, invalidation_id, dependent_key
+                     FROM strict_live_mapping_impacts
+                    WHERE dependent_type='shadow_order'"""
+            )],
+            [(original.mapping_id, original_invalidation, "original-order")],
+        )
 
 
 if __name__ == "__main__":

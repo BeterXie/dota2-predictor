@@ -26,7 +26,6 @@ from event_intelligence.benchmarks import (  # noqa: E402
     build_benchmark_snapshot,
 )
 from event_intelligence.player_scoring import (  # noqa: E402
-    SCORE_VERSION,
     PlayerMapScore,
     PlayerScoreInput,
     ResidualAdjustments,
@@ -885,12 +884,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--assignment-version", help="pin observed-position version")
     parser.add_argument("--min-samples", type=_positive_int, default=5)
     parser.add_argument("--dry-run", action="store_true", help="compute without writes")
-    parser.add_argument(
-        "--score-version",
-        choices=(SCORE_VERSION,),
-        default=SCORE_VERSION,
-        help="immutable scoring algorithm version",
-    )
     return parser
 
 

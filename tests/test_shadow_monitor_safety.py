@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +14,7 @@ from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
-from live_betting.shadow_monitor import run_once
+from live_betting.shadow_monitor import _observation, run_once
 from live_betting.storage import LiveBettingStore
 from live_betting.strict_eligibility import (
     accept_strict_live_map_mapping,
@@ -80,7 +82,7 @@ def mapping_evidence() -> dict[str, object]:
     }
 
 
-def snapshots(at: datetime, *, status: int = 5) -> list[OddsSnapshot]:
+def snapshots(at: datetime, *, status: int = 1) -> list[OddsSnapshot]:
     return [
         OddsSnapshot(
             "match-1", "winner-one", "winner-group", at, 2.8, status,
@@ -95,7 +97,7 @@ def snapshots(at: datetime, *, status: int = 5) -> list[OddsSnapshot]:
     ]
 
 
-def complete_snapshots(at: datetime, *, status: int = 5) -> list[OddsSnapshot]:
+def complete_snapshots(at: datetime, *, status: int = 1) -> list[OddsSnapshot]:
     rows = snapshots(at, status=status)
     for odds_id, group, market_type, side, line in (
         ("kh-one", "kh-group", "kill_handicap", "team_one", -5.5),
@@ -150,7 +152,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         self.directory.cleanup()
 
     def record_transport(
-        self, at: datetime, *, key: str, status: int = 5,
+        self, at: datetime, *, key: str, status: int = 1,
         rows: list[OddsSnapshot] | None = None,
     ) -> list[OddsSnapshot]:
         rows = rows or snapshots(at, status=status)
@@ -184,7 +186,9 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             signal_outcome_key=signal.market.outcome_key,
             signal_identity_verified=True,
         )
-        self.assertTrue(self.store.insert_map_order(order, 1))
+        self.assertTrue(
+            self.store.insert_map_order(order, 1, strict_mapping_id=1)
+        )
 
     def test_pending_fill_is_processed_without_any_vision(self) -> None:
         self.insert_pending(NOW)
@@ -203,7 +207,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def test_pending_rejection_is_processed_without_fresh_vision(self) -> None:
         self.insert_pending(NOW)
-        self.record_transport(NOW + timedelta(seconds=2), key="closed", status=0)
+        self.record_transport(NOW + timedelta(seconds=2), key="closed", status=5)
 
         result = run_once(
             self.store, Mock(), MISSING_VISION,
@@ -249,6 +253,60 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "waiting_for_fresh_odds")
         strategy.evaluate.assert_not_called()
+
+    def test_persisted_invalidation_cannot_be_reconfirmed_from_payload_fields(self) -> None:
+        self.store.insert_vision_observation(observation(NOW))
+        self.store.connection.execute(
+            "UPDATE vision_observations SET confirmed=0 WHERE source_frame_ref='frame'"
+        )
+        row = self.store.connection.execute(
+            "SELECT * FROM vision_observations WHERE source_frame_ref='frame'"
+        ).fetchone()
+        self.assertFalse(_observation(row).is_confirmed)
+
+    def test_cross_session_draft_conflict_freezes_the_map(self) -> None:
+        original = observation(NOW, frame="original")
+        conflicting = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=1),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+            source_frame_ref="conflict",
+        )
+        after_conflict = replace(
+            original,
+            captured_at=NOW + timedelta(seconds=2),
+            source_frame_ref="after-conflict",
+        )
+
+        self.assertTrue(self.store.insert_vision_observation(original))
+        self.assertTrue(self.store.insert_vision_observation(conflicting))
+        self.assertTrue(self.store.insert_vision_observation(after_conflict))
+
+        rows = self.store.connection.execute(
+            """SELECT source_frame_ref, confirmed FROM vision_observations
+                 ORDER BY captured_at"""
+        ).fetchall()
+        self.assertEqual(
+            [(str(row[0]), int(row[1])) for row in rows],
+            [("original", 1), ("conflict", 0), ("after-conflict", 0)],
+        )
+        anchor = self.store.connection.execute(
+            "SELECT status, conflict_at FROM vision_draft_anchors"
+        ).fetchone()
+        self.assertEqual(anchor["status"], "conflict")
+        self.assertIsNotNone(anchor["conflict_at"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM vision_draft_conflicts"
+            ).fetchone()[0],
+            2,
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            self.store.connection.execute(
+                "UPDATE vision_draft_anchors SET draft_hash=?",
+                ("0" * 64,),
+            )
 
     def test_transport_uses_latest_prior_vision_not_a_future_frame(self) -> None:
         self.store.insert_vision_observation(observation(NOW, frame="old"))
@@ -438,6 +496,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         def fake_draft(
             _connection: object, _radiant: tuple[int, ...],
             _dire: tuple[int, ...], as_of: int,
+            **_target: object,
         ) -> DraftCurve:
             draft_times.append(as_of)
             return DraftCurve((DraftPoint(
@@ -448,6 +507,10 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 calibration_hash="3" * 64,
                 global_calibration_passed=True,
                 global_gate_ref="test:global-passed",
+                model_version="draft-logistic-l2-v1",
+                model_kind="pure_draft",
+                availability_mode="prospective",
+                input_snapshot_hash="5" * 64,
             ),))
 
         strategy.fake_profiles = fake_profiles

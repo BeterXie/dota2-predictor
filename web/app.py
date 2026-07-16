@@ -1,17 +1,30 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import threading
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from . import queries
-from .routers import heroes, leagues, matches, monitor, teams
+from . import alerts, monitoring, queries
+from .routers import (
+    control,
+    heroes,
+    intelligence,
+    leagues,
+    mappings,
+    matches,
+    monitor,
+    teams,
+)
 from .schemas import H2HComparison, MatchSummary, PrematchRequest, PredictionRequest, TeamBase
 
 # Resolve paths for the prediction module
@@ -29,6 +42,7 @@ if _project_root_str not in sys.path:
 _prediction_module = None
 _fetch_process: subprocess.Popen[bytes] | None = None
 _fetch_process_lock = threading.Lock()
+_alert_task: asyncio.Task[None] | None = None
 
 
 def _get_prediction_module():
@@ -39,10 +53,29 @@ def _get_prediction_module():
     return _prediction_module
 
 
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    global _alert_task
+    connection = queries.get_db()
+    try:
+        alerts.init_alert_schema(connection)
+    finally:
+        connection.close()
+    _alert_task = asyncio.create_task(_alert_reconciliation_loop())
+    try:
+        yield
+    finally:
+        _alert_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _alert_task
+        _alert_task = None
+
+
 app = FastAPI(
     title="Dota 2 Predictor API",
     description="REST API for Dota 2 match data, team stats, and predictions.",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 
 app.include_router(matches.router)
@@ -50,6 +83,24 @@ app.include_router(teams.router)
 app.include_router(heroes.router)
 app.include_router(leagues.router)
 app.include_router(monitor.router)
+app.include_router(control.router)
+app.include_router(mappings.router)
+app.include_router(intelligence.router)
+
+
+async def _alert_reconciliation_loop() -> None:
+    await asyncio.sleep(1)
+    while True:
+        try:
+            connection = queries.get_db()
+            try:
+                health = monitoring.derive_health(connection)
+                alerts.reconcile_alerts(connection, health=health)
+            finally:
+                connection.close()
+        except Exception:
+            logging.getLogger("web.alerts").exception("alert reconciliation failed")
+        await asyncio.sleep(5)
 
 # ---- Hero grid endpoint (for pre-match hero picker) ----
 
@@ -144,6 +195,11 @@ def serve_index():
     if index_path.exists():
         return HTMLResponse(index_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>Dota 2 Predictor</h1><p>index.html not found.</p>")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.get("/monitor", include_in_schema=False)

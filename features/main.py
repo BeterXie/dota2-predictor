@@ -163,7 +163,8 @@ def run(db_path: str, features_dir: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Feature engine")
     parser.add_argument("--force", action="store_true", help="Force rebuild")
-    args = parser.parse_args()
+    # The pipeline always rewrites its outputs; keep --force for CLI compatibility.
+    parser.parse_args()
 
     config = _load_config()
     db_path = config.get("database", "data/dota2.db")

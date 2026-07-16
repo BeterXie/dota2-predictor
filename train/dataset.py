@@ -4,13 +4,12 @@ Reads data/features/*.parquet, pivots/aggregates to one row per match,
 imputes missing values, and provides time-based train/test splits.
 """
 
-import sqlite3
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from shared.sqlite import connect as connect_sqlite
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import TimeSeriesSplit
 
 
 def _read_parquet(path: str) -> pd.DataFrame:
@@ -62,7 +61,6 @@ def _aggregate_hero_features(hero_df: pd.DataFrame) -> pd.DataFrame:
     if hero_df.empty:
         return pd.DataFrame()
 
-    id_cols = ["match_id", "hero_id", "player_slot", "team_id", "role"]
     agg_cols = [
         "kills", "deaths", "assists", "gpm", "xpm", "net_worth",
         "last_hits", "denies", "hero_damage", "hero_healing", "tower_damage",
@@ -221,7 +219,7 @@ def build_training_data(
 
 def _get_start_times(db_path: str, match_ids: list[int]) -> pd.Series:
     """Fetch match start_times from the database."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     try:
         placeholders = ",".join("?" for _ in match_ids)
         rows = conn.execute(

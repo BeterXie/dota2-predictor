@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from live_betting.browser_companion import MAX_BODY_BYTES, CompanionConfig, create_app
 from live_betting.browser_contract import payload_sha256
+from live_betting.health import record_health
+from live_betting.storage import LiveBettingStore
 
 
 ORIGIN = "chrome-extension://" + "a" * 32
@@ -79,8 +82,9 @@ class BrowserCompanionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        self.database = root / "test.db"
         self.app = create_app(
-            CompanionConfig(database=root / "test.db", extension_origin=ORIGIN)
+            CompanionConfig(database=self.database, extension_origin=ORIGIN)
         )
         self.client = TestClient(self.app)
 
@@ -100,6 +104,7 @@ class BrowserCompanionTests(unittest.TestCase):
             self.client.get("/health").json(),
             {"protocol_version": 1, "state": "ok"},
         )
+        self.assertEqual(self.client.get("/openapi.json").status_code, 404)
         response = self.client.options("/v1/events", headers={"Origin": ORIGIN})
         self.assertEqual(response.status_code, 204)
         self.assertEqual(response.headers["access-control-allow-origin"], ORIGIN)
@@ -119,6 +124,7 @@ class BrowserCompanionTests(unittest.TestCase):
             "/v1/events", content=body, headers=self.headers(content_type=True)
         )
         self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["protocol_version"], 1)
         self.assertEqual(first.json()["results"][0]["status"], "accepted")
         second = self.client.post(
             "/v1/events", content=body, headers=self.headers(content_type=True)
@@ -133,6 +139,28 @@ class BrowserCompanionTests(unittest.TestCase):
         self.assertEqual(status.json()["duplicate_count"], 1)
         self.assertEqual(status.json()["known_dota_match_count"], 1)
         self.assertEqual(self.client.get("/v1/status").status_code, 405)
+
+    def test_status_requires_empty_json_and_reports_fresh_shadow(self) -> None:
+        for body in (b"", b"[]", b'{"unexpected":true}', b"null", b"not-json"):
+            response = self.client.post(
+                "/v1/status", content=body, headers=self.headers(content_type=True)
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+
+        now = datetime.now(timezone.utc)
+        with LiveBettingStore(self.database) as store:
+            record_health(
+                store.connection,
+                "shadow",
+                "healthy",
+                heartbeat_at=now,
+                success_at=now,
+            )
+        response = self.client.post(
+            "/v1/status", content=b"{}", headers=self.headers(content_type=True)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["shadow_strategy_active"])
 
     def test_origin_and_version_are_required(self) -> None:
         body = json.dumps([browser_event()], separators=(",", ":")).encode()

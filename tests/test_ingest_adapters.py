@@ -12,7 +12,12 @@ from unittest.mock import patch
 
 from event_intelligence.benchmarks import BENCHMARK_VERSION
 from event_intelligence.facts import extract_completed_match_facts
-from event_intelligence.incremental import SCORE_VERSION, StrictDerivedPipeline
+from event_intelligence.incremental import (
+    ROLE_VERSION,
+    SCORE_VERSION,
+    StrictDerivedPipeline,
+    current_derived_scopes,
+)
 from event_intelligence.ingest import (
     MATCH_PROCESSOR_VERSION,
     IngestReport,
@@ -28,6 +33,8 @@ from event_intelligence.opendota import OpenDotaAdapter
 from event_intelligence.registry import EventRegistry
 from event_intelligence.scheduler import ScheduleRun, SchedulerRetryState
 from event_intelligence.storage import IntelligenceStorage
+from event_intelligence.team_profiles import PROFILE_VERSION
+from event_intelligence.team_states import LABEL_VERSION
 from fetch.db import Database
 from scripts.run_strict_event_ingest import (
     Runtime,
@@ -548,12 +555,20 @@ class IngestAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "benchmark version mismatch"):
                 pipeline._verify_derived(connection, sources)
             connection.execute(
+                """UPDATE player_map_scores
+                      SET explanation_json=json_set(
+                          explanation_json, '$.benchmark_version', ?)
+                    WHERE match_id=8001 AND player_slot=0""",
+                (BENCHMARK_VERSION,),
+            )
+            connection.execute(
                 """UPDATE match_ingest_status
                       SET state_readiness='retryable' WHERE match_id=8001"""
             )
             connection.commit()
-            with self.assertRaisesRegex(ValueError, "formal ready match not found: 8001"):
-                pipeline.run((8_001,), force=True)
+            player_only = pipeline.run((8_001,), force=True)
+            self.assertEqual(player_only.score_rows, 10)
+            self.assertEqual(player_only.state_rows, 0)
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM team_style_profiles").fetchone()[0],
                 2,
@@ -609,6 +624,237 @@ class IngestAdapterTests(unittest.TestCase):
 
         rerun = pipeline.run(())
         self.assertEqual((rerun.pending_maps, rerun.derived_maps), (2, 2))
+
+        self.storage.connection.execute(
+            "UPDATE match_ingest_status SET stage_in_scope=0 WHERE match_id=8001"
+        )
+        self.storage.connection.commit()
+        after_retirement = pipeline.run(())
+        self.assertEqual(after_retirement.derived_maps, 1)
+        self.assertEqual(
+            [
+                int(row[0])
+                for row in self.storage.connection.execute(
+                    "SELECT match_id FROM strict_derived_status ORDER BY match_id"
+                )
+            ],
+            [8_002],
+        )
+        scopes = current_derived_scopes(self.storage.connection)
+        self.assertEqual(scopes.formal, frozenset({8_002}))
+        self.assertEqual(scopes.player, frozenset({8_002}))
+        self.assertEqual(scopes.state, frozenset({8_002}))
+
+    def test_state_and_player_components_complete_independently(self) -> None:
+        payload = completed_payload()
+        payload["start_time"] = int((NOW - timedelta(hours=1)).timestamp())
+        summary = {
+            "match_id": payload["match_id"],
+            "leagueid": payload["leagueid"],
+            "start_time": payload["start_time"],
+        }
+
+        class CompletedClient:
+            async def get_leagues(self) -> list[dict]:
+                return []
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                return [summary]
+
+            async def get_match(self, match_id: int) -> dict:
+                return payload
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CompletedClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+        ingested = asyncio.run(
+            ingestor.run_once(event_id="pgl-wallachia-s8-2026")
+        )
+        self.storage.connection.execute(
+            """UPDATE match_ingest_status
+                  SET player_readiness='retryable', state_readiness='ready'
+                WHERE match_id=8001"""
+        )
+        self.storage.connection.commit()
+
+        pipeline = StrictDerivedPipeline(self.path)
+        state_only = pipeline.run(ingested.changed_match_ids)
+        self.assertEqual(state_only.assignment_rows, 0)
+        self.assertEqual(state_only.score_rows, 0)
+        self.assertEqual(state_only.state_rows, 2)
+        scopes = current_derived_scopes(self.storage.connection)
+        self.assertEqual(scopes.state, frozenset({8_001}))
+        self.assertEqual(scopes.player, frozenset())
+        original_cutoff = self.storage.connection.execute(
+            "SELECT profile_cutoff FROM strict_derived_status WHERE match_id=8001"
+        ).fetchone()[0]
+
+        self.storage.connection.execute(
+            """UPDATE match_ingest_status SET player_readiness='ready'
+                 WHERE match_id=8001"""
+        )
+        self.storage.connection.commit()
+        player_only = pipeline.run(())
+        self.assertEqual(player_only.score_rows, 10)
+        self.assertEqual(player_only.state_rows, 0)
+        self.assertIsNone(player_only.profile_cutoff)
+        self.assertEqual(
+            self.storage.connection.execute(
+                "SELECT profile_cutoff FROM strict_derived_status WHERE match_id=8001"
+            ).fetchone()[0],
+            original_cutoff,
+        )
+        scopes = current_derived_scopes(self.storage.connection)
+        self.assertEqual(scopes.state, frozenset({8_001}))
+        self.assertEqual(scopes.player, frozenset({8_001}))
+
+    def test_missing_gold_curve_delivers_unscorable_state_and_stays_retryable(
+        self,
+    ) -> None:
+        payload = completed_payload()
+        payload["start_time"] = int((NOW - timedelta(hours=1)).timestamp())
+        payload.pop("radiant_gold_adv")
+        summary = {
+            "match_id": payload["match_id"],
+            "leagueid": payload["leagueid"],
+            "start_time": payload["start_time"],
+        }
+
+        class CompletedClient:
+            async def get_leagues(self) -> list[dict]:
+                return []
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                return [summary]
+
+            async def get_match(self, match_id: int) -> dict:
+                return payload
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CompletedClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+        report = asyncio.run(
+            ingestor.run_once(event_id="pgl-wallachia-s8-2026")
+        )
+        self.assertEqual(report.retryable, 1)
+        status = self.storage.connection.execute(
+            """SELECT state_readiness, next_retry_at
+                 FROM match_ingest_status WHERE match_id=8001"""
+        ).fetchone()
+        self.assertEqual(status["state_readiness"], "unscorable")
+        self.assertIsNotNone(status["next_retry_at"])
+
+        derived = StrictDerivedPipeline(self.path).run(report.changed_match_ids)
+        self.assertEqual(derived.state_rows, 2)
+        labels = {
+            str(row[0])
+            for row in self.storage.connection.execute(
+                "SELECT label FROM team_map_states WHERE match_id=8001"
+            )
+        }
+        self.assertEqual(labels, {"state_unscorable"})
+        self.assertEqual(
+            current_derived_scopes(self.storage.connection).state,
+            frozenset({8_001}),
+        )
+
+    def test_registry_profile_context_change_invalidates_only_affected_event(self) -> None:
+        rows = (
+            (8_001, "pgl-wallachia-s8-2026", "a" * 64),
+            (8_002, "ewc-dota2-2026", "b" * 64),
+        )
+        self.storage.connection.executemany(
+            """INSERT INTO match_ingest_status
+               (match_id, event_id, start_time, stage_scope, stage_in_scope,
+                has_valid_result, ingest_state, latest_raw_content_hash,
+                normalizer_version, player_readiness, state_readiness,
+                discovered_at, updated_at)
+               VALUES (?, ?, 1, 'main_event', 1, 1, 'detailed', ?, ?,
+                       'ready', 'ready', ?, ?)""",
+            (
+                (
+                    match_id,
+                    event_id,
+                    content_hash,
+                    MATCH_PROCESSOR_VERSION,
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                )
+                for match_id, event_id, content_hash in rows
+            ),
+        )
+        pipeline = StrictDerivedPipeline(self.path)
+        snapshots = pipeline._source_snapshots(
+            self.storage.connection, {match_id for match_id, _, _ in rows}
+        )
+        self.storage.connection.executemany(
+            """INSERT INTO strict_derived_status
+               (match_id, source_content_hash, role_assignment_version,
+                score_version, team_state_version, profile_version,
+                profile_cutoff, derived_at, normalizer_version,
+                benchmark_version, profile_context_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                (
+                    match_id,
+                    content_hash,
+                    ROLE_VERSION,
+                    SCORE_VERSION,
+                    LABEL_VERSION,
+                    PROFILE_VERSION,
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    MATCH_PROCESSOR_VERSION,
+                    BENCHMARK_VERSION,
+                    snapshots[match_id].profile_context_hash,
+                )
+                for match_id, _, content_hash in rows
+            ),
+        )
+        self.storage.connection.commit()
+        self.assertEqual(
+            pipeline._pending_components(self.storage.connection).base,
+            frozenset(),
+        )
+
+        included_stages = self.storage.connection.execute(
+            """SELECT included_stages_json FROM event_registry
+                 WHERE event_id='ewc-dota2-2026'"""
+        ).fetchone()[0]
+        self.storage.connection.execute(
+            """UPDATE event_registry SET included_stages_json=?
+                 WHERE event_id='ewc-dota2-2026'""",
+            (json.dumps(json.loads(included_stages), indent=2),),
+        )
+        self.storage.connection.commit()
+        self.assertEqual(
+            pipeline._pending_components(self.storage.connection).base,
+            frozenset(),
+        )
+
+        self.storage.connection.execute(
+            """UPDATE event_registry
+                  SET prize_pool_usd=prize_pool_usd + 1000000
+                WHERE event_id='ewc-dota2-2026'"""
+        )
+        self.storage.connection.commit()
+
+        self.assertEqual(
+            pipeline._pending_components(self.storage.connection).base,
+            frozenset({8_002}),
+        )
+        with self.assertRaisesRegex(RuntimeError, "source version changed"):
+            pipeline._verify_source_snapshots(self.storage.connection, snapshots)
 
     def test_source_change_during_derivation_cannot_complete_lineage(self) -> None:
         payload = completed_payload()
@@ -680,6 +926,77 @@ class IngestAdapterTests(unittest.TestCase):
                 StrictDerivedPipeline._verify_derived(verification, sources)
         finally:
             verification.close()
+
+    def test_nonselected_earlier_dependency_change_aborts_later_rebuild(self) -> None:
+        earlier = completed_payload(8_001, 1)
+        later = completed_payload(8_002, 11)
+        earlier["start_time"] = int((NOW - timedelta(hours=2)).timestamp())
+        later["start_time"] = int((NOW - timedelta(hours=1)).timestamp())
+        payloads = {8_001: earlier, 8_002: later}
+
+        class CompletedClient:
+            async def get_leagues(self) -> list[dict]:
+                return []
+
+            async def get_league_matches(self, league_id: int) -> list[dict]:
+                return [
+                    {
+                        "match_id": payload["match_id"],
+                        "leagueid": payload["leagueid"],
+                        "start_time": payload["start_time"],
+                    }
+                    for payload in payloads.values()
+                ]
+
+            async def get_match(self, match_id: int) -> dict:
+                return payloads[match_id]
+
+        ingestor = StrictEventIngestor(
+            self.registry_port,
+            self.store,
+            self.archive,
+            OpenDotaAdapter(CompletedClient(), clock=lambda: NOW),
+            processor=completed_match_processing_result,
+            clock=lambda: NOW,
+        )
+        report = asyncio.run(
+            ingestor.run_once(event_id="pgl-wallachia-s8-2026")
+        )
+        pipeline = StrictDerivedPipeline(self.path)
+        pipeline.run(report.changed_match_ids)
+
+        from scripts.build_strict_team_profiles import (
+            build_strict_profiles as real_build_profiles,
+        )
+
+        def change_earlier_dependency(*args: object, **kwargs: object) -> object:
+            built = real_build_profiles(*args, **kwargs)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """UPDATE match_ingest_status
+                          SET latest_raw_content_hash=? WHERE match_id=8001""",
+                    ("e" * 64,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            return built
+
+        with patch(
+            "scripts.build_strict_team_profiles.build_strict_profiles",
+            side_effect=change_earlier_dependency,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source version changed"):
+                pipeline.run((8_002,), force=True)
+
+        status_hash = self.storage.connection.execute(
+            "SELECT source_content_hash FROM strict_derived_status WHERE match_id=8001"
+        ).fetchone()[0]
+        latest_hash = self.storage.connection.execute(
+            "SELECT latest_raw_content_hash FROM match_ingest_status WHERE match_id=8001"
+        ).fetchone()[0]
+        self.assertNotEqual(status_hash, latest_hash)
 
     def test_success_atomically_writes_legacy_exact_facts_and_readiness(self) -> None:
         payload = completed_payload()
@@ -1115,7 +1432,7 @@ class IngestAdapterTests(unittest.TestCase):
 
         health = self.storage.connection.execute(
             "SELECT status, details_json FROM service_health "
-            "WHERE component='strict_ingest'"
+            "WHERE component='strict_ingest_worker'"
         ).fetchone()
         self.assertEqual(health["status"], "healthy")
         self.assertEqual(json.loads(health["details_json"])["source"], "worker")
@@ -1150,7 +1467,7 @@ class IngestAdapterTests(unittest.TestCase):
         health = self.storage.connection.execute(
             """SELECT status, last_success_at, last_error_at, last_error,
                       details_json FROM service_health
-                 WHERE component='strict_ingest'"""
+                 WHERE component='strict_ingest_worker'"""
         ).fetchone()
         self.assertEqual((health["status"], health["last_error"]), (
             "degraded",
@@ -1189,7 +1506,7 @@ class IngestAdapterTests(unittest.TestCase):
 
         row = self.storage.connection.execute(
             """SELECT last_heartbeat_at, last_success_at, last_error_at
-                 FROM service_health WHERE component='strict_ingest'"""
+                 FROM service_health WHERE component='strict_ingest_worker'"""
         ).fetchone()
         self.assertEqual(
             tuple(row),

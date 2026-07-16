@@ -2,13 +2,13 @@
 
 import json
 import math
-import sqlite3
+from shared.sqlite import connect as connect_sqlite
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 def _lookup_team_name(db_path: str, team_id: int) -> str | None:
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     try:
         row = conn.execute(
             "SELECT name FROM teams WHERE team_id = ?", (team_id,)
@@ -21,7 +21,7 @@ def _lookup_team_name(db_path: str, team_id: int) -> str | None:
 def _lookup_league_name(db_path: str, league_id: int) -> str | None:
     if not league_id:
         return None
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path, read_only=True)
     try:
         row = conn.execute(
             "SELECT name FROM leagues WHERE leagueid = ?", (league_id,)

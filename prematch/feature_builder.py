@@ -5,8 +5,6 @@ statistics, then assembles a feature dict whose keys match the model's expected
 feature_names (pre-match subset).
 """
 
-import sqlite3
-
 import numpy as np
 import pandas as pd
 

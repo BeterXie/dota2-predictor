@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .ingest import MATCH_PROCESSOR_VERSION
 from .incremental import ROLE_VERSION, SCORE_VERSION
 from .team_profiles import PROFILE_VERSION
 from .team_states import LABEL_VERSION
+from shared.sqlite import connect
 
 
 UTC = timezone.utc
@@ -47,9 +49,9 @@ def build_coverage_report(
             """SELECT COUNT(*) FROM player_map_facts AS facts
                 JOIN match_ingest_status AS status USING(match_id)
                 WHERE status.event_id=?
-                  AND facts.fact_version='opendota-exact-v1:' ||
+                  AND facts.fact_version=? || ':' ||
                                          status.latest_raw_content_hash""",
-            (event_id,),
+            (event_id, MATCH_PROCESSOR_VERSION),
         ).fetchone()[0]
         value["player_scores"] = connection.execute(
             """SELECT COUNT(*) FROM player_map_scores AS scores
@@ -70,6 +72,7 @@ def build_coverage_report(
         "generated_at": generated_at.isoformat(),
         "versions": {
             "role_assignment": ROLE_VERSION,
+            "match_processor": MATCH_PROCESSOR_VERSION,
             "player_score": SCORE_VERSION,
             "team_state": LABEL_VERSION,
             "team_profile": PROFILE_VERSION,
@@ -81,8 +84,9 @@ def build_coverage_report(
         "current_player_facts": connection.execute(
             """SELECT COUNT(*) FROM player_map_facts AS facts
                 JOIN match_ingest_status AS status USING(match_id)
-                WHERE facts.fact_version='opendota-exact-v1:' ||
-                                         status.latest_raw_content_hash"""
+                WHERE facts.fact_version=? || ':' ||
+                                         status.latest_raw_content_hash""",
+            (MATCH_PROCESSOR_VERSION,),
         ).fetchone()[0],
         "current_player_scores": connection.execute(
             "SELECT COUNT(*) FROM player_map_scores WHERE score_version=?",
@@ -164,8 +168,7 @@ def write_coverage_report(
     include_integrity: bool = False,
 ) -> dict[str, Any]:
     database = database.resolve()
-    connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
+    connection = connect(database, read_only=True, row_factory=sqlite3.Row)
     try:
         report = build_coverage_report(
             connection,

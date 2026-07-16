@@ -142,10 +142,12 @@ export function MatchWorkspace({
             </div>
             <Suspense fallback={<div className="chart-empty"><span>正在加载概率图</span></div>}>
               <ProbabilityChart
+                key={match.raybet_match_id}
                 timeline={detail?.winner_timeline || []}
                 decisions={detail?.decisions || []}
                 teamOne={match.team_one}
                 teamTwo={match.team_two}
+                preferredPeriod={winner?.period || null}
               />
             </Suspense>
           </section>

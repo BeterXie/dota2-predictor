@@ -17,6 +17,7 @@ from .evaluation import brier_score, log_loss
 from .market_state import MarketSurface
 from .models import OddsSnapshot
 from .profiles.draft_curve import DraftCurve, DraftPoint, MAX_LANDMARK_AGE_MINUTES
+from .raybet_state import raybet_odds_is_open
 from .vision import VisionObservation
 
 if TYPE_CHECKING:
@@ -32,9 +33,6 @@ MAX_MANUAL_EVENT_GAP = timedelta(seconds=15)
 MAX_MANUAL_RATE_DRIFT_SECONDS = 10.0
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CLOCK_RE = re.compile(r"^(\d{1,3}):(\d{2})$")
-_OPEN_STATUSES = {"1", "5", "open", "active", "running"}
-
-
 def _utc(value: datetime, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field} must be timezone-aware")
@@ -350,6 +348,14 @@ def _gate_failures(point: DraftPoint | None, curve: DraftCurve) -> tuple[str, ..
     for name in ("feature_hash", "model_hash", "calibration_hash"):
         if not getattr(point, name, None):
             failures.append(f"{name}_missing")
+    if not getattr(point, "model_version", "").strip():
+        failures.append("model_version_missing")
+    if getattr(point, "model_kind", "") != "pure_draft":
+        failures.append("model_kind_not_pure_draft")
+    if getattr(point, "availability_mode", "") != "prospective":
+        failures.append("prospective_artifact_required")
+    if not getattr(point, "input_snapshot_hash", None):
+        failures.append("input_snapshot_hash_missing")
     return tuple(failures)
 
 
@@ -365,7 +371,7 @@ def _winner_quotes(
             or side not in {"team_one", "team_two"}
             or not row.market.supported
             or row.price <= 1.0
-            or str(row.status).casefold() not in _OPEN_STATUSES
+            or not raybet_odds_is_open(row.status)
             or row.odds_id not in probabilities
         ):
             continue
@@ -539,6 +545,12 @@ def record_research_prediction(
         "feature_hash": feature_hash,
         "model_hash": model_hash,
         "calibration_hash": calibration_hash,
+        "model_version": None if point is None else point.model_version,
+        "model_kind": None if point is None else point.model_kind,
+        "availability_mode": None if point is None else point.availability_mode,
+        "input_snapshot_hash": (
+            None if point is None else point.input_snapshot_hash
+        ),
         "transport_key": transport_key,
         "transport_hash": transport_hash,
         "radiant_hero_ids": list(observation.radiant_hero_ids),
@@ -629,7 +641,13 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
     try:
         predictions = connection.execute(
             """SELECT gate_status, gate_failures_json, raw_model_probability,
-                      market_probability FROM research_live_predictions"""
+                      market_probability
+                 FROM research_live_predictions AS prediction
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vision_derived_invalidations AS invalidation
+                     WHERE invalidation.dependent_type='research_prediction'
+                       AND invalidation.dependent_key=prediction.prediction_key
+                )"""
         ).fetchall()
     except sqlite3.OperationalError:
         predictions = []
@@ -647,50 +665,79 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
                       label.market_probability, label.price
                  FROM research_price_labels AS label
                  JOIN research_live_predictions AS prediction
-                   ON prediction.prediction_key=label.prediction_key"""
+                   ON prediction.prediction_key=label.prediction_key
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vision_derived_invalidations AS invalidation
+                     WHERE invalidation.dependent_type='research_prediction'
+                       AND invalidation.dependent_key=prediction.prediction_key
+                )"""
         ).fetchall()
         result_rows = connection.execute(
             """SELECT prediction.raw_model_probability,
                       prediction.market_probability, label.selected_side_win,
-                      prediction.model_hash, prediction.calibration_hash,
+                      prediction.feature_hash, prediction.model_hash,
+                      prediction.calibration_hash,
                       prediction.gate_status
                   FROM research_result_labels AS label
-                  JOIN research_live_predictions AS prediction
+                 JOIN research_live_predictions AS prediction
                     ON prediction.prediction_key=label.prediction_key
                  WHERE julianday(prediction.observed_at) <
-                       julianday(label.settled_at)"""
+                       julianday(label.settled_at)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM vision_derived_invalidations AS invalidation
+                        WHERE invalidation.dependent_type='research_prediction'
+                          AND invalidation.dependent_key=prediction.prediction_key
+                   )"""
         ).fetchall()
     except sqlite3.OperationalError:
         price_rows = []
         result_rows = []
-    cohort_points: dict[tuple[str | None, str | None, str], list[tuple[float, int]]] = {}
+    cohort_points: dict[
+        tuple[str | None, str | None, str | None, str],
+        dict[str, list[tuple[float, int]]],
+    ] = {}
     for row in result_rows:
         if row[0] is None:
             continue
         key = (
             None if row[3] is None else str(row[3]),
             None if row[4] is None else str(row[4]),
-            str(row[5]),
+            None if row[5] is None else str(row[5]),
+            str(row[6]),
         )
-        cohort_points.setdefault(key, []).append((float(row[0]), int(row[2])))
+        cohort = cohort_points.setdefault(key, {"model": [], "market": []})
+        cohort["model"].append((float(row[0]), int(row[2])))
+        cohort["market"].append((float(row[1]), int(row[2])))
     model_cohorts = []
-    for (model_hash, calibration_hash, gate_status), points in sorted(
+    for (feature_hash, model_hash, calibration_hash, gate_status), points in sorted(
         cohort_points.items(), key=lambda item: tuple("" if value is None else value for value in item[0])
     ):
+        model_points = points["model"]
+        market_points = points["market"]
+        identity_complete = all(
+            value is not None
+            for value in (feature_hash, model_hash, calibration_hash)
+        )
         model_cohorts.append({
+            "feature_hash": feature_hash,
             "model_hash": model_hash,
             "calibration_hash": calibration_hash,
             "gate_status": gate_status,
-            "results": len(points),
-            "accuracy": _accuracy(points),
-            "brier_score": brier_score(points),
-            "log_loss": log_loss(points),
+            "identity_complete": identity_complete,
+            "results": len(model_points),
+            "accuracy": _accuracy(model_points),
+            "brier_score": brier_score(model_points),
+            "log_loss": log_loss(model_points),
+            "market_accuracy": _accuracy(market_points),
+            "market_brier_score": brier_score(market_points),
+            "market_log_loss": log_loss(market_points),
         })
     passed_cohorts = [
-        cohort for cohort in model_cohorts if cohort["gate_status"] == "passed"
+        cohort
+        for cohort in model_cohorts
+        if cohort["gate_status"] == "passed" and cohort["identity_complete"]
     ]
     headline = passed_cohorts[0] if len(passed_cohorts) == 1 else None
-    market_points = [(float(row[1]), int(row[2])) for row in result_rows]
     price_probability_moves = [float(row[2]) - float(row[0]) for row in price_rows]
     price_moves = [float(row[3]) - float(row[1]) for row in price_rows]
     return {
@@ -715,9 +762,13 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         "model_brier_score": None if headline is None else headline["brier_score"],
         "model_log_loss": None if headline is None else headline["log_loss"],
         "model_cohorts": model_cohorts,
-        "market_accuracy": _accuracy(market_points),
-        "market_brier_score": brier_score(market_points) if market_points else None,
-        "market_log_loss": log_loss(market_points) if market_points else None,
+        "market_accuracy": None if headline is None else headline["market_accuracy"],
+        "market_brier_score": (
+            None if headline is None else headline["market_brier_score"]
+        ),
+        "market_log_loss": (
+            None if headline is None else headline["market_log_loss"]
+        ),
         "actionability": ACTIONABILITY,
     }
 

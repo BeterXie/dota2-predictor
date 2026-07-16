@@ -115,11 +115,80 @@ export interface HealthItem {
   details: Record<string, unknown>;
 }
 
+export interface AlertIncident {
+  incident_id: number;
+  dedupe_key: string;
+  episode: number;
+  category: "operational" | "paper_signal";
+  severity: "warning" | "critical";
+  title: string;
+  body: string;
+  first_detected_at: string;
+  opened_at: string;
+  last_detected_at: string;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
+  source: Record<string, unknown>;
+  occurrence_count: number;
+}
+
+export interface ControlComponent {
+  component: "raybet_collector" | "shadow_monitor" | "vision_supervisor" | "mail_worker";
+  label: string;
+  status: "running" | "stopped" | "identity_mismatch";
+  pid: number | null;
+  started_at: string | null;
+  detail: string | null;
+  control_allowed: boolean;
+}
+
+export interface ControlSession {
+  csrf_token: string;
+  expires_in: number;
+  client_host: string;
+  components: ControlComponent[];
+}
+
+export interface ControlResult {
+  ok: boolean;
+  component: string;
+  action: "start" | "stop" | "restart";
+  result: string;
+  pid: number | null;
+  detail: string | null;
+  request_id: string;
+  idempotent: boolean;
+}
+
+export interface MappingRecord {
+  mapping_id: number;
+  map_number: number;
+  event_id: string;
+  raybet_team_ids: [number, number];
+  canonical_teams: [{ id: number; name: string }, { id: number; name: string }];
+  acceptance_mode: "manual_exact" | "automatic_exact";
+  automatic_approval_id: number | null;
+  accepted_by: string;
+  accepted_at: string;
+  recorded_at: string;
+  evidence: Record<string, unknown>;
+  evidence_hash: string;
+  invalidation: {
+    invalidation_id: number;
+    reason: string;
+    invalidated_by: string;
+    invalidated_at: string;
+  } | null;
+  evidence_approval_id: number | null;
+}
+
 export interface MonitorSnapshot {
   generated_at: string;
   cursor: string;
+  mapping_revision: string;
   health: HealthItem[];
   matches: MonitorMatch[];
+  alerts: AlertIncident[];
   summary: {
     total: number;
     upcoming: number;
@@ -127,7 +196,240 @@ export interface MonitorSnapshot {
     degraded: number;
     ended: number;
     unhealthy_components: number;
+    active_alerts: number;
   };
 }
 
 export type ConnectionState = "connecting" | "live" | "fallback" | "offline";
+
+export type IntelligenceStateLabel =
+  | "comeback"
+  | "throw"
+  | "stomp"
+  | "stomp_loss"
+  | "advantage"
+  | "disadvantage"
+  | "even"
+  | "state_unscorable";
+
+export type IntelligenceAvailabilityMode =
+  | "reconstructed_walk_forward"
+  | "prospective";
+
+export interface IntelligencePagination {
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+}
+
+export interface IntelligenceTeamState {
+  match_id?: number;
+  team_id: number | null;
+  side: "radiant" | "dire";
+  label: IntelligenceStateLabel;
+  duration_seconds: number | null;
+  max_lead: number | null;
+  max_deficit: number | null;
+  ahead_fraction?: number | null;
+  behind_fraction?: number | null;
+  even_fraction?: number | null;
+  signed_auc?: number | null;
+  absolute_auc?: number | null;
+  crossings?: unknown[];
+  first_significant_lead_at?: number | null;
+  first_significant_deficit_at?: number | null;
+  closeout_seconds?: number | null;
+  objective_conversion?: Record<string, unknown>;
+  curve_coverage: number;
+  source_versions?: Record<string, unknown>;
+  label_version: string;
+  created_at?: string;
+}
+
+export interface IntelligenceMatchSummary {
+  match_id: number;
+  radiant_team_id: number | null;
+  dire_team_id: number | null;
+  radiant_team_name: string | null;
+  dire_team_name: string | null;
+  radiant_win: boolean | null;
+  duration: number | null;
+  start_time: number | null;
+  leagueid: number | null;
+  league_name: string | null;
+  radiant_score: number | null;
+  dire_score: number | null;
+  radiant_state?: IntelligenceTeamState | null;
+  dire_state?: IntelligenceTeamState | null;
+}
+
+export interface IntelligencePlayerPerformance {
+  player_slot: number;
+  account_id: number | null;
+  player_name: string | null;
+  team_id: number | null;
+  side: "radiant" | "dire" | null;
+  hero_id: number | null;
+  hero_name: string | null;
+  performance?: {
+    kills: number | null;
+    deaths: number | null;
+    assists: number | null;
+    gold_per_min: number | null;
+    xp_per_min: number | null;
+    net_worth: number | null;
+    last_hits: number | null;
+    denies: number | null;
+    hero_damage: number | null;
+    hero_healing: number | null;
+    tower_damage: number | null;
+    level: number | null;
+    lane_efficiency: number | null;
+    kda: number | null;
+  } | null;
+}
+
+export interface IntelligencePlayerMapScore extends IntelligencePlayerPerformance {
+  position: number | null;
+  execution_score: number;
+  result_adjusted_score: number;
+  coverage: number;
+  role_confidence: number;
+  ranking_eligible: boolean;
+  benchmark_cutoff: string;
+  score_version: string;
+  component_facts: unknown[] | Record<string, unknown>;
+  component_scores: unknown[] | Record<string, unknown>;
+  weights: unknown[] | Record<string, unknown>;
+  explanation: Record<string, unknown>;
+}
+
+export interface IntelligenceDraftPrediction {
+  model_version: string;
+  model_kind: "pure_draft" | "context_adjusted";
+  horizon_minutes: number;
+  availability_mode: IntelligenceAvailabilityMode;
+  assignment_version: string;
+  score_version: string;
+  training_cutoff: string;
+  model_status: string;
+  prediction_cutoff: string;
+  cutoff_source: string;
+  probability: number | null;
+  uncertainty: number | null;
+  support: number;
+  eventual_radiant_win: number | null;
+  status: "predicted" | "insufficient_evidence" | "settled";
+}
+
+export interface IntelligenceFlatMatchDetail extends IntelligenceMatchSummary {
+  states?: {
+    radiant: IntelligenceTeamState | null;
+    dire: IntelligenceTeamState | null;
+  };
+  player_performance?: IntelligencePlayerPerformance[];
+  player_scores: IntelligencePlayerMapScore[];
+  draft_predictions: IntelligenceDraftPrediction[];
+}
+
+export interface IntelligenceNestedMatchDetail {
+  match: IntelligenceMatchSummary;
+  radiant_state: IntelligenceTeamState | null;
+  dire_state: IntelligenceTeamState | null;
+  player_performance?: IntelligencePlayerPerformance[];
+  player_scores: IntelligencePlayerMapScore[];
+  draft_predictions: IntelligenceDraftPrediction[];
+}
+
+export type IntelligenceMatchDetail =
+  | IntelligenceFlatMatchDetail
+  | IntelligenceNestedMatchDetail;
+
+export interface IntelligenceDraftQualitySlice {
+  model_kind: "pure_draft" | "context_adjusted";
+  horizon_minutes: number;
+  availability_mode: IntelligenceAvailabilityMode;
+  assignment_version: string;
+  score_version: string;
+  availability_status: "available" | "missing";
+  is_reconstructed: boolean;
+  support: number;
+  eligible_targets: number;
+  predicted: number;
+  insufficient_evidence: number;
+  brier_score: number | null;
+  log_loss: number | null;
+  ece_5_bin: number | null;
+  ece_90_upper: number | null;
+  status: "passed" | "failed" | "unsupported" | "missing" | "provisional";
+  gate_failures: string[];
+}
+
+export interface IntelligenceOverview {
+  versions: {
+    player_score: string;
+    team_state: string;
+    team_profile: string;
+    draft_score: string;
+  };
+  coverage: Record<string, number>;
+  team_state_distribution: Partial<Record<IntelligenceStateLabel, number>>;
+  draft_cohorts?: Array<{
+    availability_mode: IntelligenceAvailabilityMode;
+    assignment_version: string;
+    score_version: string;
+  }>;
+  draft_quality_slices?: IntelligenceDraftQualitySlice[];
+  draft_quality?:
+    | IntelligenceDraftQualitySlice[]
+    | {
+        slices: IntelligenceDraftQualitySlice[];
+        availability?: Partial<Record<IntelligenceAvailabilityMode, boolean>>;
+      };
+  availability?: Partial<Record<IntelligenceAvailabilityMode, boolean>>;
+}
+
+export interface IntelligencePlayerRanking {
+  rank: number;
+  account_id: number;
+  player_name: string | null;
+  position: number;
+  map_count: number;
+  average_execution_score: number;
+  average_result_adjusted_score: number;
+  average_coverage: number;
+  average_role_confidence: number;
+  score_version: string;
+}
+
+export interface IntelligenceTeamProfile {
+  team_id: number;
+  team_name: string | null;
+  team_tag: string | null;
+  logo_url: string | null;
+  profile_cutoff: string;
+  profile_version: string;
+  opportunity_counts: unknown[] | Record<string, unknown>;
+  posterior_rates: unknown[] | Record<string, unknown>;
+  duration_quantiles: unknown[] | Record<string, unknown>;
+  weighting: Record<string, unknown>;
+  effective_sample_size: number;
+  created_at: string;
+  state_counts: Partial<Record<IntelligenceStateLabel, number>>;
+}
+
+export interface IntelligenceMatchPage {
+  data: IntelligenceMatchSummary[];
+  pagination: IntelligencePagination;
+}
+
+export interface IntelligencePlayerPage {
+  data: IntelligencePlayerRanking[];
+  pagination: IntelligencePagination;
+}
+
+export interface IntelligenceTeamPage {
+  data: IntelligenceTeamProfile[];
+  pagination?: IntelligencePagination;
+}

@@ -104,6 +104,10 @@ def _point_inputs(point: DraftPoint | None, wait_reason: str | None) -> dict[str
         "feature_hash": point.feature_hash,
         "model_hash": point.model_hash,
         "calibration_hash": point.calibration_hash,
+        "model_version": point.model_version,
+        "model_kind": point.model_kind,
+        "availability_mode": point.availability_mode,
+        "input_snapshot_hash": point.input_snapshot_hash,
         "input_refs": list(point.input_refs),
         "validation_reason": point.validation_reason,
     }

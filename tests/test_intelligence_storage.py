@@ -17,7 +17,7 @@ from event_intelligence.models import (
     ReconciliationStatus,
     RolePurpose,
 )
-from event_intelligence.storage import IntelligenceStorage
+from event_intelligence.storage import CURRENT_SCHEMA_VERSION, IntelligenceStorage
 
 
 EXPECTED_TABLES = {
@@ -33,6 +33,9 @@ EXPECTED_TABLES = {
     "team_style_profiles",
     "draft_model_runs",
     "draft_predictions",
+    "draft_lineage_changes",
+    "draft_lineage_revisions",
+    "draft_prediction_validations",
     "notification_outbox",
     "service_health",
     "ingest_scheduler_retry_state",
@@ -142,7 +145,7 @@ class IntelligenceStorageTests(unittest.TestCase):
                     storage.connection.execute(
                         "SELECT MAX(version) FROM intelligence_schema_version"
                     ).fetchone()[0],
-                    4,
+                    CURRENT_SCHEMA_VERSION,
                 )
                 columns = {
                     row[1]
@@ -158,7 +161,12 @@ class IntelligenceStorageTests(unittest.TestCase):
                     )
                 }
                 self.assertTrue(
-                    {"normalizer_version", "benchmark_version"} <= derived_columns
+                    {
+                        "normalizer_version",
+                        "benchmark_version",
+                        "profile_context_hash",
+                    }
+                    <= derived_columns
                 )
                 self.assertIsNotNone(
                     storage.connection.execute(
@@ -167,7 +175,7 @@ class IntelligenceStorageTests(unittest.TestCase):
                     ).fetchone()
                 )
 
-    def test_version_four_additively_migrates_derived_lineage_columns(self) -> None:
+    def test_version_five_additively_migrates_derived_lineage_columns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "intelligence.db"
             connection = sqlite3.connect(path)
@@ -183,6 +191,12 @@ class IntelligenceStorageTests(unittest.TestCase):
                     derived_at TEXT NOT NULL
                 )"""
             )
+            connection.execute(
+                """INSERT INTO strict_derived_status VALUES
+                   (8001, ?, 'role-v1', 'score-v1', 'state-v1',
+                    'profile-v1', '2026-01-01', '2026-01-01')""",
+                ("a" * 64,),
+            )
             connection.commit()
             connection.close()
 
@@ -196,11 +210,110 @@ class IntelligenceStorageTests(unittest.TestCase):
                 }
                 self.assertEqual(columns["normalizer_version"], 0)
                 self.assertEqual(columns["benchmark_version"], 0)
+                self.assertEqual(columns["profile_context_hash"], 0)
+                self.assertIsNone(
+                    storage.connection.execute(
+                        """SELECT profile_context_hash
+                             FROM strict_derived_status WHERE match_id=8001"""
+                    ).fetchone()[0]
+                )
                 self.assertEqual(
                     storage.connection.execute(
                         "SELECT MAX(version) FROM intelligence_schema_version"
                     ).fetchone()[0],
-                    4,
+                    CURRENT_SCHEMA_VERSION,
+                )
+
+    def test_version_six_adds_draft_artifact_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intelligence.db"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """CREATE TABLE draft_prediction_validations (
+                    run_id TEXT NOT NULL,
+                    match_id INTEGER NOT NULL,
+                    input_snapshot_hash TEXT NOT NULL,
+                    dependency_fingerprint TEXT NOT NULL,
+                    validation_version TEXT NOT NULL,
+                    validated_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, match_id)
+                )"""
+            )
+            connection.commit()
+            connection.close()
+
+            with IntelligenceStorage(path) as storage:
+                storage.init_schema(seed_events=False)
+                columns = {
+                    str(row[1])
+                    for row in storage.connection.execute(
+                        "PRAGMA table_info(draft_prediction_validations)"
+                    )
+                }
+                self.assertIn("artifact_fingerprint", columns)
+                self.assertIn("dependency_revision", columns)
+                self.assertEqual(
+                    tuple(
+                        storage.connection.execute(
+                            """SELECT dependency_revision, artifact_revision
+                                 FROM draft_lineage_revisions WHERE singleton=1"""
+                        ).fetchone()
+                    ),
+                    (1, 1),
+                )
+                self.assertEqual(
+                    storage.connection.execute(
+                        "SELECT MAX(version) FROM intelligence_schema_version"
+                    ).fetchone()[0],
+                    CURRENT_SCHEMA_VERSION,
+                )
+
+    def test_version_seven_proofs_are_cleared_without_cutoff_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intelligence.db"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """CREATE TABLE intelligence_schema_version (
+                       version INTEGER PRIMARY KEY,
+                       applied_at TEXT NOT NULL
+                   );
+                   INSERT INTO intelligence_schema_version VALUES (1, 'v1');
+                   INSERT INTO intelligence_schema_version VALUES (7, 'v7');
+                   CREATE TABLE draft_prediction_validations (
+                       run_id TEXT NOT NULL,
+                       match_id INTEGER NOT NULL,
+                       input_snapshot_hash TEXT NOT NULL,
+                       artifact_fingerprint TEXT NOT NULL,
+                       dependency_fingerprint TEXT NOT NULL,
+                       dependency_revision INTEGER NOT NULL,
+                       validation_version TEXT NOT NULL,
+                       validated_at TEXT NOT NULL,
+                       PRIMARY KEY (run_id, match_id)
+                   );
+                   INSERT INTO draft_prediction_validations VALUES (
+                       'legacy', 1,
+                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                       'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                       'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                       7, 'draft-input-lineage-v3', '2026-07-15'
+                   );"""
+            )
+            connection.commit()
+            connection.close()
+
+            with IntelligenceStorage(path) as storage:
+                storage.init_schema(seed_events=False)
+                self.assertEqual(
+                    storage.connection.execute(
+                        "SELECT COUNT(*) FROM draft_prediction_validations"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    storage.connection.execute(
+                        "SELECT MAX(version) FROM intelligence_schema_version"
+                    ).fetchone()[0],
+                    CURRENT_SCHEMA_VERSION,
                 )
 
     def test_migration_backfills_legacy_normalizer_from_complete_v1_facts(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import unittest
@@ -7,13 +8,20 @@ from datetime import datetime, timedelta, timezone
 
 from live_betting.models import Market, OddsSnapshot
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
-from live_betting.profiles.draft_curve import DraftPoint
+from live_betting.profiles.draft_curve import DraftPoint, build_draft_curve
 from live_betting.shadow_strategy import ComebackShadowStrategy
 from live_betting.shadow_monitor import _profile_refs, _profiles
+from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
 
 
 NOW = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
+PROSPECTIVE_IDENTITY = {
+    "model_version": "draft-logistic-l2-v1",
+    "model_kind": "pure_draft",
+    "availability_mode": "prospective",
+    "input_snapshot_hash": "5" * 64,
+}
 
 
 def observation() -> VisionObservation:
@@ -56,7 +64,7 @@ def snapshots(
             group,
             at,
             price,
-            5,
+            1,
             Market(market_type, "map_1", side, line, f"{side}:{line}", True),
         )
         for odds_id, group, market_type, side, line, price in definitions
@@ -81,6 +89,70 @@ def form(score: float = 0.0, quality: float = 1.0) -> PlayerForm:
     return PlayerForm((1, 2, 3, 4, 5), score, {}, 100, quality)
 
 
+def insert_prospective_curve(
+    store: LiveBettingStore,
+    *,
+    curve_digit: str,
+    first_usable_at: datetime,
+    validation_status: str = "passed",
+    global_calibration_passed: bool = True,
+    landmark_created_at: datetime | None = None,
+) -> str:
+    radiant = (1, 2, 3, 4, 5)
+    dire = (6, 7, 8, 9, 10)
+    encoded = json.dumps(
+        {"dire": list(dire), "radiant": list(radiant)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    lineup_hash = hashlib.sha256(encoded).hexdigest()
+    curve_key = curve_digit * 64
+    landmark_key = hashlib.sha256(f"{curve_key}:30".encode()).hexdigest()
+    store.connection.execute(
+        """INSERT INTO prospective_draft_curves
+           (curve_key, raybet_match_id, map_number, strict_mapping_id,
+            lineup_hash, radiant_hero_ids_json, dire_hero_ids_json,
+            prediction_cutoff, first_usable_at, availability_mode, created_at)
+           VALUES (?, 'match-1', 1, 7, ?, ?, ?, ?, ?, 'prospective', ?)""",
+        (
+            curve_key,
+            lineup_hash,
+            json.dumps(list(radiant)),
+            json.dumps(list(dire)),
+            (first_usable_at - timedelta(seconds=1)).isoformat(),
+            first_usable_at.isoformat(),
+            first_usable_at.isoformat(),
+        ),
+    )
+    store.connection.execute(
+        """INSERT INTO prospective_draft_landmarks
+           (landmark_key, curve_key, horizon_minutes, radiant_probability,
+            scaling_edge, synergy_edge, quality, validation_status, support,
+            calibration_ref, input_refs_json, uncertainty, validation_reason,
+            feature_hash, model_hash, calibration_hash,
+            global_calibration_passed, global_gate_ref, model_version,
+            model_kind, availability_mode, input_snapshot_hash, created_at)
+           VALUES (?, ?, 30, 0.7, 0.1, 0.05, 0.9, ?, 150,
+                   'calibration:passed', ?, 0.02, NULL, ?, ?, ?, ?, ?,
+                   'draft-logistic-l2-v1', 'pure_draft', 'prospective', ?, ?)""",
+        (
+            landmark_key,
+            curve_key,
+            validation_status,
+            json.dumps(["model:immutable", "features:immutable"]),
+            "1" * 64,
+            "2" * 64,
+            "3" * 64,
+            int(global_calibration_passed),
+            "global-gate:passed" if global_calibration_passed else "",
+            "5" * 64,
+            (landmark_created_at or first_usable_at).isoformat(),
+        ),
+    )
+    store.connection.commit()
+    return curve_key
+
+
 class DraftCurveSelectionTests(unittest.TestCase):
     def test_uses_only_latest_validated_past_landmark(self) -> None:
         curve = DraftCurve(
@@ -93,6 +165,7 @@ class DraftCurveSelectionTests(unittest.TestCase):
                     calibration_hash="3" * 64,
                     global_calibration_passed=True,
                     global_gate_ref="test:global-passed",
+                    **PROSPECTIVE_IDENTITY,
                 ),
                 DraftPoint(
                     20,
@@ -114,13 +187,17 @@ class DraftCurveSelectionTests(unittest.TestCase):
                     calibration_hash="3" * 64,
                     global_calibration_passed=True,
                     global_gate_ref="test:global-passed",
+                    **PROSPECTIVE_IDENTITY,
                 ),
             )
         )
 
         self.assertIsNone(curve.at(9 * 60 + 59))
         self.assertEqual(curve.at(15 * 60).minute, 10)
-        self.assertEqual(curve.at(20 * 60).minute, 10)
+        self.assertIsNone(curve.at(20 * 60))
+        self.assertEqual(
+            curve.wait_reason(20 * 60), "required_draft_landmark_not_validated"
+        )
         self.assertIsNone(curve.at(20 * 60 + 1))
         self.assertEqual(curve.at(30 * 60).minute, 30)
 
@@ -160,7 +237,9 @@ class DraftCurveSelectionTests(unittest.TestCase):
         curve = DraftCurve((unsupported, missing_ref))
 
         self.assertIsNone(curve.at(20 * 60))
-        self.assertEqual(curve.wait_reason(20 * 60), "no_validated_past_draft_landmark")
+        self.assertEqual(
+            curve.wait_reason(20 * 60), "required_draft_landmark_not_validated"
+        )
 
     def test_global_calibration_gate_is_explicit_and_fail_closed(self) -> None:
         point = DraftPoint(
@@ -175,6 +254,108 @@ class DraftCurveSelectionTests(unittest.TestCase):
         )
         self.assertFalse(point.passes_live_gate)
         self.assertIsNone(DraftCurve((point,)).at(10 * 60))
+
+    def test_loads_exact_causally_available_prospective_artifact(self) -> None:
+        with LiveBettingStore(":memory:") as store:
+            store.init_schema()
+            curve_key = insert_prospective_curve(
+                store,
+                curve_digit="a",
+                first_usable_at=NOW - timedelta(seconds=5),
+            )
+
+            curve = build_draft_curve(
+                store.connection,
+                (1, 2, 3, 4, 5),
+                (6, 7, 8, 9, 10),
+                int(NOW.timestamp()),
+                raybet_match_id="match-1",
+                map_number=1,
+                strict_mapping_id=7,
+            )
+
+            self.assertEqual(curve.source_ref, f"prospective-draft:{curve_key}")
+            point = curve.at(30 * 60)
+            self.assertIsNotNone(point)
+            self.assertEqual(point.model_version, "draft-logistic-l2-v1")
+            self.assertEqual(point.availability_mode, "prospective")
+            self.assertEqual(point.input_snapshot_hash, "5" * 64)
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                store.connection.execute(
+                    "UPDATE prospective_draft_curves SET map_number=2"
+                )
+
+    def test_future_or_latest_failed_artifact_cannot_fall_back(self) -> None:
+        with LiveBettingStore(":memory:") as store:
+            store.init_schema()
+            insert_prospective_curve(
+                store,
+                curve_digit="a",
+                first_usable_at=NOW - timedelta(minutes=2),
+            )
+            insert_prospective_curve(
+                store,
+                curve_digit="b",
+                first_usable_at=NOW - timedelta(minutes=1),
+                validation_status="failed",
+                global_calibration_passed=False,
+            )
+            insert_prospective_curve(
+                store,
+                curve_digit="c",
+                first_usable_at=NOW + timedelta(minutes=1),
+            )
+
+            curve = build_draft_curve(
+                store.connection,
+                (1, 2, 3, 4, 5),
+                (6, 7, 8, 9, 10),
+                int(NOW.timestamp()),
+                raybet_match_id="match-1",
+                map_number=1,
+                strict_mapping_id=7,
+            )
+
+            self.assertIsNone(curve.at(30 * 60))
+            self.assertEqual(
+                curve.wait_reason(30 * 60),
+                "prospective_draft_calibration_gate_not_passed",
+            )
+
+    def test_missing_target_identity_remains_fail_closed(self) -> None:
+        with LiveBettingStore(":memory:") as store:
+            store.init_schema()
+            curve = build_draft_curve(
+                store.connection,
+                (1, 2, 3, 4, 5),
+                (6, 7, 8, 9, 10),
+                int(NOW.timestamp()),
+            )
+            self.assertEqual(
+                curve.unavailable_reason, "prospective_draft_target_missing"
+            )
+
+    def test_landmark_added_after_curve_availability_is_rejected(self) -> None:
+        with LiveBettingStore(":memory:") as store:
+            store.init_schema()
+            insert_prospective_curve(
+                store,
+                curve_digit="a",
+                first_usable_at=NOW - timedelta(minutes=2),
+                landmark_created_at=NOW - timedelta(minutes=1),
+            )
+            curve = build_draft_curve(
+                store.connection,
+                (1, 2, 3, 4, 5),
+                (6, 7, 8, 9, 10),
+                int(NOW.timestamp()),
+                raybet_match_id="match-1",
+                map_number=1,
+                strict_mapping_id=7,
+            )
+            self.assertEqual(
+                curve.unavailable_reason, "prospective_draft_artifact_invalid"
+            )
 
 
 class StrictComebackStrategyTests(unittest.TestCase):
@@ -216,6 +397,7 @@ class StrictComebackStrategyTests(unittest.TestCase):
                         calibration_hash="3" * 64,
                         global_calibration_passed=True,
                         global_gate_ref="test:global-passed",
+                        **PROSPECTIVE_IDENTITY,
                     ),
                 )
             ),

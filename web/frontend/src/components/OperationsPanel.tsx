@@ -1,5 +1,6 @@
 import { Button } from "@fluentui/react-components";
 import {
+  ArrowClockwise,
   Bell,
   Brain,
   Broadcast,
@@ -10,19 +11,43 @@ import {
   GitMerge,
   Pause,
   Play,
+  PlusCircle,
+  SealCheck,
   WarningCircle,
+  XCircle,
 } from "@phosphor-icons/react";
 import type { Icon } from "@phosphor-icons/react";
 
 import { formatAge } from "../format";
-import type { FreshnessState, HealthItem, MonitorMatch, ReadinessStatus } from "../types";
+import type {
+  AlertIncident,
+  ControlComponent,
+  ControlResult,
+  FreshnessState,
+  HealthItem,
+  MappingRecord,
+  MonitorMatch,
+  ReadinessStatus,
+} from "../types";
 import { ReadinessBadge } from "./StatusBadge";
 
 interface OperationsPanelProps {
+  alerts: AlertIncident[];
+  busyKey: string | null;
+  components: ControlComponent[];
+  controlMessage: string | null;
   health: HealthItem[];
+  mappings: MappingRecord[];
   match: MonitorMatch | null;
   controlsEnabled?: boolean;
-  onControl?: (component: string, action: "start" | "stop" | "restart") => void;
+  onAcknowledge: (incidentId: number) => void;
+  onApproveMapping: (mappingId: number) => void;
+  onControl: (
+    component: ControlComponent["component"],
+    action: ControlResult["action"],
+  ) => void;
+  onCreateAutomaticMap: (sourceMappingId: number, mapNumber: number) => void;
+  onInvalidateMapping: (mappingId: number) => void;
 }
 
 const readinessRows: Array<{
@@ -38,13 +63,32 @@ const readinessRows: Array<{
 ];
 
 export function OperationsPanel({
+  alerts,
+  busyKey,
+  components,
+  controlMessage,
   health,
+  mappings,
   match,
   controlsEnabled = false,
+  onAcknowledge,
+  onApproveMapping,
   onControl,
+  onCreateAutomaticMap,
+  onInvalidateMapping,
 }: OperationsPanelProps) {
-  const workers = health.filter((item) => item.component.endsWith("_worker"));
-  const alerts = buildAlerts(health, match);
+  const activeMappings = mappings.filter((mapping) => !mapping.invalidation);
+  const visibleAlerts = [...alerts]
+    .sort((left, right) => Number(Boolean(left.acknowledged_at))
+      - Number(Boolean(right.acknowledged_at)))
+    .slice(0, 8);
+  const approvedSource = activeMappings.find(
+    (mapping) => mapping.acceptance_mode === "manual_exact" && mapping.evidence_approval_id,
+  );
+  const nextMap = approvedSource && match?.best_of
+    ? Array.from({ length: match.best_of }, (_, index) => index + 1)
+      .find((number) => !activeMappings.some((mapping) => mapping.map_number === number))
+    : undefined;
 
   return (
     <aside className="operations-panel" aria-label="就绪状态与操作">
@@ -75,6 +119,78 @@ export function OperationsPanel({
         </div>
       </section>
 
+      <section className="operations-section mapping-section">
+        <div className="operations-heading">
+          <div>
+            <h2>Exact 映射</h2>
+            <span>{activeMappings.length} 条有效证据</span>
+          </div>
+          <GitMerge size={19} aria-hidden="true" />
+        </div>
+        <div className="mapping-list">
+          {mappings.map((mapping) => (
+            <details
+              className={`mapping-row ${mapping.invalidation ? "invalidated" : ""}`}
+              key={mapping.mapping_id}
+            >
+              <summary>
+                <span>第 {mapping.map_number} 局</span>
+                <code>{mapping.acceptance_mode}</code>
+                <ReadinessBadge status={mapping.invalidation ? "invalid" : "ready"} />
+              </summary>
+              <dl>
+                <div><dt>赛事</dt><dd>{mapping.event_id}</dd></div>
+                <div>
+                  <dt>队伍</dt>
+                  <dd>{mapping.canonical_teams.map((team) => team.name).join(" / ")}</dd>
+                </div>
+                <div><dt>证据</dt><dd>{mapping.evidence_hash.slice(0, 12)}</dd></div>
+              </dl>
+              {mapping.invalidation && (
+                <p className="mapping-invalid-reason">{mapping.invalidation.reason}</p>
+              )}
+              {!mapping.invalidation && (
+                <div className="mapping-actions">
+                  {mapping.acceptance_mode === "manual_exact" && !mapping.evidence_approval_id && (
+                    <Button
+                      appearance="subtle"
+                      aria-label="批准自动 exact 证据"
+                      disabled={!controlsEnabled || busyKey !== null}
+                      icon={<SealCheck size={16} />}
+                      onClick={() => onApproveMapping(mapping.mapping_id)}
+                      size="small"
+                      title="批准同系列后续局使用该 exact 证据"
+                    />
+                  )}
+                  <Button
+                    appearance="subtle"
+                    aria-label="使映射失效"
+                    disabled={!controlsEnabled || busyKey !== null}
+                    icon={<XCircle size={16} />}
+                    onClick={() => onInvalidateMapping(mapping.mapping_id)}
+                    size="small"
+                    title="追加失效记录"
+                  />
+                </div>
+              )}
+            </details>
+          ))}
+          {!mappings.length && <div className="subtle-empty compact">没有 exact 映射</div>}
+        </div>
+        {approvedSource && nextMap && (
+          <Button
+            appearance="subtle"
+            className="automatic-map-button"
+            disabled={!controlsEnabled || busyKey !== null}
+            icon={<PlusCircle size={16} />}
+            onClick={() => onCreateAutomaticMap(approvedSource.mapping_id, nextMap)}
+            size="small"
+          >
+            登记第 {nextMap} 局
+          </Button>
+        )}
+      </section>
+
       <section className="operations-section">
         <div className="operations-heading">
           <div>
@@ -82,38 +198,48 @@ export function OperationsPanel({
             <span>状态按心跳重新计算</span>
           </div>
         </div>
-        <div className="worker-list">
-          {workers.map((worker) => (
-            <div className="worker-row" key={worker.component}>
+        <div className="worker-list managed-workers">
+          {components.map((component) => (
+            <div className="worker-row managed-worker" key={component.component}>
               <div>
-                <strong>{workerName(worker.component)}</strong>
-                <span>{formatAge(worker.age_seconds)}</span>
+                <strong>{componentName(component.component)}</strong>
+                <span>{component.pid ? `PID ${component.pid}` : component.detail || "未运行"}</span>
               </div>
-              <ReadinessBadge status={healthStatus(worker.status)} />
+              <ReadinessBadge status={controlStatus(component.status)} />
+              <div className="worker-actions">
+                <Button
+                  appearance="subtle"
+                  aria-label={`启动${componentName(component.component)}`}
+                  disabled={!controlsEnabled || !component.control_allowed || busyKey !== null || component.status === "running"}
+                  icon={<Play size={15} />}
+                  onClick={() => onControl(component.component, "start")}
+                  size="small"
+                  title="启动"
+                />
+                <Button
+                  appearance="subtle"
+                  aria-label={`停止${componentName(component.component)}`}
+                  disabled={!controlsEnabled || !component.control_allowed || busyKey !== null || component.status !== "running"}
+                  icon={<Pause size={15} />}
+                  onClick={() => onControl(component.component, "stop")}
+                  size="small"
+                  title="停止"
+                />
+                <Button
+                  appearance="subtle"
+                  aria-label={`重启${componentName(component.component)}`}
+                  disabled={!controlsEnabled || !component.control_allowed || busyKey !== null || component.status !== "running"}
+                  icon={<ArrowClockwise size={15} />}
+                  onClick={() => onControl(component.component, "restart")}
+                  size="small"
+                  title="重启"
+                />
+              </div>
             </div>
           ))}
-          {!workers.length && <div className="subtle-empty">没有工作进程心跳</div>}
+          {!components.length && <div className="subtle-empty compact">控制会话未建立</div>}
         </div>
-        <div className="control-grid">
-          <Button
-            disabled={!controlsEnabled}
-            icon={<Play size={16} />}
-            onClick={() => onControl?.("raybet", "start")}
-            size="small"
-            title={controlsEnabled ? "启动采集进程" : "控制服务尚未启用"}
-          >
-            启动采集
-          </Button>
-          <Button
-            disabled={!controlsEnabled}
-            icon={<Pause size={16} />}
-            onClick={() => onControl?.("raybet", "stop")}
-            size="small"
-            title={controlsEnabled ? "停止采集进程" : "控制服务尚未启用"}
-          >
-            停止采集
-          </Button>
-        </div>
+        {controlMessage && <div className="control-message" role="status">{controlMessage}</div>}
       </section>
 
       <section className="operations-section alert-section">
@@ -125,13 +251,25 @@ export function OperationsPanel({
           <Bell size={20} aria-hidden="true" />
         </div>
         <div className="alert-list">
-          {alerts.slice(0, 8).map((alert) => (
-            <div className={`alert-row ${alert.severity}`} key={alert.key}>
+          {visibleAlerts.map((alert) => (
+            <div
+              className={`alert-row ${alert.severity} ${alert.acknowledged_at ? "acknowledged" : ""}`}
+              key={alert.incident_id}
+            >
               <WarningCircle size={17} aria-hidden="true" />
               <div>
                 <strong>{alert.title}</strong>
                 <span>{alert.body}</span>
               </div>
+              <Button
+                appearance="subtle"
+                aria-label={`确认告警：${alert.title}`}
+                disabled={!controlsEnabled || Boolean(alert.acknowledged_at)}
+                icon={<CheckCircle size={15} />}
+                onClick={() => onAcknowledge(alert.incident_id)}
+                size="small"
+                title={alert.acknowledged_at ? "已确认" : "确认"}
+              />
             </div>
           ))}
           {!alerts.length && (
@@ -160,50 +298,26 @@ function freshnessText(state: FreshnessState): string {
   return "尚未收到证据";
 }
 
-function healthStatus(value: HealthItem["status"]): ReadinessStatus {
-  if (value === "healthy") return "ready";
-  if (value === "starting") return "delayed";
-  return value;
+function controlStatus(value: ControlComponent["status"]): ReadinessStatus {
+  if (value === "running") return "ready";
+  if (value === "identity_mismatch") return "invalid";
+  return "stopped";
 }
 
-function workerName(component: string): string {
+function componentName(component: ControlComponent["component"]): string {
   return {
-    raybet_worker: "赔率采集",
-    shadow_worker: "纸面策略",
+    raybet_collector: "赔率采集",
+    shadow_monitor: "纸面策略",
+    vision_supervisor: "视觉监控",
     mail_worker: "邮件投递",
-  }[component] || component;
+  }[component];
 }
 
 function mailState(health: HealthItem[]): string {
-  const mail = health.find((item) => item.component === "mail_worker")
-    || health.find((item) => item.component === "mail");
+  const mail = health.find((item) => item.component === "mail")
+    || health.find((item) => item.component === "mail_worker");
   if (!mail) return "未配置";
   if (mail.status === "healthy") return "已连接";
   if (mail.last_error === "configuration_missing" || mail.status === "stopped") return "未配置或未启动";
   return `不可用: ${mail.last_error || mail.status}`;
-}
-
-function buildAlerts(health: HealthItem[], match: MonitorMatch | null) {
-  const alerts: Array<{ key: string; severity: "critical" | "warning"; title: string; body: string }> = [];
-  for (const worker of health.filter((item) => item.component.endsWith("_worker"))) {
-    if (worker.status === "healthy") continue;
-    alerts.push({
-      key: `worker-${worker.component}`,
-      severity: worker.status === "unhealthy" ? "critical" : "warning",
-      title: `${workerName(worker.component)}${worker.status === "stopped" ? "已停止" : "心跳异常"}`,
-      body: worker.age_seconds == null ? "未收到心跳" : `最后心跳 ${formatAge(worker.age_seconds)}`,
-    });
-  }
-  if (match) {
-    for (const [key, state] of Object.entries(match.readiness)) {
-      if (state.status === "ready") continue;
-      alerts.push({
-        key: `match-${match.raybet_match_id}-${key}`,
-        severity: state.status === "stale" || state.status === "unhealthy" ? "critical" : "warning",
-        title: `${readinessRows.find((item) => item.key === key)?.label || key}未就绪`,
-        body: freshnessText(state),
-      });
-    }
-  }
-  return alerts;
 }

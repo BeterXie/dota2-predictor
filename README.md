@@ -4,8 +4,13 @@ Predict Dota 2 match outcomes using historical match data from OpenDota. Data
 is stored in SQLite for model training, strict event intelligence, live shadow
 analysis, and the web interface.
 
-See [DESIGN.md](DESIGN.md) for the original module specifications and
-[live_betting/README.md](live_betting/README.md) for live operations.
+`DESIGN.md` is the legacy module baseline, not the current acceptance source.
+Use the [current specifications](docs/superpowers/specs/) together with the
+[historical intelligence delivery design](docs/historical-intelligence-delivery-design.md)
+for current behavior, and [live_betting/README.md](live_betting/README.md) for
+live operations.
+The full Chinese monitoring-console guide is at
+[docs/monitoring-console-operations-manual.md](docs/monitoring-console-operations-manual.md).
 
 ## Project Structure
 
@@ -41,9 +46,13 @@ python -m train.main
 # Generate a prematch prediction
 python -m predict.main --radiant 9247354 --dire 10150538
 
-# Start the match browser at http://localhost:8000
+# Start the match browser and monitoring console
 python -m web.main
 ```
+
+After building `web/frontend`, open the live console at
+`http://127.0.0.1:8000/monitor`. It includes history replay, freshness-derived
+health, allowlisted process controls, exact-mapping audit, and persistent alerts.
 
 ## Live Shadow Workflow
 

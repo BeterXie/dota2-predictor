@@ -103,7 +103,8 @@ def run(args: argparse.Namespace) -> int:
     raw_dir = Path(args.raw_dir)
 
     with LiveBettingStore(db_path) as store, RayBetClient() as client:
-        store.init_schema()
+        if not getattr(args, "schema_prepared", False):
+            store.init_schema()
         started_at = utc_now()
         record_health(
             store.connection,
@@ -170,6 +171,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-interval", type=float, default=15.0)
     parser.add_argument("--max-backoff", type=float, default=300.0)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
     return parser.parse_args()
 
 

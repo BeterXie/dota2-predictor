@@ -21,12 +21,15 @@ _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from train.dataset import build_training_data, split_train_test
-from train.evaluate import evaluate, print_report
-from train.model import cross_validate, train
+from train.dataset import build_training_data, split_train_test  # noqa: E402
+from train.evaluate import evaluate, print_report  # noqa: E402
+from train.model import cross_validate, train  # noqa: E402
 
-from .feature_builder import COUNTER_FEATURE_NAMES, build_counter_features_for_matches
-from .feature_list import PREMATCH_FEATURES
+from .feature_builder import (  # noqa: E402
+    COUNTER_FEATURE_NAMES,
+    build_counter_features_for_matches,
+)
+from .feature_list import PREMATCH_FEATURES  # noqa: E402
 
 
 def _resolve_path(relative: str) -> str:

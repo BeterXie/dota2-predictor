@@ -21,8 +21,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from event_intelligence.roles import (  # noqa: E402
-    ASSIGNMENT_VERSION,
     HistoricalPositionEvidence,
+    PROSPECTIVE_ASSIGNMENT_VERSION,
+    RECONSTRUCTED_ASSIGNMENT_VERSION,
     RoleAssignment,
     SingleMapRoleEvidence,
     assign_expected_positions,
@@ -39,10 +40,8 @@ class AvailabilityMode(str, Enum):
 
 
 ASSIGNMENT_VERSIONS = {
-    AvailabilityMode.RECONSTRUCTED_WALK_FORWARD: (
-        f"{ASSIGNMENT_VERSION}-reconstructed-walk-forward"
-    ),
-    AvailabilityMode.PROSPECTIVE: f"{ASSIGNMENT_VERSION}-prospective",
+    AvailabilityMode.RECONSTRUCTED_WALK_FORWARD: RECONSTRUCTED_ASSIGNMENT_VERSION,
+    AvailabilityMode.PROSPECTIVE: PROSPECTIVE_ASSIGNMENT_VERSION,
 }
 
 

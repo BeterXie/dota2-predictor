@@ -122,7 +122,33 @@ summary:focus-visible {
 
 .topbar-status {
   justify-content: flex-end;
+  gap: 8px;
+}
+
+.topbar-status .fui-Switch__label {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.compact-switch {
+  display: inline-flex;
+  align-items: center;
+}
+
+.compact-switch > svg {
+  display: none;
+  color: var(--text-muted);
+}
+
+.alert-count {
+  display: inline-flex;
+  min-width: 30px;
+  align-items: center;
+  justify-content: center;
   gap: 4px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
 .connection-badge {
@@ -450,9 +476,9 @@ summary:focus-visible {
   align-items: baseline;
   gap: 10px;
   margin: 7px 0 5px;
-  font-size: clamp(22px, 2.3vw, 32px);
+  font-size: 28px;
   font-weight: 670;
-  letter-spacing: -0.025em;
+  letter-spacing: 0;
   line-height: 1.15;
 }
 
@@ -938,6 +964,27 @@ summary:focus-visible {
   padding: 4px 3px;
 }
 
+.managed-worker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 50px;
+  padding: 5px 3px;
+}
+
+.managed-worker .worker-actions {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(3, 28px);
+  justify-content: end;
+  gap: 2px;
+}
+
+.worker-actions button,
+.mapping-actions button,
+.alert-row button {
+  min-width: 28px;
+}
+
 .control-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -949,18 +996,112 @@ summary:focus-visible {
   min-width: 0;
 }
 
+.control-message {
+  margin-top: 8px;
+  padding: 7px 8px;
+  border-left: 2px solid var(--accent);
+  color: var(--text-muted);
+  background: var(--accent-soft);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.mapping-list {
+  display: grid;
+  gap: 3px;
+}
+
+.mapping-row {
+  border-bottom: 1px solid rgba(48, 56, 64, 0.72);
+}
+
+.mapping-row > summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.mapping-row > summary code {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mapping-row dl {
+  display: grid;
+  gap: 4px;
+  margin: 2px 3px 8px;
+}
+
+.mapping-row dl > div {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 6px;
+}
+
+.mapping-row dt,
+.mapping-row dd {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.mapping-row dd {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.mapping-row.invalidated {
+  opacity: 0.62;
+}
+
+.mapping-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 3px;
+  padding: 0 3px 7px;
+}
+
+.mapping-invalid-reason {
+  margin: 0 3px 8px;
+  color: var(--critical);
+  font-size: 9px;
+}
+
+.automatic-map-button {
+  width: 100%;
+  margin-top: 7px;
+}
+
+.subtle-empty.compact {
+  min-height: 52px;
+}
+
 .alert-section {
   min-height: 170px;
 }
 
 .alert-row {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr);
+  grid-template-columns: 20px minmax(0, 1fr) 28px;
   gap: 7px;
   padding: 8px;
   border-left: 2px solid var(--warning);
   border-radius: 0 var(--radius) var(--radius) 0;
   background: rgba(213, 168, 79, 0.07);
+}
+
+.alert-row.acknowledged {
+  opacity: 0.58;
 }
 
 .alert-row > svg {
@@ -1073,6 +1214,10 @@ summary:focus-visible {
     padding: 14px 12px 28px;
   }
 
+  .match-title-block h1 {
+    font-size: 22px;
+  }
+
   .match-header,
   .quote-strip,
   .workspace-lower-grid {
@@ -1122,6 +1267,30 @@ summary:focus-visible {
   .operations-section {
     border-right: 0;
     border-bottom: 1px solid var(--border);
+  }
+}
+
+@media (max-width: 480px) {
+  .topbar-status .fui-Switch__label {
+    display: none;
+  }
+
+  .compact-switch {
+    gap: 3px;
+  }
+
+  .compact-switch > svg {
+    display: block;
+  }
+}
+
+@media (max-width: 360px) {
+  .topbar {
+    padding-inline: 12px;
+  }
+
+  .brand-lockup > div:last-child {
+    display: none;
   }
 }
 

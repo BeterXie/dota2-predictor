@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fetch.client import OpenDotaClient
 from fetch.db import Database
+from event_intelligence.ingest_adapters import SQLiteIngestAdapter
+from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
+from event_intelligence.registry import EventRegistry
+from event_intelligence.storage import IntelligenceStorage
 
+from .health import record_health
 from .models import Market
-from .settlement import MapResult, settle
+from .raybet import RayBetClient, RayBetMapFinal, parse_raybet_map_final
+from .settlement import MapResult, reconcile_map_winners, settle
 from .storage import LiveBettingStore
 
 
@@ -61,29 +68,66 @@ def _vision_drafts(connection: sqlite3.Connection, match_id: str) -> dict[int, s
 
 
 def _winner(detail: dict, team_id: int, team_side: str) -> tuple[str, int, int]:
-    target_radiant = int(detail.get("radiant_team_id") or 0) == team_id
-    target_won = bool(detail.get("radiant_win")) == target_radiant
+    radiant_team_id = detail.get("radiant_team_id")
+    radiant_win = detail.get("radiant_win")
+    radiant_score = detail.get("radiant_score")
+    dire_score = detail.get("dire_score")
+    if (
+        type(radiant_team_id) is not int
+        or type(radiant_win) is not bool
+        or type(radiant_score) is not int
+        or type(dire_score) is not int
+        or radiant_score < 0
+        or dire_score < 0
+        or team_side not in {"team_one", "team_two"}
+    ):
+        raise ValueError("OpenDota map result is incomplete or invalid")
+    target_radiant = radiant_team_id == team_id
+    target_won = radiant_win == target_radiant
     winner_side = team_side if target_won else (
         "team_two" if team_side == "team_one" else "team_one"
     )
-    radiant_score = int(detail.get("radiant_score") or 0)
-    dire_score = int(detail.get("dire_score") or 0)
     target_kills = radiant_score if target_radiant else dire_score
     opponent_kills = dire_score if target_radiant else radiant_score
     return winner_side, target_kills, opponent_kills
 
 
-def _settle_winner_orders(store: LiveBettingStore, result: StoredMapResult) -> int:
-    rows = store.connection.execute(
-        """SELECT o.order_key, o.market_key, o.fill_price
+def _opendota_evidence_ref(detail: dict, dota_match_id: int) -> str:
+    encoded = json.dumps(
+        detail,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return f"opendota:{dota_match_id}:sha256:{digest}"
+
+
+def _winner_order_rows(
+    store: LiveBettingStore, raybet_match_id: str, map_number: int
+) -> list[sqlite3.Row]:
+    return store.connection.execute(
+        """SELECT o.order_key, o.odds_id, o.market_key, o.fill_price
            FROM shadow_orders o JOIN shadow_map_attempts a ON a.order_key=o.order_key
            LEFT JOIN settlements s ON s.order_key=o.order_key
            WHERE a.raybet_match_id=? AND a.map_number=?
              AND o.status='filled' AND s.order_key IS NULL""",
-        (result.raybet_match_id, result.map_number),
+        (raybet_match_id, map_number),
     ).fetchall()
+
+
+def _settle_winner_orders(
+    store: LiveBettingStore,
+    result: StoredMapResult,
+    rows: list[sqlite3.Row] | None = None,
+) -> int:
+    rows = rows if rows is not None else _winner_order_rows(
+        store, result.raybet_match_id, result.map_number
+    )
     count = 0
-    for order_key, key, fill_price in rows:
+    for row in rows:
+        order_key, key, fill_price = row["order_key"], row["market_key"], row["fill_price"]
         market_type, period, side, line = str(key).split("|", 3)
         if market_type != "winner":
             continue
@@ -100,22 +144,147 @@ def _settle_winner_orders(store: LiveBettingStore, result: StoredMapResult) -> i
     return count
 
 
+def _reconcile_and_settle(
+    store: LiveBettingStore,
+    result: StoredMapResult,
+    raybet_final: RayBetMapFinal,
+) -> dict[str, object]:
+    """Atomically persist source evidence, resolution, settlement, and outbox."""
+    rows = _winner_order_rows(store, result.raybet_match_id, result.map_number)
+    status, reason = reconcile_map_winners(
+        raybet_status=raybet_final.status,
+        raybet_winner=raybet_final.winner_side,
+        opendota_winner=result.winner_side,
+    )
+    if raybet_final.status != "confirmed":
+        reason = raybet_final.reason
+    elif status == "confirmed":
+        for row in rows:
+            parts = str(row["market_key"]).split("|", 3)
+            if len(parts) != 4:
+                status, reason = "manual_review", "order_market_identity_invalid"
+                break
+            market_type, period, side, line = parts
+            fill_price = row["fill_price"]
+            if (
+                market_type != "winner"
+                or period != f"map_{result.map_number}"
+                or side not in {"team_one", "team_two"}
+                or line
+                or isinstance(fill_price, bool)
+                or not isinstance(fill_price, (int, float))
+                or not float(fill_price) > 1.0
+            ):
+                status, reason = "manual_review", "order_market_identity_invalid"
+                break
+            selection_won = raybet_final.selection_won(str(row["odds_id"]))
+            if selection_won is None:
+                status, reason = "pending", "raybet_order_outcome_missing"
+                break
+            if selection_won != (side == raybet_final.winner_side):
+                status, reason = "manual_review", "raybet_order_outcome_conflict"
+                break
+
+    reconciliation_ref = (
+        f"settlement-reconciliation:{result.raybet_match_id}:map:{result.map_number}"
+    )
+    opendota_facts = {
+        "dota_match_id": result.dota_match_id,
+        "winner_side": result.winner_side,
+        "team_one_kills": result.team_one_kills,
+        "team_two_kills": result.team_two_kills,
+        "duration_seconds": result.duration_seconds,
+    }
+    with store.transaction():
+        reconciliation = store.record_settlement_reconciliation(
+            raybet_match_id=result.raybet_match_id,
+            map_number=result.map_number,
+            dota_match_id=result.dota_match_id,
+            raybet_status=raybet_final.status,
+            raybet_winner_side=raybet_final.winner_side,
+            opendota_winner_side=result.winner_side,
+            raybet_evidence_ref=raybet_final.evidence_ref,
+            opendota_evidence_ref=result.evidence_ref,
+            raybet_facts=raybet_final.facts(),
+            opendota_facts=opendota_facts,
+            status=status,
+            reason=reason,
+            observed_at=result.settled_at,
+        )
+        effective_status = str(reconciliation["status"])
+        if effective_status == "manual_review":
+            for row in rows:
+                store.insert_settlement(
+                    str(row["order_key"]),
+                    "review",
+                    0.0,
+                    result.settled_at,
+                    reconciliation_ref,
+                    True,
+                )
+            return {"status": "manual_review", "orders_settled": 0}
+        if effective_status != "confirmed":
+            return {"status": "pending", "orders_settled": 0}
+
+        reconciled_result = replace(result, evidence_ref=reconciliation_ref)
+        stored = store.connection.execute(
+            """SELECT dota_match_id, winner_side FROM map_results
+                WHERE raybet_match_id=? AND map_number=?""",
+            (result.raybet_match_id, result.map_number),
+        ).fetchone()
+        if stored is not None and tuple(stored) != (
+            result.dota_match_id,
+            result.winner_side,
+        ):
+            reconciliation = store.record_settlement_reconciliation(
+                raybet_match_id=result.raybet_match_id,
+                map_number=result.map_number,
+                dota_match_id=result.dota_match_id,
+                raybet_status=raybet_final.status,
+                raybet_winner_side=raybet_final.winner_side,
+                opendota_winner_side=result.winner_side,
+                raybet_evidence_ref=raybet_final.evidence_ref,
+                opendota_evidence_ref=result.evidence_ref,
+                raybet_facts=raybet_final.facts(),
+                opendota_facts=opendota_facts,
+                status="manual_review",
+                reason="stored_map_result_conflict",
+                observed_at=result.settled_at,
+            )
+            assert reconciliation["status"] == "manual_review"
+            return {"status": "manual_review", "orders_settled": 0}
+        if stored is None:
+            store.insert_map_result(reconciled_result)
+        settled = _settle_winner_orders(store, reconciled_result, rows)
+        return {"status": "confirmed", "orders_settled": settled}
+
+
 async def label_once(
-    store: LiveBettingStore, client: OpenDotaClient, archive: Database,
+    store: LiveBettingStore, client: OpenDotaClient, raw_archive: RawArchive,
     match_id: str, team_id: int, team_side: str,
+    raybet_client: RayBetClient | None = None,
 ) -> dict[str, object]:
     match = store.connection.execute(
-        "SELECT status, scheduled_at FROM raybet_matches WHERE raybet_match_id=?",
+        """SELECT scheduled_at, raw_json, updated_at
+             FROM raybet_matches WHERE raybet_match_id=?""",
         (match_id,),
     ).fetchone()
     if not match:
         return {"status": "waiting_for_match_metadata"}
-    if str(match[0]) != "2":
-        return {"status": "waiting_for_raybet_completion"}
     strict_rows = store.connection.execute(
-        """SELECT map_number, canonical_team_one_id, canonical_team_two_id
-             FROM strict_live_map_mappings
-            WHERE raybet_match_id=? ORDER BY map_number""",
+        """SELECT mapping.map_number, mapping.team_one_id, mapping.team_two_id,
+                  mapping.canonical_team_one_id, mapping.canonical_team_two_id
+             FROM strict_live_map_mappings AS mapping
+             LEFT JOIN strict_live_map_mapping_invalidations AS direct_invalidation
+               ON direct_invalidation.mapping_id=mapping.mapping_id
+             LEFT JOIN strict_live_automatic_evidence_approvals AS approval
+               ON approval.approval_id=mapping.automatic_approval_id
+             LEFT JOIN strict_live_map_mapping_invalidations AS source_invalidation
+               ON source_invalidation.mapping_id=approval.source_mapping_id
+            WHERE mapping.raybet_match_id=?
+              AND direct_invalidation.invalidation_id IS NULL
+              AND source_invalidation.invalidation_id IS NULL
+            ORDER BY mapping.map_number""",
         (match_id,),
     ).fetchall()
     if not strict_rows:
@@ -127,28 +296,98 @@ async def label_once(
     if len(team_pairs) != 1:
         return {"status": "strict_mapping_team_conflict"}
     team_one_id, team_two_id = next(iter(team_pairs))
+    raybet_team_pairs = {
+        (int(row["team_one_id"]), int(row["team_two_id"])) for row in strict_rows
+    }
+    if len(raybet_team_pairs) != 1:
+        return {"status": "strict_mapping_raybet_team_conflict"}
+    raybet_team_ids = next(iter(raybet_team_pairs))
     expected_team_id = team_one_id if team_side == "team_one" else team_two_id
     if team_id != expected_team_id:
         return {"status": "strict_mapping_team_mismatch"}
     strict_maps = {int(row["map_number"]) for row in strict_rows}
+    unresolved_maps = strict_maps - {
+        int(row["map_number"])
+        for row in store.connection.execute(
+            """SELECT map_number FROM settlement_reconciliations
+                WHERE raybet_match_id=?
+                  AND status IN ('confirmed', 'manual_review')""",
+            (match_id,),
+        )
+    }
+    try:
+        raybet_payload = json.loads(str(match["raw_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return {"status": "waiting_for_raybet_final_payload"}
+    raybet_observed_at = datetime.fromisoformat(str(match["updated_at"]))
+    if raybet_observed_at.tzinfo is None:
+        raybet_observed_at = raybet_observed_at.replace(tzinfo=timezone.utc)
+    if raybet_client is not None and unresolved_maps:
+        try:
+            refreshed = raybet_client.match_odds(match_id).get("result")
+        except Exception as error:
+            logger.warning(
+                "RayBet final refresh failed for match_id=%s (%s)",
+                match_id,
+                type(error).__name__,
+            )
+        else:
+            if (
+                not isinstance(refreshed, dict)
+                or str(refreshed.get("id") or "") != match_id
+                or type(refreshed.get("game_id")) is not int
+                or int(refreshed["game_id"]) != 151
+            ):
+                return {"status": "raybet_final_refresh_identity_conflict"}
+            raybet_observed_at = datetime.now(timezone.utc)
+            with store.transaction():
+                store.upsert_raybet_match(refreshed, raybet_observed_at)
+            raybet_payload = refreshed
     drafts = _vision_drafts(store.connection, match_id)
     if not drafts:
         return {"status": "waiting_for_confirmed_draft"}
-    scheduled = _scheduled_timestamp(match[1])
+    scheduled = _scheduled_timestamp(match["scheduled_at"])
     summaries = await client.get_team_matches(team_id)
-    candidates = [row for row in summaries if
-                  abs(int(row.get("start_time") or 0) - scheduled) <= 6 * 3600]
-    labeled = settled = 0
+    candidates = [
+        row
+        for row in summaries
+        if type(row.get("match_id")) is int
+        and int(row["match_id"]) > 0
+        and type(row.get("start_time")) is int
+        and abs(int(row["start_time"]) - scheduled) <= 6 * 3600
+    ]
+    labeled = settled = pending = manual_review = 0
     for summary in sorted(candidates, key=lambda row: int(row.get("start_time") or 0)):
         dota_match_id = int(summary["match_id"])
-        if store.connection.execute(
-            "SELECT 1 FROM map_results WHERE dota_match_id=?", (dota_match_id,)
-        ).fetchone():
-            continue
         detail = await client.get_match(dota_match_id)
-        hero_set = frozenset(
-            int(player.get("hero_id") or 0) for player in detail.get("players") or []
+        observed_at = datetime.now(timezone.utc)
+        raw_archive.archive_json(
+            source="opendota",
+            endpoint=f"/api/matches/{dota_match_id}",
+            request_identity=f"/api/matches/{dota_match_id}",
+            payload_bytes=canonical_json_bytes(detail),
+            observed_at=observed_at,
+            match_id=dota_match_id,
+            status_code=200,
+            first_usable_at=None,
         )
+        if type(detail.get("match_id")) is not int or detail["match_id"] != dota_match_id:
+            raise ValueError("OpenDota match identity is invalid")
+        players = detail.get("players")
+        if (
+            not isinstance(players, list)
+            or len(players) != 10
+            or any(
+                not isinstance(player, dict)
+                or type(player.get("hero_id")) is not int
+                or int(player["hero_id"]) <= 0
+                for player in players
+            )
+        ):
+            continue
+        hero_set = frozenset(int(player["hero_id"]) for player in players)
+        if len(hero_set) != 10:
+            continue
         matching_maps = [
             map_number
             for map_number, sets in drafts.items()
@@ -157,21 +396,52 @@ async def label_once(
         if len(matching_maps) != 1:
             continue
         map_number = matching_maps[0]
+        if {
+            detail.get("radiant_team_id"),
+            detail.get("dire_team_id"),
+        } != {team_one_id, team_two_id}:
+            continue
         winner_side, target_kills, opponent_kills = _winner(detail, team_id, team_side)
         if team_side == "team_one":
             team_one_kills, team_two_kills = target_kills, opponent_kills
         else:
             team_one_kills, team_two_kills = opponent_kills, target_kills
+        duration = detail.get("duration")
+        if type(duration) is not int or duration <= 0:
+            raise ValueError("OpenDota map duration is incomplete or invalid")
+        settled_at = datetime.now(timezone.utc)
         result = StoredMapResult(
             match_id, map_number, dota_match_id, winner_side,
-            team_one_kills, team_two_kills, int(detail.get("duration") or 0),
-            f"opendota:{dota_match_id}", datetime.now(timezone.utc),
+            team_one_kills, team_two_kills, duration,
+            _opendota_evidence_ref(detail, dota_match_id), settled_at,
         )
-        if store.insert_map_result(result):
-            archive.insert_match(detail)
+        raybet_final = parse_raybet_map_final(
+            raybet_payload,
+            map_number,
+            observed_at=raybet_observed_at,
+            expected_match_id=match_id,
+            expected_team_ids=raybet_team_ids,
+        )
+        existed = store.connection.execute(
+            """SELECT 1 FROM map_results
+                WHERE raybet_match_id=? AND map_number=?""",
+            (match_id, map_number),
+        ).fetchone()
+        outcome = _reconcile_and_settle(store, result, raybet_final)
+        if outcome["status"] == "confirmed" and existed is None:
             labeled += 1
-            settled += _settle_winner_orders(store, result)
-    return {"status": "labeled", "maps": labeled, "orders_settled": settled}
+        elif outcome["status"] == "pending":
+            pending += 1
+        elif outcome["status"] == "manual_review":
+            manual_review += 1
+        settled += int(outcome["orders_settled"])
+    return {
+        "status": "labeled",
+        "maps": labeled,
+        "orders_settled": settled,
+        "settlement_pending": pending,
+        "settlement_manual_review": manual_review,
+    }
 
 
 def main() -> int:
@@ -183,17 +453,48 @@ def main() -> int:
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--archive-root",
+        type=Path,
+        default=ROOT / "data" / "raw" / "event_intelligence",
+    )
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
     if not args.all and not (args.match_id and args.team_id and args.team_side):
         parser.error("provide --all or --match-id, --team-id, and --team-side")
 
     async def run() -> int:
         client = OpenDotaClient(rate_limit=30)
-        archive = Database(str(args.database))
-        archive.connect()
+        raybet_client = RayBetClient()
         try:
             with LiveBettingStore(args.database) as store:
-                store.init_schema()
+                if not getattr(args, "schema_prepared", False):
+                    store.init_schema()
+                intelligence_storage = IntelligenceStorage(
+                    args.database, connection=store.connection
+                )
+                if not getattr(args, "schema_prepared", False):
+                    intelligence_storage.init_schema()
+                    Database(connection=store.connection).init_db()
+                registry = EventRegistry(intelligence_storage)
+                ingest_store = SQLiteIngestAdapter(
+                    intelligence_storage, registry,
+                    Database(connection=store.connection),
+                )
+                raw_archive = RawArchive(
+                    args.archive_root,
+                    observation_sink=ingest_store.record_raw_artifact,
+                )
+                started_at = datetime.now(timezone.utc)
+                record_health(
+                    store.connection,
+                    "postmatch_worker",
+                    "starting",
+                    heartbeat_at=started_at,
+                    details={"source": "worker"},
+                )
                 while True:
                     try:
                         if args.all:
@@ -206,26 +507,60 @@ def main() -> int:
                                      ON v.raybet_match_id=r.raybet_match_id
                                    JOIN strict_live_map_mappings AS mapping
                                      ON mapping.raybet_match_id=r.raybet_match_id
-                                   WHERE r.status='2' AND v.confirmed=1"""
+                                   LEFT JOIN strict_live_map_mapping_invalidations
+                                     AS direct_invalidation
+                                     ON direct_invalidation.mapping_id=mapping.mapping_id
+                                   LEFT JOIN strict_live_automatic_evidence_approvals
+                                     AS approval
+                                     ON approval.approval_id=mapping.automatic_approval_id
+                                   LEFT JOIN strict_live_map_mapping_invalidations
+                                     AS source_invalidation
+                                     ON source_invalidation.mapping_id=approval.source_mapping_id
+                                   WHERE v.confirmed=1
+                                     AND direct_invalidation.invalidation_id IS NULL
+                                     AND source_invalidation.invalidation_id IS NULL"""
                             ).fetchall()
                             for match_id, team_id in rows:
                                 result = await label_once(
                                     store,
                                     client,
-                                    archive,
+                                    raw_archive,
                                     str(match_id),
                                     int(team_id),
                                     "team_one",
+                                    raybet_client,
                                 )
                                 results.append({"match_id": match_id, **result})
                             result = {"status": "batch", "matches": results}
                         else:
                             result = await label_once(
-                                store, client, archive, args.match_id,
-                                args.team_id, args.team_side,
+                                store, client, raw_archive, args.match_id,
+                                args.team_id, args.team_side, raybet_client,
                             )
+                        succeeded_at = datetime.now(timezone.utc)
+                        record_health(
+                            store.connection,
+                            "postmatch_worker",
+                            "healthy",
+                            heartbeat_at=succeeded_at,
+                            success_at=succeeded_at,
+                            details={
+                                "source": "worker",
+                                "run_status": result.get("status"),
+                            },
+                        )
                         print(json.dumps(result, ensure_ascii=False))
-                    except Exception:
+                    except Exception as error:
+                        failed_at = datetime.now(timezone.utc)
+                        record_health(
+                            store.connection,
+                            "postmatch_worker",
+                            "degraded",
+                            heartbeat_at=failed_at,
+                            error_at=failed_at,
+                            error=type(error).__name__,
+                            details={"source": "worker"},
+                        )
                         logger.exception("post-match labeling iteration failed")
                         if args.once:
                             return 1
@@ -234,7 +569,7 @@ def main() -> int:
                     await asyncio.sleep(args.interval)
         finally:
             await client.close()
-            archive.close()
+            raybet_client.close()
 
     return asyncio.run(run())
 

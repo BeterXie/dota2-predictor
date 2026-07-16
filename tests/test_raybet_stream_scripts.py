@@ -3,25 +3,71 @@ from __future__ import annotations
 import json
 from io import StringIO
 import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from scripts.supervise_raybet_streams import (
     DEFAULT_OBSERVATION_DIR as SUPERVISOR_OBSERVATION_DIR,
+    active_matches,
     reap_children,
+    record_supervisor_health,
     watcher_command,
 )
+from scripts.invalidate_vision_observations import invalidate
 from scripts.watch_raybet_stream import (
     DEFAULT_OBSERVATION_DIR as WATCHER_OBSERVATION_DIR,
     ROOT,
+    _meaningful,
     completion_check_due,
+    current_frame_clock_fields,
+    match_is_complete,
     match_source,
     resolve_source,
 )
+from contracts.live_observation import LiveObservation
+from vision.map_state import ConfirmedClock
+from live_betting.storage import LiveBettingStore
 
 
-def _source_database(tmp_path: Path, raw: dict, rows: list[tuple]) -> Path:
+def test_visual_supervisor_cli_constructs_parser() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "supervise_raybet_streams.py"), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--database" in result.stdout
+
+
+def test_visual_supervisor_records_worker_heartbeat(tmp_path: Path) -> None:
+    database = tmp_path / "vision-health.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+    record_supervisor_health(database, "healthy", active_matches=2)
+    with LiveBettingStore(database) as store:
+        row = store.connection.execute(
+            """SELECT status, details_json FROM service_health
+                 WHERE component='vision_worker'"""
+        ).fetchone()
+    assert row["status"] == "healthy"
+    assert json.loads(row["details_json"])["active_watchers"] == 2
+
+
+def _source_database(
+    tmp_path: Path,
+    raw: dict,
+    rows: list[tuple],
+    *,
+    status: str = "2",
+    updated_at: str = "2026-07-14T01:00:00+00:00",
+) -> Path:
     database = tmp_path / "live.db"
     connection = sqlite3.connect(database)
     try:
@@ -31,7 +77,9 @@ def _source_database(tmp_path: Path, raw: dict, rows: list[tuple]) -> Path:
                 raybet_match_id TEXT PRIMARY KEY,
                 live_url TEXT,
                 raw_json TEXT,
-                best_of INTEGER
+                best_of INTEGER,
+                status TEXT,
+                updated_at TEXT
             );
             CREATE TABLE odds_snapshots (
                 id INTEGER PRIMARY KEY,
@@ -45,8 +93,15 @@ def _source_database(tmp_path: Path, raw: dict, rows: list[tuple]) -> Path:
             """
         )
         connection.execute(
-            "INSERT INTO raybet_matches VALUES (?, ?, ?, ?)",
-            ("42", "https://stream.test/live.m3u8", json.dumps(raw), 3),
+            "INSERT INTO raybet_matches VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "42",
+                "https://stream.test/live.m3u8",
+                json.dumps(raw),
+                3,
+                status,
+                updated_at,
+            ),
         )
         connection.executemany(
             "INSERT INTO odds_snapshots VALUES (?, ?, ?, ?, ?, ?, ?)", rows
@@ -55,6 +110,36 @@ def _source_database(tmp_path: Path, raw: dict, rows: list[tuple]) -> Path:
     finally:
         connection.close()
     return database
+
+
+def _raybet_payload(*, settled_maps: dict[int, str] | None = None) -> dict:
+    settled_maps = settled_maps or {}
+    odds = []
+    for map_number in range(1, 4):
+        winner = settled_maps.get(map_number)
+        status = 5 if winner is not None else (2 if map_number == 1 else 1)
+        for team_id, side in ((101, "team_one"), (202, "team_two")):
+            odds.append(
+                {
+                    "odds_group_id": 1000 + map_number,
+                    "odds_id": 2000 + map_number * 10 + team_id,
+                    "match_stage": f"r{map_number}",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "team_id": team_id,
+                    "status": status,
+                    "win": int(side == winner) if winner is not None else -1,
+                }
+            )
+    return {
+        "id": 42,
+        "game_id": 151,
+        "team": [
+            {"pos": 1, "team_id": 101, "score": {}},
+            {"pos": 2, "team_id": 202, "score": {}},
+        ],
+        "odds": odds,
+    }
 
 
 def test_match_source_prefers_manual_current_index(tmp_path: Path) -> None:
@@ -76,21 +161,24 @@ def test_match_source_prefers_manual_current_index(tmp_path: Path) -> None:
     assert match_source(database, "42") == ("https://stream.test/live.m3u8", 3)
 
 
-def test_match_source_uses_latest_state_per_outcome(tmp_path: Path) -> None:
+def test_match_source_uses_settled_maps_not_open_future_markets(
+    tmp_path: Path,
+) -> None:
     database = _source_database(
         tmp_path,
-        {},
-        [
-            (1, "map-2-a", "42", "winner", "1", "map_2", "2026-07-14T01:00:00+00:00"),
-            (2, "map-2-b", "42", "winner", "1", "map_2", "2026-07-14T01:00:00+00:00"),
-            (3, "map-2-a", "42", "winner", "2", "map_2", "2026-07-14T02:00:00+00:00"),
-            (4, "map-2-b", "42", "winner", "2", "map_2", "2026-07-14T02:00:00+00:00"),
-            (5, "map-3-a", "42", "winner", "1", "map_3", "2026-07-14T03:00:00+00:00"),
-            (6, "map-3-b", "42", "winner", "1", "map_3", "2026-07-14T03:00:00+00:00"),
-        ],
+        _raybet_payload(settled_maps={1: "team_one"}),
+        [],
     )
 
-    assert match_source(database, "42") == ("https://stream.test/live.m3u8", 3)
+    assert match_source(database, "42") == ("https://stream.test/live.m3u8", 2)
+
+
+def test_match_source_does_not_mistake_future_open_market_for_current_map(
+    tmp_path: Path,
+) -> None:
+    database = _source_database(tmp_path, _raybet_payload(), [])
+
+    assert match_source(database, "42") == ("https://stream.test/live.m3u8", 1)
 
 
 def test_match_source_fails_closed_when_current_map_is_ambiguous(
@@ -155,10 +243,136 @@ def test_supervisor_does_not_override_inferred_map_number(tmp_path: Path) -> Non
     assert str(tmp_path / "observations" / "42.jsonl") in command
 
 
+def test_supervisor_selects_only_fresh_live_provider_rows(tmp_path: Path) -> None:
+    database = tmp_path / "live.db"
+    now = datetime(2026, 7, 15, 14, 2, tzinfo=timezone.utc)
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        rows = [
+            ("live", "2", now - timedelta(seconds=10), "https://stream/live.m3u8"),
+            ("prematch", "1", now - timedelta(seconds=10), "https://stream/pre.m3u8"),
+            ("stale", "2", now - timedelta(minutes=2), "https://stream/stale.m3u8"),
+            ("no-video", "2", now - timedelta(seconds=10), None),
+        ]
+        for match_id, status, updated_at, live_url in rows:
+            store.connection.execute(
+                """INSERT INTO raybet_matches
+                   (raybet_match_id, status, live_url, raw_json, updated_at)
+                   VALUES (?, ?, ?, '{}', ?)""",
+                (match_id, status, live_url, updated_at.isoformat()),
+            )
+        store.connection.commit()
+
+    assert active_matches(database, now=now) == ["live"]
+
+
+def test_watcher_stops_only_when_live_provider_row_is_stale_or_not_live(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 15, 14, 2, tzinfo=timezone.utc)
+    database = _source_database(
+        tmp_path,
+        _raybet_payload(),
+        [],
+        updated_at=(now - timedelta(seconds=10)).isoformat(),
+    )
+    assert not match_is_complete(database, "42", now=now)
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE raybet_matches SET updated_at=? WHERE raybet_match_id='42'",
+            ((now - timedelta(minutes=2)).isoformat(),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert match_is_complete(database, "42", now=now)
+
+
 def test_completion_checks_use_sample_count_not_decoder_sequence() -> None:
     assert not completion_check_due(1)
     assert completion_check_due(15)
     assert completion_check_due(30)
+
+
+def test_unconfirmed_frame_never_refreshes_previous_clock_value() -> None:
+    previous = ConfirmedClock(1, 1392, False, 0.94)
+    assert current_frame_clock_fields(previous) == (1392, False, 0.94)
+    assert current_frame_clock_fields(None) == (None, None, 0.0)
+
+
+def test_confirmation_and_pause_changes_are_persisted_as_barriers() -> None:
+    def row(clock: int | None, paused: bool | None) -> LiveObservation:
+        return LiveObservation(
+            raybet_match_id="42",
+            map_number=1,
+            captured_at_utc=datetime.now(timezone.utc),
+            game_clock_seconds=clock,
+            is_paused=paused,
+            radiant_hero_ids=[1, 2, 3, 4, 5],
+            dire_hero_ids=[6, 7, 8, 9, 10],
+            clock_confidence=0.95 if clock is not None else 0.0,
+            draft_confidence=0.95,
+            source_frame_ref="frame",
+            screen_state="game",
+        )
+
+    confirmed = row(600, False)
+    assert _meaningful(confirmed, row(None, None))
+    assert _meaningful(confirmed, row(600, True))
+
+
+def test_vision_invalidation_is_audited_and_online_backed_up(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live.db"
+    backup = tmp_path / "backups" / "before.db"
+    first = "2026-07-11T17:07:38.100279+00:00"
+    second = "2026-07-11T17:07:54.139449+00:00"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        for captured_at, frame in ((first, "first.jpg"), (second, "second.jpg")):
+            store.connection.execute(
+                """INSERT INTO vision_observations VALUES
+                   ('42', 1, ?, 1392, 0, '[1,2,3,4,5]',
+                    '[6,7,8,9,10]', NULL, 0.94, 0.96, ?, 'game', 1)""",
+                (captured_at, frame),
+            )
+        store.connection.commit()
+
+    count = invalidate(
+        database,
+        match_id="42",
+        map_number=1,
+        clock_seconds=1392,
+        after=datetime.fromisoformat(first).astimezone(timezone.utc).isoformat(),
+        reason="stale_clock_republished_with_new_capture_time",
+        backup=backup,
+    )
+    assert count == 1
+    assert backup.exists()
+    with LiveBettingStore(database) as store:
+        assert store.connection.execute(
+            "SELECT confirmed FROM vision_observations WHERE source_frame_ref='first.jpg'"
+        ).fetchone()[0] == 1
+        assert store.connection.execute(
+            "SELECT confirmed FROM vision_observations WHERE source_frame_ref='second.jpg'"
+        ).fetchone()[0] == 0
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM vision_observation_invalidations"
+        ).fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            store.connection.execute(
+                "UPDATE vision_observation_invalidations SET reason='changed'"
+            )
+    verification = sqlite3.connect(backup)
+    try:
+        assert verification.execute(
+            "SELECT confirmed FROM vision_observations WHERE source_frame_ref='second.jpg'"
+        ).fetchone()[0] == 1
+    finally:
+        verification.close()
 
 
 class FakeProcess:
