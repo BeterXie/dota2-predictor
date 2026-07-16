@@ -33,9 +33,12 @@ class VisionObservation:
             and self.game_clock_seconds is not None
             and len(self.radiant_hero_ids) == 5
             and len(self.dire_hero_ids) == 5
+            and all(type(hero_id) is int and hero_id > 0 for hero_id in heroes)
             and len(set(heroes)) == 10
             and self.clock_confidence >= 0.9
             and self.draft_confidence >= 0.9
+            and isinstance(self.source_frame_ref, str)
+            and bool(self.source_frame_ref.strip())
         )
 
 
@@ -47,11 +50,16 @@ def parse_observation(payload: dict) -> VisionObservation:
         raise ValueError("captured_at_utc must be timezone-aware")
     radiant = tuple(int(value) for value in payload.get("radiant_hero_ids") or [])
     dire = tuple(int(value) for value in payload.get("dire_hero_ids") or [])
+    if any(hero_id <= 0 for hero_id in radiant + dire):
+        raise ValueError("hero IDs must be positive")
     if len(set(radiant + dire)) != len(radiant + dire):
         raise ValueError("hero IDs must be unique")
     radiant_team_side = payload.get("radiant_team_side")
     if radiant_team_side not in {None, "team_one", "team_two"}:
         raise ValueError("radiant_team_side must be team_one, team_two, or null")
+    source_frame_ref = str(payload.get("source_frame_ref") or "")
+    if not source_frame_ref.strip():
+        raise ValueError("source_frame_ref must be non-empty")
     return VisionObservation(
         raybet_match_id=str(payload["raybet_match_id"]),
         map_number=payload.get("map_number"),
@@ -62,7 +70,7 @@ def parse_observation(payload: dict) -> VisionObservation:
         dire_hero_ids=dire,
         clock_confidence=float(payload.get("clock_confidence") or 0),
         draft_confidence=float(payload.get("draft_confidence") or 0),
-        source_frame_ref=str(payload.get("source_frame_ref") or ""),
+        source_frame_ref=source_frame_ref,
         screen_state=str(payload.get("screen_state") or "unknown"),
         radiant_team_side=radiant_team_side,
     )

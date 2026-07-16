@@ -312,6 +312,26 @@ def test_observation_rejects_duplicate_heroes() -> None:
         )
 
 
+def test_observation_rejects_non_positive_heroes() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        LiveObservation(
+            raybet_match_id="42",
+            captured_at_utc=datetime.now(timezone.utc),
+            radiant_hero_ids=[0, 2, 3, 4, 5],
+            dire_hero_ids=[6, 7, 8, 9, 10],
+            source_frame_ref="frame.jpg",
+        )
+
+
+def test_observation_rejects_blank_source_frame_ref() -> None:
+    with pytest.raises(ValueError, match="source_frame_ref"):
+        LiveObservation(
+            raybet_match_id="42",
+            captured_at_utc=datetime.now(timezone.utc),
+            source_frame_ref="  ",
+        )
+
+
 def test_team_side_recognizes_swapped_logos() -> None:
     circle, square = _logo("circle"), _logo("square")
     reading = TeamSideRecognizer(circle, square, LOGO_LAYOUT).read(

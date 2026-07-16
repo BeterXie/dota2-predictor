@@ -42,9 +42,18 @@ class LiveObservation(BaseModel):
     @model_validator(mode="after")
     def unique_heroes(self) -> "LiveObservation":
         heroes = self.radiant_hero_ids + self.dire_hero_ids
+        if any(hero_id <= 0 for hero_id in heroes):
+            raise ValueError("hero IDs must be positive")
         if len(heroes) != len(set(heroes)):
             raise ValueError("hero IDs must be unique")
         return self
+
+    @field_validator("source_frame_ref")
+    @classmethod
+    def non_empty_source_frame_ref(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("source_frame_ref must be non-empty")
+        return value
 
     @property
     def is_confirmed(self) -> bool:
@@ -53,8 +62,10 @@ class LiveObservation(BaseModel):
             and self.game_clock_seconds is not None
             and len(self.radiant_hero_ids) == 5
             and len(self.dire_hero_ids) == 5
+            and all(hero_id > 0 for hero_id in self.radiant_hero_ids + self.dire_hero_ids)
             and self.clock_confidence >= 0.9
             and self.draft_confidence >= 0.9
+            and bool(self.source_frame_ref.strip())
         )
 
     @property

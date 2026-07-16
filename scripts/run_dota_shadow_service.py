@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -65,6 +66,8 @@ _DATABASE_HEALTH_CACHE: dict[
     str,
     tuple[datetime, tuple[str, str | None, dict[str, Any]]],
 ] = {}
+_DATABASE_AUDIT_THREADS: dict[str, threading.Thread] = {}
+_DATABASE_AUDIT_LOCK = threading.Lock()
 
 
 def _write_service_report(report_path: Path, result: Mapping[str, Any]) -> None:
@@ -284,17 +287,64 @@ def _database_health(connection: Any) -> tuple[str, str | None, dict[str, Any]]:
     return "healthy", None, details
 
 
+def _run_database_audit(database_key: str, database: Path) -> None:
+    try:
+        connection = sqlite3.connect(
+            f"{database.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        try:
+            connection.execute("PRAGMA busy_timeout=1000")
+            result = _database_health(connection)
+        finally:
+            connection.close()
+    except Exception as error:
+        message = " ".join(str(error).split())[:500]
+        result = (
+            "unhealthy",
+            "database_audit_failed",
+            {
+                "integrity": "unknown",
+                "foreign_key_issues": None,
+                "audit_error": f"{type(error).__name__}: {message}",
+            },
+        )
+    checked_at = datetime.now(timezone.utc)
+    with _DATABASE_AUDIT_LOCK:
+        _DATABASE_HEALTH_CACHE[database_key] = (checked_at, result)
+        if _DATABASE_AUDIT_THREADS.get(database_key) is threading.current_thread():
+            del _DATABASE_AUDIT_THREADS[database_key]
+
+
+def _start_database_audit(database_key: str, database: Path) -> None:
+    with _DATABASE_AUDIT_LOCK:
+        thread = _DATABASE_AUDIT_THREADS.get(database_key)
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=_run_database_audit,
+            args=(database_key, database),
+            name="service-database-audit",
+            daemon=True,
+        )
+        _DATABASE_AUDIT_THREADS[database_key] = thread
+        thread.start()
+
+
 def _periodic_database_health(
     connection: Any,
     now: datetime,
+    *,
+    background: bool = False,
 ) -> tuple[str, str | None, dict[str, Any]]:
     database_row = connection.execute(
         "PRAGMA database_list"
     ).fetchone()
-    database_key = str(database_row[2]) if database_row and database_row[2] else str(
-        id(connection)
-    )
-    cached = _DATABASE_HEALTH_CACHE.get(database_key)
+    database_name = str(database_row[2]) if database_row and database_row[2] else ""
+    database_key = database_name or str(id(connection))
+    with _DATABASE_AUDIT_LOCK:
+        cached = _DATABASE_HEALTH_CACHE.get(database_key)
     if cached is not None:
         checked_at, result = cached
         max_age = (
@@ -311,8 +361,31 @@ def _periodic_database_health(
                 "audit_age_seconds": round(age, 3),
                 "audit_cached": True,
             }
+    if background and database_name:
+        _start_database_audit(database_key, Path(database_name))
+        if cached is not None:
+            checked_at, result = cached
+            status, reason, details = result
+            age = max(0.0, (now - checked_at).total_seconds())
+            return status, reason, {
+                **details,
+                "audit_checked_at": checked_at.isoformat(),
+                "audit_age_seconds": round(age, 3),
+                "audit_cached": True,
+                "audit_stale": True,
+                "audit_refreshing": True,
+            }
+        return "starting", "database_audit_pending", {
+            "integrity": "pending",
+            "foreign_key_issues": None,
+            "audit_checked_at": None,
+            "audit_age_seconds": None,
+            "audit_cached": False,
+            "audit_refreshing": True,
+        }
     result = _database_health(connection)
-    _DATABASE_HEALTH_CACHE[database_key] = (now, result)
+    with _DATABASE_AUDIT_LOCK:
+        _DATABASE_HEALTH_CACHE[database_key] = (now, result)
     status, reason, details = result
     return status, reason, {
         **details,
@@ -431,7 +504,7 @@ def service_once(
             store.init_schema()
         connection = store.connection
         database_status, database_reason, database_details = _periodic_database_health(
-            connection, now
+            connection, now, background=health_only
         )
         _record_component(
             connection,

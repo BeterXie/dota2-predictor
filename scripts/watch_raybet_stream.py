@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -244,6 +245,47 @@ def current_frame_clock_fields(
     )
 
 
+def _should_persist_frame(
+    previous: LiveObservation | None,
+    current: LiveObservation,
+    *,
+    captured_at: float,
+    last_evidence_at: float,
+    evidence_interval: float,
+) -> bool:
+    """Persist every decision-capable observation and periodic barriers."""
+    important_change = (
+        previous is None
+        or previous.screen_state != current.screen_state
+        or (current.is_confirmed and not previous.is_confirmed)
+        or current.map_number != previous.map_number
+    )
+    return (
+        current.is_confirmed
+        or important_change
+        or captured_at - last_evidence_at >= evidence_interval
+    )
+
+
+def _write_evidence_frame(frame_path: Path, image: object) -> str:
+    """Atomically publish a reference only after a non-empty frame exists."""
+    temporary = frame_path.with_name(
+        f".{frame_path.stem}.{uuid.uuid4().hex}.tmp{frame_path.suffix}"
+    )
+    try:
+        written = cv2.imwrite(str(temporary), image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not written or not temporary.is_file() or temporary.stat().st_size <= 0:
+            raise OSError("encoder did not produce a complete evidence frame")
+        temporary.replace(frame_path)
+    except (cv2.error, OSError) as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise OSError(f"failed to write evidence frame: {frame_path}") from error
+    return str(frame_path.resolve())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--match-id", required=True)
@@ -326,9 +368,7 @@ def main() -> int:
                     side_tracker.reset()
                 outside_game_frames = 0
                 confirmed_clock = clock_tracker.update(raw_clock)
-                confirmed_draft = draft_tracker.update(
-                    hero_reader.read(frame.image)
-                )
+                confirmed_draft = draft_tracker.update(hero_reader.read(frame.image))
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
                 last_draft = confirmed_draft or last_draft
@@ -361,20 +401,16 @@ def main() -> int:
                 screen_state=state,
             )
             if _meaningful(previous, observation):
-                important_change = (
-                    previous is None
-                    or previous.screen_state != observation.screen_state
-                    or (observation.is_confirmed and not previous.is_confirmed)
-                    or observation.map_number != previous.map_number
-                )
-                if (
-                    important_change
-                    or frame.captured_at - last_evidence_at >= args.evidence_interval
+                if _should_persist_frame(
+                    previous,
+                    observation,
+                    captured_at=frame.captured_at,
+                    last_evidence_at=last_evidence_at,
+                    evidence_interval=args.evidence_interval,
                 ):
-                    cv2.imwrite(
-                        str(frame_path), frame.image, [cv2.IMWRITE_JPEG_QUALITY, 85]
+                    observation.source_frame_ref = _write_evidence_frame(
+                        frame_path, frame.image
                     )
-                    observation.source_frame_ref = str(frame_path.resolve())
                     last_evidence_at = frame.captured_at
                 writer.append(observation)
                 print(observation.model_dump_json())

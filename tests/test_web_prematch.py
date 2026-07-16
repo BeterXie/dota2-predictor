@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
+from fastapi.testclient import TestClient
 
 from web import app as web_app
 from web.queries import _sort_heroes_by_position
@@ -132,6 +133,21 @@ class PrematchMarkupTests(unittest.TestCase):
         self.assertNotIn("players.every", roster_function)
         self.assertIn("includePlayerRosters ? radiantPlayers : null", html)
         self.assertIn("includePlayerRosters ? direPlayers : null", html)
+
+
+class WebEntryRouteTests(unittest.TestCase):
+    def test_root_opens_monitor_and_preserves_view_query(self) -> None:
+        with TestClient(web_app.app) as client:
+            response = client.get("/?view=intelligence", follow_redirects=False)
+            self.assertEqual(response.status_code, 307)
+            self.assertEqual(response.headers["location"], "/monitor?view=intelligence")
+
+    def test_legacy_matches_page_has_an_explicit_route(self) -> None:
+        with TestClient(web_app.app) as client:
+            response = client.get("/matches")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Dota 2 Predictor", response.text)
+            self.assertIn('href="/monitor"', response.text)
 
 
 if __name__ == "__main__":

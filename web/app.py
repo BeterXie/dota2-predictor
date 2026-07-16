@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 from . import alerts, monitoring, queries
 from .routers import (
@@ -189,8 +189,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 MONITOR_DIST_DIR = Path(__file__).parent / "frontend" / "dist"
 
 
-@app.get("/", response_class=HTMLResponse)
-def serve_index():
+@app.get("/", include_in_schema=False)
+def serve_index(request: Request) -> RedirectResponse:
+    """Open the operator console while preserving legacy query deep links."""
+    target = "/monitor"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    return RedirectResponse(target, status_code=307)
+
+
+@app.get("/matches", response_class=HTMLResponse)
+def serve_legacy_matches():
+    """Serve the legacy searchable match table at an explicit secondary route."""
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
         return HTMLResponse(index_path.read_text(encoding="utf-8"))

@@ -1097,6 +1097,7 @@ def run_once(
         result.order,
         map_number,
         strict_mapping_id=strict.mapping.mapping_id,
+        decision_key=result.decision.decision_key,
     ):
         return {
             "status": "shadow_pending", "order_key": result.order.order_key,

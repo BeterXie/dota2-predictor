@@ -102,6 +102,8 @@ class LiveReportCohortTests(unittest.TestCase):
         order_status: str = "filled",
         rejection_reason: str | None = None,
         strict_available_at: str | None = None,
+        settlement_result: str | None = None,
+        settlement_review_required: bool = False,
     ) -> None:
         match_id = series_id or f"match-{index}"
         order_key = f"order-{index}"
@@ -117,6 +119,10 @@ class LiveReportCohortTests(unittest.TestCase):
         outcome = index % 2 == 0
         result = "win" if outcome else "loss"
         return_units = 2.0 if outcome else 0.0
+        if settlement_result is not None:
+            result = settlement_result
+            if result == "review":
+                return_units = 0.0
         landmark = {
             "model_version": "draft-logistic-l2-v1",
             "model_kind": "pure_draft",
@@ -232,13 +238,14 @@ class LiveReportCohortTests(unittest.TestCase):
             """INSERT INTO settlements
                (order_key, result, return_units, settled_at, evidence_ref,
                 review_required)
-               VALUES (?, ?, ?, ?, ?, 0)""",
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 order_key,
                 result,
                 return_units,
                 (decided_at + timedelta(hours=1)).isoformat(),
                 f"result:{index}",
+                int(settlement_review_required),
             ),
         )
         self.store.connection.execute(
@@ -418,11 +425,10 @@ class LiveReportCohortTests(unittest.TestCase):
         self.assertNotEqual(report["stability_status"], "stable")
 
     def test_review_results_are_unscored_and_reconciliation_is_visible(self) -> None:
-        self.insert_settled_order(1)
-        self.store.connection.execute(
-            """UPDATE settlements
-                  SET result='review', review_required=1
-                WHERE order_key='order-1'"""
+        self.insert_settled_order(
+            1,
+            settlement_result="review",
+            settlement_review_required=True,
         )
         self.store.connection.execute(
             """UPDATE settlement_reconciliations
@@ -454,7 +460,11 @@ class LiveReportCohortTests(unittest.TestCase):
 
     def test_order_audit_counts_invalidated_orders_separately_from_evaluation(self) -> None:
         self.insert_settled_order(1)
-        self.insert_settled_order(2)
+        self.insert_settled_order(
+            2,
+            settlement_result="review",
+            settlement_review_required=True,
+        )
         self.store.connection.execute(
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
@@ -462,11 +472,6 @@ class LiveReportCohortTests(unittest.TestCase):
                VALUES ('shadow_order', 'order-1', 'match-1', 1,
                        'vision_draft_conflict', ?)""",
             (NOW.isoformat(),),
-        )
-        self.store.connection.execute(
-            """UPDATE settlements
-                  SET result='review', review_required=1
-                WHERE order_key='order-2'"""
         )
         self.store.connection.commit()
 

@@ -7,11 +7,13 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from live_betting.markets import normalized_state_hash
-from live_betting.models import Market, OddsSnapshot, ShadowOrder
+from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder
 from live_betting.storage import LiveBettingStore
+from live_betting.strategy import make_order
 
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
@@ -46,7 +48,8 @@ class SuccessorFillTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "live.db"
         self.store = LiveBettingStore(self.path)
         self.store.init_schema()
-        self.strict_mapping_id = 1
+        self.strict_mapping_id = self.insert_strict_mapping()
+        self.order_key: str | None = None
         self.strict_context_patch = patch.object(
             self.store, "_strict_mapping_context_block_reason", return_value=None
         )
@@ -122,21 +125,66 @@ class SuccessorFillTests(unittest.TestCase):
     def pending_order(self) -> ShadowOrder:
         signal = snapshot(NOW)
         self.observe("signal", NOW, [signal])
-        order = ShadowOrder(
-            order_key="order-1",
-            raybet_match_id=MATCH_ID,
-            odds_id=TARGET_ID,
-            market=snapshot(NOW).market,
-            signaled_at=NOW,
-            model_probability=0.6,
-            market_probability=0.5,
-            signal_price=2.0,
+        strategy_version = "successor-test-v1"
+        input_ref = "successor-test-input"
+        order = make_order(
+            ModelQuote(
+                MATCH_ID,
+                "map_1",
+                signal.market,
+                0.6,
+                0.5,
+                0.1,
+                NOW,
+                strategy_version,
+                input_ref,
+            ),
+            signal,
+            min_edge=0.05,
             signal_transport_key="signal",
             signal_transport_at=NOW,
-            expires_at=NOW + timedelta(seconds=15),
-            signal_odds_group_id=signal.odds_group_id,
-            signal_outcome_key=signal.market.outcome_key,
-            signal_identity_verified=True,
+        )
+        assert order is not None
+        self.order_key = order.order_key
+        self.assertTrue(
+            self.store.insert_decision(
+                SimpleNamespace(
+                    decision_key="successor-test-decision",
+                    raybet_match_id=MATCH_ID,
+                    map_number=1,
+                    decided_at=NOW,
+                    underdog_side=signal.market.outcome_key,
+                    market_probability=order.market_probability,
+                    model_probability=order.model_probability,
+                    edge=order.model_probability - order.market_probability,
+                    data_quality=0.8,
+                    eligible=True,
+                    reason="eligible",
+                    contributions={
+                        "test": 0.1,
+                        "__inputs__": {
+                            "strict_live_eligibility": {
+                                "mapping_refs": {
+                                    "strict_mapping_id": self.strict_mapping_id
+                                }
+                            },
+                            "vision": {
+                                "captured_at": NOW.isoformat(),
+                                "source_frame_ref": "C:/evidence/successor-test.jpg",
+                                "game_clock_seconds": 600,
+                            },
+                            "quality": {"aggregate": 0.8},
+                            "draft_landmark": {
+                                "model_version": "successor-test-model-v1",
+                                "model_kind": "pure_draft",
+                                "model_hash": "a" * 64,
+                            },
+                        },
+                    },
+                    input_ref=input_ref,
+                    strategy_version=strategy_version,
+                )
+            )
         )
         self.assertTrue(
             self.store.insert_map_order(
@@ -145,18 +193,21 @@ class SuccessorFillTests(unittest.TestCase):
         )
         self.assertEqual(
             self.store.connection.execute(
-                "SELECT strict_mapping_id FROM shadow_orders WHERE order_key='order-1'"
+                "SELECT strict_mapping_id FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
             ).fetchone()[0],
             self.strict_mapping_id,
         )
         return order
 
     def statuses(self) -> tuple[str, str, str | None]:
+        assert self.order_key is not None
         row = self.store.connection.execute(
             """SELECT o.status, a.status, o.rejection_reason
                  FROM shadow_orders o JOIN shadow_map_attempts a
                    ON a.order_key=o.order_key
-                WHERE o.order_key='order-1'"""
+                WHERE o.order_key=?""",
+            (self.order_key,),
         ).fetchone()
         return str(row[0]), str(row[1]), row[2]
 

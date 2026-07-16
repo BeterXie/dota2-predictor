@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from event_intelligence.storage import IntelligenceStorage
 from live_betting.markets import normalized_state_hash
-from live_betting.models import Market, OddsSnapshot, ShadowOrder
+from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder
 from live_betting.notifications import (
     EVENT_FILLED,
     EVENT_MONITOR_ALERT,
@@ -22,12 +24,14 @@ from live_betting.notifications import (
     enqueue,
     mark_failure,
     mark_sent,
+    quarantine_outbox,
     requeue_dead_letter,
     simulation_payload,
     stable_message_id,
 )
 from live_betting.smtp_delivery import SMTPConfig
 from live_betting.storage import LiveBettingStore
+from live_betting.strategy import make_order
 from live_betting.strict_eligibility import accept_strict_live_map_mapping
 from scripts.run_notification_worker import run_once as run_notification_once
 
@@ -52,14 +56,35 @@ class NotificationOutboxTests(unittest.TestCase):
             {"raybet_match_id": "match-1", "value": 1},
         )
 
-    def add(self, event_type: str = EVENT_FILLED) -> bool:
+    def operational_payload(
+        self, event_type: str = EVENT_MONITOR_ALERT
+    ) -> dict[str, object]:
+        return {
+            "incident_id": 1,
+            "category": "operational",
+            "severity": "warning",
+            "title": "worker test",
+            "body": "worker test",
+            "source": {"component": "test"},
+            "event_type": event_type,
+        }
+
+    def add(self, event_type: str = EVENT_MONITOR_ALERT) -> bool:
+        monitor_event = event_type in {EVENT_MONITOR_ALERT}
         return enqueue(
             self.store.connection,
             order_key="order-1",
             event_type=event_type,
-            payload=self.payload(event_type),
+            payload=(
+                self.operational_payload(event_type)
+                if monitor_event
+                else self.payload(event_type)
+            ),
             stats_cutoff_at=NOW,
             created_at=NOW,
+            template_version=(
+                MONITOR_TEMPLATE_VERSION if monitor_event else "dota2-shadow-email-v2"
+            ),
         )
 
     def test_logical_key_and_message_id_are_idempotent(self) -> None:
@@ -70,7 +95,15 @@ class NotificationOutboxTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(
             tuple(row),
-            (stable_message_id("order-1", EVENT_FILLED), "pending", 0),
+            (
+                stable_message_id(
+                    "order-1",
+                    EVENT_MONITOR_ALERT,
+                    template_version=MONITOR_TEMPLATE_VERSION,
+                ),
+                "pending",
+                0,
+            ),
         )
         with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
             self.store.connection.execute(
@@ -80,16 +113,16 @@ class NotificationOutboxTests(unittest.TestCase):
     def test_logical_key_rejects_divergent_immutable_content(self) -> None:
         self.assertTrue(self.add())
         cases = (
-            {"payload": {**self.payload(), "value": 2}},
+            {"payload": {**self.operational_payload(), "body": "different"}},
             {"recipient": "other@example.com"},
             {"template_version": "different-template"},
             {"stats_cutoff_at": NOW + timedelta(seconds=1)},
             {"created_at": NOW + timedelta(seconds=1)},
         )
         defaults = {
-            "payload": self.payload(),
+            "payload": self.operational_payload(),
             "recipient": "599084618@qq.com",
-            "template_version": "dota2-shadow-email-v2",
+            "template_version": MONITOR_TEMPLATE_VERSION,
             "stats_cutoff_at": NOW,
             "created_at": NOW,
         }
@@ -99,7 +132,7 @@ class NotificationOutboxTests(unittest.TestCase):
                     enqueue(
                         self.store.connection,
                         order_key="order-1",
-                        event_type=EVENT_FILLED,
+                        event_type=EVENT_MONITOR_ALERT,
                         **{**defaults, **override},
                     )
 
@@ -170,6 +203,111 @@ class NotificationOutboxTests(unittest.TestCase):
                 lease_token=second.lease_token,
                 sent_at=NOW + timedelta(seconds=31),
             )
+        )
+
+    def test_expired_lease_is_not_sendable_and_can_be_reclaimed(self) -> None:
+        self.assertTrue(self.add())
+        first = claim(self.store.connection, now=NOW, lease_seconds=30)
+        assert first is not None and first.lease_token is not None
+        expired_at = NOW + timedelta(seconds=30)
+
+        self.assertFalse(
+            ensure_sendable(
+                self.store.connection,
+                outbox_id=first.outbox_id,
+                lease_token=first.lease_token,
+                now=expired_at,
+            )
+        )
+        second = claim(self.store.connection, now=expired_at, lease_seconds=30)
+        assert second is not None and second.lease_token is not None
+        self.assertNotEqual(second.lease_token, first.lease_token)
+        self.assertTrue(
+            ensure_sendable(
+                self.store.connection,
+                outbox_id=second.outbox_id,
+                lease_token=second.lease_token,
+                now=expired_at,
+            )
+        )
+
+    def test_quarantine_intent_survives_successful_smtp_completion(self) -> None:
+        self.assertTrue(self.add())
+        record = claim(self.store.connection, now=NOW, lease_seconds=30)
+        assert record is not None and record.lease_token is not None
+        self.assertTrue(
+            quarantine_outbox(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                reason="vision_draft_conflict",
+                actor="red_team_test",
+                now=NOW + timedelta(seconds=1),
+            )
+        )
+        leased = self.store.connection.execute(
+            "SELECT status, lease_token, last_error FROM notification_outbox"
+        ).fetchone()
+        self.assertEqual(
+            tuple(leased),
+            (
+                "leased",
+                record.lease_token,
+                "quarantine_intent:vision_draft_conflict",
+            ),
+        )
+
+        self.assertFalse(
+            mark_sent(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                lease_token=record.lease_token,
+                sent_at=NOW + timedelta(seconds=2),
+            )
+        )
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status, lease_token, last_error FROM notification_outbox"
+                ).fetchone()
+            ),
+            (
+                "sent",
+                None,
+                "sent_then_quarantined:vision_draft_conflict",
+            ),
+        )
+
+    def test_quarantine_intent_cannot_be_retried_after_smtp_failure(self) -> None:
+        self.assertTrue(self.add())
+        record = claim(self.store.connection, now=NOW, lease_seconds=30)
+        assert record is not None and record.lease_token is not None
+        self.assertTrue(
+            quarantine_outbox(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                reason="vision_draft_conflict",
+                actor="red_team_test",
+                now=NOW + timedelta(seconds=1),
+            )
+        )
+
+        self.assertTrue(
+            mark_failure(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                lease_token=record.lease_token,
+                transient=True,
+                reason="network_failure",
+                now=NOW + timedelta(seconds=2),
+            )
+        )
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status, lease_token, last_error FROM notification_outbox"
+                ).fetchone()
+            ),
+            ("dead_letter", None, "vision_draft_conflict"),
         )
 
     def test_transient_retry_schedule_and_permanent_dead_letter(self) -> None:
@@ -275,10 +413,11 @@ class NotificationOutboxTests(unittest.TestCase):
             enqueue(
                 self.store.connection,
                 order_key="exhausted-order",
-                event_type=EVENT_FILLED,
-                payload=self.payload(),
+                event_type=EVENT_MONITOR_ALERT,
+                payload=self.operational_payload(),
                 stats_cutoff_at=due_at,
                 created_at=due_at,
+                template_version=MONITOR_TEMPLATE_VERSION,
             )
         )
         self.store.connection.execute(
@@ -302,6 +441,39 @@ class NotificationOutboxTests(unittest.TestCase):
             "dead_letter",
         )
 
+    def test_worker_dead_letters_legacy_formal_row_without_web_schema_init(
+        self,
+    ) -> None:
+        due_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.assertTrue(
+            enqueue(
+                self.store.connection,
+                order_key="legacy-v1-order",
+                event_type=EVENT_FILLED,
+                payload=self.payload(),
+                stats_cutoff_at=due_at,
+                created_at=due_at,
+                template_version="dota2-shadow-email-v1",
+            )
+        )
+        with patch("scripts.run_notification_worker.send_message") as send:
+            result = run_notification_once(
+                self.store,
+                SMTPConfig("sender@qq.com", "not-a-real-credential"),
+            )
+
+        self.assertEqual(result["status"], "idle")
+        send.assert_not_called()
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT status, last_error FROM notification_outbox
+                        WHERE order_key='legacy-v1-order'"""
+                ).fetchone()
+            ),
+            ("dead_letter", "formal_notification_template_unsupported"),
+        )
+
     def test_worker_records_actual_send_completion_time(self) -> None:
         self.assertTrue(self.add())
         completed_at = NOW + timedelta(seconds=12)
@@ -309,7 +481,7 @@ class NotificationOutboxTests(unittest.TestCase):
             patch("scripts.run_notification_worker.send_message"),
             patch("scripts.run_notification_worker.datetime") as clock,
         ):
-            clock.now.side_effect = [NOW, completed_at]
+            clock.now.side_effect = [NOW, NOW, completed_at]
             result = run_notification_once(
                 self.store,
                 SMTPConfig("sender@qq.com", "not-a-real-credential"),
@@ -317,9 +489,13 @@ class NotificationOutboxTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "sent")
         self.assertEqual(
-            datetime.fromisoformat(str(self.store.connection.execute(
-                "SELECT sent_at FROM notification_outbox"
-            ).fetchone()[0])),
+            datetime.fromisoformat(
+                str(
+                    self.store.connection.execute(
+                        "SELECT sent_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+            ),
             completed_at,
         )
 
@@ -333,7 +509,7 @@ class NotificationOutboxTests(unittest.TestCase):
             ),
             patch("scripts.run_notification_worker.datetime") as clock,
         ):
-            clock.now.side_effect = [NOW, failed_at]
+            clock.now.side_effect = [NOW, NOW, failed_at]
             result = run_notification_once(
                 self.store,
                 SMTPConfig("sender@qq.com", "not-a-real-credential"),
@@ -341,9 +517,13 @@ class NotificationOutboxTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "retry_scheduled")
         self.assertEqual(
-            datetime.fromisoformat(str(self.store.connection.execute(
-                "SELECT next_attempt_at FROM notification_outbox"
-            ).fetchone()[0])),
+            datetime.fromisoformat(
+                str(
+                    self.store.connection.execute(
+                        "SELECT next_attempt_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+            ),
             failed_at + timedelta(seconds=RETRY_DELAYS[0]),
         )
 
@@ -366,22 +546,115 @@ class NotificationOutboxTests(unittest.TestCase):
             normalized_state_hash=normalized_state_hash([signal]),
             snapshots=[signal],
         )
-        return ShadowOrder(
-            order_key="order-1",
-            raybet_match_id="match-1",
-            odds_id="winner-one",
-            market=signal.market,
-            signaled_at=NOW,
-            model_probability=0.6,
-            market_probability=0.5,
-            signal_price=2.0,
+        input_ref = "integration-input-ref"
+        strategy_version = "integration-strategy-v1"
+        self.assertTrue(
+            self.store.insert_decision(
+                SimpleNamespace(
+                    decision_key="integration-decision",
+                    raybet_match_id="match-1",
+                    map_number=1,
+                    decided_at=NOW,
+                    underdog_side="team_one",
+                    market_probability=0.5,
+                    model_probability=0.6,
+                    edge=0.1,
+                    data_quality=0.8,
+                    eligible=True,
+                    reason="eligible",
+                    contributions={
+                        "draft": 0.1,
+                        "__inputs__": {
+                            "strict_live_eligibility": {
+                                "mapping_refs": {
+                                    "strict_mapping_id": self.strict_mapping_id
+                                }
+                            },
+                            "vision": {
+                                "captured_at": NOW.isoformat(),
+                                "source_frame_ref": "C:/evidence/integration.jpg",
+                                "game_clock_seconds": 600,
+                            },
+                            "quality": {"aggregate": 0.8},
+                            "draft_landmark": {
+                                "model_version": "integration-model-v1",
+                                "model_kind": "pure_draft",
+                                "model_hash": "a" * 64,
+                            },
+                        },
+                    },
+                    input_ref=input_ref,
+                    strategy_version=strategy_version,
+                )
+            )
+        )
+        order = make_order(
+            ModelQuote(
+                "match-1",
+                "map_1",
+                signal.market,
+                0.6,
+                0.5,
+                0.1,
+                NOW,
+                strategy_version,
+                input_ref,
+            ),
+            signal,
+            min_edge=0.05,
             signal_transport_key="signal",
             signal_transport_at=NOW,
-            expires_at=NOW + timedelta(seconds=15),
-            signal_odds_group_id="winner-group",
-            signal_outcome_key="team_one",
-            signal_identity_verified=True,
         )
+        assert order is not None
+        return order
+
+    def _filled_order_with_outbox(self) -> ShadowOrder:
+        order = self._order()
+        self.assertTrue(
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
+        )
+        successor_at = NOW + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            "match-1",
+            "winner-one",
+            "winner-group",
+            successor_at,
+            1.99,
+            1,
+            order.market,
+        )
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key="formal-gate-successor",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=successor_at,
+            normalized_state_hash=normalized_state_hash([successor]),
+            snapshots=[successor],
+        )
+        resolved = self.store.process_pending_successor(
+            order, watermark=successor_at
+        )
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.status, "filled")
+        return order
+
+    def test_strategy_decision_content_is_immutable(self) -> None:
+        self._order()
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            self.store.connection.execute(
+                """UPDATE strategy_decisions SET contributions_json='{}'
+                    WHERE decision_key='integration-decision'"""
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            self.store.connection.execute(
+                """DELETE FROM strategy_decisions
+                    WHERE decision_key='integration-decision'"""
+            )
 
     def _ensure_strict_mapping(self) -> int:
         IntelligenceStorage(
@@ -453,7 +726,9 @@ class NotificationOutboxTests(unittest.TestCase):
                 },
             },
         }
-        with patch("live_betting.strict_eligibility._utc_now", return_value=accepted_at):
+        with patch(
+            "live_betting.strict_eligibility._utc_now", return_value=accepted_at
+        ):
             mapping = accept_strict_live_map_mapping(
                 self.store.connection,
                 raybet_match_id="match-1",
@@ -480,7 +755,12 @@ class NotificationOutboxTests(unittest.TestCase):
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1", "winner-one", "winner-group", successor_at, 1.99, 1,
+            "match-1",
+            "winner-one",
+            "winner-group",
+            successor_at,
+            1.99,
+            1,
             order.market,
         )
         self.store.store_odds_observation(
@@ -502,13 +782,166 @@ class NotificationOutboxTests(unittest.TestCase):
         )
         self.assertTrue(
             self.store.insert_settlement(
-                "order-1", "win", 1.99, successor_at, "opendota:1"
+                order.order_key, "win", 1.99, successor_at, "opendota:1"
             )
         )
-        events = [row[0] for row in self.store.connection.execute(
-            "SELECT event_type FROM notification_outbox ORDER BY outbox_id"
-        )]
+        events = [
+            row[0]
+            for row in self.store.connection.execute(
+                "SELECT event_type FROM notification_outbox ORDER BY outbox_id"
+            )
+        ]
         self.assertEqual(events, [EVENT_FILLED, EVENT_SETTLED])
+
+    def test_entry_and_settlement_payloads_preserve_full_traceability(self) -> None:
+        market = Market("winner", "map_1", "team_one", None, "team_one", True)
+        signal = OddsSnapshot(
+            "match-1", "trace-winner", "trace-group", NOW, 2.0, 1, market
+        )
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key="trace-signal",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=NOW,
+            normalized_state_hash=normalized_state_hash([signal]),
+            snapshots=[signal],
+        )
+        inputs = {
+            "strict_live_eligibility": {
+                "mapping_refs": {"strict_mapping_id": self.strict_mapping_id}
+            },
+            "vision": {
+                "captured_at": (NOW - timedelta(seconds=1)).isoformat(),
+                "source_frame_ref": "C:/evidence/trace-frame.jpg",
+                "game_clock_seconds": 615,
+            },
+            "quality": {
+                "team": 0.8,
+                "player": 0.7,
+                "draft": 0.9,
+                "aggregate": 0.83,
+            },
+            "draft_landmark": {
+                "model_version": "draft-v5",
+                "model_kind": "pure_draft",
+                "model_hash": "a" * 64,
+            },
+        }
+        input_ref = "trace-input-ref"
+        strategy_version = "trace-strategy-v5"
+        decision = SimpleNamespace(
+            decision_key="trace-decision",
+            raybet_match_id="match-1",
+            map_number=1,
+            decided_at=NOW,
+            underdog_side="team_one",
+            market_probability=0.5,
+            model_probability=0.6,
+            edge=0.1,
+            data_quality=0.83,
+            eligible=True,
+            reason="eligible",
+            contributions={
+                "draft": 0.08,
+                "team_style": 0.02,
+                "__inputs__": inputs,
+            },
+            input_ref=input_ref,
+            strategy_version=strategy_version,
+        )
+        self.assertTrue(self.store.insert_decision(decision))
+        order = make_order(
+            ModelQuote(
+                "match-1",
+                "map_1",
+                market,
+                0.6,
+                0.5,
+                0.1,
+                NOW,
+                strategy_version,
+                input_ref,
+            ),
+            signal,
+            min_edge=0.05,
+            signal_transport_key="trace-signal",
+            signal_transport_at=NOW,
+        )
+        assert order is not None
+        self.assertTrue(
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
+        )
+        successor_at = NOW + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            "match-1",
+            "trace-winner",
+            "trace-group",
+            successor_at,
+            1.99,
+            1,
+            market,
+        )
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key="trace-successor",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=successor_at,
+            normalized_state_hash=normalized_state_hash([successor]),
+            snapshots=[successor],
+        )
+        resolved = self.store.process_pending_successor(order, watermark=successor_at)
+        assert resolved is not None
+        self.assertEqual(resolved.status, "filled")
+
+        entry = json.loads(
+            self.store.connection.execute(
+                "SELECT payload_json FROM notification_outbox "
+                "WHERE order_key=? AND event_type='filled'",
+                (order.order_key,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(entry["decision_lineage_status"], "verified")
+        self.assertEqual(entry["event_id"], "pgl-wallachia-s8-2026")
+        self.assertEqual(entry["teams"]["team_one"]["name"], "Alpha")
+        self.assertEqual(entry["teams"]["team_two"]["name"], "Beta")
+        self.assertEqual(entry["trusted_game_time_seconds"], 615)
+        self.assertEqual(entry["source_frame_ref"], "C:/evidence/trace-frame.jpg")
+        self.assertEqual(entry["principal_contributions"]["draft"], 0.08)
+        self.assertEqual(entry["quality"]["aggregate"], 0.83)
+        self.assertEqual(entry["model_version"], "draft-v5")
+        self.assertEqual(entry["strategy_version"], strategy_version)
+        self.assertEqual(entry["decision_input_ref"], input_ref)
+        self.assertEqual(entry["fill_transport_key"], "trace-successor")
+        self.assertEqual(entry["order_key"], order.order_key)
+        settled_at = successor_at + timedelta(seconds=1)
+        self.assertTrue(
+            self.store.insert_settlement(
+                order.order_key, "win", 1.99, settled_at, "opendota:trace"
+            )
+        )
+        result = json.loads(
+            self.store.connection.execute(
+                "SELECT payload_json FROM notification_outbox "
+                "WHERE order_key=? AND event_type='settled'",
+                (order.order_key,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(result["map_number"], 1)
+        self.assertEqual(result["selected_side"], "team_one")
+        self.assertEqual(result["event_name"], entry["event_name"])
+        self.assertEqual(result["result"], "win")
+        self.assertAlmostEqual(result["profit_loss_units"], 0.99)
+        cumulative = result["cumulative_shadow_statistics"]
+        self.assertEqual(cumulative["filled_orders"], 1)
+        self.assertEqual(cumulative["settled_orders"], 1)
+        self.assertAlmostEqual(cumulative["stake_units"], 1.0)
+        self.assertAlmostEqual(cumulative["return_units"], 1.99)
+        self.assertAlmostEqual(cumulative["profit_loss_units"], 0.99)
+        self.assertAlmostEqual(cumulative["roi"], 0.99)
 
     def test_review_required_settlement_does_not_mail(self) -> None:
         self.assertTrue(
@@ -521,6 +954,98 @@ class NotificationOutboxTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM notification_outbox"
             ).fetchone()[0],
             0,
+        )
+
+    def test_claim_rejects_settlement_payload_that_disagrees_with_ledger(
+        self,
+    ) -> None:
+        order = self._filled_order_with_outbox()
+        settled_at = NOW + timedelta(seconds=3)
+        self.assertTrue(
+            self.store.insert_settlement(
+                order.order_key,
+                "win",
+                1.99,
+                settled_at,
+                "opendota:verified",
+            )
+        )
+        row = self.store.connection.execute(
+            """SELECT outbox_id, payload_json FROM notification_outbox
+                WHERE order_key=? AND event_type='settled'""",
+            (order.order_key,),
+        ).fetchone()
+        payload = json.loads(str(row["payload_json"]))
+        payload["return_units"] = 9.0
+        payload["profit_loss_units"] = 8.0
+        self.store.connection.execute(
+            "DROP TRIGGER notification_outbox_payload_immutable"
+        )
+        self.store.connection.execute(
+            "UPDATE notification_outbox SET status='sent' WHERE event_type='filled'"
+        )
+        self.store.connection.execute(
+            "UPDATE notification_outbox SET payload_json=? WHERE outbox_id=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                int(row["outbox_id"]),
+            ),
+        )
+        self.store.connection.commit()
+
+        self.assertIsNone(claim(self.store.connection, now=settled_at))
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT status, last_error FROM notification_outbox
+                        WHERE outbox_id=?""",
+                    (int(row["outbox_id"]),),
+                ).fetchone()
+            ),
+            ("dead_letter", "formal_notification_settlement_mismatch"),
+        )
+
+    def test_settled_claim_rechecks_current_filled_order_baseline(self) -> None:
+        order = self._filled_order_with_outbox()
+        settled_at = NOW + timedelta(seconds=3)
+        self.assertTrue(
+            self.store.insert_settlement(
+                order.order_key,
+                "win",
+                1.99,
+                settled_at,
+                "opendota:verified",
+            )
+        )
+        settled_outbox_id = int(
+            self.store.connection.execute(
+                """SELECT outbox_id FROM notification_outbox
+                    WHERE order_key=? AND event_type='settled'""",
+                (order.order_key,),
+            ).fetchone()[0]
+        )
+        self.store.connection.execute(
+            "UPDATE notification_outbox SET status='sent' WHERE event_type='filled'"
+        )
+        self.store.connection.execute("DROP TRIGGER shadow_orders_terminal_immutable")
+        self.store.connection.execute(
+            """UPDATE shadow_orders
+                  SET stake=2.0, fill_price=7.0, model_probability=0.9
+                WHERE order_key=?""",
+            (order.order_key,),
+        )
+        self.store.connection.commit()
+
+        self.assertIsNone(claim(self.store.connection, now=settled_at))
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT status, last_error FROM notification_outbox
+                        WHERE outbox_id=?""",
+                    (settled_outbox_id,),
+                ).fetchone()
+            ),
+            ("dead_letter", "formal_notification_lineage_mismatch"),
         )
 
     def test_claim_suppresses_invalidated_order_event(self) -> None:
@@ -553,9 +1078,7 @@ class NotificationOutboxTests(unittest.TestCase):
         row = self.store.connection.execute(
             "SELECT status, last_error FROM notification_outbox"
         ).fetchone()
-        self.assertEqual(
-            tuple(row), ("dead_letter", "vision_observation_invalidated")
-        )
+        self.assertEqual(tuple(row), ("dead_letter", "vision_observation_invalidated"))
 
     def test_claim_uses_paper_signal_source_order_for_legacy_monitor_row(self) -> None:
         self.store.connection.execute(
@@ -605,15 +1128,6 @@ class NotificationOutboxTests(unittest.TestCase):
                 template_version=MONITOR_TEMPLATE_VERSION,
             )
         )
-        self.store.connection.execute(
-            """INSERT INTO vision_derived_invalidations
-               (dependent_type, dependent_key, raybet_match_id, map_number,
-                reason, recorded_at)
-               VALUES ('shadow_order', 'legacy-paper-order', 'match-1', 1,
-                       'vision_draft_conflict', ?)""",
-            (NOW.isoformat(),),
-        )
-
         self.assertIsNone(claim(self.store.connection, now=NOW))
         self.assertEqual(
             tuple(
@@ -656,24 +1170,24 @@ class NotificationOutboxTests(unittest.TestCase):
         )
 
     def test_mark_sent_rechecks_conflict_after_claim(self) -> None:
-        self.assertTrue(self.add(EVENT_FILLED))
-        record = claim(self.store.connection, now=NOW)
+        order = self._filled_order_with_outbox()
+        record = claim(self.store.connection, now=NOW + timedelta(seconds=2))
         self.assertIsNotNone(record)
         assert record is not None and record.lease_token is not None
         self.store.connection.execute(
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, recorded_at)
-               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+               VALUES ('shadow_order', ?, 'match-1', 1,
                        'vision_draft_conflict', ?)""",
-            (NOW.isoformat(),),
+            (order.order_key, NOW.isoformat()),
         )
         self.assertFalse(
             ensure_sendable(
                 self.store.connection,
                 outbox_id=record.outbox_id,
                 lease_token=record.lease_token,
-                now=NOW,
+                now=NOW + timedelta(seconds=3),
             )
         )
         self.assertFalse(
@@ -681,7 +1195,7 @@ class NotificationOutboxTests(unittest.TestCase):
                 self.store.connection,
                 outbox_id=record.outbox_id,
                 lease_token=record.lease_token,
-                sent_at=NOW,
+                sent_at=NOW + timedelta(seconds=3),
             )
         )
         self.assertEqual(
@@ -689,6 +1203,42 @@ class NotificationOutboxTests(unittest.TestCase):
                 "SELECT status FROM notification_outbox"
             ).fetchone()[0],
             "dead_letter",
+        )
+
+    def test_mark_sent_records_post_send_quarantine_without_retrying(self) -> None:
+        order = self._filled_order_with_outbox()
+        record = claim(self.store.connection, now=NOW + timedelta(seconds=2))
+        self.assertIsNotNone(record)
+        assert record is not None and record.lease_token is not None
+        self.store.connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, recorded_at)
+               VALUES ('shadow_order', ?, 'match-1', 1,
+                       'vision_draft_conflict', ?)""",
+            (order.order_key, NOW.isoformat()),
+        )
+        self.assertFalse(
+            mark_sent(
+                self.store.connection,
+                outbox_id=record.outbox_id,
+                lease_token=record.lease_token,
+                sent_at=NOW + timedelta(seconds=3),
+            )
+        )
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status, last_error FROM notification_outbox"
+                ).fetchone()
+            ),
+            ("sent", "sent_then_quarantined:vision_draft_conflict"),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT action FROM notification_outbox_audit ORDER BY audit_id DESC LIMIT 1"
+            ).fetchone()[0],
+            "sent_then_quarantined",
         )
 
     def test_requeue_cannot_resurrect_invalidated_event(self) -> None:
@@ -754,7 +1304,12 @@ class NotificationOutboxTests(unittest.TestCase):
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1", "winner-one", "winner-group", successor_at, 1.99, 1,
+            "match-1",
+            "winner-one",
+            "winner-group",
+            successor_at,
+            1.99,
+            1,
             order.market,
         )
         self.store.store_odds_observation(
@@ -774,15 +1329,21 @@ class NotificationOutboxTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outbox failure"):
                 self.store.process_pending_successor(order, watermark=successor_at)
         self.assertEqual(
-            tuple(self.store.connection.execute(
-                "SELECT status FROM shadow_orders WHERE order_key='order-1'"
-            ).fetchone()),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status FROM shadow_orders WHERE order_key=?",
+                    (order.order_key,),
+                ).fetchone()
+            ),
             ("pending",),
         )
         self.assertEqual(
-            tuple(self.store.connection.execute(
-                "SELECT status FROM shadow_map_attempts WHERE order_key='order-1'"
-            ).fetchone()),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status FROM shadow_map_attempts WHERE order_key=?",
+                    (order.order_key,),
+                ).fetchone()
+            ),
             ("pending",),
         )
         self.assertEqual(
@@ -790,6 +1351,196 @@ class NotificationOutboxTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM notification_outbox"
             ).fetchone()[0],
             0,
+        )
+
+    def test_formal_fill_without_decision_lineage_rolls_back(self) -> None:
+        order = self._order()
+        self.assertTrue(
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
+        )
+        self.store.connection.execute(
+            "DROP TRIGGER shadow_order_decision_lineage_immutable_delete"
+        )
+        self.store.connection.execute(
+            "DELETE FROM shadow_order_decision_lineage WHERE order_key=?",
+            (order.order_key,),
+        )
+        self.store.connection.commit()
+        successor_at = NOW + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            "match-1",
+            "winner-one",
+            "winner-group",
+            successor_at,
+            1.99,
+            1,
+            order.market,
+        )
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key="successor",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=successor_at,
+            normalized_state_hash=normalized_state_hash([successor]),
+            snapshots=[successor],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "formal notification decision lineage is unavailable"
+        ):
+            self.store.process_pending_successor(order, watermark=successor_at)
+
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status FROM shadow_orders WHERE order_key=?",
+                    (order.order_key,),
+                ).fetchone()
+            ),
+            ("pending",),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_map_order_with_zero_decision_candidates_is_rejected(self) -> None:
+        order = self._order()
+        self.store.connection.execute(
+            "DROP TRIGGER strategy_decisions_immutable_delete"
+        )
+        self.store.connection.execute(
+            "DELETE FROM strategy_decisions WHERE decision_key='integration-decision'"
+        )
+        self.store.connection.commit()
+        self.assertFalse(
+            self.store.insert_map_order(
+                order, 1, strict_mapping_id=self.strict_mapping_id
+            )
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM shadow_map_attempts WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()
+        )
+
+    def test_map_order_with_wrong_explicit_decision_key_is_rejected(self) -> None:
+        order = self._order()
+
+        self.assertFalse(
+            self.store.insert_map_order(
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                decision_key="missing-decision",
+            )
+        )
+        for table in ("shadow_orders", "shadow_map_attempts"):
+            with self.subTest(table=table):
+                self.assertIsNone(
+                    self.store.connection.execute(
+                        f"SELECT 1 FROM {table} WHERE order_key=?",
+                        (order.order_key,),
+                    ).fetchone()
+                )
+
+    def test_map_order_with_multiple_matching_decisions_is_rejected(self) -> None:
+        order = self._order()
+        self.store.connection.execute(
+            """INSERT INTO strategy_decisions
+               SELECT 'duplicate-decision', raybet_match_id, map_number,
+                      decided_at, underdog_side, market_probability,
+                      model_probability, edge, data_quality, eligible, reason,
+                      contributions_json, input_ref, strategy_version
+                 FROM strategy_decisions
+                WHERE decision_key='integration-decision'"""
+        )
+        self.store.connection.commit()
+
+        self.assertFalse(
+            self.store.insert_map_order(
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                decision_key="integration-decision",
+            )
+        )
+        for table in ("shadow_orders", "shadow_map_attempts"):
+            with self.subTest(table=table):
+                self.assertIsNone(
+                    self.store.connection.execute(
+                        f"SELECT 1 FROM {table} WHERE order_key=?",
+                        (order.order_key,),
+                    ).fetchone()
+                )
+
+    def test_formal_fill_rechecks_persisted_lineage_after_decision_deletion(self) -> None:
+        order = self._order()
+        self.assertTrue(
+            self.store.insert_map_order(
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+            )
+        )
+        self.store.connection.execute(
+            "DROP TRIGGER strategy_decisions_immutable_delete"
+        )
+        self.store.connection.execute(
+            "DELETE FROM strategy_decisions WHERE decision_key=?",
+            ("integration-decision",),
+        )
+        self.store.connection.commit()
+        successor_at = NOW + timedelta(seconds=2)
+        successor = OddsSnapshot(
+            "match-1",
+            "winner-one",
+            "winner-group",
+            successor_at,
+            1.99,
+            1,
+            order.market,
+        )
+        self.store.store_odds_observation(
+            source="direct",
+            observation_key="deleted-decision:successor",
+            source_event_id=None,
+            raybet_match_id="match-1",
+            observed_at=successor_at,
+            normalized_state_hash=normalized_state_hash([successor]),
+            snapshots=[successor],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "formal notification decision lineage is unavailable"
+        ):
+            self.store.process_pending_successor(order, watermark=successor_at)
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()[0],
+            "pending",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT decision_key FROM shadow_order_decision_lineage WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()[0],
+            "integration-decision",
         )
 
 

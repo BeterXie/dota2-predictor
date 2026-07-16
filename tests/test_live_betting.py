@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from live_betting.event_detector import detect_events
@@ -296,6 +297,41 @@ class StorageTests(unittest.TestCase):
                         normalized_state_hash=normalized_state_hash([row]),
                         snapshots=[row],
                     )
+                for decision_key, order, input_ref in (
+                    ("decision-1", first, "frame"),
+                    ("decision-2", second, "frame2"),
+                ):
+                    self.assertTrue(
+                        store.insert_decision(
+                            SimpleNamespace(
+                                decision_key=decision_key,
+                                raybet_match_id=order.raybet_match_id,
+                                map_number=1,
+                                decided_at=order.signal_transport_at,
+                                underdog_side=order.signal_outcome_key,
+                                market_probability=order.market_probability,
+                                model_probability=order.model_probability,
+                                edge=(
+                                    order.model_probability
+                                    - order.market_probability
+                                ),
+                                data_quality=1.0,
+                                eligible=True,
+                                reason="eligible",
+                                contributions={
+                                    "__inputs__": {
+                                        "strict_live_eligibility": {
+                                            "mapping_refs": {
+                                                "strict_mapping_id": 1
+                                            }
+                                        }
+                                    }
+                                },
+                                input_ref=input_ref,
+                                strategy_version="v1",
+                            )
+                        )
+                    )
                 with patch.object(
                     store, "_strict_mapping_context_block_reason", return_value=None
                 ):
@@ -370,8 +406,9 @@ class EvaluationTests(unittest.TestCase):
 
 
 class VisionContractTests(unittest.TestCase):
-    def test_parses_confirmed_observation(self) -> None:
-        observation = parse_observation({
+    @staticmethod
+    def confirmed_payload() -> dict[str, object]:
+        return {
             "schema_version": 1,
             "raybet_match_id": "123",
             "map_number": 2,
@@ -384,8 +421,34 @@ class VisionContractTests(unittest.TestCase):
             "draft_confidence": 0.96,
             "source_frame_ref": "frame.png",
             "screen_state": "game",
-        })
+        }
+
+    def test_parses_confirmed_observation(self) -> None:
+        observation = parse_observation(self.confirmed_payload())
         self.assertTrue(observation.is_confirmed)
+
+    def test_rejects_non_positive_hero_ids(self) -> None:
+        for hero_id in (0, -1):
+            with self.subTest(hero_id=hero_id):
+                payload = self.confirmed_payload()
+                payload["radiant_hero_ids"] = [hero_id, 2, 3, 4, 5]
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    parse_observation(payload)
+
+    def test_rejects_blank_source_frame_ref(self) -> None:
+        for source_frame_ref in (None, "", "  "):
+            with self.subTest(source_frame_ref=source_frame_ref):
+                payload = self.confirmed_payload()
+                payload["source_frame_ref"] = source_frame_ref
+                with self.assertRaisesRegex(ValueError, "source_frame_ref"):
+                    parse_observation(payload)
+
+    def test_confirmation_requires_positive_heroes_and_frame_ref(self) -> None:
+        valid = parse_observation(self.confirmed_payload())
+        self.assertFalse(
+            replace(valid, radiant_hero_ids=(0, 2, 3, 4, 5)).is_confirmed
+        )
+        self.assertFalse(replace(valid, source_frame_ref=" ").is_confirmed)
 
     def test_rejects_future_schema(self) -> None:
         with self.assertRaises(ValueError):

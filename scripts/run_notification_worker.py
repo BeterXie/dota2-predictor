@@ -39,10 +39,12 @@ def run_once(store: LiveBettingStore, config: SMTPConfig) -> dict[str, object]:
     if record is None:
         return {"status": "idle"}
     assert record.lease_token is not None
+    send_check_at = datetime.now(timezone.utc)
     if not ensure_sendable(
         store.connection,
         outbox_id=record.outbox_id,
         lease_token=record.lease_token,
+        now=send_check_at,
     ):
         return {
             "status": "suppressed",
@@ -86,7 +88,20 @@ def run_once(store: LiveBettingStore, config: SMTPConfig) -> dict[str, object]:
         lease_token=record.lease_token,
         sent_at=completed_at,
     )
-    return {"status": "sent" if updated else "lease_lost", "outbox_id": record.outbox_id}
+    if updated:
+        status = "sent"
+    else:
+        audit = store.connection.execute(
+            """SELECT action FROM notification_outbox_audit
+                WHERE outbox_id=? ORDER BY audit_id DESC LIMIT 1""",
+            (record.outbox_id,),
+        ).fetchone()
+        status = (
+            "sent_then_quarantined"
+            if audit is not None and str(audit[0]) == "sent_then_quarantined"
+            else "lease_lost"
+        )
+    return {"status": status, "outbox_id": record.outbox_id}
 
 
 def main() -> int:
@@ -136,6 +151,7 @@ def main() -> int:
                     "dead_letter",
                     "lease_lost",
                     "retry_scheduled",
+                    "sent_then_quarantined",
                 } or run_status.startswith("state_")
                 record_health(
                     store.connection,

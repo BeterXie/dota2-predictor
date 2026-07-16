@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -19,7 +20,29 @@ from .sanitize import sanitize_raybet_payload
 from .strategy import attempt_fill, is_open
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
+VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
+
+
+def _valid_confirmed_vision_payload(
+    radiant_hero_ids: object,
+    dire_hero_ids: object,
+    source_frame_ref: object,
+) -> bool:
+    """Validate the immutable inputs required for a confirmed draft frame."""
+    if not isinstance(radiant_hero_ids, (list, tuple)):
+        return False
+    if not isinstance(dire_hero_ids, (list, tuple)):
+        return False
+    if not isinstance(source_frame_ref, str) or not source_frame_ref.strip():
+        return False
+    heroes = tuple(radiant_hero_ids) + tuple(dire_hero_ids)
+    return (
+        len(radiant_hero_ids) == 5
+        and len(dire_hero_ids) == 5
+        and all(type(hero_id) is int and hero_id > 0 for hero_id in heroes)
+        and len(set(heroes)) == 10
+    )
 
 
 SCHEMA_SQL = """
@@ -270,6 +293,21 @@ CREATE TABLE IF NOT EXISTS shadow_orders (
     filled_at TEXT,
     rejection_reason TEXT
 );
+CREATE TABLE IF NOT EXISTS shadow_order_decision_lineage (
+    order_key TEXT PRIMARY KEY,
+    decision_key TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS shadow_order_decision_lineage_immutable_update
+BEFORE UPDATE ON shadow_order_decision_lineage
+BEGIN
+    SELECT RAISE(ABORT, 'shadow order decision lineage is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS shadow_order_decision_lineage_immutable_delete
+BEFORE DELETE ON shadow_order_decision_lineage
+BEGIN
+    SELECT RAISE(ABORT, 'shadow order decision lineage is immutable');
+END;
 CREATE TABLE IF NOT EXISTS settlements (
     order_key TEXT PRIMARY KEY,
     result TEXT NOT NULL,
@@ -519,6 +557,16 @@ CREATE TABLE IF NOT EXISTS strategy_decisions (
     input_ref TEXT NOT NULL,
     strategy_version TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS strategy_decisions_immutable_update
+BEFORE UPDATE ON strategy_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'strategy decisions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS strategy_decisions_immutable_delete
+BEFORE DELETE ON strategy_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'strategy decisions are immutable');
+END;
 CREATE TABLE IF NOT EXISTS prospective_draft_curves (
     curve_key TEXT PRIMARY KEY CHECK (length(curve_key)=64),
     raybet_match_id TEXT NOT NULL,
@@ -868,6 +916,12 @@ class LiveBettingStore:
 
     def init_schema(self) -> None:
         self._reject_future_schema()
+        self.connection.executescript(
+            """DROP TRIGGER IF EXISTS shadow_orders_terminal_immutable;
+               DROP TRIGGER IF EXISTS shadow_orders_immutable_delete;
+               DROP TRIGGER IF EXISTS settlements_core_immutable;
+               DROP TRIGGER IF EXISTS settlements_immutable_delete;"""
+        )
         self.connection.executescript(SCHEMA_SQL)
         self._migrate_shadow_order_signal_fields()
         self._migrate_vision_map_identity_fields()
@@ -883,6 +937,8 @@ class LiveBettingStore:
         from .strict_eligibility import init_strict_live_eligibility_schema
 
         init_strict_live_eligibility_schema(self.connection)
+        self._migrate_shadow_order_decision_lineage()
+        self._init_ledger_immutability_triggers()
         self.connection.execute(
             """INSERT OR IGNORE INTO live_schema_version (version, applied_at)
                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
@@ -906,6 +962,88 @@ class LiveBettingStore:
                 f"database live schema version {version} is newer than supported "
                 f"version {CURRENT_SCHEMA_VERSION}"
             )
+
+    def _init_ledger_immutability_triggers(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TRIGGER shadow_orders_terminal_immutable
+            BEFORE UPDATE ON shadow_orders
+            WHEN NOT (
+                OLD.order_key IS NEW.order_key
+                AND OLD.raybet_match_id IS NEW.raybet_match_id
+                AND OLD.strict_mapping_id IS NEW.strict_mapping_id
+                AND OLD.odds_id IS NEW.odds_id
+                AND OLD.market_key IS NEW.market_key
+                AND OLD.signaled_at IS NEW.signaled_at
+                AND OLD.model_probability IS NEW.model_probability
+                AND OLD.market_probability IS NEW.market_probability
+                AND OLD.signal_price IS NEW.signal_price
+                AND OLD.signal_transport_key IS NEW.signal_transport_key
+                AND OLD.signal_transport_at IS NEW.signal_transport_at
+                AND OLD.expires_at IS NEW.expires_at
+                AND OLD.signal_odds_group_id IS NEW.signal_odds_group_id
+                AND OLD.signal_outcome_key IS NEW.signal_outcome_key
+                AND OLD.signal_identity_verified IS NEW.signal_identity_verified
+                AND OLD.stake IS NEW.stake
+                AND OLD.status='pending'
+                AND OLD.fill_price IS NULL
+                AND OLD.filled_at IS NULL
+                AND OLD.rejection_reason IS NULL
+                AND (
+                    (
+                        NEW.status='pending'
+                        AND NEW.fill_price IS NULL
+                        AND NEW.filled_at IS NULL
+                        AND NEW.rejection_reason IS NULL
+                    )
+                    OR (
+                        NEW.status='filled'
+                        AND typeof(NEW.fill_price) IN ('integer', 'real')
+                        AND NEW.fill_price>1.0
+                        AND NEW.filled_at IS NOT NULL
+                        AND NEW.filled_at!=''
+                        AND NEW.rejection_reason IS NULL
+                    )
+                    OR (
+                        NEW.status='rejected'
+                        AND NEW.fill_price IS NULL
+                        AND NEW.filled_at IS NULL
+                        AND NEW.rejection_reason IS NOT NULL
+                        AND NEW.rejection_reason!=''
+                    )
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'shadow order terminal state is immutable');
+            END;
+            CREATE TRIGGER shadow_orders_immutable_delete
+            BEFORE DELETE ON shadow_orders
+            BEGIN
+                SELECT RAISE(ABORT, 'shadow orders are immutable');
+            END;
+            CREATE TRIGGER settlements_core_immutable
+            BEFORE UPDATE ON settlements
+            WHEN NOT (
+                OLD.order_key IS NEW.order_key
+                AND OLD.result IS NEW.result
+                AND OLD.return_units IS NEW.return_units
+                AND OLD.settled_at IS NEW.settled_at
+                AND OLD.evidence_ref IS NEW.evidence_ref
+                AND (
+                    OLD.review_required IS NEW.review_required
+                    OR (OLD.review_required=0 AND NEW.review_required=1)
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'settlement core state is immutable');
+            END;
+            CREATE TRIGGER settlements_immutable_delete
+            BEFORE DELETE ON settlements
+            BEGIN
+                SELECT RAISE(ABORT, 'settlements are immutable');
+            END;
+            """
+        )
 
     def _migrate_shadow_order_signal_fields(self) -> None:
         """Add strict signal identity to databases created by earlier versions."""
@@ -1014,33 +1152,6 @@ class LiveBettingStore:
                     str(row["order_key"]),
                 ),
             )
-
-        self.connection.execute(
-            """UPDATE shadow_orders
-                  SET strict_mapping_id=(
-                      SELECT CAST(json_extract(
-                                 decision.contributions_json,
-                                 '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
-                             ) AS INTEGER)
-                        FROM shadow_map_attempts AS attempt
-                        JOIN strategy_decisions AS decision
-                          ON decision.raybet_match_id=attempt.raybet_match_id
-                         AND decision.map_number=attempt.map_number
-                       WHERE attempt.order_key=shadow_orders.order_key
-                         AND decision.decided_at=shadow_orders.signaled_at
-                         AND decision.model_probability=shadow_orders.model_probability
-                         AND decision.market_probability=shadow_orders.market_probability
-                         AND decision.eligible=1
-                         AND json_valid(decision.contributions_json)
-                         AND CAST(json_extract(
-                                 decision.contributions_json,
-                                 '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
-                             ) AS INTEGER)>0
-                       ORDER BY decision.decision_key
-                       LIMIT 1
-                  )
-                WHERE strict_mapping_id IS NULL"""
-        )
 
         signal_columns = {
             str(row[1]): (int(row[3]), row[4])
@@ -1159,6 +1270,190 @@ class LiveBettingStore:
             END;
             """
         )
+
+    @staticmethod
+    def _stored_shadow_order(row: sqlite3.Row) -> ShadowOrder:
+        market_parts = str(row["market_key"]).split("|")
+        if len(market_parts) != 4:
+            raise ValueError("stored shadow market key is invalid")
+        line = float(market_parts[3]) if market_parts[3] else None
+        market = Market(
+            market_parts[0],
+            market_parts[1],
+            market_parts[2] or None,
+            line,
+            str(row["signal_outcome_key"] or ""),
+            True,
+        )
+        return ShadowOrder(
+            order_key=str(row["order_key"]),
+            raybet_match_id=str(row["raybet_match_id"]),
+            odds_id=str(row["odds_id"]),
+            market=market,
+            signaled_at=datetime.fromisoformat(str(row["signaled_at"])),
+            model_probability=float(row["model_probability"]),
+            market_probability=float(row["market_probability"]),
+            signal_price=float(row["signal_price"]),
+            signal_transport_key=str(row["signal_transport_key"]),
+            signal_transport_at=datetime.fromisoformat(
+                str(row["signal_transport_at"])
+            ),
+            expires_at=datetime.fromisoformat(str(row["expires_at"])),
+            signal_odds_group_id=row["signal_odds_group_id"],
+            signal_outcome_key=row["signal_outcome_key"],
+            signal_identity_verified=bool(row["signal_identity_verified"]),
+            stake=float(row["stake"]),
+            status=str(row["status"]),
+            fill_price=(
+                float(row["fill_price"]) if row["fill_price"] is not None else None
+            ),
+            filled_at=(
+                datetime.fromisoformat(str(row["filled_at"]))
+                if row["filled_at"] is not None
+                else None
+            ),
+            rejection_reason=row["rejection_reason"],
+        )
+
+    def _restore_shadow_order_signal_identity_trigger(self) -> None:
+        self.connection.executescript(
+            """DROP TRIGGER IF EXISTS shadow_orders_signal_identity_immutable;
+               CREATE TRIGGER shadow_orders_signal_identity_immutable
+               BEFORE UPDATE ON shadow_orders
+               WHEN OLD.raybet_match_id IS NOT NEW.raybet_match_id
+                 OR OLD.strict_mapping_id IS NOT NEW.strict_mapping_id
+                 OR OLD.odds_id IS NOT NEW.odds_id
+                 OR OLD.market_key IS NOT NEW.market_key
+                 OR OLD.signaled_at IS NOT NEW.signaled_at
+                 OR OLD.signal_price IS NOT NEW.signal_price
+                 OR OLD.signal_transport_key IS NOT NEW.signal_transport_key
+                 OR OLD.signal_transport_at IS NOT NEW.signal_transport_at
+                 OR OLD.expires_at IS NOT NEW.expires_at
+                 OR OLD.signal_odds_group_id IS NOT NEW.signal_odds_group_id
+                 OR OLD.signal_outcome_key IS NOT NEW.signal_outcome_key
+                 OR OLD.signal_identity_verified IS NOT NEW.signal_identity_verified
+               BEGIN
+                   SELECT RAISE(ABORT, 'shadow order signal identity is immutable');
+               END;"""
+        )
+
+    def _migrate_shadow_order_decision_lineage(self) -> None:
+        """Backfill only uniquely proven lineage and quarantine everything else."""
+        rows = self.connection.execute(
+            """SELECT orders.*, attempt.map_number,
+                      lineage.decision_key AS recorded_decision_key
+                 FROM shadow_orders AS orders
+                 LEFT JOIN shadow_map_attempts AS attempt
+                   ON attempt.order_key=orders.order_key
+                 LEFT JOIN shadow_order_decision_lineage AS lineage
+                   ON lineage.order_key=orders.order_key
+                ORDER BY orders.order_key"""
+        ).fetchall()
+        quarantine_time = datetime.now(timezone.utc)
+        quarantined_at = quarantine_time.isoformat()
+        for row in rows:
+            map_number = int(row["map_number"] or 0)
+            strict_mapping_id = row["strict_mapping_id"]
+            expected_mapping_id = (
+                int(strict_mapping_id)
+                if type(strict_mapping_id) is int and int(strict_mapping_id) > 0
+                else None
+            )
+            try:
+                order = self._stored_shadow_order(row)
+                candidates = (
+                    self._matching_strategy_decision_candidates(
+                        order, map_number
+                    )
+                    if map_number > 0
+                    else []
+                )
+            except (TypeError, ValueError, OverflowError):
+                candidates = []
+            recorded_key = row["recorded_decision_key"]
+            proven = (
+                len(candidates) == 1
+                and (
+                    expected_mapping_id is None
+                    or expected_mapping_id == candidates[0][1]
+                )
+                and (
+                    recorded_key is None
+                    or str(recorded_key) == candidates[0][0]
+                )
+            )
+            if proven:
+                decision_key, mapping_id = candidates[0]
+                if expected_mapping_id is None:
+                    self.connection.execute(
+                        "DROP TRIGGER shadow_orders_signal_identity_immutable"
+                    )
+                    try:
+                        self.connection.execute(
+                            """UPDATE shadow_orders SET strict_mapping_id=?
+                                WHERE order_key=?""",
+                            (mapping_id, str(row["order_key"])),
+                        )
+                    finally:
+                        self._restore_shadow_order_signal_identity_trigger()
+                if recorded_key is None:
+                    self.connection.execute(
+                        """INSERT INTO shadow_order_decision_lineage
+                           (order_key, decision_key, recorded_at)
+                           VALUES (?, ?, ?)""",
+                        (
+                            str(row["order_key"]),
+                            decision_key,
+                            str(row["signaled_at"]),
+                        ),
+                    )
+                continue
+
+            order_key = str(row["order_key"])
+            if str(row["status"]) == "pending":
+                self.connection.execute(
+                    """UPDATE shadow_orders
+                          SET status='rejected', fill_price=NULL, filled_at=NULL,
+                              rejection_reason='decision_lineage_unavailable'
+                        WHERE order_key=? AND status='pending'""",
+                    (order_key,),
+                )
+                self.connection.execute(
+                    """UPDATE shadow_map_attempts
+                          SET status='rejected' WHERE order_key=? AND status='pending'""",
+                    (order_key,),
+                )
+            self.connection.execute(
+                """INSERT OR IGNORE INTO vision_derived_invalidations
+                   (dependent_type, dependent_key, raybet_match_id, map_number,
+                    reason, block_reason, recorded_at)
+                   VALUES ('shadow_order', ?, ?, ?, ?, ?, ?)""",
+                (
+                    order_key,
+                    str(row["raybet_match_id"]),
+                    map_number,
+                    "schema_v4_decision_lineage_unavailable",
+                    "decision_lineage_unavailable",
+                    quarantined_at,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE settlements SET review_required=1 WHERE order_key=?",
+                (order_key,),
+            )
+            outbox_rows = self.connection.execute(
+                """SELECT outbox_id FROM notification_outbox
+                    WHERE order_key=? AND status IN ('pending', 'leased')""",
+                (order_key,),
+            ).fetchall()
+            for outbox_row in outbox_rows:
+                outbox_id = int(outbox_row["outbox_id"])
+                self.quarantine_notification(
+                    outbox_id=outbox_id,
+                    reason="decision_lineage_unavailable",
+                    actor="schema_v4_migration",
+                    now=quarantine_time,
+                )
 
     def _migrate_vision_map_identity_fields(self) -> None:
         """Add team-side identity without guessing values for legacy anchors."""
@@ -1371,45 +1666,462 @@ class LiveBettingStore:
     ) -> tuple[bool, str | None]:
         """Return whether a map has a draft conflict and its earliest cutoff.
 
-        Conflict rows can arrive out of capture order.  The anchor keeps its
-        original identity immutable, so causal readers derive the cutoff from
-        every append-only conflict row and fail closed on malformed timestamps.
+        Conflict rows can arrive out of capture order.  Causal readers derive
+        the cutoff from rows that conflict with the rebuilt canonical anchor
+        and fail closed on missing schema or malformed timestamps.  If an
+        operator froze a map without an intrinsic draft mismatch, every audit
+        row remains effective.
         """
         try:
             anchor = self.connection.execute(
-                """SELECT status, conflict_at FROM vision_draft_anchors
+                """SELECT draft_hash, radiant_team_side, status, conflict_at
+                     FROM vision_draft_anchors
                     WHERE raybet_match_id=? AND map_number=?""",
                 (raybet_match_id, map_number),
             ).fetchone()
-        except sqlite3.OperationalError:
-            return True, None
-        if anchor is None or str(anchor["status"]) != "conflict":
-            return False, None
-        values: list[str] = []
-        if anchor["conflict_at"] is not None:
-            values.append(str(anchor["conflict_at"]))
-        try:
             rows = self.connection.execute(
-                """SELECT captured_at FROM vision_draft_conflicts
+                """SELECT captured_at, observed_draft_hash,
+                          observed_radiant_team_side
+                     FROM vision_draft_conflicts
                     WHERE raybet_match_id=? AND map_number=?
                     ORDER BY conflict_id""",
                 (raybet_match_id, map_number),
             ).fetchall()
         except sqlite3.OperationalError:
             return True, None
-        values.extend(str(row["captured_at"]) for row in rows)
-        if not values:
+        if anchor is None:
+            return (True, None) if rows else (False, None)
+        status = str(anchor["status"])
+        if status not in {"anchored", "conflict"}:
             return True, None
-        parsed: list[tuple[datetime, str]] = []
-        for value in values:
+        parsed_rows: list[tuple[datetime, str, bool]] = []
+        for row in rows:
+            value = str(row["captured_at"])
             try:
                 timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except (TypeError, ValueError):
                 return True, None
             if timestamp.tzinfo is None or timestamp.utcoffset() is None:
                 return True, None
-            parsed.append((timestamp.astimezone(timezone.utc), timestamp.astimezone(timezone.utc).isoformat()))
+            intrinsic = str(row["observed_draft_hash"]) != str(
+                anchor["draft_hash"]
+            ) or (
+                anchor["radiant_team_side"] in {"team_one", "team_two"}
+                and row["observed_radiant_team_side"]
+                in {"team_one", "team_two"}
+                and row["observed_radiant_team_side"]
+                != anchor["radiant_team_side"]
+            )
+            normalized = timestamp.astimezone(timezone.utc)
+            parsed_rows.append((normalized, normalized.isoformat(), intrinsic))
+        if status == "anchored" and not parsed_rows:
+            return False, None
+
+        parsed: list[tuple[datetime, str]] = [
+            (timestamp, value)
+            for timestamp, value, intrinsic in parsed_rows
+            if intrinsic
+        ]
+        if not parsed:
+            parsed = [
+                (timestamp, value) for timestamp, value, _intrinsic in parsed_rows
+            ]
+        if status == "conflict" and anchor["conflict_at"] is not None:
+            value = str(anchor["conflict_at"])
+            try:
+                timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return True, None
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                return True, None
+            normalized = timestamp.astimezone(timezone.utc)
+            parsed.append((normalized, normalized.isoformat()))
+        if not parsed:
+            return True, None
         return True, min(parsed)[1]
+
+    @staticmethod
+    def _draft_event_key(captured_at: object, source_frame_ref: object) -> tuple[datetime, str] | None:
+        """Return the deterministic event-time ordering key for one frame."""
+        try:
+            parsed = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc), str(source_frame_ref)
+
+    def _restore_vision_anchor_identity_trigger(self) -> None:
+        """Reinstall the immutable-anchor guard after an internal rebase."""
+        self.connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS vision_draft_anchor_identity_immutable
+            BEFORE UPDATE ON vision_draft_anchors
+            WHEN NOT (
+                (
+                    OLD.status='anchored'
+                    AND NEW.status='conflict'
+                    AND OLD.raybet_match_id IS NEW.raybet_match_id
+                    AND OLD.map_number IS NEW.map_number
+                    AND OLD.draft_hash IS NEW.draft_hash
+                    AND OLD.radiant_hero_ids IS NEW.radiant_hero_ids
+                    AND OLD.dire_hero_ids IS NEW.dire_hero_ids
+                    AND OLD.radiant_team_side IS NEW.radiant_team_side
+                    AND OLD.team_side_anchored_at IS NEW.team_side_anchored_at
+                    AND OLD.team_side_source_frame_ref
+                        IS NEW.team_side_source_frame_ref
+                    AND OLD.anchored_at IS NEW.anchored_at
+                    AND OLD.source_frame_ref IS NEW.source_frame_ref
+                    AND OLD.conflict_at IS NULL
+                    AND NEW.conflict_at IS NOT NULL
+                )
+                OR
+                (
+                    OLD.status='anchored'
+                    AND NEW.status='anchored'
+                    AND OLD.raybet_match_id IS NEW.raybet_match_id
+                    AND OLD.map_number IS NEW.map_number
+                    AND OLD.draft_hash IS NEW.draft_hash
+                    AND OLD.radiant_hero_ids IS NEW.radiant_hero_ids
+                    AND OLD.dire_hero_ids IS NEW.dire_hero_ids
+                    AND OLD.radiant_team_side IS NULL
+                    AND (
+                        NEW.radiant_team_side IS 'team_one'
+                        OR NEW.radiant_team_side IS 'team_two'
+                    )
+                    AND OLD.team_side_anchored_at IS NULL
+                    AND NEW.team_side_anchored_at IS NOT NULL
+                    AND OLD.team_side_source_frame_ref IS NULL
+                    AND NEW.team_side_source_frame_ref IS NOT NULL
+                    AND NEW.team_side_source_frame_ref!=''
+                    AND OLD.anchored_at IS NEW.anchored_at
+                    AND OLD.source_frame_ref IS NEW.source_frame_ref
+                    AND OLD.conflict_at IS NEW.conflict_at
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'vision draft anchor is immutable');
+            END;
+            """
+        )
+
+    def _rebuild_vision_draft_anchor(
+        self, observation: Any, anchor: sqlite3.Row,
+    ) -> bool:
+        """Rebuild a draft anchor in deterministic browser event-time order.
+
+        Browser capture time is the event order.  Rebuilding for every confirmed
+        frame is necessary because a frame can arrive before an already-recorded
+        conflict or team-side observation while still being later than the draft
+        anchor.  All candidate facts remain append-only in the observation and
+        conflict tables.
+        """
+        match_id = str(observation.raybet_match_id)
+        map_number = int(observation.map_number)
+        candidates: dict[tuple[str, str], dict[str, Any]] = {}
+
+        def add_candidate(
+            captured_at: object,
+            source_frame_ref: object,
+            draft_hash: object,
+            radiant_hero_ids: object,
+            dire_hero_ids: object,
+            radiant_team_side: object,
+        ) -> None:
+            key = (str(captured_at), str(source_frame_ref))
+            event_key = self._draft_event_key(*key)
+            if event_key is None or not str(source_frame_ref).strip():
+                return
+            try:
+                radiant = json.loads(str(radiant_hero_ids))
+                dire = json.loads(str(dire_hero_ids))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return
+            if not _valid_confirmed_vision_payload(
+                radiant, dire, source_frame_ref
+            ):
+                return
+            payload = self.json({"radiant": radiant, "dire": dire})
+            calculated_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if str(draft_hash) != calculated_hash:
+                return
+            side = radiant_team_side if radiant_team_side in {"team_one", "team_two"} else None
+            candidates[key] = {
+                "captured_at": event_key[0],
+                "source_frame_ref": str(source_frame_ref),
+                "draft_hash": calculated_hash,
+                "radiant_json": self.json(radiant),
+                "dire_json": self.json(dire),
+                "radiant_team_side": side,
+            }
+
+        add_candidate(
+            anchor["anchored_at"],
+            anchor["source_frame_ref"],
+            anchor["draft_hash"],
+            anchor["radiant_hero_ids"],
+            anchor["dire_hero_ids"],
+            anchor["radiant_team_side"],
+        )
+        conflict_rows = self.connection.execute(
+            """SELECT captured_at, source_frame_ref, observed_draft_hash,
+                      radiant_hero_ids, dire_hero_ids,
+                      observed_radiant_team_side
+                 FROM vision_draft_conflicts
+                WHERE raybet_match_id=? AND map_number=?""",
+            (match_id, map_number),
+        ).fetchall()
+        conflict_keys = {
+            (str(row["captured_at"]), str(row["source_frame_ref"]))
+            for row in conflict_rows
+        }
+        for row in conflict_rows:
+            add_candidate(
+                row["captured_at"],
+                row["source_frame_ref"],
+                row["observed_draft_hash"],
+                row["radiant_hero_ids"],
+                row["dire_hero_ids"],
+                row["observed_radiant_team_side"],
+            )
+        for row in self.connection.execute(
+            """SELECT captured_at, source_frame_ref, radiant_hero_ids,
+                      dire_hero_ids, radiant_team_side
+                 FROM vision_observations
+                WHERE raybet_match_id=? AND map_number=? AND confirmed=1""",
+            (match_id, map_number),
+        ).fetchall():
+            key = (str(row["captured_at"]), str(row["source_frame_ref"]))
+            if key not in conflict_keys:
+                try:
+                    payload = self.json({
+                        "radiant": json.loads(str(row["radiant_hero_ids"])),
+                        "dire": json.loads(str(row["dire_hero_ids"])),
+                    })
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                add_candidate(
+                    row["captured_at"],
+                    row["source_frame_ref"],
+                    hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                    row["radiant_hero_ids"],
+                    row["dire_hero_ids"],
+                    row["radiant_team_side"],
+                )
+        add_candidate(
+            observation.captured_at.isoformat(),
+            observation.source_frame_ref,
+            hashlib.sha256(
+                self.json({
+                    "radiant": list(observation.radiant_hero_ids),
+                    "dire": list(observation.dire_hero_ids),
+                }).encode("utf-8")
+            ).hexdigest(),
+            self.json(list(observation.radiant_hero_ids)),
+            self.json(list(observation.dire_hero_ids)),
+            observation.radiant_team_side,
+        )
+
+        invalidated = {
+            (str(row["captured_at"]), str(row["source_frame_ref"]))
+            for row in self.connection.execute(
+                """SELECT invalidation.captured_at,
+                          invalidation.source_frame_ref
+                     FROM vision_observation_invalidations AS invalidation
+                     JOIN vision_observations AS observation
+                       ON observation.raybet_match_id=
+                          invalidation.raybet_match_id
+                      AND observation.captured_at=invalidation.captured_at
+                      AND observation.source_frame_ref=
+                          invalidation.source_frame_ref
+                    WHERE invalidation.raybet_match_id=?
+                      AND observation.map_number=?""",
+                (match_id, map_number),
+            ).fetchall()
+        }
+        candidates = {
+            key: value for key, value in candidates.items() if key not in invalidated
+        }
+        ordered = sorted(
+            candidates.values(),
+            key=lambda value: (value["captured_at"], value["source_frame_ref"]),
+        )
+        if not ordered:
+            return False
+        canonical = ordered[0]
+        canonical_hash = canonical["draft_hash"]
+        canonical_side: str | None = None
+        side_source: dict[str, Any] | None = None
+        conflict_candidates: list[dict[str, Any]] = []
+        for candidate in ordered:
+            if candidate["draft_hash"] != canonical_hash:
+                conflict_candidates.append(candidate)
+                continue
+            side = candidate["radiant_team_side"]
+            if side is None:
+                continue
+            if canonical_side is None:
+                canonical_side = side
+                side_source = candidate
+            elif side != canonical_side:
+                conflict_candidates.append(candidate)
+
+        existing_conflict = bool(anchor["status"] == "conflict")
+        conflict_cutoff = min(
+            (candidate["captured_at"] for candidate in conflict_candidates),
+            default=None,
+        )
+        if existing_conflict and conflict_cutoff is None:
+            old_cutoff = self._draft_event_key(
+                anchor["conflict_at"], anchor["source_frame_ref"]
+            )
+            if old_cutoff is not None:
+                conflict_cutoff = old_cutoff[0]
+            else:
+                conflict_cutoff = min(
+                    (value["captured_at"] for value in candidates.values()),
+                    default=None,
+                )
+        has_conflict = conflict_cutoff is not None
+        for candidate in conflict_candidates:
+            self.connection.execute(
+                """INSERT OR IGNORE INTO vision_draft_conflicts
+                   (raybet_match_id, map_number, captured_at,
+                    source_frame_ref, observed_draft_hash,
+                    radiant_hero_ids, dire_hero_ids,
+                    observed_radiant_team_side, reason, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    match_id,
+                    map_number,
+                    candidate["captured_at"].isoformat(),
+                    candidate["source_frame_ref"],
+                    candidate["draft_hash"],
+                    candidate["radiant_json"],
+                    candidate["dire_json"],
+                    candidate["radiant_team_side"],
+                    VISION_DRAFT_CONFLICT_REASON,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        if has_conflict:
+            cutoff = conflict_cutoff
+            for candidate in ordered:
+                if candidate["captured_at"] < cutoff:
+                    continue
+                if candidate["draft_hash"] != canonical_hash or candidate in conflict_candidates:
+                    continue
+                if (
+                    candidate["captured_at"], candidate["source_frame_ref"]
+                ) == (
+                    canonical["captured_at"], canonical["source_frame_ref"]
+                ):
+                    continue
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO vision_draft_conflicts
+                       (raybet_match_id, map_number, captured_at,
+                        source_frame_ref, observed_draft_hash,
+                        radiant_hero_ids, dire_hero_ids,
+                        observed_radiant_team_side, reason, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        match_id,
+                        map_number,
+                        candidate["captured_at"].isoformat(),
+                        candidate["source_frame_ref"],
+                        candidate["draft_hash"],
+                        candidate["radiant_json"],
+                        candidate["dire_json"],
+                        candidate["radiant_team_side"],
+                        VISION_DRAFT_CONFLICT_REASON,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+
+        side_time = side_source["captured_at"].isoformat() if side_source else None
+        side_ref = side_source["source_frame_ref"] if side_source else None
+        status = "conflict" if has_conflict else "anchored"
+        conflict_at = conflict_cutoff.isoformat() if conflict_cutoff else None
+        self.connection.execute("DROP TRIGGER IF EXISTS vision_draft_anchor_identity_immutable")
+        try:
+            self.connection.execute(
+                """UPDATE vision_draft_anchors
+                      SET draft_hash=?, radiant_hero_ids=?, dire_hero_ids=?,
+                          radiant_team_side=?, team_side_anchored_at=?,
+                          team_side_source_frame_ref=?, anchored_at=?,
+                          source_frame_ref=?, status=?, conflict_at=?
+                    WHERE raybet_match_id=? AND map_number=?""",
+                (
+                    canonical["draft_hash"],
+                    canonical["radiant_json"],
+                    canonical["dire_json"],
+                    canonical_side,
+                    side_time,
+                    side_ref,
+                    canonical["captured_at"].isoformat(),
+                    canonical["source_frame_ref"],
+                    status,
+                    conflict_at,
+                    match_id,
+                    map_number,
+                ),
+            )
+        finally:
+            self._restore_vision_anchor_identity_trigger()
+
+        for row in self.connection.execute(
+            """SELECT captured_at, source_frame_ref, radiant_hero_ids,
+                      dire_hero_ids, radiant_team_side
+                 FROM vision_observations
+                WHERE raybet_match_id=? AND map_number=?""",
+            (match_id, map_number),
+        ).fetchall():
+            key = (str(row["captured_at"]), str(row["source_frame_ref"]))
+            candidate = candidates.get(key)
+            if candidate is None or key in invalidated:
+                continue
+            trusted = candidate["draft_hash"] == canonical_hash
+            if (
+                trusted
+                and canonical_side is not None
+                and candidate["radiant_team_side"] is not None
+                and candidate["radiant_team_side"] != canonical_side
+            ):
+                trusted = False
+            if conflict_cutoff is not None and candidate["captured_at"] >= conflict_cutoff:
+                trusted = False
+            self.connection.execute(
+                """UPDATE vision_observations SET confirmed=?
+                    WHERE raybet_match_id=? AND captured_at=?
+                      AND source_frame_ref=?""",
+                (int(trusted), match_id, row["captured_at"], row["source_frame_ref"]),
+            )
+
+        if has_conflict:
+            self._invalidate_draft_dependents(
+                match_id,
+                map_number,
+                VISION_DRAFT_CONFLICT_REASON,
+                conflict_at,
+            )
+        current_key = (
+            observation.captured_at.isoformat(), str(observation.source_frame_ref)
+        )
+        current = candidates.get(current_key)
+        if current is None:
+            return False
+        trusted = current["draft_hash"] == canonical_hash
+        if (
+            trusted
+            and canonical_side is not None
+            and current["radiant_team_side"] is not None
+            and current["radiant_team_side"] != canonical_side
+        ):
+            trusted = False
+        if conflict_cutoff is not None and current["captured_at"] >= conflict_cutoff:
+            trusted = False
+        return trusted
 
     def _draft_conflict_at_or_before(
         self,
@@ -2279,27 +2991,13 @@ class LiveBettingStore:
                 ).fetchone()
                 if map_row is None or resolved.filled_at is None:
                     raise RuntimeError("filled order is missing map provenance")
-                from .notifications import EVENT_FILLED, simulation_payload
+                from .notifications import EVENT_FILLED, filled_order_payload
 
                 self.enqueue_notification(
                     order_key=resolved.order_key,
                     event_type=EVENT_FILLED,
-                    payload=simulation_payload(
-                        EVENT_FILLED,
-                        {
-                            "raybet_match_id": resolved.raybet_match_id,
-                            "map_number": int(map_row["map_number"]),
-                            "selected_side": resolved.market.side,
-                            "signal_price": resolved.signal_price,
-                            "fill_price": resolved.fill_price,
-                            "model_probability": resolved.model_probability,
-                            "market_probability": resolved.market_probability,
-                            "edge": resolved.model_probability
-                            - resolved.market_probability,
-                            "signal_transport_at": resolved.signal_transport_at,
-                            "filled_at": resolved.filled_at,
-                            "order_key": resolved.order_key,
-                        },
+                    payload=filled_order_payload(
+                        self.connection, resolved.order_key
                     ),
                     stats_cutoff_at=resolved.filled_at,
                     created_at=resolved.filled_at,
@@ -2389,7 +3087,11 @@ class LiveBettingStore:
             raise ValueError(
                 "radiant_team_side must be team_one, team_two, or null"
             )
-        stored_confirmed = bool(observation.is_confirmed)
+        stored_confirmed = _valid_confirmed_vision_payload(
+            observation.radiant_hero_ids,
+            observation.dire_hero_ids,
+            observation.source_frame_ref,
+        ) and bool(observation.is_confirmed)
         with self.transaction():
             if stored_confirmed and observation.map_number is not None:
                 draft_payload = self.json(
@@ -2400,7 +3102,10 @@ class LiveBettingStore:
                 )
                 draft_hash = hashlib.sha256(draft_payload.encode("utf-8")).hexdigest()
                 anchor = self.connection.execute(
-                    """SELECT draft_hash, radiant_team_side, status, conflict_at
+                    """SELECT draft_hash, radiant_hero_ids, dire_hero_ids,
+                              radiant_team_side, team_side_anchored_at,
+                              team_side_source_frame_ref, anchored_at,
+                              source_frame_ref, status, conflict_at
                          FROM vision_draft_anchors
                         WHERE raybet_match_id=? AND map_number=?""",
                     (observation.raybet_match_id, observation.map_number),
@@ -2430,86 +3135,9 @@ class LiveBettingStore:
                             observation.source_frame_ref,
                         ),
                     )
-                elif (
-                    anchor["status"] == "conflict"
-                    or anchor["draft_hash"] != draft_hash
-                    or (
-                        anchor["radiant_team_side"] is not None
-                        and radiant_team_side is not None
-                        and anchor["radiant_team_side"] != radiant_team_side
-                    )
-                ):
-                    reason = (
-                        "map_draft_already_in_conflict"
-                        if anchor["status"] == "conflict"
-                        else (
-                            "confirmed_draft_identity_changed"
-                            if anchor["draft_hash"] != draft_hash
-                            else "confirmed_radiant_team_side_changed"
-                        )
-                    )
-                    self.connection.execute(
-                        """INSERT OR IGNORE INTO vision_draft_conflicts
-                           (raybet_match_id, map_number, captured_at,
-                            source_frame_ref, observed_draft_hash,
-                            radiant_hero_ids, dire_hero_ids,
-                            observed_radiant_team_side, reason, recorded_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            observation.raybet_match_id,
-                            observation.map_number,
-                            captured_at,
-                            observation.source_frame_ref,
-                            draft_hash,
-                            radiant_json,
-                            dire_json,
-                            radiant_team_side,
-                            reason,
-                            datetime.now(timezone.utc).isoformat(),
-                        ),
-                    )
-                    if anchor["status"] != "conflict":
-                        self.connection.execute(
-                            """UPDATE vision_draft_anchors
-                                  SET status='conflict', conflict_at=?
-                                WHERE raybet_match_id=? AND map_number=?
-                                  AND status='anchored'""",
-                            (
-                                captured_at,
-                                observation.raybet_match_id,
-                                observation.map_number,
-                            ),
-                        )
-                    _has_conflict, conflict_cutoff = self._draft_conflict_state(
-                        observation.raybet_match_id,
-                        int(observation.map_number),
-                    )
-                    self._invalidate_draft_dependents(
-                        observation.raybet_match_id,
-                        int(observation.map_number),
-                        reason,
-                        conflict_cutoff,
-                    )
-                    stored_confirmed = False
-                elif (
-                    anchor["radiant_team_side"] is None
-                    and radiant_team_side is not None
-                ):
-                    self.connection.execute(
-                        """UPDATE vision_draft_anchors
-                              SET radiant_team_side=?, team_side_anchored_at=?,
-                                  team_side_source_frame_ref=?
-                            WHERE raybet_match_id=? AND map_number=?
-                              AND status='anchored' AND draft_hash=?
-                              AND radiant_team_side IS NULL""",
-                        (
-                            radiant_team_side,
-                            captured_at,
-                            observation.source_frame_ref,
-                            observation.raybet_match_id,
-                            observation.map_number,
-                            draft_hash,
-                        ),
+                else:
+                    stored_confirmed = self._rebuild_vision_draft_anchor(
+                        observation, anchor
                     )
             cursor = self.connection.execute(
                 """INSERT OR IGNORE INTO vision_observations
@@ -2552,7 +3180,8 @@ class LiveBettingStore:
             raise ValueError("block_reason is required")
         if not block_actor.strip():
             raise ValueError("block_actor is required")
-        recorded_at = datetime.now(timezone.utc).isoformat()
+        recorded_time = datetime.now(timezone.utc)
+        recorded_at = recorded_time.isoformat()
         dependent_queries = (
             (
                 "odds_alignment",
@@ -2679,21 +3308,11 @@ class LiveBettingStore:
             ).fetchall()
             for outbox_row in outbox_rows:
                 outbox_id = int(outbox_row[0])
-                self.connection.execute(
-                    """UPDATE notification_outbox
-                          SET status='dead_letter', lease_token=NULL,
-                              lease_until=NULL,
-                              last_error=?,
-                              updated_at=?
-                        WHERE outbox_id=?
-                          AND status IN ('pending', 'leased')""",
-                    (block_reason, recorded_at, outbox_id),
-                )
-                self.connection.execute(
-                    """INSERT INTO notification_outbox_audit
-                       (outbox_id, action, actor, reason, created_at)
-                       VALUES (?, 'blocked', ?, ?, ?)""",
-                    (outbox_id, block_actor, reason, recorded_at),
+                self.quarantine_notification(
+                    outbox_id=outbox_id,
+                    reason=block_reason,
+                    actor=block_actor,
+                    now=recorded_time,
                 )
 
     def _invalidate_draft_dependents(
@@ -2723,7 +3342,8 @@ class LiveBettingStore:
         conflict_at: str | None,
     ) -> None:
         """Quarantine results observed after a draft conflict event-time."""
-        recorded_at = datetime.now(timezone.utc).isoformat()
+        recorded_time = datetime.now(timezone.utc)
+        recorded_at = recorded_time.isoformat()
         rows = self.connection.execute(
             """SELECT settlement.order_key
                  FROM settlements AS settlement
@@ -2754,21 +3374,11 @@ class LiveBettingStore:
             ).fetchall()
             for outbox_row in outbox_rows:
                 outbox_id = int(outbox_row["outbox_id"])
-                self.connection.execute(
-                    """UPDATE notification_outbox
-                          SET status='dead_letter', lease_token=NULL,
-                              lease_until=NULL,
-                              last_error='vision_draft_conflict', updated_at=?
-                        WHERE outbox_id=?
-                          AND status IN ('pending', 'leased')""",
-                    (recorded_at, outbox_id),
-                )
-                self.connection.execute(
-                    """INSERT INTO notification_outbox_audit
-                       (outbox_id, action, actor, reason, created_at)
-                       VALUES (?, 'blocked', 'vision_conflict',
-                               'vision_draft_conflict', ?)""",
-                    (outbox_id, recorded_at),
+                self.quarantine_notification(
+                    outbox_id=outbox_id,
+                    reason="vision_draft_conflict",
+                    actor="vision_conflict",
+                    now=recorded_time,
                 )
         self.connection.execute(
             """UPDATE settlement_reconciliations
@@ -3065,12 +3675,87 @@ class LiveBettingStore:
                 raise RuntimeError("pending order has no matching pending map attempt")
         return resolved
 
+    def _matching_strategy_decision_candidates(
+        self,
+        order: ShadowOrder,
+        map_number: int,
+        strict_mapping_id: int | None = None,
+    ) -> list[tuple[str, int]]:
+        """Find decisions that cryptographically own an order."""
+        try:
+            rows = self.connection.execute(
+                """SELECT decision_key, strategy_version, input_ref,
+                          contributions_json
+                     FROM strategy_decisions
+                    WHERE raybet_match_id=? AND map_number=? AND decided_at=?
+                      AND underdog_side=? AND eligible=1
+                      AND model_probability=? AND market_probability=?
+                    ORDER BY decision_key""",
+                (
+                    order.raybet_match_id,
+                    map_number,
+                    self._iso(order.signal_transport_at),
+                    order.signal_outcome_key,
+                    order.model_probability,
+                    order.market_probability,
+                ),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        matches: list[tuple[str, int]] = []
+        for row in rows:
+            identity = "|".join(
+                (
+                    order.raybet_match_id,
+                    order.odds_id,
+                    order.signal_odds_group_id or "",
+                    order.signal_outcome_key or "",
+                    market_key(
+                        order.market.market_type,
+                        order.market.period,
+                        order.market.side,
+                        order.market.line,
+                    ),
+                    str(row["strategy_version"]),
+                    str(row["input_ref"]),
+                )
+            )
+            if hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32] != order.order_key:
+                continue
+            try:
+                contributions = json.loads(str(row["contributions_json"]))
+                mapping_id = contributions["__inputs__"][
+                    "strict_live_eligibility"
+                ]["mapping_refs"]["strict_mapping_id"]
+                mapping_id = int(mapping_id)
+                if mapping_id <= 0 or (
+                    strict_mapping_id is not None
+                    and mapping_id != strict_mapping_id
+                ):
+                    continue
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            matches.append((str(row["decision_key"]), mapping_id))
+        return matches
+
+    def _matching_strategy_decision_key(
+        self,
+        order: ShadowOrder,
+        map_number: int,
+        strict_mapping_id: int,
+    ) -> str | None:
+        matches = self._matching_strategy_decision_candidates(
+            order, map_number, strict_mapping_id
+        )
+        return matches[0][0] if len(matches) == 1 else None
+
     def insert_map_order(
         self,
         order: ShadowOrder,
         map_number: int,
         *,
         strict_mapping_id: int,
+        decision_key: str | None = None,
     ) -> bool:
         """Atomically reserve a map and persist its only shadow order."""
         if (
@@ -3079,8 +3764,39 @@ class LiveBettingStore:
             or strict_mapping_id <= 0
         ):
             raise ValueError("strict_mapping_id must be a positive integer")
+        if (
+            order.status != "pending"
+            or order.fill_price is not None
+            or order.filled_at is not None
+            or order.rejection_reason is not None
+        ):
+            return False
+        numeric_values = (
+            order.model_probability,
+            order.market_probability,
+            order.signal_price,
+            order.stake,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in numeric_values
+        ):
+            return False
+        if (
+            not 0.0 <= float(order.model_probability) <= 1.0
+            or not 0.0 <= float(order.market_probability) <= 1.0
+            or float(order.signal_price) <= 1.0
+            or float(order.stake) != 1.0
+        ):
+            return False
         if not self._signal_identity_matches(order):
             return False
+        if decision_key is not None:
+            decision_key = str(decision_key).strip()
+            if not decision_key:
+                raise ValueError("decision_key must be non-empty when provided")
         with self.transaction():
             if self._strict_mapping_context_block_reason(
                 strict_mapping_id=strict_mapping_id,
@@ -3095,6 +3811,14 @@ class LiveBettingStore:
                 order.signal_transport_at,
             ):
                 return False
+            matched_decision_key = self._matching_strategy_decision_key(
+                order, map_number, strict_mapping_id
+            )
+            if matched_decision_key is None or (
+                decision_key is not None and decision_key != matched_decision_key
+            ):
+                return False
+            decision_key = matched_decision_key
             reserved = self.connection.execute(
                 """INSERT OR IGNORE INTO shadow_map_attempts
                    VALUES (?, ?, ?, ?, ?)""",
@@ -3125,7 +3849,13 @@ class LiveBettingStore:
                  order.stake, order.status,
                  order.fill_price,
                  self._iso(order.filled_at) if order.filled_at else None,
-                 order.rejection_reason),
+                  order.rejection_reason),
+            )
+            self.connection.execute(
+                """INSERT INTO shadow_order_decision_lineage
+                   (order_key, decision_key, recorded_at)
+                   VALUES (?, ?, ?)""",
+                (order.order_key, decision_key, self._iso(order.signaled_at)),
             )
             return True
 
@@ -3393,6 +4123,24 @@ class LiveBettingStore:
             created_at=created_at,
         )
 
+    def quarantine_notification(
+        self,
+        *,
+        outbox_id: int,
+        reason: str,
+        actor: str,
+        now: datetime,
+    ) -> bool:
+        from .notifications import quarantine_outbox
+
+        return quarantine_outbox(
+            self.connection,
+            outbox_id=outbox_id,
+            reason=reason,
+            actor=actor,
+            now=now,
+        )
+
     def insert_settlement(
         self, order_key: str, result: str, return_units: float,
         settled_at: datetime, evidence_ref: str, review_required: bool = False,
@@ -3439,22 +4187,18 @@ class LiveBettingStore:
                 return False
             if not review_required:
                 assert order is not None
-                from .notifications import EVENT_SETTLED, simulation_payload
+                from .notifications import EVENT_SETTLED, settled_order_payload
 
                 self.enqueue_notification(
                     order_key=order_key,
                     event_type=EVENT_SETTLED,
-                    payload=simulation_payload(
-                        EVENT_SETTLED,
-                        {
-                            "raybet_match_id": str(order["raybet_match_id"]),
-                            "result": result,
-                            "return_units": return_units,
-                            "fill_price": order["fill_price"],
-                            "evidence_ref": evidence_ref,
-                            "settled_at": settled_at,
-                            "order_key": order_key,
-                        },
+                    payload=settled_order_payload(
+                        self.connection,
+                        order_key,
+                        result=result,
+                        return_units=return_units,
+                        settled_at=settled_at,
+                        evidence_ref=evidence_ref,
                     ),
                     stats_cutoff_at=settled_at,
                     created_at=settled_at,

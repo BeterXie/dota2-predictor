@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -212,11 +214,15 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         map_number: int = 1,
         signal_at: datetime = RECORDED_AT,
         expected_insert: bool = True,
+        order_overrides: dict[str, object] | None = None,
     ) -> ShadowOrder:
+        order_label = order_key
+        strategy_version = "strict-test-v1"
+        input_ref = f"{order_label}:input"
         signal = OddsSnapshot(
             "match-1",
-            f"{order_key}-winner-one",
-            f"{order_key}-winner-group",
+            f"{order_label}-winner-one",
+            f"{order_label}-winner-group",
             signal_at,
             2.5,
             1,
@@ -224,6 +230,18 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 "winner", f"map_{map_number}", "team_one", None, "team_one", True
             ),
         )
+        identity = "|".join(
+            (
+                "match-1",
+                signal.odds_id,
+                signal.odds_group_id or "",
+                signal.market.outcome_key,
+                f"winner|map_{map_number}|team_one|",
+                strategy_version,
+                input_ref,
+            )
+        )
+        order_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
         order = ShadowOrder(
             order_key=order_key,
             raybet_match_id="match-1",
@@ -240,6 +258,8 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             signal_outcome_key=signal.market.outcome_key,
             signal_identity_verified=True,
         )
+        if order_overrides:
+            order = replace(order, **order_overrides)
         with LiveBettingStore(self.path) as store:
             store.store_odds_observation(
                 source="direct",
@@ -249,6 +269,45 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 observed_at=signal_at,
                 normalized_state_hash=normalized_state_hash([signal]),
                 snapshots=[signal],
+            )
+            self.assertTrue(
+                store.insert_decision(
+                    SimpleNamespace(
+                        decision_key=f"{order_label}:decision",
+                        raybet_match_id="match-1",
+                        map_number=map_number,
+                        decided_at=signal_at,
+                        underdog_side="team_one",
+                        market_probability=0.4,
+                        model_probability=0.6,
+                        edge=0.2,
+                        data_quality=0.8,
+                        eligible=True,
+                        reason="eligible",
+                        contributions={
+                            "__inputs__": {
+                                "strict_live_eligibility": {
+                                    "mapping_refs": {
+                                        "strict_mapping_id": mapping_id
+                                    }
+                                },
+                                "vision": {
+                                    "captured_at": signal_at.isoformat(),
+                                    "source_frame_ref": f"{order_label}:frame",
+                                    "game_clock_seconds": 600,
+                                },
+                                "quality": {"aggregate": 0.8},
+                                "draft_landmark": {
+                                    "model_version": "strict-test-model-v1",
+                                    "model_kind": "pure_draft",
+                                    "model_hash": "a" * 64,
+                                },
+                            }
+                        },
+                        input_ref=input_ref,
+                        strategy_version=strategy_version,
+                    )
+                )
             )
             self.assertEqual(
                 store.insert_map_order(
@@ -376,7 +435,13 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.assertEqual(
             outbox,
             [
-                ("filled", "dead_letter", None, None, "strict_mapping_invalidated"),
+                (
+                    "filled",
+                    "leased",
+                    "test-lease",
+                    (RECORDED_AT + timedelta(minutes=5, seconds=2)).isoformat(),
+                    "quarantine_intent:strict_mapping_invalidated",
+                ),
                 (
                     "monitor_alert",
                     "dead_letter",
@@ -397,12 +462,21 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             ],
             [
                 (
+                    "quarantine_intent",
+                    "strict_mapping_invalidation",
+                    "strict_mapping_invalidated",
+                ),
+                (
                     "blocked",
                     "strict_mapping_invalidation",
                     "strict_mapping_invalidated",
-                )
-            ]
-            * 3,
+                ),
+                (
+                    "blocked",
+                    "strict_mapping_invalidation",
+                    "strict_mapping_invalidated",
+                ),
+            ],
         )
         impact = self.connection.execute(
             """SELECT mapping_id, invalidation_id FROM strict_live_mapping_impacts
@@ -659,7 +733,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
     def test_order_insert_rechecks_mapping_at_signal_transport_time(self) -> None:
         mapping = self.accept()
 
-        self.create_pending_order(
+        order = self.create_pending_order(
             mapping.mapping_id,
             order_key="backdated-signal-order",
             signal_at=RECORDED_AT - timedelta(microseconds=1),
@@ -668,17 +742,87 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM shadow_orders WHERE order_key='backdated-signal-order'"
+                "SELECT COUNT(*) FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
             ).fetchone()[0],
             0,
         )
         self.assertEqual(
             self.connection.execute(
                 """SELECT COUNT(*) FROM shadow_map_attempts
-                    WHERE order_key='backdated-signal-order'"""
+                    WHERE order_key=?""",
+                (order.order_key,),
             ).fetchone()[0],
             0,
         )
+
+    def test_order_insert_rejects_forged_terminal_states(self) -> None:
+        mapping = self.accept()
+        cases = (
+            (
+                "forged-filled",
+                {
+                    "status": "filled",
+                    "fill_price": 2.5,
+                    "filled_at": RECORDED_AT,
+                },
+            ),
+            (
+                "forged-rejected",
+                {
+                    "status": "rejected",
+                    "rejection_reason": "forged terminal order",
+                },
+            ),
+        )
+
+        for order_label, overrides in cases:
+            with self.subTest(status=overrides["status"]):
+                order = self.create_pending_order(
+                    mapping.mapping_id,
+                    order_key=order_label,
+                    expected_insert=False,
+                    order_overrides=overrides,
+                )
+                for table in (
+                    "shadow_orders",
+                    "shadow_map_attempts",
+                    "shadow_order_decision_lineage",
+                ):
+                    self.assertIsNone(
+                        self.connection.execute(
+                            f"SELECT 1 FROM {table} WHERE order_key=?",
+                            (order.order_key,),
+                        ).fetchone()
+                    )
+
+    def test_order_insert_requires_exactly_one_finite_stake_unit(self) -> None:
+        mapping = self.accept()
+        cases = (
+            ("zero", 0.0),
+            ("hundred", 100.0),
+            ("nan", float("nan")),
+        )
+
+        for label, stake in cases:
+            with self.subTest(stake=label):
+                order = self.create_pending_order(
+                    mapping.mapping_id,
+                    order_key=f"invalid-stake-{label}",
+                    expected_insert=False,
+                    order_overrides={"stake": stake},
+                )
+                for table in (
+                    "shadow_orders",
+                    "shadow_map_attempts",
+                    "shadow_order_decision_lineage",
+                ):
+                    self.assertIsNone(
+                        self.connection.execute(
+                            f"SELECT 1 FROM {table} WHERE order_key=?",
+                            (order.order_key,),
+                        ).fetchone()
+                    )
 
     def test_order_insert_rechecks_current_raybet_metadata(self) -> None:
         mapping = self.accept()
@@ -687,7 +831,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             updated_at=RECORDED_AT,
         )
 
-        self.create_pending_order(
+        order = self.create_pending_order(
             mapping.mapping_id,
             order_key="metadata-drift-order",
             expected_insert=False,
@@ -695,7 +839,8 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM shadow_orders WHERE order_key='metadata-drift-order'"
+                "SELECT COUNT(*) FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
             ).fetchone()[0],
             0,
         )
@@ -833,6 +978,31 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 self.assertFalse(result.eligible)
                 self.assertEqual(result.reason, expected_reason)
                 self.connection.rollback()
+
+    def test_event_policy_drift_is_excluded_by_read_gate(self) -> None:
+        mapping = self.accept()
+        gate = strict_read_gate(
+            self.connection,
+            mapping_id_sql=str(mapping.mapping_id),
+            raybet_match_id_sql="'match-1'",
+            map_number_sql="1",
+            signal_at_sql=f"'{RECORDED_AT.isoformat()}'",
+            dependent_type="research_prediction",
+            dependent_key_sql="'prediction-1'",
+        )
+        before = self.connection.execute(
+            f"SELECT {gate.included_sql}, {gate.unverifiable_sql}"
+        ).fetchone()
+        self.assertEqual(tuple(before), (1, 0))
+
+        self.connection.execute(
+            "UPDATE event_registry SET approval_status='pending' WHERE event_id=?",
+            (EVENT_ID,),
+        )
+        after = self.connection.execute(
+            f"SELECT {gate.included_sql}, {gate.unverifiable_sql}"
+        ).fetchone()
+        self.assertEqual(tuple(after), (0, 1))
 
     def test_future_event_approval_is_not_knowable_at_transport(self) -> None:
         self.accept()

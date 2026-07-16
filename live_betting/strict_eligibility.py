@@ -1741,6 +1741,8 @@ def _quarantine_mapping_order_dependents(
         "notification_outbox_audit",
         {"outbox_id", "action", "actor", "reason", "created_at"},
     )
+    from .notifications import quarantine_outbox
+
     for order_key in order_keys:
         outbox_rows = connection.execute(
             """SELECT outbox_id FROM notification_outbox
@@ -1750,20 +1752,14 @@ def _quarantine_mapping_order_dependents(
         ).fetchall()
         for row in outbox_rows:
             outbox_id = int(row[0])
-            updated = connection.execute(
-                """UPDATE notification_outbox
-                      SET status='dead_letter', lease_token=NULL, lease_until=NULL,
-                          last_error=?, updated_at=?
-                    WHERE outbox_id=? AND status IN ('pending', 'leased')""",
-                (block_reason, recorded_at_iso, outbox_id),
+            quarantine_outbox(
+                connection,
+                outbox_id=outbox_id,
+                reason=block_reason,
+                actor="strict_mapping_invalidation",
+                now=recorded_at,
+                record_audit=audit_available,
             )
-            if updated.rowcount == 1 and audit_available:
-                connection.execute(
-                    """INSERT INTO notification_outbox_audit
-                       (outbox_id, action, actor, reason, created_at)
-                       VALUES (?, 'blocked', 'strict_mapping_invalidation', ?, ?)""",
-                    (outbox_id, block_reason, recorded_at_iso),
-                )
 
 
 def _automatic_mappings_for_source(

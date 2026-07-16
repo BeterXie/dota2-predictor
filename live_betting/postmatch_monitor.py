@@ -27,6 +27,7 @@ from .raybet import RayBetClient, RayBetMapFinal, parse_raybet_map_final
 from .sanitize import sanitize_raybet_payload
 from .settlement import MapResult, reconcile_map_winners, settle
 from .storage import LiveBettingStore
+from .strict_eligibility import query_strict_live_eligibility
 
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,19 @@ def _vision_drafts(
     except sqlite3.OperationalError:
         return {}
 
+    try:
+        all_conflicts = connection.execute(
+            """SELECT map_number, captured_at, observed_draft_hash,
+                      observed_radiant_team_side
+                 FROM vision_draft_conflicts
+                WHERE raybet_match_id=?""",
+            (match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
     conflict_rows: dict[int, list[sqlite3.Row]] = {}
+    for conflict in all_conflicts:
+        conflict_rows.setdefault(int(conflict["map_number"]), []).append(conflict)
     for row in rows:
         map_number = int(row["map_number"])
         cutoff = (causal_cutoffs or {}).get(map_number)
@@ -159,27 +172,33 @@ def _vision_drafts(
             ):
                 continue
         status = str(row["status"])
-        if status == "conflict":
-            if cutoff is None:
-                continue
-            if map_number not in conflict_rows:
-                try:
-                    conflict_rows[map_number] = connection.execute(
-                        """SELECT captured_at FROM vision_draft_conflicts
-                            WHERE raybet_match_id=? AND map_number=?""",
-                        (match_id, map_number),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    return {}
-            conflict_times = [_parse_utc(row["conflict_at"])]
-            conflict_times.extend(
-                _parse_utc(conflict["captured_at"])
-                for conflict in conflict_rows[map_number]
-            )
-            if any(timestamp is None or timestamp <= cutoff for timestamp in conflict_times):
-                continue
-        elif status != "anchored":
+        if status not in {"anchored", "conflict"}:
             continue
+        map_conflicts = conflict_rows.get(map_number, [])
+        intrinsic_conflicts = [
+            conflict
+            for conflict in map_conflicts
+            if str(conflict["observed_draft_hash"]) != str(row["draft_hash"])
+            or (
+                team_side in {"team_one", "team_two"}
+                and conflict["observed_radiant_team_side"]
+                in {"team_one", "team_two"}
+                and conflict["observed_radiant_team_side"] != team_side
+            )
+        ]
+        effective_conflicts = intrinsic_conflicts or map_conflicts
+        conflict_times = [
+            _parse_utc(conflict["captured_at"])
+            for conflict in effective_conflicts
+        ]
+        if status == "conflict":
+            conflict_times.append(_parse_utc(row["conflict_at"]))
+        if conflict_times:
+            if cutoff is None or any(
+                timestamp is None or timestamp <= cutoff
+                for timestamp in conflict_times
+            ):
+                continue
         anchor_identity = _draft_identity(
             row["radiant_hero_ids"], row["dire_hero_ids"]
         )
@@ -572,7 +591,12 @@ def _causal_draft_cutoffs(
     match_id: str,
     map_numbers: set[int],
 ) -> dict[int, datetime]:
-    """Return signal-time cutoffs for filled order lineage that remains valid."""
+    """Return the latest valid dependent signal time for each map.
+
+    Post-match alignment can be driven by a research-only prediction even when
+    no shadow order was filled.  Every dependent lineage is event-time gated;
+    an invalidated or no-longer-verifiable row cannot widen the cutoff.
+    """
     if not map_numbers:
         return {}
     rows = store.connection.execute(
@@ -593,7 +617,107 @@ def _causal_draft_cutoffs(
             continue
         cutoff = _parse_utc(row["signal_transport_at"])
         if cutoff is not None:
-            output[map_number] = cutoff
+            output[map_number] = max(output.get(map_number, cutoff), cutoff)
+
+    try:
+        prediction_rows = store.connection.execute(
+            """SELECT prediction_key, map_number, observed_at,
+                      strict_mapping_id
+                 FROM research_live_predictions
+                WHERE raybet_match_id=?""",
+            (match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        prediction_rows = []
+    for row in prediction_rows:
+        map_number = int(row["map_number"])
+        if map_number not in map_numbers:
+            continue
+        prediction_key = str(row["prediction_key"])
+        try:
+            invalidated = store.connection.execute(
+                """SELECT 1 FROM vision_derived_invalidations
+                    WHERE dependent_type='research_prediction'
+                      AND dependent_key=? LIMIT 1""",
+                (prediction_key,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if invalidated is not None:
+            continue
+        cutoff = _parse_utc(row["observed_at"])
+        if cutoff is None:
+            continue
+        if store._draft_conflict_at_or_before(match_id, map_number, cutoff):
+            continue
+        try:
+            eligibility = query_strict_live_eligibility(
+                store.connection,
+                raybet_match_id=match_id,
+                map_number=map_number,
+                transport_observed_at=cutoff,
+            )
+        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+            continue
+        if (
+            not eligibility.eligible
+            or eligibility.mapping is None
+            or eligibility.mapping.mapping_id != row["strict_mapping_id"]
+        ):
+            continue
+        output[map_number] = max(output.get(map_number, cutoff), cutoff)
+
+    try:
+        decision_rows = store.connection.execute(
+            """SELECT decision_key, map_number, decided_at,
+                      contributions_json
+                 FROM strategy_decisions
+                WHERE raybet_match_id=?""",
+            (match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        decision_rows = []
+    for row in decision_rows:
+        map_number = int(row["map_number"])
+        if map_number not in map_numbers:
+            continue
+        try:
+            invalidated = store.connection.execute(
+                """SELECT 1 FROM vision_derived_invalidations
+                    WHERE dependent_type='strategy_decision'
+                      AND dependent_key=? LIMIT 1""",
+                (str(row["decision_key"]),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if invalidated is not None:
+            continue
+        cutoff = _parse_utc(row["decided_at"])
+        if cutoff is None:
+            continue
+        if store._draft_conflict_at_or_before(match_id, map_number, cutoff):
+            continue
+        try:
+            contributions = json.loads(str(row["contributions_json"]))
+            mapping_id = contributions["__inputs__"]["strict_live_eligibility"][
+                "mapping_refs"
+            ]["strict_mapping_id"]
+            eligibility = query_strict_live_eligibility(
+                store.connection,
+                raybet_match_id=match_id,
+                map_number=map_number,
+                transport_observed_at=cutoff,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError,
+                sqlite3.Error, OverflowError):
+            continue
+        if (
+            not eligibility.eligible
+            or eligibility.mapping is None
+            or eligibility.mapping.mapping_id != mapping_id
+        ):
+            continue
+        output[map_number] = max(output.get(map_number, cutoff), cutoff)
     return output
 
 
@@ -634,29 +758,21 @@ def _reconcile_and_settle(
     """Atomically persist source evidence, resolution, settlement, and outbox."""
     with store.transaction():
         if expected_strict_mapping_id is not None:
-            current_mapping = store.connection.execute(
-                """SELECT 1
-                     FROM strict_live_map_mappings AS mapping
-                     LEFT JOIN strict_live_map_mapping_invalidations
-                       AS direct_invalidation
-                       ON direct_invalidation.mapping_id=mapping.mapping_id
-                     LEFT JOIN strict_live_automatic_evidence_approvals AS approval
-                       ON approval.approval_id=mapping.automatic_approval_id
-                     LEFT JOIN strict_live_map_mapping_invalidations
-                       AS source_invalidation
-                       ON source_invalidation.mapping_id=approval.source_mapping_id
-                    WHERE mapping.mapping_id=?
-                      AND mapping.raybet_match_id=?
-                      AND mapping.map_number=?
-                      AND direct_invalidation.invalidation_id IS NULL
-                      AND source_invalidation.invalidation_id IS NULL""",
-                (
-                    expected_strict_mapping_id,
-                    result.raybet_match_id,
-                    result.map_number,
-                ),
-            ).fetchone()
-            if current_mapping is None:
+            try:
+                eligibility = query_strict_live_eligibility(
+                    store.connection,
+                    raybet_match_id=result.raybet_match_id,
+                    map_number=result.map_number,
+                    transport_observed_at=result.settled_at,
+                )
+            except (sqlite3.Error, TypeError, ValueError, OverflowError):
+                eligibility = None
+            if (
+                eligibility is None
+                or not eligibility.eligible
+                or eligibility.mapping is None
+                or eligibility.mapping.mapping_id != expected_strict_mapping_id
+            ):
                 return {
                     "status": "strict_mapping_unverified",
                     "orders_settled": 0,
@@ -763,6 +879,28 @@ def _reconcile_and_settle(
         )
         effective_status = str(reconciliation["status"])
         if effective_status == "manual_review":
+            # Preserve a causally bounded OpenDota result for research-only
+            # lineages.  There is no wager to settle, so a later vision draft
+            # conflict must not erase the immutable post-match fact; the
+            # reconciliation remains manual review and is excluded from formal
+            # confirmed-result statistics until an operator resolves it.
+            if (
+                not lineage_rows
+                and str(reconciliation["reason"]) == "vision_draft_conflict"
+            ):
+                reviewed_result = replace(result, evidence_ref=reconciliation_ref)
+                existing_result = store.connection.execute(
+                    """SELECT dota_match_id, winner_side FROM map_results
+                        WHERE raybet_match_id=? AND map_number=?""",
+                    (result.raybet_match_id, result.map_number),
+                ).fetchone()
+                if existing_result is None:
+                    store.insert_map_result(reviewed_result)
+                elif tuple(existing_result) != (
+                    result.dota_match_id,
+                    result.winner_side,
+                ):
+                    return {"status": "manual_review", "orders_settled": 0}
             for row in all_rows:
                 store.insert_settlement(
                     str(row["order_key"]),
@@ -912,6 +1050,27 @@ async def label_once(
         map_number: next(iter(mapping_ids))
         for map_number, mapping_ids in mapping_ids_by_map.items()
     }
+    preflight_at = datetime.now(timezone.utc)
+    for map_number, mapping_id in sorted(strict_mapping_ids.items()):
+        try:
+            eligibility = query_strict_live_eligibility(
+                store.connection,
+                raybet_match_id=match_id,
+                map_number=map_number,
+                transport_observed_at=preflight_at,
+            )
+        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+            eligibility = None
+        if (
+            eligibility is None
+            or not eligibility.eligible
+            or eligibility.mapping is None
+            or eligibility.mapping.mapping_id != mapping_id
+        ):
+            return {
+                "status": "strict_mapping_unverified",
+                "map_number": map_number,
+            }
     strict_maps = set(strict_mapping_ids)
     unresolved_maps = strict_maps - {
         int(row["map_number"])
@@ -1043,7 +1202,8 @@ async def label_once(
         if len(matches) > 1
     )
     if ambiguous_maps:
-        quarantined_at = datetime.now(timezone.utc).isoformat()
+        quarantine_time = datetime.now(timezone.utc)
+        quarantined_at = quarantine_time.isoformat()
         with store.transaction():
             for map_number in sorted(ambiguous_maps):
                 store.connection.execute(
@@ -1077,22 +1237,11 @@ async def label_once(
                 ).fetchall()
                 for outbox_row in outbox_rows:
                     outbox_id = int(outbox_row["outbox_id"])
-                    store.connection.execute(
-                        """UPDATE notification_outbox
-                              SET status='dead_letter', lease_token=NULL,
-                                  lease_until=NULL,
-                                  last_error='opendota_map_identity_ambiguous',
-                                  updated_at=?
-                            WHERE outbox_id=?
-                              AND status IN ('pending', 'leased')""",
-                        (quarantined_at, outbox_id),
-                    )
-                    store.connection.execute(
-                        """INSERT INTO notification_outbox_audit
-                           (outbox_id, action, actor, reason, created_at)
-                           VALUES (?, 'blocked', 'postmatch_identity',
-                                   'opendota_map_identity_ambiguous', ?)""",
-                        (outbox_id, quarantined_at),
+                    store.quarantine_notification(
+                        outbox_id=outbox_id,
+                        reason="opendota_map_identity_ambiguous",
+                        actor="postmatch_identity",
+                        now=quarantine_time,
                     )
         return {
             "status": "opendota_map_identity_ambiguous",

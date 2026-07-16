@@ -11,6 +11,7 @@ from live_betting.notifications import (
     EVENT_MONITOR_ALERT,
     EVENT_MONITOR_RECOVERY,
     MONITOR_TEMPLATE_VERSION,
+    decision_lineage_block_reason,
     enqueue,
 )
 
@@ -81,6 +82,20 @@ _PAPER_SIGNAL_REQUIRED_COLUMNS = {
         "status",
     },
     "shadow_map_attempts": {"order_key", "raybet_match_id", "map_number"},
+    "shadow_order_decision_lineage": {"order_key", "decision_key"},
+    "strategy_decisions": {
+        "decision_key",
+        "raybet_match_id",
+        "map_number",
+        "decided_at",
+        "underdog_side",
+        "eligible",
+        "model_probability",
+        "market_probability",
+        "strategy_version",
+        "input_ref",
+        "contributions_json",
+    },
     "vision_derived_invalidations": {"dependent_type", "dependent_key"},
     "vision_draft_anchors": {
         "raybet_match_id",
@@ -518,6 +533,15 @@ def _paper_signal_conditions(
     signal_conditions: dict[str, dict[str, Any]] = {}
     for row in rows:
         order_key = str(row[0])
+        lineage_issue = decision_lineage_block_reason(connection, order_key)
+        if lineage_issue is not None:
+            return (
+                _paper_signal_contract_failure(
+                    "decision_lineage_invalid",
+                    [f"order_key={order_key}: {lineage_issue}"],
+                ),
+                False,
+            )
         try:
             model_probability = _paper_signal_probability(
                 row[3], "model_probability"

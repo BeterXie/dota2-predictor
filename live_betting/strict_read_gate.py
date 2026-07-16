@@ -22,6 +22,8 @@ _STRICT_READ_SCHEMA = {
         "canonical_identity_hash",
         "crosswalk_evidence_hash",
         "evidence_hash",
+        "stage_scope",
+        "scheduled_at_utc",
         "raybet_metadata_updated_at",
         "acceptance_mode",
         "automatic_approval_id",
@@ -151,6 +153,11 @@ def strict_read_gate(
     source_metadata_aware = _aware_timestamp_sql(
         "strict_source.raybet_metadata_updated_at"
     )
+    event_policy_sql = _event_policy_sql(
+        connection,
+        mapping_id_sql=mapping_id_sql,
+        signal_at_sql=signal_at_sql,
+    )
     valid_mapping = f"""EXISTS (
         SELECT 1
           FROM strict_live_map_mappings AS strict_mapping
@@ -173,6 +180,7 @@ def strict_read_gate(
                <=julianday(strict_mapping.recorded_at)
            AND julianday(strict_mapping.raybet_metadata_updated_at)
                <=julianday(strict_mapping.recorded_at)
+           AND ({event_policy_sql})
            AND (
                 (strict_mapping.acceptance_mode='manual_exact'
                  AND strict_mapping.automatic_approval_id IS NULL)
@@ -261,6 +269,82 @@ def _aware_timestamp_sql(value_sql: str) -> str:
         f"AND (({value_sql}) GLOB '*Z' "
         f"OR ({value_sql}) GLOB '*[+-][0-9][0-9]:[0-9][0-9]'))"
     )
+
+
+def _event_policy_sql(
+    connection: sqlite3.Connection,
+    *,
+    mapping_id_sql: str,
+    signal_at_sql: str,
+) -> str:
+    """Mirror the full event-scope gate when the intelligence schema exists.
+
+    Older isolated live-only fixtures intentionally carry a one-column event
+    table; those rows are already covered by the legacy mapping gate.  The
+    production intelligence schema has the full policy columns, so event
+    approval/scope/evidence drift cannot silently keep a dependent row in
+    formal statistics.
+    """
+    required = {
+        "event_id",
+        "scope",
+        "approval_status",
+        "evidence_status",
+        "tier",
+        "prize_pool_usd",
+        "approved_by",
+        "approved_at",
+        "main_event_start_at",
+        "main_event_end_at",
+        "official_evidence_urls_json",
+        "included_stages_json",
+        "include_internal_lcq",
+        "excludes_qualifiers",
+        "excludes_division_2",
+        "excludes_exhibitions",
+        "excludes_forfeits",
+        "excludes_void_remakes",
+    }
+    if not table_has_columns(connection, "event_registry", required):
+        return "1"
+    return f"""EXISTS (
+        SELECT 1
+          FROM strict_live_map_mappings AS strict_event_mapping
+          JOIN event_registry AS strict_event
+            ON strict_event.event_id=strict_event_mapping.event_id
+         WHERE strict_event_mapping.mapping_id={mapping_id_sql}
+           AND strict_event.scope='formal_main_event'
+           AND strict_event.approval_status='approved'
+           AND strict_event.evidence_status='manually_audited'
+           AND strict_event.tier='tier_1'
+           AND typeof(strict_event.prize_pool_usd) IN ('integer', 'real')
+           AND strict_event.prize_pool_usd>=1000000
+           AND typeof(strict_event.approved_by)='text'
+           AND length(trim(strict_event.approved_by))>0
+           AND {_aware_timestamp_sql('strict_event.approved_at')}
+           AND julianday(strict_event.approved_at)<=julianday({signal_at_sql})
+           AND {_aware_timestamp_sql('strict_event.main_event_start_at')}
+           AND {_aware_timestamp_sql('strict_event.main_event_end_at')}
+           AND julianday(strict_event.main_event_start_at)
+               <=julianday(strict_event.main_event_end_at)
+           AND json_valid(strict_event.official_evidence_urls_json)
+           AND json_array_length(strict_event.official_evidence_urls_json)>0
+           AND json_valid(strict_event.included_stages_json)
+           AND json_array_length(strict_event.included_stages_json)>0
+           AND EXISTS (
+               SELECT 1 FROM json_each(strict_event.included_stages_json)
+                WHERE value=strict_event_mapping.stage_scope
+           )
+           AND strict_event_mapping.scheduled_at_utc IS NOT NULL
+           AND julianday(strict_event_mapping.scheduled_at_utc)
+               BETWEEN julianday(strict_event.main_event_start_at)
+                   AND julianday(strict_event.main_event_end_at)
+           AND strict_event.excludes_qualifiers=1
+           AND strict_event.excludes_division_2=1
+           AND strict_event.excludes_exhibitions=1
+           AND strict_event.excludes_forfeits=1
+           AND strict_event.excludes_void_remakes=1
+    )"""
 
 
 def _strict_schema_reasons(connection: sqlite3.Connection) -> tuple[str, ...]:

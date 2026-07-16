@@ -17,6 +17,7 @@ from live_betting.health import read_health, record_health
 from live_betting.storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
 from live_betting.storage import LiveBettingStore
 from scripts.run_dota_shadow_service import (
+    _DATABASE_AUDIT_THREADS,
     _DATABASE_HEALTH_CACHE,
     _ReportWorker,
     SingleInstanceLock,
@@ -24,6 +25,7 @@ from scripts.run_dota_shadow_service import (
     _companion_health,
     _database_health,
     _periodic_database_health,
+    _run_database_audit,
     main,
     service_once,
 )
@@ -119,6 +121,82 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertFalse(report.exists())
             with LiveBettingStore(database) as store:
                 self.assertTrue(read_health(store.connection))
+            for thread in list(_DATABASE_AUDIT_THREADS.values()):
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+
+    def test_health_only_cycle_does_not_wait_for_database_audit(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_audit(*args: object) -> tuple[str, None, dict[str, object]]:
+            started.set()
+            self.assertTrue(release.wait(5))
+            return "healthy", None, {
+                "integrity": "ok",
+                "foreign_key_issues": 0,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "service.db"
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+            _DATABASE_HEALTH_CACHE.clear()
+            _DATABASE_AUDIT_THREADS.clear()
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "scripts.run_dota_shadow_service._database_health",
+                    side_effect=slow_audit,
+                ) as audit,
+            ):
+                thread = None
+                try:
+                    first = service_once(
+                        database,
+                        initialize_schema=False,
+                        health_only=True,
+                    )
+                    self.assertTrue(started.wait(2))
+                    second = service_once(
+                        database,
+                        initialize_schema=False,
+                        health_only=True,
+                    )
+                    self.assertEqual(first, {"pending_orders": 0})
+                    self.assertEqual(second, {"pending_orders": 0})
+                    self.assertEqual(audit.call_count, 1)
+                    with LiveBettingStore(database) as store:
+                        database_health = next(
+                            row for row in read_health(store.connection)
+                            if row["component"] == "database"
+                        )
+                    self.assertEqual(database_health["status"], "starting")
+                    self.assertEqual(
+                        database_health["details"]["audit_checked_at"], None
+                    )
+                    thread = next(iter(_DATABASE_AUDIT_THREADS.values()))
+                finally:
+                    release.set()
+                    for running in list(_DATABASE_AUDIT_THREADS.values()):
+                        running.join(5)
+                if thread is None:
+                    self.fail("database audit thread was not started")
+                self.assertFalse(thread.is_alive())
+
+                service_once(
+                    database,
+                    initialize_schema=False,
+                    health_only=True,
+                )
+
+            with LiveBettingStore(database) as store:
+                database_health = next(
+                    row for row in read_health(store.connection)
+                    if row["component"] == "database"
+                )
+            self.assertEqual(database_health["status"], "healthy")
+            self.assertTrue(database_health["details"]["audit_cached"])
 
     def test_report_worker_is_single_flight(self) -> None:
         started = threading.Event()
@@ -153,6 +231,35 @@ class ServiceHealthTests(unittest.TestCase):
 
         self.assertEqual(generate.call_count, 2)
         generate.assert_called_with(Path("service.db"), Path("report.json"))
+
+    def test_database_audit_uses_read_only_connection_and_closes_on_failure(
+        self,
+    ) -> None:
+        database = Path("audit.db").resolve()
+        connection = Mock()
+        _DATABASE_HEALTH_CACHE.clear()
+        with (
+            patch(
+                "scripts.run_dota_shadow_service.sqlite3.connect",
+                return_value=connection,
+            ) as connect,
+            patch(
+                "scripts.run_dota_shadow_service._database_health",
+                side_effect=RuntimeError("audit failed"),
+            ),
+        ):
+            _run_database_audit(str(database), database)
+
+        connect.assert_called_once_with(
+            f"{database.as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        connection.execute.assert_called_once_with("PRAGMA busy_timeout=1000")
+        connection.close.assert_called_once_with()
+        cached = _DATABASE_HEALTH_CACHE[str(database)][1]
+        self.assertEqual(cached[0], "unhealthy")
+        self.assertEqual(cached[1], "database_audit_failed")
 
     def test_report_worker_failure_does_not_escape_and_can_retry(self) -> None:
         worker = _ReportWorker(
@@ -558,6 +665,49 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertEqual(audit.call_count, 1)
             self.assertFalse(first[2]["audit_cached"])
             self.assertTrue(second[2]["audit_cached"])
+
+    def test_failed_database_audit_remains_unhealthy_during_background_recheck(
+        self,
+    ) -> None:
+        database = Path("failed-service.db").resolve()
+        connection = Mock()
+        connection.execute.return_value.fetchone.return_value = (
+            0,
+            "main",
+            str(database),
+        )
+        _DATABASE_HEALTH_CACHE.clear()
+        _DATABASE_HEALTH_CACHE[str(database)] = (
+            NOW,
+            (
+                "unhealthy",
+                "integrity_check_failed",
+                {"integrity": ["malformed"], "foreign_key_issues": 0},
+            ),
+        )
+
+        with patch(
+            "scripts.run_dota_shadow_service._start_database_audit"
+        ) as start_audit:
+            cached = _periodic_database_health(
+                connection,
+                NOW + timedelta(seconds=59),
+                background=True,
+            )
+            refreshing = _periodic_database_health(
+                connection,
+                NOW + timedelta(seconds=61),
+                background=True,
+            )
+
+        self.assertEqual(cached[:2], ("unhealthy", "integrity_check_failed"))
+        self.assertTrue(cached[2]["audit_cached"])
+        self.assertEqual(
+            refreshing[:2], ("unhealthy", "integrity_check_failed")
+        )
+        self.assertTrue(refreshing[2]["audit_stale"])
+        self.assertTrue(refreshing[2]["audit_refreshing"])
+        start_audit.assert_called_once_with(str(database), database)
 
 
 if __name__ == "__main__":

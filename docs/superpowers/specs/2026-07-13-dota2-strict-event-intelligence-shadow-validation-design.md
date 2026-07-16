@@ -649,6 +649,15 @@ network and SMTP 4xx failures retry after 1 minute, 5 minutes, 30 minutes,
 Restart resumes pending and expired leases. A local audited command may requeue
 a dead letter after configuration is corrected.
 
+At the live-schema version 4 safety boundary (formal-email template version 2),
+restart recovery is restricted to `pending` or expired `leased` rows that use
+the current template and pass the complete immutable decision, vision, and fill
+lineage gates. A pre-template-version-2 formal row, or any formal row missing
+that lineage, enters an audited `dead_letter` during migration or its first
+delivery claim. It is never re-rendered with a newer template or silently
+upgraded. The migration audit found no such rows in the current production
+database.
+
 Every logical event uses a stable RFC Message-ID. The application sends a
 logical event once after a successful SMTP acknowledgement. SMTP cannot
 guarantee mathematical exactly-once delivery when the server accepts a message

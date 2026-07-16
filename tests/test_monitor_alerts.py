@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -100,7 +101,22 @@ class MonitorAlertTests(unittest.TestCase):
         create_strict_mapping: bool = True,
         insert_vision_anchor: bool = True,
         vision_anchor_at: datetime | None = None,
+        insert_decision_lineage: bool = True,
     ) -> int | None:
+        strategy_version = "paper-test-v1"
+        input_ref = f"paper-input:{order_key}"
+        identity = "|".join(
+            (
+                raybet_match_id,
+                f"odds-{order_key}",
+                f"group-{order_key}",
+                "team_one",
+                "winner|map_1|team_one|",
+                strategy_version,
+                input_ref,
+            )
+        )
+        persisted_order_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
         if strict_mapping_id is None and create_strict_mapping:
             strict_mapping_id = self._insert_strict_mapping(
                 connection,
@@ -116,7 +132,7 @@ class MonitorAlertTests(unittest.TestCase):
                 signal_identity_verified, stake, status)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                order_key,
+                persisted_order_key,
                 raybet_match_id,
                 strict_mapping_id,
                 f"odds-{order_key}",
@@ -139,8 +155,51 @@ class MonitorAlertTests(unittest.TestCase):
             """INSERT INTO shadow_map_attempts
                (raybet_match_id, map_number, order_key, status, created_at)
                VALUES (?, ?, ?, 'pending', ?)""",
-            (raybet_match_id, map_number, order_key, signal_at.isoformat()),
+            (
+                raybet_match_id,
+                map_number,
+                persisted_order_key,
+                signal_at.isoformat(),
+            ),
         )
+        if insert_decision_lineage:
+            decision_key = f"paper-decision:{order_key}"
+            connection.execute(
+                """INSERT INTO strategy_decisions
+                   (decision_key, raybet_match_id, map_number, decided_at,
+                    underdog_side, market_probability, model_probability, edge,
+                    data_quality, eligible, reason, contributions_json, input_ref,
+                    strategy_version)
+                   VALUES (?, ?, ?, ?, 'team_one', ?, ?, 0.1, 0.8, 1,
+                           'eligible', ?, ?, ?)""",
+                (
+                    decision_key,
+                    raybet_match_id,
+                    map_number,
+                    signal_at.isoformat(),
+                    market_probability,
+                    model_probability,
+                    json.dumps(
+                        {
+                            "__inputs__": {
+                                "strict_live_eligibility": {
+                                    "mapping_refs": {
+                                        "strict_mapping_id": strict_mapping_id
+                                    }
+                                }
+                            }
+                        },
+                        sort_keys=True,
+                    ),
+                    input_ref,
+                    strategy_version,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO shadow_order_decision_lineage
+                   (order_key, decision_key, recorded_at) VALUES (?, ?, ?)""",
+                (persisted_order_key, decision_key, signal_at.isoformat()),
+            )
         if insert_vision_anchor:
             connection.execute(
                 """INSERT INTO vision_draft_anchors
@@ -160,6 +219,23 @@ class MonitorAlertTests(unittest.TestCase):
             )
         connection.commit()
         return strict_mapping_id
+
+    @staticmethod
+    def _persisted_order_key(
+        order_key: str = "order-alert", raybet_match_id: str = "match-1"
+    ) -> str:
+        identity = "|".join(
+            (
+                raybet_match_id,
+                f"odds-{order_key}",
+                f"group-{order_key}",
+                "team_one",
+                "winner|map_1|team_one|",
+                "paper-test-v1",
+                f"paper-input:{order_key}",
+            )
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
     def _insert_automatic_approval(
         self,
@@ -292,6 +368,7 @@ class MonitorAlertTests(unittest.TestCase):
         )
 
     def test_paper_signal_opens_immediately_and_can_be_acknowledged(self) -> None:
+        order_key = self._persisted_order_key()
         self._insert_pending_order(self.store.connection)
 
         reconcile_alerts(
@@ -307,7 +384,7 @@ class MonitorAlertTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT order_key FROM notification_outbox"
             ).fetchone()[0],
-            "order-alert",
+            order_key,
         )
         self.assertTrue(
             acknowledge_alert(
@@ -331,6 +408,8 @@ class MonitorAlertTests(unittest.TestCase):
             "strict_live_map_mapping_invalidations",
             "strict_live_map_mappings",
             "strict_live_automatic_evidence_approvals",
+            "shadow_order_decision_lineage",
+            "strategy_decisions",
         )
         for relation in relations:
             with self.subTest(relation=relation):
@@ -367,6 +446,7 @@ class MonitorAlertTests(unittest.TestCase):
                         store.close()
 
     def test_schema_outage_keeps_existing_paper_incident_unknown(self) -> None:
+        order_key = self._persisted_order_key()
         self._insert_pending_order(self.store.connection)
         reconcile_alerts(
             self.store.connection,
@@ -388,7 +468,8 @@ class MonitorAlertTests(unittest.TestCase):
 
         paper = self.store.connection.execute(
             """SELECT status, recovered_at FROM monitor_alert_incidents
-                WHERE dedupe_key='paper_signal:order-alert'"""
+                WHERE dedupe_key=?""",
+            (f"paper_signal:{order_key}",),
         ).fetchone()
         self.assertEqual(tuple(paper), ("active", None))
         self.assertEqual(
@@ -425,6 +506,8 @@ class MonitorAlertTests(unittest.TestCase):
             "strict_live_map_mapping_invalidations": "invalidation_id",
             "strict_live_map_mappings": "acceptance_mode",
             "strict_live_automatic_evidence_approvals": "source_mapping_id",
+            "shadow_order_decision_lineage": "decision_key",
+            "strategy_decisions": "contributions_json",
         }
         for relation, missing_column in missing_columns.items():
             with self.subTest(relation=relation, column=missing_column):
@@ -563,7 +646,13 @@ class MonitorAlertTests(unittest.TestCase):
                 reason, block_reason, recorded_at)
                VALUES ('shadow_order', ?, ?, 1, 'draft_conflict',
                        'vision_draft_conflict', ?)""",
-            ("order-invalidated", "match-invalidated", NOW.isoformat()),
+            (
+                self._persisted_order_key(
+                    "order-invalidated", "match-invalidated"
+                ),
+                "match-invalidated",
+                NOW.isoformat(),
+            ),
         )
         self.store.connection.execute(
             """INSERT INTO vision_draft_anchors
@@ -612,6 +701,34 @@ class MonitorAlertTests(unittest.TestCase):
         reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
 
         self.assertEqual(active_alerts(self.store.connection), [])
+
+    def test_paper_signal_requires_exact_decision_lineage(self) -> None:
+        order_key = self._persisted_order_key()
+        self._insert_pending_order(
+            self.store.connection,
+            insert_decision_lineage=False,
+        )
+
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW,
+            grace_seconds=0,
+            email_recipient="ops@example.com",
+        )
+
+        self._assert_no_paper_signal(self.store.connection)
+        row = self.store.connection.execute(
+            """SELECT source_json FROM monitor_alert_incidents
+                WHERE dedupe_key='operational:paper_signal_contract'"""
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        source = json.loads(str(row[0]))
+        self.assertEqual(source["reason"], "decision_lineage_invalid")
+        self.assertEqual(
+            source["issues"],
+            [f"order_key={order_key}: decision_lineage_unavailable"],
+        )
 
     def test_paper_signal_requires_a_vision_draft_anchor(self) -> None:
         self._insert_pending_order(
@@ -714,7 +831,9 @@ class MonitorAlertTests(unittest.TestCase):
                                 (
                                     order_mapping_id,
                                     int(cursor.lastrowid),
-                                    "order-impact",
+                                    self._persisted_order_key(
+                                        "order-impact", "match-impact"
+                                    ),
                                     NOW.isoformat(),
                                 ),
                             )
@@ -744,6 +863,7 @@ class MonitorAlertTests(unittest.TestCase):
                         store.close()
 
     def test_paper_signal_gate_and_enqueue_share_one_write_transaction(self) -> None:
+        paper_order_key = self._persisted_order_key()
         self._insert_pending_order(self.store.connection)
         contender = sqlite3.connect(self.database, timeout=0)
         writer_errors: list[str] = []
@@ -763,9 +883,9 @@ class MonitorAlertTests(unittest.TestCase):
                             """INSERT INTO vision_derived_invalidations
                                (dependent_type, dependent_key, raybet_match_id,
                                 map_number, reason, recorded_at)
-                               VALUES ('shadow_order', 'order-alert', 'match-1',
+                               VALUES ('shadow_order', ?, 'match-1',
                                        1, 'racing_invalidation', ?)""",
-                            (NOW.isoformat(),),
+                            (paper_order_key, NOW.isoformat()),
                         )
                         contender.commit()
                     except sqlite3.OperationalError as exc:
@@ -797,9 +917,9 @@ class MonitorAlertTests(unittest.TestCase):
                 """INSERT INTO vision_derived_invalidations
                    (dependent_type, dependent_key, raybet_match_id, map_number,
                     reason, recorded_at)
-                   VALUES ('shadow_order', 'order-alert', 'match-1', 1,
+                   VALUES ('shadow_order', ?, 'match-1', 1,
                            'post_commit_invalidation', ?)""",
-                ((NOW + timedelta(seconds=1)).isoformat(),),
+                (paper_order_key, (NOW + timedelta(seconds=1)).isoformat()),
             )
             contender.commit()
         finally:
@@ -815,7 +935,7 @@ class MonitorAlertTests(unittest.TestCase):
                          FROM notification_outbox"""
                 ).fetchone()
             ),
-            ("order-alert", "dead_letter", "strict_mapping_unverified"),
+            (paper_order_key, "dead_letter", "strict_mapping_unverified"),
         )
 
     def test_email_outbox_uses_monitor_template_when_recipient_is_configured(self) -> None:

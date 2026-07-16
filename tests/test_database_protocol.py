@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -462,7 +464,7 @@ def test_live_store_itself_rejects_a_future_schema(tmp_path: Path) -> None:
         )
 
 
-def test_live_v1_schema_migrates_to_v3_and_is_idempotent(tmp_path: Path) -> None:
+def test_live_v1_schema_migrates_to_v4_and_is_idempotent(tmp_path: Path) -> None:
     database = tmp_path / "live-v1.db"
     connection = connect(database)
     connection.executescript(
@@ -576,10 +578,253 @@ def test_live_v1_schema_migrates_to_v3_and_is_idempotent(tmp_path: Path) -> None
             for row in store.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [1, 3]
+        ] == [1, 4]
 
 
-def test_version_one_binary_rejects_live_v3_database(
+def test_prepare_database_migrates_live_v3_contract_to_v4(tmp_path: Path) -> None:
+    database = tmp_path / "live-v3.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.connection.execute(
+            "CREATE TABLE operator_marker (value TEXT NOT NULL)"
+        )
+        store.connection.execute("INSERT INTO operator_marker VALUES ('preserved')")
+        store.connection.execute(
+            "DROP TRIGGER shadow_orders_require_strict_mapping_insert"
+        )
+        signal_at = "2026-07-15T12:00:00+00:00"
+        expires_at = "2026-07-15T12:00:15+00:00"
+
+        def legacy_order_key(match_id: str, odds_id: str, input_ref: str) -> str:
+            identity = "|".join(
+                (
+                    match_id,
+                    odds_id,
+                    "winner-group",
+                    "team_one",
+                    "winner|map_1|team_one|",
+                    "legacy-strategy-v1",
+                    input_ref,
+                )
+            )
+            return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+        def insert_legacy_order(
+            match_id: str,
+            *,
+            strict_mapping_id: int | None,
+            status: str = "pending",
+            decision_mappings: tuple[int, ...] = (),
+        ) -> str:
+            odds_id = f"odds-{match_id}"
+            input_ref = f"input-{match_id}"
+            order_key = legacy_order_key(match_id, odds_id, input_ref)
+            store.connection.execute(
+                """INSERT INTO shadow_orders
+                   (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                    market_key, signaled_at, model_probability,
+                    market_probability, signal_price, signal_transport_key,
+                    signal_transport_at, expires_at, signal_odds_group_id,
+                    signal_outcome_key, signal_identity_verified, stake, status,
+                    fill_price, filled_at, rejection_reason)
+                   VALUES (?, ?, ?, ?, 'winner|map_1|team_one|', ?, 0.6, 0.5,
+                           2.0, ?, ?, ?, 'winner-group', 'team_one', 1, 1.0,
+                           ?, ?, ?, NULL)""",
+                (
+                    order_key,
+                    match_id,
+                    strict_mapping_id,
+                    odds_id,
+                    signal_at,
+                    f"signal-{match_id}",
+                    signal_at,
+                    expires_at,
+                    status,
+                    2.0 if status == "filled" else None,
+                    signal_at if status == "filled" else None,
+                ),
+            )
+            store.connection.execute(
+                """INSERT INTO shadow_map_attempts
+                   (raybet_match_id, map_number, order_key, status, created_at)
+                   VALUES (?, 1, ?, ?, ?)""",
+                (match_id, order_key, status, signal_at),
+            )
+            for index, mapping_id in enumerate(decision_mappings, start=1):
+                contributions = json.dumps(
+                    {
+                        "__inputs__": {
+                            "strict_live_eligibility": {
+                                "mapping_refs": {"strict_mapping_id": mapping_id}
+                            }
+                        }
+                    },
+                    sort_keys=True,
+                )
+                store.connection.execute(
+                    """INSERT INTO strategy_decisions
+                       (decision_key, raybet_match_id, map_number, decided_at,
+                        underdog_side, market_probability, model_probability,
+                        edge, data_quality, eligible, reason, contributions_json,
+                        input_ref, strategy_version)
+                       VALUES (?, ?, 1, ?, 'team_one', 0.5, 0.6, 0.1, 0.8, 1,
+                               'eligible', ?, ?, 'legacy-strategy-v1')""",
+                    (
+                        f"decision-{match_id}-{index}",
+                        match_id,
+                        signal_at,
+                        contributions,
+                        input_ref,
+                    ),
+                )
+            return order_key
+
+        unique_key = insert_legacy_order(
+            "match-unique", strict_mapping_id=None, decision_mappings=(7,)
+        )
+        missing_key = insert_legacy_order(
+            "match-missing", strict_mapping_id=8
+        )
+        ambiguous_key = insert_legacy_order(
+            "match-ambiguous",
+            strict_mapping_id=7,
+            decision_mappings=(7, 8),
+        )
+        filled_key = insert_legacy_order(
+            "match-filled", strict_mapping_id=9, status="filled"
+        )
+        store.connection.execute(
+            """INSERT INTO settlements
+               (order_key, result, return_units, settled_at, evidence_ref,
+                review_required) VALUES (?, 'win', 2.0, ?, 'legacy-result', 0)""",
+            (filled_key, signal_at),
+        )
+        store.connection.execute(
+            """INSERT INTO notification_outbox
+               (order_key, event_type, channel, status, recipient, message_id,
+                payload_json, statistics_cutoff, template_version,
+                attempt_count, next_attempt_at, created_at, updated_at)
+               VALUES (?, 'filled', 'email', 'pending', 'ops@example.com', ?,
+                       '{}', ?, 'dota2-shadow-email-v1', 0, ?, ?, ?)""",
+            (
+                filled_key,
+                "<legacy-filled@example.invalid>",
+                signal_at,
+                signal_at,
+                signal_at,
+                signal_at,
+            ),
+        )
+        store.connection.execute("DROP TABLE shadow_order_decision_lineage")
+        store.connection.execute("DROP TRIGGER strategy_decisions_immutable_update")
+        store.connection.execute("DROP TRIGGER strategy_decisions_immutable_delete")
+        store.connection.execute("DROP TRIGGER shadow_orders_terminal_immutable")
+        store.connection.execute("DROP TRIGGER shadow_orders_immutable_delete")
+        store.connection.execute("DROP TRIGGER settlements_core_immutable")
+        store.connection.execute("DROP TRIGGER settlements_immutable_delete")
+        store.connection.execute("DELETE FROM live_schema_version")
+        store.connection.execute(
+            "INSERT INTO live_schema_version VALUES (3, 'v3')"
+        )
+        store.connection.commit()
+
+    result = prepare_database(
+        database,
+        tmp_path / "backups",
+        now=datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.live_schema_version == 4
+    assert result.backup is not None and result.backup.is_file()
+    verification = verify_prepared_database(database)
+    assert verification.live_schema_version == 4
+    connection = connect(database, read_only=True)
+    try:
+        assert connection.execute(
+            "SELECT value FROM operator_marker"
+        ).fetchone()[0] == "preserved"
+        assert [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT version FROM live_schema_version ORDER BY version"
+            )
+        ] == [3, 4]
+        objects = {
+            (str(row[0]), str(row[1]))
+            for row in connection.execute(
+                """SELECT type, name FROM sqlite_master
+                    WHERE name IN (
+                        'shadow_order_decision_lineage',
+                        'strategy_decisions_immutable_update',
+                        'strategy_decisions_immutable_delete',
+                        'shadow_orders_terminal_immutable',
+                        'shadow_orders_immutable_delete',
+                        'settlements_core_immutable',
+                        'settlements_immutable_delete'
+                    )"""
+            )
+        }
+        assert objects == {
+            ("table", "shadow_order_decision_lineage"),
+            ("trigger", "strategy_decisions_immutable_update"),
+            ("trigger", "strategy_decisions_immutable_delete"),
+            ("trigger", "shadow_orders_terminal_immutable"),
+            ("trigger", "shadow_orders_immutable_delete"),
+            ("trigger", "settlements_core_immutable"),
+            ("trigger", "settlements_immutable_delete"),
+        }
+        unique = connection.execute(
+            """SELECT orders.status, orders.strict_mapping_id,
+                      lineage.decision_key
+                 FROM shadow_orders AS orders
+                 JOIN shadow_order_decision_lineage AS lineage
+                   ON lineage.order_key=orders.order_key
+                WHERE orders.order_key=?""",
+            (unique_key,),
+        ).fetchone()
+        assert tuple(unique) == ("pending", 7, "decision-match-unique-1")
+        for order_key in (missing_key, ambiguous_key):
+            order = connection.execute(
+                """SELECT orders.status, attempt.status, orders.rejection_reason
+                     FROM shadow_orders AS orders
+                     JOIN shadow_map_attempts AS attempt
+                       ON attempt.order_key=orders.order_key
+                    WHERE orders.order_key=?""",
+                (order_key,),
+            ).fetchone()
+            assert tuple(order) == (
+                "rejected",
+                "rejected",
+                "decision_lineage_unavailable",
+            )
+            assert connection.execute(
+                """SELECT block_reason FROM vision_derived_invalidations
+                    WHERE dependent_type='shadow_order' AND dependent_key=?""",
+                (order_key,),
+            ).fetchone()[0] == "decision_lineage_unavailable"
+        assert tuple(
+            connection.execute(
+                """SELECT orders.status, settlement.review_required,
+                          outbox.status, outbox.last_error
+                     FROM shadow_orders AS orders
+                     JOIN settlements AS settlement
+                       ON settlement.order_key=orders.order_key
+                     JOIN notification_outbox AS outbox
+                       ON outbox.order_key=orders.order_key
+                    WHERE orders.order_key=?""",
+                (filled_key,),
+            ).fetchone()
+        ) == (
+            "filled",
+            1,
+            "dead_letter",
+            "decision_lineage_unavailable",
+        )
+    finally:
+        connection.close()
+
+
+def test_version_one_binary_rejects_live_v4_database(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -589,14 +834,14 @@ def test_version_one_binary_rejects_live_v3_database(
     monkeypatch.setattr(live_storage, "CURRENT_SCHEMA_VERSION", 1)
 
     with LiveBettingStore(database) as legacy_store:
-        with pytest.raises(RuntimeError, match="version 3 is newer than supported"):
+        with pytest.raises(RuntimeError, match="version 4 is newer than supported"):
             legacy_store.init_schema()
         assert [
             int(row[0])
             for row in legacy_store.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [3]
+        ] == [4]
 
 
 def test_existing_database_restores_backup_when_intelligence_init_fails_after_live(
