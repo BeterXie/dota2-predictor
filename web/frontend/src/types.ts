@@ -139,7 +139,12 @@ export interface AlertIncident {
 }
 
 export interface ControlComponent {
-  component: "raybet_collector" | "shadow_monitor" | "vision_supervisor" | "mail_worker";
+  component:
+    | "raybet_collector"
+    | "shadow_monitor"
+    | "vision_supervisor"
+    | "draft_publisher"
+    | "mail_worker";
   label: string;
   status: "running" | "stopped" | "identity_mismatch";
   pid: number | null;
@@ -356,6 +361,51 @@ export interface IntelligenceNestedMatchDetail {
 export type IntelligenceMatchDetail =
   | IntelligenceFlatMatchDetail
   | IntelligenceNestedMatchDetail;
+
+export type ExactPostmatchStatus = "available" | "unavailable" | "review";
+
+export interface ExactPostmatchEvent {
+  game_time_seconds: number;
+  event_type: "economy" | "objective" | "teamfight" | "buyback";
+  side: "radiant" | "dire" | null;
+  label: string;
+  radiant_gold_adv: number | null;
+  radiant_xp_adv: number | null;
+  team_one_probability: number | null;
+  team_two_probability: number | null;
+  details: Record<string, unknown>;
+}
+
+export interface ExactPostmatchPayload {
+  match: IntelligenceMatchSummary;
+  states: {
+    radiant: IntelligenceTeamState | null;
+    dire: IntelligenceTeamState | null;
+  };
+  player_performance: IntelligencePlayerPerformance[];
+  player_scores: IntelligencePlayerMapScore[];
+  events: ExactPostmatchEvent[];
+  event_availability: {
+    gold_advantage: boolean;
+    xp_advantage: boolean;
+    objectives: boolean;
+    teamfights: boolean;
+    buybacks: boolean;
+    odds_game_clock_alignment: boolean;
+    missing_reasons: string[];
+  };
+}
+
+export interface ExactPostmatchAttribution {
+  raybet_match_id: string;
+  map_number: number;
+  status: ExactPostmatchStatus;
+  reason: string;
+  mapping: Record<string, unknown> | null;
+  reconciliation: Record<string, unknown> | null;
+  odds_timeline: WinnerTimelinePoint[];
+  postmatch: ExactPostmatchPayload | null;
+}
 
 export interface IntelligenceDraftQualitySlice {
   model_kind: "pure_draft" | "context_adjusted";

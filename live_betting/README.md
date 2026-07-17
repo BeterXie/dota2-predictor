@@ -50,6 +50,19 @@ data directory:
 python scripts/supervise_raybet_streams.py --database data/dota2.db
 ```
 
+The visual supervisor keeps frames used by decisions, orders, settlements,
+research predictions, draft anchors/conflicts, and one audit frame per map per
+10 game minutes. It skips active matches and hourly removes only other JPGs
+older than 7 days or, after a one-hour ingestion grace period, beyond 2,000
+unprotected frames per match. Inspect the same plan without deleting anything:
+
+```powershell
+python scripts/cleanup_vision_evidence.py --database data/dota2.db
+```
+
+Add `--delete` only for an explicit manual cleanup; the command is dry-run by
+default and refuses incomplete lineage schema or an unsafe evidence root.
+
 Run the strategy monitor against that observation directory:
 
 ```powershell
@@ -131,9 +144,14 @@ To run the complete passive shadow pipeline:
 ```powershell
 python scripts/run_dota_shadow_service.py --database data/dota2.db `
   --start-collector --start-companion --start-shadow --start-vision `
-  --start-strict-ingest --start-postmatch `
+  --start-strict-ingest --start-postmatch --start-draft-publisher `
   --vision-jsonl data/live_betting/live_observations
 ```
+
+`--start-shadow` also starts the independent draft publisher. The publisher
+builds or loads frozen model/calibration artifacts outside the 3-second shadow
+loop. Failed or reconstructed calibration gates still publish immutable
+research evidence, but can never authorize a shadow order.
 
 The supervisor takes its single-instance lock and verifies exact schema versions,
 required tables, and migration-critical columns before starting workers. Routine

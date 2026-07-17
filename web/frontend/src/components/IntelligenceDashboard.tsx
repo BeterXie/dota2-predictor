@@ -767,6 +767,7 @@ function ScoreEvidenceStrip({
   scoreVersions: string[];
   source: string;
 }) {
+  const cutoffSummary = summarizeCutoffs(benchmarkCutoffs);
   return (
     <dl className="intel-score-evidence" aria-label={`${source}版本证据`}>
       <div>
@@ -780,10 +781,16 @@ function ScoreEvidenceStrip({
       <div>
         <dt>基准截止</dt>
         <dd>
-          {benchmarkCutoffs.length
-            ? benchmarkCutoffs.map((value) => (
-              <code key={value} title={value}>{formatCutoff(value)}</code>
-            ))
+          {cutoffSummary
+            ? (
+              <span className="intel-cutoff-summary">
+                <code title={cutoffSummary.first}>{formatCutoff(cutoffSummary.first)}</code>
+                {cutoffSummary.last !== cutoffSummary.first && (
+                  <><span aria-hidden="true">至</span><code title={cutoffSummary.last}>{formatCutoff(cutoffSummary.last)}</code></>
+                )}
+                {cutoffSummary.count > 1 && <small>{cutoffSummary.count} 个截止点</small>}
+              </span>
+            )
             : missingCutoffNote}
         </dd>
       </div>
@@ -1340,6 +1347,16 @@ function collectRankingEvidence(rows: IntelligencePlayerRanking[]): {
 
 function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
+export function summarizeCutoffs(values: string[]): {
+  count: number;
+  first: string;
+  last: string;
+} | null {
+  const cutoffs = uniqueNonEmpty(values).sort((left, right) => left.localeCompare(right));
+  if (!cutoffs.length) return null;
+  return { count: cutoffs.length, first: cutoffs[0], last: cutoffs.at(-1) || cutoffs[0] };
 }
 
 function formatCutoff(value: string): string {

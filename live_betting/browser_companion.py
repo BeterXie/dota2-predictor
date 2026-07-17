@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sqlite3
@@ -27,6 +28,11 @@ HOST = "127.0.0.1"
 PORT = 8765
 MAX_BODY_BYTES = 1024 * 1024
 MAX_BATCH_EVENTS = 50
+MAX_JSON_DEPTH = 32
+MAX_JSON_NODES = 20_000
+MAX_JSON_ARRAY_ITEMS = 5_000
+MAX_JSON_OBJECT_KEYS = 256
+MAX_JSON_STRING_BYTES = 64 * 1024
 AUTH_HEADERS = "Content-Type, X-Dota-Extension-Version"
 SUPPORTED_EXTENSION_VERSION = "0.1.0"
 PROTOCOL_VERSION = 1
@@ -125,7 +131,51 @@ def _reject_json_constant(value: str) -> NoReturn:
 
 
 def _strict_json_loads(body: bytes | str) -> Any:
-    return json.loads(body, parse_constant=_reject_json_constant)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8")
+    try:
+        value = json.loads(body, parse_constant=_reject_json_constant)
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the parser limit") from error
+    _validate_json_budget(value)
+    return value
+
+
+def _validate_json_budget(value: Any) -> None:
+    """Apply the extension's structural limits without recursive traversal."""
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            raise ValueError("JSON node limit exceeded")
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError("JSON depth limit exceeded")
+        if isinstance(current, dict):
+            if len(current) > MAX_JSON_OBJECT_KEYS:
+                raise ValueError("JSON object key limit exceeded")
+            for key, child in current.items():
+                try:
+                    key_bytes = len(key.encode("utf-8"))
+                except UnicodeEncodeError as error:
+                    raise ValueError("JSON object key is not valid UTF-8") from error
+                if key_bytes > MAX_JSON_STRING_BYTES:
+                    raise ValueError("JSON object key size limit exceeded")
+                stack.append((child, depth + 1))
+        elif isinstance(current, list):
+            if len(current) > MAX_JSON_ARRAY_ITEMS:
+                raise ValueError("JSON array item limit exceeded")
+            stack.extend((child, depth + 1) for child in current)
+        elif isinstance(current, str):
+            try:
+                string_bytes = len(current.encode("utf-8"))
+            except UnicodeEncodeError as error:
+                raise ValueError("JSON string is not valid UTF-8") from error
+            if string_bytes > MAX_JSON_STRING_BYTES:
+                raise ValueError("JSON string size limit exceeded")
+        elif isinstance(current, float) and not math.isfinite(current):
+            raise ValueError("non-finite JSON number is not allowed")
 
 
 async def _read_bounded_body(request: Request) -> bytes | None:

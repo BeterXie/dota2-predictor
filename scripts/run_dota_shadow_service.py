@@ -41,6 +41,7 @@ WORKER_COMPONENTS = {
     "vision": "vision_worker",
     "strict_ingest": "strict_ingest_worker",
     "postmatch": "postmatch_worker",
+    "draft_publisher": "draft_publisher_worker",
 }
 ACTIVE_COMMANDS = {
     "raybet": "collector",
@@ -49,6 +50,7 @@ ACTIVE_COMMANDS = {
     "vision": "vision",
     "strict_ingest": "strict_ingest",
     "postmatch": "postmatch",
+    "draft_publisher": "draft_publisher",
 }
 WORKER_MAX_AGE = {
     "raybet": timedelta(seconds=45),
@@ -57,6 +59,7 @@ WORKER_MAX_AGE = {
     "vision": timedelta(seconds=90),
     "strict_ingest": timedelta(seconds=90),
     "postmatch": timedelta(seconds=150),
+    "draft_publisher": timedelta(minutes=15),
 }
 COLLECTOR_MAX_AGE = timedelta(seconds=60)
 DATABASE_AUDIT_MAX_AGE = timedelta(minutes=15)
@@ -595,7 +598,7 @@ def service_once(
             details=mail_details,
         )
 
-        for component in ("vision", "strict_ingest", "postmatch"):
+        for component in ("vision", "strict_ingest", "postmatch", "draft_publisher"):
             status, details = _worker_health(
                 connection, component, now, active_components
             )
@@ -703,6 +706,15 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "--all",
             "--schema-prepared",
         ]
+    if getattr(args, "start_draft_publisher", False) or args.start_shadow:
+        commands["draft_publisher"] = [
+            python,
+            "-m",
+            "live_betting.draft_publisher",
+            "--database",
+            str(args.database),
+            "--schema-prepared",
+        ]
     return commands
 
 
@@ -720,6 +732,7 @@ def main() -> int:
     parser.add_argument("--start-mail", action="store_true")
     parser.add_argument("--start-strict-ingest", action="store_true")
     parser.add_argument("--start-postmatch", action="store_true")
+    parser.add_argument("--start-draft-publisher", action="store_true")
     parser.add_argument(
         "--backup-dir",
         type=Path,

@@ -587,7 +587,6 @@ def fit_draft_model(
     )
     estimator = LogisticRegression(
         C=1.0 / regularization,
-        penalty="l2",
         solver=_SOLVER,
         fit_intercept=True,
         max_iter=_MAX_ITERATIONS,
@@ -934,8 +933,24 @@ def _calibration_structure_valid(metrics: BinaryMetrics) -> bool:
         or not _in_range(row.mean_probability, 0.0, 1.0)
         or not _in_range(row.event_rate, 0.0, 1.0)
         or not _in_range(row.absolute_gap, 0.0, 1.0)
-        or row.min_probability > row.mean_probability
-        or row.mean_probability > row.max_probability
+        or (
+            row.min_probability > row.mean_probability
+            and not math.isclose(
+                row.min_probability,
+                row.mean_probability,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
+        or (
+            row.mean_probability > row.max_probability
+            and not math.isclose(
+                row.mean_probability,
+                row.max_probability,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
         or not math.isclose(
             row.absolute_gap,
             abs(row.mean_probability - row.event_rate),

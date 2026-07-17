@@ -257,72 +257,30 @@ class DraftCurveSelectionTests(unittest.TestCase):
         self.assertFalse(point.passes_live_gate)
         self.assertIsNone(DraftCurve((point,)).at(10 * 60))
 
-    def test_loads_exact_causally_available_prospective_artifact(self) -> None:
+    def test_unbound_prospective_artifact_is_rejected_at_insert(self) -> None:
         with LiveBettingStore(":memory:") as store:
             store.init_schema()
-            curve_key = insert_prospective_curve(
-                store,
-                curve_digit="a",
-                first_usable_at=NOW - timedelta(seconds=5),
-            )
-
-            curve = build_draft_curve(
-                store.connection,
-                (1, 2, 3, 4, 5),
-                (6, 7, 8, 9, 10),
-                int(NOW.timestamp()),
-                raybet_match_id="match-1",
-                map_number=1,
-                strict_mapping_id=7,
-            )
-
-            self.assertEqual(curve.source_ref, f"prospective-draft:{curve_key}")
-            point = curve.at(30 * 60)
-            self.assertIsNotNone(point)
-            self.assertEqual(point.model_version, "draft-logistic-l2-v1")
-            self.assertEqual(point.availability_mode, "prospective")
-            self.assertEqual(point.input_snapshot_hash, "5" * 64)
-            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
-                store.connection.execute(
-                    "UPDATE prospective_draft_curves SET map_number=2"
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority"):
+                insert_prospective_curve(
+                    store,
+                    curve_digit="a",
+                    first_usable_at=NOW - timedelta(seconds=5),
                 )
 
-    def test_future_or_latest_failed_artifact_cannot_fall_back(self) -> None:
+    def test_unbound_latest_artifact_cannot_bypass_authority(self) -> None:
         with LiveBettingStore(":memory:") as store:
             store.init_schema()
-            insert_prospective_curve(
-                store,
-                curve_digit="a",
-                first_usable_at=NOW - timedelta(minutes=2),
-            )
-            insert_prospective_curve(
-                store,
-                curve_digit="b",
-                first_usable_at=NOW - timedelta(minutes=1),
-                validation_status="failed",
-                global_calibration_passed=False,
-            )
-            insert_prospective_curve(
-                store,
-                curve_digit="c",
-                first_usable_at=NOW + timedelta(minutes=1),
-            )
-
-            curve = build_draft_curve(
-                store.connection,
-                (1, 2, 3, 4, 5),
-                (6, 7, 8, 9, 10),
-                int(NOW.timestamp()),
-                raybet_match_id="match-1",
-                map_number=1,
-                strict_mapping_id=7,
-            )
-
-            self.assertIsNone(curve.at(30 * 60))
-            self.assertEqual(
-                curve.wait_reason(30 * 60),
-                "prospective_draft_calibration_gate_not_passed",
-            )
+            for digit, first_usable_at in (
+                ("a", NOW - timedelta(minutes=2)),
+                ("b", NOW - timedelta(minutes=1)),
+                ("c", NOW + timedelta(minutes=1)),
+            ):
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "authority"):
+                    insert_prospective_curve(
+                        store,
+                        curve_digit=digit,
+                        first_usable_at=first_usable_at,
+                    )
 
     def test_missing_target_identity_remains_fail_closed(self) -> None:
         with LiveBettingStore(":memory:") as store:
@@ -337,27 +295,16 @@ class DraftCurveSelectionTests(unittest.TestCase):
                 curve.unavailable_reason, "prospective_draft_target_missing"
             )
 
-    def test_landmark_added_after_curve_availability_is_rejected(self) -> None:
+    def test_unbound_late_landmark_is_rejected_before_curve_publication(self) -> None:
         with LiveBettingStore(":memory:") as store:
             store.init_schema()
-            insert_prospective_curve(
-                store,
-                curve_digit="a",
-                first_usable_at=NOW - timedelta(minutes=2),
-                landmark_created_at=NOW - timedelta(minutes=1),
-            )
-            curve = build_draft_curve(
-                store.connection,
-                (1, 2, 3, 4, 5),
-                (6, 7, 8, 9, 10),
-                int(NOW.timestamp()),
-                raybet_match_id="match-1",
-                map_number=1,
-                strict_mapping_id=7,
-            )
-            self.assertEqual(
-                curve.unavailable_reason, "prospective_draft_artifact_invalid"
-            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority"):
+                insert_prospective_curve(
+                    store,
+                    curve_digit="a",
+                    first_usable_at=NOW - timedelta(minutes=2),
+                    landmark_created_at=NOW - timedelta(minutes=1),
+                )
 
 
 class StrictComebackStrategyTests(unittest.TestCase):

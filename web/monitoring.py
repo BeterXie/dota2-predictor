@@ -208,7 +208,8 @@ def winner_timeline(
     connection: sqlite3.Connection,
     raybet_match_id: str,
     *,
-    max_points: int = 1200,
+    max_points: int | None = 1200,
+    period: str | None = None,
 ) -> list[dict[str, Any]]:
     rows = _rows(
         connection,
@@ -222,8 +223,9 @@ def winner_timeline(
                ON alignment.odds_snapshot_id=odds.id
             WHERE odds.raybet_match_id=?
               AND odds.market_type='winner' AND odds.supported=1
+              AND (? IS NULL OR odds.period=?)
             ORDER BY odds.received_at, odds.period, odds.id""",
-        (raybet_match_id,),
+        (raybet_match_id, period, period),
     )
     grouped: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
     for row in rows:
@@ -278,7 +280,7 @@ def winner_timeline(
                 ),
             }
         )
-    return _downsample(points, max_points)
+    return points if max_points is None else _downsample(points, max_points)
 
 
 def current_markets(

@@ -309,6 +309,7 @@ function componentName(component: ControlComponent["component"]): string {
     raybet_collector: "赔率采集",
     shadow_monitor: "纸面策略",
     vision_supervisor: "视觉监控",
+    draft_publisher: "阵容预测发布器",
     mail_worker: "邮件投递",
   }[component];
 }

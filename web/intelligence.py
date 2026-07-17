@@ -7,6 +7,7 @@ import math
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -29,8 +30,13 @@ from event_intelligence.player_scoring import score_version_for_role
 from event_intelligence.roles import PROSPECTIVE_ASSIGNMENT_VERSION
 from event_intelligence.team_profiles import PROFILE_VERSION
 from event_intelligence.team_states import LABEL_VERSION
+from live_betting.strict_eligibility import (
+    StrictLiveMapMapping,
+    query_strict_live_eligibility,
+)
 
 from . import queries
+from .monitoring import winner_timeline
 
 
 MODEL_KINDS = ("pure_draft", "context_adjusted")
@@ -1145,76 +1151,948 @@ def _match_draft_predictions(
     ]
 
 
+def _match_detail_payload(
+    connection: sqlite3.Connection,
+    match_id: int,
+    scopes: CurrentDerivedScopes,
+) -> dict[str, Any] | None:
+    match = _match_row(connection, match_id)
+    if match is None:
+        return None
+    states = (
+        _match_states(connection, match_id)
+        if match_id in scopes.state
+        else {"radiant": None, "dire": None}
+    )
+    player_performance = _match_performance(connection, match_id)
+    player_scores = (
+        _match_players(connection, match_id, player_performance)
+        if match_id in scopes.player
+        else []
+    )
+    draft_predictions = (
+        _match_draft_predictions(connection, match_id, scopes.draft_predictions)
+        if match_id in scopes.draft
+        else []
+    )
+    return {
+        "match": match,
+        # Keep the flat match fields and state alias for older read-only
+        # clients while the nested shape remains the canonical response.
+        **match,
+        "states": states,
+        "radiant_state": states["radiant"],
+        "dire_state": states["dire"],
+        "player_performance": player_performance,
+        "player_scores": player_scores,
+        "draft_predictions": draft_predictions,
+        "versions": {
+            "player_score": SCORE_VERSION,
+            "team_state": LABEL_VERSION,
+            "team_profile": PROFILE_VERSION,
+            "draft_score": SCORE_VERSION,
+            "draft_model": DRAFT_MODEL_VERSION,
+            "draft_backtest": BACKTEST_VERSION,
+            "draft_features": DRAFT_FEATURE_VERSION,
+        },
+        "cutoffs": {
+            "player_score": sorted(
+                {
+                    str(row["benchmark_cutoff"])
+                    for row in player_scores
+                    if row.get("benchmark_cutoff") is not None
+                }
+            ),
+            "draft_training": sorted(
+                {
+                    str(row["training_cutoff"])
+                    for row in draft_predictions
+                    if row.get("training_cutoff") is not None
+                }
+            ),
+            "draft_prediction": sorted(
+                {
+                    str(row["prediction_cutoff"])
+                    for row in draft_predictions
+                    if row.get("prediction_cutoff") is not None
+                }
+            ),
+        },
+    }
+
+
 def get_match(match_id: int) -> dict[str, Any] | None:
     with _database() as connection:
         scopes = _current_scopes(connection)
         if match_id not in scopes.formal:
             return None
-        match = _match_row(connection, match_id)
-        if match is None:
-            return None
-        states = (
-            _match_states(connection, match_id)
-            if match_id in scopes.state
-            else {"radiant": None, "dire": None}
+        return _match_detail_payload(connection, match_id, scopes)
+
+
+def _postmatch_base(
+    raybet_match_id: str,
+    map_number: int,
+    odds_timeline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "raybet_match_id": raybet_match_id,
+        "map_number": map_number,
+        "status": "unavailable",
+        "reason": "reconciliation_missing",
+        "mapping": None,
+        "reconciliation": None,
+        "odds_timeline": odds_timeline,
+        "postmatch": None,
+    }
+
+
+def _downsample_timeline(
+    points: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    if limit <= 1:
+        raise ValueError("max_points must be greater than one")
+    if len(points) <= limit:
+        return points
+    last = len(points) - 1
+    indexes = sorted({round(index * last / (limit - 1)) for index in range(limit)})
+    return [points[index] for index in indexes]
+
+
+def _mapping_payload(mapping: StrictLiveMapMapping) -> dict[str, Any]:
+    return {
+        "mapping_id": mapping.mapping_id,
+        "event_id": mapping.event_id,
+        "acceptance_mode": mapping.acceptance_mode,
+        "mapping_version": mapping.mapping_version,
+        "canonical_teams": [
+            {
+                "side": "team_one",
+                "team_id": mapping.canonical_team_one_id,
+                "team_name": mapping.canonical_team_one_name,
+            },
+            {
+                "side": "team_two",
+                "team_id": mapping.canonical_team_two_id,
+                "team_name": mapping.canonical_team_two_name,
+            },
+        ],
+        "accepted_at": mapping.accepted_at.isoformat(),
+        "recorded_at": mapping.recorded_at.isoformat(),
+    }
+
+
+def _reconciliation_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        key: row[key]
+        for key in (
+            "dota_match_id",
+            "raybet_winner_side",
+            "opendota_winner_side",
+            "raybet_evidence_ref",
+            "opendota_evidence_ref",
+            "status",
+            "reason",
+            "first_observed_at",
+            "updated_at",
         )
-        player_performance = _match_performance(connection, match_id)
-        player_scores = (
-            _match_players(connection, match_id, player_performance)
-            if match_id in scopes.player
-            else []
-        )
-        draft_predictions = (
-            _match_draft_predictions(
-                connection, match_id, scopes.draft_predictions
+    }
+
+
+def _aware_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _confirmed_evidence_reason(
+    connection: sqlite3.Connection,
+    reconciliation: sqlite3.Row,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    mapping_recorded_at: datetime,
+) -> str | None:
+    required = {
+        "raybet_match_id",
+        "map_number",
+        "dota_match_id",
+        "source",
+        "status",
+        "winner_side",
+        "evidence_ref",
+        "facts_json",
+        "observed_at",
+        "evidence_id",
+    }
+    if not required.issubset(
+        _relation_columns(connection, "settlement_result_evidence")
+    ):
+        return "settlement_evidence_schema_unavailable"
+    rows = connection.execute(
+        """SELECT dota_match_id, source, status, winner_side,
+                  evidence_ref, facts_json, observed_at
+             FROM settlement_result_evidence
+            WHERE raybet_match_id=? AND map_number=?
+            ORDER BY source, observed_at, evidence_id""",
+        (raybet_match_id, map_number),
+    ).fetchall()
+    dota_match_id = int(reconciliation["dota_match_id"])
+    expected = {
+        "raybet": (
+            str(reconciliation["raybet_evidence_ref"]),
+            reconciliation["raybet_winner_side"],
+        ),
+        "opendota": (
+            str(reconciliation["opendota_evidence_ref"]),
+            reconciliation["opendota_winner_side"],
+        ),
+    }
+    for source, (evidence_ref, winner_side) in expected.items():
+        exact = [
+            row
+            for row in rows
+            if row["source"] == source and row["evidence_ref"] == evidence_ref
+        ]
+        if len(exact) != 1:
+            return "settlement_evidence_missing"
+        row = exact[0]
+        if (
+            isinstance(row["dota_match_id"], bool)
+            or not isinstance(row["dota_match_id"], int)
+            or row["dota_match_id"] != dota_match_id
+            or row["status"] != "confirmed"
+            or row["winner_side"] != winner_side
+            or not isinstance(row["facts_json"], str)
+        ):
+            return "settlement_evidence_conflict"
+        observed_at = _aware_timestamp(row["observed_at"])
+        if observed_at is None or observed_at < mapping_recorded_at:
+            return "settlement_evidence_causal_order_invalid"
+        try:
+            facts = json.loads(row["facts_json"])
+        except json.JSONDecodeError:
+            return "settlement_evidence_conflict"
+        if not isinstance(facts, dict):
+            return "settlement_evidence_conflict"
+        if source == "raybet" and (
+            facts.get("status") != "confirmed"
+            or facts.get("winner_side") != winner_side
+        ):
+            return "settlement_evidence_conflict"
+        if source == "opendota" and (
+            isinstance(facts.get("dota_match_id"), bool)
+            or facts.get("dota_match_id") != dota_match_id
+            or facts.get("winner_side") != winner_side
+        ):
+            return "settlement_evidence_conflict"
+    for row in rows:
+        if row["source"] not in expected:
+            return "settlement_evidence_conflict"
+        if (
+            isinstance(row["dota_match_id"], bool)
+            or not isinstance(row["dota_match_id"], int)
+            or row["dota_match_id"] != dota_match_id
+        ):
+            return "settlement_evidence_conflict"
+        observed_at = _aware_timestamp(row["observed_at"])
+        if observed_at is None or observed_at < mapping_recorded_at:
+            return "settlement_evidence_causal_order_invalid"
+        expected_winner = expected[str(row["source"])][1]
+        if row["status"] in {"confirmed", "conflict"} and (
+            row["winner_side"] is not None
+            and row["winner_side"] != expected_winner
+        ):
+            return "settlement_evidence_conflict"
+        try:
+            facts = json.loads(row["facts_json"])
+        except (TypeError, json.JSONDecodeError):
+            return "settlement_evidence_conflict"
+        if not isinstance(facts, dict):
+            return "settlement_evidence_conflict"
+        if row["source"] == "raybet" and (
+            facts.get("status") != row["status"]
+            or facts.get("winner_side") != row["winner_side"]
+        ):
+            return "settlement_evidence_conflict"
+        if row["source"] == "opendota" and (
+            facts.get("dota_match_id") != dota_match_id
+            or facts.get("winner_side") != row["winner_side"]
+        ):
+            return "settlement_evidence_conflict"
+    return None
+
+
+def _duplicate_link_reason(
+    connection: sqlite3.Connection,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    dota_match_id: int,
+) -> str | None:
+    duplicate = connection.execute(
+        """SELECT 1 FROM settlement_reconciliations
+            WHERE dota_match_id=?
+              AND (raybet_match_id!=? OR map_number!=?)
+            LIMIT 1""",
+        (dota_match_id, raybet_match_id, map_number),
+    ).fetchone()
+    if duplicate is not None:
+        return "opendota_match_link_conflict"
+    map_result_columns = _relation_columns(connection, "map_results")
+    if {"raybet_match_id", "map_number", "dota_match_id"}.issubset(
+        map_result_columns
+    ):
+        conflict = connection.execute(
+            """SELECT 1 FROM map_results
+                WHERE (dota_match_id=?
+                       AND (raybet_match_id!=? OR map_number!=?))
+                   OR (raybet_match_id=? AND map_number=?
+                       AND dota_match_id!=?)
+                LIMIT 1""",
+            (
+                dota_match_id,
+                raybet_match_id,
+                map_number,
+                raybet_match_id,
+                map_number,
+                dota_match_id,
+            ),
+        ).fetchone()
+        if conflict is not None:
+            return "opendota_match_link_conflict"
+    return None
+
+
+def _opendota_identity_reason(
+    connection: sqlite3.Connection,
+    mapping: StrictLiveMapMapping,
+    reconciliation: sqlite3.Row,
+    *,
+    map_number: int,
+    scopes: CurrentDerivedScopes,
+) -> tuple[str | None, str | None]:
+    dota_match_id = int(reconciliation["dota_match_id"])
+    match = _match_row(connection, dota_match_id)
+    if match is None:
+        return "unavailable", "opendota_match_unavailable"
+    if not scopes.available:
+        return "unavailable", "opendota_scope_schema_unavailable"
+    if dota_match_id not in scopes.formal:
+        return "review", "opendota_match_out_of_scope"
+
+    ingest_columns = _relation_columns(connection, "match_ingest_status")
+    if not {"match_id", "event_id"}.issubset(ingest_columns):
+        return "unavailable", "opendota_ingest_schema_unavailable"
+    selected = ["event_id"]
+    for optional in (
+        "map_number",
+        "ingest_state",
+        "reconciliation_status",
+        "missing_fields_json",
+    ):
+        if optional in ingest_columns:
+            selected.append(optional)
+    ingest = connection.execute(
+        f"SELECT {', '.join(selected)} FROM match_ingest_status WHERE match_id=?",
+        (dota_match_id,),
+    ).fetchone()
+    if ingest is None:
+        return "unavailable", "opendota_ingest_unavailable"
+    if str(ingest["event_id"]) != mapping.event_id:
+        return "review", "opendota_event_identity_conflict"
+    if "map_number" in selected and ingest["map_number"] is not None:
+        if (
+            isinstance(ingest["map_number"], bool)
+            or not isinstance(ingest["map_number"], int)
+            or ingest["map_number"] != map_number
+        ):
+            return "review", "opendota_map_number_conflict"
+    if "ingest_state" in selected and ingest["ingest_state"] == "review_required":
+        return "review", "opendota_ingest_review_required"
+    if (
+        "reconciliation_status" in selected
+        and ingest["reconciliation_status"] == "review_required"
+    ):
+        return "review", "opendota_ingest_review_required"
+
+    radiant_team_id = match.get("radiant_team_id")
+    dire_team_id = match.get("dire_team_id")
+    canonical_ids = {
+        mapping.canonical_team_one_id,
+        mapping.canonical_team_two_id,
+    }
+    if (
+        isinstance(radiant_team_id, bool)
+        or isinstance(dire_team_id, bool)
+        or not isinstance(radiant_team_id, int)
+        or not isinstance(dire_team_id, int)
+        or {radiant_team_id, dire_team_id} != canonical_ids
+    ):
+        return "review", "opendota_team_identity_conflict"
+    radiant_win = match.get("radiant_win")
+    if not isinstance(radiant_win, bool):
+        return "review", "opendota_result_identity_conflict"
+    team_one_is_radiant = radiant_team_id == mapping.canonical_team_one_id
+    team_one_won = radiant_win == team_one_is_radiant
+    expected_winner = "team_one" if team_one_won else "team_two"
+    if reconciliation["opendota_winner_side"] != expected_winner:
+        return "review", "opendota_winner_identity_conflict"
+    if (
+        reconciliation["raybet_winner_side"] not in {"team_one", "team_two"}
+        or reconciliation["raybet_winner_side"]
+        != reconciliation["opendota_winner_side"]
+    ):
+        return "review", "reconciliation_winner_conflict"
+    return None, None
+
+
+def _curve_rows(
+    connection: sqlite3.Connection,
+    relation: str,
+    match_id: int,
+) -> list[dict[str, Any]]:
+    if not {"match_id", "time_min", "value"}.issubset(
+        _relation_columns(connection, relation)
+    ):
+        return []
+    result = []
+    for row in connection.execute(
+        f"SELECT time_min, value FROM {relation} "
+        "WHERE match_id=? AND time_min>=0 ORDER BY time_min",
+        (match_id,),
+    ).fetchall():
+        minute = row["time_min"]
+        value = _finite_number(row["value"])
+        if (
+            isinstance(minute, bool)
+            or not isinstance(minute, int)
+            or minute < 0
+            or value is None
+        ):
+            continue
+        result.append({"minute": minute, "value": value})
+    return result
+
+
+def _curve_value(rows: list[dict[str, Any]], game_time_seconds: int) -> Any:
+    minute = game_time_seconds // 60
+    value = None
+    for row in rows:
+        if row["minute"] > minute:
+            break
+        value = row["value"]
+    return value
+
+
+def _timeline_complete(
+    rows: list[dict[str, Any]], duration_seconds: int | None
+) -> bool:
+    if duration_seconds is None or duration_seconds <= 0:
+        return False
+    end_minute = duration_seconds // 60 - 2
+    if end_minute < 10:
+        return False
+    observed = {row["minute"] for row in rows}
+    return all(minute in observed for minute in range(10, end_minute + 1))
+
+
+def _odds_at_game_time(
+    odds_timeline: list[dict[str, Any]],
+    game_time_seconds: int,
+    map_number: int,
+) -> tuple[float | None, float | None]:
+    selected: dict[str, Any] | None = None
+    selected_clock = -1
+    for point in odds_timeline:
+        clock = point.get("game_clock_seconds")
+        if isinstance(clock, bool) or not isinstance(clock, int):
+            continue
+        if point.get("map_number") != map_number:
+            continue
+        if selected_clock <= clock <= game_time_seconds:
+            selected = point
+            selected_clock = clock
+    if selected is None:
+        return None, None
+    probabilities = selected.get("probabilities")
+    if not isinstance(probabilities, dict):
+        return None, None
+    return (
+        _finite_number(probabilities.get("team_one")),
+        _finite_number(probabilities.get("team_two")),
+    )
+
+
+def _event_row(
+    *,
+    game_time_seconds: int,
+    event_type: str,
+    side: str | None,
+    label: str,
+    details: dict[str, Any],
+    gold: list[dict[str, Any]],
+    xp: list[dict[str, Any]],
+    odds_timeline: list[dict[str, Any]],
+    map_number: int,
+) -> dict[str, Any]:
+    team_one_probability, team_two_probability = _odds_at_game_time(
+        odds_timeline, game_time_seconds, map_number
+    )
+    return {
+        "game_time_seconds": game_time_seconds,
+        "event_type": event_type,
+        "side": side,
+        "label": label,
+        "radiant_gold_adv": _curve_value(gold, game_time_seconds),
+        "radiant_xp_adv": _curve_value(xp, game_time_seconds),
+        "team_one_probability": team_one_probability,
+        "team_two_probability": team_two_probability,
+        "details": details,
+    }
+
+
+def _player_side(player_slot: Any) -> str | None:
+    if isinstance(player_slot, bool) or not isinstance(player_slot, int):
+        return None
+    if 0 <= player_slot <= 4:
+        return "radiant"
+    if 128 <= player_slot <= 132:
+        return "dire"
+    return None
+
+
+def _match_event_rows(
+    connection: sqlite3.Connection,
+    match_id: int,
+    odds_timeline: list[dict[str, Any]],
+    map_number: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    gold = _curve_rows(connection, "gold_advantage", match_id)
+    xp = _curve_rows(connection, "xp_advantage", match_id)
+    events: list[dict[str, Any]] = []
+    minutes = sorted({row["minute"] for row in gold} | {row["minute"] for row in xp})
+    for minute in minutes:
+        events.append(
+            _event_row(
+                game_time_seconds=minute * 60,
+                event_type="economy",
+                side=None,
+                label="economy_snapshot",
+                details={"minute": minute},
+                gold=gold,
+                xp=xp,
+                odds_timeline=odds_timeline,
+                map_number=map_number,
             )
-            if match_id in scopes.draft
-            else []
         )
-        return {
-            "match": match,
-            # Keep the flat match fields and state alias for older read-only
-            # clients while the nested shape remains the canonical response.
-            **match,
-            "states": states,
-            "radiant_state": states["radiant"],
-            "dire_state": states["dire"],
-            "player_performance": player_performance,
-            "player_scores": player_scores,
-            "draft_predictions": draft_predictions,
-            "versions": {
-                "player_score": SCORE_VERSION,
-                "team_state": LABEL_VERSION,
-                "team_profile": PROFILE_VERSION,
-                "draft_score": SCORE_VERSION,
-                "draft_model": DRAFT_MODEL_VERSION,
-                "draft_backtest": BACKTEST_VERSION,
-                "draft_features": DRAFT_FEATURE_VERSION,
-            },
-            "cutoffs": {
-                "player_score": sorted(
-                    {
-                        str(row["benchmark_cutoff"])
-                        for row in player_scores
-                        if row.get("benchmark_cutoff") is not None
-                    }
-                ),
-                "draft_training": sorted(
-                    {
-                        str(row["training_cutoff"])
-                        for row in draft_predictions
-                        if row.get("training_cutoff") is not None
-                    }
-                ),
-                "draft_prediction": sorted(
-                    {
-                        str(row["prediction_cutoff"])
-                        for row in draft_predictions
-                        if row.get("prediction_cutoff") is not None
-                    }
-                ),
-            },
+
+    objective_columns = _relation_columns(connection, "objectives")
+    objective_rows: list[sqlite3.Row] = []
+    if {"match_id", "time", "type"}.issubset(objective_columns):
+        selected = [
+            name if name in objective_columns else f"NULL AS {name}"
+            for name in ("time", "type", "unit", "key", "player_slot")
+        ]
+        objective_order = "time, id" if "id" in objective_columns else "time"
+        objective_rows = connection.execute(
+            f"SELECT {', '.join(selected)} FROM objectives "
+            f"WHERE match_id=? ORDER BY {objective_order}",
+            (match_id,),
+        ).fetchall()
+    for row in objective_rows:
+        time_value = _finite_number(row["time"])
+        if time_value is None or time_value < 0:
+            continue
+        details = {
+            key: row[key]
+            for key in ("type", "unit", "key", "player_slot")
+            if row[key] is not None
         }
+        events.append(
+            _event_row(
+                game_time_seconds=int(time_value),
+                event_type="objective",
+                side=_player_side(row["player_slot"]),
+                label=str(row["type"] or "objective"),
+                details=details,
+                gold=gold,
+                xp=xp,
+                odds_timeline=odds_timeline,
+                map_number=map_number,
+            )
+        )
+
+    teamfight_columns = _relation_columns(connection, "teamfights")
+    teamfight_player_columns = _relation_columns(connection, "teamfight_players")
+    teamfight_rows: list[sqlite3.Row] = []
+    teamfights_available = {"id", "match_id", "start_time"}.issubset(
+        teamfight_columns
+    )
+    if teamfights_available:
+        selected = [
+            name if name in teamfight_columns else f"NULL AS {name}"
+            for name in ("id", "start_time", "end_time", "last_death", "deaths")
+        ]
+        teamfight_rows = connection.execute(
+            f"SELECT {', '.join(selected)} FROM teamfights "
+            "WHERE match_id=? ORDER BY start_time, id",
+            (match_id,),
+        ).fetchall()
+    teamfight_players_available = {
+        "teamfight_id",
+        "player_slot",
+    }.issubset(teamfight_player_columns)
+    for row in teamfight_rows:
+        start = _finite_number(row["start_time"])
+        if start is None or start < 0:
+            continue
+        players: list[dict[str, Any]] = []
+        if teamfight_players_available:
+            metrics = (
+                "player_slot",
+                "deaths",
+                "buybacks",
+                "damage",
+                "healing",
+                "gold_delta",
+                "xp_delta",
+                "kills",
+            )
+            selected = [
+                name if name in teamfight_player_columns else f"NULL AS {name}"
+                for name in metrics
+            ]
+            for player in connection.execute(
+                f"SELECT {', '.join(selected)} FROM teamfight_players "
+                "WHERE teamfight_id=? ORDER BY player_slot",
+                (row["id"],),
+            ).fetchall():
+                payload = {key: player[key] for key in metrics}
+                payload["side"] = _player_side(player["player_slot"])
+                players.append(payload)
+        events.append(
+            _event_row(
+                game_time_seconds=int(start),
+                event_type="teamfight",
+                side=None,
+                label="teamfight",
+                details={
+                    "end_time": row["end_time"],
+                    "last_death": row["last_death"],
+                    "deaths": row["deaths"],
+                    "players": players,
+                },
+                gold=gold,
+                xp=xp,
+                odds_timeline=odds_timeline,
+                map_number=map_number,
+            )
+        )
+
+    fact_columns = _relation_columns(connection, "player_map_facts")
+    latest_facts: list[sqlite3.Row] = []
+    if {"match_id", "player_slot", "facts_json"}.issubset(fact_columns):
+        order = []
+        if "created_at" in fact_columns:
+            order.append("created_at DESC")
+        if "fact_id" in fact_columns:
+            order.append("fact_id DESC")
+        if not order:
+            order.append("rowid DESC")
+        optional = [
+            name if name in fact_columns else f"NULL AS {name}"
+            for name in ("account_id", "team_id")
+        ]
+        latest_facts = connection.execute(
+            f"""SELECT player_slot, {', '.join(optional)}, facts_json
+                  FROM (
+                       SELECT player_slot, {', '.join(optional)}, facts_json,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY player_slot
+                                  ORDER BY {', '.join(order)}
+                              ) AS fact_rank
+                         FROM player_map_facts WHERE match_id=?
+                  )
+                 WHERE fact_rank=1 ORDER BY player_slot""",
+            (match_id,),
+        ).fetchall()
+    buyback_logs_complete = len(latest_facts) == 10
+    for row in latest_facts:
+        try:
+            facts = json.loads(row["facts_json"])
+        except (TypeError, json.JSONDecodeError):
+            buyback_logs_complete = False
+            continue
+        logs = facts.get("buyback_log") if isinstance(facts, dict) else None
+        if not isinstance(logs, list):
+            buyback_logs_complete = False
+            continue
+        for log in logs:
+            if not isinstance(log, dict):
+                buyback_logs_complete = False
+                continue
+            time_value = _finite_number(log.get("time"))
+            if time_value is None or time_value < 0:
+                buyback_logs_complete = False
+                continue
+            events.append(
+                _event_row(
+                    game_time_seconds=int(time_value),
+                    event_type="buyback",
+                    side=_player_side(row["player_slot"]),
+                    label="buyback",
+                    details={
+                        "player_slot": row["player_slot"],
+                        "account_id": row["account_id"],
+                        "team_id": row["team_id"],
+                    },
+                    gold=gold,
+                    xp=xp,
+                    odds_timeline=odds_timeline,
+                    map_number=map_number,
+                )
+            )
+
+    missing: set[str] = set()
+    ingest_columns = _relation_columns(connection, "match_ingest_status")
+    if {"match_id", "missing_fields_json"}.issubset(ingest_columns):
+        ingest = connection.execute(
+            "SELECT missing_fields_json FROM match_ingest_status WHERE match_id=?",
+            (match_id,),
+        ).fetchone()
+        parsed = _json_value(ingest[0] if ingest else None, [])
+        if isinstance(parsed, list):
+            missing = {str(value) for value in parsed}
+    duration: int | None = None
+    match_columns = _relation_columns(connection, "matches")
+    if {"match_id", "duration"}.issubset(match_columns):
+        match_row = connection.execute(
+            "SELECT duration FROM matches WHERE match_id=?", (match_id,)
+        ).fetchone()
+        if (
+            match_row is not None
+            and not isinstance(match_row[0], bool)
+            and isinstance(match_row[0], int)
+        ):
+            duration = match_row[0]
+    availability = {
+        "gold_advantage": (
+            _timeline_complete(gold, duration)
+            and "gold_timeline_incomplete" not in missing
+        ),
+        "xp_advantage": _timeline_complete(xp, duration),
+        "objectives": (
+            bool(objective_rows) and "objectives_incomplete" not in missing
+        ),
+        "teamfights": (
+            teamfights_available and "teamfights_missing" not in missing
+        ),
+        "buybacks": (
+            buyback_logs_complete and "buyback_logs_missing" not in missing
+        ),
+        "odds_game_clock_alignment": any(
+            isinstance(point.get("game_clock_seconds"), int)
+            and not isinstance(point.get("game_clock_seconds"), bool)
+            and point.get("map_number") == map_number
+            for point in odds_timeline
+        ),
+        "missing_reasons": sorted(missing),
+    }
+    event_order = {"economy": 0, "objective": 1, "teamfight": 2, "buyback": 3}
+    events.sort(
+        key=lambda row: (
+            row["game_time_seconds"],
+            event_order.get(str(row["event_type"]), 9),
+            str(row["label"]),
+        )
+    )
+    return events, availability
+
+
+def get_raybet_postmatch(
+    raybet_match_id: str,
+    map_number: int,
+    *,
+    max_points: int = 1200,
+) -> dict[str, Any] | None:
+    """Return a strict, confirmed RayBet-map to OpenDota attribution."""
+    clean_match_id = str(raybet_match_id).strip()
+    with _database() as connection:
+        raybet_columns = _relation_columns(connection, "raybet_matches")
+        if "raybet_match_id" not in raybet_columns:
+            return {
+                **_postmatch_base(clean_match_id, map_number, []),
+                "reason": "raybet_match_schema_unavailable",
+            }
+        exists = connection.execute(
+            "SELECT 1 FROM raybet_matches WHERE raybet_match_id=?",
+            (clean_match_id,),
+        ).fetchone()
+        if exists is None:
+            return None
+        full_odds = winner_timeline(
+            connection,
+            clean_match_id,
+            max_points=None,
+            period=f"map_{map_number}",
+        )
+        odds = _downsample_timeline(full_odds, max_points)
+        response = _postmatch_base(clean_match_id, map_number, odds)
+        eligibility = query_strict_live_eligibility(
+            connection,
+            raybet_match_id=clean_match_id,
+            map_number=map_number,
+            transport_observed_at=datetime.now(timezone.utc),
+        )
+        if eligibility.mapping is not None:
+            response["mapping"] = _mapping_payload(eligibility.mapping)
+        if not eligibility.eligible or eligibility.mapping is None:
+            response["reason"] = eligibility.reason
+            if eligibility.reason not in {
+                "accepted_mapping_missing",
+                "mapping_invalidated",
+                "strict_mapping_schema_missing",
+                "raybet_metadata_missing",
+                "canonical_team_missing",
+            }:
+                response["status"] = "review"
+            return response
+
+        reconciliation_columns = _relation_columns(
+            connection, "settlement_reconciliations"
+        )
+        required_reconciliation = {
+            "raybet_match_id",
+            "map_number",
+            "dota_match_id",
+            "raybet_winner_side",
+            "opendota_winner_side",
+            "raybet_evidence_ref",
+            "opendota_evidence_ref",
+            "status",
+            "reason",
+            "first_observed_at",
+            "updated_at",
+        }
+        if not required_reconciliation.issubset(reconciliation_columns):
+            response["reason"] = "reconciliation_schema_unavailable"
+            return response
+        reconciliation = connection.execute(
+            """SELECT * FROM settlement_reconciliations
+                WHERE raybet_match_id=? AND map_number=?""",
+            (clean_match_id, map_number),
+        ).fetchone()
+        if reconciliation is None:
+            return response
+        response["reconciliation"] = _reconciliation_payload(reconciliation)
+        if reconciliation["status"] != "confirmed":
+            response["status"] = "review"
+            response["reason"] = (
+                "reconciliation_pending"
+                if reconciliation["status"] == "pending"
+                else "reconciliation_review_required"
+            )
+            return response
+        if (
+            isinstance(reconciliation["dota_match_id"], bool)
+            or not isinstance(reconciliation["dota_match_id"], int)
+            or reconciliation["dota_match_id"] <= 0
+        ):
+            response["status"] = "review"
+            response["reason"] = "opendota_match_identity_invalid"
+            return response
+
+        first_observed_at = _aware_timestamp(reconciliation["first_observed_at"])
+        updated_at = _aware_timestamp(reconciliation["updated_at"])
+        if (
+            first_observed_at is None
+            or updated_at is None
+            or first_observed_at < eligibility.mapping.recorded_at
+            or updated_at < first_observed_at
+        ):
+            response["status"] = "review"
+            response["reason"] = "reconciliation_mapping_lineage_unverified"
+            return response
+        historical_eligibility = query_strict_live_eligibility(
+            connection,
+            raybet_match_id=clean_match_id,
+            map_number=map_number,
+            transport_observed_at=first_observed_at,
+        )
+        if (
+            not historical_eligibility.eligible
+            or historical_eligibility.mapping is None
+            or historical_eligibility.mapping.mapping_id
+            != eligibility.mapping.mapping_id
+        ):
+            response["status"] = "review"
+            response["reason"] = "reconciliation_mapping_lineage_unverified"
+            return response
+
+        evidence_reason = _confirmed_evidence_reason(
+            connection,
+            reconciliation,
+            raybet_match_id=clean_match_id,
+            map_number=map_number,
+            mapping_recorded_at=eligibility.mapping.recorded_at,
+        )
+        if evidence_reason is not None:
+            response["status"] = (
+                "unavailable"
+                if evidence_reason == "settlement_evidence_schema_unavailable"
+                else "review"
+            )
+            response["reason"] = evidence_reason
+            return response
+        dota_match_id = int(reconciliation["dota_match_id"])
+        duplicate_reason = _duplicate_link_reason(
+            connection,
+            raybet_match_id=clean_match_id,
+            map_number=map_number,
+            dota_match_id=dota_match_id,
+        )
+        if duplicate_reason is not None:
+            response["status"] = "review"
+            response["reason"] = duplicate_reason
+            return response
+
+        scopes = _current_scopes(connection)
+        identity_status, identity_reason = _opendota_identity_reason(
+            connection,
+            eligibility.mapping,
+            reconciliation,
+            map_number=map_number,
+            scopes=scopes,
+        )
+        if identity_reason is not None:
+            response["status"] = str(identity_status)
+            response["reason"] = identity_reason
+            return response
+        detail = _match_detail_payload(connection, dota_match_id, scopes)
+        if detail is None:
+            response["reason"] = "opendota_match_unavailable"
+            return response
+        events, event_availability = _match_event_rows(
+            connection, dota_match_id, full_odds, map_number
+        )
+        response.update(
+            {
+                "status": "available",
+                "reason": "confirmed_exact_link",
+                "postmatch": {
+                    **detail,
+                    "events": events,
+                    "event_availability": event_availability,
+                },
+            }
+        )
+        return response
 
 
 def _player_identities(connection: sqlite3.Connection) -> dict[int, str]:
@@ -1519,6 +2397,7 @@ def list_teams() -> dict[str, Any]:
 __all__ = [
     "get_match",
     "get_overview",
+    "get_raybet_postmatch",
     "list_matches",
     "list_players",
     "list_teams",

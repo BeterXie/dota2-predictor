@@ -12,6 +12,11 @@ from fastapi.testclient import TestClient
 
 from live_betting.browser_companion import (
     MAX_BODY_BYTES,
+    MAX_JSON_ARRAY_ITEMS,
+    MAX_JSON_DEPTH,
+    MAX_JSON_NODES,
+    MAX_JSON_OBJECT_KEYS,
+    MAX_JSON_STRING_BYTES,
     CompanionConfig,
     _read_bounded_body,
     create_app,
@@ -214,7 +219,7 @@ class BrowserCompanionTests(unittest.TestCase):
         self.assertTrue(response.json()["shadow_strategy_active"])
 
     def test_non_finite_json_constants_are_rejected_as_invalid_json(self) -> None:
-        for body in (b"[NaN]", b"[Infinity]", b"[-Infinity]"):
+        for body in (b"[NaN]", b"[Infinity]", b"[-Infinity]", b"[1e400]"):
             response = self.client.post(
                 "/v1/events", content=body, headers=self.headers(content_type=True)
             )
@@ -226,6 +231,56 @@ class BrowserCompanionTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["code"], "invalid_json")
+
+    def test_structural_json_limits_are_stable_invalid_json(self) -> None:
+        nested: object = 0
+        for _ in range(MAX_JSON_DEPTH + 2):
+            nested = [nested]
+        too_many_nodes = [
+            {"payload": list(range(MAX_JSON_NODES // 50))}
+            for _ in range(50)
+        ]
+        bodies = (
+            json.dumps(nested).encode(),
+            json.dumps([{"payload": list(range(MAX_JSON_ARRAY_ITEMS + 1))}]).encode(),
+            json.dumps([{
+                "payload": {
+                    f"field_{index}": index
+                    for index in range(MAX_JSON_OBJECT_KEYS + 1)
+                }
+            }]).encode(),
+            json.dumps(too_many_nodes).encode(),
+            json.dumps([{"payload": "x" * (MAX_JSON_STRING_BYTES + 1)}]).encode(),
+        )
+        for body in bodies:
+            with self.subTest(body_bytes=len(body)):
+                response = self.client.post(
+                    "/v1/events",
+                    content=body,
+                    headers=self.headers(content_type=True),
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json()["code"], "invalid_json")
+
+    def test_parser_recursion_and_non_utf8_are_stable_invalid_json(self) -> None:
+        recursively_nested = b"[" * 2_000 + b"0" + b"]" * 2_000
+        utf16_json = "[]".encode("utf-16")
+        for body in (recursively_nested, utf16_json):
+            response = self.client.post(
+                "/v1/events",
+                content=body,
+                headers=self.headers(content_type=True),
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["code"], "invalid_json")
+
+        status = self.client.post(
+            "/v1/status",
+            content=b"[" * 2_000 + b"0" + b"]" * 2_000,
+            headers=self.headers(content_type=True),
+        )
+        self.assertEqual(status.status_code, 400, status.text)
+        self.assertEqual(status.json()["code"], "invalid_json")
 
     def test_origin_and_version_are_required(self) -> None:
         body = json.dumps([browser_event()], separators=(",", ":")).encode()

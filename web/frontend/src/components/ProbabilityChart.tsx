@@ -9,9 +9,15 @@ import * as echarts from "echarts/core";
 import type { EChartsCoreOption } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import ReactEChartsCore from "echarts-for-react/lib/core";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import { formatClock, formatDateTime, formatPercent, parseTimestamp } from "../format";
+import {
+  comparePeriods,
+  mapNumberForPeriod,
+  periodLabel,
+  resolvePeriod,
+} from "../probability-period";
 import type { StrategyDecision, WinnerTimelinePoint } from "../types";
 
 interface ProbabilityChartProps {
@@ -22,6 +28,8 @@ interface ProbabilityChartProps {
   preferredPeriod?: string | null;
   /** Historical replay should open on the most recently observed map. */
   preferLatestPeriod?: boolean;
+  selectedPeriod: string | null;
+  onPeriodChange: (period: string) => void;
 }
 
 type SeriesPoint = [number, number | null];
@@ -43,12 +51,13 @@ export function ProbabilityChart({
   teamTwo,
   preferredPeriod,
   preferLatestPeriod = false,
+  selectedPeriod,
+  onPeriodChange,
 }: ProbabilityChartProps) {
   const periods = useMemo(
     () => Array.from(new Set(timeline.map((point) => point.period))).sort(comparePeriods),
     [timeline],
   );
-  const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
   const period = resolvePeriod(
     periods,
     selectedPeriod,
@@ -59,7 +68,7 @@ export function ProbabilityChart({
     () => timeline.filter((point) => !period || point.period === period),
     [period, timeline],
   );
-  const mapNumber = period ? Number(period.match(/\d+/)?.[0] || 0) : 0;
+  const mapNumber = mapNumberForPeriod(period) || 0;
   const selectedDecisions = decisions.filter(
     (decision) => !mapNumber || decision.map_number === mapNumber,
   );
@@ -188,22 +197,26 @@ export function ProbabilityChart({
   return (
     <div className="probability-chart">
       {periods.length > 1 && (
-        <label className="period-select">
-          <span>局数</span>
-          <select value={period || ""} onChange={(event) => setSelectedPeriod(event.target.value)}>
-            {periods.map((item) => (
-              <option key={item} value={item}>{periodLabel(item)}</option>
-            ))}
-          </select>
-        </label>
+        <div className="chart-controls">
+          <label className="period-select">
+            <span>局数</span>
+            <select value={period || ""} onChange={(event) => onPeriodChange(event.target.value)}>
+              {periods.map((item) => (
+                <option key={item} value={item}>{periodLabel(item)}</option>
+              ))}
+            </select>
+          </label>
+        </div>
       )}
-      <ReactEChartsCore
-        echarts={echarts}
-        option={option}
-        notMerge
-        lazyUpdate
-        style={{ height: 330 }}
-      />
+      <div className="probability-chart-canvas">
+        <ReactEChartsCore
+          echarts={echarts}
+          option={option}
+          notMerge
+          lazyUpdate
+          style={{ height: 330 }}
+        />
+      </div>
     </div>
   );
 }
@@ -226,29 +239,4 @@ function withGaps(
   return output;
 }
 
-function periodLabel(period: string): string {
-  const number = period.match(/\d+/)?.[0];
-  return number ? `第 ${number} 局` : period;
-}
-
-function comparePeriods(left: string, right: string): number {
-  const leftNumber = Number(left.match(/^(?:map|game)[_-]?(\d+)$/i)?.[1]);
-  const rightNumber = Number(right.match(/^(?:map|game)[_-]?(\d+)$/i)?.[1]);
-  const leftKnown = Number.isFinite(leftNumber) && leftNumber > 0;
-  const rightKnown = Number.isFinite(rightNumber) && rightNumber > 0;
-  if (leftKnown && rightKnown) return leftNumber - rightNumber;
-  if (leftKnown) return -1;
-  if (rightKnown) return 1;
-  return left.localeCompare(right);
-}
-
-export function resolvePeriod(
-  periods: string[],
-  selectedPeriod: string | null,
-  preferredPeriod?: string | null,
-  preferLatestPeriod = false,
-): string | null {
-  if (selectedPeriod && periods.includes(selectedPeriod)) return selectedPeriod;
-  if (preferredPeriod && periods.includes(preferredPeriod)) return preferredPeriod;
-  return (preferLatestPeriod ? periods.at(-1) : periods[0]) || null;
-}
+export { resolvePeriod } from "../probability-period";

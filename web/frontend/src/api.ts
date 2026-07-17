@@ -2,6 +2,7 @@ import type {
   ControlComponent,
   ControlResult,
   ControlSession,
+  ExactPostmatchAttribution,
   IntelligenceMatchDetail,
   IntelligenceMatchPage,
   IntelligenceOverview,
@@ -62,6 +63,17 @@ export function fetchMatchDetail(
 ): Promise<MatchDetail> {
   return getJson<MatchDetail>(
     `${MONITOR_API}/matches/${encodeURIComponent(matchId)}`,
+    signal,
+  );
+}
+
+export function fetchExactPostmatchAttribution(
+  matchId: string,
+  mapNumber: number,
+  signal?: AbortSignal,
+): Promise<ExactPostmatchAttribution> {
+  return getJson<ExactPostmatchAttribution>(
+    `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${encodeURIComponent(mapNumber)}/postmatch`,
     signal,
   );
 }

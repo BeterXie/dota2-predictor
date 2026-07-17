@@ -464,7 +464,7 @@ def test_live_store_itself_rejects_a_future_schema(tmp_path: Path) -> None:
         )
 
 
-def test_live_v1_schema_migrates_to_v4_and_is_idempotent(tmp_path: Path) -> None:
+def test_live_v1_schema_migrates_to_current_and_is_idempotent(tmp_path: Path) -> None:
     database = tmp_path / "live-v1.db"
     connection = connect(database)
     connection.executescript(
@@ -578,10 +578,10 @@ def test_live_v1_schema_migrates_to_v4_and_is_idempotent(tmp_path: Path) -> None
             for row in store.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [1, 4]
+        ] == [1, LIVE_VERSION]
 
 
-def test_prepare_database_migrates_live_v3_contract_to_v4(tmp_path: Path) -> None:
+def test_prepare_database_migrates_live_v3_contract_to_current(tmp_path: Path) -> None:
     database = tmp_path / "live-v3.db"
     with LiveBettingStore(database) as store:
         store.init_schema()
@@ -734,10 +734,10 @@ def test_prepare_database_migrates_live_v3_contract_to_v4(tmp_path: Path) -> Non
         now=datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc),
     )
 
-    assert result.live_schema_version == 4
+    assert result.live_schema_version == LIVE_VERSION
     assert result.backup is not None and result.backup.is_file()
     verification = verify_prepared_database(database)
-    assert verification.live_schema_version == 4
+    assert verification.live_schema_version == LIVE_VERSION
     connection = connect(database, read_only=True)
     try:
         assert connection.execute(
@@ -748,7 +748,7 @@ def test_prepare_database_migrates_live_v3_contract_to_v4(tmp_path: Path) -> Non
             for row in connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [3, 4]
+        ] == [3, LIVE_VERSION]
         objects = {
             (str(row[0]), str(row[1]))
             for row in connection.execute(
@@ -824,7 +824,7 @@ def test_prepare_database_migrates_live_v3_contract_to_v4(tmp_path: Path) -> Non
         connection.close()
 
 
-def test_version_one_binary_rejects_live_v4_database(
+def test_version_one_binary_rejects_current_live_database(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -834,14 +834,17 @@ def test_version_one_binary_rejects_live_v4_database(
     monkeypatch.setattr(live_storage, "CURRENT_SCHEMA_VERSION", 1)
 
     with LiveBettingStore(database) as legacy_store:
-        with pytest.raises(RuntimeError, match="version 4 is newer than supported"):
+        with pytest.raises(
+            RuntimeError,
+            match=rf"version {LIVE_VERSION} is newer than supported",
+        ):
             legacy_store.init_schema()
         assert [
             int(row[0])
             for row in legacy_store.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [4]
+        ] == [LIVE_VERSION]
 
 
 def test_existing_database_restores_backup_when_intelligence_init_fails_after_live(

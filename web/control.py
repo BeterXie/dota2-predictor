@@ -43,6 +43,13 @@ COMPONENTS: dict[str, ComponentSpec] = {
         "Vision supervisor",
         ("-u", "scripts/supervise_raybet_streams.py", "--database", "{database}"),
     ),
+    "draft_publisher": ComponentSpec(
+        "Draft prediction publisher",
+        (
+            "-u", "-m", "live_betting.draft_publisher", "--database",
+            "{database}", "--schema-prepared",
+        ),
+    ),
     "mail_worker": ComponentSpec(
         "Mail worker",
         ("-u", "scripts/run_notification_worker.py", "--database", "{database}"),
@@ -54,15 +61,15 @@ _SUPERVISOR_HEALTH_COMPONENTS = {
     "raybet_collector": "raybet_worker",
     "shadow_monitor": "shadow_worker",
     "vision_supervisor": "vision_worker",
+    "draft_publisher": "draft_publisher_worker",
     "mail_worker": "mail_worker",
 }
 
 
 def initialize_control_schema(connection: sqlite3.Connection) -> None:
     component_values = ", ".join(f"'{name}'" for name in COMPONENTS)
-    connection.executescript(
-        f"""
-        CREATE TABLE IF NOT EXISTS monitor_process_registry (
+    table_statements = {
+        "monitor_process_registry": f"""CREATE TABLE monitor_process_registry (
             component TEXT PRIMARY KEY CHECK (component IN ({component_values})),
             pid INTEGER,
             command_hash TEXT NOT NULL,
@@ -71,9 +78,8 @@ def initialize_control_schema(connection: sqlite3.Connection) -> None:
             started_at TEXT,
             status TEXT NOT NULL CHECK (status IN ('running', 'stopped')),
             updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS monitor_control_audit (
+        )""",
+        "monitor_control_audit": f"""CREATE TABLE monitor_control_audit (
             audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id TEXT NOT NULL UNIQUE,
             component TEXT NOT NULL CHECK (component IN ({component_values})),
@@ -86,22 +92,102 @@ def initialize_control_schema(connection: sqlite3.Connection) -> None:
             client_host TEXT NOT NULL,
             requested_at TEXT NOT NULL,
             response_json TEXT NOT NULL
-        );
-
-        CREATE TRIGGER IF NOT EXISTS monitor_control_audit_no_update
+        )""",
+    }
+    trigger_statements = (
+        """CREATE TRIGGER monitor_control_audit_no_update
         BEFORE UPDATE ON monitor_control_audit
         BEGIN
             SELECT RAISE(ABORT, 'monitor control audit rows are immutable');
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS monitor_control_audit_no_delete
+        END""",
+        """CREATE TRIGGER monitor_control_audit_no_delete
         BEFORE DELETE ON monitor_control_audit
         BEGIN
             SELECT RAISE(ABORT, 'monitor control audit rows cannot be deleted');
-        END;
-        """
+        END""",
     )
-    connection.commit()
+    existing = {
+        str(row[0]): str(row[1] or "")
+        for row in connection.execute(
+            """SELECT name, sql FROM sqlite_master
+                 WHERE type='table' AND name IN
+                       ('monitor_process_registry', 'monitor_control_audit')"""
+        ).fetchall()
+    }
+    needs_rebuild = any(
+        name in existing and "'draft_publisher'" not in existing[name]
+        for name in table_statements
+    )
+    if not needs_rebuild:
+        for name, statement in table_statements.items():
+            if name not in existing:
+                connection.execute(statement)
+        installed_triggers = {
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master WHERE type='trigger'
+                     AND name IN ('monitor_control_audit_no_update',
+                                  'monitor_control_audit_no_delete')"""
+            ).fetchall()
+        }
+        for statement, name in zip(
+            trigger_statements,
+            ("monitor_control_audit_no_update", "monitor_control_audit_no_delete"),
+            strict=True,
+        ):
+            if name not in installed_triggers:
+                connection.execute(statement)
+        connection.commit()
+        return
+
+    legacy_suffix = "__component_migration"
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for trigger in (
+            "monitor_control_audit_no_update",
+            "monitor_control_audit_no_delete",
+        ):
+            connection.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+        migrated: list[str] = []
+        for name in table_statements:
+            legacy = f"{name}{legacy_suffix}"
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (legacy,),
+            ).fetchone() is not None:
+                raise RuntimeError(f"unfinished control schema migration: {legacy}")
+            if name in existing:
+                connection.execute(f'ALTER TABLE "{name}" RENAME TO "{legacy}"')
+                migrated.append(name)
+            connection.execute(table_statements[name])
+        if "monitor_process_registry" in migrated:
+            connection.execute(
+                """INSERT INTO monitor_process_registry
+                   (component, pid, command_hash, command_json,
+                    process_created_at, started_at, status, updated_at)
+                   SELECT component, pid, command_hash, command_json,
+                          process_created_at, started_at, status, updated_at
+                     FROM monitor_process_registry__component_migration"""
+            )
+        if "monitor_control_audit" in migrated:
+            connection.execute(
+                """INSERT INTO monitor_control_audit
+                   (audit_id, request_id, component, action, result, ok, pid,
+                    command_hash, process_created_at, client_host, requested_at,
+                    response_json)
+                   SELECT audit_id, request_id, component, action, result, ok, pid,
+                          command_hash, process_created_at, client_host, requested_at,
+                          response_json
+                     FROM monitor_control_audit__component_migration"""
+            )
+        for statement in trigger_statements:
+            connection.execute(statement)
+        for name in migrated:
+            connection.execute(f'DROP TABLE "{name}{legacy_suffix}"')
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 class ControlService:

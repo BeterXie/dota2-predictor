@@ -13,7 +13,7 @@ import type {
   IntelligenceDraftQualitySlice,
   IntelligenceOverview,
 } from "../types";
-import { IntelligenceDashboard } from "./IntelligenceDashboard";
+import { IntelligenceDashboard, summarizeCutoffs } from "./IntelligenceDashboard";
 
 vi.mock("../api", () => ({
   fetchIntelligenceMatchDetail: vi.fn(),
@@ -46,6 +46,47 @@ beforeEach(() => {
 });
 
 describe("IntelligenceDashboard", () => {
+  it("summarizes large benchmark cutoff sets without expanding every timestamp", () => {
+    const cutoffs = Array.from({ length: 296 }, (_, index) => (
+      new Date(Date.UTC(2026, 0, 1, index)).toISOString()
+    ));
+
+    expect(summarizeCutoffs([...cutoffs, cutoffs[0]])).toEqual({
+      count: 296,
+      first: cutoffs[0],
+      last: cutoffs.at(-1),
+    });
+  });
+
+  it("renders one compact benchmark range for a ranking with many cutoff snapshots", async () => {
+    const cutoffs = Array.from({ length: 296 }, (_, index) => (
+      new Date(Date.UTC(2026, 0, 1, index)).toISOString()
+    ));
+    playersMock.mockResolvedValue({
+      data: [{
+        rank: 1,
+        account_id: 44,
+        player_name: "Northwind",
+        position: 1,
+        map_count: 296,
+        average_execution_score: 84.3,
+        average_result_adjusted_score: 82.1,
+        average_coverage: 0.97,
+        average_role_confidence: 0.93,
+        score_version: "player-score-v3+observed-role=role-v1",
+        benchmark_cutoffs: cutoffs,
+      }],
+      pagination: { ...pagination, total: 1 },
+    });
+
+    renderDashboard();
+    fireEvent.click(screen.getByRole("tab", { name: /选手评分/ }));
+
+    expect(await screen.findByText("296 个截止点")).toBeInTheDocument();
+    expect(screen.getAllByText(/^2026-01-/)).toHaveLength(2);
+    expect(screen.queryByTitle(cutoffs[120])).not.toBeInTheDocument();
+  });
+
   it("keeps every calibration status distinct and shows the complete gate", async () => {
     overviewMock.mockResolvedValue({
       ...overview(),

@@ -20,11 +20,13 @@ DEFAULT_OBSERVATION_DIR = LIVE_BETTING_DATA / "live_observations"
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
 from live_betting.health import record_health  # noqa: E402
 from live_betting.raybet_state import raybet_match_is_live  # noqa: E402
+from live_betting.vision_retention import prune_vision_evidence  # noqa: E402
 
 DEFAULT_EVIDENCE_DIR = LIVE_BETTING_DATA / "live_evidence"
 DEFAULT_LOG_DIR = LIVE_BETTING_DATA / "watcher_logs"
 OUTPUT_MAX_AGE = timedelta(seconds=90)
 WATCHER_STARTUP_GRACE = timedelta(seconds=90)
+RETENTION_INTERVAL_SECONDS = 60 * 60
 
 Child = tuple[subprocess.Popen, object, object]
 OutputSignature = tuple[int, int]
@@ -195,6 +197,20 @@ def active_matches(database: Path, *, now: datetime | None = None) -> list[str]:
         connection.close()
 
 
+def run_evidence_retention(
+    database: Path,
+    evidence_dir: Path,
+    active_match_ids: set[str],
+) -> dict[str, object]:
+    """Apply the fixed policy while excluding every currently active match."""
+    return prune_vision_evidence(
+        database,
+        evidence_dir,
+        excluded_match_ids=active_match_ids,
+        dry_run=False,
+    ).as_dict()
+
+
 def watcher_command(
     database: Path,
     match_id: str,
@@ -256,6 +272,8 @@ def main() -> int:
     last_start: dict[str, float] = {}
     started_at: dict[str, datetime] = {}
     output_baselines: dict[str, OutputSignature | None] = {}
+    last_retention_at: float | None = None
+    retention_details: dict[str, object] = {"status": "pending"}
     try:
         while True:
             try:
@@ -300,6 +318,21 @@ def main() -> int:
                     children[match_id] = (process, stdout, stderr)
                     last_start[match_id] = time.monotonic()
                     started_at[match_id] = datetime.now(timezone.utc)
+                monotonic_now = time.monotonic()
+                if (
+                    last_retention_at is None
+                    or monotonic_now - last_retention_at >= RETENTION_INTERVAL_SECONDS
+                ):
+                    last_retention_at = monotonic_now
+                    try:
+                        retention_details = run_evidence_retention(
+                            args.database, args.evidence_dir, active
+                        )
+                    except Exception as retention_error:
+                        retention_details = {
+                            "status": "error",
+                            "error_type": type(retention_error).__name__,
+                        }
                 status, details, error = supervisor_health(
                     active,
                     children,
@@ -307,6 +340,11 @@ def main() -> int:
                     started_at=started_at,
                     output_baselines=output_baselines,
                 )
+                details["evidence_retention"] = retention_details
+                if retention_details.get("status") == "error":
+                    if status == "healthy":
+                        status = "degraded"
+                    error = error or "vision evidence retention failed"
                 record_supervisor_health(
                     args.database,
                     status,

@@ -417,6 +417,7 @@ class ServiceHealthTests(unittest.TestCase):
                 "mail",
                 "strict_ingest",
                 "postmatch",
+                "draft_publisher",
             },
         )
         for command in commands.values():

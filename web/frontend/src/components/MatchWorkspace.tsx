@@ -8,7 +8,7 @@ import {
   Eye,
   WarningCircle,
 } from "@phosphor-icons/react";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 
 import {
   formatAge,
@@ -17,8 +17,10 @@ import {
   formatOdds,
   formatPercent,
 } from "../format";
+import { comparePeriods, mapNumberForPeriod, resolvePeriod } from "../probability-period";
 import type { MatchDetail, MonitorMatch } from "../types";
 import { LifecycleBadge } from "./StatusBadge";
+import { PostmatchIntelligencePanel } from "./PostmatchIntelligencePanel";
 
 const ProbabilityChart = lazy(() =>
   import("./ProbabilityChart").then((module) => ({ default: module.ProbabilityChart })),
@@ -41,6 +43,25 @@ export function MatchWorkspace({
   now,
   replay,
 }: MatchWorkspaceProps) {
+  const [periodSelection, setPeriodSelection] = useState<{
+    matchId: string;
+    period: string;
+  } | null>(null);
+  const selectedPeriod = periodSelection && periodSelection.matchId === match?.raybet_match_id
+    ? periodSelection.period
+    : null;
+  const periods = useMemo(
+    () => Array.from(new Set((detail?.winner_timeline || []).map((point) => point.period)))
+      .sort(comparePeriods),
+    [detail?.winner_timeline],
+  );
+  const activePeriod = resolvePeriod(
+    periods,
+    selectedPeriod,
+    detail?.winner?.period || match?.winner?.period || null,
+    replay,
+  );
+
   if (!match) {
     return (
       <main className="workspace workspace-empty">
@@ -155,9 +176,23 @@ export function MatchWorkspace({
                 teamTwo={match.team_two}
                 preferLatestPeriod={replay}
                 preferredPeriod={winner?.period || null}
+                selectedPeriod={activePeriod}
+                onPeriodChange={(period) => setPeriodSelection({
+                  matchId: match.raybet_match_id,
+                  period,
+                })}
               />
             </Suspense>
           </section>
+
+          {replay && (
+            <PostmatchIntelligencePanel
+              mapNumber={mapNumberForPeriod(activePeriod)}
+              raybetMatchId={match.raybet_match_id}
+              teamOne={match.team_one}
+              teamTwo={match.team_two}
+            />
+          )}
 
           <section className="workspace-lower-grid">
             <DecisionTimeline decisions={detail?.decisions || []} />

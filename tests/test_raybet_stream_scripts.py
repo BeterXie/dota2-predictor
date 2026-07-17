@@ -20,6 +20,7 @@ from scripts.supervise_raybet_streams import (
     active_matches,
     reap_children,
     record_supervisor_health,
+    run_evidence_retention,
     supervisor_health,
     watcher_command,
 )
@@ -76,6 +77,26 @@ def test_visual_supervisor_records_worker_heartbeat(tmp_path: Path) -> None:
         ).fetchone()
     assert row["status"] == "healthy"
     assert json.loads(row["details_json"])["active_watchers"] == 2
+
+
+def test_visual_supervisor_applies_retention_with_active_match_exclusion(
+    tmp_path: Path,
+) -> None:
+    expected = SimpleNamespace(as_dict=lambda: {"status": "ok", "deleted_files": 2})
+    with patch(
+        "scripts.supervise_raybet_streams.prune_vision_evidence",
+        return_value=expected,
+    ) as prune:
+        result = run_evidence_retention(
+            tmp_path / "live.db", tmp_path / "evidence", {"42", "99"}
+        )
+    assert result == {"status": "ok", "deleted_files": 2}
+    prune.assert_called_once_with(
+        tmp_path / "live.db",
+        tmp_path / "evidence",
+        excluded_match_ids={"42", "99"},
+        dry_run=False,
+    )
 
 
 def _source_database(

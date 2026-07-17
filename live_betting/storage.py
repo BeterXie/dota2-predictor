@@ -20,7 +20,7 @@ from .sanitize import sanitize_raybet_payload
 from .strategy import attempt_fill, is_open
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 
 
@@ -567,6 +567,71 @@ BEFORE DELETE ON strategy_decisions
 BEGIN
     SELECT RAISE(ABORT, 'strategy decisions are immutable');
 END;
+CREATE TABLE IF NOT EXISTS draft_model_artifacts (
+    model_hash TEXT PRIMARY KEY CHECK (length(model_hash)=64),
+    model_version TEXT NOT NULL,
+    model_kind TEXT NOT NULL CHECK (model_kind='pure_draft'),
+    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes IN (10, 20, 30, 40, 50)),
+    training_cutoff TEXT NOT NULL,
+    feature_schema_hash TEXT NOT NULL CHECK (length(feature_schema_hash)=64),
+    training_input_hash TEXT NOT NULL CHECK (length(training_input_hash)=64),
+    artifact_json TEXT NOT NULL CHECK (json_valid(artifact_json)),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS draft_calibration_artifacts (
+    calibration_hash TEXT PRIMARY KEY CHECK (length(calibration_hash)=64),
+    model_hash TEXT NOT NULL CHECK (length(model_hash)=64),
+    calibration_version TEXT NOT NULL,
+    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes IN (10, 20, 30, 40, 50)),
+    evidence_mode TEXT NOT NULL CHECK (
+        evidence_mode IN ('reconstructed_walk_forward', 'prospective')
+    ),
+    support INTEGER NOT NULL CHECK (support >= 0),
+    artifact_json TEXT NOT NULL CHECK (json_valid(artifact_json)),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS draft_deployment_bundles (
+    deployment_key TEXT PRIMARY KEY CHECK (length(deployment_key)=64),
+    model_hashes_json TEXT NOT NULL CHECK (json_valid(model_hashes_json)),
+    calibration_hashes_json TEXT NOT NULL CHECK (json_valid(calibration_hashes_json)),
+    training_cutoff TEXT NOT NULL,
+    dependency_fingerprint TEXT NOT NULL CHECK (length(dependency_fingerprint)=64),
+    dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
+    evidence_mode TEXT NOT NULL CHECK (
+        evidence_mode IN ('reconstructed_walk_forward', 'prospective')
+    ),
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS draft_model_artifacts_immutable_update
+BEFORE UPDATE ON draft_model_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'draft model artifact is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS draft_model_artifacts_immutable_delete
+BEFORE DELETE ON draft_model_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'draft model artifact is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS draft_calibration_artifacts_immutable_update
+BEFORE UPDATE ON draft_calibration_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'draft calibration artifact is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS draft_calibration_artifacts_immutable_delete
+BEFORE DELETE ON draft_calibration_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'draft calibration artifact is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS draft_deployment_bundles_immutable_update
+BEFORE UPDATE ON draft_deployment_bundles
+BEGIN
+    SELECT RAISE(ABORT, 'draft deployment bundle is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS draft_deployment_bundles_immutable_delete
+BEFORE DELETE ON draft_deployment_bundles
+BEGIN
+    SELECT RAISE(ABORT, 'draft deployment bundle is immutable');
+END;
 CREATE TABLE IF NOT EXISTS prospective_draft_curves (
     curve_key TEXT PRIMARY KEY CHECK (length(curve_key)=64),
     raybet_match_id TEXT NOT NULL,
@@ -579,6 +644,23 @@ CREATE TABLE IF NOT EXISTS prospective_draft_curves (
     first_usable_at TEXT NOT NULL,
     availability_mode TEXT NOT NULL CHECK (availability_mode='prospective'),
     created_at TEXT NOT NULL,
+    radiant_team_side TEXT CHECK (
+        radiant_team_side IS NULL OR radiant_team_side IN ('team_one', 'team_two')
+    ),
+    anchor_draft_hash TEXT CHECK (
+        anchor_draft_hash IS NULL OR length(anchor_draft_hash)=64
+    ),
+    anchor_source_frame_ref TEXT,
+    anchor_anchored_at TEXT,
+    deployment_key TEXT CHECK (
+        deployment_key IS NULL OR length(deployment_key)=64
+    ),
+    target_snapshot_hash TEXT CHECK (
+        target_snapshot_hash IS NULL OR length(target_snapshot_hash)=64
+    ),
+    feature_snapshot_json TEXT CHECK (
+        feature_snapshot_json IS NULL OR json_valid(feature_snapshot_json)
+    ),
     UNIQUE (raybet_match_id, map_number, strict_mapping_id, lineup_hash,
             first_usable_at, curve_key)
 );
@@ -613,8 +695,78 @@ CREATE TABLE IF NOT EXISTS prospective_draft_landmarks (
     availability_mode TEXT NOT NULL CHECK (availability_mode='prospective'),
     input_snapshot_hash TEXT NOT NULL CHECK (length(input_snapshot_hash)=64),
     created_at TEXT NOT NULL,
+    raw_radiant_probability REAL CHECK (
+        raw_radiant_probability IS NULL OR
+        raw_radiant_probability BETWEEN 0.0 AND 1.0
+    ),
+    deployment_key TEXT CHECK (
+        deployment_key IS NULL OR length(deployment_key)=64
+    ),
+    model_input_hash TEXT CHECK (
+        model_input_hash IS NULL OR length(model_input_hash)=64
+    ),
+    raw_uncertainty REAL CHECK (
+        raw_uncertainty IS NULL OR raw_uncertainty BETWEEN 0.0 AND 0.5
+    ),
     UNIQUE (curve_key, horizon_minutes)
 );
+CREATE TRIGGER IF NOT EXISTS prospective_draft_curve_authority_insert
+BEFORE INSERT ON prospective_draft_curves
+WHEN NEW.radiant_team_side IS NULL
+  OR NEW.anchor_draft_hash IS NULL
+  OR NEW.anchor_source_frame_ref IS NULL
+  OR NEW.anchor_source_frame_ref=''
+  OR NEW.anchor_anchored_at IS NULL
+  OR NEW.deployment_key IS NULL
+  OR NEW.target_snapshot_hash IS NULL
+  OR NEW.feature_snapshot_json IS NULL
+  OR NOT EXISTS (
+      SELECT 1 FROM draft_deployment_bundles AS deployment
+       WHERE deployment.deployment_key=NEW.deployment_key
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft curve authority is required');
+END;
+CREATE TRIGGER IF NOT EXISTS prospective_draft_landmark_authority_insert
+BEFORE INSERT ON prospective_draft_landmarks
+WHEN NEW.raw_radiant_probability IS NULL
+  OR NEW.deployment_key IS NULL
+  OR NEW.model_input_hash IS NULL
+  OR NOT EXISTS (
+      SELECT 1 FROM prospective_draft_curves AS curve
+       WHERE curve.curve_key=NEW.curve_key
+         AND curve.deployment_key=NEW.deployment_key
+  )
+  OR NOT EXISTS (
+      SELECT 1 FROM draft_model_artifacts AS model
+       WHERE model.model_hash=NEW.model_hash
+         AND model.horizon_minutes=NEW.horizon_minutes
+         AND model.model_version=NEW.model_version
+         AND model.model_kind=NEW.model_kind
+         AND model.feature_schema_hash=NEW.feature_hash
+  )
+  OR NOT EXISTS (
+      SELECT 1 FROM draft_calibration_artifacts AS calibration
+       WHERE calibration.calibration_hash=NEW.calibration_hash
+         AND calibration.model_hash=NEW.model_hash
+         AND calibration.horizon_minutes=NEW.horizon_minutes
+         AND calibration.support=NEW.support
+  )
+  OR NOT EXISTS (
+      SELECT 1 FROM draft_deployment_bundles AS deployment
+       WHERE deployment.deployment_key=NEW.deployment_key
+         AND json_extract(
+             deployment.model_hashes_json,
+             '$."' || NEW.horizon_minutes || '"'
+         )=NEW.model_hash
+         AND json_extract(
+             deployment.calibration_hashes_json,
+             '$."' || NEW.horizon_minutes || '"'
+         )=NEW.calibration_hash
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft landmark authority is required');
+END;
 CREATE TRIGGER IF NOT EXISTS prospective_draft_curves_immutable_update
 BEFORE UPDATE ON prospective_draft_curves
 BEGIN
@@ -634,6 +786,27 @@ CREATE TRIGGER IF NOT EXISTS prospective_draft_landmarks_immutable_delete
 BEFORE DELETE ON prospective_draft_landmarks
 BEGIN
     SELECT RAISE(ABORT, 'prospective draft landmark is immutable');
+END;
+CREATE TABLE IF NOT EXISTS prospective_draft_outcomes (
+    curve_key TEXT PRIMARY KEY REFERENCES prospective_draft_curves(curve_key),
+    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id > 0),
+    dota_match_id INTEGER NOT NULL,
+    radiant_win INTEGER NOT NULL CHECK (radiant_win IN (0, 1)),
+    winner_side TEXT NOT NULL CHECK (winner_side IN ('team_one', 'team_two')),
+    evidence_ref TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL CHECK (length(evidence_hash)=64),
+    settled_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS prospective_draft_outcomes_immutable_update
+BEFORE UPDATE ON prospective_draft_outcomes
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft outcome is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS prospective_draft_outcomes_immutable_delete
+BEFORE DELETE ON prospective_draft_outcomes
+BEGIN
+    SELECT RAISE(ABORT, 'prospective draft outcome is immutable');
 END;
 CREATE TABLE IF NOT EXISTS shadow_map_attempts (
     raybet_match_id TEXT NOT NULL,
@@ -916,6 +1089,7 @@ class LiveBettingStore:
 
     def init_schema(self) -> None:
         self._reject_future_schema()
+        self._migrate_prospective_draft_authority_fields()
         self.connection.executescript(
             """DROP TRIGGER IF EXISTS shadow_orders_terminal_immutable;
                DROP TRIGGER IF EXISTS shadow_orders_immutable_delete;
@@ -945,6 +1119,73 @@ class LiveBettingStore:
             (CURRENT_SCHEMA_VERSION,),
         )
         self.connection.commit()
+
+    def _migrate_prospective_draft_authority_fields(self) -> None:
+        """Add deployment lineage before authority triggers are compiled."""
+
+        curve_columns = {
+            str(row[1])
+            for row in self.connection.execute(
+                "PRAGMA table_info(prospective_draft_curves)"
+            )
+        }
+        curve_additions = {
+            "radiant_team_side": (
+                "TEXT CHECK (radiant_team_side IS NULL OR "
+                "radiant_team_side IN ('team_one', 'team_two'))"
+            ),
+            "anchor_draft_hash": (
+                "TEXT CHECK (anchor_draft_hash IS NULL OR "
+                "length(anchor_draft_hash)=64)"
+            ),
+            "anchor_source_frame_ref": "TEXT",
+            "anchor_anchored_at": "TEXT",
+            "deployment_key": (
+                "TEXT CHECK (deployment_key IS NULL OR length(deployment_key)=64)"
+            ),
+            "target_snapshot_hash": (
+                "TEXT CHECK (target_snapshot_hash IS NULL OR "
+                "length(target_snapshot_hash)=64)"
+            ),
+            "feature_snapshot_json": (
+                "TEXT CHECK (feature_snapshot_json IS NULL OR "
+                "json_valid(feature_snapshot_json))"
+            ),
+        }
+        for name, definition in curve_additions.items():
+            if curve_columns and name not in curve_columns:
+                self.connection.execute(
+                    f"ALTER TABLE prospective_draft_curves ADD COLUMN {name} {definition}"
+                )
+
+        landmark_columns = {
+            str(row[1])
+            for row in self.connection.execute(
+                "PRAGMA table_info(prospective_draft_landmarks)"
+            )
+        }
+        landmark_additions = {
+            "raw_radiant_probability": (
+                "REAL CHECK (raw_radiant_probability IS NULL OR "
+                "raw_radiant_probability BETWEEN 0.0 AND 1.0)"
+            ),
+            "deployment_key": (
+                "TEXT CHECK (deployment_key IS NULL OR length(deployment_key)=64)"
+            ),
+            "model_input_hash": (
+                "TEXT CHECK (model_input_hash IS NULL OR length(model_input_hash)=64)"
+            ),
+            "raw_uncertainty": (
+                "REAL CHECK (raw_uncertainty IS NULL OR "
+                "raw_uncertainty BETWEEN 0.0 AND 0.5)"
+            ),
+        }
+        for name, definition in landmark_additions.items():
+            if landmark_columns and name not in landmark_columns:
+                self.connection.execute(
+                    f"ALTER TABLE prospective_draft_landmarks "
+                    f"ADD COLUMN {name} {definition}"
+                )
 
     def _reject_future_schema(self) -> None:
         exists = self.connection.execute(

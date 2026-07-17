@@ -35,6 +35,14 @@ describe("OperationsPanel", () => {
             started_at: null,
             detail: null,
             control_allowed: true,
+          }, {
+            component: "draft_publisher",
+            label: "Draft publisher",
+            status: "stopped",
+            pid: null,
+            started_at: null,
+            detail: null,
+            control_allowed: true,
           }]}
           controlMessage={null}
           controlsEnabled
@@ -67,6 +75,7 @@ describe("OperationsPanel", () => {
 
     expect(screen.getByRole("button", { name: "启动赔率采集" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "停止赔率采集" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "启动阵容预测发布器" })).toBeEnabled();
     expect(screen.getByText("赔率采集状态异常")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /确认告警/ })).toBeEnabled();
     expect(screen.getByText("manual_exact")).toBeInTheDocument();

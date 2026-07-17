@@ -4,10 +4,10 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import StreamingResponse
 
-from .. import monitoring, queries
+from .. import intelligence, monitoring, queries
 
 
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
@@ -64,6 +64,22 @@ def match_detail(
         )
     finally:
         connection.close()
+    if detail is None:
+        raise HTTPException(status_code=404, detail="RayBet match not found")
+    return detail
+
+
+@router.get("/matches/{raybet_match_id}/maps/{map_number}/postmatch")
+def postmatch_detail(
+    raybet_match_id: str,
+    map_number: int = Path(ge=1),
+    max_points: int = Query(1200, ge=100, le=5000),
+) -> dict[str, object]:
+    detail = intelligence.get_raybet_postmatch(
+        raybet_match_id,
+        map_number,
+        max_points=max_points,
+    )
     if detail is None:
         raise HTTPException(status_code=404, detail="RayBet match not found")
     return detail

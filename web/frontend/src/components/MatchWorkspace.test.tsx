@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -12,7 +12,14 @@ vi.mock("@fluentui/react-components", () => ({
   SkeletonItem: () => <div />,
 }));
 vi.mock("./ProbabilityChart", () => ({
-  ProbabilityChart: () => <div>probability-chart</div>,
+  ProbabilityChart: ({ onPeriodChange }: { onPeriodChange: (value: string) => void }) => (
+    <button onClick={() => onPeriodChange("map_1")}>probability-chart</button>
+  ),
+}));
+vi.mock("./PostmatchIntelligencePanel", () => ({
+  PostmatchIntelligencePanel: ({ mapNumber }: { mapNumber: number | null }) => (
+    <div>postmatch-map-{mapNumber ?? "none"}</div>
+  ),
 }));
 
 import { MatchWorkspace } from "./MatchWorkspace";
@@ -112,5 +119,55 @@ describe("MatchWorkspace trusted vision clock", () => {
       />,
     );
     expect(screen.getByText("可信时钟 2:00")).toBeInTheDocument();
+  });
+
+  it("shares the replay map selection with the exact postmatch panel", () => {
+    const replayDetail = detail(1, "ready");
+    replayDetail.lifecycle = "ended";
+    replayDetail.history_eligible = true;
+    replayDetail.winner_timeline = [
+      {
+        observed_at: "2026-07-16T12:00:00+00:00",
+        period: "map_1",
+        prices: { team_one: 1.8, team_two: 2.1 },
+        probabilities: { team_one: 0.54, team_two: 0.46 },
+        status: { team_one: "open", team_two: "open" },
+      },
+      {
+        observed_at: "2026-07-16T13:00:00+00:00",
+        period: "map_2",
+        prices: { team_one: 1.7, team_two: 2.2 },
+        probabilities: { team_one: 0.57, team_two: 0.43 },
+        status: { team_one: "open", team_two: "open" },
+      },
+    ];
+
+    const view = render(
+      <MatchWorkspace
+        detail={replayDetail}
+        error={null}
+        loading={false}
+        match={replayDetail}
+        now={Date.parse("2026-07-16T14:00:00+00:00")}
+        replay
+      />,
+    );
+
+    expect(screen.getByText("postmatch-map-2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "probability-chart" }));
+    expect(screen.getByText("postmatch-map-1")).toBeInTheDocument();
+
+    const nextMatch = { ...replayDetail, raybet_match_id: "match-2" };
+    view.rerender(
+      <MatchWorkspace
+        detail={nextMatch}
+        error={null}
+        loading={false}
+        match={nextMatch}
+        now={Date.parse("2026-07-16T14:00:00+00:00")}
+        replay
+      />,
+    );
+    expect(screen.getByText("postmatch-map-2")).toBeInTheDocument();
   });
 });
