@@ -216,6 +216,8 @@ def winner_timeline(
             """SELECT odds.id, odds.received_at, odds.price, odds.status,
                       odds.period, odds.side, odds.odds_id, odds.odds_group_id,
                   alignment.map_number, alignment.game_clock_seconds,
+                  alignment.raybet_match_id AS alignment_raybet_match_id,
+                  alignment.observation_captured_at,
                   alignment.method AS alignment_method,
                   alignment.lag_seconds, alignment.usable AS alignment_usable
              FROM odds_snapshots AS odds
@@ -248,14 +250,41 @@ def winner_timeline(
             continue
         inverse = {side: 1.0 / price for side, price in prices.items()}
         total = sum(inverse.values())
-        aligned = next(
+        aligned_quotes = tuple(quotes[side] for side in ("team_one", "team_two"))
+        alignment_identities = {
             (
-                quote
-                for quote in quotes.values()
-                if quote["alignment_usable"]
-                and quote["game_clock_seconds"] is not None
-            ),
-            None,
+                quote["alignment_raybet_match_id"],
+                quote["map_number"],
+                quote["game_clock_seconds"],
+                quote["observation_captured_at"],
+                quote["alignment_method"],
+                quote["lag_seconds"],
+            )
+            for quote in aligned_quotes
+            if quote["alignment_usable"] == 1
+            and quote["alignment_raybet_match_id"] == raybet_match_id
+            and type(quote["map_number"]) is int
+            and quote["map_number"] > 0
+            and type(quote["game_clock_seconds"]) is int
+            and quote["game_clock_seconds"] >= 0
+        }
+        aligned = (
+            aligned_quotes[0]
+            if len(alignment_identities) == 1
+            and all(quote["alignment_usable"] == 1 for quote in aligned_quotes)
+            and all(
+                (
+                    quote["alignment_raybet_match_id"],
+                    quote["map_number"],
+                    quote["game_clock_seconds"],
+                    quote["observation_captured_at"],
+                    quote["alignment_method"],
+                    quote["lag_seconds"],
+                )
+                in alignment_identities
+                for quote in aligned_quotes
+            )
+            else None
         )
         points.append(
             {

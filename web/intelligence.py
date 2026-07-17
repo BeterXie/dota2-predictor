@@ -13,15 +13,21 @@ from typing import Any, Iterator
 
 from event_intelligence.backtest import (
     BACKTEST_VERSION,
+    DRAFT_VALIDATION_VERSION,
     EvaluationPoint,
+    draft_lineage_tracking_is_current,
+    draft_prediction_artifacts,
     evaluate_points,
 )
+from event_intelligence.benchmarks import BENCHMARK_VERSION
 from event_intelligence.draft_features import FEATURE_VERSION as DRAFT_FEATURE_VERSION
 from event_intelligence.draft_model import MODEL_VERSION as DRAFT_MODEL_VERSION
 from event_intelligence.incremental import (
     CurrentDerivedScopes,
     ROLE_VERSION,
     SCORE_VERSION,
+    StrictDerivedPipeline,
+    _draft_prediction_artifacts_for_read,
     current_derived_scopes,
     current_state_input_hashes,
     profile_weighting_is_current,
@@ -142,6 +148,259 @@ def _relation_columns(connection: sqlite3.Connection, name: str) -> set[str]:
 
 def _current_scopes(connection: sqlite3.Connection) -> CurrentDerivedScopes:
     return current_derived_scopes(connection)
+
+
+def _targeted_scopes(
+    connection: sqlite3.Connection,
+    match_id: int,
+) -> CurrentDerivedScopes:
+    """Validate current derived lineage for one postmatch identity."""
+    formal_columns = _relation_columns(connection, "formal_map_eligibility")
+    if "match_id" not in formal_columns:
+        return CurrentDerivedScopes(available=False)
+    try:
+        formal_row = connection.execute(
+            "SELECT match_id FROM formal_map_eligibility WHERE match_id=?",
+            (match_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return CurrentDerivedScopes(available=False)
+    formal = frozenset({match_id}) if formal_row is not None else frozenset()
+    if formal_row is None:
+        return CurrentDerivedScopes(available=True, formal=formal)
+
+    required = {
+        "formal_map_eligibility": {
+            "match_id",
+            "event_id",
+            "player_readiness",
+            "state_readiness",
+            "draft_readiness",
+        },
+        "match_ingest_status": {
+            "match_id",
+            "event_id",
+            "latest_raw_content_hash",
+            "normalizer_version",
+        },
+        "strict_derived_status": {
+            "match_id",
+            "source_content_hash",
+            "role_assignment_version",
+            "score_version",
+            "team_state_version",
+            "profile_version",
+            "profile_cutoff",
+            "normalizer_version",
+            "benchmark_version",
+            "profile_context_hash",
+        },
+    }
+    if any(
+        not columns.issubset(_relation_columns(connection, relation))
+        for relation, columns in required.items()
+    ):
+        return CurrentDerivedScopes(available=True, formal=formal)
+
+    try:
+        row = connection.execute(
+            """SELECT derived.match_id, derived.source_content_hash,
+                      derived.role_assignment_version, derived.score_version,
+                      derived.team_state_version, derived.profile_version,
+                      derived.profile_cutoff,
+                      derived.normalizer_version AS derived_normalizer_version,
+                      derived.benchmark_version, derived.profile_context_hash,
+                      status.event_id, status.latest_raw_content_hash,
+                      status.normalizer_version,
+                      eligible.event_id AS eligible_event_id,
+                      eligible.player_readiness, eligible.state_readiness,
+                      eligible.draft_readiness
+                 FROM strict_derived_status AS derived
+                 JOIN match_ingest_status AS status USING(match_id)
+                 LEFT JOIN formal_map_eligibility AS eligible USING(match_id)
+                WHERE derived.match_id=?""",
+            (match_id,),
+        ).fetchone()
+        if row is None:
+            return CurrentDerivedScopes(available=True, formal=formal)
+        event_id = str(row["event_id"])
+        contexts = StrictDerivedPipeline._profile_context_hashes(
+            connection, {event_id}
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return CurrentDerivedScopes(available=True, formal=formal)
+
+    lineage_current = (
+        row["eligible_event_id"] is not None
+        and str(row["eligible_event_id"]) == event_id
+        and row["latest_raw_content_hash"] is not None
+        and row["source_content_hash"] == row["latest_raw_content_hash"]
+        and row["role_assignment_version"] == ROLE_VERSION
+        and row["score_version"] == SCORE_VERSION
+        and row["team_state_version"] == LABEL_VERSION
+        and row["profile_version"] == PROFILE_VERSION
+        and row["derived_normalizer_version"] == row["normalizer_version"]
+        and row["benchmark_version"] == BENCHMARK_VERSION
+        and row["profile_context_hash"] == contexts.get(event_id)
+    )
+    if not lineage_current:
+        return CurrentDerivedScopes(available=True, formal=formal)
+
+    player_complete = False
+    if {
+        "match_id",
+        "player_slot",
+        "score_version",
+    }.issubset(_relation_columns(connection, "player_map_scores")) and {
+        "match_id",
+        "player_slot",
+        "purpose",
+        "assignment_version",
+        "position",
+    }.issubset(_relation_columns(connection, "player_role_assignments")):
+        try:
+            scored = connection.execute(
+                """SELECT COUNT(DISTINCT player_slot)
+                     FROM player_map_scores
+                    WHERE match_id=? AND score_version=?""",
+                (match_id, SCORE_VERSION),
+            ).fetchone()
+            assigned = connection.execute(
+                """SELECT COUNT(DISTINCT player_slot)
+                     FROM player_role_assignments
+                    WHERE match_id=? AND purpose='observed_position'
+                      AND assignment_version=? AND position BETWEEN 1 AND 5""",
+                (match_id, ROLE_VERSION),
+            ).fetchone()
+            player_complete = (
+                scored is not None
+                and assigned is not None
+                and int(scored[0]) == 10
+                and int(assigned[0]) == 10
+            )
+        except (TypeError, ValueError, sqlite3.Error):
+            player_complete = False
+
+    state_complete = False
+    if {
+        "match_id",
+        "side",
+        "label_version",
+    }.issubset(_relation_columns(connection, "team_map_states")):
+        try:
+            state_count = connection.execute(
+                """SELECT COUNT(DISTINCT side) FROM team_map_states
+                    WHERE match_id=? AND label_version=?""",
+                (match_id, LABEL_VERSION),
+            ).fetchone()
+            state_complete = state_count is not None and int(state_count[0]) == 2
+        except (TypeError, ValueError, sqlite3.Error):
+            state_complete = False
+
+    state_eligible = row["state_readiness"] in {"ready", "unscorable"}
+    player = (
+        frozenset({match_id})
+        if row["player_readiness"] == "ready" and player_complete
+        else frozenset()
+    )
+    state = (
+        frozenset({match_id})
+        if state_eligible and state_complete
+        else frozenset()
+    )
+    draft_predictions = (
+        _targeted_draft_prediction_keys(connection, match_id)
+        if row["draft_readiness"] == "ready"
+        else frozenset()
+    )
+    draft = (
+        frozenset({match_id})
+        if any(candidate_match_id == match_id for _, candidate_match_id in draft_predictions)
+        else frozenset()
+    )
+    cutoff = str(row["profile_cutoff"])
+    return CurrentDerivedScopes(
+        available=True,
+        formal=formal,
+        current=frozenset({match_id}),
+        player=player,
+        state=state,
+        draft=draft,
+        draft_predictions=draft_predictions,
+        valid_profile_cutoffs=(
+            frozenset({cutoff}) if state_eligible and state_complete else frozenset()
+        ),
+    )
+
+
+def _targeted_draft_prediction_keys(
+    connection: sqlite3.Connection,
+    match_id: int,
+) -> frozenset[tuple[str, int]]:
+    required = {
+        "draft_prediction_validations": {
+            "run_id",
+            "match_id",
+            "input_snapshot_hash",
+            "artifact_fingerprint",
+            "dependency_fingerprint",
+            "dependency_revision",
+            "validation_version",
+        },
+        "draft_predictions": {
+            "run_id",
+            "match_id",
+            "prediction_cutoff",
+            "input_snapshot_hash",
+        },
+    }
+    if any(
+        not columns.issubset(_relation_columns(connection, relation))
+        for relation, columns in required.items()
+    ):
+        return frozenset()
+    try:
+        if not draft_lineage_tracking_is_current(connection):
+            return frozenset()
+        artifacts = _draft_prediction_artifacts_for_read(
+            connection, draft_prediction_artifacts
+        )
+        rows = connection.execute(
+            """SELECT validation.run_id, validation.match_id,
+                      validation.input_snapshot_hash,
+                      validation.artifact_fingerprint
+                 FROM draft_prediction_validations AS validation
+                 JOIN draft_predictions AS prediction
+                   ON prediction.run_id=validation.run_id
+                  AND prediction.match_id=validation.match_id
+                  AND prediction.input_snapshot_hash=
+                      validation.input_snapshot_hash
+                 JOIN draft_lineage_revisions AS lineage
+                   ON lineage.singleton=1
+                WHERE validation.match_id=?
+                  AND validation.validation_version=?
+                  AND validation.dependency_revision<=lineage.dependency_revision
+                  AND strftime('%s', prediction.prediction_cutoff) IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM draft_lineage_changes AS change
+                       WHERE change.dependency_revision>
+                             validation.dependency_revision
+                         AND (change.affected_from_unix IS NULL OR
+                              change.affected_from_unix<=CAST(
+                                  strftime('%s', prediction.prediction_cutoff)
+                                  AS INTEGER
+                              ))
+                  )""",
+            (match_id, DRAFT_VALIDATION_VERSION),
+        ).fetchall()
+    except (TypeError, ValueError, sqlite3.Error):
+        return frozenset()
+    return frozenset(
+        (str(row[0]), int(row[1]))
+        for row in rows
+        if artifacts.get((str(row[0]), int(row[1])))
+        == (str(row[2]), str(row[3]))
+    )
 
 
 def _scope_join(
@@ -882,8 +1141,12 @@ def _match_row(connection: sqlite3.Connection, match_id: int) -> dict[str, Any] 
     if row is None:
         return None
     payload = dict(row)
-    if payload["radiant_win"] is not None:
-        payload["radiant_win"] = bool(payload["radiant_win"])
+    raw_radiant_win = payload["radiant_win"]
+    payload["radiant_win"] = (
+        bool(raw_radiant_win)
+        if type(raw_radiant_win) is int and raw_radiant_win in {0, 1}
+        else None
+    )
     return payload
 
 
@@ -1317,6 +1580,9 @@ def _confirmed_evidence_reason(
     raybet_match_id: str,
     map_number: int,
     mapping_recorded_at: datetime,
+    reconciliation_first_observed_at: datetime,
+    reconciliation_updated_at: datetime,
+    read_cutoff: datetime,
 ) -> str | None:
     required = {
         "raybet_match_id",
@@ -1372,7 +1638,13 @@ def _confirmed_evidence_reason(
         ):
             return "settlement_evidence_conflict"
         observed_at = _aware_timestamp(row["observed_at"])
-        if observed_at is None or observed_at < mapping_recorded_at:
+        if (
+            observed_at is None
+            or observed_at < mapping_recorded_at
+            or observed_at < reconciliation_first_observed_at
+            or observed_at > reconciliation_updated_at
+            or observed_at > read_cutoff
+        ):
             return "settlement_evidence_causal_order_invalid"
         try:
             facts = json.loads(row["facts_json"])
@@ -1401,7 +1673,13 @@ def _confirmed_evidence_reason(
         ):
             return "settlement_evidence_conflict"
         observed_at = _aware_timestamp(row["observed_at"])
-        if observed_at is None or observed_at < mapping_recorded_at:
+        if (
+            observed_at is None
+            or observed_at < mapping_recorded_at
+            or observed_at < reconciliation_first_observed_at
+            or observed_at > reconciliation_updated_at
+            or observed_at > read_cutoff
+        ):
             return "settlement_evidence_causal_order_invalid"
         expected_winner = expected[str(row["source"])][1]
         if row["status"] in {"confirmed", "conflict"} and (
@@ -1487,11 +1765,10 @@ def _opendota_identity_reason(
         return "review", "opendota_match_out_of_scope"
 
     ingest_columns = _relation_columns(connection, "match_ingest_status")
-    if not {"match_id", "event_id"}.issubset(ingest_columns):
+    if not {"match_id", "event_id", "map_number"}.issubset(ingest_columns):
         return "unavailable", "opendota_ingest_schema_unavailable"
-    selected = ["event_id"]
+    selected = ["event_id", "map_number"]
     for optional in (
-        "map_number",
         "ingest_state",
         "reconciliation_status",
         "missing_fields_json",
@@ -1506,13 +1783,13 @@ def _opendota_identity_reason(
         return "unavailable", "opendota_ingest_unavailable"
     if str(ingest["event_id"]) != mapping.event_id:
         return "review", "opendota_event_identity_conflict"
-    if "map_number" in selected and ingest["map_number"] is not None:
-        if (
-            isinstance(ingest["map_number"], bool)
-            or not isinstance(ingest["map_number"], int)
-            or ingest["map_number"] != map_number
-        ):
-            return "review", "opendota_map_number_conflict"
+    if (
+        isinstance(ingest["map_number"], bool)
+        or not isinstance(ingest["map_number"], int)
+        or ingest["map_number"] <= 0
+        or ingest["map_number"] != map_number
+    ):
+        return "review", "opendota_map_number_conflict"
     if "ingest_state" in selected and ingest["ingest_state"] == "review_required":
         return "review", "opendota_ingest_review_required"
     if (
@@ -1615,7 +1892,7 @@ def _odds_at_game_time(
             continue
         if point.get("map_number") != map_number:
             continue
-        if selected_clock <= clock <= game_time_seconds:
+        if selected_clock <= clock < game_time_seconds:
             selected = point
             selected_clock = clock
     if selected is None:
@@ -1923,6 +2200,7 @@ def get_raybet_postmatch(
 ) -> dict[str, Any] | None:
     """Return a strict, confirmed RayBet-map to OpenDota attribution."""
     clean_match_id = str(raybet_match_id).strip()
+    read_cutoff = datetime.now(timezone.utc)
     with _database() as connection:
         raybet_columns = _relation_columns(connection, "raybet_matches")
         if "raybet_match_id" not in raybet_columns:
@@ -1948,7 +2226,7 @@ def get_raybet_postmatch(
             connection,
             raybet_match_id=clean_match_id,
             map_number=map_number,
-            transport_observed_at=datetime.now(timezone.utc),
+            transport_observed_at=read_cutoff,
         )
         if eligibility.mapping is not None:
             response["mapping"] = _mapping_payload(eligibility.mapping)
@@ -2015,9 +2293,11 @@ def get_raybet_postmatch(
             or updated_at is None
             or first_observed_at < eligibility.mapping.recorded_at
             or updated_at < first_observed_at
+            or first_observed_at > read_cutoff
+            or updated_at > read_cutoff
         ):
             response["status"] = "review"
-            response["reason"] = "reconciliation_mapping_lineage_unverified"
+            response["reason"] = "reconciliation_causal_order_invalid"
             return response
         historical_eligibility = query_strict_live_eligibility(
             connection,
@@ -2041,6 +2321,9 @@ def get_raybet_postmatch(
             raybet_match_id=clean_match_id,
             map_number=map_number,
             mapping_recorded_at=eligibility.mapping.recorded_at,
+            reconciliation_first_observed_at=first_observed_at,
+            reconciliation_updated_at=updated_at,
+            read_cutoff=read_cutoff,
         )
         if evidence_reason is not None:
             response["status"] = (
@@ -2062,7 +2345,7 @@ def get_raybet_postmatch(
             response["reason"] = duplicate_reason
             return response
 
-        scopes = _current_scopes(connection)
+        scopes = _targeted_scopes(connection, dota_match_id)
         identity_status, identity_reason = _opendota_identity_reason(
             connection,
             eligibility.mapping,

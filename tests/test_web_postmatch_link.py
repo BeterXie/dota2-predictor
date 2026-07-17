@@ -34,11 +34,14 @@ CREATE TABLE odds_snapshots (
 );
 CREATE TABLE odds_alignments (
     odds_snapshot_id INTEGER,
+    raybet_match_id TEXT,
     map_number INTEGER,
     game_clock_seconds INTEGER,
+    observation_captured_at TEXT,
     method TEXT,
     lag_seconds REAL,
-    usable INTEGER
+    usable INTEGER,
+    reason TEXT
 );
 CREATE TABLE settlement_reconciliations (
     raybet_match_id TEXT,
@@ -204,7 +207,7 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         )
         self.scope_patch = patch.object(
             intelligence,
-            "_current_scopes",
+            "_targeted_scopes",
             return_value=scopes,
         )
         self.path_patch.start()
@@ -234,8 +237,9 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
             ),
         )
         connection.executemany(
-            "INSERT INTO odds_alignments VALUES (?, 1, 600, 'vision_exact', 0, 1)",
-            ((1,), (2,)),
+            """INSERT INTO odds_alignments VALUES
+               (?, 'ray-1', 1, 600, ?, 'vision_exact', 0, 1, NULL)""",
+            ((1, NOW), (2, NOW)),
         )
         connection.executemany(
             "INSERT INTO teams VALUES (?, ?, ?, NULL)",
@@ -425,6 +429,107 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
             payload["postmatch"]["event_availability"]["odds_game_clock_alignment"]
         )
 
+    def test_one_sided_alignment_identity_never_marks_pair_as_aligned(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """UPDATE odds_alignments
+                  SET map_number=2, game_clock_seconds=900
+                WHERE odds_snapshot_id=2"""
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
+
+        event = next(
+            row
+            for row in payload["postmatch"]["events"]
+            if row["event_type"] == "objective"
+        )
+        self.assertIsNone(event["team_one_probability"])
+        self.assertIsNone(event["team_two_probability"])
+        self.assertFalse(
+            payload["postmatch"]["event_availability"]["odds_game_clock_alignment"]
+        )
+
+    def test_same_second_odds_are_not_treated_as_pre_event(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        connection = sqlite3.connect(self.path)
+        connection.execute("UPDATE odds_alignments SET game_clock_seconds=620")
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
+
+        event = next(
+            row
+            for row in payload["postmatch"]["events"]
+            if row["event_type"] == "objective"
+        )
+        self.assertIsNone(event["team_one_probability"])
+        self.assertIsNone(event["team_two_probability"])
+
+    def test_missing_opendota_map_number_is_review(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE match_ingest_status SET map_number=NULL WHERE match_id=9001"
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
+
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(payload["reason"], "opendota_map_number_conflict")
+        self.assertIsNone(payload["postmatch"])
+
+    def test_non_boolean_opendota_result_is_review(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        connection = sqlite3.connect(self.path)
+        connection.execute("UPDATE matches SET radiant_win=2 WHERE match_id=9001")
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
+
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(payload["reason"], "opendota_result_identity_conflict")
+        self.assertIsNone(payload["postmatch"])
+
+    def test_future_reconciliation_is_review(self) -> None:
+        future = "2099-01-01T00:00:00+00:00"
+        self._insert_reconciliation(observed_at=future)
+        self._insert_evidence()
+
+        payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
+
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(payload["reason"], "reconciliation_causal_order_invalid")
+        self.assertIsNone(payload["postmatch"])
+
+    def test_evidence_after_reconciliation_update_is_review(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """UPDATE settlement_result_evidence
+                  SET observed_at='2099-01-01T00:00:00+00:00'"""
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
+
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(payload["reason"], "settlement_evidence_causal_order_invalid")
+        self.assertIsNone(payload["postmatch"])
+
     def test_confirmed_row_with_conflicting_evidence_is_review(self) -> None:
         self._insert_reconciliation()
         self._insert_evidence()
@@ -467,7 +572,7 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         payload = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch").json()
 
         self.assertEqual(payload["status"], "review")
-        self.assertEqual(payload["reason"], "reconciliation_mapping_lineage_unverified")
+        self.assertEqual(payload["reason"], "reconciliation_causal_order_invalid")
         self.assertIsNone(payload["postmatch"])
 
     def test_reconciliation_must_resolve_to_same_historical_mapping(self) -> None:
