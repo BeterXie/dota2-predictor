@@ -4,7 +4,8 @@ import hashlib
 import tempfile
 import unittest
 import sqlite3
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from itertools import permutations
 from pathlib import Path
@@ -12,7 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from event_intelligence.storage import IntelligenceStorage
+from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
+from live_betting.draft_authority import DraftLandmarkAuthority
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
@@ -23,12 +26,17 @@ from live_betting.strict_eligibility import (
     init_strict_live_eligibility_schema,
 )
 from live_betting.vision import VisionObservation
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
+)
 
 
 NOW = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
 MISSING_VISION = Path("does-not-exist.jsonl")
 EVENT_ID = "ewc-dota2-2026"
 SCHEDULED_AT = "2026-07-12T12:00:00+00:00"
+_CURRENT_DRAFT_AUTHORITY = object()
 
 
 def raybet_metadata() -> dict[str, object]:
@@ -112,17 +120,107 @@ def complete_snapshots(at: datetime, *, status: int = 1) -> list[OddsSnapshot]:
         rows.append(
             OddsSnapshot(
                 "match-1", odds_id, group, at, 1.9, status,
-                Market(market_type, "map_1", side, line, f"{side}:{line}", True),
+                Market(
+                    market_type,
+                    "map_1",
+                    side,
+                    line,
+                    (
+                        f"both:{side}:{line}"
+                        if market_type == "total_kills"
+                        else f"{side}:{line}"
+                    ),
+                    True,
+                ),
             )
         )
     return rows
 
 
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    match_ids = {row.raybet_match_id for row in rows}
+    if len(match_ids) != 1:
+        raise ValueError("raw fixture requires one RayBet match")
+    match_id = next(iter(match_ids))
+    outcomes: list[dict[str, object]] = []
+    for row in rows:
+        market = row.market
+        item: dict[str, object] = {
+            "id": row.odds_id,
+            "odds_group_id": row.odds_group_id or "",
+            "match_stage": "r1",
+            "odds": str(row.price),
+            "status": row.status,
+        }
+        if row.last_update is not None:
+            item["last_update"] = row.last_update
+        if market.side in {"team_one", "team_two"}:
+            item["team_id"] = 1 if market.side == "team_one" else 2
+        if market.market_type == "winner":
+            item.update(group_short_name="Winner", tag="win")
+        elif market.market_type == "kill_handicap":
+            item.update(
+                group_short_name="Kill Handicap",
+                tag="hdp",
+                value=str(market.line),
+            )
+        elif market.market_type == "total_kills":
+            item.update(
+                group_short_name="Total Kills",
+                tag="ou",
+                value=f"{str(market.side).title()} {market.line}",
+            )
+        elif market.market_type == "duration":
+            item.update(
+                group_short_name="Duration",
+                tag="ou",
+                value=f"{str(market.side).title()} {market.line}",
+            )
+        else:
+            raise ValueError(f"unsupported raw fixture market: {market.market_type}")
+        outcomes.append(item)
+    return {
+        "result": {
+            "id": match_id,
+            "game_id": 151,
+            "team": [
+                {"team_id": 1, "team_name": "One", "pos": 1},
+                {"team_id": 2, "team_name": "Two", "pos": 2},
+            ],
+            "odds": outcomes,
+        }
+    }
+
+
 def observation(at: datetime, *, frame: str = "frame") -> VisionObservation:
-    return VisionObservation(
-        "match-1", 1, at, 600, False,
-        (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
-        0.95, 0.95, frame, "game", "team_one",
+    return make_test_vision_observation(
+        raybet_match_id="match-1",
+        map_number=1,
+        captured_at=at,
+        label=frame,
+    )
+
+
+def reframe(
+    base: VisionObservation,
+    *,
+    frame: str,
+    **changes: object,
+) -> VisionObservation:
+    candidate = replace(base, **changes)
+    if candidate.is_paused is not False or candidate.screen_state != "game":
+        raise ValueError("test reframe supports ordinary game frames only")
+    return make_test_vision_observation(
+        raybet_match_id=candidate.raybet_match_id,
+        map_number=candidate.map_number,  # type: ignore[arg-type]
+        captured_at=candidate.captured_at,
+        game_clock_seconds=candidate.game_clock_seconds or 0,
+        radiant_hero_ids=candidate.radiant_hero_ids,
+        dire_hero_ids=candidate.dire_hero_ids,
+        radiant_team_side=candidate.radiant_team_side,
+        clock_confidence=candidate.clock_confidence,
+        draft_confidence=candidate.draft_confidence,
+        label=frame,
     )
 
 
@@ -180,16 +278,22 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             observed_at=at,
             normalized_state_hash=normalized_state_hash(rows),
             snapshots=rows,
+            raw_payload=raw_odds_payload(rows),
         )
         return rows
 
-    def insert_pending(self, signaled_at: datetime) -> ShadowOrder:
+    def seed_draft_authority(
+        self,
+        observed_at: datetime,
+        *,
+        label: str,
+    ) -> DraftLandmarkAuthority:
         self.store.upsert_raybet_match(
-            raybet_metadata(), signaled_at - timedelta(minutes=2)
+            raybet_metadata(), observed_at - timedelta(minutes=2)
         )
         with patch(
             "live_betting.strict_eligibility._utc_now",
-            return_value=signaled_at - timedelta(seconds=30),
+            return_value=observed_at - timedelta(seconds=30),
         ):
             mapping = accept_strict_live_map_mapping(
                 self.store.connection,
@@ -203,10 +307,55 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 source="test_fixture",
                 evidence=mapping_evidence(),
                 accepted_by="tester",
-                accepted_at=signaled_at - timedelta(minutes=1),
+                accepted_at=observed_at - timedelta(minutes=1),
             )
         self.assertEqual(mapping.mapping_id, 1)
-        signal = self.record_transport(signaled_at, key="signal")[0]
+        return seed_test_draft_authority(
+            self.store.connection,
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=mapping.mapping_id,
+            observed_at=observed_at,
+            label=label,
+        )
+
+    def insert_pending(
+        self,
+        signaled_at: datetime,
+        *,
+        decision_draft_authority: object = _CURRENT_DRAFT_AUTHORITY,
+        order_draft_authority: object = _CURRENT_DRAFT_AUTHORITY,
+        signal_rows: list[OddsSnapshot] | None = None,
+        order_transform: Callable[[ShadowOrder], ShadowOrder] | None = None,
+        mutate_authority_before_order: bool = False,
+        expected_decision_inserted: bool = True,
+        expected_inserted: bool = True,
+    ) -> ShadowOrder:
+        anchor_frame = observation(
+            signaled_at - timedelta(seconds=2),
+            frame=f"safety-anchor:{signaled_at.isoformat()}",
+        )
+        signal_vision = observation(
+            signaled_at,
+            frame=f"safety-frame:{signaled_at.isoformat()}",
+        )
+        self.store.insert_vision_observation(anchor_frame)
+        self.store.insert_vision_observation(signal_vision)
+        current_draft_authority = self.seed_draft_authority(
+            signaled_at,
+            label=f"shadow-safety:{signaled_at.isoformat()}",
+        )
+        signal_key = f"signal:{signaled_at.isoformat()}"
+        transport_rows = self.record_transport(
+            signaled_at,
+            key=signal_key,
+            rows=signal_rows,
+        )
+        signal = transport_rows[0]
+        market_probability = price_groups(transport_rows).get(
+            signal.odds_id,
+            0.5,
+        )
         market = signal.market
         strategy_version = "safety-test-v1"
         input_ref = f"safety-input:{signaled_at.isoformat()}"
@@ -228,57 +377,470 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             market=market,
             signaled_at=signaled_at,
             model_probability=0.6,
-            market_probability=0.5,
-            signal_price=2.8,
-            signal_transport_key="signal",
+            market_probability=market_probability,
+            signal_price=signal.price,
+            signal_transport_key=signal_key,
             signal_transport_at=signaled_at,
             expires_at=signaled_at + timedelta(seconds=15),
             signal_odds_group_id=signal.odds_group_id,
             signal_outcome_key=signal.market.outcome_key,
             signal_identity_verified=True,
         )
-        self.assertTrue(
-            self.store.insert_decision(
+        if order_transform is not None:
+            order = order_transform(order)
+        if callable(decision_draft_authority):
+            decision_draft_authority = decision_draft_authority(
+                current_draft_authority
+            )
+        if callable(order_draft_authority):
+            order_draft_authority = order_draft_authority(current_draft_authority)
+        if decision_draft_authority is _CURRENT_DRAFT_AUTHORITY:
+            decision_draft_authority = current_draft_authority
+        if order_draft_authority is _CURRENT_DRAFT_AUTHORITY:
+            order_draft_authority = current_draft_authority
+        decision_inputs: dict[str, object] = {
+            "strict_live_eligibility": {
+                "mapping_refs": {"strict_mapping_id": 1}
+            },
+            "vision": {
+                "captured_at": signaled_at.isoformat(),
+                "source_frame_ref": signal_vision.source_frame_ref,
+                "game_clock_seconds": 600,
+            },
+            "quality": {"aggregate": 0.8},
+            "draft_landmark": {
+                "model_version": "safety-model-v1",
+                "model_kind": "pure_draft",
+                "model_hash": "a" * 64,
+            },
+        }
+        if isinstance(decision_draft_authority, DraftLandmarkAuthority):
+            decision_inputs["draft_authority"] = asdict(
+                decision_draft_authority
+            )
+        decision_inserted = self.store.insert_decision(
                 SimpleNamespace(
                     decision_key=f"safety-decision:{signaled_at.isoformat()}",
                     raybet_match_id="match-1",
                     map_number=1,
                     decided_at=signaled_at,
                     underdog_side="team_one",
-                    market_probability=0.5,
+                    market_probability=market_probability,
                     model_probability=0.6,
                     edge=0.1,
                     data_quality=0.8,
                     eligible=True,
                     reason="eligible",
                     contributions={
-                        "__inputs__": {
-                            "strict_live_eligibility": {
-                                "mapping_refs": {"strict_mapping_id": 1}
-                            },
-                            "vision": {
-                                "captured_at": signaled_at.isoformat(),
-                                "source_frame_ref": "safety-frame",
-                                "game_clock_seconds": 600,
-                            },
-                            "quality": {"aggregate": 0.8},
-                            "draft_landmark": {
-                                "model_version": "safety-model-v1",
-                                "model_kind": "pure_draft",
-                                "model_hash": "a" * 64,
-                            },
-                        }
+                        "__inputs__": decision_inputs
                     },
                     input_ref=input_ref,
                     strategy_version=strategy_version,
-                )
+                ),
+                draft_authority=decision_draft_authority,
+                vision_observation=signal_vision,
+                vision_transport_key=signal_key,
+        )
+        self.assertEqual(decision_inserted, expected_decision_inserted)
+        if mutate_authority_before_order:
+            self.store.connection.execute(
+                """UPDATE draft_authority_revisions
+                      SET authority_revision=authority_revision + 1
+                    WHERE singleton=1"""
             )
+            self.store.connection.commit()
+        inserted = (
+            self.store.insert_map_order(
+                order,
+                1,
+                strict_mapping_id=1,
+                draft_authority=order_draft_authority,
+            )
+            if decision_inserted
+            else False
         )
-        self.assertTrue(
-            self.store.insert_map_order(order, 1, strict_mapping_id=1)
-        )
+        self.assertEqual(inserted, expected_inserted)
         self.pending_order_key = order.order_key
         return order
+
+    def insert_raw_vision_frame(
+        self,
+        captured_at: str,
+        *,
+        source_frame_ref: str,
+        game_clock_seconds: int = 601,
+    ) -> None:
+        self.store.connection.execute(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids,
+                radiant_team_side, clock_confidence, draft_confidence,
+                source_frame_ref, screen_state, confirmed)
+               VALUES ('match-1', 1, ?, ?, 0, '[1,2,3,4,5]',
+                       '[6,7,8,9,10]', 'team_one', 0.95, 0.95, ?, 'game', 1)""",
+            (captured_at, game_clock_seconds, source_frame_ref),
+        )
+
+    def test_order_rejects_invalid_decision_draft_authority(self) -> None:
+        invalid_authorities = (
+            ("missing", None),
+            (
+                "wrong_curve",
+                lambda authority: replace(
+                    authority,
+                    curve_key="0" * 64,
+                    source_ref=f"prospective-draft:{'0' * 64}",
+                ),
+            ),
+            (
+                "altered_probability",
+                lambda authority: replace(
+                    authority,
+                    radiant_probability=authority.radiant_probability - 0.1,
+                ),
+            ),
+            (
+                "wrong_mapping",
+                lambda authority: replace(authority, strict_mapping_id=2),
+            ),
+        )
+        for offset, (case, authority) in enumerate(invalid_authorities):
+            with self.subTest(case=case):
+                order = self.insert_pending(
+                    NOW + timedelta(seconds=offset),
+                    decision_draft_authority=authority,
+                    expected_decision_inserted=False,
+                    expected_inserted=False,
+                )
+                self.assertIsNone(
+                    self.store.connection.execute(
+                        "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                        (order.order_key,),
+                    ).fetchone()
+                )
+
+    def test_verified_vision_authority_is_unique_per_decision(self) -> None:
+        self.insert_pending(NOW)
+
+        count = self.store.connection.execute(
+            """SELECT COUNT(*)
+                 FROM verified_strategy_decision_vision_authority
+                WHERE decision_key=?""",
+            (f"safety-decision:{NOW.isoformat()}",),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_same_instant_offset_alias_invalidates_verified_decision_view(
+        self,
+    ) -> None:
+        self.insert_pending(NOW)
+        same_instant = NOW.astimezone(timezone(timedelta(hours=8))).isoformat()
+
+        self.insert_raw_vision_frame(
+            same_instant,
+            source_frame_ref="same-instant-offset-alias",
+        )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*)
+                     FROM verified_strategy_decision_vision_authority
+                    WHERE decision_key=?""",
+                (f"safety-decision:{NOW.isoformat()}",),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.vision_block_reason_for_order(self.pending_order_key),
+            "vision_authority_unverifiable",
+        )
+
+    def test_same_instant_offset_alias_blocks_decision_insert_trigger(self) -> None:
+        self.insert_pending(NOW)
+        decision = self.store.connection.execute(
+            "SELECT * FROM strategy_decisions WHERE decision_key=?",
+            (f"safety-decision:{NOW.isoformat()}",),
+        ).fetchone()
+        self.assertIsNotNone(decision)
+        same_instant = NOW.astimezone(timezone(timedelta(hours=8))).isoformat()
+        self.insert_raw_vision_frame(
+            same_instant,
+            source_frame_ref="same-instant-trigger-alias",
+        )
+        columns = [
+            str(row[1])
+            for row in self.store.connection.execute(
+                "PRAGMA table_info(strategy_decisions)"
+            )
+        ]
+        values = [decision[column] for column in columns]
+        values[columns.index("decision_key")] = "same-instant-trigger-clone"
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "eligible strategy decision vision authority is required",
+        ):
+            self.store.connection.execute(
+                f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                values,
+            )
+
+    def test_same_instant_offset_alias_blocks_python_decision_derivation(
+        self,
+    ) -> None:
+        same_instant = NOW.astimezone(timezone(timedelta(hours=8))).isoformat()
+        self.insert_raw_vision_frame(
+            same_instant,
+            source_frame_ref="same-instant-python-alias",
+        )
+        self.store.connection.commit()
+
+        order = self.insert_pending(
+            NOW,
+            expected_decision_inserted=False,
+            expected_inserted=False,
+        )
+
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()
+        )
+
+    def test_one_millisecond_neighbor_is_not_a_vision_tie(self) -> None:
+        neighbor_at = NOW - timedelta(milliseconds=1)
+        self.insert_raw_vision_frame(
+            neighbor_at.isoformat(),
+            source_frame_ref="one-millisecond-earlier",
+            game_clock_seconds=599,
+        )
+        self.store.connection.commit()
+
+        self.insert_pending(NOW)
+
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*)
+                     FROM verified_strategy_decision_vision_authority
+                    WHERE decision_key=?""",
+                (f"safety-decision:{NOW.isoformat()}",),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_malformed_late_frame_time_fails_closed(self) -> None:
+        self.insert_pending(NOW)
+
+        self.insert_raw_vision_frame(
+            "not-a-timestamp",
+            source_frame_ref="malformed-time",
+        )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*)
+                     FROM verified_strategy_decision_vision_authority
+                    WHERE decision_key=?""",
+                (f"safety-decision:{NOW.isoformat()}",),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.vision_block_reason_for_order(self.pending_order_key),
+            "vision_authority_unverifiable",
+        )
+
+    def test_decision_rejects_incomplete_or_ambiguous_winner_authority(self) -> None:
+        def missing_side(at: datetime) -> list[OddsSnapshot]:
+            return snapshots(at)[:1]
+
+        def conflicting_group(at: datetime) -> list[OddsSnapshot]:
+            rows = snapshots(at)
+            return [
+                *rows,
+                replace(rows[0], odds_id="winner-one-conflict", price=2.7),
+            ]
+
+        def multiple_complete_groups(at: datetime) -> list[OddsSnapshot]:
+            rows = snapshots(at)
+            other = [
+                replace(
+                    row,
+                    odds_id=f"{row.odds_id}-other",
+                    odds_group_id="winner-group-other",
+                )
+                for row in rows
+            ]
+            return [*rows, *other]
+
+        cases = (
+            ("missing_side", missing_side),
+            ("conflicting_group", conflicting_group),
+            ("multiple_complete_groups", multiple_complete_groups),
+        )
+        for offset, (case, build_rows) in enumerate(cases):
+            with self.subTest(case=case):
+                signaled_at = NOW + timedelta(seconds=offset)
+                self.insert_pending(
+                    signaled_at,
+                    signal_rows=build_rows(signaled_at),
+                    expected_decision_inserted=False,
+                    expected_inserted=False,
+                )
+
+    def test_response_rejects_duplicate_odds_id(self) -> None:
+        rows = snapshots(NOW)
+        duplicate = replace(rows[1], odds_id=rows[0].odds_id)
+
+        with self.assertRaisesRegex(ValueError, "duplicate odds id"):
+            self.record_transport(
+                NOW,
+                key="duplicate-odds-id",
+                rows=[rows[0], duplicate],
+            )
+
+    def test_order_rejects_signal_outside_exact_winner_authority(self) -> None:
+        transforms = (
+            ("wrong_odds_id", lambda order: replace(order, odds_id="winner-two")),
+            (
+                "wrong_group",
+                lambda order: replace(order, signal_odds_group_id="other-group"),
+            ),
+            (
+                "wrong_outcome",
+                lambda order: replace(
+                    order,
+                    market=replace(order.market, outcome_key="team_two"),
+                    signal_outcome_key="team_two",
+                ),
+            ),
+            (
+                "wrong_price",
+                lambda order: replace(order, signal_price=order.signal_price + 0.1),
+            ),
+            (
+                "wrong_probability",
+                lambda order: replace(
+                    order,
+                    market_probability=order.market_probability + 0.01,
+                ),
+            ),
+        )
+        for offset, (case, transform) in enumerate(transforms):
+            with self.subTest(case=case):
+                order = self.insert_pending(
+                    NOW + timedelta(seconds=offset),
+                    order_transform=transform,
+                    expected_inserted=False,
+                )
+                self.assertIsNone(
+                    self.store.connection.execute(
+                        "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                        (order.order_key,),
+                    ).fetchone()
+                )
+
+    def test_order_rejects_invalid_caller_draft_authority(self) -> None:
+        invalid_authorities = (
+            (
+                "wrong_curve",
+                lambda authority: replace(
+                    authority,
+                    curve_key="0" * 64,
+                    source_ref=f"prospective-draft:{'0' * 64}",
+                ),
+            ),
+            (
+                "altered_probability",
+                lambda authority: replace(
+                    authority,
+                    radiant_probability=authority.radiant_probability - 0.1,
+                ),
+            ),
+            (
+                "wrong_revision_tuple",
+                lambda authority: (
+                    authority.authority_revision + 1,
+                    authority.dependency_revision,
+                ),
+            ),
+            (
+                "malformed_revision_tuple",
+                lambda authority: (
+                    str(authority.authority_revision),
+                    authority.dependency_revision,
+                ),
+            ),
+        )
+        for offset, (case, authority) in enumerate(invalid_authorities):
+            with self.subTest(case=case):
+                order = self.insert_pending(
+                    NOW + timedelta(seconds=offset),
+                    order_draft_authority=authority,
+                    expected_inserted=False,
+                )
+                self.assertIsNone(
+                    self.store.connection.execute(
+                        "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                        (order.order_key,),
+                    ).fetchone()
+                )
+
+    def test_order_uses_persisted_authority_when_caller_omits_it(self) -> None:
+        order = self.insert_pending(NOW, order_draft_authority=None)
+
+        row = self.store.connection.execute(
+            """SELECT draft_curve_key, draft_landmark_key, draft_deployment_key
+                 FROM shadow_orders WHERE order_key=?""",
+            (order.order_key,),
+        ).fetchone()
+        decision = self.store.connection.execute(
+            """SELECT draft_curve_key, draft_landmark_key, draft_deployment_key
+                 FROM strategy_decisions
+                WHERE decision_key='safety-decision:2026-07-13T04:00:00+00:00'"""
+        ).fetchone()
+        self.assertEqual(tuple(row), tuple(decision))
+
+    def test_order_rejects_unsupported_caller_authority_type(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "draft_authority must be exact authority or revisions",
+        ):
+            self.insert_pending(NOW, order_draft_authority="invalid")
+
+    def test_order_rejects_caller_authority_that_differs_from_decision(self) -> None:
+        order = self.insert_pending(
+            NOW,
+            order_draft_authority=lambda authority: replace(
+                authority,
+                curve_key="f" * 64,
+                source_ref=f"prospective-draft:{'f' * 64}",
+            ),
+            expected_inserted=False,
+        )
+
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()
+        )
+
+    def test_order_rechecks_draft_authority_inside_write_transaction(self) -> None:
+        order = self.insert_pending(
+            NOW,
+            mutate_authority_before_order=True,
+            expected_inserted=False,
+        )
+
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM shadow_orders WHERE order_key=?",
+                (order.order_key,),
+            ).fetchone()
+        )
 
     def test_pending_fill_is_processed_without_any_vision(self) -> None:
         self.insert_pending(NOW)
@@ -349,12 +911,15 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         strategy.evaluate.assert_not_called()
 
     def test_persisted_invalidation_cannot_be_reconfirmed_from_payload_fields(self) -> None:
-        self.store.insert_vision_observation(observation(NOW))
+        frame = observation(NOW)
+        self.store.insert_vision_observation(frame)
         self.store.connection.execute(
-            "UPDATE vision_observations SET confirmed=0 WHERE source_frame_ref='frame'"
+            "UPDATE vision_observations SET confirmed=0 WHERE source_frame_ref=?",
+            (frame.source_frame_ref,),
         )
         row = self.store.connection.execute(
-            "SELECT * FROM vision_observations WHERE source_frame_ref='frame'"
+            "SELECT * FROM vision_observations WHERE source_frame_ref=?",
+            (frame.source_frame_ref,),
         ).fetchone()
         self.assertFalse(_observation(row).is_confirmed)
 
@@ -408,17 +973,17 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def test_cross_session_draft_conflict_freezes_the_map(self) -> None:
         original = observation(NOW, frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict",
             captured_at=NOW + timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict",
         )
-        after_conflict = replace(
+        after_conflict = reframe(
             original,
+            frame="after-conflict",
             captured_at=NOW + timedelta(seconds=2),
-            source_frame_ref="after-conflict",
         )
 
         self.assertTrue(self.store.insert_vision_observation(original))
@@ -431,7 +996,11 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             [(str(row[0]), int(row[1])) for row in rows],
-            [("original", 1), ("conflict", 0), ("after-conflict", 0)],
+            [
+                (original.source_frame_ref, 1),
+                (conflicting.source_frame_ref, 0),
+                (after_conflict.source_frame_ref, 0),
+            ],
         )
         anchor = self.store.connection.execute(
             "SELECT status, conflict_at FROM vision_draft_anchors"
@@ -455,10 +1024,10 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             observation(NOW, frame="unknown-side"),
             radiant_team_side=None,
         )
-        known = replace(
+        known = reframe(
             unknown,
+            frame="known-side",
             captured_at=NOW + timedelta(seconds=1),
-            source_frame_ref="known-side",
             radiant_team_side="team_two",
         )
 
@@ -476,7 +1045,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             (
                 "team_two",
                 (NOW + timedelta(seconds=1)).isoformat(),
-                "known-side",
+                known.source_frame_ref,
                 "anchored",
             ),
         )
@@ -511,19 +1080,19 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             (
                 "team_two",
                 NOW.isoformat(),
-                "earlier-known",
+                earlier_known.source_frame_ref,
                 NOW.isoformat(),
-                "earlier-known",
+                earlier_known.source_frame_ref,
                 "anchored",
             ),
         )
 
     def test_confirmed_team_side_reversal_creates_draft_conflict(self) -> None:
         original = observation(NOW, frame="team-one-side")
-        reversed_side = replace(
+        reversed_side = reframe(
             original,
+            frame="team-two-side",
             captured_at=NOW + timedelta(seconds=1),
-            source_frame_ref="team-two-side",
             radiant_team_side="team_two",
         )
 
@@ -554,7 +1123,8 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         self.assertEqual(
             self.store.connection.execute(
                 """SELECT confirmed FROM vision_observations
-                    WHERE source_frame_ref='team-two-side'"""
+                    WHERE source_frame_ref=?""",
+                (reversed_side.source_frame_ref,),
             ).fetchone()[0],
             0,
         )
@@ -622,41 +1192,41 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 (
                     "team_one",
                     (NOW + timedelta(seconds=1)).isoformat(),
-                    "team-side",
+                    frames[1].source_frame_ref,
                     NOW.isoformat(),
-                    "draft-only",
+                    frames[0].source_frame_ref,
                     "conflict",
                     (NOW + timedelta(seconds=2)).isoformat(),
                 ),
                 (
                     (
                         (NOW + timedelta(seconds=2)).isoformat(),
-                        "draft-conflict",
+                        frames[2].source_frame_ref,
                         "confirmed_draft_conflict",
                     ),
                     (
                         (NOW + timedelta(seconds=3)).isoformat(),
-                        "side-conflict",
+                        frames[3].source_frame_ref,
                         "confirmed_draft_conflict",
                     ),
                 ),
                 (
-                    ("draft-only", 1),
-                    ("team-side", 1),
-                    ("draft-conflict", 0),
-                    ("side-conflict", 0),
+                    (frames[0].source_frame_ref, 1),
+                    (frames[1].source_frame_ref, 1),
+                    (frames[2].source_frame_ref, 0),
+                    (frames[3].source_frame_ref, 0),
                 ),
                 (True, (NOW + timedelta(seconds=2)).isoformat()),
             ),
         )
     def test_draft_conflict_hides_confirmed_frames_from_live_monitor(self) -> None:
         original = observation(NOW, frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict",
             captured_at=NOW + timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict",
         )
         self.store.insert_vision_observation(original)
         self.store.insert_vision_observation(conflicting)
@@ -671,12 +1241,12 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def test_draft_conflict_rejects_pending_order_before_successor_fill(self) -> None:
         original = observation(NOW - timedelta(seconds=2), frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict",
             captured_at=NOW - timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict",
         )
         self.insert_pending(NOW)
         self.store.insert_vision_observation(original)
@@ -703,16 +1273,16 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             1,
         )
 
-    def test_draft_conflict_after_signal_does_not_reject_pending_order(self) -> None:
+    def test_draft_conflict_after_signal_rejects_pending_order_at_fill(self) -> None:
         original = observation(NOW - timedelta(seconds=1), frame="original")
         self.store.insert_vision_observation(original)
         self.insert_pending(NOW)
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict-between-signal-and-fill",
             captured_at=NOW + timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict-between-signal-and-fill",
         )
         self.store.insert_vision_observation(conflicting)
         self.record_transport(NOW + timedelta(seconds=2), key="successor")
@@ -722,14 +1292,12 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             now=NOW + timedelta(seconds=3),
         )
 
-        self.assertEqual(result["status"], "shadow_filled")
+        self.assertEqual(result["status"], "shadow_rejected")
         row = self.store.connection.execute(
-            "SELECT status, filled_at FROM shadow_orders WHERE order_key=?",
+            "SELECT status, rejection_reason FROM shadow_orders WHERE order_key=?",
             (self.pending_order_key,),
         ).fetchone()
-        self.assertEqual(
-            tuple(row), ("filled", (NOW + timedelta(seconds=2)).isoformat())
-        )
+        self.assertEqual(tuple(row), ("rejected", "vision_draft_conflict"))
         self.assertEqual(
             self.store.connection.execute(
                 """SELECT COUNT(*) FROM vision_derived_invalidations
@@ -739,14 +1307,92 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             0,
         )
 
+    def test_draft_conflict_after_successor_does_not_retroactively_reject_fill(
+        self,
+    ) -> None:
+        original = observation(NOW - timedelta(seconds=1), frame="original")
+        self.store.insert_vision_observation(original)
+        self.insert_pending(NOW)
+        successor_at = NOW + timedelta(seconds=2)
+        self.record_transport(successor_at, key="first-successor")
+        conflicting = reframe(
+            original,
+            frame="conflict-after-successor",
+            captured_at=NOW + timedelta(seconds=3),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+        )
+        self.store.insert_vision_observation(conflicting)
+
+        result = run_once(
+            self.store, Mock(), MISSING_VISION,
+            now=NOW + timedelta(seconds=4),
+        )
+
+        self.assertEqual(result["status"], "shadow_filled")
+        row = self.store.connection.execute(
+            """SELECT status, fill_price, filled_at, rejection_reason
+                 FROM shadow_orders WHERE order_key=?""",
+            (self.pending_order_key,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            ("filled", 2.8, successor_at.isoformat(), None),
+        )
+
+    def test_multiple_successors_bind_fill_cutoff_and_price_to_first(self) -> None:
+        original = observation(NOW - timedelta(seconds=1), frame="original")
+        self.store.insert_vision_observation(original)
+        self.insert_pending(NOW)
+        first_at = NOW + timedelta(seconds=2)
+        first_rows = snapshots(first_at)
+        first_rows[0] = replace(
+            first_rows[0], price=2.75, last_update="first-successor"
+        )
+        self.record_transport(
+            first_at, key="first-successor", rows=first_rows
+        )
+        conflicting = reframe(
+            original,
+            frame="conflict-between-successors",
+            captured_at=NOW + timedelta(seconds=3),
+            radiant_hero_ids=(1, 2, 3, 4, 6),
+            dire_hero_ids=(5, 7, 8, 9, 10),
+        )
+        self.store.insert_vision_observation(conflicting)
+        second_at = NOW + timedelta(seconds=4)
+        second_rows = snapshots(second_at)
+        second_rows[0] = replace(
+            second_rows[0], price=3.1, last_update="second-successor"
+        )
+        self.record_transport(
+            second_at, key="second-successor", rows=second_rows
+        )
+
+        result = run_once(
+            self.store, Mock(), MISSING_VISION,
+            now=NOW + timedelta(seconds=5),
+        )
+
+        self.assertEqual(result["status"], "shadow_filled")
+        row = self.store.connection.execute(
+            """SELECT status, fill_price, filled_at, rejection_reason
+                 FROM shadow_orders WHERE order_key=?""",
+            (self.pending_order_key,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            ("filled", 2.75, first_at.isoformat(), None),
+        )
+
     def test_future_draft_conflict_keeps_cutoff_vision_usable(self) -> None:
         original = observation(NOW, frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="future-conflict",
             captured_at=NOW + timedelta(seconds=10),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="future-conflict",
         )
         self.store.insert_vision_observation(original)
         self.store.insert_vision_observation(conflicting)
@@ -766,12 +1412,12 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def test_delayed_worker_uses_transport_time_before_draft_conflict(self) -> None:
         original = observation(NOW, frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="later-conflict",
             captured_at=NOW + timedelta(seconds=10),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="later-conflict",
         )
         self.store.insert_vision_observation(original)
         self.store.insert_vision_observation(conflicting)
@@ -802,12 +1448,12 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             raybet_match_id="match-2",
         )
         original = observation(NOW + timedelta(seconds=1), frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict",
             captured_at=NOW + timedelta(seconds=2),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict",
         )
         self.store.insert_vision_observation(other_observation)
         self.store.insert_vision_observation(original)
@@ -826,6 +1472,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             observed_at=other_at,
             normalized_state_hash=normalized_state_hash(other_rows),
             snapshots=other_rows,
+            raw_payload=raw_odds_payload(other_rows),
         )
 
         result = run_once(
@@ -846,26 +1493,39 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
     def test_storage_rejects_decision_at_or_after_draft_conflict(self) -> None:
         original = observation(NOW, frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict",
             captured_at=NOW + timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict",
         )
         self.store.insert_vision_observation(original)
-        self.store.insert_vision_observation(conflicting)
+        authority = self.seed_draft_authority(
+            NOW,
+            label="shadow-storage-conflict",
+        )
+        before_rows = self.record_transport(NOW, key="decision-before-conflict")
+        market_probability = price_groups(before_rows)[before_rows[0].odds_id]
         base = dict(
             raybet_match_id="match-1",
             map_number=1,
             underdog_side="team_one",
-            market_probability=0.4,
+            market_probability=market_probability,
             model_probability=0.5,
             edge=0.1,
             data_quality=0.8,
             eligible=True,
             reason="eligible",
-            contributions={"draft": 0.1},
+            contributions={
+                "draft": 0.1,
+                "__inputs__": {
+                    "draft_authority": asdict(authority),
+                    "strict_live_eligibility": {
+                        "mapping_refs": {"strict_mapping_id": 1}
+                    },
+                },
+            },
             input_ref="input-1",
             strategy_version="strategy-1",
         )
@@ -875,64 +1535,101 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                     **base,
                     decision_key="decision-before-conflict",
                     decided_at=NOW,
-                )
+                ),
+                draft_authority=authority,
+                vision_observation=original,
+                vision_transport_key="decision-before-conflict",
             )
+        )
+        self.store.insert_vision_observation(conflicting)
+        self.record_transport(
+            NOW + timedelta(seconds=1),
+            key="decision-after-conflict",
         )
         self.assertFalse(
             self.store.insert_decision(
                 SimpleNamespace(
                     **{**base, "decision_key": "decision-after-conflict"},
                     decided_at=NOW + timedelta(seconds=1),
-                )
+                ),
+                draft_authority=authority,
+                vision_observation=original,
+                vision_transport_key="decision-after-conflict",
             )
         )
 
     def test_out_of_order_conflict_uses_earliest_capture_cutoff(self) -> None:
         original = observation(NOW, frame="original")
-        first_conflict = replace(
+        first_conflict = reframe(
             original,
+            frame="conflict-late",
             captured_at=NOW + timedelta(seconds=10),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict-late",
         )
-        earlier_conflict = replace(
+        earlier_conflict = reframe(
             original,
+            frame="conflict-earlier",
             captured_at=NOW + timedelta(seconds=5),
             radiant_hero_ids=(1, 2, 3, 4, 7),
             dire_hero_ids=(5, 6, 8, 9, 10),
-            source_frame_ref="conflict-earlier",
         )
         self.store.insert_vision_observation(original)
+        authority = self.seed_draft_authority(
+            NOW,
+            label="shadow-out-of-order-conflict",
+        )
         self.store.insert_vision_observation(first_conflict)
         self.store.insert_vision_observation(earlier_conflict)
+        transport_at = NOW + timedelta(seconds=7)
+        transport_rows = self.record_transport(
+            transport_at,
+            key="decision-out-of-order",
+        )
         decision = SimpleNamespace(
             decision_key="decision-out-of-order",
             raybet_match_id="match-1",
             map_number=1,
-            decided_at=NOW + timedelta(seconds=7),
+            decided_at=transport_at,
             underdog_side="team_one",
-            market_probability=0.4,
+            market_probability=price_groups(transport_rows)[
+                transport_rows[0].odds_id
+            ],
             model_probability=0.5,
             edge=0.1,
             data_quality=0.8,
             eligible=True,
             reason="eligible",
-            contributions={"draft": 0.1},
+            contributions={
+                "draft": 0.1,
+                "__inputs__": {
+                    "draft_authority": asdict(authority),
+                    "strict_live_eligibility": {
+                        "mapping_refs": {"strict_mapping_id": 1}
+                    },
+                },
+            },
             input_ref="input-1",
             strategy_version="strategy-1",
         )
 
-        self.assertFalse(self.store.insert_decision(decision))
+        self.assertFalse(
+            self.store.insert_decision(
+                decision,
+                draft_authority=authority,
+                vision_observation=original,
+                vision_transport_key="decision-out-of-order",
+            )
+        )
 
     def test_future_anchor_arriving_first_rebases_to_capture_order(self) -> None:
         original = observation(NOW, frame="original")
-        later_conflict = replace(
+        later_conflict = reframe(
             original,
+            frame="conflict-late",
             captured_at=NOW + timedelta(seconds=10),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict-late",
         )
         self.store.insert_vision_observation(later_conflict)
         self.store.insert_vision_observation(original)
@@ -943,7 +1640,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                  FROM vision_draft_anchors
                 WHERE raybet_match_id='match-1' AND map_number=1"""
         ).fetchone()
-        self.assertEqual(anchor["source_frame_ref"], "original")
+        self.assertEqual(anchor["source_frame_ref"], original.source_frame_ref)
         self.assertEqual(anchor["anchored_at"], NOW.isoformat())
         self.assertEqual(anchor["status"], "conflict")
         self.assertEqual(anchor["conflict_at"], (NOW + timedelta(seconds=10)).isoformat())
@@ -955,42 +1652,35 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             [(str(row[0]), int(row[1])) for row in rows],
-            [("original", 1), ("conflict-late", 0)],
+            [
+                (original.source_frame_ref, 1),
+                (later_conflict.source_frame_ref, 0),
+            ],
         )
 
-        decision = SimpleNamespace(
-            decision_key="decision-before-rebased-conflict",
-            raybet_match_id="match-1",
-            map_number=1,
-            decided_at=NOW + timedelta(seconds=5),
-            underdog_side="team_one",
-            market_probability=0.4,
-            model_probability=0.5,
-            edge=0.1,
-            data_quality=0.8,
-            eligible=True,
-            reason="eligible",
-            contributions={"draft": 0.1},
-            input_ref="input-1",
-            strategy_version="strategy-1",
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM vision_draft_conflicts
+                    WHERE raybet_match_id='match-1' AND map_number=1"""
+            ).fetchone()[0],
+            1,
         )
-        self.assertTrue(self.store.insert_decision(decision))
 
     def test_out_of_order_conflict_is_excluded_from_causal_alignment_reads(self) -> None:
         original = observation(NOW, frame="original")
-        first_conflict = replace(
+        first_conflict = reframe(
             original,
+            frame="conflict-late",
             captured_at=NOW + timedelta(seconds=10),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict-late",
         )
-        earlier_conflict = replace(
+        earlier_conflict = reframe(
             original,
+            frame="conflict-earlier",
             captured_at=NOW + timedelta(seconds=5),
             radiant_hero_ids=(1, 2, 3, 4, 7),
             dire_hero_ids=(5, 6, 8, 9, 10),
-            source_frame_ref="conflict-earlier",
         )
         self.store.insert_vision_observation(original)
         self.store.insert_vision_observation(first_conflict)
@@ -1013,12 +1703,12 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
     def test_pending_successor_rechecks_conflict_before_filling(self) -> None:
         order = self.insert_pending(NOW)
         original = observation(NOW - timedelta(seconds=2), frame="original")
-        conflicting = replace(
+        conflicting = reframe(
             original,
+            frame="conflict",
             captured_at=NOW - timedelta(seconds=1),
             radiant_hero_ids=(1, 2, 3, 4, 6),
             dire_hero_ids=(5, 7, 8, 9, 10),
-            source_frame_ref="conflict",
         )
         self.store.insert_vision_observation(original)
         self.store.insert_vision_observation(conflicting)
@@ -1041,7 +1731,8 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         )
 
     def test_transport_uses_latest_prior_vision_not_a_future_frame(self) -> None:
-        self.store.insert_vision_observation(observation(NOW, frame="old"))
+        old = observation(NOW, frame="old")
+        self.store.insert_vision_observation(old)
         self.record_transport(NOW + timedelta(seconds=1), key="before-new-frame")
         self.store.insert_vision_observation(
             observation(NOW + timedelta(seconds=2), frame="current")
@@ -1063,7 +1754,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "no_signal")
         aligned = strategy.evaluate.call_args.kwargs["observation"]
-        self.assertEqual(aligned.source_frame_ref, "old")
+        self.assertEqual(aligned.source_frame_ref, old.source_frame_ref)
         self.assertEqual(aligned.game_clock_seconds, 601)
 
     def test_transport_without_a_recent_prior_vision_waits_for_alignment(self) -> None:
@@ -1186,27 +1877,10 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
     ) -> tuple[Mock, list[int], list[int]]:
         if add_observation:
             self.store.insert_vision_observation(observation(NOW))
-        self.store.upsert_raybet_match(
-            raybet_metadata(), NOW - timedelta(minutes=2)
+        authority = self.seed_draft_authority(
+            NOW,
+            label="shadow-transport-flow",
         )
-        with patch(
-            "live_betting.strict_eligibility._utc_now",
-            return_value=NOW - timedelta(seconds=30),
-        ):
-            accept_strict_live_map_mapping(
-                self.store.connection,
-                raybet_match_id="match-1",
-                map_number=1,
-                event_id=EVENT_ID,
-                team_one_id=1,
-                team_two_id=2,
-                canonical_team_one_id=10,
-                canonical_team_two_id=20,
-                source="test_fixture",
-                evidence=mapping_evidence(),
-                accepted_by="tester",
-                accepted_at=NOW - timedelta(minutes=1),
-            )
         strategy = Mock()
         strategy.evaluate.return_value = SimpleNamespace(
             decision=SimpleNamespace(
@@ -1231,19 +1905,38 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
             **_target: object,
         ) -> DraftCurve:
             draft_times.append(as_of)
-            return DraftCurve((DraftPoint(
-                10, 0.5, 0.0, 0.0, 0.0, validated=True, support=100,
-                calibration_ref="test:passed", input_refs=("test:model",),
-                uncertainty=0.0,
-                feature_hash="1" * 64, model_hash="2" * 64,
-                calibration_hash="3" * 64,
-                global_calibration_passed=True,
-                global_gate_ref="test:global-passed",
-                model_version="draft-logistic-l2-v1",
-                model_kind="pure_draft",
-                availability_mode="prospective",
-                input_snapshot_hash="5" * 64,
-            ),))
+            return DraftCurve(
+                (DraftPoint(
+                    10, authority.radiant_probability, 0.0, 0.0,
+                    authority.quality, validated=True,
+                    support=authority.support,
+                    calibration_ref=(
+                        f"draft-calibration:{authority.calibration_hash}"
+                    ),
+                    input_refs=("test",),
+                    uncertainty=authority.uncertainty,
+                    feature_hash=authority.feature_hash,
+                    model_hash=authority.model_hash,
+                    calibration_hash=authority.calibration_hash,
+                    global_calibration_passed=True,
+                    global_gate_ref=authority.global_gate_ref,
+                    model_version=authority.model_version,
+                    model_kind="pure_draft",
+                    availability_mode="prospective",
+                    input_snapshot_hash=authority.input_snapshot_hash,
+                    landmark_key=authority.landmark_key,
+                    curve_key=authority.curve_key,
+                    deployment_key=authority.deployment_key,
+                    target_snapshot_hash=authority.target_snapshot_hash,
+                ),),
+                source_ref=authority.source_ref,
+                authority_revision=authority.authority_revision,
+                dependency_revision=authority.dependency_revision,
+                curve_key=authority.curve_key,
+                deployment_key=authority.deployment_key,
+                target_snapshot_hash=authority.target_snapshot_hash,
+                strict_mapping_id=authority.strict_mapping_id,
+            )
 
         strategy.fake_profiles = fake_profiles
         strategy.fake_draft = fake_draft

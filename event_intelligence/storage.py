@@ -11,7 +11,7 @@ from typing import Any, Iterator, Sequence
 
 
 BUSY_TIMEOUT_MS = 5_000
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 CUTOFF_LINEAGE_SCHEMA_VERSION = 8
 
 
@@ -107,6 +107,101 @@ CREATE TABLE IF NOT EXISTS raw_source_artifacts (
     created_at TEXT NOT NULL,
     UNIQUE (source, content_hash)
 );
+
+CREATE TABLE IF NOT EXISTS raw_source_artifact_relocations (
+    relocation_id TEXT PRIMARY KEY CHECK (length(relocation_id) = 64),
+    relocation_sequence INTEGER NOT NULL CHECK (relocation_sequence > 0),
+    artifact_id TEXT NOT NULL REFERENCES raw_source_artifacts(artifact_id),
+    content_hash TEXT NOT NULL CHECK (length(content_hash) = 64),
+    source TEXT NOT NULL CHECK (source IN ('opendota', 'stratz')),
+    old_storage_path TEXT NOT NULL,
+    new_storage_path TEXT NOT NULL,
+    uncompressed_bytes INTEGER NOT NULL CHECK (uncompressed_bytes >= 0),
+    compressed_bytes INTEGER NOT NULL CHECK (compressed_bytes >= 0),
+    schema_fingerprint TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    actor TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+    relocated_at TEXT NOT NULL,
+    UNIQUE (artifact_id, relocation_sequence),
+    CHECK (old_storage_path != new_storage_path)
+);
+
+CREATE TRIGGER IF NOT EXISTS raw_source_artifact_relocations_guard_insert
+BEFORE INSERT ON raw_source_artifact_relocations
+WHEN NOT EXISTS (
+        SELECT 1 FROM raw_source_artifacts AS artifact
+         WHERE artifact.artifact_id=NEW.artifact_id
+           AND artifact.content_hash=NEW.content_hash
+           AND artifact.source=NEW.source
+           AND artifact.storage_path=NEW.old_storage_path
+           AND artifact.uncompressed_bytes=NEW.uncompressed_bytes
+           AND artifact.compressed_bytes=NEW.compressed_bytes
+           AND artifact.schema_fingerprint=NEW.schema_fingerprint
+    )
+    OR NEW.relocation_sequence != COALESCE(
+        (SELECT MAX(existing.relocation_sequence) + 1
+           FROM raw_source_artifact_relocations AS existing
+          WHERE existing.artifact_id=NEW.artifact_id),
+        1
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'raw source relocation authority mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS raw_source_artifact_relocations_immutable_update
+BEFORE UPDATE ON raw_source_artifact_relocations
+BEGIN
+    SELECT RAISE(ABORT, 'raw source relocation audit is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS raw_source_artifact_relocations_immutable_delete
+BEFORE DELETE ON raw_source_artifact_relocations
+BEGIN
+    SELECT RAISE(ABORT, 'raw source relocation audit is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS raw_source_artifacts_identity_immutable
+BEFORE UPDATE ON raw_source_artifacts
+WHEN NEW.artifact_id IS NOT OLD.artifact_id
+    OR NEW.content_hash IS NOT OLD.content_hash
+    OR NEW.source IS NOT OLD.source
+    OR NEW.artifact_use IS NOT OLD.artifact_use
+    OR NEW.endpoint IS NOT OLD.endpoint
+    OR NEW.sanitized_request_identity IS NOT OLD.sanitized_request_identity
+    OR NEW.uncompressed_bytes IS NOT OLD.uncompressed_bytes
+    OR NEW.compressed_bytes IS NOT OLD.compressed_bytes
+    OR NEW.source_at IS NOT OLD.source_at
+    OR NEW.received_at IS NOT OLD.received_at
+    OR NEW.schema_fingerprint IS NOT OLD.schema_fingerprint
+    OR NEW.event_id IS NOT OLD.event_id
+    OR NEW.match_id IS NOT OLD.match_id
+    OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'raw source artifact identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS raw_source_artifacts_relocation_required
+BEFORE UPDATE OF storage_path ON raw_source_artifacts
+WHEN NEW.storage_path IS NOT OLD.storage_path
+ AND NOT EXISTS (
+     SELECT 1 FROM raw_source_artifact_relocations AS relocation
+      WHERE relocation.artifact_id=OLD.artifact_id
+        AND relocation.content_hash=OLD.content_hash
+        AND relocation.source=OLD.source
+        AND relocation.old_storage_path=OLD.storage_path
+        AND relocation.new_storage_path=NEW.storage_path
+        AND relocation.uncompressed_bytes=OLD.uncompressed_bytes
+        AND relocation.compressed_bytes=OLD.compressed_bytes
+        AND relocation.schema_fingerprint=OLD.schema_fingerprint
+        AND relocation.relocation_sequence=(
+            SELECT MAX(latest.relocation_sequence)
+              FROM raw_source_artifact_relocations AS latest
+             WHERE latest.artifact_id=OLD.artifact_id
+        )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'raw source artifact relocation audit is required');
+END;
 
 CREATE TABLE IF NOT EXISTS raw_source_observations (
     observation_id TEXT PRIMARY KEY,
@@ -515,9 +610,19 @@ class IntelligenceStorage:
         if self._owns_connection:
             self.connection.close()
 
-    def init_schema(self, *, seed_events: bool = True) -> None:
+    def init_schema(
+        self,
+        *,
+        seed_events: bool = True,
+        external_transaction: bool = False,
+    ) -> None:
         self._reject_future_schema()
-        with self.transaction():
+        transaction = (
+            self._external_transaction()
+            if external_transaction
+            else self.transaction()
+        )
+        with transaction:
             for statement in self._schema_statements(SCHEMA_SQL):
                 self.connection.execute(statement)
             self._migrate_schema()
@@ -533,6 +638,16 @@ class IntelligenceStorage:
                    VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
                 ((1,), (CURRENT_SCHEMA_VERSION,)),
             )
+
+    @contextmanager
+    def _external_transaction(self) -> Iterator[None]:
+        if not self.connection.in_transaction:
+            raise RuntimeError("external transaction is not active")
+        self._transaction_depth += 1
+        try:
+            yield
+        finally:
+            self._transaction_depth -= 1
 
     def _reject_future_schema(self) -> None:
         exists = self.connection.execute(

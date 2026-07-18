@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import asyncio
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ from event_intelligence.ingest_adapters import (
     SQLiteIngestAdapter,
 )
 from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
+from event_intelligence.raw_registry import relocate_raw_source_artifacts
 from event_intelligence.opendota import OpenDotaAdapter
 from event_intelligence.registry import EventRegistry
 from event_intelligence.scheduler import ScheduleRun, SchedulerRetryState
@@ -410,6 +412,113 @@ class IngestAdapterTests(unittest.TestCase):
             (initial.observation_id,),
         ).fetchone()
         self.assertEqual(row["first_usable_at"], (NOW + timedelta(seconds=1)).isoformat())
+
+    def test_raw_artifact_conflict_cannot_implicitly_relocate_or_recreate(self) -> None:
+        payload = completed_payload()
+        self.discover()
+        first = self.archive_payload(payload)
+        observation_count = self.storage.connection.execute(
+            "SELECT COUNT(*) FROM raw_source_observations"
+        ).fetchone()[0]
+
+        other = RawArchive(
+            Path(self.directory.name) / "other-raw",
+            observation_sink=self.store.record_raw_artifact,
+        )
+        with self.assertRaisesRegex(RuntimeError, "persisted authority"):
+            other.archive_json(
+                source="opendota",
+                endpoint=f"/api/matches/{payload['match_id']}",
+                request_identity=f"/api/matches/{payload['match_id']}",
+                payload_bytes=canonical_json_bytes(payload),
+                observed_at=NOW + timedelta(seconds=1),
+                match_id=payload["match_id"],
+                status_code=200,
+            )
+        self.assertEqual(list((Path(self.directory.name) / "other-raw").rglob("*.json.gz")), [])
+        self.assertEqual(
+            self.storage.connection.execute(
+                "SELECT COUNT(*) FROM raw_source_observations"
+            ).fetchone()[0],
+            observation_count,
+        )
+
+        first.path.unlink()
+        recreated = RawArchive(
+            Path(self.directory.name) / "raw",
+            observation_sink=self.store.record_raw_artifact,
+        )
+        with self.assertRaisesRegex(RuntimeError, "registered_file_was_missing"):
+            recreated.archive_json(
+                source="opendota",
+                endpoint=f"/api/matches/{payload['match_id']}",
+                request_identity=f"/api/matches/{payload['match_id']}",
+                payload_bytes=canonical_json_bytes(payload),
+                observed_at=NOW + timedelta(seconds=2),
+                match_id=payload["match_id"],
+                status_code=200,
+            )
+        self.assertFalse(first.path.exists())
+
+    def test_raw_artifact_relocation_is_verified_and_durably_audited(self) -> None:
+        payload = completed_payload()
+        self.discover()
+        receipt = self.archive_payload(payload)
+        artifact_id = f"opendota:{receipt.content_sha256}"
+        relocation_root = Path(self.directory.name) / "relocated-raw"
+        destination = relocation_root / receipt.path.name
+        destination.parent.mkdir()
+        shutil.copy2(receipt.path, destination)
+
+        relocation_ids = relocate_raw_source_artifacts(
+            self.storage.connection,
+            {artifact_id: destination},
+            allowed_new_roots=[relocation_root],
+            reason="database bundle restore",
+            actor="test_restore",
+            relocated_at=NOW + timedelta(minutes=1),
+        )
+
+        self.assertEqual(len(relocation_ids), 1)
+        row = self.storage.connection.execute(
+            """SELECT artifact_id, content_hash, source, old_storage_path,
+                      new_storage_path, reason, actor, relocation_sequence
+                 FROM raw_source_artifact_relocations"""
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            (
+                artifact_id,
+                receipt.content_sha256,
+                "opendota",
+                str(receipt.path.resolve()),
+                str(destination.resolve()),
+                "database bundle restore",
+                "test_restore",
+                1,
+            ),
+        )
+        self.assertEqual(
+            self.storage.connection.execute(
+                "SELECT storage_path FROM raw_source_artifacts WHERE artifact_id=?",
+                (artifact_id,),
+            ).fetchone()[0],
+            str(destination.resolve()),
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "audit is immutable"):
+            self.storage.connection.execute(
+                "UPDATE raw_source_artifact_relocations SET actor='forged'"
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "audit is required"):
+            self.storage.connection.execute(
+                "UPDATE raw_source_artifacts SET storage_path='forged' WHERE artifact_id=?",
+                (artifact_id,),
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "identity is immutable"):
+            self.storage.connection.execute(
+                "UPDATE raw_source_artifacts SET compressed_bytes=0 WHERE artifact_id=?",
+                (artifact_id,),
+            )
 
     def test_same_payload_hash_from_two_sources_has_two_artifacts(self) -> None:
         payload = completed_payload()

@@ -543,6 +543,14 @@ class ServiceHealthTests(unittest.TestCase):
                 migrate.call_args.args,
                 (root / "service.db", backup_dir),
             )
+            self.assertIs(
+                migrate.call_args.kwargs["supervisor_process_lock_held"],
+                True,
+            )
+            self.assertEqual(
+                migrate.call_args.kwargs["odds_raw_root"],
+                root / "live_betting" / "raw-v2",
+            )
 
     def test_routine_supervisor_start_verifies_without_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

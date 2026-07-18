@@ -30,6 +30,20 @@ describe("PostmatchIntelligencePanel", () => {
     expect(fetchMock).toHaveBeenCalledWith("match-1", 2, expect.any(AbortSignal));
   });
 
+  it("shows current mapping warnings without hiding immutable postmatch facts", async () => {
+    fetchMock.mockResolvedValue({
+      ...available(),
+      warnings: ["mapping_invalidated"],
+    });
+    renderPanel();
+
+    expect(await screen.findByText("当前 mapping 状态待复核")).toBeInTheDocument();
+    expect(screen.getByText("该局 strict mapping 已失效。")).toBeInTheDocument();
+    expect(screen.getByText("mapping_invalidated")).toBeInTheDocument();
+    expect(screen.getByText("OpenDota #9001")).toBeInTheDocument();
+    expect(screen.getByText("Kunkka")).toBeInTheDocument();
+  });
+
   it.each([
     ["review", "opendota_match_link_conflict", "赛后归因待复核"],
     ["unavailable", "strict_mapping_missing", "赛后归因不可用"],
@@ -45,6 +59,34 @@ describe("PostmatchIntelligencePanel", () => {
     expect(await screen.findByText(title)).toBeInTheDocument();
     expect(screen.getByText(reason)).toBeInTheDocument();
     expect(screen.queryByText("Kunkka")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["review", "reconciliation_causal_order_invalid", "结算核对时间早于 mapping、时间顺序异常，或缺少可验证时区。"],
+    ["unavailable", "reconciliation_schema_unavailable", "当前数据库缺少赛后结算核对协议结构。"],
+    ["review", "opendota_match_identity_invalid", "已确认结算中的 OpenDota 比赛 ID 无效。"],
+    ["unavailable", "opendota_scope_schema_unavailable", "当前数据库缺少验证 OpenDota 正式赛事范围所需的协议结构。"],
+    ["unavailable", "opendota_ingest_schema_unavailable", "当前数据库缺少验证 OpenDota 入库身份所需的协议结构。"],
+    ["review", "opendota_result_identity_conflict", "OpenDota 比赛结果缺失或类型无效，无法确认胜方身份。"],
+    ["review", "reconciliation_winner_conflict", "RayBet 与 OpenDota 的已确认胜方不一致。"],
+    ["unavailable", "settlement_evidence_schema_unavailable", "当前数据库缺少验证结算证据所需的协议结构。"],
+    ["unavailable", "raybet_match_schema_unavailable", "当前数据库缺少 RayBet 比赛身份协议结构。"],
+    ["review", "reconciliation_mapping_authority_missing", "历史结算缺少不可变 mapping authority，需人工复核。"],
+    ["unavailable", "map_result_schema_unavailable", "当前数据库缺少赛果 mapping authority 协议结构。"],
+    ["unavailable", "map_result_missing", "已确认结算缺少对应的不可变赛果记录。"],
+    ["review", "map_result_mapping_lineage_unverified", "赛果记录与结算时的不可变 mapping 不一致。"],
+    ["review", "map_result_causal_order_invalid", "赛果记录的时间顺序无法通过因果校验。"],
+  ] as const)("explains exact-postmatch reason %s", async (status, reason, detail) => {
+    fetchMock.mockResolvedValue({
+      ...available(),
+      status,
+      reason,
+      postmatch: null,
+    });
+    renderPanel();
+
+    expect(await screen.findByText(detail)).toBeInTheDocument();
+    expect(screen.getByText(reason)).toBeInTheDocument();
   });
 
   it("rejects a response for another map instead of showing stale facts", async () => {

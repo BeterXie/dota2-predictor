@@ -384,7 +384,7 @@ def _validate_video_payload(payload: dict[str, Any]) -> None:
                 raise ValueError("video URL is invalid")
             parsed = urlsplit(value)
             if (
-                parsed.scheme not in {"https", "wss"}
+                parsed.scheme != "https"
                 or parsed.hostname not in RAYBET_VIDEO_HOSTS
                 or parsed.username
                 or parsed.password

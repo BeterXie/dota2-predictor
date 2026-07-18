@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 _SENSITIVE_KEY_PARTS = (
@@ -43,6 +44,16 @@ _QUERY_SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 _DROP = object()
+
+PUBLIC_STREAM_HOSTS = frozenset(
+    {
+        "play.ehome.gg",
+        "qplay.ehome.gg",
+        "qplay.shyxswl.com",
+    }
+)
+PUBLIC_STREAM_EVIDENCE_KEY = "_dota2_predictor_public_stream_v1"
+PUBLIC_STREAM_EVIDENCE_SOURCE = "direct_unsigned_v1"
 
 
 class RayBetPayloadSanitizationError(ValueError):
@@ -83,6 +94,72 @@ def sanitize_public_url(value: object) -> str | None:
     if parsed.port is not None:
         netloc = f"{netloc}:{parsed.port}"
     return urlunsplit((parsed.scheme.casefold(), netloc, parsed.path, "", ""))
+
+
+def verified_public_stream_url(value: object) -> str | None:
+    """Return a canonical unsigned HLS URL only for known public stream hosts."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        return None
+    if "\\" in value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        decoded_path = unquote(parsed.path, errors="strict")
+    except (UnicodeError, ValueError):
+        return None
+    hostname = parsed.hostname.casefold() if parsed.hostname is not None else None
+    segments = decoded_path.split("/")
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname not in PUBLIC_STREAM_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or not decoded_path.casefold().endswith(".m3u8")
+        or any(segment in {".", ".."} for segment in segments)
+        or any(character in decoded_path for character in ("?", "#", "\x00", "\\"))
+    ):
+        return None
+    return urlunsplit(("https", hostname, parsed.path, "", ""))
+
+
+def public_stream_evidence(value: object) -> dict[str, str] | None:
+    url = verified_public_stream_url(value)
+    if url is None:
+        return None
+    return {"source": PUBLIC_STREAM_EVIDENCE_SOURCE, "url": url}
+
+
+def stored_public_stream_url(live_url: object, raw_json: object) -> str | None:
+    """Verify that a stored stream URL has writer-owned unsigned provenance."""
+    url = verified_public_stream_url(live_url)
+    if url is None:
+        return None
+    try:
+        payload = (
+            raw_json
+            if isinstance(raw_json, Mapping)
+            else json.loads(str(raw_json or "{}"))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    evidence = payload.get(PUBLIC_STREAM_EVIDENCE_KEY)
+    if not isinstance(evidence, Mapping):
+        return None
+    if (
+        evidence.get("source") != PUBLIC_STREAM_EVIDENCE_SOURCE
+        or evidence.get("url") != url
+    ):
+        return None
+    return url
 
 
 def _sanitize_string(value: str, *, key: str) -> str | object:
@@ -146,7 +223,13 @@ def sanitize_raybet_payload(
 
 
 __all__ = [
+    "PUBLIC_STREAM_EVIDENCE_KEY",
+    "PUBLIC_STREAM_EVIDENCE_SOURCE",
+    "PUBLIC_STREAM_HOSTS",
     "RayBetPayloadSanitizationError",
+    "public_stream_evidence",
     "sanitize_public_url",
     "sanitize_raybet_payload",
+    "stored_public_stream_url",
+    "verified_public_stream_url",
 ]

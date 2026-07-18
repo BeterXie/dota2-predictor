@@ -46,6 +46,7 @@ CREATE TABLE odds_alignments (
 CREATE TABLE settlement_reconciliations (
     raybet_match_id TEXT,
     map_number INTEGER,
+    strict_mapping_id INTEGER,
     dota_match_id INTEGER,
     raybet_winner_side TEXT,
     opendota_winner_side TEXT,
@@ -72,7 +73,14 @@ CREATE TABLE settlement_result_evidence (
 CREATE TABLE map_results (
     raybet_match_id TEXT,
     map_number INTEGER,
-    dota_match_id INTEGER
+    strict_mapping_id INTEGER,
+    dota_match_id INTEGER,
+    winner_side TEXT,
+    team_one_kills INTEGER,
+    team_two_kills INTEGER,
+    duration_seconds INTEGER,
+    evidence_ref TEXT,
+    settled_at TEXT
 );
 CREATE TABLE matches (
     match_id INTEGER PRIMARY KEY,
@@ -180,6 +188,8 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
 
         self.mapping = SimpleNamespace(
             mapping_id=7,
+            raybet_match_id="ray-1",
+            map_number=1,
             event_id="event-1",
             acceptance_mode="manual_exact",
             mapping_version="strict-live-map-v3",
@@ -205,6 +215,11 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
             "query_strict_live_eligibility",
             return_value=eligibility,
         )
+        self.snapshot_patch = patch.object(
+            intelligence,
+            "query_strict_mapping_snapshot",
+            return_value=eligibility,
+        )
         self.scope_patch = patch.object(
             intelligence,
             "_targeted_scopes",
@@ -212,6 +227,7 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         )
         self.path_patch.start()
         self.gate_patch.start()
+        self.snapshot_patch.start()
         self.scope_patch.start()
         app = FastAPI()
         app.include_router(router)
@@ -220,6 +236,7 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client.close()
         self.scope_patch.stop()
+        self.snapshot_patch.stop()
         self.gate_patch.stop()
         self.path_patch.stop()
         self.directory.cleanup()
@@ -311,14 +328,22 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         status: str = "confirmed",
         reason: str = "sources_agree",
         observed_at: str = NOW,
+        strict_mapping_id: int | None = 7,
     ) -> None:
         connection = sqlite3.connect(self.path)
         connection.execute(
             """INSERT INTO settlement_reconciliations VALUES
-               ('ray-1', 1, 9001, 'team_one', 'team_one',
+               ('ray-1', 1, ?, 9001, 'team_one', 'team_one',
                 'raybet:9001', 'opendota:9001', ?, ?, ?, ?)""",
-            (status, reason, observed_at, observed_at),
+            (strict_mapping_id, status, reason, observed_at, observed_at),
         )
+        if status == "confirmed":
+            connection.execute(
+                """INSERT INTO map_results VALUES
+                   ('ray-1', 1, ?, 9001, 'team_one', 30, 20, 2400,
+                    'settlement-reconciliation:ray-1:map:1', ?)""",
+                (strict_mapping_id, observed_at),
+            )
         connection.commit()
         connection.close()
 
@@ -579,16 +604,13 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         self._insert_reconciliation()
         self._insert_evidence()
         replacement = SimpleNamespace(**{**vars(self.mapping), "mapping_id": 8})
-        current = SimpleNamespace(
-            eligible=True, reason="eligible", mapping=self.mapping
-        )
         historical = SimpleNamespace(
             eligible=True, reason="eligible", mapping=replacement
         )
         with patch.object(
             intelligence,
-            "query_strict_live_eligibility",
-            side_effect=(current, historical),
+            "query_strict_mapping_snapshot",
+            return_value=historical,
         ):
             payload = self.client.get(
                 "/api/monitor/matches/ray-1/maps/1/postmatch"
@@ -604,7 +626,7 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         connection = sqlite3.connect(self.path)
         connection.execute(
             """INSERT INTO settlement_reconciliations VALUES
-               ('ray-2', 1, 9001, 'team_one', 'team_one',
+               ('ray-2', 1, 8, 9001, 'team_one', 'team_one',
                 'raybet:other', 'opendota:9001', 'manual_review',
                 'opendota_match_link_conflict', ?, ?)""",
             (NOW, NOW),
@@ -616,6 +638,57 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "review")
         self.assertEqual(payload["reason"], "opendota_match_link_conflict")
+        self.assertIsNone(payload["postmatch"])
+
+    def test_legacy_reconciliation_without_mapping_authority_is_review(self) -> None:
+        self._insert_reconciliation(strict_mapping_id=None)
+        self._insert_evidence()
+
+        payload = self.client.get(
+            "/api/monitor/matches/ray-1/maps/1/postmatch"
+        ).json()
+
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(
+            payload["reason"], "reconciliation_mapping_authority_missing"
+        )
+        self.assertIsNone(payload["postmatch"])
+
+    def test_later_live_mapping_invalidation_warns_without_hiding_history(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        current = SimpleNamespace(
+            eligible=False,
+            reason="mapping_invalidated",
+            mapping=self.mapping,
+        )
+        with patch.object(
+            intelligence,
+            "query_strict_live_eligibility",
+            return_value=current,
+        ):
+            payload = self.client.get(
+                "/api/monitor/matches/ray-1/maps/1/postmatch"
+            ).json()
+
+        self.assertEqual(payload["status"], "available")
+        self.assertEqual(payload["warnings"], ["mapping_invalidated"])
+        self.assertEqual(payload["postmatch"]["match"]["match_id"], 9001)
+
+    def test_map_result_mapping_mismatch_is_review(self) -> None:
+        self._insert_reconciliation()
+        self._insert_evidence()
+        connection = sqlite3.connect(self.path)
+        connection.execute("UPDATE map_results SET strict_mapping_id=8")
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get(
+            "/api/monitor/matches/ray-1/maps/1/postmatch"
+        ).json()
+
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(payload["reason"], "map_result_mapping_lineage_unverified")
         self.assertIsNone(payload["postmatch"])
 
     def test_ineligible_strict_mapping_is_never_bypassed(self) -> None:

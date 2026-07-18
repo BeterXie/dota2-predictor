@@ -42,7 +42,7 @@ def valid_video_event() -> dict:
         "result": {
             "state": "playing",
             "currentTime": 120.0,
-            "playback_url": "wss://cfinfo.365raylinks.com/live/38407985.m3u8",
+            "playback_url": "https://cfinfo.365raylinks.com/live/38407985.m3u8",
         }
     }
     event = valid_event()

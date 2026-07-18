@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class LiveObservation(BaseModel):
@@ -16,7 +16,7 @@ class LiveObservation(BaseModel):
 
     schema_version: int = Field(
         default=SCHEMA_VERSION,
-        ge=SCHEMA_VERSION,
+        ge=1,
         le=SCHEMA_VERSION,
     )
     raybet_match_id: str = Field(min_length=1)
@@ -30,6 +30,9 @@ class LiveObservation(BaseModel):
     clock_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     draft_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     source_frame_ref: str
+    source_frame_sha256: str | None = None
+    source_frame_bytes: int | None = Field(default=None, gt=0)
+    source_frame_path: str | None = None
     screen_state: str = "unknown"
 
     @field_validator("captured_at_utc")
@@ -46,6 +49,26 @@ class LiveObservation(BaseModel):
             raise ValueError("hero IDs must be positive")
         if len(heroes) != len(set(heroes)):
             raise ValueError("hero IDs must be unique")
+        integrity = (
+            self.source_frame_sha256,
+            self.source_frame_bytes,
+            self.source_frame_path,
+        )
+        if any(value is not None for value in integrity) and any(
+            value is None for value in integrity
+        ):
+            raise ValueError("vision frame integrity metadata must be complete")
+        if all(value is not None for value in integrity):
+            digest = str(self.source_frame_sha256)
+            if (
+                len(digest) != 64
+                or digest != digest.casefold()
+                or any(character not in "0123456789abcdef" for character in digest)
+                or self.source_frame_ref != f"vision-frame:sha256:{digest}"
+            ):
+                raise ValueError("vision frame reference must match its SHA-256")
+            if not str(self.source_frame_path).strip():
+                raise ValueError("source_frame_path must be non-empty")
         return self
 
     @field_validator("source_frame_ref")

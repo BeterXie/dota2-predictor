@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Mapping
 
+from .settlement import (
+    persisted_settlement_authority_reason,
+    record_settlement_authority_review,
+)
+from .vision_frame_registry import verify_bound_order_vision_frame
+
 
 CHANNEL_EMAIL = "email"
 EVENT_FILLED = "filled"
@@ -123,7 +129,7 @@ def filled_order_payload(
                          AND transport.processing_status='processed'
                          AND EXISTS (
                                SELECT 1
-                                 FROM odds_response_outcomes AS outcome
+                                 FROM odds_response_outcomes_effective AS outcome
                                 WHERE outcome.observation_key=transport.observation_key
                                   AND outcome.raybet_match_id=orders.raybet_match_id
                                   AND outcome.odds_id=orders.odds_id
@@ -145,6 +151,10 @@ def filled_order_payload(
     ).fetchone()
     if order is None:
         raise ValueError("notification order lineage is unavailable")
+    try:
+        verify_bound_order_vision_frame(connection, order_key)
+    except (RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+        raise ValueError("notification vision frame authority is invalid") from error
     event_name = None
     if order["event_id"] and _table_has_column(
         connection, "event_registry", "canonical_name"
@@ -614,6 +624,10 @@ def enqueue(
     )
     with _transaction(connection):
         if event_type in {EVENT_FILLED, EVENT_SETTLED}:
+            try:
+                verify_bound_order_vision_frame(connection, order_key)
+            except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+                return False
             if _strict_mapping_block_reason(connection, order_key) is not None:
                 return False
             try:
@@ -674,6 +688,10 @@ def _formal_notification_block_reason(
     order_key: str,
 ) -> str | None:
     event_type = str(row["event_type"])
+    try:
+        verify_bound_order_vision_frame(connection, order_key)
+    except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return "vision_frame_integrity_failed"
     if str(row["template_version"]) != TEMPLATE_VERSION:
         return "formal_notification_template_unsupported"
     payload = json.loads(str(row["payload_json"]))
@@ -692,6 +710,17 @@ def _formal_notification_block_reason(
     ):
         return "formal_notification_payload_invalid"
     if event_type == EVENT_SETTLED:
+        authority_reason = persisted_settlement_authority_reason(
+            connection, order_key
+        )
+        if authority_reason is not None:
+            record_settlement_authority_review(
+                connection,
+                order_key,
+                authority_reason,
+                actor="notification_gate",
+            )
+            return authority_reason
         try:
             baseline = _stored_entry_payload(connection, order_key)
         except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):

@@ -18,8 +18,10 @@ from .backtest import (
 from .draft_artifacts import (
     CalibrationSample,
     DraftCalibrationArtifact,
+    assert_model_artifact_deployable,
     build_calibration_artifact,
     canonical_hash,
+    canonical_json_bytes,
 )
 from .draft_features import AvailabilityMode, DraftMapEvidence
 from .draft_model import (
@@ -32,10 +34,14 @@ from .draft_model import (
     fit_draft_model,
 )
 from .incremental import current_derived_scopes
+from .roles import (
+    PROSPECTIVE_ASSIGNMENT_VERSION,
+    RECONSTRUCTED_ASSIGNMENT_VERSION,
+)
 
 
 UTC = timezone.utc
-DEPLOYMENT_VERSION = "frozen-pure-draft-deployment-v1"
+DEPLOYMENT_VERSION = "frozen-pure-draft-deployment-v2"
 MIN_CALIBRATION_FIT_SUPPORT = 20
 MIN_CALIBRATION_EVALUATION_SUPPORT = 100
 
@@ -126,6 +132,7 @@ def _training_rows(
     corpus = load_draft_corpus(
         connection,
         availability_mode=AvailabilityMode.RECONSTRUCTED,
+        assignment_version=RECONSTRUCTED_ASSIGNMENT_VERSION,
     )
     snapshots = _draft_snapshot_rows(corpus)
     result_available = _actual_result_availability(connection)
@@ -167,6 +174,54 @@ def _training_rows(
     if schema_names is None:
         raise ValueError("no causally available draft training snapshots")
     return tuple(rows), schema_names
+
+
+def assert_draft_models_match_database(
+    connection: sqlite3.Connection,
+    models: Iterable[DraftModelArtifact],
+    *,
+    training_cutoff: datetime,
+) -> None:
+    """Rebuild deployment models from the authoritative cutoff corpus."""
+
+    if training_cutoff.tzinfo is None or training_cutoff.utcoffset() is None:
+        raise ValueError("training_cutoff must be timezone-aware")
+    cutoff = training_cutoff.astimezone(UTC)
+    ordered = tuple(sorted(models, key=lambda row: row.horizon_minutes))
+    if tuple(row.horizon_minutes for row in ordered) != tuple(HORIZONS):
+        raise ValueError("database model replay requires all five horizons")
+
+    owns_snapshot = not connection.in_transaction
+    if owns_snapshot:
+        connection.execute("BEGIN")
+    try:
+        training_rows, feature_names = _training_rows(connection, cutoff)
+        schema = FeatureSchema.from_names(feature_names)
+        for model in ordered:
+            assert_model_artifact_deployable(model)
+            if model.training_cutoff != cutoff:
+                raise ValueError("deployment model training cutoffs disagree")
+            rebuilt = fit_draft_model(
+                training_rows,
+                schema,
+                cutoff,
+                model.horizon_minutes,
+                min_samples=model.min_samples,
+                model_kind=model.model_kind,
+                l2_regularization=model.l2_regularization,
+            )
+            if canonical_json_bytes(rebuilt.to_payload()) != canonical_json_bytes(
+                model.to_payload()
+            ):
+                raise ValueError(
+                    "model artifact does not match the authoritative database corpus"
+                )
+        if owns_snapshot:
+            connection.commit()
+    except BaseException:
+        if owns_snapshot and connection.in_transaction:
+            connection.rollback()
+        raise
 
 
 def _current_calibration_samples(
@@ -352,9 +407,23 @@ def load_prospective_history(
 ) -> tuple[DraftMapEvidence, ...]:
     """Load only historical facts whose real archive availability is known."""
 
+    available = connection.execute(
+        """SELECT 1
+             FROM player_role_assignments AS roles
+             JOIN formal_map_eligibility AS eligible
+               ON eligible.match_id=roles.match_id
+            WHERE eligible.draft_readiness='ready'
+              AND roles.purpose='expected_position'
+              AND roles.assignment_version=?
+            LIMIT 1""",
+        (PROSPECTIVE_ASSIGNMENT_VERSION,),
+    ).fetchone()
+    if available is None:
+        return ()
     corpus = load_draft_corpus(
         connection,
         availability_mode=AvailabilityMode.PROSPECTIVE,
+        assignment_version=PROSPECTIVE_ASSIGNMENT_VERSION,
     )
     return tuple(row.evidence for row in corpus.maps)
 
@@ -366,6 +435,7 @@ def deployment_summary(deployment: FrozenDraftDeployment) -> str:
 __all__ = [
     "DEPLOYMENT_VERSION",
     "FrozenDraftDeployment",
+    "assert_draft_models_match_database",
     "build_frozen_draft_deployment",
     "deployment_summary",
     "load_prospective_history",

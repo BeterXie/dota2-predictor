@@ -16,9 +16,15 @@ from pathlib import Path
 from typing import Any
 
 from .evaluation import brier_score, log_loss, shadow_summary
+from .draft_authority import (
+    authority_from_row,
+    draft_landmark_authority_matches,
+)
 from .health import read_health
 from .research import research_summary
+from .settlement import persisted_settlement_authority_reason
 from .strict_read_gate import StrictReadGate, strict_read_gate, table_has_columns
+from .vision_frame_registry import verify_registered_vision_frame
 
 
 _COHORT_IDENTITY_FIELDS = (
@@ -74,6 +80,114 @@ class _OrderRecord:
     coverage: float | None
     slippage: float | None
     outcome: int | None
+
+
+def _decision_draft_authority_valid(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> bool:
+    """Require every eligible decision to name a re-readable draft landmark."""
+
+    if int(row["eligible"]) != 1:
+        return True
+    authority = authority_from_row(row)
+    if authority is None:
+        return False
+    try:
+        payload = json.loads(str(row["contributions_json"]))
+        mapping_id = int(
+            payload["__inputs__"]["strict_live_eligibility"]["mapping_refs"][
+                "strict_mapping_id"
+            ]
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return draft_landmark_authority_matches(
+        connection,
+        authority,
+        raybet_match_id=str(row["raybet_match_id"]),
+        map_number=int(row["map_number"]),
+        strict_mapping_id=mapping_id,
+        radiant_hero_ids=None,
+        dire_hero_ids=None,
+        observed_at=datetime.fromisoformat(str(row["decided_at"])),
+        require_current_revisions=False,
+        verify_curve=False,
+    )
+
+
+def _order_draft_authority_valid(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> bool:
+    """Require an order's immutable authority to match its persisted decision."""
+
+    authority = authority_from_row(row)
+    if authority is None:
+        return False
+    try:
+        lineage = connection.execute(
+            """SELECT decision_key FROM shadow_order_decision_lineage
+                WHERE order_key=?""",
+            (str(row["order_key"]),),
+        ).fetchone()
+        if lineage is None:
+            return False
+        decision = connection.execute(
+            """SELECT * FROM strategy_decisions WHERE decision_key=?""",
+            (str(lineage[0]),),
+        ).fetchone()
+        if decision is None or int(decision["eligible"]) != 1:
+            return False
+        decision_authority = authority_from_row(decision)
+        if decision_authority != authority:
+            return False
+        attempt_map = int(row["attempt_map_number"])
+        mapping_id = int(row["strict_mapping_id"])
+        return draft_landmark_authority_matches(
+            connection,
+            authority,
+            raybet_match_id=str(row["raybet_match_id"]),
+            map_number=attempt_map,
+            strict_mapping_id=mapping_id,
+            radiant_hero_ids=None,
+            dire_hero_ids=None,
+            observed_at=datetime.fromisoformat(str(row["signal_transport_at"])),
+            require_current_revisions=False,
+            verify_curve=False,
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return False
+
+
+def _isolate_unverified_settlements(
+    connection: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+) -> tuple[list[Mapping[str, object]], Counter[str]]:
+    """Keep legacy orders visible while excluding unprovable result labels."""
+
+    output: list[Mapping[str, object]] = []
+    failures: Counter[str] = Counter()
+    for row in rows:
+        if (
+            str(row["status"]) != "filled"
+            or row["result"] is None
+            or bool(row["review_required"])
+        ):
+            output.append(row)
+            continue
+        reason = persisted_settlement_authority_reason(
+            connection, str(row["order_key"])
+        )
+        if reason is None:
+            output.append(row)
+            continue
+        failures[reason] += 1
+        isolated = dict(row)
+        isolated["reconciliation_status"] = None
+        isolated["settlement_authority_reason"] = reason
+        output.append(isolated)
+    return output, failures
 
 
 def build_report(connection: sqlite3.Connection) -> dict[str, object]:
@@ -148,19 +262,60 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
                   AND {strict_decision_filter}
                   AND 0"""
         ).fetchall()
+    raw_decision_rows = decisions
+    decisions = [
+        row for row in decisions
+        if _decision_draft_authority_valid(connection, row)
+    ]
     reasons = Counter(str(row["reason"]) for row in decisions)
-    reconciliation_available = _table_exists(
-        connection, "settlement_reconciliations"
+    reconciliation_available = table_has_columns(
+        connection,
+        "settlement_reconciliations",
+        {
+            "raybet_match_id",
+            "map_number",
+            "strict_mapping_id",
+            "dota_match_id",
+            "raybet_winner_side",
+            "opendota_winner_side",
+            "status",
+        },
+    ) and table_has_columns(
+        connection,
+        "map_results",
+        {
+            "raybet_match_id",
+            "map_number",
+            "strict_mapping_id",
+            "dota_match_id",
+            "winner_side",
+        },
     )
     reconciliation_select = (
-        "reconciliation.status AS reconciliation_status"
+        """CASE
+               WHEN reconciliation.status!='confirmed'
+                 THEN reconciliation.status
+               WHEN reconciled_result.dota_match_id IS NOT NULL
+                 THEN reconciliation.status
+               ELSE NULL
+           END AS reconciliation_status"""
         if reconciliation_available
         else "NULL AS reconciliation_status"
     )
     reconciliation_join = (
         """LEFT JOIN settlement_reconciliations AS reconciliation
                ON reconciliation.raybet_match_id=o.raybet_match_id
-              AND reconciliation.map_number=attempt.map_number"""
+              AND reconciliation.map_number=attempt.map_number
+              AND reconciliation.strict_mapping_id=o.strict_mapping_id
+            LEFT JOIN map_results AS reconciled_result
+               ON reconciled_result.raybet_match_id=reconciliation.raybet_match_id
+              AND reconciled_result.map_number=reconciliation.map_number
+              AND reconciled_result.strict_mapping_id=
+                  reconciliation.strict_mapping_id
+              AND reconciled_result.dota_match_id=reconciliation.dota_match_id
+              AND reconciled_result.winner_side=reconciliation.raybet_winner_side
+              AND reconciled_result.winner_side=
+                  reconciliation.opendota_winner_side"""
         if reconciliation_available
         else ""
     )
@@ -266,6 +421,14 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
                AND {strict_order_filter}
                AND 0"""
         ).fetchall()
+    raw_order_rows = orders
+    orders = [
+        row for row in orders
+        if _order_draft_authority_valid(connection, row)
+    ]
+    orders, settlement_authority_failures = _isolate_unverified_settlements(
+        connection, orders
+    )
     decision_index = _decision_index(decisions)
     cohorts = _evaluation_cohorts(
         orders,
@@ -296,6 +459,9 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
     headline = cohorts[0] if len(cohorts) == 1 and cohorts[0]["identity_complete"] else None
     outbox = _group_counts(connection, "notification_outbox", "status")
     reconciliation = _settlement_reconciliation_counts(connection)
+    settlement_authority_audit_log = _group_counts(
+        connection, "settlement_authority_audit", "reason"
+    )
     health = read_health(connection)
     strategy_versions = dict(sorted(Counter(
         str(row["strategy_version"]) for row in decisions
@@ -313,6 +479,9 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         strict_counts = {"accepted_mappings": 0, "mapping_audits": 0}
     return {
         "decision_count": len(decisions),
+        "draft_authority_invalid_decision_count": (
+            len(raw_decision_rows) - len(decisions)
+        ),
         "decision_audit": decision_audit,
         "raw_decision_count": decision_audit["raw_decisions"],
         "included_decision_count": decision_audit["included_decisions"],
@@ -327,6 +496,10 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
             "draft_conflict_decisions"
         ],
         "order_audit": order_audit,
+        "raw_order_count": len(raw_order_rows),
+        "draft_authority_invalid_order_count": (
+            len(raw_order_rows) - len(orders)
+        ),
         # Flat aliases keep the two safety-critical counts discoverable for
         # consumers that do not yet understand the nested audit object.
         "invalidated_order_count": order_audit["invalidated_orders"],
@@ -337,6 +510,12 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
             "strict_mapping_unverifiable_orders"
         ],
         "review_required_order_count": order_audit["review_required_orders"],
+        "settlement_authority_invalid_order_count": sum(
+            settlement_authority_failures.values()
+        ),
+        "settlement_authority_audit": dict(
+            sorted(settlement_authority_failures.items())
+        ),
         "eligible_decisions": sum(int(row["eligible"]) for row in decisions),
         "decision_reasons": dict(sorted(reasons.items())),
         "orders": shadow_summary(summary_rows),
@@ -355,6 +534,10 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         "evaluation_cohorts": cohorts,
         "notification_outbox": outbox,
         "settlement_reconciliation": reconciliation,
+        "settlement_authority_audit_log": settlement_authority_audit_log,
+        "settlement_authority_audit_log_count": sum(
+            settlement_authority_audit_log.values()
+        ),
         "service_health": health,
         "strategy_versions": strategy_versions,
         "strict_scope": strict_counts,
@@ -528,10 +711,20 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
             identity, None, None, None, "unknown", None, None, "unknown", None
         )
     identity["strategy_version"] = str(decision["strategy_version"])
+    authority = authority_from_row(decision)
+    if authority is not None:
+        identity.update({
+            "model_version": authority.model_version,
+            "model_kind": "pure_draft",
+            "availability_mode": "prospective",
+            "feature_hash": authority.feature_hash,
+            "model_hash": authority.model_hash,
+            "calibration_hash": authority.calibration_hash,
+            "global_gate_ref": authority.global_gate_ref,
+        })
     try:
         payload = json.loads(str(decision["contributions_json"]))
         inputs = payload["__inputs__"]
-        landmark = inputs["draft_landmark"]
         strict = inputs["strict_live_eligibility"]["mapping_refs"]
     except (KeyError, TypeError, ValueError):
         return _DecisionContext(
@@ -545,13 +738,11 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
             str(decision["reason"]),
             _finite_or_none(decision["data_quality"]),
         )
-    for field in _COHORT_IDENTITY_FIELDS[1:]:
-        value = landmark.get(field)
-        identity[field] = None if value in (None, "") else str(value)
-    try:
-        mapping_id = int(strict["strict_mapping_id"])
-    except (KeyError, TypeError, ValueError):
-        mapping_id = None
+    mapping_id = (
+        authority.strict_mapping_id
+        if authority is not None
+        else None
+    )
     event_id = strict.get("strict_event_id")
     selected_side = str(decision["underdog_side"])
     team = _strict_team_label(strict, selected_side)
@@ -636,6 +827,8 @@ def _vision_quality_index(
         rows = connection.execute(
             """SELECT observation.raybet_match_id, observation.captured_at,
                       observation.source_frame_ref,
+                      observation.source_frame_sha256,
+                      observation.source_frame_bytes,
                       observation.clock_confidence,
                       observation.draft_confidence
                  FROM json_each(?) AS requested
@@ -681,8 +874,17 @@ def _vision_quality_index(
         return {}
     output = {}
     for row in rows:
-        clock = _finite_or_none(row[3])
-        draft = _finite_or_none(row[4])
+        try:
+            verify_registered_vision_frame(
+                connection,
+                str(row[2]),
+                expected_sha256=str(row[3]),
+                expected_bytes=int(row[4]),
+            )
+        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+            continue
+        clock = _finite_or_none(row[5])
+        draft = _finite_or_none(row[6])
         if clock is None or draft is None:
             continue
         output[(str(row[0]), str(row[1]), str(row[2]))] = min(clock, draft)

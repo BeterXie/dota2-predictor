@@ -17,6 +17,9 @@ if str(ROOT) not in sys.path:
 
 from live_betting.database_protocol import online_backup  # noqa: E402
 from live_betting.storage import LiveBettingStore  # noqa: E402
+from live_betting.vision_frame_registry import (  # noqa: E402
+    verify_registered_vision_frame,
+)
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
 
 
@@ -159,8 +162,10 @@ def freeze_draft_map(
         rows = store.connection.execute(
             """SELECT observation.captured_at, observation.source_frame_ref,
                       observation.radiant_hero_ids, observation.dire_hero_ids,
-                      observation.radiant_team_side
-                 FROM vision_observations AS observation
+                      observation.radiant_team_side,
+                      observation.source_frame_sha256,
+                      observation.source_frame_bytes
+                 FROM trusted_vision_observation_authority AS observation
                 WHERE observation.raybet_match_id=?
                   AND observation.map_number=?
                   AND observation.confirmed=1
@@ -176,12 +181,18 @@ def freeze_draft_map(
         valid: list[tuple[sqlite3.Row, str, datetime]] = []
         for row in rows:
             try:
+                verify_registered_vision_frame(
+                    store.connection,
+                    str(row["source_frame_ref"]),
+                    expected_sha256=str(row["source_frame_sha256"]),
+                    expected_bytes=int(row["source_frame_bytes"]),
+                )
                 radiant = json.loads(str(row["radiant_hero_ids"]))
                 dire = json.loads(str(row["dire_hero_ids"]))
                 captured_at = datetime.fromisoformat(
                     str(row["captured_at"]).replace("Z", "+00:00")
                 )
-            except (TypeError, ValueError, json.JSONDecodeError):
+            except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
                 continue
             if not isinstance(radiant, list) or not isinstance(dire, list):
                 continue

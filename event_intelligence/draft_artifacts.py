@@ -9,6 +9,7 @@ import math
 import random
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from numbers import Real
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -18,12 +19,21 @@ from sklearn.linear_model import LogisticRegression
 from .draft_model import (
     DEFAULT_ECE_BINS,
     LANDMARK_MINUTES,
+    LEGACY_MODEL_ARTIFACT_VERSION,
+    MODEL_ARTIFACT_VERSION,
     MODEL_VERSION,
     BinaryMetrics,
     CalibrationBin,
     CalibrationGate,
     DraftModelArtifact,
+    DraftTrainingCorpusRow,
     ModelStatus,
+    _MAX_ITERATIONS as MODEL_MAX_ITERATIONS,
+    _SOLVER as MODEL_SOLVER,
+    _TOLERANCE as MODEL_TOLERANCE,
+    _TRAINER_RUNTIME as MODEL_TRAINER_RUNTIME,
+    _expected_calibration_error,
+    assert_model_artifact_deployable,
     _verify_model_artifact,
     evaluate_binary_predictions,
     passes_calibration_gate,
@@ -42,6 +52,115 @@ _LOGIT_EPSILON = 1e-9
 _SOLVER = "lbfgs"
 _MAX_ITERATIONS = 2_000
 _TOLERANCE = 1e-10
+# Keep only the live and next candidate five-horizon bundles strongly referenced.
+_VERIFICATION_CACHE_SIZE = len(LANDMARK_MINUTES) * 2
+
+_MODEL_LEGACY_FIELDS = frozenset(
+    {
+        "model_version",
+        "model_kind",
+        "status",
+        "reason",
+        "horizon_minutes",
+        "training_cutoff",
+        "support",
+        "series_support",
+        "min_samples",
+        "l2_regularization",
+        "solver",
+        "max_iterations",
+        "tolerance",
+        "feature_names",
+        "feature_schema_hash",
+        "training_input_hash",
+        "class_counts",
+        "missing_counts",
+        "imputation_values",
+        "standardization_means",
+        "standardization_scales",
+        "coefficients",
+        "intercept",
+        "logit_covariance",
+        "model_hash",
+    }
+)
+_MODEL_V2_FIELDS = _MODEL_LEGACY_FIELDS | {
+    "artifact_version",
+    "trainer_runtime",
+    "training_corpus",
+}
+_TRAINING_CORPUS_ROW_FIELDS = frozenset(
+    {
+        "match_id",
+        "input_snapshot_hash",
+        "cutoff",
+        "completed_at",
+        "result_usable_at",
+        "outcome",
+        "duration_minutes",
+        "series_id",
+        "features",
+        "missing_features",
+    }
+)
+_CALIBRATION_ARTIFACT_FIELDS = frozenset(
+    {
+        "calibration_version",
+        "model_hash",
+        "model_version",
+        "model_kind",
+        "horizon_minutes",
+        "feature_schema_hash",
+        "evidence_mode",
+        "source_ref",
+        "fit_samples",
+        "evaluation_samples",
+        "method",
+        "intercept",
+        "slope",
+        "metrics",
+        "ece_upper_bound",
+        "gate",
+        "calibration_hash",
+    }
+)
+_CALIBRATION_SAMPLE_FIELDS = frozenset(
+    {
+        "sample_id",
+        "probability",
+        "outcome",
+        "observed_at",
+        "settled_at",
+        "cluster_id",
+        "event_id",
+    }
+)
+_CALIBRATION_METRIC_FIELDS = frozenset(
+    {
+        "support",
+        "brier_score",
+        "log_loss",
+        "expected_calibration_error",
+        "auc",
+        "accuracy",
+        "classification_threshold",
+        "calibration_bins",
+    }
+)
+_CALIBRATION_BIN_FIELDS = frozenset(
+    {
+        "bin_number",
+        "count",
+        "min_probability",
+        "max_probability",
+        "mean_probability",
+        "event_rate",
+        "absolute_gap",
+    }
+)
+_CALIBRATION_GATE_FIELDS = frozenset(
+    {"passed", "reasons", "ece_upper_bound", "prospective_required"}
+)
 
 
 def canonical_json_bytes(payload: object) -> bytes:
@@ -88,7 +207,9 @@ def _integer(value: object, field: str, *, minimum: int = 0) -> int:
 
 
 def _digest(value: object, field: str) -> str:
-    result = str(value)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    result = value
     if len(result) != 64 or any(character not in "0123456789abcdef" for character in result):
         raise ValueError(f"{field} must be a lowercase SHA-256 digest")
     return result
@@ -101,21 +222,142 @@ def _nonempty(value: object, field: str) -> str:
     return result
 
 
+def _strict_nonempty(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _exact_object(
+    value: object,
+    fields: frozenset[str],
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise ValueError(f"{label} must be an object with string keys")
+    actual = frozenset(value)
+    if actual != fields:
+        missing = sorted(fields - actual)
+        unknown = sorted(actual - fields)
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown: {', '.join(unknown)}")
+        raise ValueError(f"{label} keys do not match ({'; '.join(details)})")
+    return value
+
+
+def _strict_json_object(payload_json: str, label: str) -> Mapping[str, Any]:
+    if not isinstance(payload_json, str):
+        raise ValueError(f"{label} JSON must be a string")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    try:
+        payload = json.loads(
+            payload_json,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} JSON is invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be an object")
+    return payload
+
+
 def _named_float_pairs(
     value: object,
     field: str,
+    *,
+    expected_names: tuple[str, ...] | None = None,
 ) -> tuple[tuple[str, float], ...]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field} must be an object")
-    return tuple(
+    result = tuple(
         sorted(
             (
-                _nonempty(name, f"{field} name"),
+                _strict_nonempty(name, f"{field} name"),
                 _finite(number, f"{field}.{name}"),
             )
             for name, number in value.items()
         )
     )
+    if expected_names is not None and tuple(name for name, _ in result) != expected_names:
+        raise ValueError(f"{field} keys do not match feature_names")
+    return result
+
+
+def _training_corpus_row_from_payload(
+    value: object,
+    *,
+    feature_names: tuple[str, ...],
+) -> DraftTrainingCorpusRow:
+    payload = _exact_object(
+        value,
+        _TRAINING_CORPUS_ROW_FIELDS,
+        "model training corpus row",
+    )
+    features_raw = _exact_object(
+        payload["features"],
+        frozenset(feature_names),
+        "model training corpus features",
+    )
+    features = tuple(
+        (
+            name,
+            None
+            if features_raw[name] is None
+            else _finite(features_raw[name], f"training feature {name}"),
+        )
+        for name in feature_names
+    )
+    missing_raw = payload["missing_features"]
+    if not isinstance(missing_raw, list) or any(
+        not isinstance(name, str) for name in missing_raw
+    ):
+        raise ValueError("model training missing_features must be an array of strings")
+    expected_missing = [name for name, number in features if number is None]
+    if missing_raw != expected_missing:
+        raise ValueError("model training missing_features do not match features")
+    outcome = _integer(payload["outcome"], "training outcome")
+    if outcome not in (0, 1):
+        raise ValueError("training outcome must be 0 or 1")
+    duration = _finite(payload["duration_minutes"], "training duration_minutes")
+    if duration <= 0.0:
+        raise ValueError("training duration_minutes must be positive")
+    row = DraftTrainingCorpusRow(
+        match_id=_integer(payload["match_id"], "training match_id", minimum=1),
+        input_snapshot_hash=_digest(
+            payload["input_snapshot_hash"],
+            "training input_snapshot_hash",
+        ),
+        cutoff=_parse_utc(payload["cutoff"], "training cutoff"),
+        completed_at=_parse_utc(payload["completed_at"], "training completed_at"),
+        result_usable_at=_parse_utc(
+            payload["result_usable_at"],
+            "training result_usable_at",
+        ),
+        outcome=outcome,
+        duration_minutes=duration,
+        series_id=_strict_nonempty(payload["series_id"], "training series_id"),
+        features=features,
+    )
+    if canonical_json_bytes(row.to_payload()) != canonical_json_bytes(dict(payload)):
+        raise ValueError("model training corpus row is not canonical")
+    return row
 
 
 def model_artifact_from_payload(payload: Mapping[str, Any]) -> DraftModelArtifact:
@@ -123,44 +365,52 @@ def model_artifact_from_payload(payload: Mapping[str, Any]) -> DraftModelArtifac
 
     if not isinstance(payload, Mapping):
         raise ValueError("model artifact payload must be an object")
+    is_v2 = "artifact_version" in payload
+    payload = _exact_object(
+        payload,
+        _MODEL_V2_FIELDS if is_v2 else _MODEL_LEGACY_FIELDS,
+        "model artifact",
+    )
+    if is_v2 and payload["artifact_version"] != MODEL_ARTIFACT_VERSION:
+        raise ValueError("unsupported draft model artifact version")
+    if (
+        payload["solver"] != MODEL_SOLVER
+        or _integer(payload["max_iterations"], "max_iterations", minimum=1)
+        != MODEL_MAX_ITERATIONS
+        or _finite(payload["tolerance"], "tolerance") != MODEL_TOLERANCE
+    ):
+        raise ValueError("model solver contract does not match")
     feature_names_raw = payload.get("feature_names")
     if not isinstance(feature_names_raw, list) or not feature_names_raw:
         raise ValueError("model feature_names must be a non-empty array")
-    feature_names = tuple(_nonempty(value, "feature name") for value in feature_names_raw)
+    feature_names = tuple(
+        _strict_nonempty(value, "feature name") for value in feature_names_raw
+    )
     if len(set(feature_names)) != len(feature_names):
         raise ValueError("model feature_names contain duplicates")
 
-    class_counts_raw = payload.get("class_counts")
-    if not isinstance(class_counts_raw, Mapping):
-        raise ValueError("model class_counts must be an object")
-    try:
-        class_counts = tuple(
-            sorted(
-                (
-                    int(label),
-                    _integer(count, f"class_counts.{label}"),
-                )
-                for label, count in class_counts_raw.items()
-            )
-        )
-    except (TypeError, ValueError) as error:
-        raise ValueError("model class_counts are invalid") from error
-    if {label for label, _ in class_counts} != {0, 1}:
-        raise ValueError("model class_counts must contain classes 0 and 1")
-
-    missing_raw = payload.get("missing_counts")
-    if not isinstance(missing_raw, Mapping):
-        raise ValueError("model missing_counts must be an object")
-    missing_counts = tuple(
-        sorted(
-            (
-                _nonempty(name, "missing feature name"),
-                _integer(count, f"missing_counts.{name}"),
-            )
-            for name, count in missing_raw.items()
-        )
+    class_counts_raw = _exact_object(
+        payload["class_counts"],
+        frozenset({"0", "1"}),
+        "model class_counts",
     )
-    covariance_raw = payload.get("logit_covariance")
+    class_counts = tuple(
+        (label, _integer(class_counts_raw[str(label)], f"class_counts.{label}"))
+        for label in (0, 1)
+    )
+    missing_raw = _exact_object(
+        payload["missing_counts"],
+        frozenset(feature_names),
+        "model missing_counts",
+    )
+    missing_counts = tuple(
+        (
+            name,
+            _integer(missing_raw[name], f"missing_counts.{name}"),
+        )
+        for name in sorted(feature_names)
+    )
+    covariance_raw = payload["logit_covariance"]
     if not isinstance(covariance_raw, list):
         raise ValueError("model logit_covariance must be an array")
     covariance = tuple(
@@ -171,7 +421,37 @@ def model_artifact_from_payload(payload: Mapping[str, Any]) -> DraftModelArtifac
     if len(covariance) != len(covariance_raw):
         raise ValueError("model logit_covariance rows must be arrays")
 
+    if is_v2:
+        runtime_raw = _exact_object(
+            payload["trainer_runtime"],
+            frozenset(name for name, _version in MODEL_TRAINER_RUNTIME),
+            "model trainer_runtime",
+        )
+        trainer_runtime = tuple(
+            (
+                name,
+                _strict_nonempty(runtime_raw[name], f"trainer_runtime.{name}"),
+            )
+            for name, _version in MODEL_TRAINER_RUNTIME
+        )
+        corpus_raw = payload["training_corpus"]
+        if not isinstance(corpus_raw, list):
+            raise ValueError("model training_corpus must be an array")
+        training_corpus = tuple(
+            _training_corpus_row_from_payload(
+                row,
+                feature_names=tuple(sorted(feature_names)),
+            )
+            for row in corpus_raw
+        )
+    else:
+        trainer_runtime = ()
+        training_corpus = ()
+
     artifact = DraftModelArtifact(
+        artifact_version=(
+            MODEL_ARTIFACT_VERSION if is_v2 else LEGACY_MODEL_ARTIFACT_VERSION
+        ),
         model_version=_nonempty(payload.get("model_version"), "model_version"),
         model_kind=_nonempty(payload.get("model_kind"), "model_kind"),
         status=ModelStatus(str(payload.get("status"))),
@@ -189,14 +469,24 @@ def model_artifact_from_payload(payload: Mapping[str, Any]) -> DraftModelArtifac
         feature_names=feature_names,
         feature_schema_hash=_digest(payload.get("feature_schema_hash"), "feature_schema_hash"),
         training_input_hash=_digest(payload.get("training_input_hash"), "training_input_hash"),
+        trainer_runtime=trainer_runtime,
+        training_corpus=training_corpus,
         class_counts=class_counts,
         missing_counts=missing_counts,
-        imputation_values=_named_float_pairs(payload.get("imputation_values"), "imputation_values"),
+        imputation_values=_named_float_pairs(
+            payload.get("imputation_values"),
+            "imputation_values",
+            expected_names=tuple(sorted(feature_names)),
+        ),
         standardization_means=_named_float_pairs(
-            payload.get("standardization_means"), "standardization_means"
+            payload.get("standardization_means"),
+            "standardization_means",
+            expected_names=tuple(sorted(feature_names)),
         ),
         standardization_scales=_named_float_pairs(
-            payload.get("standardization_scales"), "standardization_scales"
+            payload.get("standardization_scales"),
+            "standardization_scales",
+            expected_names=tuple(sorted(feature_names)),
         ),
         coefficients=_named_float_pairs(payload.get("coefficients"), "coefficients"),
         intercept=(
@@ -215,14 +505,6 @@ def model_artifact_from_payload(payload: Mapping[str, Any]) -> DraftModelArtifac
         raise ValueError("unsupported draft landmark horizon")
     if artifact.l2_regularization <= 0.0:
         raise ValueError("model l2_regularization must be positive")
-    named_fields = (
-        artifact.missing_counts,
-        artifact.imputation_values,
-        artifact.standardization_means,
-        artifact.standardization_scales,
-    )
-    if any(tuple(name for name, _ in rows) != tuple(sorted(feature_names)) for rows in named_fields):
-        raise ValueError("model feature parameters do not match feature_names")
     if artifact.status is ModelStatus.TRAINED:
         if tuple(name for name, _ in artifact.coefficients) != tuple(sorted(feature_names)):
             raise ValueError("trained model coefficients do not match feature_names")
@@ -232,7 +514,16 @@ def model_artifact_from_payload(payload: Mapping[str, Any]) -> DraftModelArtifac
         ):
             raise ValueError("trained model covariance is incomplete")
     _verify_model_artifact(artifact)
+    if canonical_json_bytes(artifact.to_payload()) != canonical_json_bytes(dict(payload)):
+        raise ValueError("model artifact payload is not canonical")
     return artifact
+
+
+def load_model_artifact_json(payload_json: str) -> DraftModelArtifact:
+    """Strictly parse raw JSON before replaying its model training corpus."""
+
+    payload = _strict_json_object(payload_json, "model artifact")
+    return model_artifact_from_payload(payload)
 
 
 @dataclass(frozen=True)
@@ -277,17 +568,23 @@ class CalibrationSample:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "CalibrationSample":
-        if not isinstance(payload, Mapping):
-            raise ValueError("calibration sample must be an object")
-        return cls(
-            sample_id=str(payload.get("sample_id", "")),
-            probability=_finite(payload.get("probability"), "sample probability"),
-            outcome=_integer(payload.get("outcome"), "sample outcome"),
-            observed_at=_parse_utc(payload.get("observed_at"), "sample observed_at"),
-            settled_at=_parse_utc(payload.get("settled_at"), "sample settled_at"),
-            cluster_id=str(payload.get("cluster_id", "")),
-            event_id=str(payload.get("event_id", "")),
+        row = _exact_object(
+            payload,
+            _CALIBRATION_SAMPLE_FIELDS,
+            "calibration sample",
         )
+        sample = cls(
+            sample_id=_strict_nonempty(row["sample_id"], "sample_id"),
+            probability=_finite(row["probability"], "sample probability"),
+            outcome=_integer(row["outcome"], "sample outcome"),
+            observed_at=_parse_utc(row["observed_at"], "sample observed_at"),
+            settled_at=_parse_utc(row["settled_at"], "sample settled_at"),
+            cluster_id=_strict_nonempty(row["cluster_id"], "cluster_id"),
+            event_id=_strict_nonempty(row["event_id"], "event_id"),
+        )
+        if canonical_json_bytes(sample.to_payload()) != canonical_json_bytes(dict(row)):
+            raise ValueError("calibration sample is not canonical")
+        return sample
 
 
 def _logit(probability: float) -> float:
@@ -345,13 +642,12 @@ def _bootstrap_ece_upper(
             for _key in keys
             for row in grouped[keys[generator.randrange(len(keys))]]
         ]
-        metrics = evaluate_binary_predictions(
-            (row[0] for row in selected),
-            (row[1] for row in selected),
-            ece_bins=DEFAULT_ECE_BINS,
+        ece, _bins = _expected_calibration_error(
+            tuple(row[0] for row in selected),
+            tuple(row[1] for row in selected),
+            DEFAULT_ECE_BINS,
         )
-        if metrics.expected_calibration_error is not None:
-            estimates.append(metrics.expected_calibration_error)
+        estimates.append(ece)
     if not estimates:
         return None
     estimates.sort()
@@ -359,38 +655,71 @@ def _bootstrap_ece_upper(
 
 
 def _bin_from_payload(payload: Mapping[str, Any]) -> CalibrationBin:
+    payload = _exact_object(
+        payload,
+        _CALIBRATION_BIN_FIELDS,
+        "calibration bin",
+    )
     return CalibrationBin(
-        bin_number=_integer(payload.get("bin_number"), "bin_number", minimum=1),
-        count=_integer(payload.get("count"), "bin count", minimum=1),
-        min_probability=_finite(payload.get("min_probability"), "min_probability"),
-        max_probability=_finite(payload.get("max_probability"), "max_probability"),
-        mean_probability=_finite(payload.get("mean_probability"), "mean_probability"),
-        event_rate=_finite(payload.get("event_rate"), "event_rate"),
-        absolute_gap=_finite(payload.get("absolute_gap"), "absolute_gap"),
+        bin_number=_integer(payload["bin_number"], "bin_number", minimum=1),
+        count=_integer(payload["count"], "bin count", minimum=1),
+        min_probability=_finite(payload["min_probability"], "min_probability"),
+        max_probability=_finite(payload["max_probability"], "max_probability"),
+        mean_probability=_finite(payload["mean_probability"], "mean_probability"),
+        event_rate=_finite(payload["event_rate"], "event_rate"),
+        absolute_gap=_finite(payload["absolute_gap"], "absolute_gap"),
     )
 
 
 def _metrics_from_payload(payload: Mapping[str, Any]) -> BinaryMetrics:
-    bins_raw = payload.get("calibration_bins")
+    payload = _exact_object(
+        payload,
+        _CALIBRATION_METRIC_FIELDS,
+        "calibration metrics",
+    )
+    bins_raw = payload["calibration_bins"]
     if not isinstance(bins_raw, list):
         raise ValueError("calibration_bins must be an array")
 
     def optional(name: str) -> float | None:
-        value = payload.get(name)
+        value = payload[name]
         return None if value is None else _finite(value, name)
 
     return BinaryMetrics(
-        support=_integer(payload.get("support"), "metrics support"),
+        support=_integer(payload["support"], "metrics support"),
         brier_score=optional("brier_score"),
         log_loss=optional("log_loss"),
         expected_calibration_error=optional("expected_calibration_error"),
         auc=optional("auc"),
         accuracy=optional("accuracy"),
         classification_threshold=_finite(
-            payload.get("classification_threshold"), "classification_threshold"
+            payload["classification_threshold"], "classification_threshold"
         ),
         calibration_bins=tuple(_bin_from_payload(row) for row in bins_raw),
     )
+
+
+def _verify_calibration_cohorts(
+    fit: Sequence[CalibrationSample],
+    evaluation: Sequence[CalibrationSample],
+) -> None:
+    def order_key(row: CalibrationSample) -> tuple[datetime, str]:
+        return row.observed_at, row.sample_id
+
+    if tuple(fit) != tuple(sorted(fit, key=order_key)) or tuple(evaluation) != tuple(
+        sorted(evaluation, key=order_key)
+    ):
+        raise ValueError("calibration cohorts must use canonical chronological order")
+    fit_ids = {row.sample_id for row in fit}
+    evaluation_ids = {row.sample_id for row in evaluation}
+    if len(fit_ids) != len(fit) or len(evaluation_ids) != len(evaluation):
+        raise ValueError("calibration sample IDs must be unique")
+    if fit_ids & evaluation_ids:
+        raise ValueError("fit and evaluation calibration cohorts must be disjoint")
+    if fit and evaluation and max(row.settled_at for row in fit) > min(
+        row.observed_at for row in evaluation
+    ):
+        raise ValueError("calibration fit cohort must settle before evaluation starts")
 
 
 @dataclass(frozen=True)
@@ -481,16 +810,7 @@ def build_calibration_artifact(
     evaluation = tuple(
         sorted(evaluation_samples, key=lambda row: (row.observed_at, row.sample_id))
     )
-    fit_ids = {row.sample_id for row in fit}
-    evaluation_ids = {row.sample_id for row in evaluation}
-    if len(fit_ids) != len(fit) or len(evaluation_ids) != len(evaluation):
-        raise ValueError("calibration sample IDs must be unique")
-    if fit_ids & evaluation_ids:
-        raise ValueError("fit and evaluation calibration cohorts must be disjoint")
-    if fit and evaluation and max(row.settled_at for row in fit) > min(
-        row.observed_at for row in evaluation
-    ):
-        raise ValueError("calibration fit cohort must settle before evaluation starts")
+    _verify_calibration_cohorts(fit, evaluation)
 
     intercept, slope = _fit_platt(fit)
     calibrated = tuple(
@@ -541,62 +861,78 @@ def build_calibration_artifact(
 def calibration_artifact_from_payload(
     payload: Mapping[str, Any],
 ) -> DraftCalibrationArtifact:
-    if not isinstance(payload, Mapping):
-        raise ValueError("calibration artifact payload must be an object")
-    fit_raw = payload.get("fit_samples")
-    evaluation_raw = payload.get("evaluation_samples")
-    metrics_raw = payload.get("metrics")
+    payload = _exact_object(
+        payload,
+        _CALIBRATION_ARTIFACT_FIELDS,
+        "calibration artifact",
+    )
+    fit_raw = payload["fit_samples"]
+    evaluation_raw = payload["evaluation_samples"]
+    metrics_raw = payload["metrics"]
     if not isinstance(fit_raw, list) or not isinstance(evaluation_raw, list):
         raise ValueError("calibration cohorts must be arrays")
     if not isinstance(metrics_raw, Mapping):
         raise ValueError("calibration metrics must be an object")
     artifact = DraftCalibrationArtifact(
-        calibration_version=_nonempty(
-            payload.get("calibration_version"), "calibration_version"
+        calibration_version=_strict_nonempty(
+            payload["calibration_version"], "calibration_version"
         ),
-        model_hash=_digest(payload.get("model_hash"), "model_hash"),
-        model_version=_nonempty(payload.get("model_version"), "model_version"),
-        model_kind=_nonempty(payload.get("model_kind"), "model_kind"),
+        model_hash=_digest(payload["model_hash"], "model_hash"),
+        model_version=_strict_nonempty(payload["model_version"], "model_version"),
+        model_kind=_strict_nonempty(payload["model_kind"], "model_kind"),
         horizon_minutes=_integer(
-            payload.get("horizon_minutes"), "horizon_minutes", minimum=1
+            payload["horizon_minutes"], "horizon_minutes", minimum=1
         ),
         feature_schema_hash=_digest(
-            payload.get("feature_schema_hash"), "feature_schema_hash"
+            payload["feature_schema_hash"], "feature_schema_hash"
         ),
-        evidence_mode=_nonempty(payload.get("evidence_mode"), "evidence_mode"),
-        source_ref=_nonempty(payload.get("source_ref"), "source_ref"),
+        evidence_mode=_strict_nonempty(payload["evidence_mode"], "evidence_mode"),
+        source_ref=_strict_nonempty(payload["source_ref"], "source_ref"),
         fit_samples=tuple(CalibrationSample.from_payload(row) for row in fit_raw),
         evaluation_samples=tuple(
             CalibrationSample.from_payload(row) for row in evaluation_raw
         ),
-        method=_nonempty(payload.get("method"), "method"),
-        intercept=_finite(payload.get("intercept"), "intercept"),
-        slope=_finite(payload.get("slope"), "slope"),
+        method=_strict_nonempty(payload["method"], "method"),
+        intercept=_finite(payload["intercept"], "intercept"),
+        slope=_finite(payload["slope"], "slope"),
         metrics=_metrics_from_payload(metrics_raw),
         ece_upper_bound=(
             None
-            if payload.get("ece_upper_bound") is None
-            else _finite(payload.get("ece_upper_bound"), "ece_upper_bound")
+            if payload["ece_upper_bound"] is None
+            else _finite(payload["ece_upper_bound"], "ece_upper_bound")
         ),
-        calibration_hash=_digest(
-            payload.get("calibration_hash"), "calibration_hash"
-        ),
+        calibration_hash=_digest(payload["calibration_hash"], "calibration_hash"),
     )
     _verify_calibration_artifact(artifact)
-    gate_payload = payload.get("gate")
-    if not isinstance(gate_payload, Mapping):
-        raise ValueError("calibration gate evidence must be an object")
+    gate_payload = _exact_object(
+        payload["gate"],
+        _CALIBRATION_GATE_FIELDS,
+        "calibration gate evidence",
+    )
     gate = artifact.gate
+    reasons = gate_payload["reasons"]
     if (
-        gate_payload.get("passed") is not gate.passed
-        or tuple(gate_payload.get("reasons", ())) != gate.reasons
-        or gate_payload.get("ece_upper_bound") != gate.ece_upper_bound
-        or gate_payload.get("prospective_required") is not True
+        not isinstance(reasons, list)
+        or any(not isinstance(reason, str) for reason in reasons)
+        or gate_payload["passed"] is not gate.passed
+        or tuple(reasons) != gate.reasons
+        or gate_payload["ece_upper_bound"] != gate.ece_upper_bound
+        or gate_payload["prospective_required"] is not True
     ):
         raise ValueError("calibration gate evidence does not recompute")
+    if canonical_json_bytes(artifact.to_payload()) != canonical_json_bytes(dict(payload)):
+        raise ValueError("calibration artifact payload is not canonical")
     return artifact
 
 
+def load_calibration_artifact_json(payload_json: str) -> DraftCalibrationArtifact:
+    """Strictly parse raw calibration JSON before recomputing all evidence."""
+
+    payload = _strict_json_object(payload_json, "calibration artifact")
+    return calibration_artifact_from_payload(payload)
+
+
+@lru_cache(maxsize=_VERIFICATION_CACHE_SIZE)
 def _verify_calibration_artifact(artifact: DraftCalibrationArtifact) -> None:
     if artifact.calibration_version != CALIBRATION_ARTIFACT_VERSION:
         raise ValueError("unsupported calibration artifact version")
@@ -610,10 +946,10 @@ def _verify_calibration_artifact(artifact: DraftCalibrationArtifact) -> None:
         raise ValueError("unsupported calibration evidence mode")
     if artifact.method != CALIBRATION_METHOD:
         raise ValueError("unsupported calibration method")
-    if {row.sample_id for row in artifact.fit_samples} & {
-        row.sample_id for row in artifact.evaluation_samples
-    }:
-        raise ValueError("calibration cohorts overlap")
+    _verify_calibration_cohorts(
+        artifact.fit_samples,
+        artifact.evaluation_samples,
+    )
     expected_intercept, expected_slope = _fit_platt(artifact.fit_samples)
     if not math.isclose(artifact.intercept, expected_intercept, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("calibration intercept does not recompute")
@@ -656,7 +992,7 @@ def assert_model_calibration_compatible(
     model: DraftModelArtifact,
     calibration: DraftCalibrationArtifact,
 ) -> None:
-    _verify_model_artifact(model)
+    assert_model_artifact_deployable(model)
     _verify_calibration_artifact(calibration)
     if (
         calibration.model_hash != model.model_hash
@@ -675,10 +1011,13 @@ __all__ = [
     "CALIBRATION_EVIDENCE_MODES",
     "CalibrationSample",
     "DraftCalibrationArtifact",
+    "assert_model_artifact_deployable",
     "assert_model_calibration_compatible",
     "build_calibration_artifact",
     "calibration_artifact_from_payload",
     "canonical_hash",
     "canonical_json_bytes",
+    "load_calibration_artifact_json",
+    "load_model_artifact_json",
     "model_artifact_from_payload",
 ]

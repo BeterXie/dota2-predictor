@@ -63,7 +63,7 @@ only. There is no real betting endpoint.
 ```powershell
 # Read-only RayBet odds collection
 python -m live_betting.monitor --database data/dota2.db `
-  --raw-dir data/live_betting/raw --interval 6 --list-interval 30
+  --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30
 
 # Visual observation supervisor
 python scripts/supervise_raybet_streams.py --database data/dota2.db
@@ -84,4 +84,7 @@ sanitized Dota 2 market events, and cannot submit a wager.
 ## Database
 
 All match data lives in `data/dota2.db`. The web API and live shadow workers
-share that database. Runtime artifacts under `data/` are ignored by Git.
+share that database. RayBet raw response artifacts live in the paired
+`data/live_betting/raw-v2` tree. Runtime artifacts under `data/` are ignored by
+Git. The migration, offline compaction, and self-contained bundle runbook is in
+[`live_betting/README.md`](live_betting/README.md#database-migration-compaction-and-bundles).

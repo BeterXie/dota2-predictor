@@ -4,12 +4,17 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from event_intelligence.ingest_adapters import SQLiteIngestAdapter
+from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
+from event_intelligence.registry import EventRegistry
 from event_intelligence.storage import IntelligenceStorage
+from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder
 from live_betting.notifications import (
@@ -29,14 +34,46 @@ from live_betting.notifications import (
     simulation_payload,
     stable_message_id,
 )
+from live_betting.raybet import parse_raybet_map_final
 from live_betting.smtp_delivery import SMTPConfig
+from live_betting.settlement import settle_authoritative_order
 from live_betting.storage import LiveBettingStore
 from live_betting.strategy import make_order
 from live_betting.strict_eligibility import accept_strict_live_map_mapping
 from scripts.run_notification_worker import run_once as run_notification_once
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
+)
 
 
 NOW = datetime(2026, 7, 14, 1, 0, tzinfo=timezone.utc)
+
+
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    return {
+        "result": {
+            "id": "1001",
+            "game_id": 151,
+            "team": [
+                {"team_id": 101, "team_name": "Alpha", "pos": 1},
+                {"team_id": 202, "team_name": "Beta", "pos": 2},
+            ],
+            "odds": [
+                {
+                    "id": row.odds_id,
+                    "odds_group_id": row.odds_group_id or "",
+                    "team_id": 101 if row.market.side == "team_one" else 202,
+                    "match_stage": row.market.period.replace("map_", "r"),
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "odds": str(row.price),
+                    "status": row.status,
+                }
+                for row in rows
+            ],
+        }
+    }
 
 
 class NotificationOutboxTests(unittest.TestCase):
@@ -44,7 +81,41 @@ class NotificationOutboxTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.store = LiveBettingStore(Path(self.directory.name) / "outbox.db")
         self.store.init_schema()
+        intelligence = IntelligenceStorage(
+            self.store.path, connection=self.store.connection
+        )
+        intelligence.init_schema()
+        ingest = SQLiteIngestAdapter(intelligence, EventRegistry(intelligence))
+        self.opendota_archive = RawArchive(
+            Path(self.directory.name) / "opendota-raw",
+            observation_sink=ingest.record_raw_artifact,
+        )
         self.strict_mapping_id = self._ensure_strict_mapping()
+        self.signal_vision = make_test_vision_observation(
+            raybet_match_id="1001",
+            map_number=1,
+            captured_at=NOW,
+            game_clock_seconds=615,
+            label="notification-trace-frame",
+        )
+        self.store.insert_vision_observation(self.signal_vision)
+        self.draft_authority = seed_test_draft_authority(
+            self.store.connection,
+            raybet_match_id="1001",
+            map_number=1,
+            strict_mapping_id=self.strict_mapping_id,
+            observed_at=NOW,
+            label="notification-outbox",
+        )
+
+    def _store_odds_observation(self, **kwargs: object) -> tuple[str, int]:
+        rows = kwargs.get("snapshots")
+        if not isinstance(rows, list):
+            raise TypeError("notification odds fixture requires snapshot rows")
+        return self.store.store_odds_observation(
+            **kwargs,
+            raw_payload=raw_odds_payload(rows),
+        )
 
     def tearDown(self) -> None:
         self.store.close()
@@ -53,7 +124,7 @@ class NotificationOutboxTests(unittest.TestCase):
     def payload(self, event_type: str = EVENT_FILLED) -> dict[str, object]:
         return simulation_payload(
             event_type,
-            {"raybet_match_id": "match-1", "value": 1},
+            {"raybet_match_id": "1001", "value": 1},
         )
 
     def operational_payload(
@@ -71,21 +142,28 @@ class NotificationOutboxTests(unittest.TestCase):
 
     def add(self, event_type: str = EVENT_MONITOR_ALERT) -> bool:
         monitor_event = event_type in {EVENT_MONITOR_ALERT}
-        return enqueue(
-            self.store.connection,
-            order_key="order-1",
-            event_type=event_type,
-            payload=(
-                self.operational_payload(event_type)
-                if monitor_event
-                else self.payload(event_type)
-            ),
-            stats_cutoff_at=NOW,
-            created_at=NOW,
-            template_version=(
-                MONITOR_TEMPLATE_VERSION if monitor_event else "dota2-shadow-email-v2"
-            ),
-        )
+        # Formal calls through this legacy helper intentionally seed an old
+        # outbox row so claim/requeue tests can exercise their own gate.
+        if monitor_event:
+            return enqueue(
+                self.store.connection,
+                order_key="order-1",
+                event_type=event_type,
+                payload=self.operational_payload(event_type),
+                stats_cutoff_at=NOW,
+                created_at=NOW,
+                template_version=MONITOR_TEMPLATE_VERSION,
+            )
+        with patch("live_betting.notifications.verify_bound_order_vision_frame"):
+            return enqueue(
+                self.store.connection,
+                order_key="order-1",
+                event_type=event_type,
+                payload=self.payload(event_type),
+                stats_cutoff_at=NOW,
+                created_at=NOW,
+                template_version="dota2-shadow-email-v2",
+            )
 
     def test_logical_key_and_message_id_are_idempotent(self) -> None:
         self.assertTrue(self.add())
@@ -445,17 +523,18 @@ class NotificationOutboxTests(unittest.TestCase):
         self,
     ) -> None:
         due_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        self.assertTrue(
-            enqueue(
-                self.store.connection,
-                order_key="legacy-v1-order",
-                event_type=EVENT_FILLED,
-                payload=self.payload(),
-                stats_cutoff_at=due_at,
-                created_at=due_at,
-                template_version="dota2-shadow-email-v1",
+        with patch("live_betting.notifications.verify_bound_order_vision_frame"):
+            self.assertTrue(
+                enqueue(
+                    self.store.connection,
+                    order_key="legacy-v1-order",
+                    event_type=EVENT_FILLED,
+                    payload=self.payload(),
+                    stats_cutoff_at=due_at,
+                    created_at=due_at,
+                    template_version="dota2-shadow-email-v1",
+                )
             )
-        )
         with patch("scripts.run_notification_worker.send_message") as send:
             result = run_notification_once(
                 self.store,
@@ -529,7 +608,7 @@ class NotificationOutboxTests(unittest.TestCase):
 
     def _order(self) -> ShadowOrder:
         signal = OddsSnapshot(
-            "match-1",
+            "1001",
             "winner-one",
             "winner-group",
             NOW,
@@ -537,26 +616,37 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             Market("winner", "map_1", "team_one", None, "team_one", True),
         )
-        self.store.store_odds_observation(
+        opposite = OddsSnapshot(
+            "1001",
+            "winner-two",
+            "winner-group",
+            NOW,
+            1.5,
+            1,
+            Market("winner", "map_1", "team_two", None, "team_two", True),
+        )
+        signal_rows = [signal, opposite]
+        self._store_odds_observation(
             source="direct",
             observation_key="signal",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=NOW,
-            normalized_state_hash=normalized_state_hash([signal]),
-            snapshots=[signal],
+            normalized_state_hash=normalized_state_hash(signal_rows),
+            snapshots=signal_rows,
         )
+        market_probability = price_groups(signal_rows)[signal.odds_id]
         input_ref = "integration-input-ref"
         strategy_version = "integration-strategy-v1"
         self.assertTrue(
             self.store.insert_decision(
                 SimpleNamespace(
                     decision_key="integration-decision",
-                    raybet_match_id="match-1",
+                    raybet_match_id="1001",
                     map_number=1,
                     decided_at=NOW,
                     underdog_side="team_one",
-                    market_probability=0.5,
+                    market_probability=market_probability,
                     model_probability=0.6,
                     edge=0.1,
                     data_quality=0.8,
@@ -565,6 +655,7 @@ class NotificationOutboxTests(unittest.TestCase):
                     contributions={
                         "draft": 0.1,
                         "__inputs__": {
+                            "draft_authority": asdict(self.draft_authority),
                             "strict_live_eligibility": {
                                 "mapping_refs": {
                                     "strict_mapping_id": self.strict_mapping_id
@@ -572,8 +663,12 @@ class NotificationOutboxTests(unittest.TestCase):
                             },
                             "vision": {
                                 "captured_at": NOW.isoformat(),
-                                "source_frame_ref": "C:/evidence/integration.jpg",
-                                "game_clock_seconds": 600,
+                                "source_frame_ref": (
+                                    self.signal_vision.source_frame_ref
+                                ),
+                                "game_clock_seconds": (
+                                    self.signal_vision.game_clock_seconds
+                                ),
                             },
                             "quality": {"aggregate": 0.8},
                             "draft_landmark": {
@@ -585,17 +680,20 @@ class NotificationOutboxTests(unittest.TestCase):
                     },
                     input_ref=input_ref,
                     strategy_version=strategy_version,
-                )
+                ),
+                draft_authority=self.draft_authority,
+                vision_observation=self.signal_vision,
+                vision_transport_key="signal",
             )
         )
         order = make_order(
             ModelQuote(
-                "match-1",
+                "1001",
                 "map_1",
                 signal.market,
                 0.6,
-                0.5,
-                0.1,
+                market_probability,
+                0.6 - market_probability,
                 NOW,
                 strategy_version,
                 input_ref,
@@ -612,12 +710,15 @@ class NotificationOutboxTests(unittest.TestCase):
         order = self._order()
         self.assertTrue(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             "winner-one",
             "winner-group",
             successor_at,
@@ -625,11 +726,11 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             order.market,
         )
-        self.store.store_odds_observation(
+        self._store_odds_observation(
             source="direct",
             observation_key="formal-gate-successor",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=successor_at,
             normalized_state_hash=normalized_state_hash([successor]),
             snapshots=[successor],
@@ -641,6 +742,157 @@ class NotificationOutboxTests(unittest.TestCase):
         assert resolved is not None
         self.assertEqual(resolved.status, "filled")
         return order
+
+    def _settle_authoritatively(
+        self,
+        order: ShadowOrder,
+        *,
+        settled_at: datetime,
+    ) -> None:
+        dota_match_id = 9001
+        reconciliation_ref = "settlement-reconciliation:1001:map:1"
+        raybet_payload = {
+            "id": "1001",
+            "game_id": 151,
+            "status": 2,
+            "team": [
+                {
+                    "pos": 1,
+                    "team_id": 101,
+                    "team_name": "Alpha",
+                    "score": {"r1": 1},
+                },
+                {
+                    "pos": 2,
+                    "team_id": 202,
+                    "team_name": "Beta",
+                    "score": {"r1": 0},
+                },
+            ],
+            "odds": [
+                {
+                    "odds_id": "final-one",
+                    "odds_group_id": "final-group",
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "team_id": 101,
+                    "status": 5,
+                    "win": 1,
+                },
+                {
+                    "odds_id": "final-two",
+                    "odds_group_id": "final-group",
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "team_id": 202,
+                    "status": 5,
+                    "win": 0,
+                },
+            ],
+        }
+        raybet_response = {"result": raybet_payload}
+        raybet_artifact = self.store.archive_response_payload(
+            raybet_response,
+            observed_at=settled_at,
+            match_id="1001",
+            response_kind="final_odds",
+        )
+        raybet_audit_key = self.store.record_direct_response_audit(
+            raybet_artifact,
+            response_kind="final_odds",
+            claimed_raybet_match_id="1001",
+            observed_raybet_match_id="1001",
+            disposition="audit_only",
+            reason="final_result_evidence",
+        )
+        raybet_final = parse_raybet_map_final(
+            raybet_payload,
+            1,
+            observed_at=settled_at,
+            expected_match_id="1001",
+            expected_team_ids=(101, 202),
+        )
+        opendota_payload = {
+            "match_id": dota_match_id,
+            "radiant_team_id": 101,
+            "dire_team_id": 202,
+            "radiant_win": True,
+            "radiant_score": 30,
+            "dire_score": 20,
+            "duration": 2400,
+        }
+        opendota_receipt = self.opendota_archive.archive_json(
+            source="opendota",
+            endpoint=f"/api/matches/{dota_match_id}",
+            request_identity=f"/api/matches/{dota_match_id}",
+            payload_bytes=canonical_json_bytes(opendota_payload),
+            observed_at=settled_at,
+            match_id=dota_match_id,
+            status_code=200,
+            first_usable_at=settled_at,
+        )
+        identity = {
+            "raybet_match_id": "1001",
+            "map_number": 1,
+            "strict_mapping_id": self.strict_mapping_id,
+            "dota_match_id": dota_match_id,
+            "winner_side": "team_one",
+        }
+        reconciliation = self.store.record_settlement_reconciliation(
+            raybet_match_id="1001",
+            map_number=1,
+            strict_mapping_id=self.strict_mapping_id,
+            dota_match_id=dota_match_id,
+            raybet_status="confirmed",
+            raybet_winner_side="team_one",
+            opendota_winner_side="team_one",
+            raybet_evidence_ref=raybet_final.evidence_ref,
+            opendota_evidence_ref=(
+                f"opendota:{dota_match_id}:sha256:"
+                f"{opendota_receipt.content_sha256}"
+            ),
+            raybet_facts={**identity, **raybet_final.facts()},
+            opendota_facts={
+                **identity,
+                "team_one_kills": 30,
+                "team_two_kills": 20,
+                "duration_seconds": 2400,
+            },
+            status="confirmed",
+            reason="sources_consistent",
+            raybet_observed_at=settled_at,
+            opendota_observed_at=settled_at,
+            opendota_first_usable_at=settled_at,
+            raybet_audit_key=raybet_audit_key,
+            raybet_transport_key=None,
+            raybet_response_state_hash=None,
+            raybet_response_artifact_hash=raybet_artifact.content_sha256,
+            opendota_artifact_id=(
+                f"opendota:{opendota_receipt.content_sha256}"
+            ),
+            opendota_observation_id=opendota_receipt.observation_id,
+            opendota_content_hash=opendota_receipt.content_sha256,
+        )
+        self.assertEqual(reconciliation["status"], "confirmed")
+        self.assertTrue(
+            self.store.insert_map_result(
+                SimpleNamespace(
+                    raybet_match_id="1001",
+                    map_number=1,
+                    dota_match_id=dota_match_id,
+                    winner_side="team_one",
+                    team_one_kills=30,
+                    team_two_kills=20,
+                    duration_seconds=2400,
+                    evidence_ref=reconciliation_ref,
+                    settled_at=settled_at,
+                ),
+                strict_mapping_id=self.strict_mapping_id,
+            )
+        )
+        self.assertTrue(settle_authoritative_order(self.store, order.order_key))
 
     def test_strategy_decision_content_is_immutable(self) -> None:
         self._order()
@@ -677,7 +929,7 @@ class NotificationOutboxTests(unittest.TestCase):
         accepted_at = NOW - timedelta(seconds=1)
         self.store.upsert_raybet_match(
             {
-                "id": "match-1",
+                "id": "1001",
                 "game_id": 151,
                 "tournament_name": "PGL Wallachia Season 8",
                 "start_time": "2026-04-20 12:00:00",
@@ -693,7 +945,7 @@ class NotificationOutboxTests(unittest.TestCase):
         )
         evidence = {
             "kind": "manual_cross_source_review",
-            "raybet_url": "https://example.invalid/raybet/match-1",
+            "raybet_url": "https://example.invalid/raybet/1001",
             "official_event_url": "https://www.pglesports.com/",
             "tournament": {
                 "raybet_name": "PGL Wallachia Season 8",
@@ -731,7 +983,7 @@ class NotificationOutboxTests(unittest.TestCase):
         ):
             mapping = accept_strict_live_map_mapping(
                 self.store.connection,
-                raybet_match_id="match-1",
+                raybet_match_id="1001",
                 map_number=1,
                 event_id="pgl-wallachia-s8-2026",
                 team_one_id=101,
@@ -750,12 +1002,15 @@ class NotificationOutboxTests(unittest.TestCase):
         order = self._order()
         self.assertTrue(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             "winner-one",
             "winner-group",
             successor_at,
@@ -763,11 +1018,11 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             order.market,
         )
-        self.store.store_odds_observation(
+        self._store_odds_observation(
             source="direct",
             observation_key="successor",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=successor_at,
             normalized_state_hash=normalized_state_hash([successor]),
             snapshots=[successor],
@@ -780,10 +1035,8 @@ class NotificationOutboxTests(unittest.TestCase):
             ).fetchone()[0],
             EVENT_FILLED,
         )
-        self.assertTrue(
-            self.store.insert_settlement(
-                order.order_key, "win", 1.99, successor_at, "opendota:1"
-            )
+        self._settle_authoritatively(
+            order, settled_at=successor_at + timedelta(seconds=1)
         )
         events = [
             row[0]
@@ -796,25 +1049,37 @@ class NotificationOutboxTests(unittest.TestCase):
     def test_entry_and_settlement_payloads_preserve_full_traceability(self) -> None:
         market = Market("winner", "map_1", "team_one", None, "team_one", True)
         signal = OddsSnapshot(
-            "match-1", "trace-winner", "trace-group", NOW, 2.0, 1, market
+            "1001", "trace-winner", "trace-group", NOW, 2.0, 1, market
         )
-        self.store.store_odds_observation(
+        opposite = OddsSnapshot(
+            "1001",
+            "trace-winner-two",
+            "trace-group",
+            NOW,
+            1.5,
+            1,
+            Market("winner", "map_1", "team_two", None, "team_two", True),
+        )
+        signal_rows = [signal, opposite]
+        self._store_odds_observation(
             source="direct",
             observation_key="trace-signal",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=NOW,
-            normalized_state_hash=normalized_state_hash([signal]),
-            snapshots=[signal],
+            normalized_state_hash=normalized_state_hash(signal_rows),
+            snapshots=signal_rows,
         )
+        market_probability = price_groups(signal_rows)[signal.odds_id]
         inputs = {
+            "draft_authority": asdict(self.draft_authority),
             "strict_live_eligibility": {
                 "mapping_refs": {"strict_mapping_id": self.strict_mapping_id}
             },
             "vision": {
-                "captured_at": (NOW - timedelta(seconds=1)).isoformat(),
-                "source_frame_ref": "C:/evidence/trace-frame.jpg",
-                "game_clock_seconds": 615,
+                "captured_at": self.signal_vision.captured_at.isoformat(),
+                "source_frame_ref": self.signal_vision.source_frame_ref,
+                "game_clock_seconds": self.signal_vision.game_clock_seconds,
             },
             "quality": {
                 "team": 0.8,
@@ -832,11 +1097,11 @@ class NotificationOutboxTests(unittest.TestCase):
         strategy_version = "trace-strategy-v5"
         decision = SimpleNamespace(
             decision_key="trace-decision",
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             map_number=1,
             decided_at=NOW,
             underdog_side="team_one",
-            market_probability=0.5,
+            market_probability=market_probability,
             model_probability=0.6,
             edge=0.1,
             data_quality=0.83,
@@ -850,15 +1115,22 @@ class NotificationOutboxTests(unittest.TestCase):
             input_ref=input_ref,
             strategy_version=strategy_version,
         )
-        self.assertTrue(self.store.insert_decision(decision))
+        self.assertTrue(
+            self.store.insert_decision(
+                decision,
+                draft_authority=self.draft_authority,
+                vision_observation=self.signal_vision,
+                vision_transport_key="trace-signal",
+            )
+        )
         order = make_order(
             ModelQuote(
-                "match-1",
+                "1001",
                 "map_1",
                 market,
                 0.6,
-                0.5,
-                0.1,
+                market_probability,
+                0.6 - market_probability,
                 NOW,
                 strategy_version,
                 input_ref,
@@ -871,12 +1143,15 @@ class NotificationOutboxTests(unittest.TestCase):
         assert order is not None
         self.assertTrue(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             "trace-winner",
             "trace-group",
             successor_at,
@@ -884,11 +1159,11 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             market,
         )
-        self.store.store_odds_observation(
+        self._store_odds_observation(
             source="direct",
             observation_key="trace-successor",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=successor_at,
             normalized_state_hash=normalized_state_hash([successor]),
             snapshots=[successor],
@@ -909,7 +1184,9 @@ class NotificationOutboxTests(unittest.TestCase):
         self.assertEqual(entry["teams"]["team_one"]["name"], "Alpha")
         self.assertEqual(entry["teams"]["team_two"]["name"], "Beta")
         self.assertEqual(entry["trusted_game_time_seconds"], 615)
-        self.assertEqual(entry["source_frame_ref"], "C:/evidence/trace-frame.jpg")
+        self.assertEqual(
+            entry["source_frame_ref"], self.signal_vision.source_frame_ref
+        )
         self.assertEqual(entry["principal_contributions"]["draft"], 0.08)
         self.assertEqual(entry["quality"]["aggregate"], 0.83)
         self.assertEqual(entry["model_version"], "draft-v5")
@@ -918,11 +1195,7 @@ class NotificationOutboxTests(unittest.TestCase):
         self.assertEqual(entry["fill_transport_key"], "trace-successor")
         self.assertEqual(entry["order_key"], order.order_key)
         settled_at = successor_at + timedelta(seconds=1)
-        self.assertTrue(
-            self.store.insert_settlement(
-                order.order_key, "win", 1.99, settled_at, "opendota:trace"
-            )
-        )
+        self._settle_authoritatively(order, settled_at=settled_at)
         result = json.loads(
             self.store.connection.execute(
                 "SELECT payload_json FROM notification_outbox "
@@ -961,15 +1234,7 @@ class NotificationOutboxTests(unittest.TestCase):
     ) -> None:
         order = self._filled_order_with_outbox()
         settled_at = NOW + timedelta(seconds=3)
-        self.assertTrue(
-            self.store.insert_settlement(
-                order.order_key,
-                "win",
-                1.99,
-                settled_at,
-                "opendota:verified",
-            )
-        )
+        self._settle_authoritatively(order, settled_at=settled_at)
         row = self.store.connection.execute(
             """SELECT outbox_id, payload_json FROM notification_outbox
                 WHERE order_key=? AND event_type='settled'""",
@@ -1008,15 +1273,7 @@ class NotificationOutboxTests(unittest.TestCase):
     def test_settled_claim_rechecks_current_filled_order_baseline(self) -> None:
         order = self._filled_order_with_outbox()
         settled_at = NOW + timedelta(seconds=3)
-        self.assertTrue(
-            self.store.insert_settlement(
-                order.order_key,
-                "win",
-                1.99,
-                settled_at,
-                "opendota:verified",
-            )
-        )
+        self._settle_authoritatively(order, settled_at=settled_at)
         settled_outbox_id = int(
             self.store.connection.execute(
                 """SELECT outbox_id FROM notification_outbox
@@ -1045,7 +1302,7 @@ class NotificationOutboxTests(unittest.TestCase):
                     (settled_outbox_id,),
                 ).fetchone()
             ),
-            ("dead_letter", "formal_notification_lineage_mismatch"),
+            ("dead_letter", "settlement_ledger_authority_mismatch"),
         )
 
     def test_claim_suppresses_invalidated_order_event(self) -> None:
@@ -1054,7 +1311,7 @@ class NotificationOutboxTests(unittest.TestCase):
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, recorded_at)
-               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+               VALUES ('shadow_order', 'order-1', '1001', 1,
                        'vision_draft_conflict', ?)""",
             (NOW.isoformat(),),
         )
@@ -1070,7 +1327,7 @@ class NotificationOutboxTests(unittest.TestCase):
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, block_reason, recorded_at)
-               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+               VALUES ('shadow_order', 'order-1', '1001', 1,
                        'stale_clock', 'vision_observation_invalidated', ?)""",
             (NOW.isoformat(),),
         )
@@ -1085,13 +1342,19 @@ class NotificationOutboxTests(unittest.TestCase):
             "DROP TRIGGER IF EXISTS shadow_orders_require_strict_mapping_insert"
         )
         self.store.connection.execute(
+            "DROP TRIGGER IF EXISTS shadow_order_draft_authority_insert"
+        )
+        self.store.connection.execute(
+            "DROP TRIGGER IF EXISTS shadow_order_vision_authority_insert"
+        )
+        self.store.connection.execute(
             """INSERT INTO shadow_orders
                (order_key, raybet_match_id, strict_mapping_id, odds_id,
                 market_key, signaled_at, model_probability, market_probability,
                 signal_price, signal_transport_key, signal_transport_at,
                 expires_at, signal_odds_group_id, signal_outcome_key,
                 signal_identity_verified, stake, status)
-               VALUES ('legacy-paper-order', 'match-1', NULL, 'odds-legacy',
+               VALUES ('legacy-paper-order', '1001', NULL, 'odds-legacy',
                        'winner|map_1|team_one|', ?, 0.6, 0.4, 2.5,
                        'transport-legacy', ?, ?, 'group-legacy', 'team_one',
                        1, 1.0, 'pending')""",
@@ -1104,7 +1367,7 @@ class NotificationOutboxTests(unittest.TestCase):
         self.store.connection.execute(
             """INSERT INTO shadow_map_attempts
                (raybet_match_id, map_number, order_key, status, created_at)
-               VALUES ('match-1', 1, 'legacy-paper-order', 'pending', ?)""",
+               VALUES ('1001', 1, 'legacy-paper-order', 'pending', ?)""",
             (NOW.isoformat(),),
         )
         self.store.connection.commit()
@@ -1178,7 +1441,7 @@ class NotificationOutboxTests(unittest.TestCase):
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, recorded_at)
-               VALUES ('shadow_order', ?, 'match-1', 1,
+               VALUES ('shadow_order', ?, '1001', 1,
                        'vision_draft_conflict', ?)""",
             (order.order_key, NOW.isoformat()),
         )
@@ -1214,7 +1477,7 @@ class NotificationOutboxTests(unittest.TestCase):
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, recorded_at)
-               VALUES ('shadow_order', ?, 'match-1', 1,
+               VALUES ('shadow_order', ?, '1001', 1,
                        'vision_draft_conflict', ?)""",
             (order.order_key, NOW.isoformat()),
         )
@@ -1250,7 +1513,7 @@ class NotificationOutboxTests(unittest.TestCase):
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, recorded_at)
-               VALUES ('shadow_order', 'order-1', 'match-1', 1,
+               VALUES ('shadow_order', 'order-1', '1001', 1,
                        'vision_draft_conflict', ?)""",
             (NOW.isoformat(),),
         )
@@ -1299,12 +1562,15 @@ class NotificationOutboxTests(unittest.TestCase):
         order = self._order()
         self.assertTrue(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             "winner-one",
             "winner-group",
             successor_at,
@@ -1312,11 +1578,11 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             order.market,
         )
-        self.store.store_odds_observation(
+        self._store_odds_observation(
             source="direct",
             observation_key="successor",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=successor_at,
             normalized_state_hash=normalized_state_hash([successor]),
             snapshots=[successor],
@@ -1357,7 +1623,10 @@ class NotificationOutboxTests(unittest.TestCase):
         order = self._order()
         self.assertTrue(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         self.store.connection.execute(
@@ -1370,7 +1639,7 @@ class NotificationOutboxTests(unittest.TestCase):
         self.store.connection.commit()
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             "winner-one",
             "winner-group",
             successor_at,
@@ -1378,20 +1647,26 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             order.market,
         )
-        self.store.store_odds_observation(
+        self._store_odds_observation(
             source="direct",
             observation_key="successor",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=successor_at,
             normalized_state_hash=normalized_state_hash([successor]),
             snapshots=[successor],
         )
 
-        with self.assertRaisesRegex(
-            ValueError, "formal notification decision lineage is unavailable"
-        ):
-            self.store.process_pending_successor(order, watermark=successor_at)
+        resolved = self.store.process_pending_successor(
+            order,
+            watermark=successor_at,
+        )
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(
+            (resolved.status, resolved.rejection_reason),
+            ("rejected", "vision_authority_unverifiable"),
+        )
 
         self.assertEqual(
             tuple(
@@ -1400,7 +1675,7 @@ class NotificationOutboxTests(unittest.TestCase):
                     (order.order_key,),
                 ).fetchone()
             ),
-            ("pending",),
+            ("rejected",),
         )
         self.assertEqual(
             self.store.connection.execute(
@@ -1420,7 +1695,10 @@ class NotificationOutboxTests(unittest.TestCase):
         self.store.connection.commit()
         self.assertFalse(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         self.assertIsNone(
@@ -1444,6 +1722,7 @@ class NotificationOutboxTests(unittest.TestCase):
                 order,
                 1,
                 strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
                 decision_key="missing-decision",
             )
         )
@@ -1458,14 +1737,32 @@ class NotificationOutboxTests(unittest.TestCase):
 
     def test_map_order_with_multiple_matching_decisions_is_rejected(self) -> None:
         order = self._order()
-        self.store.connection.execute(
-            """INSERT INTO strategy_decisions
-               SELECT 'duplicate-decision', raybet_match_id, map_number,
-                      decided_at, underdog_side, market_probability,
-                      model_probability, edge, data_quality, eligible, reason,
-                      contributions_json, input_ref, strategy_version
-                 FROM strategy_decisions
-                WHERE decision_key='integration-decision'"""
+        source = self.store.connection.execute(
+            "SELECT * FROM strategy_decisions WHERE decision_key='integration-decision'"
+        ).fetchone()
+        assert source is not None
+        self.assertTrue(
+            self.store.insert_decision(
+                SimpleNamespace(
+                    decision_key="duplicate-decision",
+                    raybet_match_id=source["raybet_match_id"],
+                    map_number=source["map_number"],
+                    decided_at=datetime.fromisoformat(source["decided_at"]),
+                    underdog_side=source["underdog_side"],
+                    market_probability=source["market_probability"],
+                    model_probability=source["model_probability"],
+                    edge=source["edge"],
+                    data_quality=source["data_quality"],
+                    eligible=bool(source["eligible"]),
+                    reason=source["reason"],
+                    contributions=json.loads(source["contributions_json"]),
+                    input_ref=source["input_ref"],
+                    strategy_version=source["strategy_version"],
+                ),
+                draft_authority=self.draft_authority,
+                vision_observation=self.signal_vision,
+                vision_transport_key="signal",
+            )
         )
         self.store.connection.commit()
 
@@ -1474,6 +1771,7 @@ class NotificationOutboxTests(unittest.TestCase):
                 order,
                 1,
                 strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
                 decision_key="integration-decision",
             )
         )
@@ -1493,6 +1791,7 @@ class NotificationOutboxTests(unittest.TestCase):
                 order,
                 1,
                 strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         self.store.connection.execute(
@@ -1505,7 +1804,7 @@ class NotificationOutboxTests(unittest.TestCase):
         self.store.connection.commit()
         successor_at = NOW + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             "winner-one",
             "winner-group",
             successor_at,
@@ -1513,27 +1812,33 @@ class NotificationOutboxTests(unittest.TestCase):
             1,
             order.market,
         )
-        self.store.store_odds_observation(
+        self._store_odds_observation(
             source="direct",
             observation_key="deleted-decision:successor",
             source_event_id=None,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             observed_at=successor_at,
             normalized_state_hash=normalized_state_hash([successor]),
             snapshots=[successor],
         )
 
-        with self.assertRaisesRegex(
-            ValueError, "formal notification decision lineage is unavailable"
-        ):
-            self.store.process_pending_successor(order, watermark=successor_at)
+        resolved = self.store.process_pending_successor(
+            order,
+            watermark=successor_at,
+        )
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(
+            (resolved.status, resolved.rejection_reason),
+            ("rejected", "vision_authority_unverifiable"),
+        )
 
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT status FROM shadow_orders WHERE order_key=?",
                 (order.order_key,),
             ).fetchone()[0],
-            "pending",
+            "rejected",
         )
         self.assertEqual(
             self.store.connection.execute(

@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from shared.sqlite import configure_connection
+from shared.sqlite import configure_connection, execute_script
 
 from .parser import (
     parse_chat,
@@ -280,11 +280,14 @@ class Database:
             self._conn.close()
             self._conn = None
 
-    def init_db(self) -> None:
+    def init_db(self, *, external_transaction: bool = False) -> None:
         conn = self.connect()
-        conn.executescript(SCHEMA_SQL)
+        if external_transaction and not conn.in_transaction:
+            raise RuntimeError("external transaction is not active")
+        execute_script(conn, SCHEMA_SQL)
         self._migrate(conn)
-        conn.commit()
+        if not external_transaction:
+            conn.commit()
         logger.info("Database schema initialized.")
 
     @staticmethod

@@ -39,6 +39,7 @@ from event_intelligence.team_states import LABEL_VERSION
 from live_betting.strict_eligibility import (
     StrictLiveMapMapping,
     query_strict_live_eligibility,
+    query_strict_mapping_snapshot,
 )
 
 from . import queries
@@ -1506,6 +1507,7 @@ def _postmatch_base(
         "reconciliation": None,
         "odds_timeline": odds_timeline,
         "postmatch": None,
+        "warnings": [],
     }
 
 
@@ -1548,6 +1550,7 @@ def _reconciliation_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {
         key: row[key]
         for key in (
+            "strict_mapping_id",
             "dota_match_id",
             "raybet_winner_side",
             "opendota_winner_side",
@@ -1744,6 +1747,63 @@ def _duplicate_link_reason(
         ).fetchone()
         if conflict is not None:
             return "opendota_match_link_conflict"
+    return None
+
+
+def _confirmed_map_result_reason(
+    connection: sqlite3.Connection,
+    reconciliation: sqlite3.Row,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    strict_mapping_id: int,
+    mapping_recorded_at: datetime,
+    reconciliation_first_observed_at: datetime,
+    reconciliation_updated_at: datetime,
+    read_cutoff: datetime,
+) -> str | None:
+    required = {
+        "raybet_match_id",
+        "map_number",
+        "strict_mapping_id",
+        "dota_match_id",
+        "winner_side",
+        "evidence_ref",
+        "settled_at",
+    }
+    if not required.issubset(_relation_columns(connection, "map_results")):
+        return "map_result_schema_unavailable"
+    row = connection.execute(
+        """SELECT strict_mapping_id, dota_match_id, winner_side,
+                  evidence_ref, settled_at
+             FROM map_results
+            WHERE raybet_match_id=? AND map_number=?""",
+        (raybet_match_id, map_number),
+    ).fetchone()
+    if row is None:
+        return "map_result_missing"
+    if (
+        type(row["strict_mapping_id"]) is not int
+        or int(row["strict_mapping_id"]) != strict_mapping_id
+    ):
+        return "map_result_mapping_lineage_unverified"
+    if (
+        type(row["dota_match_id"]) is not int
+        or int(row["dota_match_id"]) != int(reconciliation["dota_match_id"])
+        or row["winner_side"] != reconciliation["opendota_winner_side"]
+        or row["evidence_ref"]
+        != f"settlement-reconciliation:{raybet_match_id}:map:{map_number}"
+    ):
+        return "opendota_result_identity_conflict"
+    settled_at = _aware_timestamp(row["settled_at"])
+    if (
+        settled_at is None
+        or settled_at < mapping_recorded_at
+        or settled_at < reconciliation_first_observed_at
+        or settled_at > reconciliation_updated_at
+        or settled_at > read_cutoff
+    ):
+        return "map_result_causal_order_invalid"
     return None
 
 
@@ -2222,32 +2282,13 @@ def get_raybet_postmatch(
         )
         odds = _downsample_timeline(full_odds, max_points)
         response = _postmatch_base(clean_match_id, map_number, odds)
-        eligibility = query_strict_live_eligibility(
-            connection,
-            raybet_match_id=clean_match_id,
-            map_number=map_number,
-            transport_observed_at=read_cutoff,
-        )
-        if eligibility.mapping is not None:
-            response["mapping"] = _mapping_payload(eligibility.mapping)
-        if not eligibility.eligible or eligibility.mapping is None:
-            response["reason"] = eligibility.reason
-            if eligibility.reason not in {
-                "accepted_mapping_missing",
-                "mapping_invalidated",
-                "strict_mapping_schema_missing",
-                "raybet_metadata_missing",
-                "canonical_team_missing",
-            }:
-                response["status"] = "review"
-            return response
-
         reconciliation_columns = _relation_columns(
             connection, "settlement_reconciliations"
         )
         required_reconciliation = {
             "raybet_match_id",
             "map_number",
+            "strict_mapping_id",
             "dota_match_id",
             "raybet_winner_side",
             "opendota_winner_side",
@@ -2267,8 +2308,70 @@ def get_raybet_postmatch(
             (clean_match_id, map_number),
         ).fetchone()
         if reconciliation is None:
+            eligibility = query_strict_live_eligibility(
+                connection,
+                raybet_match_id=clean_match_id,
+                map_number=map_number,
+                transport_observed_at=read_cutoff,
+            )
+            if eligibility.mapping is not None:
+                response["mapping"] = _mapping_payload(eligibility.mapping)
+            if not eligibility.eligible or eligibility.mapping is None:
+                response["reason"] = eligibility.reason
+                if eligibility.reason not in {
+                    "accepted_mapping_missing",
+                    "mapping_invalidated",
+                    "strict_mapping_schema_missing",
+                    "raybet_metadata_missing",
+                    "canonical_team_missing",
+                }:
+                    response["status"] = "review"
             return response
         response["reconciliation"] = _reconciliation_payload(reconciliation)
+        strict_mapping_id = reconciliation["strict_mapping_id"]
+        if type(strict_mapping_id) is not int or strict_mapping_id <= 0:
+            response["status"] = "review"
+            response["reason"] = "reconciliation_mapping_authority_missing"
+            return response
+        first_observed_at = _aware_timestamp(reconciliation["first_observed_at"])
+        updated_at = _aware_timestamp(reconciliation["updated_at"])
+        if (
+            first_observed_at is None
+            or updated_at is None
+            or updated_at < first_observed_at
+            or first_observed_at > read_cutoff
+            or updated_at > read_cutoff
+        ):
+            response["status"] = "review"
+            response["reason"] = "reconciliation_causal_order_invalid"
+            return response
+        historical_eligibility = query_strict_mapping_snapshot(
+            connection,
+            mapping_id=strict_mapping_id,
+            observed_at=first_observed_at,
+        )
+        historical_mapping = historical_eligibility.mapping
+        if (
+            not historical_eligibility.eligible
+            or historical_mapping is None
+            or historical_mapping.mapping_id != strict_mapping_id
+            or historical_mapping.raybet_match_id != clean_match_id
+            or historical_mapping.map_number != map_number
+        ):
+            response["status"] = "review"
+            response["reason"] = "reconciliation_mapping_lineage_unverified"
+            return response
+        response["mapping"] = _mapping_payload(historical_mapping)
+        current_eligibility = query_strict_live_eligibility(
+            connection,
+            raybet_match_id=clean_match_id,
+            map_number=map_number,
+            transport_observed_at=read_cutoff,
+        )
+        if not current_eligibility.eligible or current_eligibility.mapping is None:
+            response["warnings"].append(current_eligibility.reason)
+        elif current_eligibility.mapping.mapping_id != strict_mapping_id:
+            response["warnings"].append("current_mapping_changed")
         if reconciliation["status"] != "confirmed":
             response["status"] = "review"
             response["reason"] = (
@@ -2286,41 +2389,18 @@ def get_raybet_postmatch(
             response["reason"] = "opendota_match_identity_invalid"
             return response
 
-        first_observed_at = _aware_timestamp(reconciliation["first_observed_at"])
-        updated_at = _aware_timestamp(reconciliation["updated_at"])
         if (
-            first_observed_at is None
-            or updated_at is None
-            or first_observed_at < eligibility.mapping.recorded_at
-            or updated_at < first_observed_at
-            or first_observed_at > read_cutoff
-            or updated_at > read_cutoff
+            first_observed_at < historical_mapping.recorded_at
         ):
             response["status"] = "review"
             response["reason"] = "reconciliation_causal_order_invalid"
             return response
-        historical_eligibility = query_strict_live_eligibility(
-            connection,
-            raybet_match_id=clean_match_id,
-            map_number=map_number,
-            transport_observed_at=first_observed_at,
-        )
-        if (
-            not historical_eligibility.eligible
-            or historical_eligibility.mapping is None
-            or historical_eligibility.mapping.mapping_id
-            != eligibility.mapping.mapping_id
-        ):
-            response["status"] = "review"
-            response["reason"] = "reconciliation_mapping_lineage_unverified"
-            return response
-
         evidence_reason = _confirmed_evidence_reason(
             connection,
             reconciliation,
             raybet_match_id=clean_match_id,
             map_number=map_number,
-            mapping_recorded_at=eligibility.mapping.recorded_at,
+            mapping_recorded_at=historical_mapping.recorded_at,
             reconciliation_first_observed_at=first_observed_at,
             reconciliation_updated_at=updated_at,
             read_cutoff=read_cutoff,
@@ -2334,6 +2414,28 @@ def get_raybet_postmatch(
             response["reason"] = evidence_reason
             return response
         dota_match_id = int(reconciliation["dota_match_id"])
+        map_result_reason = _confirmed_map_result_reason(
+            connection,
+            reconciliation,
+            raybet_match_id=clean_match_id,
+            map_number=map_number,
+            strict_mapping_id=strict_mapping_id,
+            mapping_recorded_at=historical_mapping.recorded_at,
+            reconciliation_first_observed_at=first_observed_at,
+            reconciliation_updated_at=updated_at,
+            read_cutoff=read_cutoff,
+        )
+        if map_result_reason is not None:
+            response["status"] = (
+                "unavailable"
+                if map_result_reason in {
+                    "map_result_missing",
+                    "map_result_schema_unavailable",
+                }
+                else "review"
+            )
+            response["reason"] = map_result_reason
+            return response
         duplicate_reason = _duplicate_link_reason(
             connection,
             raybet_match_id=clean_match_id,
@@ -2348,7 +2450,7 @@ def get_raybet_postmatch(
         scopes = _targeted_scopes(connection, dota_match_id)
         identity_status, identity_reason = _opendota_identity_reason(
             connection,
-            eligibility.mapping,
+            historical_mapping,
             reconciliation,
             map_number=map_number,
             scopes=scopes,

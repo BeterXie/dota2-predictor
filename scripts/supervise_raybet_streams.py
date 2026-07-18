@@ -1,11 +1,13 @@
-"""Supervise one visual watcher for every active RayBet match with video."""
+"""Supervise bounded visual watchers for exact active RayBet Dota matches."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
@@ -18,8 +20,13 @@ LIVE_BETTING_DATA = ROOT / "data" / "live_betting"
 DEFAULT_OBSERVATION_DIR = LIVE_BETTING_DATA / "live_observations"
 
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
+from live_betting.browser_contract import (  # noqa: E402
+    DOTA2_GAME_ID,
+    RAYBET_ORIGINS,
+)
 from live_betting.health import record_health  # noqa: E402
 from live_betting.raybet_state import raybet_match_is_live  # noqa: E402
+from live_betting.sanitize import stored_public_stream_url  # noqa: E402
 from live_betting.vision_retention import prune_vision_evidence  # noqa: E402
 
 DEFAULT_EVIDENCE_DIR = LIVE_BETTING_DATA / "live_evidence"
@@ -27,9 +34,23 @@ DEFAULT_LOG_DIR = LIVE_BETTING_DATA / "watcher_logs"
 OUTPUT_MAX_AGE = timedelta(seconds=90)
 WATCHER_STARTUP_GRACE = timedelta(seconds=90)
 RETENTION_INTERVAL_SECONDS = 60 * 60
+MAX_CONCURRENT_WATCHERS = 4
+WATCHER_MAX_START_FAILURES = 3
+WATCHER_RETRY_DELAYS = (timedelta(seconds=30), timedelta(seconds=60))
+VIDEO_SOURCE_PATHS = frozenset({"/live", "/video", "/playback", "/v2/video"})
 
 Child = tuple[subprocess.Popen, object, object]
 OutputSignature = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class WatcherRetryState:
+    attempts: int
+    failure_reason: str
+    last_exit_code: int | None
+    failed_at: datetime
+    retry_at: datetime | None
+    exhausted: bool
 
 
 def record_supervisor_health(
@@ -75,22 +96,31 @@ def supervisor_health(
     *,
     started_at: Mapping[str, datetime] | None = None,
     output_baselines: Mapping[str, OutputSignature | None] | None = None,
+    retry_states: Mapping[str, WatcherRetryState] | None = None,
+    max_concurrent: int = MAX_CONCURRENT_WATCHERS,
     now: datetime | None = None,
 ) -> tuple[str, dict[str, object], str | None]:
     """Describe whether desired watchers are alive and producing fresh output."""
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     started_at = started_at or {}
     output_baselines = output_baselines or {}
-    running: set[str] = set()
+    retry_states = retry_states or {}
+    running = {
+        match_id
+        for match_id in desired
+        if (child := children.get(match_id)) is not None and child[0].poll() is None
+    }
     producing: set[str] = set()
     watcher_details: dict[str, dict[str, object]] = {}
     stale: set[str] = set()
+    retrying: set[str] = set()
+    exhausted: set[str] = set()
+    queued: set[str] = set()
+    missing: set[str] = set()
 
     for match_id in sorted(desired):
         child = children.get(match_id)
         is_running = child is not None and child[0].poll() is None
-        if is_running:
-            running.add(match_id)
 
         path = output_dir / f"{match_id}.jsonl"
         signature = _output_signature(path)
@@ -123,9 +153,39 @@ def supervisor_health(
             if started is not None
             else None
         )
-        if not is_running:
+        retry = retry_states.get(match_id)
+        retry_details = None
+        if retry is not None:
+            retry_details = {
+                "attempts": retry.attempts,
+                "max_attempts": WATCHER_MAX_START_FAILURES,
+                "failure_reason": retry.failure_reason,
+                "last_exit_code": retry.last_exit_code,
+                "failed_at": retry.failed_at.isoformat(),
+                "retry_at": retry.retry_at.isoformat() if retry.retry_at else None,
+                "exhausted": retry.exhausted,
+            }
+        if not is_running and retry is not None and retry.exhausted:
+            state = "failed"
+            reason = f"{retry.failure_reason}_retry_exhausted"
+            exhausted.add(match_id)
+        elif (
+            not is_running
+            and retry is not None
+            and retry.retry_at is not None
+            and now < retry.retry_at
+        ):
+            state = "backoff"
+            reason = f"{retry.failure_reason}_retry_scheduled"
+            retrying.add(match_id)
+        elif not is_running and len(running) >= max_concurrent:
+            state = "queued"
+            reason = "watcher_capacity_limited"
+            queued.add(match_id)
+        elif not is_running:
             state = "desired"
             reason = "watcher_not_running"
+            missing.add(match_id)
         elif is_producing:
             state = "producing"
             reason = "fresh_output"
@@ -143,14 +203,18 @@ def supervisor_health(
             "reason": reason,
             "output_updated_at": output_at.isoformat() if output_at else None,
             "output_age_seconds": round(output_age, 3) if output_age is not None else None,
+            "retry": retry_details,
         }
 
-    missing = desired - running
     waiting = running - producing - stale
-    if not desired or producing == desired:
+    if not desired:
         status = "healthy"
-        reason = "idle" if not desired else "all_watchers_producing"
+        reason = "idle"
         error = None
+    elif exhausted:
+        status = "unhealthy"
+        reason = "watcher_retry_exhausted"
+        error = f"watcher retry exhausted: {','.join(sorted(exhausted))}"
     elif missing:
         status = "unhealthy"
         reason = "watchers_not_running"
@@ -159,6 +223,18 @@ def supervisor_health(
         status = "unhealthy"
         reason = "watchers_not_producing"
         error = f"watchers not producing fresh output: {','.join(sorted(stale))}"
+    elif retrying:
+        status = "degraded"
+        reason = "watcher_retry_scheduled"
+        error = f"watcher startup retry scheduled: {','.join(sorted(retrying))}"
+    elif queued:
+        status = "degraded"
+        reason = "watcher_capacity_limited"
+        error = None
+    elif producing == desired:
+        status = "healthy"
+        reason = "all_watchers_producing"
+        error = None
     elif waiting == desired:
         status = "starting"
         reason = "awaiting_first_output"
@@ -175,26 +251,85 @@ def supervisor_health(
         "desired_match_ids": sorted(desired),
         "running_match_ids": sorted(running),
         "producing_match_ids": sorted(producing),
+        "retrying_match_ids": sorted(retrying),
+        "retry_exhausted_match_ids": sorted(exhausted),
+        "queued_match_ids": sorted(queued),
+        "max_concurrent_watchers": max_concurrent,
         "reason": reason,
         "watchers": watcher_details,
     }
     return status, details, error
 
 
-def active_matches(database: Path, *, now: datetime | None = None) -> list[str]:
+def _exact_dota_live_payload(raw_json: object, match_id: str) -> bool:
+    try:
+        payload = json.loads(str(raw_json or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and str(payload.get("id") or "") == match_id
+        and type(payload.get("game_id")) is int
+        and payload["game_id"] == DOTA2_GAME_ID
+        and str(payload.get("status") or "") == "2"
+    )
+
+
+def active_match_evidence(
+    database: Path, *, now: datetime | None = None
+) -> dict[str, str]:
+    """Select exact live Dota rows; stream evidence labels but does not gate probes."""
     connection = connect_sqlite(database, read_only=True)
     try:
-        return [
-            str(row[0])
-            for row in connection.execute(
-                """SELECT raybet_match_id, status, updated_at
-                     FROM raybet_matches
-                    WHERE live_url IS NOT NULL AND live_url != ''"""
-            )
-            if raybet_match_is_live(row[1], row[2], now=now)
-        ]
+        rows = connection.execute(
+            """SELECT matches.raybet_match_id, matches.status,
+                      matches.updated_at, matches.live_url, matches.raw_json,
+                      (
+                          SELECT events.captured_at
+                            FROM browser_events AS events
+                           WHERE events.raybet_match_id=matches.raybet_match_id
+                             AND events.game_id=?
+                             AND events.event_type='video'
+                             AND events.recognized=1
+                             AND events.capture_reason IS NULL
+                             AND events.processing_status='audit_only'
+                             AND events.processing_reason='video_audit_only'
+                             AND events.payload_storage='external'
+                             AND events.payload_artifact_hash IS NOT NULL
+                             AND events.page_origin IN (?, ?, ?, ?)
+                             AND events.source_path IN (?, ?, ?, ?)
+                           ORDER BY julianday(events.captured_at) DESC,
+                                    events.event_id DESC
+                           LIMIT 1
+                      ) AS video_captured_at
+                 FROM raybet_matches AS matches""",
+            (
+                DOTA2_GAME_ID,
+                *sorted(RAYBET_ORIGINS),
+                *sorted(VIDEO_SOURCE_PATHS),
+            ),
+        ).fetchall()
     finally:
         connection.close()
+    evidence: dict[str, str] = {}
+    for row in rows:
+        match_id = str(row[0])
+        if not raybet_match_is_live(row[1], row[2], now=now):
+            continue
+        if not _exact_dota_live_payload(row[4], match_id):
+            continue
+        if stored_public_stream_url(row[3], row[4]) is not None:
+            reason = "verified_public_stream"
+        elif row[5] is not None and raybet_match_is_live("2", row[5], now=now):
+            reason = "fresh_browser_video"
+        else:
+            reason = "ephemeral_stream_refresh_probe"
+        evidence[match_id] = reason
+    return dict(sorted(evidence.items()))
+
+
+def active_matches(database: Path, *, now: datetime | None = None) -> list[str]:
+    return list(active_match_evidence(database, now=now))
 
 
 def run_evidence_retention(
@@ -227,7 +362,7 @@ def watcher_command(
         "--output",
         str(output_dir / f"{match_id}.jsonl"),
         "--evidence-dir",
-        str(evidence_dir / match_id),
+        str(evidence_dir),
         "--interval",
         "1",
         "--evidence-interval",
@@ -239,7 +374,8 @@ def watcher_command(
 def reap_children(
     children: dict[str, Child],
     active: set[str],
-) -> None:
+) -> dict[str, int]:
+    exited: dict[str, int] = {}
     for match_id, (process, stdout, stderr) in list(children.items()):
         if match_id not in active and process.poll() is None:
             process.terminate()
@@ -249,9 +385,63 @@ def reap_children(
                 process.kill()
                 process.wait(timeout=5)
         if match_id not in active or process.poll() is not None:
+            exit_code = process.poll()
+            exited[match_id] = int(exit_code) if exit_code is not None else -1
             stdout.close()
             stderr.close()
             children.pop(match_id)
+    return exited
+
+
+def watcher_retry_after_failure(
+    previous: WatcherRetryState | None,
+    *,
+    exit_code: int | None,
+    produced_output: bool,
+    failed_at: datetime,
+    failure_reason: str | None = None,
+) -> WatcherRetryState:
+    attempts = 1 if previous is None or produced_output else previous.attempts + 1
+    exhausted = attempts >= WATCHER_MAX_START_FAILURES
+    reason = failure_reason or (
+        "source_refresh_failed" if exit_code == 2 else "watcher_startup_failed"
+    )
+    retry_at = None
+    if not exhausted:
+        retry_at = failed_at + WATCHER_RETRY_DELAYS[attempts - 1]
+    return WatcherRetryState(
+        attempts=attempts,
+        failure_reason=reason,
+        last_exit_code=exit_code,
+        failed_at=failed_at,
+        retry_at=retry_at,
+        exhausted=exhausted,
+    )
+
+
+def startable_matches(
+    active: set[str],
+    children: Mapping[str, Child],
+    retry_states: Mapping[str, WatcherRetryState],
+    *,
+    now: datetime,
+    max_concurrent: int = MAX_CONCURRENT_WATCHERS,
+) -> list[str]:
+    slots = max(0, max_concurrent - len(children))
+    if slots == 0:
+        return []
+    result: list[str] = []
+    for match_id in sorted(active - set(children)):
+        retry = retry_states.get(match_id)
+        if retry is not None and (
+            retry.exhausted
+            or (retry.retry_at is not None and now < retry.retry_at)
+        ):
+            continue
+        result.append(match_id)
+        if len(result) >= slots:
+            break
+    return result
 
 
 def main() -> int:
@@ -269,25 +459,46 @@ def main() -> int:
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     args.log_dir.mkdir(parents=True, exist_ok=True)
     children: dict[str, Child] = {}
-    last_start: dict[str, float] = {}
     started_at: dict[str, datetime] = {}
     output_baselines: dict[str, OutputSignature | None] = {}
+    retry_states: dict[str, WatcherRetryState] = {}
     last_retention_at: float | None = None
     retention_details: dict[str, object] = {"status": "pending"}
     try:
         while True:
             try:
-                active = set(active_matches(args.database))
-                reap_children(children, active)
+                evidence = active_match_evidence(args.database)
+                active = set(evidence)
+                exited_output = {
+                    match_id: (
+                        _output_signature(args.output_dir / f"{match_id}.jsonl")
+                        != output_baselines.get(match_id)
+                    )
+                    for match_id, (process, _, _) in children.items()
+                    if match_id in active and process.poll() is not None
+                }
+                exited = reap_children(children, active)
+                failed_at = datetime.now(timezone.utc)
+                for match_id, exit_code in exited.items():
+                    if match_id not in active:
+                        continue
+                    retry_states[match_id] = watcher_retry_after_failure(
+                        retry_states.get(match_id),
+                        exit_code=exit_code,
+                        produced_output=exited_output.get(match_id, False),
+                        failed_at=failed_at,
+                    )
+                for match_id in set(retry_states) - active:
+                    retry_states.pop(match_id, None)
                 for match_id in set(started_at) - set(children):
                     started_at.pop(match_id, None)
                     output_baselines.pop(match_id, None)
-                for match_id in active:
-                    if (
-                        match_id in children
-                        or time.monotonic() - last_start.get(match_id, 0) < 30
-                    ):
-                        continue
+                for match_id in startable_matches(
+                    active,
+                    children,
+                    retry_states,
+                    now=failed_at,
+                ):
                     stdout = (args.log_dir / f"{match_id}.stdout.log").open(
                         "a", encoding="utf-8"
                     )
@@ -310,13 +521,19 @@ def main() -> int:
                             stderr=stderr,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         )
-                    except BaseException:
+                    except Exception:
                         stdout.close()
                         stderr.close()
                         output_baselines.pop(match_id, None)
-                        raise
+                        retry_states[match_id] = watcher_retry_after_failure(
+                            retry_states.get(match_id),
+                            exit_code=None,
+                            produced_output=False,
+                            failed_at=datetime.now(timezone.utc),
+                            failure_reason="watcher_spawn_failed",
+                        )
+                        continue
                     children[match_id] = (process, stdout, stderr)
-                    last_start[match_id] = time.monotonic()
                     started_at[match_id] = datetime.now(timezone.utc)
                 monotonic_now = time.monotonic()
                 if (
@@ -339,7 +556,11 @@ def main() -> int:
                     args.output_dir,
                     started_at=started_at,
                     output_baselines=output_baselines,
+                    retry_states=retry_states,
                 )
+                details["active_match_evidence"] = evidence
+                for match_id in details["producing_match_ids"]:
+                    retry_states.pop(str(match_id), None)
                 details["evidence_retention"] = retention_details
                 if retention_details.get("status") == "error":
                     if status == "healthy":

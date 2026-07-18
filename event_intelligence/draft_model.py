@@ -9,15 +9,20 @@ import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+from functools import lru_cache
 from numbers import Real
 from typing import Any, Iterable, Mapping
 
 import numpy as np
+import scipy
+import sklearn
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
 
 MODEL_VERSION = "draft-logistic-l2-v1"
+MODEL_ARTIFACT_VERSION = "draft-model-artifact-v2"
+LEGACY_MODEL_ARTIFACT_VERSION = "draft-model-artifact-v1"
 FEATURE_SCHEMA_VERSION = "draft-feature-schema-v1"
 LANDMARK_MINUTES = (10, 20, 30, 40, 50)
 DEFAULT_MIN_SAMPLES = 20
@@ -32,6 +37,13 @@ CALIBRATION_MAX_ECE_UPPER = 0.15
 _SOLVER = "lbfgs"
 _MAX_ITERATIONS = 2_000
 _TOLERANCE = 1e-10
+_TRAINER_RUNTIME = (
+    ("numpy", np.__version__),
+    ("scikit_learn", sklearn.__version__),
+    ("scipy", scipy.__version__),
+)
+# Keep only the live and next candidate five-horizon bundles strongly referenced.
+_VERIFICATION_CACHE_SIZE = len(LANDMARK_MINUTES) * 2
 
 
 class ModelStatus(str, Enum):
@@ -156,7 +168,52 @@ class DraftTrainingRow:
 
 
 @dataclass(frozen=True)
+class DraftTrainingCorpusRow:
+    """One immutable, canonical row embedded in a version 2 model artifact."""
+
+    match_id: int
+    input_snapshot_hash: str
+    cutoff: datetime
+    completed_at: datetime
+    result_usable_at: datetime
+    outcome: int
+    duration_minutes: float
+    series_id: str
+    features: tuple[tuple[str, FeatureValue], ...]
+
+    def to_training_row(self) -> DraftTrainingRow:
+        return DraftTrainingRow(
+            match_id=self.match_id,
+            input_snapshot_hash=self.input_snapshot_hash,
+            cutoff=self.cutoff,
+            completed_at=self.completed_at,
+            result_usable_at=self.result_usable_at,
+            outcome=self.outcome,
+            duration_minutes=self.duration_minutes,
+            series_id=self.series_id,
+            features=dict(self.features),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "match_id": self.match_id,
+            "input_snapshot_hash": self.input_snapshot_hash,
+            "cutoff": _iso(self.cutoff),
+            "completed_at": _iso(self.completed_at),
+            "result_usable_at": _iso(self.result_usable_at),
+            "outcome": self.outcome,
+            "duration_minutes": self.duration_minutes,
+            "series_id": self.series_id,
+            "features": dict(self.features),
+            "missing_features": [
+                name for name, value in self.features if value is None
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class DraftModelArtifact:
+    artifact_version: str
     model_version: str
     model_kind: str
     status: ModelStatus
@@ -170,6 +227,8 @@ class DraftModelArtifact:
     feature_names: tuple[str, ...]
     feature_schema_hash: str
     training_input_hash: str
+    trainer_runtime: tuple[tuple[str, str], ...]
+    training_corpus: tuple[DraftTrainingCorpusRow, ...]
     class_counts: tuple[tuple[int, int], ...]
     missing_counts: tuple[tuple[str, int], ...]
     imputation_values: tuple[tuple[str, float], ...]
@@ -179,6 +238,14 @@ class DraftModelArtifact:
     intercept: float | None
     logit_covariance: tuple[tuple[float, ...], ...]
     model_hash: str
+
+    @property
+    def audit_only(self) -> bool:
+        return self.artifact_version != MODEL_ARTIFACT_VERSION
+
+    @property
+    def has_replayable_training_corpus(self) -> bool:
+        return self.artifact_version == MODEL_ARTIFACT_VERSION
 
     def to_payload(self, *, include_model_hash: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -207,6 +274,16 @@ class DraftModelArtifact:
             "intercept": self.intercept,
             "logit_covariance": [list(row) for row in self.logit_covariance],
         }
+        if self.artifact_version == MODEL_ARTIFACT_VERSION:
+            payload.update(
+                {
+                    "artifact_version": self.artifact_version,
+                    "trainer_runtime": dict(self.trainer_runtime),
+                    "training_corpus": [
+                        row.to_payload() for row in self.training_corpus
+                    ],
+                }
+            )
         if include_model_hash:
             payload["model_hash"] = self.model_hash
         return payload
@@ -331,6 +408,24 @@ def _training_input_hash(
     )
 
 
+def _training_corpus_row(
+    prepared: PreparedTrainingRow,
+    schema: FeatureSchema,
+) -> DraftTrainingCorpusRow:
+    row, values, _missing = prepared
+    return DraftTrainingCorpusRow(
+        match_id=row.match_id,
+        input_snapshot_hash=row.input_snapshot_hash,
+        cutoff=row.cutoff,
+        completed_at=row.completed_at,
+        result_usable_at=row.result_usable_at,
+        outcome=int(row.outcome),
+        duration_minutes=float(row.duration_minutes),
+        series_id=str(row.series_id),
+        features=tuple(zip(schema.names, values, strict=True)),
+    )
+
+
 def _empty_column_statistics(
     schema: FeatureSchema,
     support: int,
@@ -411,6 +506,7 @@ def _artifact(
     l2_regularization: float,
     schema: FeatureSchema,
     training_input_hash: str,
+    training_corpus: tuple[DraftTrainingCorpusRow, ...],
     class_counts: tuple[tuple[int, int], ...],
     missing_counts: tuple[tuple[str, int], ...],
     imputation_values: tuple[tuple[str, float], ...],
@@ -421,6 +517,7 @@ def _artifact(
     covariance: tuple[tuple[float, ...], ...] = (),
 ) -> DraftModelArtifact:
     artifact = DraftModelArtifact(
+        artifact_version=MODEL_ARTIFACT_VERSION,
         model_version=MODEL_VERSION,
         model_kind=model_kind,
         status=status,
@@ -434,6 +531,8 @@ def _artifact(
         feature_names=schema.names,
         feature_schema_hash=schema.schema_hash,
         training_input_hash=training_input_hash,
+        trainer_runtime=_TRAINER_RUNTIME,
+        training_corpus=training_corpus,
         class_counts=class_counts,
         missing_counts=missing_counts,
         imputation_values=imputation_values,
@@ -549,6 +648,9 @@ def fit_draft_model(
         counts[int(row.outcome)] += 1
     class_counts = tuple(sorted(counts.items()))
     input_hash = _training_input_hash(prepared, schema, horizon_minutes)
+    training_corpus = tuple(
+        _training_corpus_row(row, schema) for row in prepared
+    )
     matrix, missing_counts, imputation, means, scales = _column_statistics(
         prepared, schema
     )
@@ -563,6 +665,7 @@ def fit_draft_model(
         "l2_regularization": regularization,
         "schema": schema,
         "training_input_hash": input_hash,
+        "training_corpus": training_corpus,
         "class_counts": class_counts,
         "missing_counts": missing_counts,
         "imputation_values": imputation,
@@ -626,13 +729,157 @@ def _sigmoid(logit: float) -> float:
     return exp_logit / (1.0 + exp_logit)
 
 
+@lru_cache(maxsize=_VERIFICATION_CACHE_SIZE)
 def _verify_model_artifact(model: DraftModelArtifact) -> None:
     if not isinstance(model, DraftModelArtifact):
         raise ValueError("model must be a DraftModelArtifact")
+    if model.artifact_version not in {
+        MODEL_ARTIFACT_VERSION,
+        LEGACY_MODEL_ARTIFACT_VERSION,
+    }:
+        raise ValueError("unsupported draft model artifact version")
+    if model.model_version != MODEL_VERSION:
+        raise ValueError("unsupported draft model version")
+    if model.model_kind not in {"pure_draft", "context_adjusted"}:
+        raise ValueError("unsupported draft model kind")
+    if model.horizon_minutes not in LANDMARK_MINUTES:
+        raise ValueError("unsupported draft landmark horizon")
+    if (
+        isinstance(model.support, bool)
+        or not isinstance(model.support, int)
+        or model.support < 0
+        or isinstance(model.series_support, bool)
+        or not isinstance(model.series_support, int)
+        or not 0 <= model.series_support <= model.support
+        or isinstance(model.min_samples, bool)
+        or not isinstance(model.min_samples, int)
+        or model.min_samples < 2
+    ):
+        raise ValueError("model support metadata is invalid")
+    regularization = _finite_float(
+        model.l2_regularization,
+        field="l2_regularization",
+    )
+    if regularization <= 0.0:
+        raise ValueError("model l2_regularization must be positive")
+    schema = FeatureSchema(model.feature_names)
+    if schema.names != model.feature_names or schema.schema_hash != model.feature_schema_hash:
+        raise ValueError("model feature schema does not recompute")
+    _sha256_digest(model.training_input_hash, field="training_input_hash")
+    _utc(model.training_cutoff, field="training_cutoff")
+    if model.artifact_version == MODEL_ARTIFACT_VERSION:
+        if model.trainer_runtime != _TRAINER_RUNTIME:
+            raise ValueError("model trainer runtime does not match this runtime")
+        if len(model.training_corpus) != model.support:
+            raise ValueError("model training corpus does not match support")
+    elif model.trainer_runtime or model.training_corpus:
+        raise ValueError("legacy model artifact cannot contain a training corpus")
+
+    class_counts = dict(model.class_counts)
+    if (
+        set(class_counts) != {0, 1}
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in class_counts.values()
+        )
+        or sum(class_counts.values()) != model.support
+    ):
+        raise ValueError("model class counts do not match support")
+    expected_names = schema.names
+    for field, rows in (
+        ("missing_counts", model.missing_counts),
+        ("imputation_values", model.imputation_values),
+        ("standardization_means", model.standardization_means),
+        ("standardization_scales", model.standardization_scales),
+    ):
+        if tuple(name for name, _ in rows) != expected_names:
+            raise ValueError(f"model {field} do not match feature schema")
+    if any(
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 0 <= count <= model.support
+        for _, count in model.missing_counts
+    ):
+        raise ValueError("model missing counts do not match support")
+    for field, rows in (
+        ("imputation", model.imputation_values),
+        ("standardization mean", model.standardization_means),
+        ("standardization scale", model.standardization_scales),
+        ("coefficient", model.coefficients),
+    ):
+        for _, value in rows:
+            _finite_float(value, field=field)
+    if any(value <= 0.0 for _, value in model.standardization_scales):
+        raise ValueError("model standardization scales must be positive")
+
+    if model.status is ModelStatus.TRAINED:
+        if (
+            model.reason is not None
+            or model.support < model.min_samples
+            or not class_counts[0]
+            or not class_counts[1]
+            or model.series_support < 1
+        ):
+            raise ValueError("trained model support invariants are invalid")
+        if tuple(name for name, _ in model.coefficients) != expected_names:
+            raise ValueError("trained model coefficients do not match feature schema")
+        if model.intercept is None:
+            raise ValueError("trained model intercept is missing")
+        _finite_float(model.intercept, field="model intercept")
+        covariance = np.asarray(model.logit_covariance, dtype=np.float64)
+        expected_shape = (len(expected_names) + 1, len(expected_names) + 1)
+        if covariance.shape != expected_shape or not np.all(np.isfinite(covariance)):
+            raise ValueError("trained model covariance is incomplete")
+        if not np.allclose(covariance, covariance.T, rtol=0.0, atol=1e-12):
+            raise ValueError("trained model covariance must be symmetric")
+        if float(np.min(np.linalg.eigvalsh(covariance))) < -1e-10:
+            raise ValueError("trained model covariance must be positive semidefinite")
+    else:
+        expected_reason = (
+            "support_below_minimum"
+            if model.support < model.min_samples
+            else "single_class_training_data"
+            if not class_counts[0] or not class_counts[1]
+            else None
+        )
+        if (
+            expected_reason is None
+            or model.reason != expected_reason
+            or model.coefficients
+            or model.intercept is not None
+            or model.logit_covariance
+        ):
+            raise ValueError("insufficient model parameters are inconsistent")
     claimed = _sha256_digest(model.model_hash, field="model_hash")
     expected = _sha256(model.to_payload(include_model_hash=False))
     if model.model_hash != claimed or not hmac.compare_digest(claimed, expected):
         raise ValueError("model artifact hash does not match its parameters")
+    if model.artifact_version == MODEL_ARTIFACT_VERSION:
+        replayed = fit_draft_model(
+            (row.to_training_row() for row in model.training_corpus),
+            schema,
+            model.training_cutoff,
+            model.horizon_minutes,
+            min_samples=model.min_samples,
+            model_kind=model.model_kind,
+            l2_regularization=model.l2_regularization,
+        )
+        expected_payload = _canonical_bytes(
+            replayed.to_payload(include_model_hash=False)
+        )
+        actual_payload = _canonical_bytes(
+            model.to_payload(include_model_hash=False)
+        )
+        if not hmac.compare_digest(actual_payload, expected_payload):
+            raise ValueError("model artifact does not replay from its training corpus")
+
+
+def assert_model_artifact_deployable(model: DraftModelArtifact) -> None:
+    """Reject audit-only legacy artifacts at every deployment boundary."""
+
+    _verify_model_artifact(model)
+    if model.artifact_version != MODEL_ARTIFACT_VERSION:
+        raise ValueError("legacy model artifact is audit-only and cannot be deployed")
 
 
 def predict_draft(
@@ -712,7 +959,10 @@ def predict_draft(
     if covariance.shape != expected_shape or not np.all(np.isfinite(covariance)):
         raise ValueError("model covariance is incomplete")
     design = np.asarray((1.0, *standardized_values), dtype=np.float64)
-    logit_variance = max(0.0, float(design @ covariance @ design))
+    raw_logit_variance = float(design @ covariance @ design)
+    if raw_logit_variance < -1e-10:
+        raise ValueError("model covariance produced a negative variance")
+    logit_variance = max(0.0, raw_logit_variance)
     uncertainty = min(
         0.5,
         probability * (1.0 - probability) * math.sqrt(logit_variance),
@@ -844,6 +1094,23 @@ def _equal_count_calibration_bins(
     return tuple(result)
 
 
+def _expected_calibration_error(
+    outcomes: tuple[int, ...],
+    probabilities: tuple[float, ...],
+    requested_bins: int,
+) -> tuple[float, tuple[CalibrationBin, ...]]:
+    """Compute the exact ECE definition without unrelated prediction metrics."""
+
+    calibration = _equal_count_calibration_bins(
+        outcomes, probabilities, requested_bins
+    )
+    ece = (
+        math.fsum(row.count * row.absolute_gap for row in calibration)
+        / len(outcomes)
+    )
+    return ece, calibration
+
+
 def evaluate_binary_predictions(
     outcomes: Iterable[int | bool],
     probabilities: Iterable[float],
@@ -884,10 +1151,9 @@ def evaluate_binary_predictions(
         else None
     )
 
-    calibration = _equal_count_calibration_bins(
+    ece, calibration = _expected_calibration_error(
         outcome_values, probability_values, ece_bins
     )
-    ece = math.fsum(row.count * row.absolute_gap for row in calibration) / support
     return BinaryMetrics(
         support=support,
         brier_score=brier,

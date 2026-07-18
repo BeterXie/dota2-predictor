@@ -21,7 +21,7 @@ from .ingest import (
     ScopeDecision,
 )
 from .models import RegisteredEvent, StageScope
-from .raw_archive import ArtifactReceipt
+from .raw_archive import ArtifactReceipt, verify_raw_artifact_file
 from .registry import EventRegistry, SCOPE_POLICY_VERSION
 from .scheduler import SchedulerRetryState, next_retry_at
 from .storage import IntelligenceStorage
@@ -830,64 +830,161 @@ class SQLiteIngestAdapter:
         artifact_key = _artifact_id(receipt.source, receipt.content_sha256)
         event_id = self._event_id_for_receipt(receipt)
         created_at = _iso(receipt.observed_at)
+        storage_path = str(Path(receipt.path).resolve())
+        verify_raw_artifact_file(
+            receipt.path,
+            content_hash=receipt.content_sha256,
+            uncompressed_bytes=receipt.byte_count,
+            compressed_bytes=receipt.compressed_byte_count,
+            expected_schema_fingerprint=receipt.schema_fingerprint,
+        )
         with self.storage.transaction():
-            self.connection.execute(
-                """INSERT INTO raw_source_artifacts
-                   (artifact_id, content_hash, source, artifact_use, endpoint,
-                    sanitized_request_identity, storage_path, uncompressed_bytes,
-                    compressed_bytes, source_at, received_at, first_usable_at,
-                    schema_fingerprint, event_id, match_id, created_at)
-                   VALUES (?, ?, ?, 'primary', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(artifact_id) DO UPDATE SET
-                     first_usable_at=COALESCE(raw_source_artifacts.first_usable_at,
-                                              excluded.first_usable_at)""",
-                (
-                    artifact_key,
-                    receipt.content_sha256,
-                    receipt.source,
-                    receipt.endpoint,
-                    receipt.request_identity,
-                    str(Path(receipt.path).resolve()),
-                    receipt.byte_count,
-                    receipt.compressed_byte_count,
-                    _iso(receipt.source_timestamp),
-                    _iso(receipt.observed_at),
-                    _iso(receipt.first_usable_at),
-                    receipt.schema_fingerprint,
-                    event_id,
-                    receipt.match_id,
-                    created_at,
-                ),
-            )
-            self.connection.execute(
-                """INSERT INTO raw_source_observations
-                   (observation_id, artifact_id, content_hash, source, artifact_use,
-                    endpoint, sanitized_request_identity, source_at, received_at,
-                    first_usable_at, schema_fingerprint, event_id, match_id,
-                    http_status, created_at)
-                   VALUES (?, ?, ?, ?, 'primary', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(observation_id) DO UPDATE SET
-                     first_usable_at=COALESCE(
-                         raw_source_observations.first_usable_at,
-                         excluded.first_usable_at
-                     )""",
-                (
-                    receipt.observation_id,
-                    artifact_key,
-                    receipt.content_sha256,
-                    receipt.source,
-                    receipt.endpoint,
-                    receipt.request_identity,
-                    _iso(receipt.source_timestamp),
-                    _iso(receipt.observed_at),
-                    _iso(receipt.first_usable_at),
-                    receipt.schema_fingerprint,
-                    event_id,
-                    receipt.match_id,
-                    receipt.status_code,
-                    created_at,
-                ),
-            )
+            artifact = self.connection.execute(
+                """SELECT content_hash, source, artifact_use, storage_path,
+                          uncompressed_bytes, compressed_bytes, schema_fingerprint,
+                          first_usable_at
+                     FROM raw_source_artifacts WHERE artifact_id=?""",
+                (artifact_key,),
+            ).fetchone()
+            artifact_authority = {
+                "content_hash": receipt.content_sha256,
+                "source": receipt.source,
+                "artifact_use": "primary",
+                "storage_path": storage_path,
+                "uncompressed_bytes": receipt.byte_count,
+                "compressed_bytes": receipt.compressed_byte_count,
+                "schema_fingerprint": receipt.schema_fingerprint,
+            }
+            if artifact is None:
+                self.connection.execute(
+                    """INSERT INTO raw_source_artifacts
+                       (artifact_id, content_hash, source, artifact_use, endpoint,
+                        sanitized_request_identity, storage_path, uncompressed_bytes,
+                        compressed_bytes, source_at, received_at, first_usable_at,
+                        schema_fingerprint, event_id, match_id, created_at)
+                       VALUES (?, ?, ?, 'primary', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        artifact_key,
+                        receipt.content_sha256,
+                        receipt.source,
+                        receipt.endpoint,
+                        receipt.request_identity,
+                        storage_path,
+                        receipt.byte_count,
+                        receipt.compressed_byte_count,
+                        _iso(receipt.source_timestamp),
+                        _iso(receipt.observed_at),
+                        _iso(receipt.first_usable_at),
+                        receipt.schema_fingerprint,
+                        event_id,
+                        receipt.match_id,
+                        created_at,
+                    ),
+                )
+            else:
+                mismatched = [
+                    field
+                    for field, expected in artifact_authority.items()
+                    if artifact[field] != expected
+                ]
+                if receipt.artifact_created:
+                    mismatched.append("registered_file_was_missing")
+                if mismatched:
+                    if receipt.artifact_created:
+                        receipt.path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        "raw source artifact conflict differs from persisted authority: "
+                        + ", ".join(mismatched)
+                    )
+                verify_raw_artifact_file(
+                    artifact["storage_path"],
+                    content_hash=str(artifact["content_hash"]),
+                    uncompressed_bytes=int(artifact["uncompressed_bytes"]),
+                    compressed_bytes=int(artifact["compressed_bytes"]),
+                    expected_schema_fingerprint=str(artifact["schema_fingerprint"]),
+                )
+                if artifact["first_usable_at"] is None and receipt.first_usable_at is not None:
+                    self.connection.execute(
+                        """UPDATE raw_source_artifacts SET first_usable_at=?
+                            WHERE artifact_id=? AND first_usable_at IS NULL""",
+                        (_iso(receipt.first_usable_at), artifact_key),
+                    )
+
+            observation_authority = {
+                "artifact_id": artifact_key,
+                "content_hash": receipt.content_sha256,
+                "source": receipt.source,
+                "artifact_use": "primary",
+                "endpoint": receipt.endpoint,
+                "sanitized_request_identity": receipt.request_identity,
+                "source_at": _iso(receipt.source_timestamp),
+                "received_at": _iso(receipt.observed_at),
+                "schema_fingerprint": receipt.schema_fingerprint,
+                "event_id": event_id,
+                "match_id": receipt.match_id,
+                "http_status": receipt.status_code,
+                "created_at": created_at,
+            }
+            observation = self.connection.execute(
+                """SELECT artifact_id, content_hash, source, artifact_use, endpoint,
+                          sanitized_request_identity, source_at, received_at,
+                          first_usable_at, schema_fingerprint, event_id, match_id,
+                          http_status, created_at
+                     FROM raw_source_observations WHERE observation_id=?""",
+                (receipt.observation_id,),
+            ).fetchone()
+            if observation is None:
+                self.connection.execute(
+                    """INSERT INTO raw_source_observations
+                       (observation_id, artifact_id, content_hash, source, artifact_use,
+                        endpoint, sanitized_request_identity, source_at, received_at,
+                        first_usable_at, schema_fingerprint, event_id, match_id,
+                        http_status, created_at)
+                       VALUES (?, ?, ?, ?, 'primary', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        receipt.observation_id,
+                        artifact_key,
+                        receipt.content_sha256,
+                        receipt.source,
+                        receipt.endpoint,
+                        receipt.request_identity,
+                        _iso(receipt.source_timestamp),
+                        _iso(receipt.observed_at),
+                        _iso(receipt.first_usable_at),
+                        receipt.schema_fingerprint,
+                        event_id,
+                        receipt.match_id,
+                        receipt.status_code,
+                        created_at,
+                    ),
+                )
+                return
+
+            mismatched = [
+                field
+                for field, expected in observation_authority.items()
+                if observation[field] != expected
+            ]
+            if mismatched:
+                raise RuntimeError(
+                    "raw source observation conflict differs from persisted authority: "
+                    + ", ".join(mismatched)
+                )
+            first_usable_at = _iso(receipt.first_usable_at)
+            if observation["first_usable_at"] is None and first_usable_at is not None:
+                self.connection.execute(
+                    """UPDATE raw_source_observations SET first_usable_at=?
+                        WHERE observation_id=? AND first_usable_at IS NULL""",
+                    (first_usable_at, receipt.observation_id),
+                )
+            elif (
+                observation["first_usable_at"] is not None
+                and first_usable_at is not None
+                and observation["first_usable_at"] != first_usable_at
+            ):
+                raise RuntimeError(
+                    "raw source observation first usable time conflicts with authority"
+                )
 
     def _event_id_for_receipt(self, receipt: ArtifactReceipt) -> str | None:
         if receipt.match_id is not None:

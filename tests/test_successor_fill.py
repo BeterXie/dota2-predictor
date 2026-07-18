@@ -4,16 +4,21 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder
 from live_betting.storage import LiveBettingStore
 from live_betting.strategy import make_order
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
+)
 
 
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
@@ -42,6 +47,43 @@ def snapshot(
     )
 
 
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    outcomes: list[dict[str, object]] = []
+    for row in rows:
+        market = row.market
+        item: dict[str, object] = {
+            "id": row.odds_id,
+            "odds_group_id": row.odds_group_id or "",
+            "match_stage": market.period.replace("map_", "r"),
+            "odds": str(row.price),
+            "status": row.status,
+        }
+        if market.side in {"team_one", "team_two"}:
+            item["team_id"] = 1 if market.side == "team_one" else 2
+        if market.market_type == "winner":
+            item.update(group_short_name="Winner", tag="win")
+        elif market.market_type == "kill_handicap":
+            item.update(
+                group_short_name="Kill Handicap",
+                tag="hdp",
+                value=str(market.line),
+            )
+        else:
+            raise ValueError(f"unsupported raw fixture market: {market.market_type}")
+        outcomes.append(item)
+    return {
+        "result": {
+            "id": MATCH_ID,
+            "game_id": 151,
+            "team": [
+                {"team_id": 1, "team_name": "One", "pos": 1},
+                {"team_id": 2, "team_name": "Two", "pos": 2},
+            ],
+            "odds": outcomes,
+        }
+    }
+
+
 class SuccessorFillTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -49,6 +91,21 @@ class SuccessorFillTests(unittest.TestCase):
         self.store = LiveBettingStore(self.path)
         self.store.init_schema()
         self.strict_mapping_id = self.insert_strict_mapping()
+        self.signal_vision = make_test_vision_observation(
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            captured_at=NOW,
+            label="successor-fill-frame",
+        )
+        self.store.insert_vision_observation(self.signal_vision)
+        self.draft_authority = seed_test_draft_authority(
+            self.store.connection,
+            raybet_match_id=MATCH_ID,
+            map_number=1,
+            strict_mapping_id=self.strict_mapping_id,
+            observed_at=NOW,
+            label="successor-fill",
+        )
         self.order_key: str | None = None
         self.strict_context_patch = patch.object(
             self.store, "_strict_mapping_context_block_reason", return_value=None
@@ -76,6 +133,7 @@ class SuccessorFillTests(unittest.TestCase):
             observed_at=at,
             normalized_state_hash=normalized_state_hash(rows),
             snapshots=rows,
+            raw_payload=raw_odds_payload(rows),
         )
 
     def insert_strict_mapping(self) -> int:
@@ -124,7 +182,17 @@ class SuccessorFillTests(unittest.TestCase):
 
     def pending_order(self) -> ShadowOrder:
         signal = snapshot(NOW)
-        self.observe("signal", NOW, [signal])
+        signal_rows = [
+            signal,
+            snapshot(
+                NOW,
+                odds_id="winner-two",
+                price=1.5,
+                side="team_two",
+            ),
+        ]
+        self.observe("signal", NOW, signal_rows)
+        market_probability = price_groups(signal_rows)[signal.odds_id]
         strategy_version = "successor-test-v1"
         input_ref = "successor-test-input"
         order = make_order(
@@ -133,8 +201,8 @@ class SuccessorFillTests(unittest.TestCase):
                 "map_1",
                 signal.market,
                 0.6,
-                0.5,
-                0.1,
+                market_probability,
+                0.6 - market_probability,
                 NOW,
                 strategy_version,
                 input_ref,
@@ -163,6 +231,7 @@ class SuccessorFillTests(unittest.TestCase):
                     contributions={
                         "test": 0.1,
                         "__inputs__": {
+                            "draft_authority": asdict(self.draft_authority),
                             "strict_live_eligibility": {
                                 "mapping_refs": {
                                     "strict_mapping_id": self.strict_mapping_id
@@ -170,7 +239,7 @@ class SuccessorFillTests(unittest.TestCase):
                             },
                             "vision": {
                                 "captured_at": NOW.isoformat(),
-                                "source_frame_ref": "C:/evidence/successor-test.jpg",
+                                "source_frame_ref": self.signal_vision.source_frame_ref,
                                 "game_clock_seconds": 600,
                             },
                             "quality": {"aggregate": 0.8},
@@ -183,12 +252,18 @@ class SuccessorFillTests(unittest.TestCase):
                     },
                     input_ref=input_ref,
                     strategy_version=strategy_version,
-                )
+                ),
+                draft_authority=self.draft_authority,
+                vision_observation=self.signal_vision,
+                vision_transport_key="signal",
             )
         )
         self.assertTrue(
             self.store.insert_map_order(
-                order, 1, strict_mapping_id=self.strict_mapping_id
+                order,
+                1,
+                strict_mapping_id=self.strict_mapping_id,
+                draft_authority=self.draft_authority,
             )
         )
         self.assertEqual(
@@ -256,7 +331,7 @@ class SuccessorFillTests(unittest.TestCase):
 
         self.assertEqual((timing, changes), ("on_time", 0))
         memberships = self.store.connection.execute(
-            """SELECT observation_key, odds_id FROM odds_response_outcomes
+            """SELECT observation_key, odds_id FROM odds_response_outcomes_effective
                ORDER BY observation_key, odds_id"""
         ).fetchall()
         self.assertEqual(
@@ -280,15 +355,16 @@ class SuccessorFillTests(unittest.TestCase):
 
         with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
             self.store.execute(
-                """UPDATE odds_response_outcomes SET price=3.0
-                    WHERE observation_key='response'"""
+                """UPDATE odds_response_state_outcomes SET price=3.0"""
             )
         with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
             self.store.execute(
-                """DELETE FROM odds_response_outcomes
-                    WHERE observation_key='response'"""
+                """DELETE FROM odds_response_state_outcomes"""
             )
-        with self.assertRaisesRegex(ValueError, "membership or payload differs"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "observation key already belongs to another response",
+        ):
             self.observe(
                 "response",
                 NOW,
@@ -335,7 +411,12 @@ class SuccessorFillTests(unittest.TestCase):
             signal_identity_verified=True,
         )
         self.assertFalse(
-            self.store.insert_map_order(wrong_price, 1, strict_mapping_id=1)
+            self.store.insert_map_order(
+                wrong_price,
+                1,
+                strict_mapping_id=1,
+                draft_authority=self.draft_authority,
+            )
         )
 
         closed_at = NOW + timedelta(seconds=1)
@@ -358,7 +439,12 @@ class SuccessorFillTests(unittest.TestCase):
             signal_identity_verified=True,
         )
         self.assertFalse(
-            self.store.insert_map_order(closed_order, 1, strict_mapping_id=1)
+            self.store.insert_map_order(
+                closed_order,
+                1,
+                strict_mapping_id=1,
+                draft_authority=self.draft_authority,
+            )
         )
         self.assertEqual(
             self.store.connection.execute(
@@ -384,7 +470,7 @@ class SuccessorFillTests(unittest.TestCase):
 
         self.assertEqual(timing, "late")
         membership = self.store.connection.execute(
-            """SELECT price FROM odds_response_outcomes
+            """SELECT price FROM odds_response_outcomes_effective
                WHERE observation_key='late' AND odds_id=?""",
             (TARGET_ID,),
         ).fetchone()
@@ -462,7 +548,6 @@ class SuccessorFillTests(unittest.TestCase):
         rebound = snapshot(
             at,
             odds_group_id="replacement-winner-group",
-            outcome_key="replacement-team-one",
         )
         self.observe("rebound-identity", at, [rebound])
 
@@ -714,6 +799,13 @@ class ShadowOrderMigrationTests(unittest.TestCase):
                 self.assertIsNone(row[4])
                 self.assertEqual(int(row[5]), 0)
                 self.assertIsNone(row[6])
+                self.assertIsNotNone(
+                    store.connection.execute(
+                        """SELECT 1 FROM sqlite_master
+                            WHERE type='trigger'
+                              AND name='settlement_result_evidence_authority_insert'"""
+                    ).fetchone()
+                )
 
 
 if __name__ == "__main__":

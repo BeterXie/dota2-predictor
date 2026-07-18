@@ -197,7 +197,7 @@ server:
 
 | 页面名称 | 固定命令 |
 |---|---|
-| 赔率采集 | `python -u -m live_betting.monitor --database data/dota2.db --raw-dir data/live_betting/raw --interval 6 --list-interval 30` |
+| 赔率采集 | `python -u -m live_betting.monitor --database data/dota2.db --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30` |
 | 纸面策略 | `python -u -m live_betting.shadow_monitor --database data/dota2.db --vision-jsonl data/live_betting/live_observations` |
 | 视觉监控 | `python -u scripts/supervise_raybet_streams.py --database data/dota2.db` |
 | 邮件投递 | `python -u scripts/run_notification_worker.py --database data/dota2.db` |
@@ -361,7 +361,7 @@ SMTP 投递语义是“至少一次”：进程可能在邮件服务器已接收
 | Web 标准输出 | `data/web-monitor.stdout.log` |
 | Web 错误输出 | `data/web-monitor.stderr.log` |
 | 管理进程日志 | `data/live_betting/logs/managed/` |
-| 原始赔率响应 | `data/live_betting/raw/` |
+| 原始赔率响应 | `data/live_betting/raw-v2/` |
 | 视觉观测 | `data/live_betting/live_observations/` |
 | 视觉证据 | `data/live_betting/live_evidence/` |
 | 视觉 watcher 日志 | `data/live_betting/watcher_logs/` |

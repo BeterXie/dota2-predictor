@@ -22,6 +22,14 @@ import type { MatchDetail, MonitorMatch } from "../types";
 import { LifecycleBadge } from "./StatusBadge";
 import { PostmatchIntelligencePanel } from "./PostmatchIntelligencePanel";
 
+const RAYBET_PAGE_HOSTS = new Set(["ray086.com", "www.ray086.com"]);
+const RAYBET_PAGE_PREFIXES = ["/sports/esports", "/esports", "/dota2"];
+const PUBLIC_STREAM_HOSTS = new Set([
+  "play.ehome.gg",
+  "qplay.ehome.gg",
+  "qplay.shyxswl.com",
+]);
+
 const ProbabilityChart = lazy(() =>
   import("./ProbabilityChart").then((module) => ({ default: module.ProbabilityChart })),
 );
@@ -82,6 +90,7 @@ export function MatchWorkspace({
     && (visionStatus === "ready" || visionStatus === "delayed")
     ? vision
     : null;
+  const watchLink = safeWatchLink(match.watch_link);
 
   return (
     <main className="workspace" aria-live="polite">
@@ -103,16 +112,16 @@ export function MatchWorkspace({
           </div>
         </div>
         <div className="match-header-actions">
-          {match.live_url && (
+          {watchLink && (
             <Button
               appearance="subtle"
               as="a"
-              href={match.live_url}
+              href={watchLink.url}
               icon={<ArrowSquareOut size={16} />}
               rel="noreferrer"
               target="_blank"
             >
-              打开直播
+              {watchLink.kind === "match_page" ? "打开比赛页" : "打开直播"}
             </Button>
           )}
           <span className={observedAge != null && observedAge > 60 ? "source-age stale" : "source-age"}>
@@ -204,6 +213,46 @@ export function MatchWorkspace({
       )}
     </main>
   );
+}
+
+function safeWatchLink(link: MonitorMatch["watch_link"]): {
+  kind: "public_stream" | "match_page";
+  url: string;
+} | null {
+  if (
+    link?.availability !== "available"
+    || (link.kind !== "public_stream" && link.kind !== "match_page")
+    || typeof link.url !== "string"
+  ) {
+    return null;
+  }
+  try {
+    const parsed = new URL(link.url);
+    if (
+      parsed.protocol !== "https:"
+      || parsed.username
+      || parsed.password
+      || parsed.port
+      || parsed.search
+      || parsed.hash
+    ) {
+      return null;
+    }
+    if (link.kind === "public_stream") {
+      return PUBLIC_STREAM_HOSTS.has(parsed.hostname)
+        && parsed.pathname.toLowerCase().endsWith(".m3u8")
+        ? { kind: link.kind, url: parsed.href }
+        : null;
+    }
+    const allowedPath = RAYBET_PAGE_PREFIXES.some(
+      (prefix) => parsed.pathname === prefix || parsed.pathname.startsWith(`${prefix}/`),
+    );
+    return RAYBET_PAGE_HOSTS.has(parsed.hostname) && allowedPath
+      ? { kind: link.kind, url: parsed.href }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function QuoteCell({

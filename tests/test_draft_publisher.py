@@ -2,116 +2,313 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import live_betting.draft_publisher as draft_publisher_module
+import live_betting.profiles.draft_curve as draft_curve_profile
 from event_intelligence.backtest import HORIZONS, draft_dependency_fingerprint
-from event_intelligence.deployment import FrozenDraftDeployment
+from event_intelligence.deployment import (
+    FrozenDraftDeployment,
+    build_frozen_draft_deployment,
+    load_prospective_history,
+)
 from event_intelligence.draft_artifacts import (
     CalibrationSample,
     build_calibration_artifact,
     canonical_hash,
     canonical_json_bytes,
+    model_artifact_from_payload,
 )
 from event_intelligence.draft_features import (
-    FEATURE_SCHEMA,
-    FEATURE_SCHEMA_HASH,
-    FEATURE_VERSION,
-    PURE_FEATURE_SCHEMA,
+    DRAFT_FEATURE_ARTIFACT_VERSION,
+    DraftMapEvidence,
+    build_draft_feature_artifact,
 )
 from event_intelligence.draft_model import (
-    DraftTrainingRow,
     FeatureSchema,
     fit_draft_model,
     predict_draft,
 )
+from event_intelligence.ingest_adapters import SQLiteIngestAdapter
+from event_intelligence.raw_archive import RawArchive
+from event_intelligence.registry import EventRegistry
+from event_intelligence.roles import (
+    PROSPECTIVE_ASSIGNMENT_VERSION,
+    RECONSTRUCTED_ASSIGNMENT_VERSION,
+)
+from event_intelligence.storage import IntelligenceStorage
 from live_betting.database_protocol import prepare_database
+from live_betting.draft_authority import (
+    authority_from_curve,
+    draft_landmark_authority_matches,
+)
+from live_betting.draft_evidence import prospective_outcome_authority
 from live_betting.draft_publisher import (
+    DraftAnchor,
+    ProspectiveHistorySnapshot,
+    _curve_key,
     _deployment_identity,
+    _existing_curve,
+    _latest_patch,
+    build_live_draft_target,
     build_prospective_calibration_deployment,
+    draft_anchor_frames_are_authoritative,
+    load_frozen_deployment,
     load_latest_frozen_deployment,
     persist_frozen_deployment,
+    publisher_singleton_lock,
     publish_anchor_curve,
     publish_cycle,
     ready_draft_anchors,
 )
-from live_betting.profiles.draft_curve import build_draft_curve
+from live_betting.profiles.draft_curve import (
+    _verify_prospective_calibration_evidence,
+    build_draft_curve,
+)
+from live_betting.raybet import parse_raybet_map_final
 from live_betting.storage import LiveBettingStore
-from live_betting.vision import VisionObservation
 from shared.sqlite import connect
+from tests.draft_authority_fixture import make_test_vision_observation
 
 
 UTC = timezone.utc
 CUTOFF = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
 
 
-def _deployment(database: Path) -> FrozenDraftDeployment:
-    rows = tuple(
-        DraftTrainingRow(
-            match_id=index + 1,
-            input_snapshot_hash=f"{index + 1:064x}",
-            cutoff=CUTOFF - timedelta(days=60 - index),
-            completed_at=CUTOFF - timedelta(days=59 - index),
-            result_usable_at=CUTOFF - timedelta(days=58 - index),
-            outcome=index % 2,
-            duration_minutes=60.0,
-            series_id=f"series-{index // 2}",
-            features={
-                name: (
-                    (-1.0 if index % 2 == 0 else 1.0)
-                    if name == "hero_win_rate_diff"
-                    else 0.0
-                )
-                for name in PURE_FEATURE_SCHEMA
-            },
-        )
-        for index in range(40)
-    )
-    schema = FeatureSchema.from_names(PURE_FEATURE_SCHEMA)
-    models = tuple(
-        fit_draft_model(rows, schema, CUTOFF, horizon, model_kind="pure_draft")
-        for horizon in HORIZONS
-    )
-    calibrations = tuple(
-        build_calibration_artifact(
-            model,
-            evidence_mode="reconstructed_walk_forward",
-            source_ref="strict-draft-walk-forward-v1:test",
-            fit_samples=(),
-            evaluation_samples=(),
-        )
-        for model in models
-    )
-    connection = connect(database, read_only=True, row_factory=sqlite3.Row)
+def _deployment(
+    database: Path,
+    *,
+    min_samples: int = 20,
+) -> FrozenDraftDeployment:
+    connection = connect(database, row_factory=sqlite3.Row)
     try:
-        fingerprint = draft_dependency_fingerprint(connection)
-        revision = int(
-            connection.execute(
-                "SELECT dependency_revision FROM draft_lineage_revisions"
-            ).fetchone()[0]
+        _insert_event(connection)
+        _insert_prospective_history(connection)
+        return build_frozen_draft_deployment(
+            connection,
+            training_cutoff=CUTOFF,
+            min_samples=min_samples,
         )
     finally:
         connection.close()
+
+
+def _forged_corpus_deployment(
+    deployment: FrozenDraftDeployment,
+    *,
+    horizon_minutes: int,
+) -> FrozenDraftDeployment:
+    original = deployment.model(horizon_minutes)
+    corpus = list(original.training_corpus)
+    first = corpus[0]
+    features = dict(first.features)
+    feature_name = next(
+        name for name in original.feature_names if features[name] is not None
+    )
+    features[feature_name] = float(features[feature_name]) + 0.125
+    corpus[0] = replace(
+        first,
+        features=tuple((name, features[name]) for name in original.feature_names),
+    )
+    forged_model = fit_draft_model(
+        tuple(row.to_training_row() for row in corpus),
+        FeatureSchema.from_names(original.feature_names),
+        original.training_cutoff,
+        original.horizon_minutes,
+        min_samples=original.min_samples,
+        model_kind=original.model_kind,
+        l2_regularization=original.l2_regularization,
+    )
+    assert forged_model.model_hash != original.model_hash
+    original_calibration = deployment.calibration(horizon_minutes)
+    forged_calibration = build_calibration_artifact(
+        forged_model,
+        evidence_mode=original_calibration.evidence_mode,
+        source_ref=original_calibration.source_ref,
+        fit_samples=original_calibration.fit_samples,
+        evaluation_samples=original_calibration.evaluation_samples,
+    )
+    models = tuple(
+        forged_model if row.horizon_minutes == horizon_minutes else row
+        for row in deployment.models
+    )
+    calibrations = tuple(
+        forged_calibration if row.horizon_minutes == horizon_minutes else row
+        for row in deployment.calibrations
+    )
     identity = _deployment_identity(
-        training_cutoff=CUTOFF,
-        dependency_fingerprint=fingerprint,
-        dependency_revision=revision,
+        training_cutoff=deployment.training_cutoff,
+        dependency_fingerprint=deployment.dependency_fingerprint,
+        dependency_revision=deployment.dependency_revision,
         models=models,
         calibrations=calibrations,
-        evidence_mode="reconstructed_walk_forward",
+        evidence_mode=deployment.evidence_mode,
     )
     return FrozenDraftDeployment(
         deployment_key=canonical_hash(identity),
-        training_cutoff=CUTOFF,
-        dependency_fingerprint=fingerprint,
-        dependency_revision=revision,
+        training_cutoff=deployment.training_cutoff,
+        dependency_fingerprint=deployment.dependency_fingerprint,
+        dependency_revision=deployment.dependency_revision,
         models=models,
         calibrations=calibrations,
     )
+
+
+def _legacy_audit_only_deployment(
+    deployment: FrozenDraftDeployment,
+    *,
+    horizon_minutes: int = 10,
+) -> FrozenDraftDeployment:
+    payload = deployment.model(horizon_minutes).to_payload()
+    payload.pop("artifact_version")
+    payload.pop("trainer_runtime")
+    payload.pop("training_corpus")
+    unsigned = dict(payload)
+    unsigned.pop("model_hash")
+    payload["model_hash"] = canonical_hash(unsigned)
+    legacy_model = model_artifact_from_payload(payload)
+    original_calibration = deployment.calibration(horizon_minutes)
+    legacy_calibration = build_calibration_artifact(
+        legacy_model,
+        evidence_mode=original_calibration.evidence_mode,
+        source_ref=original_calibration.source_ref,
+        fit_samples=original_calibration.fit_samples,
+        evaluation_samples=original_calibration.evaluation_samples,
+    )
+    models = tuple(
+        legacy_model if row.horizon_minutes == horizon_minutes else row
+        for row in deployment.models
+    )
+    calibrations = tuple(
+        legacy_calibration if row.horizon_minutes == horizon_minutes else row
+        for row in deployment.calibrations
+    )
+    identity = _deployment_identity(
+        training_cutoff=deployment.training_cutoff,
+        dependency_fingerprint=deployment.dependency_fingerprint,
+        dependency_revision=deployment.dependency_revision,
+        models=models,
+        calibrations=calibrations,
+        evidence_mode=deployment.evidence_mode,
+    )
+    return FrozenDraftDeployment(
+        deployment_key=canonical_hash(identity),
+        training_cutoff=deployment.training_cutoff,
+        dependency_fingerprint=deployment.dependency_fingerprint,
+        dependency_revision=deployment.dependency_revision,
+        models=models,
+        calibrations=calibrations,
+    )
+
+
+def _insert_deployment_without_replay(
+    connection: sqlite3.Connection,
+    deployment: FrozenDraftDeployment,
+    *,
+    created_at: datetime,
+) -> None:
+    timestamp = created_at.isoformat()
+    for model in deployment.models:
+        connection.execute(
+            """INSERT OR IGNORE INTO draft_model_artifacts
+               (model_hash, model_version, model_kind, horizon_minutes,
+                training_cutoff, feature_schema_hash, training_input_hash,
+                artifact_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                model.model_hash,
+                model.model_version,
+                model.model_kind,
+                model.horizon_minutes,
+                model.training_cutoff.isoformat(),
+                model.feature_schema_hash,
+                model.training_input_hash,
+                canonical_json_bytes(model.to_payload()).decode(),
+                timestamp,
+            ),
+        )
+    for calibration in deployment.calibrations:
+        connection.execute(
+            """INSERT OR IGNORE INTO draft_calibration_artifacts
+               (calibration_hash, model_hash, calibration_version,
+                horizon_minutes, evidence_mode, support, artifact_json,
+                created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                calibration.calibration_hash,
+                calibration.model_hash,
+                calibration.calibration_version,
+                calibration.horizon_minutes,
+                calibration.evidence_mode,
+                calibration.support,
+                canonical_json_bytes(calibration.to_payload()).decode(),
+                timestamp,
+            ),
+        )
+    connection.execute(
+        """INSERT INTO draft_deployment_bundles
+           (deployment_key, model_hashes_json, calibration_hashes_json,
+            training_cutoff, dependency_fingerprint, dependency_revision,
+            evidence_mode, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            deployment.deployment_key,
+            canonical_json_bytes(
+                {
+                    str(row.horizon_minutes): row.model_hash
+                    for row in deployment.models
+                }
+            ).decode(),
+            canonical_json_bytes(
+                {
+                    str(row.horizon_minutes): row.calibration_hash
+                    for row in deployment.calibrations
+                }
+            ).decode(),
+            deployment.training_cutoff.isoformat(),
+            deployment.dependency_fingerprint,
+            deployment.dependency_revision,
+            deployment.evidence_mode,
+            timestamp,
+        ),
+    )
+    connection.commit()
+
+
+def _record_dependency_change(
+    connection: sqlite3.Connection,
+    *,
+    affected_from: datetime,
+) -> int:
+    current = int(
+        connection.execute(
+            """SELECT dependency_revision FROM draft_lineage_revisions
+                WHERE singleton=1"""
+        ).fetchone()[0]
+    )
+    revision = current + 1
+    connection.execute(
+        """UPDATE draft_lineage_revisions
+              SET dependency_revision=?, updated_at=?
+            WHERE singleton=1""",
+        (revision, affected_from.isoformat()),
+    )
+    connection.execute(
+        """INSERT INTO draft_lineage_changes
+           (dependency_revision, affected_from_unix, source_relation,
+            operation, changed_at)
+           VALUES (?, ?, 'test_dependency', 'INSERT', ?)""",
+        (revision, int(affected_from.timestamp()), affected_from.isoformat()),
+    )
+    connection.commit()
+    return revision
 
 
 @pytest.fixture
@@ -131,26 +328,52 @@ def _strict_result():
     return SimpleNamespace(eligible=True, reason="eligible", mapping=mapping)
 
 
+def test_publisher_singleton_lock_fences_competing_processes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "publisher.db"
+    with publisher_singleton_lock(database):
+        with pytest.raises(RuntimeError, match="already running"):
+            with publisher_singleton_lock(database):
+                raise AssertionError("competing publisher acquired the lock")
+    with publisher_singleton_lock(database):
+        pass
+
+
+def test_publisher_singleton_lock_fences_hard_link_alias(tmp_path: Path) -> None:
+    database = tmp_path / "publisher.db"
+    alias = tmp_path / "publisher-alias.db"
+    database.touch()
+    os.link(database, alias)
+
+    with publisher_singleton_lock(database):
+        with pytest.raises(RuntimeError, match="already running"):
+            with publisher_singleton_lock(alias):
+                raise AssertionError("hard-link alias acquired a second lock")
+
+
 def _insert_anchor(store: LiveBettingStore, *, captured_at: datetime = CUTOFF) -> None:
     assert store.insert_vision_observation(
-        VisionObservation(
+        make_test_vision_observation(
             raybet_match_id="match-1",
             map_number=1,
             captured_at=captured_at,
             game_clock_seconds=120,
-            is_paused=False,
             radiant_hero_ids=(1, 2, 3, 4, 5),
             dire_hero_ids=(6, 7, 8, 9, 10),
             clock_confidence=0.99,
             draft_confidence=0.99,
-            source_frame_ref="frame-1.jpg",
-            screen_state="game",
             radiant_team_side="team_one",
+            label="draft-publisher-anchor",
         )
     )
 
 
 def _insert_event(connection: sqlite3.Connection) -> None:
+    if connection.execute(
+        "SELECT 1 FROM event_registry WHERE event_id='event-1'"
+    ).fetchone() is not None:
+        return
     connection.execute(
         """INSERT INTO event_registry
            (event_id, canonical_name, tier, prize_pool_usd,
@@ -176,6 +399,195 @@ def _insert_event(connection: sqlite3.Connection) -> None:
             (CUTOFF - timedelta(days=2)).isoformat(),
         ),
     )
+
+
+def _insert_prospective_history(connection: sqlite3.Connection) -> None:
+    if connection.execute(
+        "SELECT 1 FROM match_ingest_status WHERE match_id=7000000"
+    ).fetchone() is not None:
+        return
+    league_id = int(
+        connection.execute(
+            "SELECT opendota_league_id FROM event_registry WHERE event_id='event-1'"
+        ).fetchone()[0]
+    )
+    for group in range(5):
+        for offset in range(4):
+            match_id = 7_000_000 + group * 10 + offset
+            started = CUTOFF - timedelta(days=30 - group, hours=offset * 2)
+            completed = started + timedelta(hours=1)
+            usable = completed + timedelta(minutes=1)
+            content_hash = hashlib.sha256(f"history:{match_id}".encode()).hexdigest()
+            artifact_id = f"opendota:{content_hash}"
+            timestamp = usable.isoformat()
+            connection.execute(
+                """INSERT INTO raw_source_artifacts
+                   (artifact_id, content_hash, source, artifact_use, endpoint,
+                    sanitized_request_identity, storage_path, uncompressed_bytes,
+                    compressed_bytes, received_at, first_usable_at,
+                    schema_fingerprint, event_id, match_id, created_at)
+                   VALUES (?, ?, 'opendota', 'primary', ?, ?, ?, 1, 1, ?, ?,
+                           'test-schema', 'event-1', ?, ?)""",
+                (
+                    artifact_id,
+                    content_hash,
+                    f"/api/matches/{match_id}",
+                    f"GET /api/matches/{match_id}",
+                    f"raw/{match_id}.json.gz",
+                    timestamp,
+                    timestamp,
+                    match_id,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO match_ingest_status
+                   (match_id, event_id, start_time, series_id, map_number,
+                    stage_scope, stage_in_scope, has_valid_result,
+                    is_exhibition, is_forfeit, is_void_remake, ingest_state,
+                    basic_result_state, detailed_parse_state, player_readiness,
+                    state_readiness, draft_readiness, latest_raw_artifact_id,
+                    latest_raw_content_hash, normalizer_version, first_usable_at,
+                    discovered_at, updated_at)
+                   VALUES (?, 'event-1', ?, ?, ?, 'main_event', 1, 1, 0, 0, 0,
+                           'complete', 'ready', 'ready', 'ready', 'ready',
+                           'ready', ?, ?, 'opendota-exact-v1', ?, ?, ?)""",
+                (
+                    match_id,
+                    int(started.timestamp()),
+                    8_000_000 + group,
+                    offset + 1,
+                    artifact_id,
+                    content_hash,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO raw_source_observations
+                   (observation_id, artifact_id, content_hash, source,
+                    artifact_use, endpoint, sanitized_request_identity,
+                    source_at, received_at, first_usable_at,
+                    schema_fingerprint, event_id, match_id, http_status,
+                    created_at)
+                   VALUES (?, ?, ?, 'opendota', 'primary', ?, ?, ?, ?, ?,
+                           'test-schema', 'event-1', ?, 200, ?)""",
+                (
+                    f"observation:{content_hash}",
+                    artifact_id,
+                    content_hash,
+                    f"/api/matches/{match_id}",
+                    f"GET /api/matches/{match_id}",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    match_id,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO matches
+                   (match_id, radiant_team_id, dire_team_id, radiant_win,
+                    duration, start_time, leagueid, series_id, patch)
+                   VALUES (?, 101, 202, ?, 3600, ?, ?, ?, 59)""",
+                (
+                    match_id,
+                    int(offset < group),
+                    int(started.timestamp()),
+                    league_id,
+                    8_000_000 + group,
+                ),
+            )
+            heroes = tuple(range(group * 10 + 1, group * 10 + 11))
+            connection.executemany(
+                "INSERT OR IGNORE INTO heroes(hero_id) VALUES (?)",
+                ((hero_id,) for hero_id in heroes),
+            )
+            for index, hero_id in enumerate(heroes):
+                radiant = index < 5
+                player_slot = index if radiant else 128 + index - 5
+                team_id = 101 if radiant else 202
+                account_id = 100_000 + group * 100 + index
+                connection.execute(
+                    """INSERT INTO match_players
+                       (match_id, account_id, player_slot, hero_id,
+                        is_radiant, team_id)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        match_id,
+                        account_id,
+                        player_slot,
+                        hero_id,
+                        int(radiant),
+                        team_id,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO picks_bans
+                       (match_id, hero_id, is_pick, team, ord)
+                       VALUES (?, ?, 1, ?, ?)""",
+                    (match_id, hero_id, int(not radiant), index),
+                )
+                facts = {
+                    "hero_id": hero_id,
+                    "stuns": 12.0,
+                    "hero_healing": 100,
+                    "last_hits": 200,
+                    "tower_damage": 2_000,
+                    "net_worth": 20_000,
+                    "buyback_log": [],
+                }
+                connection.execute(
+                    """INSERT INTO player_map_facts
+                       (match_id, player_slot, account_id, team_id, hero_id,
+                        is_radiant, facts_json, missing_fields_json, coverage,
+                        source_artifact_id, source_content_hash, fact_version,
+                        first_usable_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, '[]', 1.0, ?, ?, ?, ?, ?)""",
+                    (
+                        match_id,
+                        player_slot,
+                        account_id,
+                        team_id,
+                        hero_id,
+                        int(radiant),
+                        json.dumps(facts, sort_keys=True),
+                        artifact_id,
+                        content_hash,
+                        f"opendota-exact-v1:{content_hash}",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                role_cutoff = (started - timedelta(minutes=1)).isoformat()
+                role_hash = hashlib.sha256(
+                    f"role:{match_id}:{player_slot}".encode()
+                ).hexdigest()
+                for assignment_version in (
+                    RECONSTRUCTED_ASSIGNMENT_VERSION,
+                    PROSPECTIVE_ASSIGNMENT_VERSION,
+                ):
+                    connection.execute(
+                        """INSERT INTO player_role_assignments
+                           (match_id, player_slot, account_id, team_id, purpose,
+                            position, assignment_source, confidence, input_cutoff,
+                            input_hash, assignment_version, created_at)
+                           VALUES (?, ?, ?, ?, 'expected_position', ?,
+                                   'historical_pattern', 0.9, ?, ?, ?, ?)""",
+                        (
+                            match_id,
+                            player_slot,
+                            account_id,
+                            team_id,
+                            index % 5 + 1,
+                            role_cutoff,
+                            role_hash,
+                            assignment_version,
+                            role_cutoff,
+                        ),
+                    )
+    connection.commit()
 
 
 def _insert_mapping(
@@ -222,56 +634,25 @@ def _insert_mapping(
     )
 
 
-def _feature_snapshot_json(
-    *,
-    values: dict[str, float],
-    observed_at: datetime,
-    target_hash: str,
-    match_id: int,
-) -> str:
-    payload = {
-        "match_id": match_id,
-        "prediction_cutoff": observed_at.isoformat(),
-        "availability_mode": "prospective",
-        "feature_version": FEATURE_VERSION,
-        "feature_schema": list(FEATURE_SCHEMA),
-        "feature_schema_hash": FEATURE_SCHEMA_HASH,
-        "input_hash": target_hash,
-        "pure_features": [
-            {
-                "name": name,
-                "value": values[name],
-                "support": 200,
-                "evidence_ids": [],
-                "coverage": 1.0,
-                "missing_reason": None,
-            }
-            for name in PURE_FEATURE_SCHEMA
-        ],
-        "support": 200,
-        "pure_coverage": 1.0,
-        "evidence_ids": [],
-    }
-    return canonical_json_bytes(payload).decode()
-
-
 def _insert_prospective_sample(
-    connection: sqlite3.Connection,
+    store: LiveBettingStore,
     *,
+    opendota_archive: RawArchive,
     deployment: FrozenDraftDeployment,
+    history: tuple[DraftMapEvidence, ...],
     index: int,
-    hero_edge: float,
     outcome: int,
 ) -> dict[int, CalibrationSample]:
+    connection = store.connection
     observed_at = CUTOFF + timedelta(minutes=index + 1)
     settled_at = observed_at + timedelta(hours=1)
-    match_id = f"sample-{index:03d}"
+    match_id = str(8_000_000 + index)
     mapping_id = 1_000 + index
     dota_match_id = 9_000_000 + index
     curve_key = canonical_hash({"sample": index})
-    target_hash = canonical_hash({"sample-target": index})
-    radiant = [1, 2, 3, 4, 5]
-    dire = [6, 7, 8, 9, 10]
+    group = index // 20
+    radiant = list(range(group * 10 + 1, group * 10 + 6))
+    dire = list(range(group * 10 + 6, group * 10 + 11))
     anchor_hash = hashlib.sha256(
         json.dumps(
             {"radiant": radiant, "dire": dire},
@@ -279,41 +660,65 @@ def _insert_prospective_sample(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    values = {name: 0.0 for name in PURE_FEATURE_SCHEMA}
-    values["hero_win_rate_diff"] = hero_edge
+    feature_dependency_fingerprint = draft_dependency_fingerprint(connection)
+    feature_dependency_revision = int(
+        connection.execute(
+            "SELECT dependency_revision FROM draft_lineage_revisions"
+        ).fetchone()[0]
+    )
+    observation = make_test_vision_observation(
+        raybet_match_id=match_id,
+        map_number=1,
+        captured_at=observed_at,
+        game_clock_seconds=120,
+        radiant_hero_ids=tuple(radiant),
+        dire_hero_ids=tuple(dire),
+        clock_confidence=0.99,
+        draft_confidence=0.99,
+        radiant_team_side="team_one",
+        label=f"prospective-sample-{index}",
+    )
+    assert store.insert_vision_observation(observation)
     _insert_mapping(
         connection,
         mapping_id=mapping_id,
         match_id=match_id,
         observed_at=observed_at,
     )
-    connection.execute(
-        """INSERT INTO vision_draft_anchors
-           (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
-            dire_hero_ids, radiant_team_side, team_side_anchored_at,
-            team_side_source_frame_ref, anchored_at, source_frame_ref,
-            status, conflict_at)
-           VALUES (?, 1, ?, ?, ?, 'team_one', ?, 'frame.jpg', ?, 'frame.jpg',
-                   'anchored', NULL)""",
-        (
-            match_id,
-            anchor_hash,
-            json.dumps(radiant),
-            json.dumps(dire),
-            observed_at.isoformat(),
-            observed_at.isoformat(),
-        ),
+    anchor = DraftAnchor(
+        raybet_match_id=match_id,
+        map_number=1,
+        draft_hash=anchor_hash,
+        radiant_heroes=tuple(radiant),
+        dire_heroes=tuple(dire),
+        radiant_team_side="team_one",
+        anchored_at=observed_at,
+        source_frame_ref=observation.source_frame_ref,
+        team_side_anchored_at=observed_at,
+        team_side_source_frame_ref=observation.source_frame_ref,
     )
+    mapping = SimpleNamespace(
+        mapping_id=mapping_id,
+        event_id="event-1",
+        canonical_team_one_id=101,
+        canonical_team_two_id=202,
+    )
+    target = build_live_draft_target(connection, anchor, mapping, observed_at)
+    snapshot, feature_artifact = build_draft_feature_artifact(target, history)
+    target_hash = snapshot.input_hash
+    values = snapshot.pure_values()
     connection.execute(
         """INSERT INTO prospective_draft_curves
            (curve_key, raybet_match_id, map_number, strict_mapping_id,
             lineup_hash, radiant_hero_ids_json, dire_hero_ids_json,
             prediction_cutoff, first_usable_at, availability_mode, created_at,
             radiant_team_side, anchor_draft_hash, anchor_source_frame_ref,
-            anchor_anchored_at, deployment_key, target_snapshot_hash,
-            feature_snapshot_json)
-           VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'prospective', ?, 'team_one', ?,
-                   'frame.jpg', ?, ?, ?, ?)""",
+            anchor_anchored_at, anchor_team_side_source_frame_ref,
+            anchor_team_side_anchored_at, deployment_key, target_snapshot_hash,
+            feature_snapshot_json, feature_dependency_fingerprint,
+           feature_dependency_revision)
+           VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'prospective', ?, 'team_one',
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             curve_key,
             match_id,
@@ -325,15 +730,15 @@ def _insert_prospective_sample(
             observed_at.isoformat(),
             observed_at.isoformat(),
             anchor_hash,
+            observation.source_frame_ref,
+            observed_at.isoformat(),
+            observation.source_frame_ref,
             observed_at.isoformat(),
             deployment.deployment_key,
             target_hash,
-            _feature_snapshot_json(
-                values=values,
-                observed_at=observed_at,
-                target_hash=target_hash,
-                match_id=(1 << 61) + index,
-            ),
+            canonical_json_bytes(feature_artifact).decode(),
+            feature_dependency_fingerprint,
+            feature_dependency_revision,
         ),
     )
     samples: dict[int, CalibrationSample] = {}
@@ -386,66 +791,179 @@ def _insert_prospective_sample(
             cluster_id=f"raybet:{match_id}",
             event_id="event-1",
         )
+    connection.commit()
     winner = "team_one" if outcome else "team_two"
-    raybet_ref = f"raybet:{index}"
-    opendota_ref = f"opendota:{index}"
-    connection.execute(
-        """INSERT INTO map_results
-           (raybet_match_id, map_number, dota_match_id, winner_side,
-            team_one_kills, team_two_kills, duration_seconds, evidence_ref,
-            settled_at)
-           VALUES (?, 1, ?, ?, 30, 20, 2400, ?, ?)""",
-        (match_id, dota_match_id, winner, opendota_ref, settled_at.isoformat()),
+    team_one_kills = 30 if winner == "team_one" else 20
+    team_two_kills = 20 if winner == "team_one" else 30
+    raybet_payload = {
+        "id": match_id,
+        "game_id": 151,
+        "team": [
+            {"pos": 1, "team_id": 501},
+            {"pos": 2, "team_id": 502},
+        ],
+        "odds": [
+            {
+                "odds_id": f"final-{index}-one",
+                "odds_group_id": f"final-{index}",
+                "match_stage": "r1",
+                "group_short_name": "Winner",
+                "tag": "win",
+                "team_id": 501,
+                "status": 5,
+                "win": int(winner == "team_one"),
+            },
+            {
+                "odds_id": f"final-{index}-two",
+                "odds_group_id": f"final-{index}",
+                "match_stage": "r1",
+                "group_short_name": "Winner",
+                "tag": "win",
+                "team_id": 502,
+                "status": 5,
+                "win": int(winner == "team_two"),
+            },
+        ],
+    }
+    raybet_artifact = store.archive_response_payload(
+        {"result": raybet_payload},
+        observed_at=settled_at,
+        match_id=match_id,
+        response_kind="final_odds",
     )
-    for source, evidence_ref in (("raybet", raybet_ref), ("opendota", opendota_ref)):
-        connection.execute(
-            """INSERT INTO settlement_result_evidence
-               (raybet_match_id, map_number, dota_match_id, source, status,
-                winner_side, evidence_ref, facts_json, observed_at)
-               VALUES (?, 1, ?, ?, 'confirmed', ?, ?, '{}', ?)""",
-            (
-                match_id,
-                dota_match_id,
-                source,
-                winner,
-                evidence_ref,
-                settled_at.isoformat(),
-            ),
-        )
-    connection.execute(
-        """INSERT INTO settlement_reconciliations
-           (raybet_match_id, map_number, dota_match_id, raybet_winner_side,
-            opendota_winner_side, raybet_evidence_ref, opendota_evidence_ref,
-            status, reason, first_observed_at, updated_at)
-           VALUES (?, 1, ?, ?, ?, ?, ?, 'confirmed', 'sources_agree', ?, ?)""",
-        (
-            match_id,
-            dota_match_id,
-            winner,
-            winner,
-            raybet_ref,
-            opendota_ref,
-            settled_at.isoformat(),
-            settled_at.isoformat(),
+    raybet_audit_key = store.record_direct_response_audit(
+        raybet_artifact,
+        response_kind="final_odds",
+        claimed_raybet_match_id=match_id,
+        observed_raybet_match_id=match_id,
+        disposition="audit_only",
+        reason="final_result_evidence",
+    )
+    raybet_final = parse_raybet_map_final(
+        raybet_payload,
+        1,
+        observed_at=settled_at,
+        expected_match_id=match_id,
+        expected_team_ids=(501, 502),
+    )
+    opendota_payload = {
+        "match_id": dota_match_id,
+        "radiant_team_id": 101,
+        "dire_team_id": 202,
+        "radiant_win": winner == "team_one",
+        "radiant_score": team_one_kills,
+        "dire_score": team_two_kills,
+        "duration": 2400,
+    }
+    opendota_receipt = opendota_archive.archive_json(
+        source="opendota",
+        endpoint=f"/api/matches/{dota_match_id}",
+        request_identity=f"/api/matches/{dota_match_id}",
+        payload_bytes=canonical_json_bytes(opendota_payload),
+        observed_at=settled_at,
+        match_id=dota_match_id,
+        status_code=200,
+        first_usable_at=settled_at,
+    )
+    identity = {
+        "raybet_match_id": match_id,
+        "map_number": 1,
+        "strict_mapping_id": mapping_id,
+        "dota_match_id": dota_match_id,
+        "winner_side": winner,
+    }
+    opendota_ref = (
+        f"opendota:{dota_match_id}:sha256:{opendota_receipt.content_sha256}"
+    )
+    reconciliation = store.record_settlement_reconciliation(
+        raybet_match_id=match_id,
+        map_number=1,
+        strict_mapping_id=mapping_id,
+        dota_match_id=dota_match_id,
+        raybet_status="confirmed",
+        raybet_winner_side=winner,
+        opendota_winner_side=winner,
+        raybet_evidence_ref=raybet_final.evidence_ref,
+        opendota_evidence_ref=opendota_ref,
+        raybet_facts={**identity, **raybet_final.facts()},
+        opendota_facts={
+            **identity,
+            "team_one_kills": team_one_kills,
+            "team_two_kills": team_two_kills,
+            "duration_seconds": 2400,
+        },
+        status="confirmed",
+        reason="sources_consistent",
+        raybet_observed_at=settled_at,
+        opendota_observed_at=settled_at,
+        opendota_first_usable_at=settled_at,
+        raybet_audit_key=raybet_audit_key,
+        raybet_transport_key=None,
+        raybet_response_state_hash=None,
+        raybet_response_artifact_hash=raybet_artifact.content_sha256,
+        opendota_artifact_id=f"opendota:{opendota_receipt.content_sha256}",
+        opendota_observation_id=opendota_receipt.observation_id,
+        opendota_content_hash=opendota_receipt.content_sha256,
+    )
+    assert str(reconciliation["status"]) == "confirmed", (
+        reconciliation["status"],
+        reconciliation["reason"],
+    )
+    map_result_ref = str(reconciliation["evidence_ref"])
+    assert store.insert_map_result(
+        SimpleNamespace(
+            raybet_match_id=match_id,
+            map_number=1,
+            dota_match_id=dota_match_id,
+            winner_side=winner,
+            team_one_kills=team_one_kills,
+            team_two_kills=team_two_kills,
+            duration_seconds=2400,
+            evidence_ref=map_result_ref,
+            settled_at=settled_at,
+        ),
+        strict_mapping_id=mapping_id,
+    )
+    evidence_rows = connection.execute(
+        """SELECT source, status, winner_side, evidence_ref, facts_json,
+                  observed_at
+             FROM settlement_result_evidence
+            WHERE raybet_match_id=? AND map_number=1 AND dota_match_id=?
+            ORDER BY source""",
+        (match_id, dota_match_id),
+    ).fetchall()
+    assert len(evidence_rows) == 2
+    radiant_win, evidence_hash = prospective_outcome_authority(
+        curve_key=curve_key,
+        dota_match_id=dota_match_id,
+        winner_side=winner,
+        radiant_team_side="team_one",
+        map_result_ref=map_result_ref,
+        reconciliation_observed_at=str(reconciliation["first_observed_at"]),
+        evidence_rows=tuple(
+            tuple(str(value) for value in row) for row in evidence_rows
         ),
     )
     connection.execute(
         """INSERT INTO prospective_draft_outcomes
            (curve_key, strict_mapping_id, dota_match_id, radiant_win,
-            winner_side, evidence_ref, evidence_hash, settled_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            winner_side, evidence_ref, evidence_hash, settled_at,
+            first_usable_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             curve_key,
             mapping_id,
             dota_match_id,
-            outcome,
+            radiant_win,
             winner,
-            opendota_ref,
-            canonical_hash({"curve": curve_key, "outcome": outcome}),
+            map_result_ref,
+            evidence_hash,
+            settled_at.isoformat(),
             settled_at.isoformat(),
             settled_at.isoformat(),
         ),
     )
+    connection.commit()
     return samples
 
 
@@ -476,6 +994,432 @@ def test_frozen_deployment_round_trip_is_complete_and_immutable(
             store.connection.execute(
                 "UPDATE draft_model_artifacts SET model_version='tampered'"
             )
+        bundle = store.connection.execute(
+            """SELECT deployment_key, model_hashes_json,
+                      calibration_hashes_json, training_cutoff,
+                      dependency_fingerprint, dependency_revision,
+                      evidence_mode
+                 FROM draft_deployment_bundles"""
+        ).fetchone()
+        assert bundle is not None
+        store.connection.execute(
+            "DROP TRIGGER draft_deployment_bundles_immutable_delete"
+        )
+        store.connection.execute("DELETE FROM draft_deployment_bundles")
+        store.connection.execute(
+            """INSERT INTO draft_deployment_bundles
+               (deployment_key, model_hashes_json, calibration_hashes_json,
+                training_cutoff, dependency_fingerprint,
+                dependency_revision, evidence_mode, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*tuple(bundle), (CUTOFF - timedelta(seconds=1)).isoformat()),
+        )
+        with pytest.raises(ValueError, match="created before"):
+            load_latest_frozen_deployment(store.connection)
+
+
+@pytest.mark.parametrize("horizon_minutes", (40, 50))
+def test_persist_rejects_resigned_forged_training_corpus_for_long_horizon(
+    prepared_database: Path,
+    horizon_minutes: int,
+) -> None:
+    forged = _forged_corpus_deployment(
+        _deployment(prepared_database),
+        horizon_minutes=horizon_minutes,
+    )
+    with LiveBettingStore(prepared_database) as store:
+        with pytest.raises(ValueError, match="authoritative database corpus"):
+            persist_frozen_deployment(
+                store.connection,
+                forged,
+                created_at=CUTOFF + timedelta(seconds=1),
+            )
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM draft_deployment_bundles"
+        ).fetchone()[0] == 0
+
+
+def test_specific_loader_rejects_self_consistent_forged_corpus_bundle(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    forged = _forged_corpus_deployment(deployment, horizon_minutes=10)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_deployment_without_replay(
+            store.connection,
+            forged,
+            created_at=CUTOFF + timedelta(seconds=2),
+        )
+
+        assert load_frozen_deployment(
+            store.connection,
+            deployment_key=deployment.deployment_key,
+        ) == deployment
+        with pytest.raises(ValueError, match="authoritative database corpus"):
+            load_frozen_deployment(
+                store.connection,
+                deployment_key=forged.deployment_key,
+            )
+
+
+def test_live_curve_rejects_self_consistent_forged_corpus_bundle(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    forged = _forged_corpus_deployment(deployment, horizon_minutes=10)
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    monkeypatch.setattr(
+        "live_betting.profiles.draft_curve.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    draft_curve_profile._cached_live_frozen_deployment.cache_clear()
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_deployment_without_replay(
+            store.connection,
+            forged,
+            created_at=CUTOFF + timedelta(seconds=2),
+        )
+        _insert_anchor(store, captured_at=CUTOFF + timedelta(seconds=3))
+        history = load_prospective_history(store.connection)
+        report = publish_cycle(
+            store.connection,
+            deployment=forged,
+            history=ProspectiveHistorySnapshot(
+                forged.dependency_revision,
+                forged.dependency_fingerprint,
+                history,
+            ),
+            now=CUTOFF + timedelta(seconds=4),
+        )
+        assert report.inserted == 1
+
+        curve = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=5)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert curve.points == ()
+        assert curve.unavailable_reason == "prospective_draft_artifact_invalid"
+
+
+def test_legacy_model_is_rejected_by_persist_sql_load_and_live_curve(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = _deployment(prepared_database)
+    legacy = _legacy_audit_only_deployment(current)
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    monkeypatch.setattr(
+        "live_betting.profiles.draft_curve.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    draft_curve_profile._cached_live_frozen_deployment.cache_clear()
+    with LiveBettingStore(prepared_database) as store:
+        with pytest.raises(ValueError, match="audit-only"):
+            persist_frozen_deployment(
+                store.connection,
+                legacy,
+                created_at=CUTOFF + timedelta(seconds=1),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="draft deployment bundle authority is required",
+        ):
+            _insert_deployment_without_replay(
+                store.connection,
+                legacy,
+                created_at=CUTOFF + timedelta(seconds=1),
+            )
+        store.connection.rollback()
+        store.connection.execute(
+            "DROP TRIGGER draft_deployment_bundle_authority_insert"
+        )
+        _insert_deployment_without_replay(
+            store.connection,
+            legacy,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        with pytest.raises(ValueError, match="audit-only"):
+            load_frozen_deployment(
+                store.connection,
+                deployment_key=legacy.deployment_key,
+            )
+
+        _insert_anchor(store, captured_at=CUTOFF + timedelta(seconds=2))
+        history = load_prospective_history(store.connection)
+        report = publish_cycle(
+            store.connection,
+            deployment=legacy,
+            history=ProspectiveHistorySnapshot(
+                legacy.dependency_revision,
+                legacy.dependency_fingerprint,
+                history,
+            ),
+            now=CUTOFF + timedelta(seconds=3),
+        )
+        assert report.inserted == 1
+        curve = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=4)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert curve.points == ()
+        assert curve.unavailable_reason == "prospective_draft_artifact_invalid"
+
+
+def test_live_deployment_cache_ignores_vision_and_future_dependency_changes(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        draft_curve_profile._cached_live_frozen_deployment.cache_clear()
+        real_loader = draft_curve_profile.load_frozen_deployment
+        calls = 0
+
+        def counted_loader(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_loader(*args, **kwargs)
+
+        monkeypatch.setattr(
+            draft_curve_profile,
+            "load_frozen_deployment",
+            counted_loader,
+        )
+        assert draft_curve_profile._live_frozen_deployment(
+            store.connection,
+            deployment.deployment_key,
+        ) == deployment
+        assert calls == 1
+
+        _insert_anchor(store, captured_at=CUTOFF + timedelta(seconds=2))
+        assert draft_curve_profile._live_frozen_deployment(
+            store.connection,
+            deployment.deployment_key,
+        ) == deployment
+        assert calls == 1
+
+        _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF + timedelta(days=1),
+        )
+        assert draft_curve_profile._live_frozen_deployment(
+            store.connection,
+            deployment.deployment_key,
+        ) == deployment
+        assert calls == 1
+
+        _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF - timedelta(seconds=1),
+        )
+        with pytest.raises(ValueError, match="changed_before_cutoff"):
+            draft_curve_profile._live_frozen_deployment(
+                store.connection,
+                deployment.deployment_key,
+            )
+        assert calls == 2
+
+
+def test_live_deployment_cache_does_not_hide_artifact_tamper(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        draft_curve_profile._cached_live_frozen_deployment.cache_clear()
+        real_loader = draft_curve_profile.load_frozen_deployment
+        calls = 0
+
+        def counted_loader(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_loader(*args, **kwargs)
+
+        monkeypatch.setattr(
+            draft_curve_profile,
+            "load_frozen_deployment",
+            counted_loader,
+        )
+        assert draft_curve_profile._live_frozen_deployment(
+            store.connection,
+            deployment.deployment_key,
+        ) == deployment
+        assert calls == 1
+        store.connection.execute(
+            "DROP TRIGGER draft_model_artifacts_immutable_update"
+        )
+        store.connection.execute(
+            """UPDATE draft_model_artifacts
+                  SET artifact_json=artifact_json || ' '
+                WHERE horizon_minutes=40"""
+        )
+        store.connection.commit()
+
+        with pytest.raises(ValueError, match="canonical JSON"):
+            draft_curve_profile._live_frozen_deployment(
+                store.connection,
+                deployment.deployment_key,
+            )
+        assert calls == 2
+
+
+def test_live_deployment_loader_detects_toctou_artifact_change(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        store.connection.execute(
+            "DROP TRIGGER draft_model_artifacts_immutable_update"
+        )
+        store.connection.commit()
+        draft_curve_profile._cached_live_frozen_deployment.cache_clear()
+        real_loader = draft_curve_profile.load_frozen_deployment
+        raced = False
+
+        def racing_loader(*args, **kwargs):
+            nonlocal raced
+            loaded = real_loader(*args, **kwargs)
+            if not raced:
+                raced = True
+                writer = connect(prepared_database)
+                try:
+                    writer.execute(
+                        """UPDATE draft_model_artifacts
+                              SET artifact_json=artifact_json || ' '
+                            WHERE horizon_minutes=50"""
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+            return loaded
+
+        monkeypatch.setattr(
+            draft_curve_profile,
+            "load_frozen_deployment",
+            racing_loader,
+        )
+        with pytest.raises(ValueError, match="authority changed"):
+            draft_curve_profile._live_frozen_deployment(
+                store.connection,
+                deployment.deployment_key,
+            )
+        assert raced
+
+
+def test_bundle_loader_rejects_duplicate_keys_and_nonfinite_json(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        raw = str(
+            store.connection.execute(
+                """SELECT model_hashes_json FROM draft_deployment_bundles
+                    WHERE deployment_key=?""",
+                (deployment.deployment_key,),
+            ).fetchone()[0]
+        )
+        duplicate = '{"10":"' + deployment.model(10).model_hash + '",' + raw[1:]
+        store.connection.execute(
+            "DROP TRIGGER draft_deployment_bundles_immutable_update"
+        )
+        store.connection.execute(
+            """UPDATE draft_deployment_bundles SET model_hashes_json=?
+                WHERE deployment_key=?""",
+            (duplicate, deployment.deployment_key),
+        )
+        store.connection.commit()
+
+        with pytest.raises(ValueError, match="duplicate JSON key"):
+            load_frozen_deployment(
+                store.connection,
+                deployment_key=deployment.deployment_key,
+            )
+    with pytest.raises(ValueError, match="invalid JSON constant"):
+        draft_publisher_module._hash_map(
+            '{"10":NaN,"20":"' + "a" * 64 + '"}',
+            "model_hashes_json",
+        )
+
+
+def test_publisher_rejects_caller_supplied_history_subset(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_anchor(store, captured_at=CUTOFF + timedelta(seconds=2))
+        result = publish_cycle(
+            store.connection,
+            deployment=deployment,
+            history=ProspectiveHistorySnapshot(
+                deployment.dependency_revision,
+                deployment.dependency_fingerprint,
+                (),
+            ),
+            now=CUTOFF + timedelta(seconds=3),
+        )
+        assert result.inserted == 0
+        assert result.results[0].reason == "draft_history:history_snapshot_mismatch"
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM prospective_draft_curves"
+        ).fetchone()[0] == 0
 
 
 def test_failed_reconstructed_gate_publishes_research_curve_but_no_order(
@@ -501,13 +1445,21 @@ def test_failed_reconstructed_gate_publishes_research_curve_but_no_order(
         first = publish_cycle(
             store.connection,
             deployment=deployment,
-            history=(),
+            history=ProspectiveHistorySnapshot(
+                dependency_revision=deployment.dependency_revision,
+                dependency_fingerprint=deployment.dependency_fingerprint,
+                maps=load_prospective_history(store.connection),
+            ),
             now=CUTOFF + timedelta(seconds=3),
         )
         second = publish_cycle(
             store.connection,
             deployment=deployment,
-            history=(),
+            history=ProspectiveHistorySnapshot(
+                dependency_revision=deployment.dependency_revision,
+                dependency_fingerprint=deployment.dependency_fingerprint,
+                maps=load_prospective_history(store.connection),
+            ),
             now=CUTOFF + timedelta(seconds=4),
         )
 
@@ -552,6 +1504,13 @@ def test_failed_reconstructed_gate_publishes_research_curve_but_no_order(
         store.connection.execute(
             "DROP TRIGGER prospective_draft_landmarks_immutable_update"
         )
+        original_raw_probability = float(
+            store.connection.execute(
+                """SELECT raw_radiant_probability
+                     FROM prospective_draft_landmarks
+                    WHERE horizon_minutes=10"""
+            ).fetchone()[0]
+        )
         store.connection.execute(
             """UPDATE prospective_draft_landmarks
                   SET raw_radiant_probability=raw_radiant_probability + 0.01
@@ -567,6 +1526,396 @@ def test_failed_reconstructed_gate_publishes_research_curve_but_no_order(
             strict_mapping_id=7,
         )
         assert corrupted.unavailable_reason == "prospective_draft_artifact_invalid"
+        store.connection.execute(
+            """UPDATE prospective_draft_landmarks
+                  SET raw_radiant_probability=?
+                WHERE horizon_minutes=10""",
+            (original_raw_probability,),
+        )
+        restored = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=5)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert len(restored.points) == 5
+
+        store.connection.execute(
+            "DROP TRIGGER prospective_draft_curves_immutable_update"
+        )
+        feature_payload = json.loads(str(curve["feature_snapshot_json"]))
+        assert feature_payload["artifact_version"] == DRAFT_FEATURE_ARTIFACT_VERSION
+        assert "authority" not in feature_payload
+        assert "eligible_history" not in feature_payload
+
+        legacy_payload = dict(feature_payload)
+        legacy_payload["artifact_version"] = "draft-feature-artifact-v1"
+        store.connection.execute(
+            """UPDATE prospective_draft_curves
+                  SET feature_snapshot_json=?
+                WHERE curve_key=?""",
+            (
+                canonical_json_bytes(legacy_payload).decode(),
+                str(curve["curve_key"]),
+            ),
+        )
+        legacy = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=5)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert legacy.unavailable_reason == "prospective_draft_artifact_invalid"
+
+        anchor = ready_draft_anchors(store.connection)[0]
+        mapping = _strict_result().mapping
+        target = build_live_draft_target(
+            store.connection,
+            anchor,
+            mapping,
+            datetime.fromisoformat(str(curve["prediction_cutoff"])),
+        )
+        forged_snapshot, forged_payload = build_draft_feature_artifact(
+            replace(target, event_id="forged-event"),
+            load_prospective_history(store.connection),
+        )
+        store.connection.execute(
+            """UPDATE prospective_draft_curves
+                  SET feature_snapshot_json=?, target_snapshot_hash=?
+                WHERE curve_key=?""",
+            (
+                canonical_json_bytes(forged_payload).decode(),
+                forged_snapshot.input_hash,
+                str(curve["curve_key"]),
+            ),
+        )
+        store.connection.execute(
+            """UPDATE prospective_draft_landmarks
+                  SET input_snapshot_hash=?
+                WHERE curve_key=?""",
+            (forged_snapshot.input_hash, str(curve["curve_key"])),
+        )
+        forged = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=5)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert forged.unavailable_reason == "prospective_draft_artifact_invalid"
+        store.connection.execute(
+            """UPDATE prospective_draft_curves
+                  SET feature_snapshot_json=?, target_snapshot_hash=?
+                WHERE curve_key=?""",
+            (
+                str(curve["feature_snapshot_json"]),
+                str(curve["target_snapshot_hash"]),
+                str(curve["curve_key"]),
+            ),
+        )
+        store.connection.execute(
+            """UPDATE prospective_draft_landmarks
+                  SET input_snapshot_hash=?
+                WHERE curve_key=?""",
+            (str(curve["target_snapshot_hash"]), str(curve["curve_key"])),
+        )
+        restored = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=5)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert len(restored.points) == 5
+
+        store.connection.execute(
+            """INSERT INTO vision_observation_invalidations
+               (raybet_match_id, captured_at, source_frame_ref,
+                invalidated_at, reason)
+               VALUES ('match-1', ?, ?, ?, 'test_invalidation')""",
+            (
+                anchor.anchored_at.isoformat(),
+                anchor.source_frame_ref,
+                (CUTOFF + timedelta(seconds=6)).isoformat(),
+            ),
+        )
+        invalidated = build_draft_curve(
+            store.connection,
+            (1, 2, 3, 4, 5),
+            (6, 7, 8, 9, 10),
+            int((CUTOFF + timedelta(seconds=7)).timestamp()),
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+        )
+        assert invalidated.unavailable_reason == "prospective_draft_artifact_invalid"
+
+
+def test_delayed_publication_keeps_anchor_event_cutoff(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor_at = CUTOFF + timedelta(seconds=2)
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    with LiveBettingStore(prepared_database) as store:
+        _insert_event(store.connection)
+        _insert_prospective_history(store.connection)
+        delayed_usable = anchor_at + timedelta(milliseconds=500)
+        store.connection.execute(
+            """UPDATE raw_source_artifacts SET first_usable_at=?
+                WHERE match_id=7000000""",
+            (delayed_usable.isoformat(),),
+        )
+        store.connection.execute(
+            """UPDATE player_map_facts SET first_usable_at=?
+                WHERE match_id=7000000""",
+            (delayed_usable.isoformat(),),
+        )
+        store.connection.commit()
+        deployment = _deployment(prepared_database, min_samples=19)
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_anchor(store, captured_at=anchor_at)
+        history = load_prospective_history(store.connection)
+        assert any(row.first_usable_at == delayed_usable for row in history)
+
+        report = publish_cycle(
+            store.connection,
+            deployment=deployment,
+            history=ProspectiveHistorySnapshot(
+                deployment.dependency_revision,
+                deployment.dependency_fingerprint,
+                history,
+            ),
+            now=anchor_at + timedelta(seconds=1),
+        )
+
+        assert report.inserted == 1
+        row = store.connection.execute(
+            """SELECT prediction_cutoff, first_usable_at, feature_snapshot_json
+                 FROM prospective_draft_curves"""
+        ).fetchone()
+        payload = json.loads(str(row[2]))
+        assert row[0] == anchor_at.isoformat()
+        assert row[1] == (anchor_at + timedelta(seconds=1)).isoformat()
+        assert payload["support"] == len(history) - 1
+
+
+def test_deployment_created_after_anchor_cutoff_is_rejected(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    anchor_at = CUTOFF + timedelta(seconds=2)
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=anchor_at + timedelta(seconds=1),
+        )
+        _insert_anchor(store, captured_at=anchor_at)
+        anchor = ready_draft_anchors(store.connection)[0]
+
+        result = publish_anchor_curve(
+            store.connection,
+            anchor=anchor,
+            deployment=deployment,
+            history=ProspectiveHistorySnapshot(
+                deployment.dependency_revision,
+                deployment.dependency_fingerprint,
+                load_prospective_history(store.connection),
+            ),
+            published_at=anchor_at + timedelta(seconds=2),
+        )
+
+        assert result.status == "skipped"
+        assert result.reason == (
+            "draft_deployment:deployment_not_available_at_cutoff"
+        )
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM prospective_draft_curves"
+        ).fetchone()[0] == 0
+
+
+def test_mapping_accepted_after_anchor_cutoff_is_not_backfilled(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    anchor_at = CUTOFF + timedelta(seconds=2)
+    mapping_available_at = anchor_at + timedelta(seconds=1)
+    observed: list[datetime] = []
+
+    def strict(*args, transport_observed_at: datetime, **kwargs):
+        observed.append(transport_observed_at)
+        if transport_observed_at < mapping_available_at:
+            return SimpleNamespace(
+                eligible=False,
+                reason="mapping_not_yet_recorded",
+                mapping=None,
+            )
+        return _strict_result()
+
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility", strict
+    )
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_anchor(store, captured_at=anchor_at)
+        anchor = ready_draft_anchors(store.connection)[0]
+
+        result = publish_anchor_curve(
+            store.connection,
+            anchor=anchor,
+            deployment=deployment,
+            history=ProspectiveHistorySnapshot(
+                deployment.dependency_revision,
+                deployment.dependency_fingerprint,
+                load_prospective_history(store.connection),
+            ),
+            published_at=anchor_at + timedelta(seconds=2),
+        )
+
+        assert result.status == "skipped"
+        assert result.reason == "strict_mapping:mapping_not_yet_recorded"
+        assert observed == [anchor_at]
+
+
+def test_patch_requires_pre_cutoff_ingest_authority() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(
+            """CREATE TABLE matches (
+                   match_id INTEGER PRIMARY KEY, patch INTEGER, start_time INTEGER
+               );
+               CREATE TABLE match_ingest_status (
+                   match_id INTEGER PRIMARY KEY, latest_raw_artifact_id TEXT,
+                   latest_raw_content_hash TEXT, first_usable_at TEXT
+               );
+               CREATE TABLE raw_source_artifacts (
+                   artifact_id TEXT PRIMARY KEY, match_id INTEGER,
+                   content_hash TEXT, first_usable_at TEXT
+               );"""
+        )
+        connection.execute(
+            "INSERT INTO matches VALUES (1, 99, ?)",
+            (int(CUTOFF.timestamp()) - 60,),
+        )
+        assert _latest_patch(connection, CUTOFF) is None
+        after = (CUTOFF + timedelta(seconds=1)).isoformat()
+        connection.execute(
+            "INSERT INTO match_ingest_status VALUES (1, 'artifact', ?, ?)",
+            ("a" * 64, after),
+        )
+        connection.execute(
+            "INSERT INTO raw_source_artifacts VALUES ('artifact', 1, ?, ?)",
+            ("a" * 64, after),
+        )
+        assert _latest_patch(connection, CUTOFF) is None
+        before = (CUTOFF - timedelta(seconds=1)).isoformat()
+        connection.execute(
+            "UPDATE match_ingest_status SET first_usable_at=?", (before,)
+        )
+        connection.execute(
+            "UPDATE raw_source_artifacts SET first_usable_at=?", (before,)
+        )
+        assert _latest_patch(connection, CUTOFF) == 99
+    finally:
+        connection.close()
+
+
+def test_anchor_rebase_changes_curve_identity(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    original = DraftAnchor(
+        "match-1", 1, "a" * 64,
+        (1, 2, 3, 4, 5), (6, 7, 8, 9, 10), "team_one",
+        CUTOFF, "original.jpg", CUTOFF, "side-original.jpg",
+    )
+    rebased = replace(
+        original,
+        anchored_at=CUTOFF + timedelta(seconds=1),
+        source_frame_ref="rebased.jpg",
+        team_side_anchored_at=CUTOFF + timedelta(seconds=1),
+        team_side_source_frame_ref="side-rebased.jpg",
+    )
+    identity = {
+        "mapping_id": 7,
+        "deployment_key": deployment.deployment_key,
+        "input_snapshot_hash": "b" * 64,
+        "feature_dependency_revision": deployment.dependency_revision,
+        "feature_dependency_fingerprint": deployment.dependency_fingerprint,
+    }
+    assert _curve_key(anchor=original, **identity) != _curve_key(
+        anchor=rebased, **identity
+    )
+
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection, deployment, created_at=CUTOFF
+        )
+        store.connection.execute(
+            """INSERT INTO prospective_draft_curves
+               (curve_key, raybet_match_id, map_number, strict_mapping_id,
+                lineup_hash, radiant_hero_ids_json, dire_hero_ids_json,
+                prediction_cutoff, first_usable_at, availability_mode, created_at,
+                radiant_team_side, anchor_draft_hash, anchor_source_frame_ref,
+                anchor_anchored_at, anchor_team_side_source_frame_ref,
+                anchor_team_side_anchored_at, deployment_key, target_snapshot_hash,
+                feature_snapshot_json, feature_dependency_fingerprint,
+                feature_dependency_revision)
+               VALUES (?, 'match-1', 1, 7, ?, '[1,2,3,4,5]', '[6,7,8,9,10]',
+                       ?, ?, 'prospective', ?, 'team_one', ?, ?, ?, ?, ?, ?, ?,
+                       '{}', ?, ?)""",
+            (
+                "c" * 64,
+                canonical_hash({
+                    "dire": [6, 7, 8, 9, 10],
+                    "radiant": [1, 2, 3, 4, 5],
+                }),
+                CUTOFF.isoformat(), CUTOFF.isoformat(), CUTOFF.isoformat(),
+                original.draft_hash, original.source_frame_ref,
+                original.anchored_at.isoformat(),
+                original.team_side_source_frame_ref,
+                original.team_side_anchored_at.isoformat(),
+                deployment.deployment_key, "b" * 64,
+                deployment.dependency_fingerprint,
+                deployment.dependency_revision,
+            ),
+        )
+        assert _existing_curve(
+            store.connection,
+            rebased,
+            7,
+            deployment.deployment_key,
+            deployment.dependency_revision,
+            deployment.dependency_fingerprint,
+        ) is None
 
 
 def test_conflicted_anchor_is_not_a_publication_candidate(
@@ -586,19 +1935,17 @@ def test_conflicted_anchor_is_not_a_publication_candidate(
         )
         _insert_anchor(store, captured_at=CUTOFF + timedelta(seconds=2))
         store.insert_vision_observation(
-            VisionObservation(
-                "match-1",
-                1,
-                CUTOFF + timedelta(seconds=3),
-                180,
-                False,
-                (1, 2, 3, 4, 11),
-                (6, 7, 8, 9, 10),
-                0.99,
-                0.99,
-                "conflict.jpg",
-                "game",
-                "team_one",
+            make_test_vision_observation(
+                raybet_match_id="match-1",
+                map_number=1,
+                captured_at=CUTOFF + timedelta(seconds=3),
+                game_clock_seconds=180,
+                radiant_hero_ids=(1, 2, 3, 4, 11),
+                dire_hero_ids=(6, 7, 8, 9, 10),
+                clock_confidence=0.99,
+                draft_confidence=0.99,
+                radiant_team_side="team_one",
+                label="draft-publisher-conflict",
             )
         )
 
@@ -610,6 +1957,81 @@ def test_conflicted_anchor_is_not_a_publication_candidate(
         )
 
         assert report.candidates == 0
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM prospective_draft_curves"
+        ).fetchone()[0] == 0
+
+
+def test_forged_confirmed_low_confidence_anchor_is_rejected(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    monkeypatch.setattr(
+        "live_betting.draft_publisher.query_strict_live_eligibility",
+        lambda *args, **kwargs: _strict_result(),
+    )
+    captured_at = CUTOFF + timedelta(seconds=2)
+    radiant = (1, 2, 3, 4, 5)
+    dire = (6, 7, 8, 9, 10)
+    draft_payload = json.dumps(
+        {"radiant": list(radiant), "dire": list(dire)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    draft_hash = hashlib.sha256(draft_payload.encode()).hexdigest()
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        store.connection.execute(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at,
+                game_clock_seconds, is_paused, radiant_hero_ids,
+                dire_hero_ids, radiant_team_side, clock_confidence,
+                draft_confidence, source_frame_ref, screen_state, confirmed)
+               VALUES ('match-1', 1, ?, 120, 0, ?, ?, 'team_one',
+                       0.10, 0.20, 'forged-frame.jpg', 'game', 1)""",
+            (captured_at.isoformat(), json.dumps(radiant), json.dumps(dire)),
+        )
+        store.connection.execute(
+            """INSERT INTO vision_draft_anchors
+               (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
+                dire_hero_ids, radiant_team_side, team_side_anchored_at,
+                team_side_source_frame_ref, anchored_at, source_frame_ref,
+                status, conflict_at)
+               VALUES ('match-1', 1, ?, ?, ?, 'team_one', ?,
+                       'forged-frame.jpg', ?, 'forged-frame.jpg',
+                       'anchored', NULL)""",
+            (
+                draft_hash,
+                json.dumps(radiant),
+                json.dumps(dire),
+                captured_at.isoformat(),
+                captured_at.isoformat(),
+            ),
+        )
+        anchor = ready_draft_anchors(store.connection)[0]
+
+        assert not draft_anchor_frames_are_authoritative(
+            store.connection, anchor
+        )
+        report = publish_cycle(
+            store.connection,
+            deployment=deployment,
+            history=ProspectiveHistorySnapshot(
+                dependency_revision=deployment.dependency_revision,
+                dependency_fingerprint=deployment.dependency_fingerprint,
+                maps=load_prospective_history(store.connection),
+            ),
+            now=CUTOFF + timedelta(seconds=3),
+        )
+
+        assert report.candidates == 1
+        assert report.skipped == 1
+        assert report.results[0].reason == "vision_anchor_evidence_invalid"
         assert store.connection.execute(
             "SELECT COUNT(*) FROM prospective_draft_curves"
         ).fetchone()[0] == 0
@@ -694,32 +2116,64 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
     prepared_database: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    current = _deployment(prepared_database)
     samples = {horizon: [] for horizon in HORIZONS}
     with LiveBettingStore(prepared_database) as store:
+        intelligence = IntelligenceStorage(
+            prepared_database, connection=store.connection
+        )
+        ingest = SQLiteIngestAdapter(
+            intelligence,
+            EventRegistry(intelligence),
+        )
+        opendota_archive = RawArchive(
+            prepared_database.parent / "opendota-raw",
+            observation_sink=ingest.record_raw_artifact,
+        )
+        _insert_event(store.connection)
+        _insert_prospective_history(store.connection)
+        current = _deployment(prepared_database)
         persist_frozen_deployment(
             store.connection,
             current,
             created_at=CUTOFF + timedelta(seconds=1),
         )
-        _insert_event(store.connection)
-        values = {name: 0.0 for name in PURE_FEATURE_SCHEMA}
-        for group, edge in enumerate((-2.0, -1.0, 0.0, 1.0, 2.0)):
-            values["hero_win_rate_diff"] = edge
-            probability = predict_draft(current.model(10), values).probability
-            assert probability is not None
-            wins = round(probability * 20)
-            for offset in range(20):
+        history = load_prospective_history(store.connection)
+        assert len(history) == 20
+        for group in range(5):
+            first = _insert_prospective_sample(
+                store,
+                opendota_archive=opendota_archive,
+                deployment=current,
+                history=history,
+                index=group * 20,
+                outcome=0,
+            )
+            probability = first[10].probability
+            wins = min(19, round(probability * 20))
+            for horizon, sample in first.items():
+                samples[horizon].append(sample)
+            for offset in range(1, 20):
                 index = group * 20 + offset
                 inserted = _insert_prospective_sample(
-                    store.connection,
+                    store,
+                    opendota_archive=opendota_archive,
                     deployment=current,
+                    history=history,
                     index=index,
-                    hero_edge=edge,
-                    outcome=int(offset < wins),
+                    outcome=int(offset <= wins),
                 )
                 for horizon, sample in inserted.items():
                     samples[horizon].append(sample)
+        extra = _insert_prospective_sample(
+            store,
+            opendota_archive=opendota_archive,
+            deployment=current,
+            history=history,
+            index=100,
+            outcome=0,
+        )
+        for horizon, sample in extra.items():
+            samples[horizon].append(sample)
         store.connection.commit()
 
         calibrations = tuple(
@@ -732,7 +2186,10 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
             )
             for horizon in HORIZONS
         )
-        assert all(row.passes_live_gate for row in calibrations)
+        assert all(row.passes_live_gate for row in calibrations), [
+            (row.horizon_minutes, row.gate.reasons, row.metrics)
+            for row in calibrations
+        ]
         fingerprint = draft_dependency_fingerprint(store.connection)
         revision = int(
             store.connection.execute(
@@ -770,7 +2227,16 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
                     WHERE raybet_match_id=? AND map_number=?""",
                 (raybet_match_id, map_number),
             ).fetchone()
-            mapping = None if row is None else SimpleNamespace(mapping_id=int(row[0]))
+            mapping = (
+                None
+                if row is None
+                else SimpleNamespace(
+                    mapping_id=int(row[0]),
+                    event_id="event-1",
+                    canonical_team_one_id=101,
+                    canonical_team_two_id=202,
+                )
+            )
             return SimpleNamespace(
                 eligible=mapping is not None,
                 reason="eligible" if mapping is not None else "missing",
@@ -785,6 +2251,18 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
             "live_betting.profiles.draft_curve.query_strict_live_eligibility",
             strict,
         )
+        cherry_picked = build_calibration_artifact(
+            current.model(10),
+            evidence_mode="prospective",
+            source_ref="prospective-draft-outcomes-v1",
+            fit_samples=(),
+            evaluation_samples=samples[10][:100],
+        )
+        assert cherry_picked.passes_live_gate
+        assert not _verify_prospective_calibration_evidence(
+            store.connection,
+            cherry_picked,
+        )
         anchor = next(
             row
             for row in ready_draft_anchors(store.connection)
@@ -794,7 +2272,11 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
             store.connection,
             anchor=anchor,
             deployment=prospective,
-            history=(),
+            history=ProspectiveHistorySnapshot(
+                dependency_revision=prospective.dependency_revision,
+                dependency_fingerprint=prospective.dependency_fingerprint,
+                maps=history,
+            ),
             published_at=CUTOFF + timedelta(hours=5, seconds=1),
         )
         assert result.status == "inserted"
@@ -809,4 +2291,20 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
             strict_mapping_id=7,
         )
         assert curve.unavailable_reason is None
-        assert curve.at(10 * 60) is not None
+        point = curve.at(10 * 60)
+        assert point is not None
+        authority = authority_from_curve(
+            curve, point, radiant_team_side="team_one"
+        )
+        assert authority is not None
+        assert draft_landmark_authority_matches(
+            store.connection,
+            authority,
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=7,
+            radiant_hero_ids=(1, 2, 3, 4, 5),
+            dire_hero_ids=(6, 7, 8, 9, 10),
+            observed_at=CUTOFF + timedelta(hours=5, seconds=2),
+            require_current_revisions=True,
+        )

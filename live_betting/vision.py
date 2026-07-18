@@ -9,6 +9,8 @@ from pathlib import Path
 
 from contracts.live_observation import SCHEMA_VERSION
 
+from .vision_frame_registry import vision_frame_ref
+
 
 @dataclass(frozen=True)
 class VisionObservation:
@@ -24,6 +26,9 @@ class VisionObservation:
     source_frame_ref: str
     screen_state: str
     radiant_team_side: str | None = None
+    source_frame_sha256: str | None = None
+    source_frame_bytes: int | None = None
+    source_frame_path: str | None = None
 
     @property
     def is_confirmed(self) -> bool:
@@ -43,7 +48,8 @@ class VisionObservation:
 
 
 def parse_observation(payload: dict) -> VisionObservation:
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {1, SCHEMA_VERSION}:
         raise ValueError(f"unsupported vision schema: {payload.get('schema_version')}")
     captured = datetime.fromisoformat(str(payload["captured_at_utc"]).replace("Z", "+00:00"))
     if captured.tzinfo is None:
@@ -60,6 +66,27 @@ def parse_observation(payload: dict) -> VisionObservation:
     source_frame_ref = str(payload.get("source_frame_ref") or "")
     if not source_frame_ref.strip():
         raise ValueError("source_frame_ref must be non-empty")
+    source_frame_sha256 = payload.get("source_frame_sha256")
+    source_frame_bytes = payload.get("source_frame_bytes")
+    source_frame_path = payload.get("source_frame_path")
+    integrity = (source_frame_sha256, source_frame_bytes, source_frame_path)
+    if any(value is not None for value in integrity) and any(
+        value is None for value in integrity
+    ):
+        raise ValueError("vision frame integrity metadata must be complete")
+    if all(value is not None for value in integrity):
+        source_frame_sha256 = str(source_frame_sha256)
+        if source_frame_ref != vision_frame_ref(source_frame_sha256):
+            raise ValueError("source_frame_ref must match source_frame_sha256")
+        if (
+            isinstance(source_frame_bytes, bool)
+            or not isinstance(source_frame_bytes, int)
+            or source_frame_bytes <= 0
+        ):
+            raise ValueError("source_frame_bytes must be a positive integer")
+        source_frame_path = str(source_frame_path)
+        if not source_frame_path.strip():
+            raise ValueError("source_frame_path must be non-empty")
     return VisionObservation(
         raybet_match_id=str(payload["raybet_match_id"]),
         map_number=payload.get("map_number"),
@@ -73,6 +100,9 @@ def parse_observation(payload: dict) -> VisionObservation:
         source_frame_ref=source_frame_ref,
         screen_state=str(payload.get("screen_state") or "unknown"),
         radiant_team_side=radiant_team_side,
+        source_frame_sha256=source_frame_sha256,
+        source_frame_bytes=source_frame_bytes,
+        source_frame_path=source_frame_path,
     )
 
 

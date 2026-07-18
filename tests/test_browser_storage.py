@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.monitor import (
@@ -21,6 +24,10 @@ from live_betting.raybet import RayBetClient
 from live_betting.shadow_monitor import latest_market_state
 from live_betting.storage import LiveBettingStore
 from live_betting.strategy import attempt_fill
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
+)
 
 
 NOW = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
@@ -32,9 +39,10 @@ def snapshot(
     *,
     odds_id: str = "winner-one",
     side: str = "team_one",
+    match_id: str = "match-1",
 ) -> OddsSnapshot:
     return OddsSnapshot(
-        "match-1",
+        match_id,
         odds_id,
         "winner-group",
         observed_at,
@@ -43,6 +51,37 @@ def snapshot(
         Market("winner", "map_1", side, None, side, True),
         last_update=f"{price:.2f}",
     )
+
+
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    match_ids = {row.raybet_match_id for row in rows}
+    if len(match_ids) > 1:
+        raise ValueError("raw fixture requires one RayBet match")
+    match_id = next(iter(match_ids)) if match_ids else "match-1"
+    return {
+        "result": {
+            "id": match_id,
+            "game_id": 151,
+            "team": [
+                {"team_id": 1, "pos": 1, "team_name": "One"},
+                {"team_id": 2, "pos": 2, "team_name": "Two"},
+            ],
+            "odds": [
+                {
+                    "id": row.odds_id,
+                    "odds_group_id": row.odds_group_id,
+                    "team_id": 1 if row.market.side == "team_one" else 2,
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "odds": row.price,
+                    "status": row.status,
+                    "last_update": row.last_update,
+                }
+                for row in rows
+            ],
+        }
+    }
 
 
 def browser_event(event_id: str, captured_at: datetime) -> dict[str, object]:
@@ -71,6 +110,85 @@ class BrowserSchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with LiveBettingStore(Path(directory) / "test.db") as store:
                 store.init_schema()
+                store.connection.execute(
+                    "CREATE TABLE IF NOT EXISTS event_registry (event_id TEXT PRIMARY KEY)"
+                )
+                store.connection.execute(
+                    "INSERT INTO event_registry (event_id) VALUES ('browser-test')"
+                )
+                identity_json = "{}"
+                identity_hash = hashlib.sha256(
+                    identity_json.encode("utf-8")
+                ).hexdigest()
+                mapping = store.connection.execute(
+                    """INSERT INTO strict_live_map_mappings
+                       (raybet_match_id, map_number, event_id, team_one_id,
+                        team_two_id, canonical_team_one_id,
+                        canonical_team_one_name, canonical_team_two_id,
+                        canonical_team_two_name, canonical_identity_json,
+                        canonical_identity_hash, crosswalk_evidence_json,
+                        crosswalk_evidence_hash, stage_scope, scheduled_at_utc,
+                        raybet_best_of, raybet_identity_json,
+                        raybet_identity_hash, raybet_metadata_updated_at, source,
+                        evidence_json, evidence_hash, mapping_version,
+                        acceptance_mode, automatic_approval_id, accepted_by,
+                        accepted_at, recorded_at, created_at)
+                       VALUES ('1001', 1, 'browser-test', 101, 202, 101,
+                               'Alpha', 202, 'Beta', ?, ?, ?, ?, 'main_event',
+                               ?, 3, ?, ?, ?, 'test', ?, ?, 'test-v1',
+                               'manual_exact', NULL, 'test', ?, ?, ?)""",
+                    (
+                        identity_json,
+                        identity_hash,
+                        identity_json,
+                        identity_hash,
+                        (NOW - timedelta(days=1)).isoformat(),
+                        identity_json,
+                        identity_hash,
+                        (NOW - timedelta(days=1)).isoformat(),
+                        identity_json,
+                        identity_hash,
+                        (NOW - timedelta(days=1)).isoformat(),
+                        (NOW - timedelta(days=1)).isoformat(),
+                        (NOW - timedelta(days=1)).isoformat(),
+                    ),
+                )
+                store.connection.commit()
+                vision = make_test_vision_observation(
+                    raybet_match_id="1001",
+                    map_number=1,
+                    captured_at=NOW,
+                    label="browser-storage-decision-frame",
+                )
+                store.insert_vision_observation(vision)
+                draft_authority = seed_test_draft_authority(
+                    store.connection,
+                    raybet_match_id="1001",
+                    map_number=1,
+                    strict_mapping_id=int(mapping.lastrowid),
+                    observed_at=NOW,
+                    label="browser-storage-decision",
+                )
+                winner_rows = [
+                    snapshot(NOW, 2.5, match_id="1001"),
+                    snapshot(
+                        NOW,
+                        1.5,
+                        odds_id="winner-two",
+                        side="team_two",
+                        match_id="1001",
+                    ),
+                ]
+                store.store_odds_observation(
+                    source="direct",
+                    observation_key="browser-storage-decision-transport",
+                    source_event_id=None,
+                    raybet_match_id="1001",
+                    observed_at=NOW,
+                    normalized_state_hash=normalized_state_hash(winner_rows),
+                    snapshots=winner_rows,
+                    raw_payload=raw_odds_payload(winner_rows),
+                )
                 alignment = SimpleNamespace(
                     odds_snapshot_id=1,
                     raybet_match_id="1001",
@@ -95,21 +213,54 @@ class BrowserSchemaTests(unittest.TestCase):
                     map_number=1,
                     decided_at=NOW,
                     underdog_side="team_one",
-                    market_probability=0.4,
+                    market_probability=price_groups(winner_rows)["winner-one"],
                     model_probability=0.5,
                     edge=0.1,
                     data_quality=0.8,
                     eligible=True,
                     reason="eligible",
-                    contributions={"draft": 0.1},
+                    contributions={
+                        "draft": 0.1,
+                        "__inputs__": {
+                            "draft_authority": asdict(draft_authority),
+                            "strict_live_eligibility": {
+                                "mapping_refs": {
+                                    "strict_mapping_id": int(mapping.lastrowid)
+                                }
+                            },
+                        },
+                    },
                     input_ref="input-1",
                     strategy_version="strategy-1",
                 )
-                self.assertTrue(store.insert_decision(decision))
-                self.assertFalse(store.insert_decision(decision))
+                self.assertTrue(
+                    store.insert_decision(
+                        decision,
+                        draft_authority=draft_authority,
+                        vision_observation=vision,
+                        vision_transport_key=(
+                            "browser-storage-decision-transport"
+                        ),
+                    )
+                )
+                self.assertFalse(
+                    store.insert_decision(
+                        decision,
+                        draft_authority=draft_authority,
+                        vision_observation=vision,
+                        vision_transport_key=(
+                            "browser-storage-decision-transport"
+                        ),
+                    )
+                )
                 with self.assertRaisesRegex(ValueError, "decision identity"):
                     store.insert_decision(
-                        SimpleNamespace(**{**vars(decision), "edge": 0.2})
+                        SimpleNamespace(**{**vars(decision), "edge": 0.2}),
+                        draft_authority=draft_authority,
+                        vision_observation=vision,
+                        vision_transport_key=(
+                            "browser-storage-decision-transport"
+                        ),
                     )
 
     def test_completed_refresh_is_not_due_between_low_frequency_ticks(self) -> None:
@@ -269,6 +420,7 @@ class EventTimeTests(unittest.TestCase):
                         source="direct", observation_key="direct-t1", source_event_id=None,
                         raybet_match_id="match-1", observed_at=t1,
                         normalized_state_hash=normalized_state_hash(first), snapshots=first,
+                        raw_payload=raw_odds_payload(first),
                     ),
                     ("on_time", 1),
                 )
@@ -277,6 +429,7 @@ class EventTimeTests(unittest.TestCase):
                         source="direct", observation_key="direct-t3", source_event_id=None,
                         raybet_match_id="match-1", observed_at=t3,
                         normalized_state_hash=normalized_state_hash(unchanged), snapshots=unchanged,
+                        raw_payload=raw_odds_payload(unchanged),
                     ),
                     ("on_time", 0),
                 )
@@ -290,6 +443,7 @@ class EventTimeTests(unittest.TestCase):
                         source_event_id=event_id, raybet_match_id="match-1",
                         observed_at=t2, normalized_state_hash=normalized_state_hash(delayed),
                         snapshots=delayed,
+                        raw_payload=raw_odds_payload(delayed),
                     ),
                     ("late", 0),
                 )
@@ -326,13 +480,16 @@ class EventTimeTests(unittest.TestCase):
                     source="direct", observation_key="empty", source_event_id=None,
                     raybet_match_id="match-1", observed_at=NOW,
                     normalized_state_hash=empty_hash, snapshots=[],
+                    raw_payload=raw_odds_payload([]),
                 )
-                with self.assertRaisesRegex(ValueError, "membership"):
+                changed = [snapshot(NOW, 2.0)]
+                with self.assertRaisesRegex(ValueError, "already belongs"):
                     store.store_odds_observation(
                         source="direct", observation_key="empty", source_event_id=None,
                         raybet_match_id="match-1", observed_at=NOW,
-                        normalized_state_hash=empty_hash,
-                        snapshots=[snapshot(NOW, 2.0)],
+                        normalized_state_hash=normalized_state_hash(changed),
+                        snapshots=changed,
+                        raw_payload=raw_odds_payload(changed),
                     )
 
     def test_latest_state_excludes_rows_after_as_of(self) -> None:
@@ -358,12 +515,14 @@ class EventTimeTests(unittest.TestCase):
                     source="direct", observation_key="direct-t1", source_event_id=None,
                     raybet_match_id="match-1", observed_at=t1,
                     normalized_state_hash=normalized_state_hash(rows), snapshots=rows,
+                    raw_payload=raw_odds_payload(rows),
                 )
                 unchanged = [snapshot(t3, 2.0)]
                 store.store_odds_observation(
                     source="direct", observation_key="direct-t3", source_event_id=None,
                     raybet_match_id="match-1", observed_at=t3,
                     normalized_state_hash=normalized_state_hash(unchanged), snapshots=unchanged,
+                    raw_payload=raw_odds_payload(unchanged),
                 )
                 order = ShadowOrder(
                     "order", "match-1", "winner-one", rows[0].market, t1,
@@ -412,7 +571,9 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             raw_dir = Path(directory) / "raw"
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 with patch(
                     "live_betting.monitor.utc_now",
@@ -434,17 +595,24 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     store.connection.execute(
-                        "SELECT COUNT(*) FROM odds_response_outcomes "
+                        "SELECT COUNT(*) FROM odds_response_outcomes_effective "
                         "WHERE raybet_match_id='1001'"
                     ).fetchone()[0],
                     2,
                 )
-            files = list(
-                (raw_dir / NOW.strftime("%Y-%m-%d") / "_completed_match_list").glob(
-                    "*.json.gz"
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        "SELECT response_kind, disposition FROM direct_response_audit "
+                        "ORDER BY observed_at"
+                    )],
+                    [
+                        ("completed_match_list", "audit_only"),
+                        ("completed_odds", "accepted"),
+                    ],
                 )
-            )
-            self.assertEqual(len(files), 1)
+            files = list(raw_dir.rglob("*.json.gz"))
+            self.assertEqual(len(files), 2)
+            self.assertTrue(all(len(path.name) == 72 for path in files))
 
     def test_completed_collector_isolates_one_match_failure(self) -> None:
         payload = {
@@ -467,7 +635,10 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 return payload
 
         with tempfile.TemporaryDirectory() as directory:
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 with patch(
                     "live_betting.monitor.utc_now",
@@ -481,7 +652,7 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                     summary = collect_completed_once(
                         store,
                         Client(),
-                        Path(directory) / "raw",
+                        raw_dir,
                         completed_rows=[
                             {"id": "1001", "status": 3},
                             {"id": "1002", "status": 3},
@@ -494,8 +665,32 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                         "SELECT 1 FROM raybet_matches WHERE raybet_match_id='1002'"
                     ).fetchone()
                 )
+                audits = store.connection.execute(
+                    """SELECT audit_key, response_kind, claimed_raybet_match_id,
+                              disposition, reason
+                         FROM direct_response_audit ORDER BY observed_at"""
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row[1:]) for row in audits],
+                    [
+                        ("completed_match_list", None, "audit_only", "match_list_observed"),
+                        ("completed_odds", "1001", "rejected", "request_failed:TimeoutError"),
+                        ("completed_odds", "1002", "accepted", "normalized"),
+                    ],
+                )
+                failure_payload = store.direct_response_payload(str(audits[1][0]))
+                self.assertEqual(
+                    failure_payload,
+                    {
+                        "artifact_version": "raybet-direct-request-failure-v1",
+                        "claimed_raybet_match_id": "1001",
+                        "failure": {"error_type": "TimeoutError"},
+                        "response_kind": "completed_odds",
+                    },
+                )
+            self.assertEqual(len(list(raw_dir.rglob("*.json.gz"))), 3)
 
-    def test_direct_collector_archives_each_list_and_odds_response(self) -> None:
+    def test_direct_collector_content_addresses_repeated_raw_responses(self) -> None:
         payload = {
             "result": {
                 "id": "1001",
@@ -519,7 +714,9 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             raw_dir = Path(directory) / "raw"
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 with patch(
                     "live_betting.monitor.utc_now",
@@ -528,12 +725,98 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                     ),
                 ):
                     collect_once(store, Client(), raw_dir, list_rows=[{"id": "1001"}], raw_fingerprints={})
-                    collect_once(store, Client(), raw_dir, list_rows=[{"id": "1001"}], raw_fingerprints={})
+                    collect_once(
+                        store,
+                        Client(),
+                        raw_dir,
+                        list_rows=[{"id": "1001"}],
+                        raw_fingerprints={},
+                        audit_match_list=False,
+                    )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM odds_transport_observations"
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM odds_raw_artifacts"
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM direct_response_audit"
+                    ).fetchone()[0],
+                    3,
+                )
 
-            list_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "_match_list").glob("*.json.gz"))
-            odds_files = list((raw_dir / NOW.strftime("%Y-%m-%d") / "1001").glob("*.json.gz"))
-            self.assertEqual(len(list_files), 2)
-            self.assertEqual(len(odds_files), 2)
+            self.assertEqual(len(list(raw_dir.rglob("*.json.gz"))), 2)
+
+    def test_direct_collector_rejects_mismatched_archive_configuration(self) -> None:
+        class Client:
+            def match_odds(self, match_id: str) -> dict[str, object]:
+                raise AssertionError(f"unexpected fetch for {match_id}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            owned_raw_dir = Path(directory) / "owned-raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=owned_raw_dir
+            ) as store:
+                store.init_schema()
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    collect_once(
+                        store,
+                        Client(),
+                        Path(directory) / "other-raw",
+                        list_rows=[],
+                        raw_fingerprints={},
+                    )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM direct_response_audit"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.assertEqual(list(owned_raw_dir.rglob("*.json.gz")), [])
+
+    def test_match_list_request_failures_are_replayable(self) -> None:
+        class Client:
+            def live_matches(self) -> list[dict[str, object]]:
+                raise TimeoutError("secret upstream detail")
+
+            def completed_matches(self) -> list[dict[str, object]]:
+                raise ConnectionError("private endpoint detail")
+
+        with tempfile.TemporaryDirectory() as directory:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
+                store.init_schema()
+                with self.assertRaises(TimeoutError):
+                    collect_once(store, Client(), raw_dir)
+                with self.assertRaises(ConnectionError):
+                    collect_completed_once(store, Client(), raw_dir)
+                audits = store.connection.execute(
+                    """SELECT audit_key, response_kind, disposition, reason
+                         FROM direct_response_audit ORDER BY response_kind"""
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row[1:]) for row in audits],
+                    [
+                        (
+                            "completed_match_list",
+                            "rejected",
+                            "request_failed:ConnectionError",
+                        ),
+                        ("live_match_list", "rejected", "request_failed:TimeoutError"),
+                    ],
+                )
+                for row in audits:
+                    payload = store.direct_response_payload(str(row[0]))
+                    self.assertNotIn("detail", json.dumps(payload))
 
     def test_direct_collector_rejects_mismatched_and_non_dota_responses(self) -> None:
         responses = {
@@ -546,12 +829,15 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 return responses[match_id]
 
         with tempfile.TemporaryDirectory() as directory:
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 summary = collect_once(
                     store,
                     Client(),
-                    Path(directory) / "raw",
+                    raw_dir,
                     list_rows=[{"id": "1001"}, {"id": "1002"}],
                     raw_fingerprints={},
                 )
@@ -565,6 +851,17 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 self.assertEqual(
                     store.connection.execute("SELECT COUNT(*) FROM odds_snapshots").fetchone()[0],
                     0,
+                )
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        "SELECT response_kind, disposition, reason "
+                        "FROM direct_response_audit ORDER BY observed_at"
+                    )],
+                    [
+                        ("live_match_list", "audit_only", "match_list_observed"),
+                        ("live_odds", "rejected", "identity_mismatch"),
+                        ("live_odds", "rejected", "identity_mismatch"),
+                    ],
                 )
 
     def test_direct_collector_continues_after_one_match_failure(self) -> None:
@@ -589,12 +886,15 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             client = Client()
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 summary = collect_once(
                     store,
                     client,
-                    Path(directory) / "raw",
+                    raw_dir,
                     list_rows=[{"id": "1001"}, {"id": "1002"}],
                     raw_fingerprints={},
                 )
@@ -613,6 +913,20 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 self.assertIsNotNone(collector["last_success_at"])
                 self.assertIsNotNone(collector["last_error_at"])
                 self.assertIn("1 live match", collector["last_error"])
+                failed = store.connection.execute(
+                    """SELECT audit_key, disposition, reason
+                         FROM direct_response_audit
+                        WHERE response_kind='live_odds'
+                          AND claimed_raybet_match_id='1001'"""
+                ).fetchone()
+                self.assertEqual(
+                    tuple(failed[1:]),
+                    ("rejected", "request_failed:TimeoutError"),
+                )
+                self.assertEqual(
+                    store.direct_response_payload(str(failed[0]))["failure"],
+                    {"error_type": "TimeoutError"},
+                )
 
     def test_worker_marks_partial_collection_as_degraded(self) -> None:
         payload = {
@@ -674,7 +988,10 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
             "team": [{"pos": 1, "team_name": "Wrong"}],
         }
         with tempfile.TemporaryDirectory() as directory:
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 store.upsert_raybet_match(direct, NOW)
                 self.assertFalse(store.insert_browser_raybet_match(browser, NOW))
@@ -683,7 +1000,7 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(
                     (row["tournament"], row["team_one"], row["live_url"]),
-                    ("Direct Cup", "One", "https://video"),
+                    ("Direct Cup", "One", None),
                 )
                 self.assertIn("Direct Cup", row["raw_json"])
 
@@ -711,7 +1028,10 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                 return payload
 
         with tempfile.TemporaryDirectory() as directory:
-            with LiveBettingStore(Path(directory) / "test.db") as store:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
                 store.init_schema()
                 original = store.insert_odds
                 calls = 0
@@ -725,7 +1045,7 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
 
                 with patch.object(store, "insert_odds", side_effect=fail_second):
                     summary = collect_once(
-                        store, Client(), Path(directory) / "raw",
+                        store, Client(), raw_dir,
                         list_rows=[{"id": "1001"}], raw_fingerprints={},
                     )
                 self.assertEqual(summary["matches"], 0)
@@ -737,6 +1057,16 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                         store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
                         0,
                     )
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        "SELECT response_kind, disposition, reason "
+                        "FROM direct_response_audit ORDER BY observed_at"
+                    )],
+                    [
+                        ("live_match_list", "audit_only", "match_list_observed"),
+                        ("live_odds", "rejected", "processing_failed:RuntimeError"),
+                    ],
+                )
 
     def test_raybet_metadata_does_not_regress_on_late_response(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

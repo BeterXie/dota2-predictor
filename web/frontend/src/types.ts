@@ -54,6 +54,13 @@ export interface StrategyDecision {
   strategy_version: string;
 }
 
+export interface WatchLink {
+  kind: "public_stream" | "match_page" | "none";
+  availability: "available" | "unavailable";
+  url: string | null;
+  reason: string;
+}
+
 export interface MonitorMatch {
   raybet_match_id: string;
   tournament: string;
@@ -62,7 +69,10 @@ export interface MonitorMatch {
   scheduled_at: string | null;
   best_of: number | null;
   provider_status: string;
-  live_url: string | null;
+  /** Deprecated compatibility field. It is never a playable-link authority. */
+  live_url?: string | null;
+  /** Optional so a new frontend fails closed against an older backend. */
+  watch_link?: WatchLink;
   updated_at: string;
   latest_odds_activity_at?: string | null;
   lifecycle: Lifecycle;
@@ -405,6 +415,7 @@ export interface ExactPostmatchAttribution {
   reconciliation: Record<string, unknown> | null;
   odds_timeline: WinnerTimelinePoint[];
   postmatch: ExactPostmatchPayload | null;
+  warnings?: string[];
 }
 
 export interface IntelligenceDraftQualitySlice {

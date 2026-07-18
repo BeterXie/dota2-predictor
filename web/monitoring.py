@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -11,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
+from live_betting.sanitize import stored_public_stream_url
 from live_betting.strict_eligibility import query_strict_live_eligibility
 
 from .alerts import active_alerts
@@ -27,6 +30,11 @@ _EXPECTED_HEALTH_COMPONENTS = {
     "shadow_worker": 45.0,
 }
 _OPTIONAL_UNCONFIGURED_COMPONENTS = {"mail", "mail_worker"}
+_RAYBET_PAGE_ORIGINS = frozenset(
+    {"https://ray086.com", "https://www.ray086.com"}
+)
+_RAYBET_PAGE_PREFIXES = ("/sports/esports", "/esports", "/dota2")
+_RAYBET_PAGE_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 
 
 def utc_now() -> datetime:
@@ -151,7 +159,7 @@ def monitor_matches(
     rows = _rows(
         connection,
         """SELECT raybet_match_id, tournament, team_one, team_two,
-                  scheduled_at, best_of, status, live_url, updated_at
+                  scheduled_at, best_of, status, live_url, raw_json, updated_at
              FROM raybet_matches
             ORDER BY scheduled_at DESC, raybet_match_id DESC""",
     )
@@ -183,7 +191,7 @@ def monitor_match_detail(
     checked_at = _aware_utc(now or utc_now())
     row = connection.execute(
         """SELECT raybet_match_id, tournament, team_one, team_two,
-                  scheduled_at, best_of, status, live_url, updated_at
+                  scheduled_at, best_of, status, live_url, raw_json, updated_at
              FROM raybet_matches WHERE raybet_match_id=?""",
         (raybet_match_id,),
     ).fetchone()
@@ -211,46 +219,160 @@ def winner_timeline(
     max_points: int | None = 1200,
     period: str | None = None,
 ) -> list[dict[str, Any]]:
-    rows = _rows(
-        connection,
-            """SELECT odds.id, odds.received_at, odds.price, odds.status,
-                      odds.period, odds.side, odds.odds_id, odds.odds_group_id,
-                  alignment.map_number, alignment.game_clock_seconds,
-                  alignment.raybet_match_id AS alignment_raybet_match_id,
-                  alignment.observation_captured_at,
-                  alignment.method AS alignment_method,
-                  alignment.lag_seconds, alignment.usable AS alignment_usable
-             FROM odds_snapshots AS odds
-             LEFT JOIN odds_alignments AS alignment
-               ON alignment.odds_snapshot_id=odds.id
-            WHERE odds.raybet_match_id=?
-              AND odds.market_type='winner' AND odds.supported=1
-              AND (? IS NULL OR odds.period=?)
-            ORDER BY odds.received_at, odds.period, odds.id""",
-        (raybet_match_id, period, period),
-    )
-    grouped: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
+    authority_relations = {
+        str(row[0])
+        for row in connection.execute(
+            """SELECT name FROM sqlite_master
+                 WHERE type IN ('table', 'view')
+                   AND name IN (
+                       'odds_transport_observations',
+                       'odds_response_outcomes_effective'
+                   )"""
+        ).fetchall()
+    }
+    if authority_relations:
+        if authority_relations != {
+            "odds_transport_observations",
+            "odds_response_outcomes_effective",
+        }:
+            return []
+        try:
+            rows = _rows(
+                connection,
+                """SELECT transport.observation_key AS response_key,
+                          transport.observed_at AS received_at,
+                          outcome.price, outcome.status, outcome.period,
+                          outcome.side, outcome.odds_id, outcome.odds_group_id,
+                          alignment.map_number, alignment.game_clock_seconds,
+                          alignment.raybet_match_id AS alignment_raybet_match_id,
+                          alignment.observation_captured_at,
+                          alignment.method AS alignment_method,
+                          alignment.lag_seconds,
+                          alignment.usable AS alignment_usable
+                     FROM odds_transport_observations AS transport
+                     JOIN odds_response_outcomes_effective AS outcome
+                       ON outcome.observation_key=transport.observation_key
+                      AND outcome.raybet_match_id=transport.raybet_match_id
+                     LEFT JOIN odds_snapshots AS snapshot
+                       ON snapshot.raybet_match_id=transport.raybet_match_id
+                      AND snapshot.odds_id=outcome.odds_id
+                      AND snapshot.received_at=transport.observed_at
+                      AND snapshot.odds_group_id IS outcome.odds_group_id
+                      AND snapshot.price=outcome.price
+                      AND snapshot.status IS outcome.status
+                      AND snapshot.market_type=outcome.market_type
+                      AND snapshot.period=outcome.period
+                      AND snapshot.side IS outcome.side
+                      AND snapshot.line IS outcome.line
+                      AND snapshot.outcome_key=outcome.outcome_key
+                      AND snapshot.supported=outcome.supported
+                      AND snapshot.last_update IS outcome.last_update
+                     LEFT JOIN odds_alignments AS alignment
+                       ON alignment.odds_snapshot_id=snapshot.id
+                    WHERE transport.raybet_match_id=?
+                      AND transport.timing_status='on_time'
+                      AND transport.processing_status='processed'
+                      AND outcome.market_type='winner'
+                      AND outcome.supported=1
+                      AND (? IS NULL OR outcome.period=?)
+                    ORDER BY transport.observed_at, transport.observation_key,
+                             outcome.period, outcome.odds_group_id,
+                             outcome.odds_id""",
+                (raybet_match_id, period, period),
+            )
+        except sqlite3.OperationalError:
+            # A partial or malformed response-authority schema must not revive
+            # carried-forward legacy snapshots as product data.
+            return []
+    else:
+        has_alignment_relation = connection.execute(
+            """SELECT 1 FROM sqlite_master
+                 WHERE type IN ('table', 'view') AND name='odds_alignments'"""
+        ).fetchone() is not None
+        alignment_columns = (
+            """alignment.map_number, alignment.game_clock_seconds,
+               alignment.raybet_match_id AS alignment_raybet_match_id,
+               alignment.observation_captured_at,
+               alignment.method AS alignment_method,
+               alignment.lag_seconds,
+               alignment.usable AS alignment_usable"""
+            if has_alignment_relation
+            else """NULL AS map_number, NULL AS game_clock_seconds,
+               NULL AS alignment_raybet_match_id,
+               NULL AS observation_captured_at,
+               NULL AS alignment_method, NULL AS lag_seconds,
+               NULL AS alignment_usable"""
+        )
+        alignment_join = (
+            """LEFT JOIN odds_alignments AS alignment
+                   ON alignment.odds_snapshot_id=odds.id"""
+            if has_alignment_relation
+            else ""
+        )
+        rows = _rows(
+            connection,
+            f"""SELECT '' AS response_key, odds.received_at, odds.price,
+                      odds.status, odds.period, odds.side, odds.odds_id,
+                      odds.odds_group_id, {alignment_columns}
+                 FROM odds_snapshots AS odds
+                 {alignment_join}
+                WHERE odds.raybet_match_id=?
+                  AND odds.market_type='winner' AND odds.supported=1
+                  AND (? IS NULL OR odds.period=?)
+                ORDER BY odds.received_at, odds.period,
+                         odds.odds_group_id, odds.id""",
+            (raybet_match_id, period, period),
+        )
+
+    grouped: dict[tuple[str, str, str, str], list[sqlite3.Row]] = defaultdict(list)
     for row in rows:
         side = str(row["side"] or "")
         if side not in {"team_one", "team_two"}:
             continue
+        odds_group_id = str(row["odds_group_id"] or "")
+        if not odds_group_id.strip():
+            continue
         key = (
             str(row["received_at"]),
+            str(row["response_key"]),
             str(row["period"]),
-            str(row["odds_group_id"] or ""),
+            odds_group_id,
         )
-        grouped[key][side] = row
+        grouped[key].append(row)
 
     points: list[dict[str, Any]] = []
-    for (observed_at, period, _odds_group_id), quotes in sorted(grouped.items()):
+    for (
+        observed_at,
+        _response_key,
+        point_period,
+        _odds_group_id,
+    ), response_quotes in sorted(grouped.items()):
+        if len(response_quotes) != 2:
+            continue
+        quotes = {str(quote["side"]): quote for quote in response_quotes}
         if set(quotes) != {"team_one", "team_two"}:
             continue
         prices = {side: float(quotes[side]["price"]) for side in quotes}
-        if any(price <= 1.0 for price in prices.values()):
+        if any(not math.isfinite(price) or price <= 1.0 for price in prices.values()):
             continue
         inverse = {side: 1.0 / price for side, price in prices.items()}
         total = sum(inverse.values())
         aligned_quotes = tuple(quotes[side] for side in ("team_one", "team_two"))
+        usable_aligned_quotes = tuple(
+            quote
+            for quote in aligned_quotes
+            if (
+                quote["alignment_usable"] == 1
+                and quote["alignment_raybet_match_id"] == raybet_match_id
+                and type(quote["map_number"]) is int
+                and quote["map_number"] > 0
+                and type(quote["game_clock_seconds"]) is int
+                and quote["game_clock_seconds"] >= 0
+            )
+        )
+        explicit_alignment_count = sum(
+            quote["alignment_usable"] is not None for quote in aligned_quotes
+        )
         alignment_identities = {
             (
                 quote["alignment_raybet_match_id"],
@@ -260,18 +382,11 @@ def winner_timeline(
                 quote["alignment_method"],
                 quote["lag_seconds"],
             )
-            for quote in aligned_quotes
-            if quote["alignment_usable"] == 1
-            and quote["alignment_raybet_match_id"] == raybet_match_id
-            and type(quote["map_number"]) is int
-            and quote["map_number"] > 0
-            and type(quote["game_clock_seconds"]) is int
-            and quote["game_clock_seconds"] >= 0
+            for quote in usable_aligned_quotes
         }
         aligned = (
-            aligned_quotes[0]
+            usable_aligned_quotes[0]
             if len(alignment_identities) == 1
-            and all(quote["alignment_usable"] == 1 for quote in aligned_quotes)
             and all(
                 (
                     quote["alignment_raybet_match_id"],
@@ -282,14 +397,19 @@ def winner_timeline(
                     quote["lag_seconds"],
                 )
                 in alignment_identities
-                for quote in aligned_quotes
+                for quote in usable_aligned_quotes
+            )
+            and len(usable_aligned_quotes) == explicit_alignment_count
+            and (
+                bool(authority_relations)
+                or len(usable_aligned_quotes) == len(aligned_quotes)
             )
             else None
         )
         points.append(
             {
                 "observed_at": observed_at,
-                "period": period,
+                "period": point_period,
                 "prices": prices,
                 "probabilities": {
                     side: round(value / total, 8) for side, value in inverse.items()
@@ -332,7 +452,7 @@ def current_markets(
                       outcome.market_type, outcome.period, outcome.side,
                       outcome.line, outcome.outcome_key, outcome.supported
                  FROM latest
-                 JOIN odds_response_outcomes AS outcome
+                 JOIN odds_response_outcomes_effective AS outcome
                    ON outcome.observation_key=latest.observation_key
                 WHERE outcome.raybet_match_id=?
                 ORDER BY CASE WHEN outcome.market_type='winner' THEN 0 ELSE 1 END,
@@ -364,6 +484,7 @@ def monitor_cursor(connection: sqlite3.Connection) -> str:
         "match": _max_value(connection, "raybet_matches", "updated_at"),
         "odds": _max_value(connection, "odds_snapshots", "id"),
         "transport": _latest_transport_identity(connection),
+        "browser_page": _browser_page_revision(connection),
         "vision": _vision_revision(connection),
         "vision_invalidation": _append_only_revision(
             connection,
@@ -519,6 +640,7 @@ def _monitor_match(
         odds_activity_at=latest_odds_activity,
         checked_at=now,
     )
+    watch_link = _watch_link(connection, row)
     return {
         "raybet_match_id": match_id,
         "tournament": row["tournament"],
@@ -527,7 +649,10 @@ def _monitor_match(
         "scheduled_at": row["scheduled_at"],
         "best_of": row["best_of"],
         "provider_status": str(row["status"] or ""),
-        "live_url": row["live_url"],
+        # Legacy clients receive no ambiguous stream URL.  New clients use the
+        # provenance-bearing link contract below.
+        "live_url": None,
+        "watch_link": watch_link,
         "updated_at": row["updated_at"],
         "latest_odds_activity_at": (
             latest_odds_activity.isoformat() if latest_odds_activity else None
@@ -545,6 +670,78 @@ def _monitor_match(
             "strategy": strategy_readiness,
         },
     }
+
+
+def _watch_link(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> dict[str, str | None]:
+    match_page = _captured_raybet_page_url(
+        connection, str(row["raybet_match_id"])
+    )
+    if match_page is not None:
+        return {
+            "kind": "match_page",
+            "availability": "available",
+            "url": match_page,
+            "reason": "captured_raybet_match_page",
+        }
+    public_stream = stored_public_stream_url(row["live_url"], row["raw_json"])
+    if public_stream is not None:
+        return {
+            "kind": "public_stream",
+            "availability": "available",
+            "url": public_stream,
+            "reason": "verified_unsigned_stream",
+        }
+    return {
+        "kind": "none",
+        "availability": "unavailable",
+        "url": None,
+        "reason": "no_safe_entry",
+    }
+
+
+def _captured_raybet_page_url(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+) -> str | None:
+    try:
+        rows = connection.execute(
+            """SELECT page_origin, page_path
+                 FROM browser_events
+                WHERE raybet_match_id=?
+                  AND game_id=151
+                  AND recognized=1
+                  AND event_type IN ('odds', 'market_update', 'video')
+                  AND processing_status IN ('processed', 'audit_only')
+                ORDER BY captured_at DESC, event_id DESC
+                LIMIT 50""",
+            (raybet_match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    for event in rows:
+        url = _safe_raybet_page_url(event["page_origin"], event["page_path"])
+        if url is not None:
+            return url
+    return None
+
+
+def _safe_raybet_page_url(origin: object, path: object) -> str | None:
+    if origin not in _RAYBET_PAGE_ORIGINS or not isinstance(path, str):
+        return None
+    if not _RAYBET_PAGE_PATH_RE.fullmatch(path) or path.startswith("//"):
+        return None
+    segments = path.split("/")
+    if any(segment in {".", ".."} for segment in segments):
+        return None
+    if not any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in _RAYBET_PAGE_PREFIXES
+    ):
+        return None
+    return f"{origin}{path}"
 
 
 def _mapping_readiness(
@@ -630,8 +827,7 @@ def _current_winner(
                       outcome.period, recent_transport.observed_at AS received_at,
                       outcome.odds_id AS id
                  FROM recent_transport
-                 JOIN odds_response_outcomes AS outcome
-                      INDEXED BY sqlite_autoindex_odds_response_outcomes_1
+                 JOIN odds_response_outcomes_effective AS outcome
                    ON outcome.observation_key=recent_transport.observation_key
                 WHERE outcome.raybet_match_id=?
                   AND outcome.market_type='winner'
@@ -1102,6 +1298,23 @@ def _vision_revision(connection: sqlite3.Connection) -> list[Any] | None:
     if row is None:
         return None
     return [int(row[0]), int(row[1]), row[2], row[3]]
+
+
+def _browser_page_revision(connection: sqlite3.Connection) -> list[Any] | None:
+    try:
+        row = connection.execute(
+            """SELECT COUNT(*), MAX(event_id), MAX(captured_at)
+                 FROM browser_events
+                WHERE game_id=151
+                  AND recognized=1
+                  AND event_type IN ('odds', 'market_update', 'video')
+                  AND processing_status IN ('processed', 'audit_only')"""
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    return [int(row[0]), row[1], row[2]]
 
 
 def _append_only_revision(

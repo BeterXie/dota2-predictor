@@ -7,7 +7,7 @@ import json
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from event_intelligence.team_profiles import PROFILE_VERSION
 
 from .alignment import align_snapshots
 from .comeback import no_signal_decision
+from .draft_authority import DraftLandmarkAuthority, authority_from_curve
 from .health import record_health
 from .market_state import build_market_surface
 from .models import Market, OddsSnapshot, ShadowOrder
@@ -77,7 +78,8 @@ def _snapshot(row: sqlite3.Row) -> OddsSnapshot:
     return OddsSnapshot(
         str(row["raybet_match_id"]), str(row["odds_id"]), row["odds_group_id"],
         datetime.fromisoformat(str(row["received_at"])), float(row["price"]),
-        row["status"], market, row["last_update"], json.loads(row["raw_json"]),
+        row["status"], market, row["last_update"],
+        json.loads(row["raw_json"]) if row["raw_json"] is not None else {},
     )
 
 
@@ -129,14 +131,38 @@ def _observation(row: sqlite3.Row) -> VisionObservation:
         float(row["draft_confidence"]) if stored_confirmed else 0.0,
         str(row["source_frame_ref"]),
         str(row["screen_state"]), row["radiant_team_side"],
+        source_frame_sha256=(
+            None
+            if "source_frame_sha256" not in row.keys()
+            or row["source_frame_sha256"] is None
+            else str(row["source_frame_sha256"])
+        ),
+        source_frame_bytes=(
+            None
+            if "source_frame_bytes" not in row.keys()
+            or row["source_frame_bytes"] is None
+            else int(row["source_frame_bytes"])
+        ),
     )
 
 
-def _persist_decision(store: LiveBettingStore, decision: Any) -> bool:
+def _persist_decision(
+    store: LiveBettingStore,
+    decision: Any,
+    *,
+    draft_authority: DraftLandmarkAuthority | None = None,
+    vision_observation: VisionObservation | None = None,
+    vision_transport_key: str | None = None,
+) -> bool:
     """Persist full inputs without changing the public numeric contributions."""
     inputs = getattr(decision, "inputs", None)
     if inputs is None or not hasattr(decision, "contributions"):
-        return store.insert_decision(decision)
+        return store.insert_decision(
+            decision,
+            draft_authority=draft_authority,
+            vision_observation=vision_observation,
+            vision_transport_key=vision_transport_key,
+        )
     audit_contributions: dict[str, Any] = {
         **decision.contributions,
         "__inputs__": inputs,
@@ -145,7 +171,10 @@ def _persist_decision(store: LiveBettingStore, decision: Any) -> bool:
     if conservative is not None:
         audit_contributions["__conservative__"] = conservative
     return store.insert_decision(
-        replace(decision, contributions=audit_contributions)
+        replace(decision, contributions=audit_contributions),
+        draft_authority=draft_authority,
+        vision_observation=vision_observation,
+        vision_transport_key=vision_transport_key,
     )
 
 
@@ -624,14 +653,6 @@ def _process_pending_order(
     store: LiveBettingStore, *, as_of: datetime,
 ) -> ShadowOrder | None:
     for pending in _pending_orders(store):
-        block_reason = store.pending_order_block_reason(pending.order_key)
-        if block_reason is not None:
-            resolved = store.reject_pending_order(
-                pending, reason=block_reason
-            )
-            if resolved is not None:
-                return resolved
-            continue
         watermark = store.processed_transport_watermark(
             pending.raybet_match_id, as_of=as_of
         )
@@ -676,7 +697,7 @@ def market_state_for_transport(
     period = f"map_{map_number}"
     try:
         rows = connection.execute(
-            """SELECT * FROM odds_response_outcomes
+            """SELECT * FROM odds_response_outcomes_effective
                WHERE observation_key=? AND raybet_match_id=? AND period=?""",
             (transport.observation_key, match_id, period),
         ).fetchall()
@@ -1040,6 +1061,30 @@ def run_once(
             "inputs": decision.inputs,
             "research": research_payload,
         }
+    draft_authority = authority_from_curve(
+        draft,
+        active_draft,
+        radiant_team_side=observation.radiant_team_side,
+    )
+    if draft_authority is None:
+        decision = no_signal_decision(
+            observation=observation,
+            surface=surface,
+            decided_at=current_transport_at,
+            reason="draft_authority_unavailable",
+            inputs={
+                **strict_inputs,
+                "draft_curve": {"source_ref": draft.source_ref},
+            },
+        )
+        _persist_decision(store, decision)
+        return {
+            "status": "no_signal",
+            "reason": "draft_authority_unavailable",
+            "decision_key": decision.decision_key,
+            "inputs": decision.inputs,
+            "research": research_payload,
+        }
 
     previous_snapshots = None
     previous_observation = None
@@ -1077,6 +1122,9 @@ def run_once(
             "source_ref": draft.source_ref,
             "unavailable_reason": draft.unavailable_reason,
         },
+        "draft_authority": {
+            **asdict(draft_authority),
+        },
     }
     result = strategy.evaluate(
         snapshots=snapshots, observation=observation,
@@ -1092,12 +1140,19 @@ def run_once(
         previous_transport_key=previous_transport_key,
         input_refs=intelligence_refs,
     )
-    _persist_decision(store, result.decision)
+    _persist_decision(
+        store,
+        result.decision,
+        draft_authority=draft_authority,
+        vision_observation=observation,
+        vision_transport_key=current_transport.observation_key,
+    )
     if result.order and store.insert_map_order(
         result.order,
         map_number,
         strict_mapping_id=strict.mapping.mapping_id,
         decision_key=result.decision.decision_key,
+        draft_authority=draft_authority,
     ):
         return {
             "status": "shadow_pending", "order_key": result.order.order_key,

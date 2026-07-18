@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -17,11 +16,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from contracts.live_observation import LiveObservation  # noqa: E402
+from live_betting.direct_response_audit import (  # noqa: E402
+    DirectResponseContext,
+    DirectResponseDecision,
+    audited_direct_request,
+)
 from live_betting.raybet_state import (  # noqa: E402
     infer_current_map_number,
     raybet_match_is_live,
 )
-from live_betting.raybet import RayBetClient  # noqa: E402
+from live_betting.raybet import BASE_URL, RayBetClient  # noqa: E402
+from live_betting.sanitize import stored_public_stream_url  # noqa: E402
+from live_betting.storage import LiveBettingStore  # noqa: E402
+from live_betting.vision_frame_registry import (  # noqa: E402
+    VisionFrameReceipt,
+    publish_vision_frame_bytes,
+)
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
 from vision.clock_reader import ClockReader  # noqa: E402
 from vision.hero_recognizer import (  # noqa: E402
@@ -103,22 +113,47 @@ def _manual_map_number(payload: object, best_of: int | None) -> int | None:
     return map_number
 
 
-def _fresh_stream_payload(match_id: str) -> tuple[str, dict[str, object]]:
-    with RayBetClient() as client:
-        response = client.match_odds(match_id)
-    result = response.get("result")
-    if (
-        not isinstance(result, dict)
-        or str(result.get("id") or "") != match_id
-        or type(result.get("game_id")) is not int
-        or int(result["game_id"]) != 151
-    ):
-        raise ValueError(f"RayBet stream identity mismatch for {match_id}")
-    url = result.get("live_url")
-    if not isinstance(url, str):
-        raise ValueError(f"no fresh live URL found for RayBet match {match_id}")
-    _validate_stream_url(url, description=f"fresh live URL for RayBet match {match_id}")
-    return url, result
+def _fresh_stream_payload(
+    database: Path, match_id: str
+) -> tuple[str, dict[str, object]]:
+    endpoint = f"{BASE_URL}/odds"
+    request_identity = f"{endpoint}?match_id={match_id}"
+
+    def validate(
+        context: DirectResponseContext,
+    ) -> DirectResponseDecision[tuple[str, dict[str, object]]]:
+        result = context.payload.get("result")
+        if (
+            not isinstance(result, dict)
+            or str(result.get("id") or "") != match_id
+            or type(result.get("game_id")) is not int
+            or int(result["game_id"]) != 151
+        ):
+            raise ValueError(f"RayBet stream identity mismatch for {match_id}")
+        url = result.get("live_url")
+        if not isinstance(url, str):
+            raise ValueError(f"no fresh live URL found for RayBet match {match_id}")
+        _validate_stream_url(
+            url, description=f"fresh live URL for RayBet match {match_id}"
+        )
+        return DirectResponseDecision(
+            (url, result),
+            disposition="audit_only",
+            reason="stream_url_refresh",
+            observed_raybet_match_id=match_id,
+        )
+
+    with LiveBettingStore(database) as store, RayBetClient() as client:
+        return audited_direct_request(
+            store,
+            fetch=lambda: client.match_odds_response(match_id),
+            process=validate,
+            response_kind="live_odds",
+            claimed_raybet_match_id=match_id,
+            endpoint=endpoint,
+            request_identity=request_identity,
+            request_metadata={"operation": "stream_url_refresh"},
+        )
 
 
 def match_source(
@@ -135,41 +170,47 @@ def match_source(
             "WHERE raybet_match_id=?",
             (match_id,),
         ).fetchone()
-        if not row or (not row[0] and not refresh_url):
-            raise ValueError(f"no live_url found for RayBet match {match_id}")
-        if refresh_url:
-            url, payload = _fresh_stream_payload(match_id)
-        else:
-            url = _validate_stream_url(
-                row[0], description=f"stored live URL for RayBet match {match_id}"
-            )
-            try:
-                payload = json.loads(str(row[1] or "{}"))
-            except (TypeError, ValueError):
-                payload = {}
-        best_of = int(row[2]) if row[2] is not None else None
-        if map_override is not None:
-            if map_override < 1 or map_override > 10:
-                raise ValueError("map override must be between 1 and 10")
-            if best_of is not None and map_override > best_of:
-                raise ValueError("map override exceeds the configured series length")
-            return url, map_override
-        map_number = _manual_map_number(payload, best_of)
-        if map_number is None and str(row[3]) == "2":
-            try:
-                map_number = infer_current_map_number(payload, best_of)
-            except ValueError as error:
-                raise ValueError(
-                    f"cannot determine a unique current map for RayBet match "
-                    f"{match_id}: {error}"
-                ) from error
-        if map_number is None or (best_of is not None and map_number > best_of):
-            raise ValueError(
-                f"cannot determine a unique current map for RayBet match {match_id}"
-            )
-        return url, map_number
     finally:
         connection.close()
+    if not row or (not row[0] and not refresh_url):
+        raise ValueError(f"no live_url found for RayBet match {match_id}")
+    if refresh_url:
+        url, payload = _fresh_stream_payload(database, match_id)
+    else:
+        stored_url = stored_public_stream_url(row[0], row[1])
+        if stored_url is None:
+            raise ValueError(
+                f"invalid stored live URL for RayBet match {match_id}: "
+                "unsigned provenance is missing"
+            )
+        url = _validate_stream_url(
+            stored_url, description=f"stored live URL for RayBet match {match_id}"
+        )
+        try:
+            payload = json.loads(str(row[1] or "{}"))
+        except (TypeError, ValueError):
+            payload = {}
+    best_of = int(row[2]) if row[2] is not None else None
+    if map_override is not None:
+        if map_override < 1 or map_override > 10:
+            raise ValueError("map override must be between 1 and 10")
+        if best_of is not None and map_override > best_of:
+            raise ValueError("map override exceeds the configured series length")
+        return url, map_override
+    map_number = _manual_map_number(payload, best_of)
+    if map_number is None and str(row[3]) == "2":
+        try:
+            map_number = infer_current_map_number(payload, best_of)
+        except ValueError as error:
+            raise ValueError(
+                f"cannot determine a unique current map for RayBet match "
+                f"{match_id}: {error}"
+            ) from error
+    if map_number is None or (best_of is not None and map_number > best_of):
+        raise ValueError(
+            f"cannot determine a unique current map for RayBet match {match_id}"
+        )
+    return url, map_number
 
 
 def resolve_source(
@@ -267,23 +308,20 @@ def _should_persist_frame(
     )
 
 
-def _write_evidence_frame(frame_path: Path, image: object) -> str:
-    """Atomically publish a reference only after a non-empty frame exists."""
-    temporary = frame_path.with_name(
-        f".{frame_path.stem}.{uuid.uuid4().hex}.tmp{frame_path.suffix}"
-    )
+def _write_evidence_frame(
+    evidence_root: Path,
+    image: object,
+) -> VisionFrameReceipt:
+    """Encode once and publish an atomically content-addressed frame."""
     try:
-        written = cv2.imwrite(str(temporary), image, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not written or not temporary.is_file() or temporary.stat().st_size <= 0:
+        written, encoded = cv2.imencode(
+            ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85]
+        )
+        if not written or encoded is None or int(encoded.size) <= 0:
             raise OSError("encoder did not produce a complete evidence frame")
-        temporary.replace(frame_path)
-    except (cv2.error, OSError) as error:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise OSError(f"failed to write evidence frame: {frame_path}") from error
-    return str(frame_path.resolve())
+        return publish_vision_frame_bytes(evidence_root, encoded.tobytes())
+    except (cv2.error, OSError, RuntimeError, ValueError) as error:
+        raise OSError("failed to write content-addressed evidence frame") from error
 
 
 def main() -> int:
@@ -317,7 +355,7 @@ def main() -> int:
     except ValueError as error:
         parser.error(str(error))
     output = args.output or DEFAULT_OBSERVATION_DIR / f"{args.match_id}.jsonl"
-    evidence_dir = args.evidence_dir or DEFAULT_EVIDENCE_DIR / args.match_id
+    evidence_dir = args.evidence_dir or DEFAULT_EVIDENCE_DIR
 
     clock_reader = ClockReader()
     clock_tracker = MapStateTracker()
@@ -379,8 +417,6 @@ def main() -> int:
             else:
                 outside_game_frames += 1
             captured = datetime.fromtimestamp(frame.captured_at, timezone.utc)
-            frame_name = f"{args.match_id}_{captured.strftime('%Y%m%dT%H%M%S_%fZ')}.jpg"
-            frame_path = evidence_dir / frame_name
             clock_seconds, is_paused, clock_confidence = current_frame_clock_fields(
                 confirmed_clock if state == "game" else None
             )
@@ -408,9 +444,11 @@ def main() -> int:
                     last_evidence_at=last_evidence_at,
                     evidence_interval=args.evidence_interval,
                 ):
-                    observation.source_frame_ref = _write_evidence_frame(
-                        frame_path, frame.image
-                    )
+                    receipt = _write_evidence_frame(evidence_dir, frame.image)
+                    observation.source_frame_ref = receipt.frame_ref
+                    observation.source_frame_sha256 = receipt.content_sha256
+                    observation.source_frame_bytes = receipt.byte_length
+                    observation.source_frame_path = str(receipt.storage_path)
                     last_evidence_at = frame.captured_at
                 writer.append(observation)
                 print(observation.model_dump_json())

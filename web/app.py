@@ -30,7 +30,6 @@ from .schemas import H2HComparison, MatchSummary, PrematchRequest, PredictionReq
 # Resolve paths for the prediction module
 _WEB_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _WEB_DIR.parent
-_DB_PATH = os.environ.get("DATABASE_PATH", str(_PROJECT_DIR / "data" / "dota2.db"))
 _MODELS_DIR = os.environ.get("MODELS_DIR", str(_PROJECT_DIR / "data" / "models"))
 _PREDICTIONS_DIR = os.environ.get("PREDICTIONS_DIR", str(_PROJECT_DIR / "data" / "predictions"))
 
@@ -302,12 +301,12 @@ def create_prediction(request: PredictionRequest):
         bundle = predictor.load_model(_MODELS_DIR)
         features = feature_builder.build_features(
             request.team_a, request.team_b,
-            request.league_id or 0, _DB_PATH, bundle["feature_names"],
+            request.league_id or 0, queries.DB_PATH, bundle["feature_names"],
         )
         result = predictor.predict(bundle, features)
         prediction_output = output.format_output(
             result, request.team_a, request.team_b,
-            request.league_id or 0, bundle, _DB_PATH,
+            request.league_id or 0, bundle, queries.DB_PATH,
         )
         file_path = output.save_prediction(prediction_output, _PREDICTIONS_DIR)
         prediction_output["file_path"] = file_path
@@ -371,7 +370,7 @@ def create_prematch_prediction(request: PrematchRequest):
         predict_match, output = _get_prematch_builder()
 
         result = predict_match(
-            _DB_PATH,
+            queries.DB_PATH,
             request.radiant_id, request.dire_id,
             request.radiant_heroes, request.dire_heroes,
             radiant_players=request.radiant_players,
@@ -396,7 +395,7 @@ def create_prematch_prediction(request: PrematchRequest):
         prediction_output = output.format_output(
             prediction, request.radiant_id, request.dire_id,
             request.league_id or 0,
-            {"timestamp": "scorer", "metrics": {}}, _DB_PATH,
+            {"timestamp": "scorer", "metrics": {}}, queries.DB_PATH,
         )
         file_path = output.save_prediction(prediction_output, _PREDICTIONS_DIR)
         prediction_output["file_path"] = file_path

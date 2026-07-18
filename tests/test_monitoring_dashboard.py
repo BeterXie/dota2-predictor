@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from fastapi.testclient import TestClient
 
+from live_betting.engine import price_groups
+from live_betting.browser_contract import canonical_json, payload_sha256
 from live_betting.health import record_health
+from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot
 from live_betting.storage import LiveBettingStore
-from live_betting.vision import VisionObservation
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
+)
 from web import queries
 from web.app import app
 from web.monitoring import (
@@ -27,12 +36,41 @@ from web.monitoring import (
 NOW = datetime(2026, 7, 14, 14, 0, tzinfo=timezone.utc)
 
 
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    match_id = rows[0].raybet_match_id
+    outcomes = []
+    for row in rows:
+        outcomes.append(
+            {
+                "id": row.odds_id,
+                "odds_group_id": row.odds_group_id,
+                "team_id": 11 if row.market.side == "team_one" else 22,
+                "match_stage": f"r{row.market.period.removeprefix('map_')}",
+                "group_short_name": "Winner",
+                "tag": "win",
+                "odds": str(row.price),
+                "status": row.status,
+            }
+        )
+    return {
+        "result": {
+            "id": match_id,
+            "team": [
+                {"team_id": 11, "team_name": "Radiant Five", "pos": 1},
+                {"team_id": 22, "team_name": "Dire Five", "pos": 2},
+            ],
+            "odds": outcomes,
+        }
+    }
+
+
 class MonitoringDashboardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.database = Path(self.directory.name) / "monitor.db"
         self.store = LiveBettingStore(self.database)
         self.store.init_schema()
+        self.strict_mapping_id: int | None = None
 
     def tearDown(self) -> None:
         self.store.close()
@@ -59,6 +97,40 @@ class MonitoringDashboardTests(unittest.TestCase):
                 ],
             },
             updated_at,
+        )
+        self.store.connection.commit()
+
+    def add_browser_page_event(
+        self,
+        *,
+        match_id: str = "42",
+        page_origin: str = "https://www.ray086.com",
+        page_path: str = "/sports/esports",
+        event_id: str = "a" * 64,
+    ) -> None:
+        payload = {"result": {"id": match_id, "game_id": 151, "odds": []}}
+        self.store.insert_browser_event(
+            {
+                "schema_version": 1,
+                "event_id": event_id,
+                "capture_session_id": "b" * 32,
+                "captured_at_utc": NOW,
+                "page_origin": page_origin,
+                "page_path": page_path,
+                "source_path": "/v2/odds",
+                "transport": "xhr",
+                "event_type": "odds",
+                "raybet_match_id": match_id,
+                "game_id": 151,
+                "payload": payload,
+                "payload_hash": payload_sha256(payload),
+                "payload_bytes": len(canonical_json(payload)),
+                "capture_reason": None,
+                "extension_version": "0.1.0",
+            },
+            received_at=NOW,
+            recognized=True,
+            processing_status="processed",
         )
         self.store.connection.commit()
 
@@ -98,7 +170,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         observation_key: str,
         period: str = "map_1",
         status: int = 1,
-    ) -> None:
+    ) -> list[OddsSnapshot]:
         snapshots = [
             OddsSnapshot(
                 match_id,
@@ -128,9 +200,60 @@ class MonitoringDashboardTests(unittest.TestCase):
             source_event_id=None,
             raybet_match_id=match_id,
             observed_at=observed_at,
-            normalized_state_hash="same-semantic-state",
+            normalized_state_hash=normalized_state_hash(snapshots),
             snapshots=snapshots,
+            raw_payload=raw_odds_payload(snapshots),
         )
+        return snapshots
+
+    def ensure_strict_mapping(self) -> int:
+        if self.strict_mapping_id is not None:
+            return self.strict_mapping_id
+        self.store.connection.execute(
+            "CREATE TABLE IF NOT EXISTS event_registry (event_id TEXT PRIMARY KEY)"
+        )
+        self.store.connection.execute(
+            "INSERT OR IGNORE INTO event_registry VALUES ('monitor-test')"
+        )
+        identity_json = "{}"
+        identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        recorded_at = (NOW - timedelta(days=1)).isoformat()
+        cursor = self.store.connection.execute(
+            """INSERT INTO strict_live_map_mappings
+               (raybet_match_id, map_number, event_id, team_one_id,
+                team_two_id, canonical_team_one_id,
+                canonical_team_one_name, canonical_team_two_id,
+                canonical_team_two_name, canonical_identity_json,
+                canonical_identity_hash, crosswalk_evidence_json,
+                crosswalk_evidence_hash, stage_scope, scheduled_at_utc,
+                raybet_best_of, raybet_identity_json,
+                raybet_identity_hash, raybet_metadata_updated_at, source,
+                evidence_json, evidence_hash, mapping_version,
+                acceptance_mode, automatic_approval_id, accepted_by,
+                accepted_at, recorded_at, created_at)
+               VALUES ('match-1', 1, 'monitor-test', 11, 22, 11,
+                       'Radiant Five', 22, 'Dire Five', ?, ?, ?, ?,
+                       'main_event', ?, 3, ?, ?, ?, 'test', ?, ?, 'test-v1',
+                       'manual_exact', NULL, 'test', ?, ?, ?)""",
+            (
+                identity_json,
+                identity_hash,
+                identity_json,
+                identity_hash,
+                recorded_at,
+                identity_json,
+                identity_hash,
+                recorded_at,
+                identity_json,
+                identity_hash,
+                recorded_at,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        self.store.connection.commit()
+        self.strict_mapping_id = int(cursor.lastrowid)
+        return self.strict_mapping_id
 
     def add_decision(
         self,
@@ -140,24 +263,61 @@ class MonitoringDashboardTests(unittest.TestCase):
         *,
         map_number: int = 1,
     ) -> None:
-        self.store.connection.execute(
-            """INSERT INTO strategy_decisions
-               (decision_key, raybet_match_id, map_number, decided_at,
-                underdog_side, market_probability, model_probability, edge,
-                data_quality, eligible, reason, contributions_json, input_ref,
-                strategy_version)
-               VALUES (?, 'match-1', ?, ?, 'team_one', 0.4, ?, ?, 0.9, 1,
-                       'eligible', '{}', ?, 'strategy-v1')""",
-            (
-                decision_key,
-                map_number,
-                decided_at.isoformat(),
-                model_probability,
-                model_probability - 0.4,
-                f"input-{decision_key}",
-            ),
+        mapping_id = self.ensure_strict_mapping()
+        draft_authority = seed_test_draft_authority(
+            self.store.connection,
+            raybet_match_id="match-1",
+            map_number=map_number,
+            strict_mapping_id=mapping_id,
+            observed_at=decided_at,
+            label=f"monitor:{decision_key}",
         )
-        self.store.connection.commit()
+        vision = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=map_number,
+            captured_at=decided_at,
+            label=f"monitor-frame:{decision_key}",
+        )
+        self.store.insert_vision_observation(vision)
+        rows = self.add_winner_response(
+            decided_at,
+            2.5,
+            5.0 / 3.0,
+            observation_key=f"monitor-transport:{decision_key}",
+            period=f"map_{map_number}",
+        )
+        market_probability = price_groups(rows)[rows[0].odds_id]
+        decision = SimpleNamespace(
+            decision_key=decision_key,
+            raybet_match_id="match-1",
+            map_number=map_number,
+            decided_at=decided_at,
+            underdog_side="team_one",
+            market_probability=market_probability,
+            model_probability=model_probability,
+            edge=model_probability - market_probability,
+            data_quality=0.9,
+            eligible=True,
+            reason="eligible",
+            contributions={
+                "__inputs__": {
+                    "draft_authority": asdict(draft_authority),
+                    "strict_live_eligibility": {
+                        "mapping_refs": {"strict_mapping_id": mapping_id}
+                    },
+                }
+            },
+            input_ref=f"input-{decision_key}",
+            strategy_version="strategy-v1",
+        )
+        self.assertTrue(
+            self.store.insert_decision(
+                decision,
+                draft_authority=draft_authority,
+                vision_observation=vision,
+                vision_transport_key=f"monitor-transport:{decision_key}",
+            )
+        )
 
     def test_stale_healthy_heartbeat_is_derived_as_unhealthy(self) -> None:
         heartbeat = NOW - timedelta(minutes=5)
@@ -244,6 +404,130 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(match["readiness"]["odds"]["status"], "missing")
         self.assertEqual(match["readiness"]["mapping"]["status"], "missing")
 
+    def test_signed_or_legacy_live_url_is_not_exposed_as_playable(self) -> None:
+        self.add_match(match_id="42", status=2)
+        self.store.connection.execute(
+            """UPDATE raybet_matches
+                  SET live_url=?, raw_json=?
+                WHERE raybet_match_id='42'""",
+            (
+                "https://qplay.ehome.gg/live/42.m3u8",
+                '{"live_url":"https://qplay.ehome.gg/live/42.m3u8"}',
+            ),
+        )
+        self.store.connection.commit()
+
+        match = build_monitor_snapshot(self.store.connection, now=NOW)["matches"][0]
+
+        self.assertIsNone(match["live_url"])
+        self.assertEqual(
+            match["watch_link"],
+            {
+                "kind": "none",
+                "availability": "unavailable",
+                "url": None,
+                "reason": "no_safe_entry",
+            },
+        )
+
+    def test_verified_unsigned_public_stream_is_available_without_page_evidence(
+        self,
+    ) -> None:
+        public_url = "https://qplay.ehome.gg/live/42.m3u8"
+        self.store.upsert_raybet_match(
+            {
+                "id": "42",
+                "game_id": 151,
+                "status": 2,
+                "team": [],
+            },
+            NOW,
+            public_live_url=public_url,
+        )
+        self.store.connection.commit()
+
+        match = build_monitor_snapshot(self.store.connection, now=NOW)["matches"][0]
+
+        self.assertEqual(
+            match["watch_link"],
+            {
+                "kind": "public_stream",
+                "availability": "available",
+                "url": public_url,
+                "reason": "verified_unsigned_stream",
+            },
+        )
+
+    def test_captured_allowlisted_match_page_takes_priority_over_public_stream(
+        self,
+    ) -> None:
+        public_url = "https://qplay.ehome.gg/live/42.m3u8"
+        self.store.upsert_raybet_match(
+            {"id": "42", "game_id": 151, "status": 2, "team": []},
+            NOW,
+            public_live_url=public_url,
+        )
+        self.add_browser_page_event()
+
+        match = build_monitor_snapshot(self.store.connection, now=NOW)["matches"][0]
+
+        self.assertEqual(
+            match["watch_link"],
+            {
+                "kind": "match_page",
+                "availability": "available",
+                "url": "https://www.ray086.com/sports/esports",
+                "reason": "captured_raybet_match_page",
+            },
+        )
+
+    def test_match_page_rejects_foreign_origin_and_unsafe_path(self) -> None:
+        for index, (origin, path) in enumerate(
+            (
+                ("javascript://ray086.com", "/sports/esports"),
+                ("https://evil.example", "/sports/esports"),
+                ("https://www.ray086.com", "//evil.example/redirect"),
+                ("https://www.ray086.com", "/sports/esports/../redirect"),
+            )
+        ):
+            with self.subTest(origin=origin, path=path):
+                match_id = str(50 + index)
+                self.add_match(match_id=match_id, status=2)
+                self.add_browser_page_event(
+                    match_id=match_id,
+                    page_origin=origin,
+                    page_path=path,
+                    event_id=f"{index + 1:064x}",
+                )
+                match = monitor_match_detail(
+                    self.store.connection, match_id, now=NOW
+                )
+                assert match is not None
+                self.assertEqual(match["watch_link"]["availability"], "unavailable")
+
+    def test_old_database_without_browser_events_fails_closed(self) -> None:
+        self.add_match(match_id="42", status=2)
+        self.store.connection.execute("DROP TABLE browser_events")
+        self.store.connection.execute(
+            """UPDATE raybet_matches
+                  SET live_url='https://qplay.ehome.gg/live/42.m3u8'
+                WHERE raybet_match_id='42'"""
+        )
+        self.store.connection.commit()
+
+        match = monitor_match_detail(self.store.connection, "42", now=NOW)
+
+        assert match is not None
+        self.assertEqual(match["watch_link"]["availability"], "unavailable")
+
+    def test_monitor_cursor_changes_when_match_page_evidence_arrives(self) -> None:
+        self.add_match(match_id="42", status=2)
+        before = monitor_cursor(self.store.connection)
+
+        self.add_browser_page_event(match_id="42")
+
+        self.assertNotEqual(monitor_cursor(self.store.connection), before)
+
     def test_strict_mapping_impact_is_removed_from_summary_and_detail(self) -> None:
         self.add_match(status=2)
         self.add_decision("older-valid", NOW - timedelta(seconds=20), 0.55)
@@ -326,17 +610,6 @@ class MonitoringDashboardTests(unittest.TestCase):
             (NOW.isoformat(),),
         )
         self.store.connection.execute(
-            """INSERT INTO vision_draft_anchors
-               (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
-                dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
-               VALUES ('match-1', 1, ?, '[]', '[]', ?, 'frame-conflict',
-                       'anchored', NULL)""",
-            (
-                "a" * 64,
-                (NOW - timedelta(seconds=40)).isoformat(),
-            ),
-        )
-        self.store.connection.execute(
             """UPDATE vision_draft_anchors
                   SET status='conflict', conflict_at=?
                 WHERE raybet_match_id='match-1' AND map_number=1""",
@@ -359,31 +632,25 @@ class MonitoringDashboardTests(unittest.TestCase):
 
     def test_latest_vision_requires_a_confirmed_frame_after_invalidation(self) -> None:
         self.add_match(status=2)
-        older = VisionObservation(
-            "match-1",
-            1,
-            NOW - timedelta(seconds=10),
-            110,
-            False,
-            (1, 2, 3, 4, 5),
-            (6, 7, 8, 9, 10),
-            0.99,
-            0.99,
-            "frame-valid",
-            "game",
+        older = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=NOW - timedelta(seconds=10),
+            game_clock_seconds=110,
+            radiant_team_side=None,
+            clock_confidence=0.99,
+            draft_confidence=0.99,
+            label="frame-valid",
         )
-        invalidated = VisionObservation(
-            "match-1",
-            1,
-            NOW - timedelta(seconds=5),
-            115,
-            False,
-            (1, 2, 3, 4, 5),
-            (6, 7, 8, 9, 10),
-            0.99,
-            0.99,
-            "frame-invalidated",
-            "game",
+        invalidated = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=NOW - timedelta(seconds=5),
+            game_clock_seconds=115,
+            radiant_team_side=None,
+            clock_confidence=0.99,
+            draft_confidence=0.99,
+            label="frame-invalidated",
         )
         self.store.insert_vision_observation(older)
         self.store.insert_vision_observation(invalidated)
@@ -418,18 +685,15 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertIsNone(blocked)
 
-        restored = VisionObservation(
-            "match-1",
-            1,
-            NOW - timedelta(seconds=2),
-            118,
-            False,
-            (1, 2, 3, 4, 5),
-            (6, 7, 8, 9, 10),
-            0.99,
-            0.99,
-            "frame-restored",
-            "game",
+        restored = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=NOW - timedelta(seconds=2),
+            game_clock_seconds=118,
+            radiant_team_side=None,
+            clock_confidence=0.99,
+            draft_confidence=0.99,
+            label="frame-restored",
         )
         self.store.insert_vision_observation(restored)
         self.store.connection.commit()
@@ -496,14 +760,29 @@ class MonitoringDashboardTests(unittest.TestCase):
             updated_at=NOW - timedelta(days=1),
         )
         recent = NOW - timedelta(minutes=2)
+        authority_at = recent - timedelta(seconds=1)
+        self.add_winner_response(
+            authority_at,
+            2.0,
+            2.0,
+            observation_key="audit-authority",
+        )
+        authority = self.store.connection.execute(
+            """SELECT normalized_state_hash, response_state_hash,
+                      response_artifact_hash
+                 FROM odds_transport_observations
+                WHERE observation_key='audit-authority'"""
+        ).fetchone()
         self.store.insert_transport_observation(
             observation_key="recent-audit-only",
             source="direct",
             source_event_id=None,
             raybet_match_id="match-1",
             observed_at=recent,
-            normalized_state_hash="audit-only-state",
-            timing_status="on_time",
+            normalized_state_hash=str(authority[0]),
+            response_state_hash=str(authority[1]),
+            response_artifact_hash=str(authority[2]),
+            timing_status="late",
             processing_status="audit_only",
             normalized_change_count=0,
         )
@@ -661,36 +940,15 @@ class MonitoringDashboardTests(unittest.TestCase):
     def test_transport_schema_error_does_not_fall_back_to_legacy_winner(self) -> None:
         self.add_match(status=2)
         self.add_winner_pair(NOW - timedelta(minutes=1), 2.0, 2.0, status=1)
-        self.store.connection.execute("DROP TABLE odds_response_outcomes")
-        self.store.connection.execute(
-            """CREATE TABLE odds_response_outcomes (
-                observation_key TEXT NOT NULL,
-                raybet_match_id TEXT NOT NULL,
-                odds_id TEXT NOT NULL,
-                odds_group_id TEXT,
-                received_at TEXT NOT NULL,
-                price REAL NOT NULL,
-                status TEXT,
-                market_type TEXT NOT NULL,
-                period TEXT NOT NULL,
-                side TEXT,
-                line REAL,
-                outcome_key TEXT NOT NULL,
-                supported INTEGER NOT NULL,
-                last_update TEXT,
-                raw_json TEXT NOT NULL
-            )"""
-        )
-        self.store.insert_transport_observation(
+        self.add_winner_response(
+            NOW,
+            2.0,
+            2.0,
             observation_key="malformed-response-schema",
-            source="direct",
-            source_event_id=None,
-            raybet_match_id="match-1",
-            observed_at=NOW,
-            normalized_state_hash="current-transport-state",
-            timing_status="on_time",
-            processing_status="processed",
-            normalized_change_count=0,
+        )
+        self.store.connection.execute("DROP TABLE odds_response_state_outcomes")
+        self.store.connection.execute(
+            "CREATE TABLE odds_response_state_outcomes (response_state_hash TEXT)"
         )
         self.store.connection.commit()
 
@@ -757,8 +1015,12 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.add_match()
         first = NOW - timedelta(seconds=12)
         second = NOW - timedelta(seconds=6)
-        self.add_winner_pair(first, 2.0, 2.0)
-        self.add_winner_pair(second, 4.0, 4 / 3)
+        self.add_winner_response(
+            first, 2.0, 2.0, observation_key="timeline-first"
+        )
+        self.add_winner_response(
+            second, 4.0, 4 / 3, observation_key="timeline-second"
+        )
 
         timeline = winner_timeline(self.store.connection, "match-1")
 
@@ -817,18 +1079,15 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertNotEqual(before, monitor_cursor(self.store.connection))
 
     def test_cursor_changes_for_vision_invalidation_and_confirmed_downgrade(self) -> None:
-        observation = VisionObservation(
-            "match-1",
-            1,
-            NOW - timedelta(seconds=5),
-            120,
-            False,
-            (1, 2, 3, 4, 5),
-            (6, 7, 8, 9, 10),
-            0.99,
-            0.99,
-            "cursor-invalidated-frame",
-            "game",
+        observation = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=NOW - timedelta(seconds=5),
+            game_clock_seconds=120,
+            radiant_team_side=None,
+            clock_confidence=0.99,
+            draft_confidence=0.99,
+            label="cursor-invalidated-frame",
         )
         self.store.insert_vision_observation(observation)
         self.store.connection.commit()
@@ -863,18 +1122,15 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(after, monitor_cursor(self.store.connection))
 
     def test_cursor_changes_for_draft_and_derived_invalidations(self) -> None:
-        observation = VisionObservation(
-            "match-1",
-            1,
-            NOW - timedelta(seconds=5),
-            120,
-            False,
-            (1, 2, 3, 4, 5),
-            (6, 7, 8, 9, 10),
-            0.99,
-            0.99,
-            "cursor-conflict-frame",
-            "game",
+        observation = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=NOW - timedelta(seconds=5),
+            game_clock_seconds=120,
+            radiant_team_side=None,
+            clock_confidence=0.99,
+            draft_confidence=0.99,
+            label="cursor-conflict-frame",
         )
         self.store.insert_vision_observation(observation)
         self.store.connection.commit()
@@ -942,7 +1198,9 @@ class MonitoringDashboardTests(unittest.TestCase):
 
     def test_monitor_api_exposes_bootstrap_and_match_detail(self) -> None:
         self.add_match()
-        self.add_winner_pair(NOW, 2.0, 2.0)
+        self.add_winner_response(
+            NOW, 2.0, 2.0, observation_key="monitor-api-response"
+        )
         previous_path = queries.DB_PATH
         queries.init_db(str(self.database))
         try:

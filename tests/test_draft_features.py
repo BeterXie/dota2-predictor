@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 import unittest
 
 from event_intelligence.draft_features import (
+    DRAFT_FEATURE_ARTIFACT_VERSION,
     FEATURE_SCHEMA,
     FEATURE_SCHEMA_HASH,
+    LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION,
     AvailabilityMode,
     DerivedFactProvenance,
     DraftHeroMapEvidence,
@@ -18,7 +22,16 @@ from event_intelligence.draft_features import (
     DraftTeam,
     DraftTeamMapEvidence,
     ExpectedRoleAssignment,
+    audit_legacy_draft_feature_artifact,
+    build_draft_feature_artifact,
     build_draft_feature_snapshot,
+    build_draft_feature_snapshot_with_authority,
+    load_draft_feature_artifact_json,
+    load_legacy_draft_feature_artifact_json_for_audit,
+    parse_draft_feature_artifact_json,
+    replay_draft_feature_artifact,
+    replay_draft_feature_snapshot,
+    verify_live_draft_feature_artifact,
 )
 from event_intelligence.models import RolePurpose
 from event_intelligence.roles import RoleSource
@@ -760,6 +773,279 @@ class DraftFeatureSemanticsTests(unittest.TestCase):
                 completed_at=CUTOFF - timedelta(hours=1),
                 first_usable_at=CUTOFF - timedelta(hours=2),
             )
+
+    def test_feature_authority_round_trips_the_full_snapshot(self) -> None:
+        target = _target()
+        snapshot, authority = build_draft_feature_snapshot_with_authority(
+            target,
+            (_map(2), _map(1)),
+        )
+
+        self.assertEqual(replay_draft_feature_snapshot(authority), snapshot)
+        self.assertEqual(
+            authority["eligible_history"][0]["evidence_id"],
+            "evidence-2",
+        )
+
+    def test_feature_authority_rejects_noncanonical_or_duplicate_history(self) -> None:
+        _snapshot, authority = build_draft_feature_snapshot_with_authority(
+            _target(),
+            (_map(1), _map(2)),
+        )
+        duplicated = deepcopy(authority)
+        duplicated["eligible_history"].append(
+            deepcopy(duplicated["eligible_history"][0])
+        )
+
+        with self.assertRaisesRegex(ValueError, "not canonical"):
+            replay_draft_feature_snapshot(duplicated)
+
+    def test_feature_authority_rejects_unknown_nested_fields(self) -> None:
+        _snapshot, authority = build_draft_feature_snapshot_with_authority(
+            _target(),
+            (_map(1),),
+        )
+        tampered = deepcopy(authority)
+        tampered["target"]["radiant"]["players"][0]["claimed_score"] = 100
+
+        with self.assertRaisesRegex(ValueError, "invalid object schema"):
+            replay_draft_feature_snapshot(tampered)
+
+    def test_feature_artifact_is_slim_and_requires_external_authority(self) -> None:
+        target = _target()
+        history = (_map(1), _map(2))
+        snapshot, artifact = build_draft_feature_artifact(target, history)
+
+        self.assertEqual(
+            artifact["artifact_version"], DRAFT_FEATURE_ARTIFACT_VERSION
+        )
+        self.assertNotIn("authority", artifact)
+        self.assertNotIn("eligible_history", artifact)
+        self.assertEqual(
+            set(artifact["evidence_ids"]),
+            {"count", "digest"},
+        )
+        for feature in (*artifact["pure_features"], *artifact["context_features"]):
+            self.assertEqual(
+                set(feature["evidence_ids"]),
+                {"count", "digest"},
+            )
+        with self.assertRaisesRegex(ValueError, "authoritative target and history"):
+            replay_draft_feature_artifact(artifact)
+        self.assertEqual(
+            verify_live_draft_feature_artifact(
+                artifact,
+                target=target,
+                history=history,
+            ),
+            snapshot,
+        )
+
+    def test_feature_artifact_rejects_tampered_calculated_claims(self) -> None:
+        target = _target()
+        history = (_map(1), _map(2))
+        _snapshot, artifact = build_draft_feature_artifact(target, history)
+        attacks = {
+            "value": lambda row: row["pure_features"][0].__setitem__("value", 0.9),
+            "context_value": lambda row: row["context_features"][0].__setitem__(
+                "value", 0.9
+            ),
+            "feature_support": lambda row: row["pure_features"][0].__setitem__(
+                "support", 999
+            ),
+            "feature_coverage": lambda row: row["pure_features"][0].__setitem__(
+                "coverage", 1.0
+            ),
+            "feature_evidence": lambda row: row["pure_features"][0].__setitem__(
+                "evidence_ids", {"count": 1, "digest": "f" * 64}
+            ),
+            "aggregate_support": lambda row: row.__setitem__("support", 999),
+            "aggregate_coverage": lambda row: row.__setitem__(
+                "pure_coverage", 1.0
+            ),
+            "aggregate_evidence": lambda row: row.__setitem__(
+                "evidence_ids", {"count": 1, "digest": "f" * 64}
+            ),
+            "input_hash": lambda row: row.__setitem__("input_hash", "f" * 64),
+            "authority_fingerprint": lambda row: row.__setitem__(
+                "authority_fingerprint", "f" * 64
+            ),
+            "target_hash": lambda row: row["target_identity"].__setitem__(
+                "target_hash", "f" * 64
+            ),
+        }
+        for name, attack in attacks.items():
+            with self.subTest(name=name):
+                tampered = deepcopy(artifact)
+                attack(tampered)
+                with self.assertRaisesRegex(ValueError, "authoritative inputs"):
+                    verify_live_draft_feature_artifact(
+                        tampered,
+                        target=target,
+                        history=history,
+                    )
+
+    def test_fully_consistent_forged_history_cannot_self_authorize(self) -> None:
+        target = _target()
+        authoritative_history = (_map(1), _map(2))
+        _snapshot, forged = build_draft_feature_artifact(
+            target,
+            (_map(1), _map(3, radiant_win=False)),
+        )
+
+        with self.assertRaisesRegex(ValueError, "authoritative inputs"):
+            verify_live_draft_feature_artifact(
+                forged,
+                target=target,
+                history=authoritative_history,
+            )
+
+    def test_feature_artifact_rejects_unknown_fields(self) -> None:
+        target = _target()
+        history = (_map(1),)
+        _snapshot, artifact = build_draft_feature_artifact(target, history)
+        attacks = {
+            "top_level": lambda row: row.__setitem__("unknown", True),
+            "target": lambda row: row["target_identity"].__setitem__(
+                "unknown", True
+            ),
+            "feature": lambda row: row["pure_features"][0].__setitem__(
+                "unknown", True
+            ),
+            "evidence": lambda row: row["evidence_ids"].__setitem__(
+                "unknown", True
+            ),
+        }
+        for name, attack in attacks.items():
+            with self.subTest(name=name):
+                tampered = deepcopy(artifact)
+                attack(tampered)
+                with self.assertRaisesRegex(ValueError, "invalid object schema"):
+                    verify_live_draft_feature_artifact(
+                        tampered,
+                        target=target,
+                        history=history,
+                    )
+
+    def test_feature_artifact_json_rejects_duplicates_and_nonfinite_numbers(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
+            parse_draft_feature_artifact_json(
+                '{"artifact_version":"a","artifact_version":"b"}'
+            )
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                with self.assertRaisesRegex(ValueError, "invalid JSON constant"):
+                    parse_draft_feature_artifact_json(
+                        f'{{"value":{constant}}}'
+                    )
+
+    def test_feature_artifact_json_round_trips(self) -> None:
+        target = _target()
+        history = (_map(1),)
+        snapshot, artifact = build_draft_feature_artifact(
+            target,
+            history,
+        )
+        loaded, replayed = load_draft_feature_artifact_json(
+            json.dumps(artifact, ensure_ascii=False, separators=(",", ":")),
+            target=target,
+            history=history,
+        )
+
+        self.assertEqual(loaded, artifact)
+        self.assertEqual(replayed, snapshot)
+
+    def test_feature_artifact_size_does_not_scale_with_history(self) -> None:
+        target = _target()
+        history_n = tuple(_map(match_id) for match_id in range(1, 65))
+        history_2n = tuple(_map(match_id) for match_id in range(1, 129))
+        _snapshot_n, artifact_n = build_draft_feature_artifact(target, history_n)
+        _snapshot_2n, artifact_2n = build_draft_feature_artifact(target, history_2n)
+        size_n = len(json.dumps(artifact_n, separators=(",", ":")))
+        size_2n = len(json.dumps(artifact_2n, separators=(",", ":")))
+
+        self.assertLess(size_2n - size_n, 256)
+        self.assertLess(size_2n, size_n * 1.05)
+        encoded = json.dumps(artifact_2n, separators=(",", ":"))
+        self.assertNotIn("eligible_history", encoded)
+        self.assertNotIn("evidence-128", encoded)
+
+    def test_input_hash_and_authority_fingerprint_are_canonical_and_distinct(
+        self,
+    ) -> None:
+        target = _target()
+        _snapshot, first = build_draft_feature_artifact(
+            target,
+            (_map(2), _map(1)),
+        )
+        _snapshot, reordered = build_draft_feature_artifact(
+            target,
+            (_map(1), _map(2)),
+        )
+        _snapshot, changed = build_draft_feature_artifact(
+            target,
+            (_map(1), _map(2, radiant_win=False)),
+        )
+
+        self.assertEqual(first["input_hash"], reordered["input_hash"])
+        self.assertEqual(
+            first["authority_fingerprint"],
+            reordered["authority_fingerprint"],
+        )
+        self.assertNotEqual(first["input_hash"], first["authority_fingerprint"])
+        self.assertNotEqual(first["input_hash"], changed["input_hash"])
+        self.assertNotEqual(
+            first["authority_fingerprint"],
+            changed["authority_fingerprint"],
+        )
+
+    def test_legacy_feature_artifact_is_audit_only(self) -> None:
+        target = _target()
+        history = (_map(1),)
+        snapshot, authority = build_draft_feature_snapshot_with_authority(
+            target,
+            history,
+        )
+        legacy = {
+            "artifact_version": LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION,
+            "authority": authority,
+            "match_id": snapshot.match_id,
+            "prediction_cutoff": snapshot.prediction_cutoff.isoformat(),
+            "availability_mode": snapshot.availability_mode.value,
+            "feature_version": snapshot.feature_version,
+            "feature_schema": list(snapshot.feature_schema),
+            "feature_schema_hash": snapshot.feature_schema_hash,
+            "input_hash": snapshot.input_hash,
+            "pure_features": [
+                {
+                    "name": row.name,
+                    "value": row.value,
+                    "support": row.support,
+                    "evidence_ids": list(row.evidence_ids),
+                    "coverage": row.coverage,
+                    "missing_reason": row.missing_reason,
+                }
+                for row in snapshot.pure_features
+            ],
+            "support": snapshot.support,
+            "pure_coverage": snapshot.pure_coverage,
+            "evidence_ids": list(snapshot.evidence_ids),
+        }
+
+        self.assertEqual(audit_legacy_draft_feature_artifact(legacy), snapshot)
+        with self.assertRaisesRegex(ValueError, "audit-only"):
+            replay_draft_feature_artifact(
+                legacy,
+                target=target,
+                history=history,
+            )
+        loaded, audited = load_legacy_draft_feature_artifact_json_for_audit(
+            json.dumps(legacy, separators=(",", ":"))
+        )
+        self.assertEqual(loaded, legacy)
+        self.assertEqual(audited, snapshot)
 
 
 if __name__ == "__main__":

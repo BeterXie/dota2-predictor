@@ -11,17 +11,18 @@ from shared.sqlite import connect as connect_sqlite
 
 logger = logging.getLogger(__name__)
 
-# Use the web config.yaml path, falling back to env var, then computed default.
+# DB_PATH is the single runtime authority used by queries and prediction code.
+# web.main resolves CLI/environment/config precedence before calling init_db.
 _WEB_DIR = Path(__file__).resolve().parent
 _DEFAULT_DB = str(_WEB_DIR.parent / "data" / "dota2.db")
-DB_PATH = os.environ.get("DATABASE_PATH", _DEFAULT_DB)
+DB_PATH = str(Path(os.environ.get("DATABASE_PATH", _DEFAULT_DB)).resolve())
 
 
 def init_db(db_path: str | None = None) -> None:
     """Configure the database path. Call once at application startup."""
     global DB_PATH
     if db_path:
-        DB_PATH = db_path
+        DB_PATH = str(Path(db_path).resolve())
 
 
 def get_db() -> sqlite3.Connection:

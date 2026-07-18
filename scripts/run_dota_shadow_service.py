@@ -650,6 +650,8 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "live_betting.monitor",
             "--database",
             str(args.database),
+            "--raw-dir",
+            str(args.database.resolve().parent / "live_betting" / "raw-v2"),
             "--schema-prepared",
         ]
     if args.start_companion:
@@ -744,7 +746,10 @@ def main() -> int:
     parser.add_argument(
         "--migrate",
         action="store_true",
-        help="take a verified backup and run additive schema migrations",
+        help=(
+            "verify current schema read-only, or take a backup before "
+            "migration/repair"
+        ),
     )
     parser.add_argument("--vision-jsonl", type=Path)
     args = parser.parse_args()
@@ -760,6 +765,10 @@ def main() -> int:
                 prepare_database(
                     args.database,
                     args.backup_dir or args.database.parent / "backups",
+                    supervisor_process_lock_held=True,
+                    odds_raw_root=(
+                        args.database.resolve().parent / "live_betting" / "raw-v2"
+                    ),
                 )
                 if args.migrate
                 else verify_prepared_database(args.database)

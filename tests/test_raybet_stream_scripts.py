@@ -17,11 +17,16 @@ import pytest
 
 from scripts.supervise_raybet_streams import (
     DEFAULT_OBSERVATION_DIR as SUPERVISOR_OBSERVATION_DIR,
+    MAX_CONCURRENT_WATCHERS,
+    WATCHER_MAX_START_FAILURES,
+    active_match_evidence,
     active_matches,
     reap_children,
     record_supervisor_health,
     run_evidence_retention,
+    startable_matches,
     supervisor_health,
+    watcher_retry_after_failure,
     watcher_command,
 )
 from scripts.invalidate_vision_observations import freeze_draft_map, invalidate
@@ -42,10 +47,70 @@ from scripts.watch_raybet_stream import (
 from contracts.live_observation import LiveObservation
 from vision.map_state import ConfirmedClock
 from live_betting.storage import LiveBettingStore
+from live_betting.sanitize import (
+    PUBLIC_STREAM_EVIDENCE_KEY,
+    public_stream_evidence,
+)
 from live_betting.vision import VisionObservation
+from live_betting.vision_frame_registry import publish_vision_frame_bytes
 
 
 STREAM_URL = "https://play.ehome.gg/live.m3u8"
+
+
+def _insert_test_strict_mapping(
+    store: LiveBettingStore,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    event_id: str,
+    available_at: str,
+) -> int:
+    store.connection.execute(
+        "CREATE TABLE IF NOT EXISTS event_registry (event_id TEXT PRIMARY KEY)"
+    )
+    store.connection.execute(
+        "INSERT OR IGNORE INTO event_registry (event_id) VALUES (?)",
+        (event_id,),
+    )
+    identity_json = "{}"
+    identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    cursor = store.connection.execute(
+        """INSERT INTO strict_live_map_mappings
+           (raybet_match_id, map_number, event_id, team_one_id, team_two_id,
+            canonical_team_one_id, canonical_team_one_name,
+            canonical_team_two_id, canonical_team_two_name,
+            canonical_identity_json, canonical_identity_hash,
+            crosswalk_evidence_json, crosswalk_evidence_hash, stage_scope,
+            scheduled_at_utc, raybet_best_of, raybet_identity_json,
+            raybet_identity_hash, raybet_metadata_updated_at, source,
+            evidence_json, evidence_hash, mapping_version, acceptance_mode,
+            automatic_approval_id, accepted_by, accepted_at, recorded_at,
+            created_at)
+           VALUES (?, ?, ?, 101, 202, 10, 'Canonical One',
+                   20, 'Canonical Two', ?, ?, ?, ?, 'main_event', ?, 5,
+                   ?, ?, ?, 'test', ?, ?, 'test-v1', 'manual_exact', NULL,
+                   'test', ?, ?, ?)""",
+        (
+            raybet_match_id,
+            map_number,
+            event_id,
+            identity_json,
+            identity_hash,
+            identity_json,
+            identity_hash,
+            available_at,
+            identity_json,
+            identity_hash,
+            available_at,
+            identity_json,
+            identity_hash,
+            available_at,
+            available_at,
+            available_at,
+        ),
+    )
+    return int(cursor.lastrowid)
 
 
 def test_visual_supervisor_cli_constructs_parser() -> None:
@@ -107,6 +172,8 @@ def _source_database(
     status: str = "2",
     updated_at: str = "2026-07-14T01:00:00+00:00",
 ) -> Path:
+    stored_raw = dict(raw)
+    stored_raw[PUBLIC_STREAM_EVIDENCE_KEY] = public_stream_evidence(STREAM_URL)
     database = tmp_path / "live.db"
     connection = sqlite3.connect(database)
     try:
@@ -136,7 +203,7 @@ def _source_database(
             (
                 "42",
                 STREAM_URL,
-                json.dumps(raw),
+                json.dumps(stored_raw),
                 3,
                 status,
                 updated_at,
@@ -148,6 +215,20 @@ def _source_database(
         connection.commit()
     finally:
         connection.close()
+    return database
+
+
+def _audited_source_database(tmp_path: Path, raw: dict) -> Path:
+    database = tmp_path / "audited-live.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, best_of, status, live_url, raw_json, updated_at)
+               VALUES ('42', 3, '2', ?, ?, '2026-07-14T01:00:00+00:00')""",
+            (STREAM_URL, json.dumps(raw)),
+        )
+        store.connection.commit()
     return database
 
 
@@ -209,7 +290,7 @@ def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
             {"score": {"manualControlData": {"currentIndex": 1}}},
         ]
     }
-    database = _source_database(tmp_path, raw, [])
+    database = _audited_source_database(tmp_path, raw)
     signed = "https://qplay.ehome.gg/live.m3u8?auth_key=EPHEMERAL_TOKEN"
     response = {
         "result": {
@@ -224,9 +305,9 @@ def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
     }
     with patch("scripts.watch_raybet_stream.RayBetClient") as client_type:
         client = client_type.return_value.__enter__.return_value
-        client.match_odds.return_value = response
+        client.match_odds_response.return_value = response
         assert match_source(database, "42", refresh_url=True) == (signed, 1)
-        client.match_odds.assert_called_once_with("42")
+        client.match_odds_response.assert_called_once_with("42")
 
     connection = sqlite3.connect(database)
     try:
@@ -237,6 +318,23 @@ def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(
         connection.close()
     assert stored[0] == STREAM_URL
     assert "EPHEMERAL_TOKEN" not in stored[1]
+
+
+def test_match_source_rejects_legacy_query_stripped_stream_without_provenance(
+    tmp_path: Path,
+) -> None:
+    database = _source_database(tmp_path, _raybet_payload(), [])
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE raybet_matches SET raw_json='{}' WHERE raybet_match_id='42'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="unsigned provenance is missing"):
+        match_source(database, "42")
 
 
 def test_match_source_uses_settled_maps_not_open_future_markets(
@@ -376,7 +474,7 @@ def test_stream_url_allowlist_applies_to_sqlite_and_explicit_sources(
 
 
 def test_stream_url_allowlist_applies_to_fresh_source(tmp_path: Path) -> None:
-    database = _source_database(tmp_path, {}, [])
+    database = _audited_source_database(tmp_path, {})
     response = {
         "result": {
             "id": 42,
@@ -386,10 +484,10 @@ def test_stream_url_allowlist_applies_to_fresh_source(tmp_path: Path) -> None:
     }
     with patch("scripts.watch_raybet_stream.RayBetClient") as client_type:
         client = client_type.return_value.__enter__.return_value
-        client.match_odds.return_value = response
+        client.match_odds_response.return_value = response
         with pytest.raises(ValueError, match="invalid fresh live URL"):
             match_source(database, "42", refresh_url=True)
-        client.match_odds.assert_called_once_with("42")
+        client.match_odds_response.assert_called_once_with("42")
 
 
 def test_supervisor_does_not_override_inferred_map_number(tmp_path: Path) -> None:
@@ -402,6 +500,70 @@ def test_supervisor_does_not_override_inferred_map_number(tmp_path: Path) -> Non
     assert "--map-number" not in command
     assert "--refresh-url" in command
     assert str(tmp_path / "observations" / "42.jsonl") in command
+    evidence_index = command.index("--evidence-dir")
+    assert command[evidence_index + 1] == str(tmp_path / "evidence")
+
+
+def _upsert_supervisor_match(
+    store: LiveBettingStore,
+    match_id: str,
+    *,
+    status: str,
+    updated_at: datetime,
+    game_id: int = 151,
+    live_url: str | None = None,
+) -> None:
+    row = {
+        "id": match_id,
+        "game_id": game_id,
+        "status": status,
+        "round": "bo3",
+        "team": [],
+    }
+    if live_url is not None:
+        row["live_url"] = live_url
+    store.upsert_raybet_match(
+        row,
+        updated_at,
+        public_live_url=live_url,
+    )
+
+
+def test_supervisor_probes_signed_only_live_match_without_browser_video(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live.db"
+    now = datetime(2026, 7, 15, 14, 2, tzinfo=timezone.utc)
+    signed_url = (
+        "https://qplay.ehome.gg/live/42.m3u8?auth_key=EPHEMERAL_TOKEN"
+    )
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        _upsert_supervisor_match(
+            store,
+            "42",
+            status="2",
+            updated_at=now - timedelta(seconds=10),
+            live_url=signed_url,
+        )
+        stored = store.connection.execute(
+            "SELECT live_url, raw_json FROM raybet_matches WHERE raybet_match_id='42'"
+        ).fetchone()
+
+    assert stored["live_url"] is None
+    assert "EPHEMERAL_TOKEN" not in stored["raw_json"]
+    assert active_match_evidence(database, now=now) == {
+        "42": "ephemeral_stream_refresh_probe"
+    }
+    assert startable_matches(
+        {"42"}, {}, {}, now=now
+    ) == ["42"]
+    assert "--refresh-url" in watcher_command(
+        database,
+        "42",
+        tmp_path / "observations",
+        tmp_path / "evidence",
+    )
 
 
 def test_supervisor_selects_only_fresh_live_provider_rows(tmp_path: Path) -> None:
@@ -410,21 +572,27 @@ def test_supervisor_selects_only_fresh_live_provider_rows(tmp_path: Path) -> Non
     with LiveBettingStore(database) as store:
         store.init_schema()
         rows = [
-            ("live", "2", now - timedelta(seconds=10), "https://stream/live.m3u8"),
-            ("prematch", "1", now - timedelta(seconds=10), "https://stream/pre.m3u8"),
-            ("stale", "2", now - timedelta(minutes=2), "https://stream/stale.m3u8"),
-            ("no-video", "2", now - timedelta(seconds=10), None),
+            ("live", "2", now - timedelta(seconds=10), 151, STREAM_URL),
+            ("prematch", "1", now - timedelta(seconds=10), 151, None),
+            ("stale", "2", now - timedelta(minutes=2), 151, None),
+            ("completed", "3", now - timedelta(seconds=10), 151, None),
+            ("wrong-game", "2", now - timedelta(seconds=10), 152, None),
+            ("future", "2", now + timedelta(seconds=1), 151, None),
         ]
-        for match_id, status, updated_at, live_url in rows:
-            store.connection.execute(
-                """INSERT INTO raybet_matches
-                   (raybet_match_id, status, live_url, raw_json, updated_at)
-                   VALUES (?, ?, ?, '{}', ?)""",
-                (match_id, status, live_url, updated_at.isoformat()),
+        for match_id, status, updated_at, game_id, live_url in rows:
+            _upsert_supervisor_match(
+                store,
+                match_id,
+                status=status,
+                updated_at=updated_at,
+                game_id=game_id,
+                live_url=live_url,
             )
-        store.connection.commit()
 
     assert active_matches(database, now=now) == ["live"]
+    assert active_match_evidence(database, now=now) == {
+        "live": "verified_public_stream"
+    }
 
 
 def test_watcher_stops_only_when_live_provider_row_is_stale_or_not_live(
@@ -513,28 +681,24 @@ def test_every_confirmed_observation_requires_persisted_frame_evidence() -> None
 def test_evidence_reference_is_returned_only_after_successful_write(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "frame.jpg"
     image = np.full((20, 30, 3), 127, dtype=np.uint8)
 
-    reference = _write_evidence_frame(path, image)
+    receipt = _write_evidence_frame(tmp_path, image)
 
-    assert reference == str(path.resolve())
-    assert path.stat().st_size > 0
+    assert receipt.frame_ref == f"vision-frame:sha256:{receipt.content_sha256}"
+    assert receipt.storage_path.name == f"{receipt.content_sha256}.jpg"
+    assert receipt.storage_path.stat().st_size == receipt.byte_length
 
 
 def test_failed_evidence_write_cannot_publish_a_frame_reference(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "frame.jpg"
-
-    def partial_write(temporary: str, *_: object) -> bool:
-        Path(temporary).write_bytes(b"partial")
-        return False
-
-    with patch("scripts.watch_raybet_stream.cv2.imwrite", side_effect=partial_write):
-        with pytest.raises(OSError, match="failed to write evidence frame"):
-            _write_evidence_frame(path, object())
-    assert not path.exists()
+    with patch(
+        "scripts.watch_raybet_stream.cv2.imencode",
+        return_value=(False, None),
+    ):
+        with pytest.raises(OSError, match="content-addressed evidence frame"):
+            _write_evidence_frame(tmp_path, object())
     assert list(tmp_path.iterdir()) == []
 
 
@@ -549,9 +713,13 @@ def test_vision_invalidation_is_audited_and_online_backed_up(
         store.init_schema()
         for captured_at, frame in ((first, "first.jpg"), (second, "second.jpg")):
             store.connection.execute(
-                """INSERT INTO vision_observations VALUES
-                   ('42', 1, ?, 1392, 0, '[1,2,3,4,5]',
-                    '[6,7,8,9,10]', NULL, 0.94, 0.96, ?, 'game', 1)""",
+                """INSERT INTO vision_observations
+                   (raybet_match_id, map_number, captured_at,
+                    game_clock_seconds, is_paused, radiant_hero_ids,
+                    dire_hero_ids, radiant_team_side, clock_confidence,
+                    draft_confidence, source_frame_ref, screen_state, confirmed)
+                   VALUES ('42', 1, ?, 1392, 0, '[1,2,3,4,5]',
+                           '[6,7,8,9,10]', NULL, 0.94, 0.96, ?, 'game', 1)""",
                 (captured_at, frame),
             )
         store.connection.commit()
@@ -656,6 +824,7 @@ def test_freeze_draft_map_uses_trusted_frame_and_preserves_anchor(
 ) -> None:
     database = tmp_path / "live.db"
     captured_at = datetime(2026, 7, 11, 17, 7, 38, tzinfo=timezone.utc)
+    receipt = publish_vision_frame_bytes(tmp_path / "evidence", b"trusted-frame")
     observation = VisionObservation(
         "42",
         1,
@@ -666,9 +835,12 @@ def test_freeze_draft_map_uses_trusted_frame_and_preserves_anchor(
         (6, 7, 8, 9, 10),
         0.94,
         0.96,
-        "trusted.jpg",
+        receipt.frame_ref,
         "game",
         "team_one",
+        source_frame_sha256=receipt.content_sha256,
+        source_frame_bytes=receipt.byte_length,
+        source_frame_path=str(receipt.storage_path),
     )
     with LiveBettingStore(database) as store:
         store.init_schema()
@@ -705,7 +877,8 @@ def test_freeze_draft_map_uses_trusted_frame_and_preserves_anchor(
             store.connection.execute(
                 """SELECT COUNT(*) FROM vision_draft_conflicts
                 WHERE raybet_match_id='42' AND map_number=1
-                  AND source_frame_ref='trusted.jpg'"""
+                  AND source_frame_ref=?""",
+                (receipt.frame_ref,),
             ).fetchone()[0]
             == 1
         )
@@ -735,6 +908,24 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
     ).hexdigest()[:32]
     with LiveBettingStore(database) as store:
         store.init_schema()
+        # Seed pre-v8 rows so this migration audit test can exercise causal
+        # invalidation without treating the legacy rows as current authority.
+        for trigger in (
+            "strategy_decision_draft_authority_insert",
+            "strategy_decision_vision_authority_insert",
+            "shadow_order_draft_authority_insert",
+            "shadow_order_vision_authority_insert",
+            "settlements_authority_insert_guard",
+            "settlement_reconciliation_authority_insert",
+        ):
+            store.connection.execute(f'DROP TRIGGER "{trigger}"')
+        strict_mapping_id = _insert_test_strict_mapping(
+            store,
+            raybet_match_id="42",
+            map_number=1,
+            event_id="event-42",
+            available_at=(before - timedelta(days=1)).isoformat(),
+        )
         for captured_at, frame in (
             (before.isoformat(), "before.jpg"),
             (invalid.isoformat(), "invalid.jpg"),
@@ -769,7 +960,9 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
                         {
                             "__inputs__": {
                                 "strict_live_eligibility": {
-                                    "mapping_refs": {"strict_mapping_id": 1}
+                                    "mapping_refs": {
+                                        "strict_mapping_id": strict_mapping_id
+                                    }
                                 }
                             }
                         },
@@ -786,12 +979,13 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
                 expires_at, signal_odds_group_id, signal_outcome_key,
                 signal_identity_verified, stake, status, fill_price, filled_at,
                 rejection_reason)
-               VALUES (?, '42', 1, 'odds-1',
+               VALUES (?, '42', ?, 'odds-1',
                        'winner|map_1|team_two|', ?, 0.5, 0.4, 3.0,
                        'transport-after', ?, ?, 'group-1', 'team_two',
                        1, 1.0, 'filled', 3.0, ?, NULL)""",
             (
                 order_key,
+                strict_mapping_id,
                 after.isoformat(),
                 after.isoformat(),
                 (after + timedelta(seconds=15)).isoformat(),
@@ -813,14 +1007,14 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
         )
         store.connection.execute(
             """INSERT INTO settlement_reconciliations
-               (raybet_match_id, map_number, dota_match_id,
+               (raybet_match_id, map_number, strict_mapping_id, dota_match_id,
                 raybet_winner_side, opendota_winner_side,
                 raybet_evidence_ref, opendota_evidence_ref, status, reason,
                 first_observed_at, updated_at)
-               VALUES ('42', 1, 4242, 'team_two', 'team_two',
+               VALUES ('42', 1, ?, 4242, 'team_two', 'team_two',
                        'raybet:42:1', 'opendota:4242', 'confirmed', 'matched',
                        ?, ?)""",
-            (after.isoformat(), after.isoformat()),
+            (strict_mapping_id, after.isoformat(), after.isoformat()),
         )
         store.connection.execute(
             """INSERT INTO notification_outbox
@@ -881,14 +1075,14 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
         ).fetchone()
         assert tuple(reconciliation) == (
             "manual_review",
-            "vision_observation_invalidated",
+            "legacy_source_authority_missing",
         )
         outbox = store.connection.execute(
             """SELECT status, last_error FROM notification_outbox
                 WHERE order_key=?""",
             (order_key,),
         ).fetchone()
-        assert tuple(outbox) == ("dead_letter", "vision_observation_invalidated")
+        assert tuple(outbox) == ("dead_letter", "decision_lineage_unavailable")
         blocked = SimpleNamespace(
             decision_key="decision-new-blocked",
             raybet_match_id="42",
@@ -925,16 +1119,18 @@ def test_vision_invalidation_propagates_to_post_frame_lineage(
                 "decided_at": after + timedelta(seconds=2),
             }
         )
-        assert store.insert_decision(replacement)
+        # A path-only replacement cannot restore v8 eligible authority.
+        assert not store.insert_decision(replacement)
 
 
 class FakeProcess:
-    def __init__(self) -> None:
+    def __init__(self, exit_code: int = 0) -> None:
         self.running = True
         self.terminated = False
+        self.exit_code = exit_code
 
     def poll(self) -> int | None:
-        return None if self.running else 0
+        return None if self.running else self.exit_code
 
     def terminate(self) -> None:
         self.terminated = True
@@ -1027,6 +1223,83 @@ def test_supervisor_terminates_watchers_that_are_no_longer_active() -> None:
     assert process.terminated
     assert stdout.closed and stderr.closed
     assert children == {}
+
+
+def test_source_refresh_failure_has_bounded_retry_and_visible_health(
+    tmp_path: Path,
+) -> None:
+    failed_at = datetime(2026, 7, 15, 14, 2, tzinfo=timezone.utc)
+    process = FakeProcess(exit_code=2)
+    process.running = False
+    children = {"42": (process, StringIO(), StringIO())}
+
+    assert reap_children(children, {"42"}) == {"42": 2}
+    assert children == {}
+
+    retry = watcher_retry_after_failure(
+        None,
+        exit_code=2,
+        produced_output=False,
+        failed_at=failed_at,
+    )
+    status, details, error = supervisor_health(
+        {"42"},
+        {},
+        tmp_path,
+        retry_states={"42": retry},
+        now=failed_at,
+    )
+    assert status == "degraded"
+    assert error == "watcher startup retry scheduled: 42"
+    assert details["reason"] == "watcher_retry_scheduled"
+    watcher = details["watchers"]["42"]
+    assert watcher["reason"] == "source_refresh_failed_retry_scheduled"
+    assert watcher["retry"]["last_exit_code"] == 2
+    assert watcher["retry"]["attempts"] == 1
+    assert startable_matches(
+        {"42"}, {}, {"42": retry}, now=failed_at
+    ) == []
+
+    for attempt in range(2, WATCHER_MAX_START_FAILURES + 1):
+        assert retry.retry_at is not None
+        retry = watcher_retry_after_failure(
+            retry,
+            exit_code=2,
+            produced_output=False,
+            failed_at=retry.retry_at,
+        )
+        assert retry.attempts == attempt
+
+    assert retry.exhausted
+    assert retry.retry_at is None
+    assert startable_matches(
+        {"42"}, {}, {"42": retry}, now=failed_at + timedelta(hours=1)
+    ) == []
+    status, details, error = supervisor_health(
+        {"42"},
+        {},
+        tmp_path,
+        retry_states={"42": retry},
+        now=failed_at + timedelta(hours=1),
+    )
+    assert status == "unhealthy"
+    assert error == "watcher retry exhausted: 42"
+    assert details["retry_exhausted_match_ids"] == ["42"]
+    assert details["watchers"]["42"]["retry"]["exhausted"] is True
+
+
+def test_supervisor_never_exceeds_global_watcher_limit() -> None:
+    now = datetime(2026, 7, 15, 14, 2, tzinfo=timezone.utc)
+    active = {str(match_id) for match_id in range(10)}
+
+    selected = startable_matches(active, {}, {}, now=now)
+
+    assert len(selected) == MAX_CONCURRENT_WATCHERS
+    children = {
+        match_id: (FakeProcess(), StringIO(), StringIO())
+        for match_id in selected
+    }
+    assert startable_matches(active, children, {}, now=now) == []
 
 
 def test_observation_defaults_are_anchored_in_predictor() -> None:

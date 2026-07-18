@@ -488,9 +488,16 @@ class StrictLiveEligibility:
         return self.mapping_refs
 
 
-def init_strict_live_eligibility_schema(connection: sqlite3.Connection) -> None:
+def init_strict_live_eligibility_schema(
+    connection: sqlite3.Connection,
+    *,
+    external_transaction: bool = False,
+) -> None:
     """Install the additive schema without modifying existing accepted rows."""
-    _migrate_exact_mapping_tables(connection)
+    _migrate_exact_mapping_tables(
+        connection,
+        external_transaction=external_transaction,
+    )
     with _write_transaction(connection):
         for statement in _TABLE_STATEMENTS:
             connection.execute(statement)
@@ -518,31 +525,21 @@ def init_strict_live_eligibility_schema(connection: sqlite3.Connection) -> None:
             connection.execute(statement)
 
 
-def _migrate_exact_mapping_tables(connection: sqlite3.Connection) -> None:
+def _migrate_exact_mapping_tables(
+    connection: sqlite3.Connection,
+    *,
+    external_transaction: bool = False,
+) -> None:
     """Rebuild the two v3 CHECK/UNIQUE constrained tables without changing rows."""
-    mapping_sql_row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='strict_live_map_mappings'"
-    ).fetchone()
-    if mapping_sql_row is None:
+    if not strict_live_mapping_schema_requires_rebuild(connection):
         return
-    mapping_sql = str(mapping_sql_row[0] or "")
-    if (
-        "automatic_exact" in mapping_sql
-        and "UNIQUE (raybet_match_id, map_number)" not in mapping_sql
-    ):
-        return
-    if connection.in_transaction:
-        raise StrictMappingError(
-            "strict_mapping_schema_migration_requires_clean_transaction"
-        )
-
     audit_exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strict_live_map_mapping_audit'"
     ).fetchone() is not None
-    foreign_keys = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
-    connection.execute("PRAGMA foreign_keys=OFF")
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+    with _exact_mapping_rebuild_transaction(
+        connection,
+        external_transaction=external_transaction,
+    ):
         for trigger in (
             "strict_live_map_mappings_no_update",
             "strict_live_map_mappings_no_delete",
@@ -605,10 +602,57 @@ def _migrate_exact_mapping_tables(connection: sqlite3.Connection) -> None:
                 "ALTER TABLE strict_live_map_mapping_audit_v4 "
                 "RENAME TO strict_live_map_mapping_audit"
             )
-        connection.commit()
-    except Exception:
+
+
+def strict_live_mapping_schema_requires_rebuild(
+    connection: sqlite3.Connection,
+) -> bool:
+    """Return whether the pre-v4 exact-mapping tables need an FK-off rebuild."""
+
+    mapping_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='strict_live_map_mappings'"
+    ).fetchone()
+    if mapping_sql_row is None:
+        return False
+    mapping_sql = str(mapping_sql_row[0] or "")
+    return not (
+        "automatic_exact" in mapping_sql
+        and "UNIQUE (raybet_match_id, map_number)" not in mapping_sql
+    )
+
+
+@contextmanager
+def _exact_mapping_rebuild_transaction(
+    connection: sqlite3.Connection,
+    *,
+    external_transaction: bool,
+) -> Iterator[None]:
+    if external_transaction:
+        if not connection.in_transaction:
+            raise StrictMappingError(
+                "strict_mapping_schema_migration_requires_external_transaction"
+            )
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+            raise StrictMappingError(
+                "strict_mapping_schema_migration_requires_foreign_keys_off"
+            )
+        yield
+        return
+
+    if connection.in_transaction:
+        raise StrictMappingError(
+            "strict_mapping_schema_migration_requires_clean_transaction"
+        )
+    foreign_keys = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        yield
+    except BaseException:
         connection.rollback()
         raise
+    else:
+        connection.commit()
     finally:
         connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
 
@@ -1224,6 +1268,153 @@ def query_strict_live_eligibility(
 
 
 check_strict_live_eligibility = query_strict_live_eligibility
+
+
+def query_strict_mapping_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    mapping_id: int,
+    observed_at: datetime,
+) -> StrictLiveEligibility:
+    """Verify immutable mapping authority at a historical observation cutoff."""
+
+    if type(mapping_id) is not int or mapping_id <= 0:
+        return _ineligible("invalid_mapping_id", "", 0, None)
+    try:
+        cutoff = _aware_utc(observed_at, "observed_at")
+    except StrictMappingError:
+        return _ineligible("invalid_transport_time", "", 0, None)
+    try:
+        row = _mapping_row_by_id(connection, mapping_id)
+    except sqlite3.OperationalError:
+        return _ineligible("strict_mapping_schema_missing", "", 0, cutoff)
+    if row is None:
+        return _ineligible("accepted_mapping_missing", "", 0, cutoff)
+    try:
+        mapping = _mapping_from_row(row)
+    except _FailClosed as failure:
+        return _ineligible(failure.reason, "", 0, cutoff)
+
+    causal_reason = _mapping_causal_reason(mapping, cutoff)
+    if causal_reason is not None:
+        return _ineligible(
+            causal_reason,
+            mapping.raybet_match_id,
+            mapping.map_number,
+            cutoff,
+            mapping,
+        )
+    if not (
+        mapping.raybet_metadata_updated_at <= mapping.recorded_at
+        and mapping.accepted_at <= mapping.recorded_at
+        and mapping.map_number <= mapping.raybet_best_of
+    ):
+        return _ineligible(
+            "mapping_causal_order_invalid",
+            mapping.raybet_match_id,
+            mapping.map_number,
+            cutoff,
+            mapping,
+        )
+
+    snapshots = (
+        (
+            mapping.raybet_identity_json,
+            mapping.raybet_identity_hash,
+            "mapping_identity_hash_invalid",
+        ),
+        (
+            mapping.canonical_identity_json,
+            mapping.canonical_identity_hash,
+            "canonical_identity_hash_invalid",
+        ),
+        (
+            mapping.crosswalk_evidence_json,
+            mapping.crosswalk_evidence_hash,
+            "crosswalk_evidence_hash_invalid",
+        ),
+        (
+            mapping.evidence_json,
+            mapping.evidence_hash,
+            "mapping_evidence_hash_invalid",
+        ),
+    )
+    for payload, expected_hash, reason in snapshots:
+        if hashlib.sha256(payload.encode("utf-8")).hexdigest() != expected_hash:
+            return _ineligible(
+                reason,
+                mapping.raybet_match_id,
+                mapping.map_number,
+                cutoff,
+                mapping,
+            )
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            decoded = None
+        if not isinstance(decoded, dict):
+            return _ineligible(
+                "mapping_identity_snapshot_invalid",
+                mapping.raybet_match_id,
+                mapping.map_number,
+                cutoff,
+                mapping,
+            )
+
+    try:
+        invalidation = connection.execute(
+            """SELECT invalidated_at
+                 FROM strict_live_map_mapping_invalidations
+                WHERE mapping_id=?""",
+            (mapping_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return _ineligible(
+            "strict_mapping_schema_missing",
+            mapping.raybet_match_id,
+            mapping.map_number,
+            cutoff,
+            mapping,
+        )
+    if invalidation is not None:
+        try:
+            invalidated_at = _parse_timestamp(str(_value(invalidation, 0, "invalidated_at")))
+        except (TypeError, ValueError):
+            return _ineligible(
+                "mapping_invalidation_time_invalid",
+                mapping.raybet_match_id,
+                mapping.map_number,
+                cutoff,
+                mapping,
+            )
+        if invalidated_at <= cutoff:
+            return _ineligible(
+                "mapping_invalidated",
+                mapping.raybet_match_id,
+                mapping.map_number,
+                cutoff,
+                mapping,
+            )
+
+    approval_reason = _historical_automatic_mapping_approval_reason(
+        connection, mapping, cutoff
+    )
+    if approval_reason is not None:
+        return _ineligible(
+            approval_reason,
+            mapping.raybet_match_id,
+            mapping.map_number,
+            cutoff,
+            mapping,
+        )
+    return StrictLiveEligibility(
+        True,
+        "historical_mapping_snapshot_verified",
+        mapping.raybet_match_id,
+        mapping.map_number,
+        cutoff,
+        mapping,
+    )
 
 
 def _read_raybet_identity(
@@ -1877,6 +2068,75 @@ def _automatic_mapping_approval_reason(
     )
 
 
+def _historical_automatic_mapping_approval_reason(
+    connection: sqlite3.Connection,
+    mapping: StrictLiveMapMapping,
+    transport_at: datetime,
+) -> str | None:
+    if mapping.acceptance_mode == "manual_exact":
+        return None if mapping.automatic_approval_id is None else "manual_mapping_has_automatic_approval"
+    if mapping.acceptance_mode != "automatic_exact":
+        return "mapping_acceptance_mode_invalid"
+    if mapping.automatic_approval_id is None:
+        return "automatic_exact_approval_missing"
+    try:
+        row = connection.execute(
+            """SELECT approval.raybet_match_id, approval.event_id,
+                      approval.team_one_id, approval.team_two_id,
+                      approval.canonical_team_one_id,
+                      approval.canonical_team_two_id,
+                      approval.raybet_identity_hash,
+                      approval.canonical_identity_hash,
+                      approval.crosswalk_evidence_hash, approval.evidence_hash,
+                      approval.approved_at, approval.recorded_at,
+                      invalidation.invalidated_at, source.accepted_at,
+                      source.recorded_at, source.raybet_metadata_updated_at
+                 FROM strict_live_automatic_evidence_approvals AS approval
+                 JOIN strict_live_map_mappings AS source
+                   ON source.mapping_id=approval.source_mapping_id
+                 LEFT JOIN strict_live_map_mapping_invalidations AS invalidation
+                   ON invalidation.mapping_id=source.mapping_id
+                WHERE approval.approval_id=?
+                  AND source.acceptance_mode='manual_exact'""",
+            (mapping.automatic_approval_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return "strict_mapping_schema_missing"
+    if row is None:
+        return "automatic_exact_approval_missing"
+    expected = (
+        mapping.raybet_match_id,
+        mapping.event_id,
+        mapping.team_one_id,
+        mapping.team_two_id,
+        mapping.canonical_team_one_id,
+        mapping.canonical_team_two_id,
+        mapping.raybet_identity_hash,
+        mapping.canonical_identity_hash,
+        mapping.crosswalk_evidence_hash,
+        mapping.evidence_hash,
+    )
+    if tuple(row[:10]) != expected:
+        return "automatic_exact_approval_mismatch"
+    if row[12] is not None:
+        try:
+            invalidated_at = _parse_timestamp(str(row[12]))
+        except (TypeError, ValueError):
+            return "automatic_exact_approval_causal_order_invalid"
+        if invalidated_at <= transport_at:
+            return "automatic_exact_approval_invalidated"
+    return _automatic_approval_causal_reason(
+        approval_approved_at=row[10],
+        approval_recorded_at=row[11],
+        source_accepted_at=row[13],
+        source_recorded_at=row[14],
+        source_metadata_updated_at=row[15],
+        mapping_accepted_at=mapping.accepted_at,
+        mapping_recorded_at=mapping.recorded_at,
+        transport_at=transport_at,
+    )
+
+
 def _automatic_approval_causal_reason(
     *,
     approval_approved_at: object,
@@ -2488,4 +2748,5 @@ __all__ = [
     "init_strict_live_eligibility_schema",
     "query_strict_live_eligibility",
     "record_strict_live_mapping_candidate",
+    "strict_live_mapping_schema_requires_rebuild",
 ]

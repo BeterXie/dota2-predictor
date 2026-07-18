@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,18 +22,15 @@ _ALLOWED_QUERY_NAMES = {
     "league_id",
     "limit",
     "match_id",
+    "match_type",
     "offset",
     "page",
     "start_date",
 }
 
 
-def canonical_json_bytes(value: Any) -> bytes:
-    """Return deterministic UTF-8 JSON bytes without changing JSON values."""
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        value = json.loads(bytes(value).decode("utf-8"))
-    elif isinstance(value, str):
-        value = json.loads(value)
+def canonical_json_value_bytes(value: Any) -> bytes:
+    """Serialize one already-parsed JSON value without reparsing strings."""
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -40,6 +38,15 @@ def canonical_json_bytes(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Canonicalize a serialized JSON document or an in-memory JSON value."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = json.loads(bytes(value).decode("utf-8"))
+    elif isinstance(value, str):
+        value = json.loads(value)
+    return canonical_json_value_bytes(value)
 
 
 def _schema_shape(value: Any) -> Any:
@@ -74,6 +81,40 @@ def schema_fingerprint(value: Any) -> str:
     """Hash field names and JSON types while ignoring source values."""
     shape = _shape_json(_schema_shape(value)).encode("utf-8")
     return hashlib.sha256(shape).hexdigest()
+
+
+def verify_raw_artifact_file(
+    path: str | Path,
+    *,
+    content_hash: str,
+    uncompressed_bytes: int | None = None,
+    compressed_bytes: int | None = None,
+    expected_schema_fingerprint: str | None = None,
+) -> None:
+    """Recompute the complete authority of one canonical gzip artifact."""
+
+    artifact = Path(path)
+    if artifact.is_symlink() or not artifact.is_file():
+        raise RuntimeError(f"raw artifact is missing or unsafe: {artifact}")
+    compressed = artifact.read_bytes()
+    if compressed_bytes is not None and len(compressed) != compressed_bytes:
+        raise RuntimeError(f"raw artifact compressed size mismatch: {artifact}")
+    try:
+        canonical = gzip.decompress(compressed)
+        payload = json.loads(canonical.decode("utf-8"))
+    except (OSError, EOFError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"corrupt raw artifact: {artifact}") from exc
+    if uncompressed_bytes is not None and len(canonical) != uncompressed_bytes:
+        raise RuntimeError(f"raw artifact byte count mismatch: {artifact}")
+    if hashlib.sha256(canonical).hexdigest() != content_hash:
+        raise RuntimeError(f"raw artifact hash mismatch: {artifact}")
+    if canonical_json_value_bytes(payload) != canonical:
+        raise RuntimeError(f"raw artifact is not canonical JSON: {artifact}")
+    if (
+        expected_schema_fingerprint is not None
+        and schema_fingerprint(payload) != expected_schema_fingerprint
+    ):
+        raise RuntimeError(f"raw artifact schema fingerprint mismatch: {artifact}")
 
 
 def sanitize_request_identity(identity: str) -> str:
@@ -149,6 +190,7 @@ class RawArchive:
         self.root = Path(root).resolve()
         self._observation_sink = observation_sink
         self._known_paths: dict[tuple[str, str], Path] = {}
+        self._legacy_index: dict[tuple[str, str], Path] | None = None
 
     def archive_json(
         self,
@@ -235,53 +277,61 @@ class RawArchive:
         canonical: bytes,
     ) -> tuple[Path, bool]:
         cache_key = (source, content_hash)
+        target = self.root / source / content_hash[:2] / f"{content_hash}.json.gz"
         existing = self._known_paths.get(cache_key)
-        if existing is None:
-            source_root = self.root / source
-            if source_root.exists():
-                existing = next(source_root.rglob(f"{content_hash}.json.gz"), None)
+        if existing is None and target.is_file():
+            existing = target
+        if existing is None and source != "raybet":
+            if self._legacy_index is None:
+                self._legacy_index = {}
+                source_root = self.root / source
+                if source_root.exists():
+                    for candidate in source_root.rglob("*.json.gz"):
+                        self._legacy_index.setdefault(
+                            (source, candidate.name.removesuffix(".json.gz")),
+                            candidate,
+                        )
+            existing = self._legacy_index.get(cache_key)
         if existing is not None:
             self._verify(existing, content_hash)
             self._known_paths[cache_key] = existing
             return existing, False
 
-        match_segment = f"match-{match_id}" if match_id is not None else "collection"
-        target = (
-            self.root
-            / source
-            / observed_at.strftime("%Y-%m-%d")
-            / match_segment
-            / f"{content_hash}.json.gz"
-        )
+        # New artifacts use a hash-sharded path so a hot collector never has
+        # to scan an ever-growing date/match tree. Legacy paths remain
+        # discoverable above for read compatibility.
         target.parent.mkdir(parents=True, exist_ok=True)
         compressed = gzip.compress(canonical, mtime=0)
         created = False
+        temporary_path: Path | None = None
         try:
-            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        except FileExistsError:
-            self._verify(target, content_hash)
-        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{content_hash}.", suffix=".tmp", dir=target.parent
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(compressed)
+                handle.flush()
+                os.fsync(handle.fileno())
             try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(compressed)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                os.link(temporary_path, target)
+            except FileExistsError:
+                self._verify(target, content_hash)
+            else:
                 created = True
-            except BaseException:
-                target.unlink(missing_ok=True)
-                raise
+        except BaseException:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         self._known_paths[cache_key] = target
         return target, created
 
     @staticmethod
     def _verify(path: Path, expected_hash: str) -> None:
-        try:
-            content = gzip.decompress(path.read_bytes())
-        except (OSError, EOFError) as exc:
-            raise RuntimeError(f"corrupt raw artifact: {path}") from exc
-        actual_hash = hashlib.sha256(content).hexdigest()
-        if actual_hash != expected_hash:
-            raise RuntimeError(f"raw artifact hash mismatch: {path}")
+        verify_raw_artifact_file(path, content_hash=expected_hash)
 
     @staticmethod
     def _observation_id(

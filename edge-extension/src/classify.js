@@ -142,8 +142,9 @@ function publicVideoUrl(value) {
   if (typeof value !== "string" || value.length === 0) return null;
   try {
     const url = new URL(value, "https://www.ray086.com/");
-    if (!['https:', 'wss:'].includes(url.protocol) || !RAYBET_HOSTS.includes(url.hostname)
-        || (url.port && url.port !== "443") || url.username || url.password) return null;
+    if (url.protocol !== "https:" || !RAYBET_HOSTS.includes(url.hostname)
+        || (url.port && url.port !== "443") || url.username || url.password
+        || url.search || url.hash) return null;
     return `${url.origin}${url.pathname}`;
   } catch {
     return null;

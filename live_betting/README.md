@@ -30,7 +30,7 @@ Continuous collection with the production-safe polling intervals:
 
 ```powershell
 python -m live_betting.monitor --database data/dota2.db `
-  --raw-dir data/live_betting/raw --interval 6 --list-interval 30
+  --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30
 ```
 
 Run tests:
@@ -39,8 +39,15 @@ Run tests:
 python -m pytest -q
 ```
 
-Raw snapshots are written under `data/live_betting/raw/`; normalized rows use
-the existing `data/dota2.db` database.
+Content-addressed raw responses are written under `data/live_betting/raw-v2/`;
+normalized rows and raw-artifact references use the existing `data/dota2.db`
+database. Treat the database and this registered raw tree as one dataset.
+
+All visual watchers share `data/live_betting/live_evidence/` as one
+content-addressed evidence root. Frames are published as
+`sha256/<prefix>/<sha256>.jpg`; JSONL observations bind the stable frame ref,
+SHA-256, byte length, and physical path. Treat this registered tree and the
+database as one dataset as well. Do not move registered frames by hand.
 
 Start one visual watcher for every active RayBet match that exposes an HLS
 stream. Observations, evidence frames, and watcher logs stay under the project
@@ -133,11 +140,23 @@ takes a full online backup:
 python scripts/run_dota_shadow_service.py --migrate --once --database data/dota2.db
 ```
 
-Routine verification and restarts use a read-only schema preflight:
+The current protocol target is live schema `v8` and intelligence schema `v9`.
+The live migration does not invent hashes for legacy visual evidence: a frame
+without its registered SHA-256 and byte length remains audit-only and cannot
+authorize a decision, order, notification, report score, or settlement.
+
+Use the dedicated read-only command for routine schema, contract, and artifact
+verification:
 
 ```powershell
-python scripts/run_dota_shadow_service.py --once --database data/dota2.db
+python scripts/database_cutover.py verify-prepared `
+  --database data/dota2.db `
+  --odds-raw-root data/live_betting/raw-v2
 ```
+
+The verifier opens SQLite with `mode=ro`, enables `query_only`, and never writes
+`service_health`. The supervisor's `--once` mode runs one health/report cycle and
+does write operational state; it is not a read-only verification command.
 
 To run the complete passive shadow pipeline:
 
@@ -152,6 +171,123 @@ python scripts/run_dota_shadow_service.py --database data/dota2.db `
 builds or loads frozen model/calibration artifacts outside the 3-second shadow
 loop. Failed or reconstructed calibration gates still publish immutable
 research evidence, but can never authorize a shadow order.
+
+## Database Migration, Compaction, And Bundles
+
+Stop Web and every worker before an offline cutover. Run the explicit schema
+phase once; it takes one verified online database snapshot only when migration
+or repair is required. Set the following variables to new directories on a
+volume with enough free space. Do not run this command repeatedly as a backup
+loop. Keep all processes stopped after this point, including workers previously
+started outside the supervisor:
+
+```powershell
+$backupDir = "X:\dota2-migration-backups"
+$compactionDir = "X:\dota2-compaction"
+$bundleDir = "X:\dota2-compacted-bundle"
+$restoreDir = "X:\dota2-restored"
+
+python scripts/run_dota_shadow_service.py --migrate --once `
+  --database data/dota2.db --backup-dir $backupDir
+```
+
+`--migrate --once` is a write phase. After it exits, use the formal checkpoint
+command. It acquires the same service lock as the supervisor, uses a non-blocking
+`wal_checkpoint(TRUNCATE)`, prints the `busy`, `log`, and `checkpoint` triplet,
+and exits successfully only for `(0, 0, 0)` with `wal_bytes=0`. A held service
+lock, an active SQLite writer, or a non-empty WAL fails closed:
+
+```powershell
+python scripts/database_cutover.py checkpoint --database data/dota2.db
+
+python scripts/database_cutover.py verify-prepared `
+  --database data/dota2.db `
+  --odds-raw-root data/live_betting/raw-v2
+```
+
+The service lock covers supervisor-managed writers. SQLite cannot identify a
+different process that merely has an idle writable connection, so stopping Web
+and every standalone worker remains a mandatory operator gate. Do not restart
+anything between checkpoint and publication.
+
+Keep the migration backup and any existing `data/live_betting/raw-v2` tree
+unchanged. If `raw-v2` is absent, the verifier and compactor accept that absence
+only when the database proves `odds_raw_artifacts` has zero registered rows. A
+registered reference without its exact gzip fails; never create replacement or
+placeholder artifact files.
+
+Check free space on the destination volume before each phase. Let `L` be
+`page_count * page_size` for the prepared source, `R` the registered compressed
+raw bytes, `C` the compacted database bytes, `A` all bundle artifact bytes, and
+`M = 512 MiB`. The code enforces these free-space floors in order:
+
+1. Migration snapshot: at least `L` additional bytes in `$backupDir`.
+2. Fresh compaction: at least `3L + R + M` free in `$compactionDir`'s volume.
+3. Bundle creation: at least `C + A + M` free in `$bundleDir`'s volume.
+4. Restore: at least `C + A + M` free in `$restoreDir`'s volume.
+
+When every new output is retained on D:, a deliberately conservative initial
+budget is `L + (3L + R + M) + (C + A + M) + (C + A + M)` additional free bytes,
+excluding files already present on D:. Recalculate `C` and `A` from compaction
+and bundle output before proceeding; do not rely only on the estimate.
+
+The compactor rejects a source with a non-empty WAL and never modifies the
+source database or source raw tree. Its destination must be a new directory:
+
+```powershell
+python scripts/compact_legacy_odds.py `
+  --database data/dota2.db `
+  --raw-root data/live_betting/raw-v2 `
+  --destination-root $compactionDir
+```
+
+The result is `$compactionDir/dota2-compacted.db` paired with
+`$compactionDir/live_betting/raw-v2`. A failed, target-matched checkpoint
+resumes only with `--resume`; never point the destination at the production
+directory.
+
+Create and verify a self-contained publication bundle from that compacted pair.
+The bundle destination must not already exist. Add one `--allow-source-root`
+for each audited `raw_source_artifacts` root outside the database directory:
+
+```powershell
+python scripts/database_bundle.py create `
+  --database (Join-Path $compactionDir "dota2-compacted.db") `
+  --odds-raw-root (Join-Path $compactionDir "live_betting/raw-v2") `
+  --bundle $bundleDir
+
+python scripts/database_bundle.py verify --bundle $bundleDir
+
+python scripts/database_bundle.py restore `
+  --bundle $bundleDir `
+  --destination $restoreDir `
+  --database-name dota2.db
+
+python scripts/database_cutover.py verify-prepared `
+  --database (Join-Path $restoreDir "dota2.db") `
+  --odds-raw-root (Join-Path $restoreDir "live_betting/raw-v2")
+```
+
+The bundle contains only artifacts registered by its database snapshot:
+RayBet raw responses, completed-match source artifacts, and active visual
+frames. Creation and verification recompute every artifact identity and reject
+links, hardlinks, missing files, or byte mismatches. `restore` also requires a
+new destination, restores visual frames under the shared
+`live_betting/live_evidence` content-addressed root, appends audited relocation
+records, and verifies every manifest byte. The final command above is the
+read-only schema and artifact-authority preflight. Start Web against that exact
+candidate through the single database authority:
+
+```powershell
+python -m web.main --database (Join-Path $restoreDir "dota2.db")
+```
+
+Web resolves database paths by the documented priority `--database`, then
+`DATABASE_PATH`, then `web/config.yaml`, then the project default. Query and
+prediction paths both consume the resolved `web.queries.DB_PATH`. Retain the
+original database, its migration snapshot, and its raw tree until the restored
+service passes integrity, schema, artifact-authority, and application smoke
+checks.
 
 The supervisor takes its single-instance lock and verifies exact schema versions,
 required tables, and migration-critical columns before starting workers. Routine

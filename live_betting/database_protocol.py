@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
+from event_intelligence.backtest import (
+    draft_lineage_tracking_is_current,
+    ensure_draft_lineage_tracking,
+)
 from event_intelligence.storage import (
     CURRENT_SCHEMA_VERSION as INTELLIGENCE_SCHEMA_VERSION,
     IntelligenceStorage,
@@ -18,7 +22,10 @@ from fetch.db import Database
 from shared.sqlite import connect
 
 from .storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
-from .storage import LiveBettingStore
+from .storage import LiveBettingStore, init_draft_authority_revision_schema
+from .odds_response_verifier import verify_odds_response_authority
+from .strict_eligibility import strict_live_mapping_schema_requires_rebuild
+from .vision_frame_registry import verify_vision_frame_registry
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,22 @@ class DatabasePreparation:
     backup: Path | None
     live_schema_version: int
     intelligence_schema_version: int
+
+
+@dataclass(frozen=True)
+class WalCheckpointResult:
+    database: Path
+    busy: int
+    log: int
+    checkpoint: int
+    wal_bytes: int
+
+    @property
+    def safe(self) -> bool:
+        return (
+            (self.busy, self.log, self.checkpoint) == (0, 0, 0)
+            and self.wal_bytes == 0
+        )
 
 
 @dataclass(frozen=True)
@@ -71,6 +94,7 @@ _NULLABLE_MIGRATION_COLUMNS = frozenset(
         ("strict_derived_status", "benchmark_version"),
         ("strict_derived_status", "normalizer_version"),
         ("strict_derived_status", "profile_context_hash"),
+        ("prospective_draft_outcomes", "first_usable_at"),
     }
 )
 _DEFAULT_MIGRATION_COLUMNS = {
@@ -99,13 +123,26 @@ def _schema_version(
     return version
 
 
+def _connect_query_only(database: Path) -> sqlite3.Connection:
+    connection = connect(database, read_only=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            raise RuntimeError("SQLite query_only mode could not be enabled")
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
 def check_schema_versions(database: Path) -> tuple[int, int]:
     """Reject a future database before any migration or backup mutation."""
 
     database = database.resolve()
     if not database.exists() or database.stat().st_size == 0:
         return 0, 0
-    connection = connect(database, read_only=True)
+    connection = _connect_query_only(database)
     try:
         live = _schema_version(connection, "live_schema_version", LIVE_SCHEMA_VERSION)
         intelligence = _schema_version(
@@ -116,6 +153,39 @@ def check_schema_versions(database: Path) -> tuple[int, int]:
         return live, intelligence
     finally:
         connection.close()
+
+
+def truncate_wal_checkpoint(database: Path) -> WalCheckpointResult:
+    """Run a non-blocking WAL TRUNCATE checkpoint on an existing database."""
+
+    database = database.resolve()
+    if not database.is_file():
+        raise FileNotFoundError(f"database does not exist: {database}")
+    connection = sqlite3.connect(
+        f"{database.as_uri()}?mode=rw",
+        uri=True,
+        isolation_level=None,
+        timeout=0,
+    )
+    try:
+        connection.execute("PRAGMA busy_timeout=0")
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    finally:
+        connection.close()
+    if row is None or len(row) != 3:
+        raise RuntimeError("SQLite did not return a WAL checkpoint triplet")
+    result = WalCheckpointResult(
+        database=database,
+        busy=int(row[0]),
+        log=int(row[1]),
+        checkpoint=int(row[2]),
+        wal_bytes=(
+            Path(f"{database}-wal").stat().st_size
+            if Path(f"{database}-wal").exists()
+            else 0
+        ),
+    )
+    return result
 
 
 def _sql_tokens(value: object) -> tuple[str, ...]:
@@ -294,6 +364,9 @@ def _expected_schema_contract() -> _SchemaContract:
         with IntelligenceStorage(database, connection=connection) as intelligence:
             intelligence.init_schema(seed_events=False)
             Database(connection=intelligence.connection).init_db()
+        init_draft_authority_revision_schema(connection)
+        ensure_draft_lineage_tracking(connection)
+        connection.commit()
         return _schema_contract(connection)
     finally:
         connection.close()
@@ -355,7 +428,12 @@ def _schema_contract_errors(
     return errors
 
 
-def verify_prepared_database(database: Path) -> DatabasePreparation:
+def verify_prepared_database(
+    database: Path,
+    *,
+    odds_raw_root: str | Path | None = None,
+    verify_vision_frames: bool = True,
+) -> DatabasePreparation:
     """Verify a current service schema without taking a backup or mutating it."""
 
     database = database.resolve()
@@ -370,12 +448,34 @@ def verify_prepared_database(database: Path) -> DatabasePreparation:
             f"intelligence={intelligence_version}/{INTELLIGENCE_SCHEMA_VERSION}; "
             "run the supervisor with --migrate"
         )
-    connection = connect(database, read_only=True)
+    connection = _connect_query_only(database)
     try:
         errors = _schema_contract_errors(
             _expected_schema_contract(),
             _schema_contract(connection),
         )
+        if not draft_lineage_tracking_is_current(connection):
+            errors.append("draft lineage tracking is not current")
+        if not errors:
+            try:
+                verify_odds_response_authority(
+                    connection,
+                    (
+                        Path(odds_raw_root).resolve()
+                        if odds_raw_root is not None
+                        else database.parent / "live_betting" / "raw-v2"
+                    ),
+                )
+            except RuntimeError as error:
+                errors.append(f"odds response authority failed: {error}")
+        if not errors:
+            try:
+                verify_vision_frame_registry(
+                    connection,
+                    require_active_files=verify_vision_frames,
+                )
+            except RuntimeError as error:
+                errors.append(f"vision frame authority failed: {error}")
         if errors:
             visible = errors[:20]
             suffix = f"; plus {len(errors) - 20} more" if len(errors) > 20 else ""
@@ -519,12 +619,29 @@ def prepare_database(
     backup_dir: Path,
     *,
     now: datetime | None = None,
+    supervisor_process_lock_held: bool = False,
+    odds_raw_root: str | Path | None = None,
 ) -> DatabasePreparation:
-    """Check versions, snapshot existing data, then run additive migrations."""
+    """Return current data read-only, or back it up before migration/repair.
+
+    The fast path is valid only while the supervisor's process-wide lock is
+    held from this call until child writers are started. Callers without that
+    external serialization retain the conservative exclusive migration path.
+    """
 
     database = database.resolve()
     database.parent.mkdir(parents=True, exist_ok=True)
-    check_schema_versions(database)
+    versions = check_schema_versions(database)
+    if supervisor_process_lock_held and versions == (
+        LIVE_SCHEMA_VERSION,
+        INTELLIGENCE_SCHEMA_VERSION,
+    ):
+        try:
+            return verify_prepared_database(database, odds_raw_root=odds_raw_root)
+        except (RuntimeError, sqlite3.DatabaseError):
+            # Current version numbers alone do not prove the schema or raw
+            # authority. A failed gate must enter the backed-up repair path.
+            pass
     backup: Path | None = None
     migration: sqlite3.Connection | None = None
     migration_started = False
@@ -552,14 +669,23 @@ def prepare_database(
                 now or datetime.now(timezone.utc),
             )
             _backup_connection(migration, backup)
+        if strict_live_mapping_schema_requires_rebuild(migration):
+            migration.execute("PRAGMA foreign_keys=OFF")
+            if migration.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                raise RuntimeError(
+                    "failed to suspend foreign keys for strict mapping migration"
+                )
+        migration.execute("BEGIN EXCLUSIVE")
         migration_started = True
         with LiveBettingStore(database, connection=migration) as live:
-            live.init_schema()
+            live.init_schema(external_transaction=True)
         with IntelligenceStorage(database, connection=migration) as intelligence:
-            intelligence.init_schema()
-            Database(connection=intelligence.connection).init_db()
-        if migration.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-            raise RuntimeError("migration connection disabled foreign-key enforcement")
+            intelligence.init_schema(external_transaction=True)
+            Database(connection=intelligence.connection).init_db(
+                external_transaction=True
+            )
+        init_draft_authority_revision_schema(migration)
+        ensure_draft_lineage_tracking(migration)
         if migration.execute("PRAGMA busy_timeout").fetchone()[0] != 5_000:
             raise RuntimeError("migration connection lost the 5-second busy timeout")
         foreign_key_issue = migration.execute("PRAGMA foreign_key_check").fetchone()
@@ -568,8 +694,29 @@ def prepare_database(
                 "migrated database failed foreign-key check: "
                 f"table={foreign_key_issue[0]} rowid={foreign_key_issue[1]}"
             )
+        errors = _schema_contract_errors(
+            _expected_schema_contract(),
+            _schema_contract(migration),
+        )
+        if not draft_lineage_tracking_is_current(migration):
+            errors.append("draft lineage tracking is not current")
+        if errors:
+            visible = errors[:20]
+            suffix = f"; plus {len(errors) - 20} more" if len(errors) > 20 else ""
+            raise RuntimeError(
+                "prepared database schema contract failed: "
+                + "; ".join(visible)
+                + suffix
+            )
+        migration.commit()
+        migration.execute("PRAGMA foreign_keys=ON")
+        if migration.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError("migration connection disabled foreign-key enforcement")
     except BaseException:
         if migration is not None:
+            if migration.in_transaction:
+                migration.rollback()
+            migration.execute("PRAGMA foreign_keys=ON")
             migration.close()
         if backup is not None and migration_started:
             _restore_online_backup(backup, database)
@@ -586,7 +733,7 @@ def prepare_database(
         migration.close()
 
     try:
-        verified = verify_prepared_database(database)
+        verified = verify_prepared_database(database, odds_raw_root=odds_raw_root)
     except BaseException:
         if backup is not None:
             _restore_online_backup(backup, database)
@@ -604,9 +751,11 @@ def prepare_database(
 
 __all__ = [
     "DatabasePreparation",
+    "WalCheckpointResult",
     "check_schema_versions",
     "online_backup",
     "prepare_database",
     "restore_database_backup",
+    "truncate_wal_checkpoint",
     "verify_prepared_database",
 ]

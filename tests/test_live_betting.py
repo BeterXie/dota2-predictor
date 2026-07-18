@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,9 +36,37 @@ from live_betting.storage import LiveBettingStore
 from live_betting.strategy import attempt_fill, make_order
 from live_betting.shadow_strategy import ComebackShadowStrategy
 from live_betting.vision import VisionObservation, parse_observation
+from live_betting.vision_frame_registry import publish_vision_frame_bytes
+from tests.draft_authority_fixture import seed_test_draft_authority
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    return {
+        "result": {
+            "id": rows[0].raybet_match_id,
+            "game_id": 151,
+            "team": [
+                {"team_id": 1, "team_name": "One", "pos": 1},
+                {"team_id": 2, "team_name": "Two", "pos": 2},
+            ],
+            "odds": [
+                {
+                    "id": row.odds_id,
+                    "odds_group_id": row.odds_group_id,
+                    "team_id": 1 if row.market.side == "team_one" else 2,
+                    "match_stage": row.market.period.replace("map_", "r"),
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "odds": row.price,
+                    "status": row.status,
+                }
+                for row in rows
+            ],
+        }
+    }
 
 
 class MarketTests(unittest.TestCase):
@@ -249,6 +277,7 @@ class StorageTests(unittest.TestCase):
                     observed_at=NOW,
                     normalized_state_hash=normalized_state_hash([snapshot]),
                     snapshots=[snapshot],
+                    raw_payload=raw_odds_payload([snapshot]),
                 )
                 self.assertFalse(store.insert_order(order))
                 self.assertFalse(store.insert_order(order))
@@ -263,30 +292,82 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with LiveBettingStore(Path(directory) / "test.db") as store:
                 store.init_schema()
+                store.connection.commit()
+                store.connection.execute("PRAGMA foreign_keys=OFF")
+                first_receipt = publish_vision_frame_bytes(
+                    Path(directory) / "evidence", b"first-frame"
+                )
+                second_receipt = publish_vision_frame_bytes(
+                    Path(directory) / "evidence", b"second-frame"
+                )
                 first_snapshot = OddsSnapshot(
                     "m", "o", "g", NOW, 3.0, 1,
                     Market("winner", "map_1", "team_two", None, "team_two", True),
+                )
+                first_opposite = OddsSnapshot(
+                    "m", "o-opposite", "g", NOW, 9.0 / 7.0, 1,
+                    Market("winner", "map_1", "team_one", None, "team_one", True),
                 )
                 second_at = NOW + timedelta(seconds=3)
                 second_snapshot = OddsSnapshot(
                     "m", "o", "g", second_at, 3.0, 1, first_snapshot.market,
                 )
-                quote = ModelQuote("m", "map_1", first_snapshot.market, 0.5, 0.3, 0.2,
-                                   NOW, "v1", "frame")
+                second_opposite = replace(first_opposite, received_at=second_at)
+                market_probability = price_groups(
+                    [first_snapshot, first_opposite]
+                )[first_snapshot.odds_id]
+                quote = ModelQuote(
+                    "m", "map_1", first_snapshot.market, 0.5,
+                    market_probability, 0.5 - market_probability,
+                    NOW, "v1", first_receipt.frame_ref,
+                )
                 first = make_order(
                     quote, first_snapshot, min_edge=0.08,
                     signal_transport_key="signal-1", signal_transport_at=NOW,
                 )
                 second = make_order(
-                    ModelQuote("m", "map_1", second_snapshot.market, 0.51, 0.3, 0.21,
-                               second_at, "v1", "frame2"),
+                    ModelQuote(
+                        "m", "map_1", second_snapshot.market, 0.51,
+                        market_probability, 0.51 - market_probability,
+                        second_at, "v1", second_receipt.frame_ref,
+                    ),
                     second_snapshot, min_edge=0.08,
                     signal_transport_key="signal-2",
                     signal_transport_at=second_at,
                 )
-                for key, at, row in (
-                    ("signal-1", NOW, first_snapshot),
-                    ("signal-2", second_at, second_snapshot),
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                assert first is not None and second is not None
+                first_vision = VisionObservation(
+                    "m", 1, NOW, 600, False,
+                    (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+                    0.95, 0.95, first_receipt.frame_ref, "game", "team_one",
+                    source_frame_sha256=first_receipt.content_sha256,
+                    source_frame_bytes=first_receipt.byte_length,
+                    source_frame_path=str(first_receipt.storage_path),
+                )
+                second_vision = replace(
+                    first_vision,
+                    captured_at=second_at,
+                    game_clock_seconds=603,
+                    source_frame_ref=second_receipt.frame_ref,
+                    source_frame_sha256=second_receipt.content_sha256,
+                    source_frame_bytes=second_receipt.byte_length,
+                    source_frame_path=str(second_receipt.storage_path),
+                )
+                self.assertTrue(store.insert_vision_observation(first_vision))
+                draft_authority = seed_test_draft_authority(
+                    store.connection,
+                    raybet_match_id="m",
+                    map_number=1,
+                    strict_mapping_id=1,
+                    observed_at=NOW,
+                    label="live-betting-map-reservation",
+                )
+                self.assertTrue(store.insert_vision_observation(second_vision))
+                for key, at, rows in (
+                    ("signal-1", NOW, [first_snapshot, first_opposite]),
+                    ("signal-2", second_at, [second_snapshot, second_opposite]),
                 ):
                     store.store_odds_observation(
                         source="direct",
@@ -294,12 +375,13 @@ class StorageTests(unittest.TestCase):
                         source_event_id=None,
                         raybet_match_id="m",
                         observed_at=at,
-                        normalized_state_hash=normalized_state_hash([row]),
-                        snapshots=[row],
+                        normalized_state_hash=normalized_state_hash(rows),
+                        snapshots=rows,
+                        raw_payload=raw_odds_payload(rows),
                     )
-                for decision_key, order, input_ref in (
-                    ("decision-1", first, "frame"),
-                    ("decision-2", second, "frame2"),
+                for decision_key, order, vision in (
+                    ("decision-1", first, first_vision),
+                    ("decision-2", second, second_vision),
                 ):
                     self.assertTrue(
                         store.insert_decision(
@@ -320,26 +402,51 @@ class StorageTests(unittest.TestCase):
                                 reason="eligible",
                                 contributions={
                                     "__inputs__": {
+                                        "draft_authority": asdict(draft_authority),
                                         "strict_live_eligibility": {
                                             "mapping_refs": {
                                                 "strict_mapping_id": 1
                                             }
-                                        }
+                                        },
+                                        "vision": {
+                                            "captured_at": (
+                                                vision.captured_at.isoformat()
+                                            ),
+                                            "source_frame_ref": (
+                                                vision.source_frame_ref
+                                            ),
+                                            "game_clock_seconds": (
+                                                vision.game_clock_seconds
+                                            ),
+                                        },
                                     }
                                 },
-                                input_ref=input_ref,
+                                input_ref=vision.source_frame_ref,
                                 strategy_version="v1",
-                            )
+                            ),
+                            draft_authority=draft_authority,
+                            vision_observation=vision,
+                            vision_transport_key=order.signal_transport_key,
                         )
                     )
                 with patch.object(
                     store, "_strict_mapping_context_block_reason", return_value=None
                 ):
                     self.assertTrue(
-                        store.insert_map_order(first, 1, strict_mapping_id=1)
+                        store.insert_map_order(
+                            first,
+                            1,
+                            strict_mapping_id=1,
+                            draft_authority=draft_authority,
+                        )
                     )
                     self.assertFalse(
-                        store.insert_map_order(second, 1, strict_mapping_id=1)
+                        store.insert_map_order(
+                            second,
+                            1,
+                            strict_mapping_id=1,
+                            draft_authority=draft_authority,
+                        )
                     )
                 count = store.connection.execute(
                     "SELECT COUNT(*) FROM shadow_orders"
@@ -452,7 +559,7 @@ class VisionContractTests(unittest.TestCase):
 
     def test_rejects_future_schema(self) -> None:
         with self.assertRaises(ValueError):
-            parse_observation({"schema_version": 2})
+            parse_observation({"schema_version": 3})
 
 
 class AlignmentTests(unittest.TestCase):

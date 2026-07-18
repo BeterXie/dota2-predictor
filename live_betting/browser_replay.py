@@ -13,13 +13,16 @@ from typing import Any
 
 from .browser_contract import BrowserEvent, EventType, Transport
 from .browser_ingest import ingest_browser_event
-from .storage import LiveBettingStore
+from .storage import LiveBettingStore, read_browser_event_payload
 
 
 REPLAY_TABLES = (
     "browser_events",
+    "odds_raw_artifacts",
     "odds_transport_observations",
     "odds_response_outcomes",
+    "odds_response_states",
+    "odds_response_state_outcomes",
     "odds_snapshots",
     "strategy_decisions",
     "shadow_orders",
@@ -31,9 +34,10 @@ class BrowserReplayError(RuntimeError):
     """Raised when an immutable source event cannot be replayed safely."""
 
 
-def _event_from_row(row: sqlite3.Row) -> tuple[BrowserEvent, datetime]:
+def _event_from_row(
+    row: sqlite3.Row, payload: dict[str, Any]
+) -> tuple[BrowserEvent, datetime]:
     try:
-        payload = json.loads(str(row["payload_json"]))
         event = BrowserEvent.model_validate(
             {
                 "schema_version": row["schema_version"],
@@ -66,6 +70,23 @@ def _event_from_row(row: sqlite3.Row) -> tuple[BrowserEvent, datetime]:
         ) from error
 
 
+def _payload_from_row(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    archive_root: Path,
+) -> dict[str, Any]:
+    try:
+        return read_browser_event_payload(
+            connection,
+            archive_root,
+            str(row["event_id"]),
+        )
+    except RuntimeError as error:
+        raise BrowserReplayError(
+            f"immutable browser event {row['event_id']} payload is invalid"
+        ) from error
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.hex()
@@ -75,10 +96,16 @@ def _json_value(value: Any) -> Any:
 def _table_digest(connection: sqlite3.Connection, table: str) -> tuple[int, str]:
     columns = [str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")]
     rows = connection.execute(f"SELECT * FROM {table}").fetchall()
-    values = [
-        [_json_value(row[column]) for column in columns]
-        for row in rows
-    ]
+    values = []
+    for row in rows:
+        values.append([
+            (
+                Path(str(row[column])).name
+                if table == "odds_raw_artifacts" and column == "storage_path"
+                else _json_value(row[column])
+            )
+            for column in columns
+        ])
     values.sort(key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
     encoded = json.dumps(
         values, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
@@ -109,6 +136,7 @@ def replay_browser_events(
     restart_after: int | None = None,
     overwrite: bool = False,
     mode: str = "arrival",
+    source_archive_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Replay source browser events into a fresh database.
 
@@ -126,6 +154,11 @@ def replay_browser_events(
     """
     source_path = Path(source_database).resolve()
     target_path = Path(target_database).resolve()
+    archive_root = (
+        Path(source_archive_root).resolve()
+        if source_archive_root is not None
+        else source_path.parent / "live_betting" / "raw-v2"
+    )
     if source_path == target_path:
         raise ValueError("source and target databases must be different")
     if restart_after is not None and restart_after <= 0:
@@ -140,7 +173,10 @@ def replay_browser_events(
 
     with closing(sqlite3.connect(source_path)) as source:
         source.row_factory = sqlite3.Row
-        rows = source.execute("SELECT * FROM browser_events").fetchall()
+        rows = [
+            (row, _payload_from_row(source, row, archive_root))
+            for row in source.execute("SELECT * FROM browser_events").fetchall()
+        ]
 
     def row_time(row: sqlite3.Row, column: str) -> datetime:
         value = datetime.fromisoformat(str(row[column]).replace("Z", "+00:00"))
@@ -151,25 +187,25 @@ def replay_browser_events(
     sort_columns = ("captured_at", "event_id") if mode == "capture" else (
         "received_at", "captured_at", "event_id"
     )
-    rows.sort(key=lambda row: tuple(
-        row_time(row, column) if column != "event_id" else str(row[column])
+    rows.sort(key=lambda item: tuple(
+        row_time(item[0], column) if column != "event_id" else str(item[0][column])
         for column in sort_columns
     ))
-    source_statuses = Counter(str(row["processing_status"]) for row in rows)
+    source_statuses = Counter(str(row["processing_status"]) for row, _ in rows)
     capture_order_ties = sum(
         1
         for previous, current in zip(rows, rows[1:])
-        if str(previous["captured_at"]) == str(current["captured_at"])
+        if str(previous[0]["captured_at"]) == str(current[0]["captured_at"])
     )
 
     outcomes: Counter[str] = Counter()
     store: LiveBettingStore | None = None
     try:
-        for index, row in enumerate(rows, start=1):
+        for index, (row, payload) in enumerate(rows, start=1):
             if store is None:
                 store = LiveBettingStore(target_path)
                 store.init_schema()
-            event, recorded_received_at = _event_from_row(row)
+            event, recorded_received_at = _event_from_row(row, payload)
             replay_received_at = (
                 event.captured_at_utc if mode == "capture" else recorded_received_at
             )

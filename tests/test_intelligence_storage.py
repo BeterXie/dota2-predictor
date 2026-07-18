@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "event_registry",
     "event_candidates",
     "raw_source_artifacts",
+    "raw_source_artifact_relocations",
     "raw_source_observations",
     "match_ingest_status",
     "player_role_assignments",

@@ -7,7 +7,15 @@ import type { MatchDetail, MonitorMatch } from "../types";
 
 vi.mock("@fluentui/react-components", () => ({
   Badge: ({ children }: { children: ReactNode }) => <span>{children}</span>,
-  Button: ({ children }: { children: ReactNode }) => <button>{children}</button>,
+  Button: ({
+    as,
+    children,
+    href,
+  }: {
+    as?: string;
+    children: ReactNode;
+    href?: string;
+  }) => as === "a" ? <a href={href}>{children}</a> : <button>{children}</button>,
   Skeleton: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   SkeletonItem: () => <div />,
 }));
@@ -119,6 +127,131 @@ describe("MatchWorkspace trusted vision clock", () => {
       />,
     );
     expect(screen.getByText("可信时钟 2:00")).toBeInTheDocument();
+  });
+
+  it("labels available entry links by their proven kind", () => {
+    const pageMatch: MonitorMatch = {
+      ...match,
+      watch_link: {
+        kind: "match_page",
+        availability: "available",
+        url: "https://www.ray086.com/sports/esports",
+        reason: "captured_raybet_match_page",
+      },
+    };
+    const view = render(
+      <MatchWorkspace
+        detail={null}
+        error={null}
+        loading={false}
+        match={pageMatch}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "打开比赛页" })).toHaveAttribute(
+      "href",
+      "https://www.ray086.com/sports/esports",
+    );
+    expect(screen.queryByRole("link", { name: "打开直播" })).not.toBeInTheDocument();
+
+    view.rerender(
+      <MatchWorkspace
+        detail={null}
+        error={null}
+        loading={false}
+        match={{
+          ...match,
+          watch_link: {
+            kind: "public_stream",
+            availability: "available",
+            url: "https://qplay.ehome.gg/live/42.m3u8",
+            reason: "verified_unsigned_stream",
+          },
+        }}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "打开直播" })).toHaveAttribute(
+      "href",
+      "https://qplay.ehome.gg/live/42.m3u8",
+    );
+    expect(screen.queryByRole("link", { name: "打开比赛页" })).not.toBeInTheDocument();
+  });
+
+  it("does not fall back to a legacy or unavailable live_url", () => {
+    const { rerender } = render(
+      <MatchWorkspace
+        detail={null}
+        error={null}
+        loading={false}
+        match={{
+          ...match,
+          live_url: "https://qplay.ehome.gg/live/42.m3u8",
+        }}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: /打开/ })).not.toBeInTheDocument();
+
+    rerender(
+      <MatchWorkspace
+        detail={null}
+        error={null}
+        loading={false}
+        match={{
+          ...match,
+          watch_link: {
+            kind: "none",
+            availability: "unavailable",
+            url: null,
+            reason: "no_safe_entry",
+          },
+        }}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: /打开/ })).not.toBeInTheDocument();
+
+    for (const watch_link of [
+      {
+        kind: "match_page",
+        availability: "available",
+        url: "javascript:alert(1)",
+        reason: "malicious_scheme",
+      },
+      {
+        kind: "match_page",
+        availability: "available",
+        url: "https://foreign.example/sports/esports",
+        reason: "foreign_host",
+      },
+      {
+        kind: "public_stream",
+        availability: "available",
+        url: "https://qplay.ehome.gg/live/42.m3u8?token=stripped",
+        reason: "signed_stream",
+      },
+    ] as const) {
+      rerender(
+        <MatchWorkspace
+          detail={null}
+          error={null}
+          loading={false}
+          match={{ ...match, watch_link }}
+          now={Date.parse("2026-07-16T12:00:05+00:00")}
+          replay={false}
+        />,
+      );
+      expect(screen.queryByRole("link", { name: /打开/ })).not.toBeInTheDocument();
+    }
   });
 
   it("shares the replay map selection with the exact postmatch panel", () => {

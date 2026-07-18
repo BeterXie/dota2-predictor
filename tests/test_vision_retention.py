@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from live_betting.storage import LiveBettingStore
+from live_betting.vision import VisionObservation
+from live_betting.vision_frame_registry import publish_vision_frame_bytes
 from live_betting.vision_retention import (
     RetentionSafetyError,
     prune_vision_evidence,
@@ -56,6 +58,259 @@ def _database(tmp_path: Path) -> Path:
     return database
 
 
+def _insert_legacy_decision(
+    store: LiveBettingStore,
+    *,
+    decision_key: str,
+    match_id: str,
+    decided_at: datetime,
+    contributions_json: str,
+) -> None:
+    store.connection.execute(
+        """INSERT INTO strategy_decisions
+           (decision_key, raybet_match_id, map_number, decided_at,
+            underdog_side, market_probability, model_probability, edge,
+            data_quality, eligible, reason, contributions_json, input_ref,
+            strategy_version)
+           VALUES (?, ?, 1, ?, 'team_one', 0.3, 0.4, 0.1, 0.8, 0,
+                   'legacy_lineage', ?, 'input', 'legacy-v1')""",
+        (
+            decision_key,
+            match_id,
+            decided_at.isoformat(),
+            contributions_json,
+        ),
+    )
+
+
+def _registered_observation(
+    receipt,
+    *,
+    captured: datetime,
+    heroes: bool,
+) -> VisionObservation:
+    return VisionObservation(
+        "registered-match",
+        1,
+        captured,
+        600,
+        False,
+        (1, 2, 3, 4, 5) if heroes else (),
+        (6, 7, 8, 9, 10) if heroes else (),
+        0.95 if heroes else 0.0,
+        0.95 if heroes else 0.0,
+        receipt.frame_ref,
+        "game",
+        "team_one" if heroes else None,
+        source_frame_sha256=receipt.content_sha256,
+        source_frame_bytes=receipt.byte_length,
+        source_frame_path=str(receipt.storage_path),
+    )
+
+
+def test_content_addressed_shared_frame_is_protected_once(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    root = tmp_path / "evidence"
+    root.mkdir()
+    receipt = publish_vision_frame_bytes(root, b"shared-frame")
+    duplicate = publish_vision_frame_bytes(root, b"shared-frame")
+    assert duplicate == receipt
+    with LiveBettingStore(database) as store:
+        assert store.insert_vision_observation(
+            _registered_observation(
+                receipt, captured=NOW - timedelta(days=30), heroes=True
+            )
+        )
+        assert store.insert_vision_observation(
+            _registered_observation(
+                duplicate, captured=NOW - timedelta(days=29), heroes=True
+            )
+        )
+        store.connection.commit()
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM vision_frame_artifacts"
+        ).fetchone()[0] == 1
+
+    result = prune_vision_evidence(
+        database,
+        root,
+        now=NOW,
+        ttl=timedelta(days=7),
+        max_unprotected_per_match=0,
+        dry_run=False,
+    )
+    assert result.deleted_files == 0
+    assert result.protected_reference_files == 1
+    assert receipt.storage_path.is_file()
+
+
+def test_retention_retires_unprotected_registered_frame_before_delete(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    root = tmp_path / "evidence"
+    root.mkdir()
+    audit = publish_vision_frame_bytes(root, b"audit-frame")
+    stale = publish_vision_frame_bytes(root, b"stale-frame")
+    with LiveBettingStore(database) as store:
+        assert store.insert_vision_observation(
+            _registered_observation(
+                audit, captured=NOW - timedelta(days=30), heroes=False
+            )
+        )
+        assert store.insert_vision_observation(
+            _registered_observation(
+                stale, captured=NOW - timedelta(days=29), heroes=False
+            )
+        )
+        store.connection.commit()
+
+    result = prune_vision_evidence(
+        database,
+        root,
+        now=NOW,
+        ttl=timedelta(days=7),
+        max_unprotected_per_match=0,
+        dry_run=False,
+    )
+    assert result.deleted_files == 1
+    assert audit.storage_path.is_file()
+    assert not stale.storage_path.exists()
+    with LiveBettingStore(database) as store:
+        retirement = store.connection.execute(
+            """SELECT frame_ref FROM vision_frame_artifact_retirements
+                WHERE frame_ref=?""",
+            (stale.frame_ref,),
+        ).fetchone()
+        assert retirement is not None
+        assert store.connection.execute(
+            """SELECT COUNT(*) FROM active_vision_frame_artifacts
+                WHERE frame_ref=?""",
+            (stale.frame_ref,),
+        ).fetchone()[0] == 0
+
+
+def test_exact_bound_frame_is_protected_even_when_contributions_have_other_ref(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    root = tmp_path / "evidence"
+    root.mkdir()
+    audit = publish_vision_frame_bytes(root, b"audit-exact-ref")
+    exact = publish_vision_frame_bytes(root, b"exact-bound-ref")
+    contributed = publish_vision_frame_bytes(root, b"contributed-ref")
+    stale = publish_vision_frame_bytes(root, b"unprotected-ref")
+    with LiveBettingStore(database) as store:
+        for receipt, age in (
+            (audit, 40),
+            (exact, 30),
+            (contributed, 29),
+            (stale, 28),
+        ):
+            assert store.insert_vision_observation(
+                _registered_observation(
+                    receipt,
+                    captured=NOW - timedelta(days=age),
+                    heroes=False,
+                )
+            )
+        store.connection.execute(
+            """INSERT INTO strategy_decisions
+               (decision_key, raybet_match_id, map_number, decided_at,
+                underdog_side, market_probability, model_probability, edge,
+                data_quality, eligible, reason, contributions_json, input_ref,
+                strategy_version, vision_source_frame_ref,
+                vision_source_frame_sha256, vision_source_frame_bytes)
+               VALUES ('retention-exact', 'registered-match', 1, ?,
+                       'team_one', 0.4, 0.5, 0.1, 0.8, 0, 'audit', ?,
+                       'legacy-input', 'legacy-v1', ?, ?, ?)""",
+            (
+                (NOW - timedelta(days=20)).isoformat(),
+                json.dumps(
+                    {"vision": {"source_frame_ref": contributed.frame_ref}}
+                ),
+                exact.frame_ref,
+                exact.content_sha256,
+                exact.byte_length,
+            ),
+        )
+        store.connection.commit()
+
+    result = prune_vision_evidence(
+        database,
+        root,
+        now=NOW,
+        ttl=timedelta(days=7),
+        max_unprotected_per_match=0,
+        dry_run=False,
+    )
+    assert result.deleted_files == 1
+    assert audit.storage_path.is_file()
+    assert exact.storage_path.is_file()
+    assert contributed.storage_path.is_file()
+    assert not stale.storage_path.exists()
+
+
+def test_shadow_order_exact_bound_frame_is_always_protected(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    root = tmp_path / "evidence"
+    root.mkdir()
+    audit = publish_vision_frame_bytes(root, b"order-audit-ref")
+    exact = publish_vision_frame_bytes(root, b"order-exact-ref")
+    stale = publish_vision_frame_bytes(root, b"order-stale-ref")
+    with LiveBettingStore(database) as store:
+        for receipt, age in ((audit, 40), (exact, 30), (stale, 29)):
+            assert store.insert_vision_observation(
+                _registered_observation(
+                    receipt,
+                    captured=NOW - timedelta(days=age),
+                    heroes=False,
+                )
+            )
+        store.connection.commit()
+        store.connection.execute("PRAGMA foreign_keys=OFF")
+        store.connection.execute("DROP TRIGGER shadow_order_draft_authority_insert")
+        store.connection.execute("DROP TRIGGER shadow_order_vision_authority_insert")
+        store.connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, strict_mapping_id, odds_id,
+                market_key, signaled_at, model_probability, market_probability,
+                signal_price, signal_transport_key, signal_transport_at,
+                expires_at, signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status, fill_price, filled_at,
+                rejection_reason, vision_source_frame_ref,
+                vision_source_frame_sha256, vision_source_frame_bytes)
+               VALUES ('retention-order', 'registered-match', 1, 'odds',
+                       'winner|map_1|team_one|', ?, 0.5, 0.4, 2.5,
+                       'transport', ?, ?, 'group', 'team_one', 1, 1.0,
+                       'pending', NULL, NULL, NULL, ?, ?, ?)""",
+            (
+                (NOW - timedelta(days=20)).isoformat(),
+                (NOW - timedelta(days=20)).isoformat(),
+                (NOW - timedelta(days=20) + timedelta(seconds=15)).isoformat(),
+                exact.frame_ref,
+                exact.content_sha256,
+                exact.byte_length,
+            ),
+        )
+        store.connection.commit()
+
+    result = prune_vision_evidence(
+        database,
+        root,
+        now=NOW,
+        ttl=timedelta(days=7),
+        max_unprotected_per_match=0,
+        dry_run=False,
+    )
+    assert result.deleted_files == 1
+    assert audit.storage_path.is_file()
+    assert exact.storage_path.is_file()
+    assert not stale.storage_path.exists()
+
+
 def test_dry_run_then_apply_preserves_lineage_audit_active_and_recent_frames(
     tmp_path: Path,
 ) -> None:
@@ -77,23 +332,17 @@ def test_dry_run_then_apply_preserves_lineage_audit_active_and_recent_frames(
         _observation(store, "42", audit, NOW - timedelta(days=15), 600)
         _observation(store, "42", over_capacity, NOW - timedelta(days=2), 650)
         _observation(store, "42", recent, NOW - timedelta(days=1), 700)
-        store.connection.execute(
-            """INSERT INTO strategy_decisions
-               (decision_key, raybet_match_id, map_number, decided_at,
-                underdog_side, market_probability, model_probability, edge,
-                data_quality, eligible, reason, contributions_json, input_ref,
-                strategy_version)
-               VALUES ('decision-1', '42', 1, ?, 'team_one', 0.3, 0.4,
-                       0.1, 0.8, 1, 'eligible', ?, 'input', 'test-v1')""",
-            (
-                (NOW - timedelta(days=39)).isoformat(),
-                json.dumps(
-                    {
-                        "__inputs__": {
-                            "vision": {"source_frame_ref": str(referenced)}
-                        }
+        _insert_legacy_decision(
+            store,
+            decision_key="decision-1",
+            match_id="42",
+            decided_at=NOW - timedelta(days=39),
+            contributions_json=json.dumps(
+                {
+                    "__inputs__": {
+                        "vision": {"source_frame_ref": str(referenced)}
                     }
-                ),
+                }
             ),
         )
         store.connection.commit()
@@ -151,22 +400,30 @@ def test_all_persisted_prediction_and_order_lineages_protect_source_frames(
                 NOW - timedelta(days=30, seconds=10 - index),
                 100 + index,
             )
-        store.connection.execute(
-            """INSERT INTO strategy_decisions VALUES
-               ('decision-lineage', 'd', 1, ?, 'team_one', 0.3, 0.4,
-                0.1, 0.8, 1, 'eligible', ?, 'input', 'test-v1')""",
-            (
-                (NOW - timedelta(days=30)).isoformat(),
-                json.dumps({"vision": {"source_frame_ref": str(decision)}}),
+        _insert_legacy_decision(
+            store,
+            decision_key="decision-lineage",
+            match_id="d",
+            decided_at=NOW - timedelta(days=30),
+            contributions_json=json.dumps(
+                {"vision": {"source_frame_ref": str(decision)}}
             ),
         )
         transport_at = (NOW - timedelta(days=30)).isoformat()
         store.connection.execute(
+            "DROP TRIGGER odds_transport_observations_require_v2_state"
+        )
+        store.connection.execute(
             """INSERT INTO odds_transport_observations
+               (observation_key, source, source_event_id, raybet_match_id,
+                observed_at, normalized_state_hash, timing_status,
+                processing_status, normalized_change_count)
                VALUES ('research-transport', 'direct', NULL, 'r', ?, ?,
                        'on_time', 'processed', 1)""",
             (transport_at, "a" * 64),
         )
+        store.connection.execute("DROP TRIGGER shadow_order_draft_authority_insert")
+        store.connection.execute("DROP TRIGGER shadow_order_vision_authority_insert")
         store.connection.execute(
             """INSERT INTO research_live_predictions
                (prediction_key, schema_version, raybet_match_id, map_number,
@@ -207,6 +464,7 @@ def test_all_persisted_prediction_and_order_lineages_protect_source_frames(
                VALUES ('o', 1, 'legacy-order', 'pending', ?)""",
             (transport_at,),
         )
+        store.connection.execute("DROP TRIGGER settlements_authority_insert_guard")
         store.connection.execute(
             """INSERT INTO settlements VALUES
                ('settled-order', 'win', 2.0, ?, ?, 0)""",
@@ -242,11 +500,12 @@ def test_incomplete_or_corrupt_lineage_fails_closed_before_deletion(
 
     database = _database(tmp_path / "complete")
     with LiveBettingStore(database) as store:
-        store.connection.execute(
-            """INSERT INTO strategy_decisions VALUES
-               ('bad-json', '42', 1, ?, 'team_one', 0.3, 0.4, 0.1, 0.8,
-                1, 'eligible', '{', 'input', 'test-v1')""",
-            (NOW.isoformat(),),
+        _insert_legacy_decision(
+            store,
+            decision_key="bad-json",
+            match_id="42",
+            decided_at=NOW,
+            contributions_json="{",
         )
         store.connection.commit()
     with pytest.raises(RetentionSafetyError, match="lineage JSON is invalid"):

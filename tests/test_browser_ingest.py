@@ -122,11 +122,18 @@ class BrowserIngestTests(unittest.TestCase):
 
     def test_late_odds_is_transport_and_audit_only(self) -> None:
         newer_at = NOW + timedelta(seconds=10)
-        newer = snapshots_from_payload(odds_payload("Direct Cup", "2.00"), newer_at)
+        newer_payload = odds_payload("Direct Cup", "2.00")
+        newer = snapshots_from_payload(newer_payload, newer_at)
+        newer_artifact = self.store.archive_response_payload(
+            newer_payload,
+            observed_at=newer_at,
+            match_id="38407985",
+        )
         self.store.store_odds_observation(
             source="direct", observation_key="direct-newer", source_event_id=None,
             raybet_match_id="38407985", observed_at=newer_at,
             normalized_state_hash=normalized_state_hash(newer), snapshots=newer,
+            raw_payload=newer_payload, raw_artifact=newer_artifact,
         )
         result = self.ingestor.ingest(self.store, event("d" * 64, NOW))
         self.assertEqual(
@@ -210,7 +217,7 @@ class BrowserIngestTests(unittest.TestCase):
             "SELECT tournament, live_url, raw_json FROM raybet_matches"
         ).fetchone()
         self.assertEqual((row["tournament"], row["live_url"]),
-                         ("Direct Cup", "https://video.example/live"))
+                         ("Direct Cup", None))
         self.assertIn("Direct Cup", row["raw_json"])
 
 

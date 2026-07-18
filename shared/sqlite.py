@@ -25,6 +25,25 @@ def configure_connection(
     return connection
 
 
+def execute_script(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a schema script without ``executescript``'s implicit commit."""
+
+    buffer = ""
+    chunks = script.split(";")
+    for index, chunk in enumerate(chunks):
+        buffer += chunk
+        if index < len(chunks) - 1:
+            buffer += ";"
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        if statement:
+            connection.execute(statement)
+        buffer = ""
+    if buffer.strip():
+        connection.execute(buffer)
+
+
 def connect(
     database: PathLike,
     *,
@@ -62,4 +81,4 @@ def connect(
     return connection
 
 
-__all__ = ["BUSY_TIMEOUT_MS", "configure_connection", "connect"]
+__all__ = ["BUSY_TIMEOUT_MS", "configure_connection", "connect", "execute_script"]

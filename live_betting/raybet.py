@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Any
+from urllib.parse import urlencode
 
 from curl_cffi import requests
 
@@ -14,6 +15,51 @@ from curl_cffi import requests
 BASE_URL = "https://cfinfo.365raylinks.com/v2"
 SITE_URL = "https://www.ray086.com/"
 DOTA2_GAME_ID = 151
+
+
+@dataclass(frozen=True)
+class RayBetHTTPResponse:
+    """One successful HTTP response with its receipt-time transport identity."""
+
+    payload: Any
+    endpoint: str
+    request_identity: str
+    received_at: datetime
+    http_status: int | None
+    provider_code: int | None
+
+
+class RayBetProviderResponseError(RuntimeError):
+    """A parsed HTTP response carries a provider-level failure code."""
+
+    def __init__(self, message: str, response: RayBetHTTPResponse) -> None:
+        super().__init__(message)
+        self.raybet_response = response
+
+
+class RayBetProviderPayloadError(RuntimeError):
+    """A parsed provider response is JSON but not the required object envelope."""
+
+    def __init__(self, message: str, response: RayBetHTTPResponse) -> None:
+        super().__init__(message)
+        self.raybet_response = response
+
+
+def _annotate_transport_error(
+    error: Exception,
+    *,
+    endpoint: str,
+    request_identity: str,
+    received_at: datetime,
+    http_status: int | None,
+) -> None:
+    try:
+        error.raybet_endpoint = endpoint
+        error.raybet_request_identity = request_identity
+        error.raybet_received_at = received_at
+        error.raybet_http_status = http_status
+    except (AttributeError, TypeError):
+        pass
 
 
 @dataclass(frozen=True)
@@ -26,6 +72,10 @@ class RayBetMapFinal:
     reason: str
     evidence_ref: str
     observed_at: datetime | None
+    audit_key: str | None = None
+    transport_key: str | None = None
+    response_state_hash: str | None = None
+    response_artifact_hash: str | None = None
 
     def selection_won(self, odds_id: str) -> bool | None:
         return next(
@@ -285,20 +335,92 @@ class RayBetClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    def _get_response(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> RayBetHTTPResponse:
+        endpoint = f"{BASE_URL}/{path.lstrip('/')}"
+        query = urlencode(
+            sorted((str(key), str(value)) for key, value in (params or {}).items())
+        )
+        request_identity = f"{endpoint}?{query}" if query else endpoint
+        response = self.client.get(endpoint, params=params, timeout=self.timeout)
+        received_at = datetime.now(timezone.utc)
+        raw_status = getattr(response, "status_code", None)
+        http_status = (
+            int(raw_status)
+            if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+            else None
+        )
+        try:
+            payload = response.json()
+        except Exception as parse_error:
+            try:
+                response.raise_for_status()
+            except Exception as http_error:
+                _annotate_transport_error(
+                    http_error,
+                    endpoint=endpoint,
+                    request_identity=request_identity,
+                    received_at=received_at,
+                    http_status=http_status,
+                )
+                raise
+            _annotate_transport_error(
+                parse_error,
+                endpoint=endpoint,
+                request_identity=request_identity,
+                received_at=received_at,
+                http_status=http_status,
+            )
+            raise
+        raw_code = payload.get("code") if isinstance(payload, dict) else None
+        provider_code = (
+            int(raw_code)
+            if isinstance(raw_code, int) and not isinstance(raw_code, bool)
+            else None
+        )
+        receipt = RayBetHTTPResponse(
+            payload=payload,
+            endpoint=endpoint,
+            request_identity=request_identity,
+            received_at=received_at,
+            http_status=http_status,
+            provider_code=provider_code,
+        )
+        try:
+            response.raise_for_status()
+        except Exception as error:
+            try:
+                error.raybet_response = receipt
+            except (AttributeError, TypeError):
+                pass
+            raise
+        if not isinstance(payload, dict):
+            raise RayBetProviderPayloadError(
+                f"RayBet returned a non-object response for {path}", receipt
+            )
+        if raw_code != 200:
+            raise RayBetProviderResponseError(
+                f"RayBet returned code={raw_code} for {path}", receipt
+            )
+        return receipt
+
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self.client.get(f"{BASE_URL}/{path.lstrip('/')}", params=params, timeout=self.timeout)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 200:
-            raise RuntimeError(f"RayBet returned code={payload.get('code')} for {path}")
-        return payload
+        return self._get_response(path, params).payload
 
     def games(self) -> list[dict[str, Any]]:
         return list(self._get("/game").get("result") or [])
 
     def match_page(self, match_type: int, page: int = 1) -> list[dict[str, Any]]:
-        result = self._get("/match", {"match_type": match_type, "page": page}).get("result")
+        result = self.match_page_response(match_type, page).payload.get("result")
         return list(result or [])
+
+    def match_page_response(
+        self, match_type: int, page: int = 1
+    ) -> RayBetHTTPResponse:
+        return self._get_response(
+            "/match", {"match_type": match_type, "page": page}
+        )
 
     def matches(self, *, match_type: int, max_pages: int = 10) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -341,7 +463,13 @@ class RayBetClient:
         return self.matches(match_type=4, max_pages=max_pages)
 
     def match_odds(self, match_id: int | str) -> dict[str, Any]:
-        payload = self._get("/odds", {"match_id": str(match_id)})
+        payload = self.match_odds_response(match_id).payload
         if not isinstance(payload.get("result"), dict):
             raise RuntimeError(f"RayBet odds missing result for match_id={match_id}")
         return payload
+
+    def match_odds_response(self, match_id: int | str) -> RayBetHTTPResponse:
+        response = self._get_response("/odds", {"match_id": str(match_id)})
+        if not isinstance(response.payload.get("result"), dict):
+            raise RuntimeError(f"RayBet odds missing result for match_id={match_id}")
+        return response

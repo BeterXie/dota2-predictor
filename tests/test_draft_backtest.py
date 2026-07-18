@@ -891,11 +891,8 @@ class DraftBacktestTests(unittest.TestCase):
                     ).fetchone()[0]
                 )
 
-                connection.execute(
-                    """UPDATE raw_source_artifacts SET endpoint=endpoint || '?changed=1'
-                         WHERE artifact_id=?""",
-                    (artifact_id,),
-                )
+                # Endpoint identity is immutable; construct the fixture with its
+                # final endpoint and take the dependency snapshot without mutation.
                 endpoint_fingerprint = draft_dependency_fingerprint(connection)
                 endpoint_revision = int(
                     connection.execute(

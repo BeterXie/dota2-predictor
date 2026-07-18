@@ -76,9 +76,17 @@ class BrowserEventIngestor:
     def ingest(self, store: LiveBettingStore, event: BrowserEvent) -> BrowserIngestResult:
         received_at = self.clock()
         recognized = event.event_type is not EventType.UNKNOWN
+        raw_artifact = store.archive_response_payload(
+            event.payload,
+            observed_at=event.captured_at_utc,
+            match_id=event.raybet_match_id,
+        )
         with store.transaction():
             inserted = store.insert_browser_event(
-                event, received_at=received_at, recognized=recognized,
+                event,
+                received_at=received_at,
+                recognized=recognized,
+                raw_artifact=raw_artifact,
             )
             if not inserted:
                 if not store.browser_event_identity_matches(event):
@@ -124,6 +132,8 @@ class BrowserEventIngestor:
                             observed_at=event.captured_at_utc,
                             normalized_state_hash=state_hash,
                             snapshots=snapshots,
+                            raw_payload=event.payload,
+                            raw_artifact=raw_artifact,
                         )
                     except (ValueError, TypeError, KeyError, IndexError, OverflowError) as error:
                         raise BrowserNormalizationError("odds normalization failed") from error

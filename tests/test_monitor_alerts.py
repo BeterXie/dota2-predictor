@@ -2,16 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+from event_intelligence.storage import IntelligenceStorage
+from live_betting.engine import price_groups
 from live_betting.health import record_health
+from live_betting.markets import normalized_state_hash
+from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import claim
 from live_betting.smtp_delivery import SMTPConfig, build_message
 from live_betting.storage import LiveBettingStore
+from live_betting.strict_eligibility import (
+    accept_strict_live_map_mapping,
+    approve_automatic_exact_evidence,
+    invalidate_strict_live_map_mapping,
+)
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
+)
 from web.alerts import (
     acknowledge_alert,
     active_alerts,
@@ -43,48 +60,107 @@ class MonitorAlertTests(unittest.TestCase):
         map_number: int = 1,
         acceptance_mode: str = "manual_exact",
         automatic_approval_id: int | None = None,
-        accepted_at: datetime = NOW,
+        accepted_at: datetime = NOW - timedelta(seconds=2),
     ) -> int:
         connection.commit()
-        connection.execute("PRAGMA foreign_keys=OFF")
-        try:
-            cursor = connection.execute(
-                """INSERT INTO strict_live_map_mappings
-                   (raybet_match_id, map_number, event_id, team_one_id,
-                    team_two_id, canonical_team_one_id, canonical_team_one_name,
-                    canonical_team_two_id, canonical_team_two_name,
-                    canonical_identity_json, canonical_identity_hash,
-                    crosswalk_evidence_json, crosswalk_evidence_hash,
-                    stage_scope, scheduled_at_utc, raybet_best_of,
-                    raybet_identity_json, raybet_identity_hash,
-                    raybet_metadata_updated_at, source, evidence_json,
-                    evidence_hash, mapping_version, acceptance_mode,
-                    automatic_approval_id, accepted_by, accepted_at,
-                    recorded_at, created_at)
-                   VALUES (?, ?, 'event-test', 101, 202, 101, 'Alpha',
-                           202, 'Beta', '{}', ?, '{}', ?, 'main_event', ?, 3,
-                           '{}', ?, ?, 'test', '{}', ?, 'test-v1', ?, ?,
-                           'test', ?, ?, ?)""",
-                (
-                    raybet_match_id,
-                    map_number,
-                    "a" * 64,
-                    "b" * 64,
-                    NOW.isoformat(),
-                    "c" * 64,
-                    NOW.isoformat(),
-                    "d" * 64,
-                    acceptance_mode,
-                    automatic_approval_id,
-                    accepted_at.isoformat(),
-                    accepted_at.isoformat(),
-                    accepted_at.isoformat(),
-                ),
+        database_path = Path(
+            str(connection.execute("PRAGMA database_list").fetchone()[2])
+        )
+        IntelligenceStorage(database_path, connection=connection).init_schema()
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS teams (
+                   team_id INTEGER PRIMARY KEY,
+                   name TEXT,
+                   tag TEXT,
+                   logo_url TEXT,
+                   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        connection.executemany(
+            "INSERT OR IGNORE INTO teams(team_id, name) VALUES (?, ?)",
+            ((101, "Alpha"), (202, "Beta")),
+        )
+        store = LiveBettingStore(database_path, connection=connection)
+        if connection.execute(
+            "SELECT 1 FROM raybet_matches WHERE raybet_match_id=?",
+            (raybet_match_id,),
+        ).fetchone() is None:
+            store.upsert_raybet_match(
+                {
+                    "id": raybet_match_id,
+                    "game_id": 151,
+                    "tournament_name": "PGL Wallachia Season 8",
+                    "start_time": "2026-04-20 12:00:00",
+                    "round": "bo3",
+                    "stage": "main_event",
+                    "status": 1,
+                    "team": [
+                        {"pos": 1, "team_id": 101, "team_name": "Alpha"},
+                        {"pos": 2, "team_id": 202, "team_name": "Beta"},
+                    ],
+                },
+                accepted_at - timedelta(seconds=1),
             )
-            connection.commit()
-        finally:
-            connection.execute("PRAGMA foreign_keys=ON")
-        return int(cursor.lastrowid)
+        evidence = {
+            "kind": "manual_cross_source_review",
+            "raybet_url": f"https://example.invalid/raybet/{raybet_match_id}",
+            "official_event_url": "https://www.pglesports.com/",
+            "tournament": {
+                "raybet_name": "PGL Wallachia Season 8",
+                "event_name": "PGL Wallachia Season 8",
+            },
+            "schedule": {
+                "raybet_scheduled_at": "2026-04-20 12:00:00",
+                "utc_offset_minutes": 480,
+                "scheduled_at_utc": "2026-04-20T04:00:00+00:00",
+                "timezone_evidence": "audited RayBet UTC+08 display contract",
+            },
+            "stage": {
+                "scope": "main_event",
+                "source_url": "https://www.pglesports.com/",
+            },
+            "team_crosswalk": {
+                "team_one": {
+                    "raybet_team_id": 101,
+                    "raybet_team_name": "Alpha",
+                    "canonical_team_id": 101,
+                    "canonical_team_name": "Alpha",
+                    "source_url": "https://example.invalid/teams/alpha",
+                },
+                "team_two": {
+                    "raybet_team_id": 202,
+                    "raybet_team_name": "Beta",
+                    "canonical_team_id": 202,
+                    "canonical_team_name": "Beta",
+                    "source_url": "https://example.invalid/teams/beta",
+                },
+            },
+        }
+        with patch(
+            "live_betting.strict_eligibility._utc_now",
+            return_value=accepted_at,
+        ):
+            mapping = accept_strict_live_map_mapping(
+                connection,
+                raybet_match_id=raybet_match_id,
+                map_number=map_number,
+                event_id="pgl-wallachia-s8-2026",
+                team_one_id=101,
+                team_two_id=202,
+                canonical_team_one_id=101,
+                canonical_team_two_id=202,
+                source="monitor_alert_fixture",
+                evidence=evidence,
+                accepted_by="test",
+                accepted_at=accepted_at,
+                acceptance_mode=acceptance_mode,
+            )
+        if (
+            automatic_approval_id is not None
+            and mapping.automatic_approval_id != automatic_approval_id
+        ):
+            raise AssertionError("automatic mapping approval lineage differs")
+        return mapping.mapping_id
 
     def _insert_pending_order(
         self,
@@ -111,7 +187,7 @@ class MonitorAlertTests(unittest.TestCase):
                 f"odds-{order_key}",
                 f"group-{order_key}",
                 "team_one",
-                "winner|map_1|team_one|",
+                f"winner|map_{map_number}|team_one|",
                 strategy_version,
                 input_ref,
             )
@@ -123,106 +199,232 @@ class MonitorAlertTests(unittest.TestCase):
                 raybet_match_id=raybet_match_id,
                 map_number=map_number,
             )
-        connection.execute(
-            """INSERT INTO shadow_orders
-               (order_key, raybet_match_id, strict_mapping_id, odds_id,
-                market_key, signaled_at, model_probability, market_probability,
-                signal_price, signal_transport_key, signal_transport_at,
-                expires_at, signal_odds_group_id, signal_outcome_key,
-                signal_identity_verified, stake, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                persisted_order_key,
-                raybet_match_id,
-                strict_mapping_id,
-                f"odds-{order_key}",
-                "winner|map_1|team_one|",
-                signal_at.isoformat(),
-                model_probability,
-                market_probability,
-                signal_price,
-                f"transport-{order_key}",
-                signal_at.isoformat(),
-                (signal_at + timedelta(seconds=15)).isoformat(),
-                f"group-{order_key}",
-                "team_one",
-                1,
-                1.0,
-                "pending",
-            ),
+        if strict_mapping_id is None:
+            raise AssertionError("pending order fixture requires a strict mapping")
+        connection.commit()
+        database_path = Path(
+            str(connection.execute("PRAGMA database_list").fetchone()[2])
         )
-        connection.execute(
-            """INSERT INTO shadow_map_attempts
-               (raybet_match_id, map_number, order_key, status, created_at)
-               VALUES (?, ?, ?, 'pending', ?)""",
-            (
-                raybet_match_id,
-                map_number,
-                persisted_order_key,
-                signal_at.isoformat(),
-            ),
+        store = LiveBettingStore(database_path, connection=connection)
+        anchor_vision = make_test_vision_observation(
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            captured_at=signal_at - timedelta(seconds=1),
+            game_clock_seconds=599,
+            label=f"monitor-anchor:{order_key}",
         )
-        if insert_decision_lineage:
-            decision_key = f"paper-decision:{order_key}"
-            connection.execute(
-                """INSERT INTO strategy_decisions
-                   (decision_key, raybet_match_id, map_number, decided_at,
-                    underdog_side, market_probability, model_probability, edge,
-                    data_quality, eligible, reason, contributions_json, input_ref,
-                    strategy_version)
-                   VALUES (?, ?, ?, ?, 'team_one', ?, ?, 0.1, 0.8, 1,
-                           'eligible', ?, ?, ?)""",
-                (
-                    decision_key,
-                    raybet_match_id,
-                    map_number,
-                    signal_at.isoformat(),
-                    market_probability,
-                    model_probability,
-                    json.dumps(
+        signal_vision = make_test_vision_observation(
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            captured_at=signal_at,
+            game_clock_seconds=600,
+            label=f"monitor-signal:{order_key}",
+        )
+        if not store.insert_vision_observation(anchor_vision):
+            raise AssertionError("monitor anchor frame was not inserted")
+        if not store.insert_vision_observation(signal_vision):
+            raise AssertionError("monitor signal frame was not inserted")
+        authority = seed_test_draft_authority(
+            connection,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            strict_mapping_id=strict_mapping_id,
+            observed_at=signal_at,
+            label=f"monitor-alert:{order_key}",
+        )
+        valid_signal_price = (
+            float(signal_price)
+            if isinstance(signal_price, (int, float))
+            and not isinstance(signal_price, bool)
+            and math.isfinite(float(signal_price))
+            and float(signal_price) > 1.0
+            else 2.5
+        )
+        requested_market_probability = (
+            float(market_probability)
+            if isinstance(market_probability, (int, float))
+            and not isinstance(market_probability, bool)
+            and math.isfinite(float(market_probability))
+            and 0.0 < float(market_probability) < 1.0
+            else 0.4
+        )
+        opposite_price = (
+            requested_market_probability
+            * valid_signal_price
+            / (1.0 - requested_market_probability)
+        )
+        signal_market = Market(
+            "winner", f"map_{map_number}", "team_one", None, "team_one", True
+        )
+        opposite_market = Market(
+            "winner", f"map_{map_number}", "team_two", None, "team_two", True
+        )
+        signal = OddsSnapshot(
+            raybet_match_id,
+            f"odds-{order_key}",
+            f"group-{order_key}",
+            signal_at,
+            valid_signal_price,
+            1,
+            signal_market,
+        )
+        opposite = OddsSnapshot(
+            raybet_match_id,
+            f"odds-{order_key}-opposite",
+            f"group-{order_key}",
+            signal_at,
+            opposite_price,
+            1,
+            opposite_market,
+        )
+        snapshots = [signal, opposite]
+        transport_key = f"transport-{order_key}"
+        store.store_odds_observation(
+            source="direct",
+            observation_key=transport_key,
+            source_event_id=None,
+            raybet_match_id=raybet_match_id,
+            observed_at=signal_at,
+            normalized_state_hash=normalized_state_hash(snapshots),
+            snapshots=snapshots,
+            raw_payload={
+                "result": {
+                    "id": raybet_match_id,
+                    "game_id": 151,
+                    "team": [
+                        {"team_id": 101, "team_name": "Alpha", "pos": 1},
+                        {"team_id": 202, "team_name": "Beta", "pos": 2},
+                    ],
+                    "odds": [
                         {
-                            "__inputs__": {
-                                "strict_live_eligibility": {
-                                    "mapping_refs": {
-                                        "strict_mapping_id": strict_mapping_id
-                                    }
-                                }
-                            }
-                        },
-                        sort_keys=True,
-                    ),
-                    input_ref,
-                    strategy_version,
-                ),
+                            "id": row.odds_id,
+                            "odds_group_id": row.odds_group_id,
+                            "team_id": 101 if row.market.side == "team_one" else 202,
+                            "match_stage": f"r{map_number}",
+                            "group_short_name": "Winner",
+                            "tag": "win",
+                            "odds": str(row.price),
+                            "status": row.status,
+                        }
+                        for row in snapshots
+                    ],
+                }
+            },
+        )
+        persisted_market_probability = price_groups(snapshots)[signal.odds_id]
+        persisted_model_probability = (
+            float(model_probability)
+            if isinstance(model_probability, (int, float))
+            and not isinstance(model_probability, bool)
+            and math.isfinite(float(model_probability))
+            and 0.0 <= float(model_probability) <= 1.0
+            else 0.58
+        )
+        decision_key = f"paper-decision:{order_key}"
+        decision = SimpleNamespace(
+            decision_key=decision_key,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            decided_at=signal_at,
+            underdog_side="team_one",
+            market_probability=persisted_market_probability,
+            model_probability=persisted_model_probability,
+            edge=persisted_model_probability - persisted_market_probability,
+            data_quality=0.8,
+            eligible=True,
+            reason="eligible",
+            contributions={
+                "__inputs__": {
+                    "draft_authority": asdict(authority),
+                    "strict_live_eligibility": {
+                        "mapping_refs": {"strict_mapping_id": strict_mapping_id}
+                    },
+                    "vision": {
+                        "captured_at": signal_at.isoformat(),
+                        "source_frame_ref": signal_vision.source_frame_ref,
+                        "game_clock_seconds": 600,
+                    },
+                }
+            },
+            input_ref=input_ref,
+            strategy_version=strategy_version,
+        )
+        if not store.insert_decision(
+            decision,
+            draft_authority=authority,
+            vision_observation=signal_vision,
+            vision_transport_key=transport_key,
+        ):
+            raise AssertionError("monitor strategy decision was not inserted")
+        order = ShadowOrder(
+            order_key=persisted_order_key,
+            raybet_match_id=raybet_match_id,
+            odds_id=signal.odds_id,
+            market=signal_market,
+            signaled_at=signal_at,
+            model_probability=persisted_model_probability,
+            market_probability=persisted_market_probability,
+            signal_price=valid_signal_price,
+            signal_transport_key=transport_key,
+            signal_transport_at=signal_at,
+            expires_at=signal_at + timedelta(seconds=15),
+            signal_odds_group_id=signal.odds_group_id,
+            signal_outcome_key=signal_market.outcome_key,
+            signal_identity_verified=True,
+        )
+        if not store.insert_map_order(
+            order,
+            map_number,
+            strict_mapping_id=strict_mapping_id,
+            draft_authority=authority,
+            decision_key=decision_key,
+        ):
+            raise AssertionError("monitor pending order was not inserted")
+        if not insert_decision_lineage:
+            connection.execute(
+                "DROP TRIGGER shadow_order_decision_lineage_immutable_delete"
             )
             connection.execute(
-                """INSERT INTO shadow_order_decision_lineage
-                   (order_key, decision_key, recorded_at) VALUES (?, ?, ?)""",
-                (persisted_order_key, decision_key, signal_at.isoformat()),
+                "DELETE FROM shadow_order_decision_lineage WHERE order_key=?",
+                (persisted_order_key,),
             )
-        if insert_vision_anchor:
+        if not insert_vision_anchor:
+            connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute(
-                """INSERT INTO vision_draft_anchors
-                   (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
-                    dire_hero_ids, anchored_at, source_frame_ref, status,
-                    conflict_at)
-                   VALUES (?, ?, ?, '[]', '[]', ?, ?, 'anchored', NULL)""",
-                (
-                    raybet_match_id,
-                    map_number,
-                    "a" * 64,
-                    (
-                        vision_anchor_at or signal_at - timedelta(seconds=1)
-                    ).isoformat(),
-                    f"frame-{order_key}",
-                ),
+                """DELETE FROM vision_draft_anchors
+                    WHERE raybet_match_id=? AND map_number=?""",
+                (raybet_match_id, map_number),
+            )
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys=ON")
+        elif vision_anchor_at is not None:
+            connection.execute("DROP TRIGGER vision_draft_anchor_identity_immutable")
+            connection.execute(
+                """UPDATE vision_draft_anchors SET anchored_at=?
+                    WHERE raybet_match_id=? AND map_number=?""",
+                (vision_anchor_at.isoformat(), raybet_match_id, map_number),
+            )
+        if not isinstance(model_probability, (int, float)) or isinstance(
+            model_probability, bool
+        ):
+            connection.execute("DROP TRIGGER strategy_decisions_immutable_update")
+            connection.execute("DROP TRIGGER shadow_orders_terminal_immutable")
+            connection.execute(
+                "UPDATE strategy_decisions SET model_probability=? WHERE decision_key=?",
+                (model_probability, decision_key),
+            )
+            connection.execute(
+                "UPDATE shadow_orders SET model_probability=? WHERE order_key=?",
+                (model_probability, persisted_order_key),
             )
         connection.commit()
         return strict_mapping_id
 
     @staticmethod
     def _persisted_order_key(
-        order_key: str = "order-alert", raybet_match_id: str = "match-1"
+        order_key: str = "order-alert",
+        raybet_match_id: str = "match-1",
+        map_number: int = 1,
     ) -> str:
         identity = "|".join(
             (
@@ -230,7 +432,7 @@ class MonitorAlertTests(unittest.TestCase):
                 f"odds-{order_key}",
                 f"group-{order_key}",
                 "team_one",
-                "winner|map_1|team_one|",
+                f"winner|map_{map_number}|team_one|",
                 "paper-test-v1",
                 f"paper-input:{order_key}",
             )
@@ -243,27 +445,19 @@ class MonitorAlertTests(unittest.TestCase):
         *,
         source_mapping_id: int,
     ) -> int:
-        cursor = connection.execute(
-            """INSERT INTO strict_live_automatic_evidence_approvals
-               (source_mapping_id, raybet_match_id, event_id, team_one_id,
-                team_two_id, canonical_team_one_id, canonical_team_two_id,
-                raybet_identity_hash, canonical_identity_hash,
-                crosswalk_evidence_hash, evidence_hash, approved_by,
-                approved_at, recorded_at)
-               VALUES (?, 'match-source', 'event-test', 101, 202, 101, 202,
-                       ?, ?, ?, ?, 'test', ?, ?)""",
-            (
-                source_mapping_id,
-                "e" * 64,
-                "f" * 64,
-                "1" * 64,
-                "2" * 64,
-                NOW.isoformat(),
-                NOW.isoformat(),
-            ),
-        )
+        approved_at = NOW - timedelta(seconds=1)
+        with patch(
+            "live_betting.strict_eligibility._utc_now",
+            return_value=approved_at,
+        ):
+            approval_id = approve_automatic_exact_evidence(
+                connection,
+                source_mapping_id=source_mapping_id,
+                approved_by="test",
+                approved_at=approved_at,
+            )
         connection.commit()
-        return int(cursor.lastrowid)
+        return approval_id
 
     def _assert_no_paper_signal(self, connection: sqlite3.Connection) -> None:
         self.assertEqual(
@@ -280,6 +474,23 @@ class MonitorAlertTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    @staticmethod
+    def _remove_strict_mapping(
+        connection: sqlite3.Connection,
+        mapping_id: int,
+    ) -> None:
+        """Simulate a corrupt legacy orphan after first proving a valid graph."""
+        connection.commit()
+        connection.execute("DROP TRIGGER strict_live_map_mappings_no_delete")
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "DELETE FROM strict_live_map_mappings WHERE mapping_id=?",
+            (mapping_id,),
+        )
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=ON")
 
     def test_operational_alert_uses_grace_dedupes_and_recovers(self) -> None:
         record_health(
@@ -638,7 +849,6 @@ class MonitorAlertTests(unittest.TestCase):
             self.store.connection,
             order_key="order-conflicted",
             raybet_match_id="match-conflicted",
-            insert_vision_anchor=False,
         )
         self.store.connection.execute(
             """INSERT INTO vision_derived_invalidations
@@ -654,49 +864,30 @@ class MonitorAlertTests(unittest.TestCase):
                 NOW.isoformat(),
             ),
         )
-        self.store.connection.execute(
-            """INSERT INTO vision_draft_anchors
-               (raybet_match_id, map_number, draft_hash, radiant_hero_ids,
-                dire_hero_ids, anchored_at, source_frame_ref, status, conflict_at)
-               VALUES (?, 1, ?, '[]', '[]', ?, 'frame-1', 'anchored', NULL)""",
-            (
-                "match-conflicted",
-                "a" * 64,
-                (NOW - timedelta(seconds=10)).isoformat(),
-            ),
-        )
-        self.store.connection.execute(
-            """UPDATE vision_draft_anchors
-                  SET status='conflict', conflict_at=?
-                WHERE raybet_match_id='match-conflicted' AND map_number=1""",
-            ((NOW + timedelta(seconds=10)).isoformat(),),
-        )
-        self.store.connection.execute(
-            """INSERT INTO vision_draft_conflicts
-               (raybet_match_id, map_number, captured_at, source_frame_ref,
-                observed_draft_hash, radiant_hero_ids, dire_hero_ids, reason,
-                recorded_at)
-               VALUES (?, 1, ?, 'frame-2', ?, '[]', '[]', 'mismatch', ?)""",
-            (
-                "match-conflicted",
-                (NOW - timedelta(seconds=1)).isoformat(),
-                "b" * 64,
-                NOW.isoformat(),
-            ),
-        )
         self.store.connection.commit()
+        conflicting_frame = make_test_vision_observation(
+            raybet_match_id="match-conflicted",
+            map_number=1,
+            captured_at=NOW - timedelta(milliseconds=500),
+            game_clock_seconds=600,
+            radiant_hero_ids=(11, 12, 13, 14, 15),
+            dire_hero_ids=(16, 17, 18, 19, 20),
+            label="monitor-alert:conflicting-frame",
+        )
+        self.assertTrue(self.store.insert_vision_observation(conflicting_frame))
 
         reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
 
         self.assertEqual(active_alerts(self.store.connection), [])
 
     def test_paper_signal_requires_verified_strict_mapping(self) -> None:
-        self._insert_pending_order(
+        mapping_id = self._insert_pending_order(
             self.store.connection,
             order_key="order-orphan-mapping",
             raybet_match_id="match-orphan-mapping",
-            strict_mapping_id=999,
         )
+        assert mapping_id is not None
+        self._remove_strict_mapping(self.store.connection, mapping_id)
 
         reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
 
@@ -744,7 +935,6 @@ class MonitorAlertTests(unittest.TestCase):
         future_mapping_id = self._insert_strict_mapping(
             self.store.connection,
             raybet_match_id="match-future-mapping",
-            accepted_at=NOW + timedelta(seconds=1),
         )
         self._insert_pending_order(
             self.store.connection,
@@ -752,6 +942,15 @@ class MonitorAlertTests(unittest.TestCase):
             raybet_match_id="match-future-mapping",
             strict_mapping_id=future_mapping_id,
         )
+        self.store.connection.execute(
+            "DROP TRIGGER strict_live_map_mappings_no_update"
+        )
+        self.store.connection.execute(
+            """UPDATE strict_live_map_mappings SET accepted_at=?
+                WHERE mapping_id=?""",
+            ((NOW + timedelta(seconds=1)).isoformat(), future_mapping_id),
+        )
+        self.store.connection.commit()
         self._insert_pending_order(
             self.store.connection,
             order_key="order-future-anchor",
@@ -776,7 +975,7 @@ class MonitorAlertTests(unittest.TestCase):
                         if case == "automatic_source":
                             source_mapping_id = self._insert_strict_mapping(
                                 store.connection,
-                                raybet_match_id="match-source",
+                                raybet_match_id="match-automatic_source",
                             )
                             approval_id = self._insert_automatic_approval(
                                 store.connection,
@@ -785,44 +984,47 @@ class MonitorAlertTests(unittest.TestCase):
                             strict_mapping_id = self._insert_strict_mapping(
                                 store.connection,
                                 raybet_match_id="match-automatic_source",
+                                map_number=2,
                                 acceptance_mode="automatic_exact",
                                 automatic_approval_id=approval_id,
+                                accepted_at=NOW,
                             )
                         order_mapping_id = self._insert_pending_order(
                             store.connection,
                             order_key=f"order-{case}",
                             raybet_match_id=f"match-{case}",
                             strict_mapping_id=strict_mapping_id,
+                            map_number=2 if case == "automatic_source" else 1,
                         )
                         assert order_mapping_id is not None
                         if case == "direct":
-                            store.connection.execute(
-                                """INSERT INTO strict_live_map_mapping_invalidations
-                                   (mapping_id, reason, invalidated_by,
-                                    invalidated_at, recorded_at)
-                                   VALUES (?, 'test', 'operator', ?, ?)""",
-                                (
-                                    order_mapping_id,
-                                    NOW.isoformat(),
-                                    NOW.isoformat(),
-                                ),
-                            )
+                            with patch(
+                                "live_betting.strict_eligibility._utc_now",
+                                return_value=NOW,
+                            ):
+                                invalidate_strict_live_map_mapping(
+                                    store.connection,
+                                    mapping_id=order_mapping_id,
+                                    reason="test",
+                                    invalidated_by="operator",
+                                    invalidated_at=NOW,
+                                )
                         elif case == "impact":
                             cause_mapping_id = self._insert_strict_mapping(
                                 store.connection,
                                 raybet_match_id="match-impact-cause",
                             )
-                            cursor = store.connection.execute(
-                                """INSERT INTO strict_live_map_mapping_invalidations
-                                   (mapping_id, reason, invalidated_by,
-                                    invalidated_at, recorded_at)
-                                   VALUES (?, 'test', 'operator', ?, ?)""",
-                                (
-                                    cause_mapping_id,
-                                    NOW.isoformat(),
-                                    NOW.isoformat(),
-                                ),
-                            )
+                            with patch(
+                                "live_betting.strict_eligibility._utc_now",
+                                return_value=NOW,
+                            ):
+                                invalidation_id = invalidate_strict_live_map_mapping(
+                                    store.connection,
+                                    mapping_id=cause_mapping_id,
+                                    reason="test",
+                                    invalidated_by="operator",
+                                    invalidated_at=NOW,
+                                )
                             store.connection.execute(
                                 """INSERT INTO strict_live_mapping_impacts
                                    (mapping_id, invalidation_id, dependent_type,
@@ -830,7 +1032,7 @@ class MonitorAlertTests(unittest.TestCase):
                                    VALUES (?, ?, 'shadow_order', ?, 'test', ?)""",
                                 (
                                     order_mapping_id,
-                                    int(cursor.lastrowid),
+                                    invalidation_id,
                                     self._persisted_order_key(
                                         "order-impact", "match-impact"
                                     ),
@@ -839,17 +1041,17 @@ class MonitorAlertTests(unittest.TestCase):
                             )
                         else:
                             assert source_mapping_id is not None
-                            store.connection.execute(
-                                """INSERT INTO strict_live_map_mapping_invalidations
-                                   (mapping_id, reason, invalidated_by,
-                                    invalidated_at, recorded_at)
-                                   VALUES (?, 'test', 'operator', ?, ?)""",
-                                (
-                                    source_mapping_id,
-                                    NOW.isoformat(),
-                                    NOW.isoformat(),
-                                ),
-                            )
+                            with patch(
+                                "live_betting.strict_eligibility._utc_now",
+                                return_value=NOW,
+                            ):
+                                invalidate_strict_live_map_mapping(
+                                    store.connection,
+                                    mapping_id=source_mapping_id,
+                                    reason="test",
+                                    invalidated_by="operator",
+                                    invalidated_at=NOW,
+                                )
                         store.connection.commit()
 
                         reconcile_alerts(
@@ -864,7 +1066,8 @@ class MonitorAlertTests(unittest.TestCase):
 
     def test_paper_signal_gate_and_enqueue_share_one_write_transaction(self) -> None:
         paper_order_key = self._persisted_order_key()
-        self._insert_pending_order(self.store.connection)
+        mapping_id = self._insert_pending_order(self.store.connection)
+        assert mapping_id is not None
         contender = sqlite3.connect(self.database, timeout=0)
         writer_errors: list[str] = []
 
@@ -924,6 +1127,8 @@ class MonitorAlertTests(unittest.TestCase):
             contender.commit()
         finally:
             contender.close()
+
+        self._remove_strict_mapping(self.store.connection, mapping_id)
 
         self.assertIsNone(
             claim(self.store.connection, now=NOW + timedelta(seconds=2))

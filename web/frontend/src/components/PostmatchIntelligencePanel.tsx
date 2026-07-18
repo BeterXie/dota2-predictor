@@ -176,6 +176,18 @@ function AvailablePostmatch({
 
   return (
     <div className="postmatch-content">
+      {result.warnings?.map((warning, index) => (
+        <PostmatchNotice
+          code={warning}
+          detail={reasonText(
+            warning,
+            "历史赛后事实已按不可变映射保留，但当前 live mapping 状态需要复核。",
+          )}
+          key={`${warning}-${index}`}
+          review
+          title="当前 mapping 状态待复核"
+        />
+      ))}
       <div className="postmatch-source-line">
         <span><CheckCircle size={16} weight="fill" aria-hidden="true" />OpenDota #{payload.match.match_id}</span>
         <span>赔率时间点 {result.odds_timeline.length}</span>
@@ -410,19 +422,34 @@ function reasonText(reason: string, fallback: string): string {
     reconciliation_missing: "该局尚未建立赛后结算核对。",
     reconciliation_pending: "赛后结算核对尚未确认。",
     reconciliation_review_required: "赛后结算核对已进入人工复核。",
+    reconciliation_causal_order_invalid: "结算核对时间早于 mapping、时间顺序异常，或缺少可验证时区。",
+    reconciliation_schema_unavailable: "当前数据库缺少赛后结算核对协议结构。",
+    reconciliation_mapping_authority_missing: "历史结算缺少不可变 mapping authority，需人工复核。",
     opendota_match_link_conflict: "同一 OpenDota 比赛被多个 RayBet 地图引用，已阻止展示。",
+    opendota_match_identity_invalid: "已确认结算中的 OpenDota 比赛 ID 无效。",
     opendota_match_unavailable: "exact link 指向的 OpenDota 比赛尚未归档。",
+    opendota_scope_schema_unavailable: "当前数据库缺少验证 OpenDota 正式赛事范围所需的协议结构。",
     opendota_match_out_of_scope: "exact link 对应比赛不在当前正式赛事范围。",
+    opendota_ingest_schema_unavailable: "当前数据库缺少验证 OpenDota 入库身份所需的协议结构。",
     opendota_ingest_unavailable: "OpenDota 比赛尚未完成正式入库。",
     opendota_ingest_review_required: "OpenDota 入库身份需要人工复核。",
     opendota_event_identity_conflict: "OpenDota 赛事身份与 strict mapping 不一致。",
     opendota_map_number_conflict: "OpenDota 地图局号与 strict mapping 不一致。",
     opendota_team_identity_conflict: "OpenDota 双方球队身份与 strict mapping 不一致。",
+    opendota_result_identity_conflict: "OpenDota 比赛结果缺失或类型无效，无法确认胜方身份。",
     opendota_winner_identity_conflict: "OpenDota 胜方身份与已确认结算不一致。",
+    reconciliation_winner_conflict: "RayBet 与 OpenDota 的已确认胜方不一致。",
+    settlement_evidence_schema_unavailable: "当前数据库缺少验证结算证据所需的协议结构。",
     settlement_evidence_missing: "已确认结算缺少不可变的双方赛果证据。",
     settlement_evidence_conflict: "已确认结算的赛果证据互相冲突。",
     reconciliation_mapping_lineage_unverified: "无法证明结算发生时使用的是同一条有效 mapping。",
+    current_mapping_changed: "当前 live mapping 已变更，历史内容仍按结算时的不可变 mapping 展示。",
+    map_result_schema_unavailable: "当前数据库缺少赛果 mapping authority 协议结构。",
+    map_result_missing: "已确认结算缺少对应的不可变赛果记录。",
+    map_result_mapping_lineage_unverified: "赛果记录与结算时的不可变 mapping 不一致。",
+    map_result_causal_order_invalid: "赛果记录的时间顺序无法通过因果校验。",
     settlement_evidence_causal_order_invalid: "赛果证据早于 mapping，或证据时间缺少可验证时区。",
+    raybet_match_schema_unavailable: "当前数据库缺少 RayBet 比赛身份协议结构。",
   }[reason] || fallback;
 }
 

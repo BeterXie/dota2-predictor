@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from itertools import combinations
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .models import RolePurpose
 from .raw_archive import canonical_json_bytes
@@ -16,6 +17,9 @@ from .roles import RoleSource
 
 
 FEATURE_VERSION = "draft-features-v3"
+DRAFT_FEATURE_ARTIFACT_VERSION = "draft-feature-artifact-v2"
+LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION = "draft-feature-artifact-v1"
+_DRAFT_FEATURE_AUTHORITY_FINGERPRINT_DOMAIN = "draft-feature-authority-v2"
 ROLE_CONFIDENCE_MIN = 0.7
 MIN_FEATURE_SUPPORT = 5
 SMOOTHING_SUPPORT = 2.0
@@ -757,6 +761,401 @@ def _canonical_target(target: DraftTarget) -> dict[str, Any]:
         "radiant_style": _jsonable(target.radiant_style),
         "dire_style": _jsonable(target.dire_style),
     }
+
+
+def _authority_object(
+    value: Any,
+    expected_fields: Sequence[str],
+    field: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != set(expected_fields):
+        raise ValueError(f"{field} has an invalid object schema")
+    return value
+
+
+def _authority_list(value: Any, field: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list")
+    return value
+
+
+def _authority_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _authority_datetime(value: Any, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{field} must be an ISO timestamp") from error
+    return _utc(parsed, field)
+
+
+def _authority_optional_datetime(value: Any, field: str) -> datetime | None:
+    return None if value is None else _authority_datetime(value, field)
+
+
+def _provenance_from_authority(
+    value: Any,
+    field: str,
+) -> DerivedFactProvenance:
+    row = _authority_object(
+        value,
+        ("cutoff", "first_usable_at", "input_hash", "version"),
+        field,
+    )
+    return DerivedFactProvenance(
+        cutoff=_authority_datetime(row["cutoff"], f"{field}.cutoff"),
+        first_usable_at=_authority_optional_datetime(
+            row["first_usable_at"], f"{field}.first_usable_at"
+        ),
+        input_hash=_authority_string(row["input_hash"], f"{field}.input_hash"),
+        version=_authority_string(row["version"], f"{field}.version"),
+    )
+
+
+def _expected_role_from_authority(
+    value: Any,
+    field: str,
+) -> ExpectedRoleAssignment | None:
+    if value is None:
+        return None
+    row = _authority_object(
+        value,
+        ("purpose", "source", "position", "confidence", "provenance"),
+        field,
+    )
+    try:
+        purpose = RolePurpose(_authority_string(row["purpose"], f"{field}.purpose"))
+        source = RoleSource(_authority_string(row["source"], f"{field}.source"))
+    except ValueError as error:
+        raise ValueError(f"{field} has an invalid role enum") from error
+    return ExpectedRoleAssignment(
+        purpose=purpose,
+        source=source,
+        position=row["position"],
+        confidence=row["confidence"],
+        provenance=_provenance_from_authority(
+            row["provenance"], f"{field}.provenance"
+        ),
+    )
+
+
+def _player_from_authority(value: Any, field: str) -> DraftPlayer:
+    row = _authority_object(
+        value,
+        ("player_id", "hero_id", "expected_role"),
+        field,
+    )
+    return DraftPlayer(
+        player_id=row["player_id"],
+        hero_id=row["hero_id"],
+        expected_role=_expected_role_from_authority(
+            row["expected_role"], f"{field}.expected_role"
+        ),
+    )
+
+
+def _team_from_authority(value: Any, field: str) -> DraftTeam:
+    row = _authority_object(value, ("team_id", "players"), field)
+    players = _authority_list(row["players"], f"{field}.players")
+    return DraftTeam(
+        team_id=row["team_id"],
+        players=tuple(
+            _player_from_authority(player, f"{field}.players[{index}]")
+            for index, player in enumerate(players)
+        ),
+    )
+
+
+def _hero_evidence_from_authority(
+    value: Any,
+    field: str,
+) -> DraftHeroMapEvidence:
+    row = _authority_object(
+        value,
+        (
+            "player_id",
+            "hero_id",
+            "observed_position",
+            "observed_position_confidence",
+            "observed_role_purpose",
+            "observed_role_source",
+            "observed_role_provenance",
+            "execution_score",
+            "score_provenance",
+            "control_seconds",
+            "hero_healing",
+            "last_hits",
+            "tower_damage",
+            "net_worth",
+            "buyback_count",
+        ),
+        field,
+    )
+    try:
+        purpose = (
+            None
+            if row["observed_role_purpose"] is None
+            else RolePurpose(
+                _authority_string(
+                    row["observed_role_purpose"],
+                    f"{field}.observed_role_purpose",
+                )
+            )
+        )
+        source = (
+            None
+            if row["observed_role_source"] is None
+            else RoleSource(
+                _authority_string(
+                    row["observed_role_source"],
+                    f"{field}.observed_role_source",
+                )
+            )
+        )
+    except ValueError as error:
+        raise ValueError(f"{field} has an invalid observed role enum") from error
+    role_provenance = row["observed_role_provenance"]
+    score_provenance = row["score_provenance"]
+    return DraftHeroMapEvidence(
+        player_id=row["player_id"],
+        hero_id=row["hero_id"],
+        observed_position=row["observed_position"],
+        observed_position_confidence=row["observed_position_confidence"],
+        observed_role_purpose=purpose,
+        observed_role_source=source,
+        observed_role_provenance=(
+            None
+            if role_provenance is None
+            else _provenance_from_authority(
+                role_provenance, f"{field}.observed_role_provenance"
+            )
+        ),
+        execution_score=row["execution_score"],
+        score_provenance=(
+            None
+            if score_provenance is None
+            else _provenance_from_authority(
+                score_provenance, f"{field}.score_provenance"
+            )
+        ),
+        control_seconds=row["control_seconds"],
+        hero_healing=row["hero_healing"],
+        last_hits=row["last_hits"],
+        tower_damage=row["tower_damage"],
+        net_worth=row["net_worth"],
+        buyback_count=row["buyback_count"],
+    )
+
+
+def _team_evidence_from_authority(
+    value: Any,
+    field: str,
+) -> DraftTeamMapEvidence:
+    row = _authority_object(
+        value,
+        (
+            "comeback_opportunity",
+            "came_back",
+            "throw_opportunity",
+            "threw",
+            "closeout_opportunity",
+            "closed_out",
+            "roshan_events",
+            "high_ground_events",
+            "long_fight_wins",
+            "long_fight_opportunities",
+            "state_provenance",
+        ),
+        field,
+    )
+    provenance = row["state_provenance"]
+    return DraftTeamMapEvidence(
+        comeback_opportunity=row["comeback_opportunity"],
+        came_back=row["came_back"],
+        throw_opportunity=row["throw_opportunity"],
+        threw=row["threw"],
+        closeout_opportunity=row["closeout_opportunity"],
+        closed_out=row["closed_out"],
+        roshan_events=row["roshan_events"],
+        high_ground_events=row["high_ground_events"],
+        long_fight_wins=row["long_fight_wins"],
+        long_fight_opportunities=row["long_fight_opportunities"],
+        state_provenance=(
+            None
+            if provenance is None
+            else _provenance_from_authority(
+                provenance, f"{field}.state_provenance"
+            )
+        ),
+    )
+
+
+def _style_rate_from_authority(value: Any, field: str) -> DraftStyleRateSnapshot:
+    row = _authority_object(value, ("value", "support", "coverage"), field)
+    return DraftStyleRateSnapshot(
+        value=row["value"],
+        support=row["support"],
+        coverage=row["coverage"],
+    )
+
+
+def _style_from_authority(value: Any, field: str) -> DraftStyleSnapshot | None:
+    if value is None:
+        return None
+    row = _authority_object(
+        value,
+        (
+            "team_id",
+            "availability_mode",
+            "provenance",
+            "comeback_rate",
+            "throw_resilience_rate",
+            "closeout_rate",
+        ),
+        field,
+    )
+    try:
+        mode = AvailabilityMode(
+            _authority_string(row["availability_mode"], f"{field}.availability_mode")
+        )
+    except ValueError as error:
+        raise ValueError(f"{field} has an invalid availability mode") from error
+    return DraftStyleSnapshot(
+        team_id=row["team_id"],
+        availability_mode=mode,
+        provenance=_provenance_from_authority(
+            row["provenance"], f"{field}.provenance"
+        ),
+        comeback_rate=_style_rate_from_authority(
+            row["comeback_rate"], f"{field}.comeback_rate"
+        ),
+        throw_resilience_rate=_style_rate_from_authority(
+            row["throw_resilience_rate"], f"{field}.throw_resilience_rate"
+        ),
+        closeout_rate=_style_rate_from_authority(
+            row["closeout_rate"], f"{field}.closeout_rate"
+        ),
+    )
+
+
+def _map_evidence_from_authority(value: Any, field: str) -> DraftMapEvidence:
+    row = _authority_object(
+        value,
+        (
+            "evidence_id",
+            "source_input_hash",
+            "match_id",
+            "completed_at",
+            "first_usable_at",
+            "event_id",
+            "patch",
+            "duration_seconds",
+            "series_id",
+            "map_number",
+            "radiant",
+            "dire",
+            "radiant_win",
+            "radiant_hero_evidence",
+            "dire_hero_evidence",
+            "radiant_team_evidence",
+            "dire_team_evidence",
+        ),
+        field,
+    )
+    radiant_heroes = _authority_list(
+        row["radiant_hero_evidence"], f"{field}.radiant_hero_evidence"
+    )
+    dire_heroes = _authority_list(
+        row["dire_hero_evidence"], f"{field}.dire_hero_evidence"
+    )
+    return DraftMapEvidence(
+        evidence_id=_authority_string(row["evidence_id"], f"{field}.evidence_id"),
+        source_input_hash=_authority_string(
+            row["source_input_hash"], f"{field}.source_input_hash"
+        ),
+        match_id=row["match_id"],
+        completed_at=_authority_datetime(
+            row["completed_at"], f"{field}.completed_at"
+        ),
+        first_usable_at=_authority_optional_datetime(
+            row["first_usable_at"], f"{field}.first_usable_at"
+        ),
+        event_id=_authority_string(row["event_id"], f"{field}.event_id"),
+        patch=row["patch"],
+        duration_seconds=row["duration_seconds"],
+        series_id=row["series_id"],
+        map_number=row["map_number"],
+        radiant=_team_from_authority(row["radiant"], f"{field}.radiant"),
+        dire=_team_from_authority(row["dire"], f"{field}.dire"),
+        radiant_win=row["radiant_win"],
+        radiant_hero_evidence=tuple(
+            _hero_evidence_from_authority(
+                item, f"{field}.radiant_hero_evidence[{index}]"
+            )
+            for index, item in enumerate(radiant_heroes)
+        ),
+        dire_hero_evidence=tuple(
+            _hero_evidence_from_authority(
+                item, f"{field}.dire_hero_evidence[{index}]"
+            )
+            for index, item in enumerate(dire_heroes)
+        ),
+        radiant_team_evidence=_team_evidence_from_authority(
+            row["radiant_team_evidence"], f"{field}.radiant_team_evidence"
+        ),
+        dire_team_evidence=_team_evidence_from_authority(
+            row["dire_team_evidence"], f"{field}.dire_team_evidence"
+        ),
+    )
+
+
+def _target_from_authority(value: Any) -> DraftTarget:
+    row = _authority_object(
+        value,
+        (
+            "match_id",
+            "prediction_cutoff",
+            "event_id",
+            "patch",
+            "series_id",
+            "map_number",
+            "radiant",
+            "dire",
+            "availability_mode",
+            "radiant_style",
+            "dire_style",
+        ),
+        "draft feature target",
+    )
+    try:
+        mode = AvailabilityMode(
+            _authority_string(row["availability_mode"], "target.availability_mode")
+        )
+    except ValueError as error:
+        raise ValueError("target has an invalid availability mode") from error
+    return DraftTarget(
+        match_id=row["match_id"],
+        prediction_cutoff=_authority_datetime(
+            row["prediction_cutoff"], "target.prediction_cutoff"
+        ),
+        event_id=_authority_string(row["event_id"], "target.event_id"),
+        patch=row["patch"],
+        series_id=row["series_id"],
+        map_number=row["map_number"],
+        radiant=_team_from_authority(row["radiant"], "target.radiant"),
+        dire=_team_from_authority(row["dire"], "target.dire"),
+        availability_mode=mode,
+        radiant_style=_style_from_authority(
+            row["radiant_style"], "target.radiant_style"
+        ),
+        dire_style=_style_from_authority(row["dire_style"], "target.dire_style"),
+    )
 
 
 def _causal_hero_fact(
@@ -1613,11 +2012,54 @@ def _context_features(
     )
 
 
-def build_draft_feature_snapshot(
-    target: DraftTarget, history: Iterable[DraftMapEvidence]
-) -> DraftFeatureSnapshot:
-    """Build one immutable snapshot from inputs available before its cutoff."""
+def _draft_feature_authority_from_eligible(
+    target: DraftTarget,
+    eligible: Sequence[DraftMapEvidence],
+) -> dict[str, Any]:
+    return {
+        "version": FEATURE_VERSION,
+        "schema_hash": FEATURE_SCHEMA_HASH,
+        "target": _canonical_target(target),
+        "eligible_history": [_canonical_evidence(row) for row in eligible],
+    }
+
+
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _draft_feature_input_hash(authority: Mapping[str, Any]) -> str:
+    """Identity used by the model input contract."""
+
+    return _canonical_digest(dict(authority))
+
+
+def _draft_feature_authority_fingerprint(authority: Mapping[str, Any]) -> str:
+    """Domain-separated identity of the authoritative target and history."""
+
+    return _canonical_digest(
+        {
+            "domain": _DRAFT_FEATURE_AUTHORITY_FINGERPRINT_DOMAIN,
+            "authority": dict(authority),
+        }
+    )
+
+
+def draft_feature_authority_payload(
+    target: DraftTarget,
+    history: Iterable[DraftMapEvidence],
+) -> dict[str, Any]:
+    """Serialize the exact causal inputs needed to replay one snapshot."""
+
     eligible = _eligible_history(target, history)
+    return _draft_feature_authority_from_eligible(target, eligible)
+
+
+def _build_draft_feature_snapshot_from_eligible(
+    target: DraftTarget,
+    eligible: Sequence[DraftMapEvidence],
+    authority: Mapping[str, Any],
+) -> DraftFeatureSnapshot:
     rows = _side_rows(eligible)
     pure = _pure_features(target, rows)
     context = _context_features(target, rows)
@@ -1625,13 +2067,7 @@ def build_draft_feature_snapshot(
         raise AssertionError("pure feature implementation does not match schema")
     if tuple(row.name for row in context) != CONTEXT_FEATURE_SCHEMA:
         raise AssertionError("context feature implementation does not match schema")
-    payload = {
-        "version": FEATURE_VERSION,
-        "schema_hash": FEATURE_SCHEMA_HASH,
-        "target": _canonical_target(target),
-        "eligible_history": [_canonical_evidence(row) for row in eligible],
-    }
-    input_hash = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    input_hash = _draft_feature_input_hash(authority)
     pure_coverage = math.fsum(row.coverage for row in pure) / len(pure)
     context_coverage = math.fsum(row.coverage for row in context) / len(context)
     return DraftFeatureSnapshot(
@@ -1650,3 +2086,415 @@ def build_draft_feature_snapshot(
         context_coverage=round(context_coverage, 6),
         coverage=round((pure_coverage + context_coverage) / 2.0, 6),
     )
+
+
+def build_draft_feature_snapshot_with_authority(
+    target: DraftTarget,
+    history: Iterable[DraftMapEvidence],
+) -> tuple[DraftFeatureSnapshot, dict[str, Any]]:
+    """Build a snapshot and the canonical inputs required to replay it."""
+
+    eligible = _eligible_history(target, history)
+    authority = _draft_feature_authority_from_eligible(target, eligible)
+    return (
+        _build_draft_feature_snapshot_from_eligible(target, eligible, authority),
+        authority,
+    )
+
+
+def build_draft_feature_snapshot(
+    target: DraftTarget, history: Iterable[DraftMapEvidence]
+) -> DraftFeatureSnapshot:
+    """Build one immutable snapshot from inputs available before its cutoff."""
+
+    snapshot, _authority = build_draft_feature_snapshot_with_authority(
+        target, history
+    )
+    return snapshot
+
+
+def replay_draft_feature_snapshot(
+    authority_payload: Mapping[str, Any],
+) -> DraftFeatureSnapshot:
+    """Strictly reconstruct and recompute a stored feature snapshot."""
+
+    authority = _authority_object(
+        authority_payload,
+        ("version", "schema_hash", "target", "eligible_history"),
+        "draft feature authority",
+    )
+    if (
+        authority["version"] != FEATURE_VERSION
+        or authority["schema_hash"] != FEATURE_SCHEMA_HASH
+    ):
+        raise ValueError("draft feature authority version does not match")
+    target = _target_from_authority(authority["target"])
+    history_rows = _authority_list(
+        authority["eligible_history"], "draft feature eligible_history"
+    )
+    history = tuple(
+        _map_evidence_from_authority(row, f"eligible_history[{index}]")
+        for index, row in enumerate(history_rows)
+    )
+    eligible = _eligible_history(target, history)
+    canonical = _draft_feature_authority_from_eligible(target, eligible)
+    if canonical != dict(authority):
+        raise ValueError("draft feature authority is not canonical")
+    return _build_draft_feature_snapshot_from_eligible(
+        target,
+        eligible,
+        canonical,
+    )
+
+
+def _evidence_ids_claim(evidence_ids: Iterable[str]) -> dict[str, Any]:
+    values = tuple(evidence_ids)
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("feature evidence IDs must be non-empty strings")
+    return {
+        "count": len(values),
+        "digest": _canonical_digest(list(values)),
+    }
+
+
+def _feature_estimate_claim(value: FeatureEstimate) -> dict[str, Any]:
+    return {
+        "name": value.name,
+        "value": value.value,
+        "support": value.support,
+        "evidence_ids": _evidence_ids_claim(value.evidence_ids),
+        "coverage": value.coverage,
+        "missing_reason": value.missing_reason,
+    }
+
+
+def _target_identity_claim(
+    snapshot: DraftFeatureSnapshot,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    authority_row = _authority_object(
+        authority,
+        ("version", "schema_hash", "target", "eligible_history"),
+        "draft feature authority",
+    )
+    target = _authority_object(
+        authority_row["target"],
+        (
+            "match_id",
+            "prediction_cutoff",
+            "event_id",
+            "patch",
+            "series_id",
+            "map_number",
+            "radiant",
+            "dire",
+            "availability_mode",
+            "radiant_style",
+            "dire_style",
+        ),
+        "draft feature target",
+    )
+    return {
+        "match_id": snapshot.match_id,
+        "prediction_cutoff": snapshot.prediction_cutoff.isoformat(),
+        "availability_mode": snapshot.availability_mode.value,
+        "target_hash": _canonical_digest(dict(target)),
+    }
+
+
+def draft_feature_artifact_payload(
+    snapshot: DraftFeatureSnapshot,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Serialize constant-size claims; authoritative inputs remain in the database."""
+
+    return {
+        "artifact_version": DRAFT_FEATURE_ARTIFACT_VERSION,
+        "target_identity": _target_identity_claim(snapshot, authority),
+        "feature_version": snapshot.feature_version,
+        "feature_schema": list(snapshot.feature_schema),
+        "feature_schema_hash": snapshot.feature_schema_hash,
+        "input_hash": snapshot.input_hash,
+        "authority_fingerprint": _draft_feature_authority_fingerprint(authority),
+        "pure_features": [
+            _feature_estimate_claim(row) for row in snapshot.pure_features
+        ],
+        "context_features": [
+            _feature_estimate_claim(row) for row in snapshot.context_features
+        ],
+        "support": snapshot.support,
+        "pure_coverage": snapshot.pure_coverage,
+        "context_coverage": snapshot.context_coverage,
+        "coverage": snapshot.coverage,
+        "evidence_ids": _evidence_ids_claim(snapshot.evidence_ids),
+    }
+
+
+def build_draft_feature_artifact(
+    target: DraftTarget,
+    history: Iterable[DraftMapEvidence],
+) -> tuple[DraftFeatureSnapshot, dict[str, Any]]:
+    """Build a snapshot and a slim claim that requires external verification."""
+
+    snapshot, authority = build_draft_feature_snapshot_with_authority(
+        target, history
+    )
+    return snapshot, draft_feature_artifact_payload(snapshot, authority)
+
+
+def _legacy_draft_feature_artifact_payload(
+    snapshot: DraftFeatureSnapshot,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "artifact_version": LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION,
+        "authority": dict(authority),
+        "match_id": snapshot.match_id,
+        "prediction_cutoff": snapshot.prediction_cutoff.isoformat(),
+        "availability_mode": snapshot.availability_mode.value,
+        "feature_version": snapshot.feature_version,
+        "feature_schema": list(snapshot.feature_schema),
+        "feature_schema_hash": snapshot.feature_schema_hash,
+        "input_hash": snapshot.input_hash,
+        "pure_features": [
+            {
+                "name": row.name,
+                "value": row.value,
+                "support": row.support,
+                "evidence_ids": list(row.evidence_ids),
+                "coverage": row.coverage,
+                "missing_reason": row.missing_reason,
+            }
+            for row in snapshot.pure_features
+        ],
+        "support": snapshot.support,
+        "pure_coverage": snapshot.pure_coverage,
+        "evidence_ids": list(snapshot.evidence_ids),
+    }
+
+
+def audit_legacy_draft_feature_artifact(
+    payload: Mapping[str, Any],
+) -> DraftFeatureSnapshot:
+    """Replay a v1 artifact for audit; callers must never use it for live output."""
+
+    row = _authority_object(
+        payload,
+        (
+            "artifact_version",
+            "authority",
+            "match_id",
+            "prediction_cutoff",
+            "availability_mode",
+            "feature_version",
+            "feature_schema",
+            "feature_schema_hash",
+            "input_hash",
+            "pure_features",
+            "support",
+            "pure_coverage",
+            "evidence_ids",
+        ),
+        "legacy draft feature artifact",
+    )
+    if row["artifact_version"] != LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION:
+        raise ValueError("legacy draft feature artifact version does not match")
+    authority = _authority_object(
+        row["authority"],
+        ("version", "schema_hash", "target", "eligible_history"),
+        "draft feature authority",
+    )
+    snapshot = replay_draft_feature_snapshot(authority)
+    expected = _legacy_draft_feature_artifact_payload(snapshot, authority)
+    if expected != dict(row):
+        raise ValueError("legacy draft feature artifact calculation does not replay")
+    return snapshot
+
+
+def _validate_evidence_ids_claim(value: Any, field: str) -> None:
+    row = _authority_object(value, ("count", "digest"), field)
+    _nonnegative_int(row["count"], f"{field}.count")
+    _sha256_hash(row["digest"], f"{field}.digest")
+
+
+def _validate_feature_estimate_claim(value: Any, field: str) -> None:
+    row = _authority_object(
+        value,
+        (
+            "name",
+            "value",
+            "support",
+            "evidence_ids",
+            "coverage",
+            "missing_reason",
+        ),
+        field,
+    )
+    _authority_string(row["name"], f"{field}.name")
+    if row["value"] is not None and not _finite(row["value"]):
+        raise ValueError(f"{field}.value must be finite or None")
+    _nonnegative_int(row["support"], f"{field}.support")
+    _validate_evidence_ids_claim(row["evidence_ids"], f"{field}.evidence_ids")
+    _probability(row["coverage"], f"{field}.coverage")
+    if row["missing_reason"] is not None:
+        _authority_string(row["missing_reason"], f"{field}.missing_reason")
+
+
+def _validate_feature_estimate_claims(value: Any, field: str) -> None:
+    rows = _authority_list(value, field)
+    for index, row in enumerate(rows):
+        _validate_feature_estimate_claim(row, f"{field}[{index}]")
+
+
+def _validate_live_draft_feature_artifact(
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    row = _authority_object(
+        payload,
+        (
+            "artifact_version",
+            "target_identity",
+            "feature_version",
+            "feature_schema",
+            "feature_schema_hash",
+            "input_hash",
+            "authority_fingerprint",
+            "pure_features",
+            "context_features",
+            "support",
+            "pure_coverage",
+            "context_coverage",
+            "coverage",
+            "evidence_ids",
+        ),
+        "draft feature artifact",
+    )
+    if row["artifact_version"] != DRAFT_FEATURE_ARTIFACT_VERSION:
+        if row["artifact_version"] == LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION:
+            raise ValueError("legacy draft feature artifacts are audit-only")
+        raise ValueError("draft feature artifact version does not match")
+    target_identity = _authority_object(
+        row["target_identity"],
+        ("match_id", "prediction_cutoff", "availability_mode", "target_hash"),
+        "draft feature target identity",
+    )
+    _positive_int(target_identity["match_id"], "target_identity.match_id")
+    _authority_datetime(
+        target_identity["prediction_cutoff"], "target_identity.prediction_cutoff"
+    )
+    try:
+        AvailabilityMode(
+            _authority_string(
+                target_identity["availability_mode"],
+                "target_identity.availability_mode",
+            )
+        )
+    except ValueError as error:
+        raise ValueError("target identity has an invalid availability mode") from error
+    _sha256_hash(target_identity["target_hash"], "target_identity.target_hash")
+    _authority_string(row["feature_version"], "feature_version")
+    feature_schema = _authority_list(row["feature_schema"], "feature_schema")
+    for index, name in enumerate(feature_schema):
+        _authority_string(name, f"feature_schema[{index}]")
+    _sha256_hash(row["feature_schema_hash"], "feature_schema_hash")
+    _sha256_hash(row["input_hash"], "input_hash")
+    _sha256_hash(row["authority_fingerprint"], "authority_fingerprint")
+    _validate_feature_estimate_claims(row["pure_features"], "pure_features")
+    _validate_feature_estimate_claims(row["context_features"], "context_features")
+    _nonnegative_int(row["support"], "support")
+    _probability(row["pure_coverage"], "pure_coverage")
+    _probability(row["context_coverage"], "context_coverage")
+    _probability(row["coverage"], "coverage")
+    _validate_evidence_ids_claim(row["evidence_ids"], "evidence_ids")
+    return row
+
+
+def verify_live_draft_feature_artifact(
+    payload: Mapping[str, Any],
+    *,
+    target: DraftTarget,
+    history: Iterable[DraftMapEvidence],
+) -> DraftFeatureSnapshot:
+    """Verify v2 claims against target/history loaded from authoritative storage."""
+
+    row = _validate_live_draft_feature_artifact(payload)
+    snapshot, authority = build_draft_feature_snapshot_with_authority(target, history)
+    expected = draft_feature_artifact_payload(snapshot, authority)
+    if expected != dict(row):
+        raise ValueError("draft feature artifact does not match authoritative inputs")
+    return snapshot
+
+
+def replay_draft_feature_artifact(
+    payload: Mapping[str, Any],
+    *,
+    target: DraftTarget | None = None,
+    history: Iterable[DraftMapEvidence] | None = None,
+) -> DraftFeatureSnapshot:
+    """Compatibility entry point for live v2 verification."""
+
+    version = payload.get("artifact_version") if isinstance(payload, Mapping) else None
+    if version == LEGACY_DRAFT_FEATURE_ARTIFACT_VERSION:
+        raise ValueError("legacy draft feature artifacts are audit-only")
+    if target is None or history is None:
+        raise ValueError("authoritative target and history are required")
+    return verify_live_draft_feature_artifact(
+        payload,
+        target=target,
+        history=history,
+    )
+
+
+def parse_draft_feature_artifact_json(payload_json: str) -> dict[str, Any]:
+    """Parse JSON strictly without treating stored claims as authority."""
+
+    if not isinstance(payload_json, str):
+        raise ValueError("draft feature artifact JSON must be a string")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    try:
+        payload = json.loads(
+            payload_json,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("draft feature artifact JSON is invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError("draft feature artifact must be an object")
+    return payload
+
+
+def load_draft_feature_artifact_json(
+    payload_json: str,
+    *,
+    target: DraftTarget | None = None,
+    history: Iterable[DraftMapEvidence] | None = None,
+) -> tuple[dict[str, Any], DraftFeatureSnapshot]:
+    """Strictly parse and verify one live v2 artifact against external authority."""
+
+    payload = parse_draft_feature_artifact_json(payload_json)
+    return payload, replay_draft_feature_artifact(
+        payload,
+        target=target,
+        history=history,
+    )
+
+
+def load_legacy_draft_feature_artifact_json_for_audit(
+    payload_json: str,
+) -> tuple[dict[str, Any], DraftFeatureSnapshot]:
+    """Strictly parse and replay one v1 artifact for audit-only access."""
+
+    payload = parse_draft_feature_artifact_json(payload_json)
+    return payload, audit_legacy_draft_feature_artifact(payload)

@@ -306,7 +306,7 @@ test("allowlisted WSS live payloads use market structure instead of HTTP paths",
   assert.equal(result.events[0].payload.result.id, 410001);
 });
 
-test("video classification keeps only public playback state and strips signed URLs", () => {
+test("video classification keeps public state but drops signed playback URLs", () => {
   const { classifyCandidate, createClassificationState, extractVideoPayload } = loadCore();
   const payload = {
     result: {
@@ -324,7 +324,6 @@ test("video classification keeps only public playback state and strips signed UR
       state: "playing",
       currentTime: 912,
       duration: 3600,
-      playback_url: "wss://cfinfo.365raylinks.com/live/410001.m3u8",
     },
   });
   const result = classifyCandidate({
@@ -337,6 +336,30 @@ test("video classification keeps only public playback state and strips signed UR
   assert.equal(result.events[0].eventType, "video");
   assert.equal(JSON.stringify(result.events[0]).includes("fixture-token"), false);
   assert.equal(JSON.stringify(result.events[0]).includes("authorization"), false);
+});
+
+test("video classification retains only unsigned allowlisted HTTPS playback URLs", () => {
+  const { extractVideoPayload } = loadCore();
+  assert.deepEqual(plain(extractVideoPayload({
+    result: {
+      state: "playing",
+      playback_url: "https://cfinfo.365raylinks.com/live/410001.m3u8",
+    },
+  })), {
+    result: {
+      state: "playing",
+      playback_url: "https://cfinfo.365raylinks.com/live/410001.m3u8",
+    },
+  });
+  for (const playback_url of [
+    "javascript:alert(1)",
+    "https://foreign.example/live/410001.m3u8",
+    "wss://cfinfo.365raylinks.com/live/410001.m3u8",
+  ]) {
+    assert.deepEqual(plain(extractVideoPayload({
+      result: {state: "playing", playback_url},
+    })), {result: {state: "playing"}});
+  }
 });
 
 test("video state-only payloads use constrained values and reject injected text", () => {

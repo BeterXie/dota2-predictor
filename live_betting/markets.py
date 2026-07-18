@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from datetime import datetime
 from collections.abc import Sequence
 from typing import Any
 
 from .models import Market, OddsSnapshot, utc_now
+from .odds_response_authority import (
+    ResponseStateOutcome,
+    legacy_normalized_state_identity_v1,
+    normalized_state_identity,
+)
 
 
 NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
@@ -138,16 +141,38 @@ def snapshots_from_payload(
     return snapshots
 
 
-def normalized_state_hash(snapshots: Sequence[OddsSnapshot]) -> str:
-    """Hash only normalized market state, independent of response metadata."""
-    state = sorted(
-        (
-            snapshot.odds_id,
-            snapshot.price,
-            str(snapshot.status),
-            snapshot.last_update,
-        )
-        for snapshot in snapshots
+def snapshot_state_outcome(snapshot: OddsSnapshot) -> ResponseStateOutcome:
+    """Return every strategy and fill field in one normalized outcome."""
+
+    market = snapshot.market
+    return (
+        snapshot.odds_id,
+        snapshot.odds_group_id,
+        snapshot.price,
+        None if snapshot.status is None else str(snapshot.status),
+        market.market_type,
+        market.period,
+        market.side,
+        market.line,
+        market.outcome_key,
+        int(market.supported),
+        snapshot.last_update,
     )
-    canonical = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def normalized_state_hash(snapshots: Sequence[OddsSnapshot]) -> str:
+    """Hash the complete version-2 normalized semantic response manifest."""
+
+    state_hash, _, _ = normalized_state_identity(
+        snapshot_state_outcome(snapshot) for snapshot in snapshots
+    )
+    return state_hash
+
+
+def legacy_normalized_state_hash_v1(snapshots: Sequence[OddsSnapshot]) -> str:
+    """Reproduce the historical price/status/update subset hash for audit."""
+
+    state_hash, _, _ = legacy_normalized_state_identity_v1(
+        snapshot_state_outcome(snapshot) for snapshot in snapshots
+    )
+    return state_hash

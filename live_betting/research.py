@@ -8,12 +8,17 @@ import math
 import re
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .engine import price_groups
 from .evaluation import brier_score, log_loss
+from .draft_authority import (
+    DraftLandmarkAuthority,
+    authority_from_curve,
+    draft_landmark_authority_matches,
+)
 from .market_state import MarketSurface
 from .models import OddsSnapshot
 from .profiles.draft_curve import DraftCurve, DraftPoint, MAX_LANDMARK_AGE_MINUTES
@@ -124,6 +129,7 @@ class ResearchPrediction:
     gate_status: str
     gate_failures: tuple[str, ...]
     input_context_hash: str
+    draft_authority: DraftLandmarkAuthority | None
     created_at: datetime
 
 
@@ -158,11 +164,12 @@ def manual_clock_evidence(
     transport_key: str,
     transport_hash: str,
     transport_at: datetime,
+    payload_reader: Callable[[str], Mapping[str, object]] | None = None,
 ) -> ManualClockEvidence:
     """Return a diagnostic clock only after strict continuity checks.
 
-    The trust value never becomes actionable.  Raw payloads remain in
-    ``browser_events`` for later review.
+    The trust value never becomes actionable. Externalized payloads must be
+    loaded through the store's hash- and size-verifying reader.
     """
 
     observed_at = _utc(transport_at, "transport_at")
@@ -183,7 +190,7 @@ def manual_clock_evidence(
         )
 
     rows = connection.execute(
-        """SELECT event_id, captured_at, payload_json, capture_reason,
+        """SELECT event_id, captured_at, capture_reason,
                   processing_status, processing_reason
              FROM browser_events
             WHERE raybet_match_id=? AND event_type='manual_control'
@@ -196,9 +203,17 @@ def manual_clock_evidence(
 
     current = rows[0]
     event_id = str(current[0])
+    if payload_reader is None:
+        return ManualClockEvidence(
+            event_id,
+            None,
+            None,
+            MANUAL_CLOCK_TRUST,
+            "payload_reader_unavailable",
+        )
     try:
-        current_payload = json.loads(str(current[2]))
-    except (TypeError, ValueError):
+        current_payload = payload_reader(event_id)
+    except (RuntimeError, TypeError, ValueError):
         return ManualClockEvidence(
             event_id, None, None, MANUAL_CLOCK_TRUST, "invalid_payload"
         )
@@ -213,9 +228,9 @@ def manual_clock_evidence(
         else None
     )
     if (
-        current[3] != "diagnostic_untrusted"
-        or current[4] != "audit_only"
-        or current[5] != "diagnostic_untrusted"
+        current[2] != "diagnostic_untrusted"
+        or current[3] != "audit_only"
+        or current[4] != "diagnostic_untrusted"
     ):
         return ManualClockEvidence(
             event_id,
@@ -235,8 +250,8 @@ def manual_clock_evidence(
 
     previous = rows[1]
     try:
-        previous_payload = json.loads(str(previous[2]))
-    except (TypeError, ValueError):
+        previous_payload = payload_reader(str(previous[0]))
+    except (RuntimeError, TypeError, ValueError):
         previous_payload = None
     previous_index = (
         previous_payload.get("currentIndex")
@@ -328,7 +343,11 @@ def _research_point(curve: DraftCurve, game_clock_seconds: int) -> DraftPoint | 
     return max(candidates, key=lambda point: point.minute) if candidates else None
 
 
-def _gate_failures(point: DraftPoint | None, curve: DraftCurve) -> tuple[str, ...]:
+def _gate_failures(
+    point: DraftPoint | None,
+    curve: DraftCurve,
+    authority: DraftLandmarkAuthority | None,
+) -> tuple[str, ...]:
     if point is None:
         return (curve.unavailable_reason or "live_draft_prediction_missing",)
     failures = []
@@ -357,6 +376,8 @@ def _gate_failures(point: DraftPoint | None, curve: DraftCurve) -> tuple[str, ..
         failures.append("prospective_artifact_required")
     if not getattr(point, "input_snapshot_hash", None):
         failures.append("input_snapshot_hash_missing")
+    if authority is None:
+        failures.append("draft_landmark_authority_missing")
     return tuple(failures)
 
 
@@ -505,7 +526,12 @@ def record_research_prediction(
     selected_side = surface.underdog_side
     market_price, market_probability = quotes[selected_side]
     point = _research_point(draft_curve, observation.game_clock_seconds)
-    failures = list(_gate_failures(point, draft_curve))
+    authority = authority_from_curve(
+        draft_curve,
+        point,
+        radiant_team_side=observation.radiant_team_side,
+    )
+    failures = list(_gate_failures(point, draft_curve, authority))
     raw_probability = None
     if point is not None and observation.radiant_team_side in {"team_one", "team_two"}:
         raw_probability = (
@@ -521,10 +547,6 @@ def record_research_prediction(
     calibration_hash = _optional_hash(
         getattr(point, "calibration_hash", None), "calibration_hash"
     )
-    gate_failures = tuple(dict.fromkeys(failures))
-    gate_status = (
-        "unavailable" if point is None else "failed" if gate_failures else "passed"
-    )
     manual = manual_clock_evidence(
         store.connection,
         raybet_match_id=observation.raybet_match_id,
@@ -532,86 +554,116 @@ def record_research_prediction(
         transport_key=transport_key,
         transport_hash=transport_hash,
         transport_at=observed_at,
-    )
-    context: dict[str, Any] = {
-        "schema_version": RESEARCH_SCHEMA_VERSION,
-        "raybet_match_id": observation.raybet_match_id,
-        "map_number": observation.map_number,
-        "observed_at": observed_at.isoformat(),
-        "game_clock_seconds": observation.game_clock_seconds,
-        "selected_side": selected_side,
-        "market_probability": market_probability,
-        "market_price": market_price,
-        "raw_model_probability": raw_probability,
-        "feature_hash": feature_hash,
-        "model_hash": model_hash,
-        "calibration_hash": calibration_hash,
-        "model_version": None if point is None else point.model_version,
-        "model_kind": None if point is None else point.model_kind,
-        "availability_mode": None if point is None else point.availability_mode,
-        "input_snapshot_hash": (
-            None if point is None else point.input_snapshot_hash
-        ),
-        "transport_key": transport_key,
-        "transport_hash": transport_hash,
-        "radiant_hero_ids": list(observation.radiant_hero_ids),
-        "dire_hero_ids": list(observation.dire_hero_ids),
-        "radiant_team_side": observation.radiant_team_side,
-        "strict_mapping_refs": strict_mapping.input_refs(),
-        "vision_ref": observation.source_frame_ref,
-        "manual_clock": {
-            "event_id": manual.event_id,
-            "seconds": manual.seconds,
-            "current_index": manual.current_index,
-            "trust": manual.trust,
-            "validation": manual.validation,
-        },
-        "actionability": ACTIONABILITY,
-        "gate_status": gate_status,
-        "gate_failures": list(gate_failures),
-    }
-    input_context_hash = _canonical_hash(context)
-    prediction_key = _canonical_hash(
-        {
-            "schema_version": RESEARCH_SCHEMA_VERSION,
-            "transport_key": transport_key,
-            "input_context_hash": input_context_hash,
-        }
-    )
-    prediction = ResearchPrediction(
-        prediction_key=prediction_key,
-        schema_version=RESEARCH_SCHEMA_VERSION,
-        raybet_match_id=observation.raybet_match_id,
-        map_number=observation.map_number,
-        observed_at=observed_at,
-        game_clock_seconds=observation.game_clock_seconds,
-        game_minute=observation.game_clock_seconds / 60.0,
-        selected_side=selected_side,
-        market_probability=market_probability,
-        market_price=market_price,
-        raw_model_probability=raw_probability,
-        feature_hash=feature_hash,
-        model_hash=model_hash,
-        calibration_hash=calibration_hash,
-        transport_key=transport_key,
-        transport_hash=transport_hash,
-        radiant_hero_ids=observation.radiant_hero_ids,
-        dire_hero_ids=observation.dire_hero_ids,
-        radiant_team_side=observation.radiant_team_side,
-        strict_mapping_id=strict_mapping.mapping_id,
-        clock_source="vision",
-        clock_trust="trusted_vision",
-        manual_clock_event_id=manual.event_id,
-        manual_clock_seconds=manual.seconds,
-        manual_clock_trust=manual.trust,
-        manual_clock_validation=manual.validation,
-        actionability=ACTIONABILITY,
-        gate_status=gate_status,
-        gate_failures=gate_failures,
-        input_context_hash=input_context_hash,
-        created_at=created,
+        payload_reader=store.browser_event_payload,
     )
     with store.transaction():
+        authority_verified = authority is not None and (
+            draft_landmark_authority_matches(
+                store.connection,
+                authority,
+                raybet_match_id=observation.raybet_match_id,
+                map_number=observation.map_number,
+                strict_mapping_id=strict_mapping.mapping_id,
+                radiant_hero_ids=observation.radiant_hero_ids,
+                dire_hero_ids=observation.dire_hero_ids,
+                observed_at=observed_at,
+                require_current_revisions=True,
+                verify_curve=False,
+            )
+        )
+        if authority is not None and not authority_verified:
+            failures.append("draft_landmark_authority_unverifiable")
+        gate_failures = tuple(dict.fromkeys(failures))
+        gate_status = (
+            "unavailable"
+            if point is None
+            else "failed"
+            if gate_failures
+            else "passed"
+        )
+        bound_authority = authority if authority_verified else None
+        context: dict[str, Any] = {
+            "schema_version": RESEARCH_SCHEMA_VERSION,
+            "raybet_match_id": observation.raybet_match_id,
+            "map_number": observation.map_number,
+            "observed_at": observed_at.isoformat(),
+            "game_clock_seconds": observation.game_clock_seconds,
+            "selected_side": selected_side,
+            "market_probability": market_probability,
+            "market_price": market_price,
+            "raw_model_probability": raw_probability,
+            "feature_hash": feature_hash,
+            "model_hash": model_hash,
+            "calibration_hash": calibration_hash,
+            "model_version": None if point is None else point.model_version,
+            "model_kind": None if point is None else point.model_kind,
+            "availability_mode": None if point is None else point.availability_mode,
+            "input_snapshot_hash": (
+                None if point is None else point.input_snapshot_hash
+            ),
+            "transport_key": transport_key,
+            "transport_hash": transport_hash,
+            "radiant_hero_ids": list(observation.radiant_hero_ids),
+            "dire_hero_ids": list(observation.dire_hero_ids),
+            "radiant_team_side": observation.radiant_team_side,
+            "strict_mapping_refs": strict_mapping.input_refs(),
+            "vision_ref": observation.source_frame_ref,
+            "manual_clock": {
+                "event_id": manual.event_id,
+                "seconds": manual.seconds,
+                "current_index": manual.current_index,
+                "trust": manual.trust,
+                "validation": manual.validation,
+            },
+            "actionability": ACTIONABILITY,
+            "gate_status": gate_status,
+            "gate_failures": list(gate_failures),
+            "draft_landmark_authority": (
+                None if bound_authority is None else asdict(bound_authority)
+            ),
+        }
+        input_context_hash = _canonical_hash(context)
+        prediction_key = _canonical_hash(
+            {
+                "schema_version": RESEARCH_SCHEMA_VERSION,
+                "transport_key": transport_key,
+                "input_context_hash": input_context_hash,
+            }
+        )
+        prediction = ResearchPrediction(
+            prediction_key=prediction_key,
+            schema_version=RESEARCH_SCHEMA_VERSION,
+            raybet_match_id=observation.raybet_match_id,
+            map_number=observation.map_number,
+            observed_at=observed_at,
+            game_clock_seconds=observation.game_clock_seconds,
+            game_minute=observation.game_clock_seconds / 60.0,
+            selected_side=selected_side,
+            market_probability=market_probability,
+            market_price=market_price,
+            raw_model_probability=raw_probability,
+            feature_hash=feature_hash,
+            model_hash=model_hash,
+            calibration_hash=calibration_hash,
+            transport_key=transport_key,
+            transport_hash=transport_hash,
+            radiant_hero_ids=observation.radiant_hero_ids,
+            dire_hero_ids=observation.dire_hero_ids,
+            radiant_team_side=observation.radiant_team_side,
+            strict_mapping_id=strict_mapping.mapping_id,
+            clock_source="vision",
+            clock_trust="trusted_vision",
+            manual_clock_event_id=manual.event_id,
+            manual_clock_seconds=manual.seconds,
+            manual_clock_trust=manual.trust,
+            manual_clock_validation=manual.validation,
+            actionability=ACTIONABILITY,
+            gate_status=gate_status,
+            gate_failures=gate_failures,
+            input_context_hash=input_context_hash,
+            draft_authority=bound_authority,
+            created_at=created,
+        )
         price_labels = _append_successor_price_labels(
             store,
             raybet_match_id=observation.raybet_match_id,
@@ -698,8 +750,101 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
     vision_included_sql = (
         f"NOT ({vision_invalidated_sql})" if vision_available else "0"
     )
+    authority_columns = {
+        "draft_curve_key",
+        "draft_source_ref",
+        "draft_landmark_key",
+        "draft_landmark_horizon_minutes",
+        "draft_landmark_target",
+        "draft_landmark_radiant_probability",
+        "draft_landmark_quality",
+        "draft_landmark_uncertainty",
+        "draft_landmark_support",
+        "draft_radiant_team_side",
+        "draft_deployment_key",
+        "draft_target_snapshot_hash",
+        "draft_feature_hash",
+        "draft_model_hash",
+        "draft_calibration_hash",
+        "draft_model_version",
+        "draft_global_gate_ref",
+        "draft_input_snapshot_hash",
+        "draft_authority_revision",
+        "draft_dependency_revision",
+    }
+    authority_reason = _required_schema_reason(
+        connection, "research_live_predictions", authority_columns
+    )
+    authority_available = authority_reason is None
+    authority_sql = (
+        "(prediction.gate_status<>'passed' OR ("
+        "prediction.draft_curve_key IS NOT NULL "
+        "AND prediction.draft_source_ref='prospective-draft:'||prediction.draft_curve_key "
+        "AND prediction.draft_landmark_key IS NOT NULL "
+        "AND prediction.draft_landmark_target='radiant_win' "
+        "AND prediction.draft_deployment_key IS NOT NULL "
+        "AND prediction.draft_target_snapshot_hash IS NOT NULL "
+        "AND prediction.draft_feature_hash=prediction.feature_hash "
+        "AND prediction.draft_model_hash=prediction.model_hash "
+        "AND prediction.draft_calibration_hash=prediction.calibration_hash "
+        "AND prediction.draft_model_version IS NOT NULL "
+        "AND prediction.draft_global_gate_ref IS NOT NULL "
+        "AND prediction.draft_input_snapshot_hash IS NOT NULL "
+        "AND prediction.draft_authority_revision>=1 "
+        "AND prediction.draft_dependency_revision>=1 "
+        "AND EXISTS ("
+        "SELECT 1 FROM prospective_draft_curves AS curve "
+        "JOIN prospective_draft_landmarks AS landmark "
+        "ON landmark.curve_key=curve.curve_key "
+        "JOIN draft_model_artifacts AS model "
+        "ON model.model_hash=landmark.model_hash "
+        "JOIN draft_calibration_artifacts AS calibration "
+        "ON calibration.calibration_hash=landmark.calibration_hash "
+        "JOIN draft_deployment_bundles AS deployment "
+        "ON deployment.deployment_key=curve.deployment_key "
+        "WHERE curve.curve_key=prediction.draft_curve_key "
+        "AND landmark.landmark_key=prediction.draft_landmark_key "
+        "AND curve.raybet_match_id=prediction.raybet_match_id "
+        "AND curve.map_number=prediction.map_number "
+        "AND curve.strict_mapping_id=prediction.strict_mapping_id "
+        "AND json(curve.radiant_hero_ids_json)=json(prediction.radiant_hero_ids_json) "
+        "AND json(curve.dire_hero_ids_json)=json(prediction.dire_hero_ids_json) "
+        "AND curve.radiant_team_side=prediction.radiant_team_side "
+        "AND curve.availability_mode='prospective' "
+        "AND julianday(curve.prediction_cutoff)<=julianday(curve.first_usable_at) "
+        "AND julianday(curve.first_usable_at)<=julianday(prediction.observed_at) "
+        "AND curve.deployment_key=prediction.draft_deployment_key "
+        "AND curve.target_snapshot_hash=prediction.draft_target_snapshot_hash "
+        "AND curve.feature_dependency_revision=prediction.draft_dependency_revision "
+        "AND landmark.horizon_minutes=prediction.draft_landmark_horizon_minutes "
+        "AND landmark.radiant_probability=prediction.draft_landmark_radiant_probability "
+        "AND landmark.quality=prediction.draft_landmark_quality "
+        "AND landmark.uncertainty=prediction.draft_landmark_uncertainty "
+        "AND landmark.support=prediction.draft_landmark_support "
+        "AND landmark.validation_status='passed' "
+        "AND landmark.global_calibration_passed=1 "
+        "AND landmark.deployment_key=prediction.draft_deployment_key "
+        "AND landmark.feature_hash=prediction.draft_feature_hash "
+        "AND landmark.model_hash=prediction.draft_model_hash "
+        "AND landmark.calibration_hash=prediction.draft_calibration_hash "
+        "AND landmark.model_version=prediction.draft_model_version "
+        "AND landmark.global_gate_ref=prediction.draft_global_gate_ref "
+        "AND landmark.input_snapshot_hash=prediction.draft_input_snapshot_hash "
+        "AND model.model_version=prediction.draft_model_version "
+        "AND model.model_kind='pure_draft' "
+        "AND model.feature_schema_hash=prediction.draft_feature_hash "
+        "AND calibration.model_hash=prediction.draft_model_hash "
+        "AND calibration.horizon_minutes=landmark.horizon_minutes "
+        "AND calibration.support=landmark.support "
+        "AND json_extract(deployment.model_hashes_json,'$.'||landmark.horizon_minutes)=landmark.model_hash "
+        "AND json_extract(deployment.calibration_hashes_json,'$.'||landmark.horizon_minutes)=landmark.calibration_hash"
+        ")))"
+        if authority_available
+        else "0"
+    )
     included_prediction_sql = (
-        f"(({strict_gate.included_sql}) AND ({vision_included_sql}))"
+        f"(({strict_gate.included_sql}) AND ({vision_included_sql}) "
+        f"AND ({authority_sql}))"
     )
 
     prediction_unknown = list(strict_gate.unknown_reasons)
@@ -712,6 +857,8 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         )
         if reason is not None
     )
+    if authority_reason is not None:
+        prediction_unknown.append(authority_reason)
     try:
         prediction_audit_rows = connection.execute(
             f"""SELECT prediction.gate_status,
@@ -821,15 +968,130 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
     reconciliation_reason = _required_schema_reason(
         connection,
         "settlement_reconciliations",
-        {"raybet_match_id", "map_number", "dota_match_id", "status"},
+        {
+            "raybet_match_id",
+            "map_number",
+            "strict_mapping_id",
+            "dota_match_id",
+            "evidence_ref",
+            "raybet_evidence_id",
+            "opendota_evidence_id",
+            "raybet_evidence_ref",
+            "opendota_evidence_ref",
+            "raybet_observed_at",
+            "opendota_observed_at",
+            "first_usable_at",
+            "status",
+        },
     )
-    reconciliation_available = reconciliation_reason is None
+    map_result_reason = _required_schema_reason(
+        connection,
+        "map_results",
+        {
+            "raybet_match_id",
+            "map_number",
+            "strict_mapping_id",
+            "dota_match_id",
+            "winner_side",
+            "evidence_ref",
+            "reconciliation_ref",
+            "raybet_evidence_id",
+            "opendota_evidence_id",
+            "raybet_evidence_ref",
+            "opendota_evidence_ref",
+            "raybet_observed_at",
+            "opendota_observed_at",
+            "first_usable_at",
+        },
+    )
+    source_evidence_reason = _required_schema_reason(
+        connection,
+        "settlement_result_evidence",
+        {
+            "evidence_id",
+            "raybet_match_id",
+            "map_number",
+            "dota_match_id",
+            "source",
+            "status",
+            "winner_side",
+            "evidence_ref",
+            "observed_at",
+            "first_usable_at",
+            "raybet_audit_key",
+            "raybet_response_artifact_hash",
+            "opendota_artifact_id",
+            "opendota_observation_id",
+            "opendota_content_hash",
+        },
+    )
+    result_label_reason = _required_schema_reason(
+        connection,
+        "research_result_labels",
+        {
+            "strict_mapping_id",
+            "reconciliation_ref",
+            "raybet_evidence_id",
+            "opendota_evidence_id",
+            "raybet_evidence_ref",
+            "opendota_evidence_ref",
+            "raybet_observed_at",
+            "opendota_observed_at",
+            "first_usable_at",
+        },
+    )
+    reconciliation_available = (
+        reconciliation_reason is None
+        and map_result_reason is None
+        and source_evidence_reason is None
+        and result_label_reason is None
+    )
     reconciliation_confirmed_sql = (
         "EXISTS ("
         "SELECT 1 FROM settlement_reconciliations AS reconciliation "
+        "JOIN map_results AS result "
+        "ON result.raybet_match_id=reconciliation.raybet_match_id "
+        "AND result.map_number=reconciliation.map_number "
+        "AND result.strict_mapping_id=reconciliation.strict_mapping_id "
+        "AND result.dota_match_id=reconciliation.dota_match_id "
+        "JOIN settlement_result_evidence AS raybet_evidence "
+        "ON raybet_evidence.evidence_id=result.raybet_evidence_id "
+        "AND raybet_evidence.source='raybet' "
+        "AND raybet_evidence.status='confirmed' "
+        "JOIN settlement_result_evidence AS opendota_evidence "
+        "ON opendota_evidence.evidence_id=result.opendota_evidence_id "
+        "AND opendota_evidence.source='opendota' "
+        "AND opendota_evidence.status='confirmed' "
         "WHERE reconciliation.raybet_match_id=prediction.raybet_match_id "
         "AND reconciliation.map_number=prediction.map_number "
+        "AND reconciliation.strict_mapping_id=prediction.strict_mapping_id "
         "AND reconciliation.dota_match_id=label.dota_match_id "
+        "AND label.strict_mapping_id=prediction.strict_mapping_id "
+        "AND result.winner_side=label.winner_side "
+        "AND result.evidence_ref=label.evidence_ref "
+        "AND result.reconciliation_ref=label.reconciliation_ref "
+        "AND result.raybet_evidence_id=label.raybet_evidence_id "
+        "AND result.opendota_evidence_id=label.opendota_evidence_id "
+        "AND result.raybet_evidence_ref=label.raybet_evidence_ref "
+        "AND result.opendota_evidence_ref=label.opendota_evidence_ref "
+        "AND result.raybet_observed_at=label.raybet_observed_at "
+        "AND result.opendota_observed_at=label.opendota_observed_at "
+        "AND result.first_usable_at=label.first_usable_at "
+        "AND result.settled_at=label.settled_at "
+        "AND reconciliation.evidence_ref=label.reconciliation_ref "
+        "AND reconciliation.raybet_evidence_id=label.raybet_evidence_id "
+        "AND reconciliation.opendota_evidence_id=label.opendota_evidence_id "
+        "AND reconciliation.raybet_evidence_ref=label.raybet_evidence_ref "
+        "AND reconciliation.opendota_evidence_ref=label.opendota_evidence_ref "
+        "AND reconciliation.raybet_observed_at=label.raybet_observed_at "
+        "AND reconciliation.opendota_observed_at=label.opendota_observed_at "
+        "AND reconciliation.first_usable_at=label.first_usable_at "
+        "AND raybet_evidence.evidence_ref=label.raybet_evidence_ref "
+        "AND raybet_evidence.observed_at=label.raybet_observed_at "
+        "AND raybet_evidence.winner_side=label.winner_side "
+        "AND opendota_evidence.evidence_ref=label.opendota_evidence_ref "
+        "AND opendota_evidence.observed_at=label.opendota_observed_at "
+        "AND opendota_evidence.winner_side=label.winner_side "
         "AND reconciliation.status='confirmed')"
         if reconciliation_available
         else "0"
@@ -847,6 +1109,12 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
     result_unknown = list(prediction_unknown)
     if reconciliation_reason is not None:
         result_unknown.append(reconciliation_reason)
+    if map_result_reason is not None:
+        result_unknown.append(map_result_reason)
+    if source_evidence_reason is not None:
+        result_unknown.append(source_evidence_reason)
+    if result_label_reason is not None:
+        result_unknown.append(result_label_reason)
     try:
         result_audit_rows = connection.execute(
             f"""SELECT prediction.raw_model_probability,

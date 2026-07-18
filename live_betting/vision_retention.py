@@ -13,6 +13,11 @@ from typing import Iterable
 
 from shared.sqlite import connect as connect_sqlite
 
+from .vision_frame_registry import (
+    retire_vision_frame_artifact,
+    verify_vision_frame_registry,
+)
+
 
 DEFAULT_RETENTION_TTL = timedelta(days=7)
 DEFAULT_MAX_UNPROTECTED_PER_MATCH = 2_000
@@ -23,6 +28,9 @@ _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg"})
 _REQUIRED_TABLES = frozenset(
     {
         "vision_observations",
+        "vision_frame_artifacts",
+        "vision_frame_artifact_relocations",
+        "vision_frame_artifact_retirements",
         "vision_observation_invalidations",
         "vision_draft_anchors",
         "vision_draft_conflicts",
@@ -136,9 +144,15 @@ def _inside_root(path: Path, root: Path) -> bool:
     return True
 
 
-def _reference_key(value: object, root: Path) -> str | None:
+def _reference_key(
+    value: object,
+    root: Path,
+    frame_paths: dict[str, str] | None = None,
+) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
+    if frame_paths is not None and value in frame_paths:
+        return frame_paths[value]
     try:
         raw = Path(value)
         candidate = raw if raw.is_absolute() else root / raw
@@ -211,6 +225,41 @@ def _require_tables(connection: sqlite3.Connection) -> None:
         )
 
 
+def _registered_frame_paths(
+    connection: sqlite3.Connection,
+    root: Path,
+) -> tuple[dict[str, str], dict[str, str], dict[str, tuple[str, int]]]:
+    try:
+        verify_vision_frame_registry(connection, require_active_files=True)
+    except RuntimeError as error:
+        raise RetentionSafetyError("vision frame registry is unverifiable") from error
+    by_ref: dict[str, str] = {}
+    by_path: dict[str, str] = {}
+    identities: dict[str, tuple[str, int]] = {}
+    for row in connection.execute(
+        """SELECT frame_ref, storage_path, content_sha256, byte_length
+             FROM active_vision_frame_artifacts ORDER BY frame_ref"""
+    ):
+        try:
+            path = Path(str(row[1])).resolve(strict=True)
+        except OSError as error:
+            raise RetentionSafetyError(
+                "registered vision frame is unavailable"
+            ) from error
+        if not _inside_root(path, root):
+            continue
+        key = _path_key(path)
+        prior = by_path.get(key)
+        if prior is not None and prior != str(row[0]):
+            raise RetentionSafetyError(
+                "multiple vision frame identities share one storage path"
+            )
+        by_ref[str(row[0])] = key
+        by_path[key] = str(row[0])
+        identities[str(row[0])] = (str(row[2]), int(row[3]))
+    return by_ref, by_path, identities
+
+
 def _json_source_refs(raw: object) -> tuple[str, ...]:
     try:
         value = json.loads(str(raw))
@@ -238,11 +287,14 @@ def _json_source_refs(raw: object) -> tuple[str, ...]:
 
 
 def _add_reference_keys(
-    output: set[str], values: Iterable[object], root: Path
+    output: set[str],
+    values: Iterable[object],
+    root: Path,
+    frame_paths: dict[str, str],
 ) -> int:
     before = len(output)
     for value in values:
-        key = _reference_key(value, root)
+        key = _reference_key(value, root, frame_paths)
         if key is not None:
             output.add(key)
     return len(output) - before
@@ -303,7 +355,10 @@ def _causal_observation_refs(
 
 
 def _referenced_keys(
-    connection: sqlite3.Connection, root: Path
+    connection: sqlite3.Connection,
+    root: Path,
+    frame_paths: dict[str, str],
+    frame_identities: dict[str, tuple[str, int]],
 ) -> set[str]:
     protected: set[str] = set()
     direct_rows = connection.execute(
@@ -314,7 +369,26 @@ def _referenced_keys(
                  WHERE team_side_source_frame_ref IS NOT NULL
            UNION SELECT evidence_ref FROM settlements"""
     ).fetchall()
-    _add_reference_keys(protected, (row[0] for row in direct_rows), root)
+    _add_reference_keys(
+        protected, (row[0] for row in direct_rows), root, frame_paths
+    )
+    for table in ("strategy_decisions", "shadow_orders"):
+        for row in connection.execute(
+            f"""SELECT vision_source_frame_ref,
+                       vision_source_frame_sha256,
+                       vision_source_frame_bytes
+                  FROM {table}
+                 WHERE vision_source_frame_ref IS NOT NULL"""
+        ):
+            frame_ref = str(row[0])
+            identity = frame_identities.get(frame_ref)
+            if (
+                identity is not None
+                and row[1] is not None
+                and row[2] is not None
+                and identity == (str(row[1]), int(row[2]))
+            ):
+                protected.add(frame_paths[frame_ref])
     curve_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(prospective_draft_curves)")
@@ -331,6 +405,7 @@ def _referenced_keys(
                 )
             ),
             root,
+            frame_paths,
         )
 
     for row in connection.execute(
@@ -339,7 +414,7 @@ def _referenced_keys(
              FROM strategy_decisions"""
     ):
         refs = _json_source_refs(row["contributions_json"])
-        added = _add_reference_keys(protected, refs, root)
+        added = _add_reference_keys(protected, refs, root, frame_paths)
         if added == 0:
             fallback = _causal_observation_refs(
                 connection,
@@ -347,7 +422,7 @@ def _referenced_keys(
                 map_number=int(row["map_number"]),
                 cutoff=str(row["decided_at"]),
             )
-            _add_reference_keys(protected, fallback, root)
+            _add_reference_keys(protected, fallback, root, frame_paths)
 
     for row in connection.execute(
         """SELECT prediction.raybet_match_id, prediction.map_number,
@@ -363,7 +438,7 @@ def _referenced_keys(
             radiant_json=str(row["radiant_hero_ids_json"]),
             dire_json=str(row["dire_hero_ids_json"]),
         )
-        _add_reference_keys(protected, refs, root)
+        _add_reference_keys(protected, refs, root, frame_paths)
 
     for row in connection.execute(
         """SELECT curve.raybet_match_id, curve.map_number,
@@ -373,7 +448,7 @@ def _referenced_keys(
                ON curve.curve_key=landmark.curve_key"""
     ):
         refs = _json_source_refs(row["input_refs_json"])
-        added = _add_reference_keys(protected, refs, root)
+        added = _add_reference_keys(protected, refs, root, frame_paths)
         if added == 0:
             fallback = _causal_observation_refs(
                 connection,
@@ -381,7 +456,7 @@ def _referenced_keys(
                 map_number=int(row["map_number"]),
                 cutoff=str(row["first_usable_at"]),
             )
-            _add_reference_keys(protected, fallback, root)
+            _add_reference_keys(protected, fallback, root, frame_paths)
 
     for row in connection.execute(
         """SELECT orders.raybet_match_id, attempt.map_number,
@@ -396,7 +471,7 @@ def _referenced_keys(
             map_number=int(row["map_number"]),
             cutoff=str(row["signal_transport_at"]),
         )
-        _add_reference_keys(protected, fallback, root)
+        _add_reference_keys(protected, fallback, root, frame_paths)
     return protected
 
 
@@ -414,6 +489,7 @@ def _observation_metadata(
     connection: sqlite3.Connection,
     root: Path,
     available: set[str],
+    frame_paths: dict[str, str],
 ) -> tuple[set[str], dict[str, datetime], set[str]]:
     audit: dict[tuple[object, ...], tuple[datetime, str]] = {}
     captured_by_path: dict[str, datetime] = {}
@@ -425,7 +501,7 @@ def _observation_metadata(
             ORDER BY julianday(captured_at), captured_at, source_frame_ref"""
     )
     for row in rows:
-        key = _reference_key(row["source_frame_ref"], root)
+        key = _reference_key(row["source_frame_ref"], root, frame_paths)
         if key is None or key not in available:
             continue
         captured = _parse_utc(row["captured_at"])
@@ -507,9 +583,14 @@ def prune_vision_evidence(
     )
     try:
         _require_tables(connection)
-        referenced = _referenced_keys(connection, root)
+        frame_paths, registered_by_path, frame_identities = _registered_frame_paths(
+            connection, root
+        )
+        referenced = _referenced_keys(
+            connection, root, frame_paths, frame_identities
+        )
         audit, captured_by_path, invalid_times = _observation_metadata(
-            connection, root, available
+            connection, root, available, frame_paths
         )
     finally:
         connection.close()
@@ -558,17 +639,42 @@ def prune_vision_evidence(
     deleted_bytes = 0
     delete_errors = 0
     if not dry_run and unsafe == 0:
-        for item in planned:
-            if not _safe_to_delete(item, root):
-                unsafe += 1
-                continue
-            try:
-                item.path.unlink()
-            except OSError:
-                delete_errors += 1
-            else:
-                deleted_files += 1
-                deleted_bytes += item.size
+        write_connection: sqlite3.Connection | None = None
+        try:
+            for item in planned:
+                if not _safe_to_delete(item, root):
+                    unsafe += 1
+                    continue
+                frame_ref = registered_by_path.get(_path_key(item.path))
+                if frame_ref is not None:
+                    if write_connection is None:
+                        write_connection = connect_sqlite(
+                            Path(database), row_factory=sqlite3.Row
+                        )
+                    try:
+                        retire_vision_frame_artifact(
+                            write_connection,
+                            frame_ref,
+                            reason="vision evidence retention",
+                            actor="live_betting.vision_retention",
+                            retired_at=current,
+                        )
+                    except (RuntimeError, sqlite3.Error, ValueError):
+                        unsafe += 1
+                        continue
+                    if not _safe_to_delete(item, root):
+                        unsafe += 1
+                        continue
+                try:
+                    item.path.unlink()
+                except OSError:
+                    delete_errors += 1
+                else:
+                    deleted_files += 1
+                    deleted_bytes += item.size
+        finally:
+            if write_connection is not None:
+                write_connection.close()
 
     return VisionRetentionResult(
         dry_run=dry_run,

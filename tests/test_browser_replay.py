@@ -113,7 +113,7 @@ def test_replay_reads_immutable_payload_and_orders_by_capture_time() -> None:
         with closing(sqlite3.connect(source)) as connection:
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(
-                    "UPDATE browser_events SET payload_json='{}' WHERE event_id=?",
+                    "UPDATE browser_events SET payload_json='[]' WHERE event_id=?",
                     (f"{1:064x}",),
                 )
 

@@ -6,16 +6,21 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from event_intelligence.ingest_adapters import SQLiteIngestAdapter
+from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
+from event_intelligence.registry import EventRegistry
 from event_intelligence.storage import IntelligenceStorage
+from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import claim
+from live_betting.raybet import parse_raybet_map_final
 from live_betting.report import build_report
 from live_betting.storage import LiveBettingStore
 from live_betting.strict_read_gate import strict_read_gate
@@ -27,7 +32,12 @@ from live_betting.strict_eligibility import (
     init_strict_live_eligibility_schema,
     invalidate_strict_live_map_mapping,
     query_strict_live_eligibility,
+    query_strict_mapping_snapshot,
     record_strict_live_mapping_candidate,
+)
+from tests.draft_authority_fixture import (
+    make_test_vision_observation,
+    seed_test_draft_authority,
 )
 from web.alerts import init_alert_schema
 from web.monitoring import build_monitor_snapshot, monitor_cursor
@@ -39,6 +49,32 @@ RECORDED_AT = datetime(2026, 7, 14, 0, 0, tzinfo=timezone.utc)
 METADATA_AT = datetime(2026, 7, 13, 11, 0, tzinfo=timezone.utc)
 SCHEDULE_RAW = "2026-04-20 12:00:00"
 SCHEDULE_UTC = datetime(2026, 4, 20, 4, 0, tzinfo=timezone.utc)
+
+
+def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
+    return {
+        "result": {
+            "id": "1001",
+            "game_id": 151,
+            "team": [
+                {"team_id": 501, "team_name": "Alpha", "pos": 1},
+                {"team_id": 502, "team_name": "Beta", "pos": 2},
+            ],
+            "odds": [
+                {
+                    "id": row.odds_id,
+                    "odds_group_id": row.odds_group_id or "",
+                    "team_id": 501 if row.market.side == "team_one" else 502,
+                    "match_stage": row.market.period.replace("map_", "r"),
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "odds": str(row.price),
+                    "status": row.status,
+                }
+                for row in rows
+            ],
+        }
+    }
 
 
 def evidence(
@@ -55,7 +91,7 @@ def evidence(
 ) -> dict[str, object]:
     return {
         "kind": "manual_cross_source_review",
-        "raybet_url": "https://example.invalid/raybet/match-1",
+        "raybet_url": "https://example.invalid/raybet/1001",
         "official_event_url": "https://example.invalid/event",
         "tournament": {
             "raybet_name": raybet_tournament,
@@ -102,7 +138,7 @@ def raybet_payload(
     stage: str | None = None,
 ) -> dict[str, object]:
     row: dict[str, object] = {
-        "id": "match-1",
+        "id": "1001",
         "game_id": 151,
         "tournament_name": tournament,
         "start_time": scheduled_at,
@@ -177,7 +213,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
     def accept(self, **overrides: object):
         values: dict[str, object] = {
-            "raybet_match_id": "match-1",
+            "raybet_match_id": "1001",
             "map_number": 1,
             "event_id": EVENT_ID,
             "team_one_id": 501,
@@ -201,10 +237,113 @@ class StrictLiveEligibilityTests(unittest.TestCase):
     def query(self, *, at: datetime = RECORDED_AT, map_number: int = 1):
         return query_strict_live_eligibility(
             self.connection,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             map_number=map_number,
             transport_observed_at=at,
         )
+
+    def store_winner_response(
+        self,
+        store: LiveBettingStore,
+        *,
+        signal: OddsSnapshot,
+        observation_key: str,
+    ) -> list[OddsSnapshot]:
+        opposite_side = (
+            "team_two" if signal.market.side == "team_one" else "team_one"
+        )
+        rows = [
+            signal,
+            OddsSnapshot(
+                signal.raybet_match_id,
+                f"{signal.odds_id}-opposite",
+                signal.odds_group_id,
+                signal.received_at,
+                1.5,
+                signal.status,
+                Market(
+                    "winner",
+                    signal.market.period,
+                    opposite_side,
+                    None,
+                    opposite_side,
+                    True,
+                ),
+            ),
+        ]
+        store.store_odds_observation(
+            source="direct",
+            observation_key=observation_key,
+            source_event_id=None,
+            raybet_match_id=signal.raybet_match_id,
+            observed_at=signal.received_at,
+            normalized_state_hash=normalized_state_hash(rows),
+            snapshots=rows,
+            raw_payload=raw_odds_payload(rows),
+        )
+        return rows
+
+    def test_historical_snapshot_survives_only_later_invalidation(self) -> None:
+        mapping = self.accept()
+        invalidated_at = RECORDED_AT + timedelta(hours=1)
+        with patch(
+            "live_betting.strict_eligibility._utc_now",
+            return_value=invalidated_at,
+        ):
+            invalidate_strict_live_map_mapping(
+                self.connection,
+                mapping_id=mapping.mapping_id,
+                reason="later correction",
+                invalidated_by="operator-b",
+                invalidated_at=invalidated_at,
+            )
+
+        historical = query_strict_mapping_snapshot(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            observed_at=RECORDED_AT,
+        )
+        after_invalidation = query_strict_mapping_snapshot(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            observed_at=invalidated_at,
+        )
+
+        self.assertTrue(historical.eligible)
+        self.assertEqual(historical.mapping, mapping)
+        self.assertFalse(after_invalidation.eligible)
+        self.assertEqual(after_invalidation.reason, "mapping_invalidated")
+
+    def test_historical_snapshot_rejects_tampered_immutable_payload(self) -> None:
+        mapping = self.accept()
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "accepted strict live mappings are immutable",
+        ):
+            self.connection.execute(
+                """UPDATE strict_live_map_mappings
+                      SET raybet_identity_json='{"tampered":true}'
+                    WHERE mapping_id=?""",
+                (mapping.mapping_id,),
+            )
+        self.connection.execute(
+            "DROP TRIGGER strict_live_map_mappings_no_update"
+        )
+        self.connection.execute(
+            """UPDATE strict_live_map_mappings
+                  SET raybet_identity_json='{"tampered":true}'
+                WHERE mapping_id=?""",
+            (mapping.mapping_id,),
+        )
+
+        result = query_strict_mapping_snapshot(
+            self.connection,
+            mapping_id=mapping.mapping_id,
+            observed_at=RECORDED_AT,
+        )
+
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "mapping_identity_hash_invalid")
 
     def create_pending_order(
         self,
@@ -214,13 +353,14 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         map_number: int = 1,
         signal_at: datetime = RECORDED_AT,
         expected_insert: bool = True,
+        insert_order: bool = True,
         order_overrides: dict[str, object] | None = None,
     ) -> ShadowOrder:
         order_label = order_key
         strategy_version = "strict-test-v1"
         input_ref = f"{order_label}:input"
         signal = OddsSnapshot(
-            "match-1",
+            "1001",
             f"{order_label}-winner-one",
             f"{order_label}-winner-group",
             signal_at,
@@ -232,7 +372,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         )
         identity = "|".join(
             (
-                "match-1",
+                "1001",
                 signal.odds_id,
                 signal.odds_group_id or "",
                 signal.market.outcome_key,
@@ -244,7 +384,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         order_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
         order = ShadowOrder(
             order_key=order_key,
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             odds_id=signal.odds_id,
             market=signal.market,
             signaled_at=signal_at,
@@ -258,34 +398,51 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             signal_outcome_key=signal.market.outcome_key,
             signal_identity_verified=True,
         )
-        if order_overrides:
-            order = replace(order, **order_overrides)
         with LiveBettingStore(self.path) as store:
-            store.store_odds_observation(
-                source="direct",
-                observation_key=order.signal_transport_key,
-                source_event_id=None,
+            draft_authority = seed_test_draft_authority(
+                store.connection,
                 raybet_match_id=order.raybet_match_id,
+                map_number=map_number,
+                strict_mapping_id=mapping_id,
                 observed_at=signal_at,
-                normalized_state_hash=normalized_state_hash([signal]),
-                snapshots=[signal],
+                label=f"strict-live-map-{mapping_id}-{map_number}",
             )
+            signal_vision = make_test_vision_observation(
+                raybet_match_id=order.raybet_match_id,
+                map_number=map_number,
+                captured_at=signal_at,
+                label=(
+                    f"strict-live:{mapping_id}:{map_number}:"
+                    f"{signal_at.isoformat()}:frame"
+                ),
+            )
+            store.insert_vision_observation(signal_vision)
+            signal_rows = self.store_winner_response(
+                store,
+                signal=signal,
+                observation_key=order.signal_transport_key,
+            )
+            market_probability = price_groups(signal_rows)[signal.odds_id]
+            order = replace(order, market_probability=market_probability)
+            if order_overrides:
+                order = replace(order, **order_overrides)
             self.assertTrue(
                 store.insert_decision(
                     SimpleNamespace(
                         decision_key=f"{order_label}:decision",
-                        raybet_match_id="match-1",
+                        raybet_match_id="1001",
                         map_number=map_number,
                         decided_at=signal_at,
                         underdog_side="team_one",
-                        market_probability=0.4,
+                        market_probability=market_probability,
                         model_probability=0.6,
-                        edge=0.2,
+                        edge=0.6 - market_probability,
                         data_quality=0.8,
                         eligible=True,
                         reason="eligible",
                         contributions={
                             "__inputs__": {
+                                "draft_authority": asdict(draft_authority),
                                 "strict_live_eligibility": {
                                     "mapping_refs": {
                                         "strict_mapping_id": mapping_id
@@ -293,7 +450,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                                 },
                                 "vision": {
                                     "captured_at": signal_at.isoformat(),
-                                    "source_frame_ref": f"{order_label}:frame",
+                                    "source_frame_ref": signal_vision.source_frame_ref,
                                     "game_clock_seconds": 600,
                                 },
                                 "quality": {"aggregate": 0.8},
@@ -306,21 +463,29 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                         },
                         input_ref=input_ref,
                         strategy_version=strategy_version,
-                    )
+                    ),
+                    draft_authority=draft_authority,
+                    vision_observation=signal_vision,
+                    vision_transport_key=order.signal_transport_key,
                 )
             )
-            self.assertEqual(
-                store.insert_map_order(
-                    order, map_number, strict_mapping_id=mapping_id
-                ),
-                expected_insert,
-            )
+            if insert_order:
+                self.assertEqual(
+                    store.insert_map_order(
+                        order,
+                        map_number,
+                        strict_mapping_id=mapping_id,
+                        draft_authority=draft_authority,
+                    ),
+                    expected_insert,
+                )
         return order
 
     def create_confirmed_order_outputs(
         self, order: ShadowOrder, *, map_number: int, dota_match_id: int
     ) -> None:
         successor_at = order.signal_transport_at + timedelta(seconds=2)
+        result_at = successor_at + timedelta(seconds=1)
         successor = OddsSnapshot(
             order.raybet_match_id,
             order.odds_id,
@@ -331,14 +496,10 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             order.market,
         )
         with LiveBettingStore(self.path) as store:
-            store.store_odds_observation(
-                source="direct",
+            successor_rows = self.store_winner_response(
+                store,
+                signal=successor,
                 observation_key=f"{order.order_key}:successor",
-                source_event_id=None,
-                raybet_match_id=order.raybet_match_id,
-                observed_at=successor_at,
-                normalized_state_hash=normalized_state_hash([successor]),
-                snapshots=[successor],
             )
             resolved = store.process_pending_successor(
                 order, watermark=successor_at
@@ -346,22 +507,138 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             self.assertIsNotNone(resolved)
             assert resolved is not None
             self.assertEqual(resolved.status, "filled")
+            strict_mapping_id = int(
+                store.connection.execute(
+                    "SELECT strict_mapping_id FROM shadow_orders WHERE order_key=?",
+                    (order.order_key,),
+                ).fetchone()[0]
+            )
+            response = raw_odds_payload(successor_rows)
+            result = response["result"]
+            self.assertIsInstance(result, dict)
+            assert isinstance(result, dict)
+            teams = result["team"]
+            odds = result["odds"]
+            self.assertIsInstance(teams, list)
+            self.assertIsInstance(odds, list)
+            assert isinstance(teams, list)
+            assert isinstance(odds, list)
+            for index, team in enumerate(teams):
+                self.assertIsInstance(team, dict)
+                assert isinstance(team, dict)
+                team["score"] = {f"r{map_number}": 1 if index == 0 else 0}
+            for row in odds:
+                self.assertIsInstance(row, dict)
+                assert isinstance(row, dict)
+                row["status"] = "5"
+                row["win"] = 1 if row["team_id"] == 501 else 0
+
+            raybet_final = parse_raybet_map_final(
+                result,
+                map_number,
+                observed_at=result_at,
+                expected_match_id=order.raybet_match_id,
+                expected_team_ids=(501, 502),
+            )
+            self.assertEqual(raybet_final.status, "confirmed")
+            raybet_artifact = store.archive_response_payload(
+                response,
+                observed_at=result_at,
+                match_id=order.raybet_match_id,
+                response_kind="final_odds",
+            )
+            raybet_audit_key = store.record_direct_response_audit(
+                raybet_artifact,
+                response_kind="final_odds",
+                claimed_raybet_match_id=order.raybet_match_id,
+                observed_raybet_match_id=order.raybet_match_id,
+                disposition="audit_only",
+                reason="final_result_evidence",
+            )
+
+            opendota_payload = {
+                "match_id": dota_match_id,
+                "radiant_win": True,
+                "radiant_team_id": 101,
+                "dire_team_id": 202,
+                "radiant_score": 30,
+                "dire_score": 20,
+                "duration": 2400,
+            }
+            intelligence = IntelligenceStorage(
+                self.path, connection=store.connection
+            )
+            ingest = SQLiteIngestAdapter(
+                intelligence, EventRegistry(intelligence)
+            )
+            opendota_receipt = RawArchive(
+                Path(self.directory.name) / "opendota-raw",
+                observation_sink=ingest.record_raw_artifact,
+            ).archive_json(
+                source="opendota",
+                endpoint=f"/api/matches/{dota_match_id}",
+                request_identity=f"/api/matches/{dota_match_id}",
+                payload_bytes=canonical_json_bytes(opendota_payload),
+                observed_at=result_at,
+                match_id=dota_match_id,
+                status_code=200,
+                first_usable_at=result_at,
+            )
             reconciliation = store.record_settlement_reconciliation(
                 raybet_match_id=order.raybet_match_id,
                 map_number=map_number,
+                strict_mapping_id=strict_mapping_id,
                 dota_match_id=dota_match_id,
-                raybet_status="confirmed",
-                raybet_winner_side="team_one",
+                raybet_status=raybet_final.status,
+                raybet_winner_side=raybet_final.winner_side,
                 opendota_winner_side="team_one",
-                raybet_evidence_ref=f"raybet:{dota_match_id}",
-                opendota_evidence_ref=f"opendota:{dota_match_id}",
-                raybet_facts={"winner": "team_one"},
-                opendota_facts={"winner": "team_one"},
+                raybet_evidence_ref=raybet_final.evidence_ref,
+                opendota_evidence_ref=(
+                    f"opendota:{dota_match_id}:sha256:"
+                    f"{opendota_receipt.content_sha256}"
+                ),
+                raybet_facts=raybet_final.facts(),
+                opendota_facts={
+                    "winner_side": "team_one",
+                    "team_one_kills": 30,
+                    "team_two_kills": 20,
+                    "duration_seconds": 2400,
+                },
                 status="confirmed",
                 reason="sources_agree",
-                observed_at=successor_at,
+                raybet_observed_at=result_at,
+                opendota_observed_at=result_at,
+                opendota_first_usable_at=result_at,
+                raybet_audit_key=raybet_audit_key,
+                raybet_transport_key=None,
+                raybet_response_state_hash=None,
+                raybet_response_artifact_hash=raybet_artifact.content_sha256,
+                opendota_artifact_id=(
+                    f"opendota:{opendota_receipt.content_sha256}"
+                ),
+                opendota_observation_id=opendota_receipt.observation_id,
+                opendota_content_hash=opendota_receipt.content_sha256,
             )
             self.assertEqual(reconciliation["status"], "confirmed")
+            reconciliation_ref = (
+                f"settlement-reconciliation:{order.raybet_match_id}:map:{map_number}"
+            )
+            self.assertTrue(
+                store.insert_map_result(
+                    SimpleNamespace(
+                        raybet_match_id=order.raybet_match_id,
+                        map_number=map_number,
+                        dota_match_id=dota_match_id,
+                        winner_side="team_one",
+                        team_one_kills=30,
+                        team_two_kills=20,
+                        duration_seconds=2400,
+                        evidence_ref=reconciliation_ref,
+                        settled_at=result_at,
+                    ),
+                    strict_mapping_id=strict_mapping_id,
+                )
+            )
             self.assertTrue(
                 store.enqueue_notification(
                     order_key=order.order_key,
@@ -379,8 +656,8 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                     order.order_key,
                     "win",
                     order.signal_price,
-                    successor_at,
-                    f"opendota:{dota_match_id}",
+                    result_at,
+                    reconciliation_ref,
                 )
             )
             store.connection.execute(
@@ -618,7 +895,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         for method in ("candidate", "fuzzy"):
             record_strict_live_mapping_candidate(
                 self.connection,
-                raybet_match_id="match-1",
+                raybet_match_id="1001",
                 map_number=1,
                 source="name_search",
                 evidence={"matched_text": "PGL Wallachia"},
@@ -642,7 +919,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         with self.assertRaises(StrictMappingError):
             record_strict_live_mapping_candidate(
                 self.connection,
-                raybet_match_id="match-1",
+                raybet_match_id="1001",
                 map_number=1,
                 source="bad",
                 evidence={"name": "Alpha"},
@@ -984,7 +1261,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         gate = strict_read_gate(
             self.connection,
             mapping_id_sql=str(mapping.mapping_id),
-            raybet_match_id_sql="'match-1'",
+            raybet_match_id_sql="'1001'",
             map_number_sql="1",
             signal_at_sql=f"'{RECORDED_AT.isoformat()}'",
             dependent_type="research_prediction",
@@ -1045,7 +1322,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
     def test_missing_raw_identity_and_invalid_inputs_fail_closed(self) -> None:
         self.connection.execute(
-            "UPDATE raybet_matches SET raw_json='{}' WHERE raybet_match_id='match-1'"
+            "UPDATE raybet_matches SET raw_json='{}' WHERE raybet_match_id='1001'"
         )
         self.connection.commit()
         self.assertEqual(self.query().reason, "accepted_mapping_missing")
@@ -1055,7 +1332,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.assertEqual(
             query_strict_live_eligibility(
                 self.connection,
-                raybet_match_id="match-1",
+                raybet_match_id="1001",
                 map_number=0,
                 transport_observed_at=RECORDED_AT,
             ).reason,
@@ -1064,7 +1341,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.assertEqual(
             query_strict_live_eligibility(
                 self.connection,
-                raybet_match_id="match-1",
+                raybet_match_id="1001",
                 map_number=1,
                 transport_observed_at=RECORDED_AT.replace(tzinfo=None),
             ).reason,
@@ -1140,7 +1417,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         gate = strict_read_gate(
             self.connection,
             mapping_id_sql=str(automatic.mapping_id),
-            raybet_match_id_sql="'match-1'",
+            raybet_match_id_sql="'1001'",
             map_number_sql="2",
             signal_at_sql=f"'{RECORDED_AT.isoformat()}'",
             dependent_type="shadow_order",
@@ -1263,19 +1540,12 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             acceptance_mode="automatic_exact",
             accepted_by="automatic-mapper",
         )
-        self.connection.execute(
-            """INSERT INTO strategy_decisions VALUES
-               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "decision-map-2", "match-1", 2, RECORDED_AT.isoformat(),
-                "team_one", 0.4, 0.5, 0.1, 1.0, 1, "test",
-                json.dumps({"__inputs__": {"strict_live_eligibility": {
-                    "mapping_refs": {"strict_mapping_id": automatic.mapping_id}
-                }}}),
-                "input-ref", "test-version",
-            ),
+        self.create_pending_order(
+            automatic.mapping_id,
+            order_key="decision-map-2",
+            map_number=2,
+            insert_order=False,
         )
-        self.connection.commit()
 
         invalidation_id = invalidate_strict_live_map_mapping(
             self.connection,
@@ -1284,19 +1554,12 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             invalidated_by="operator-c",
             invalidated_at=RECORDED_AT,
         )
-        self.connection.execute(
-            """INSERT INTO strategy_decisions VALUES
-               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "decision-map-2-late", "match-1", 2, RECORDED_AT.isoformat(),
-                "team_one", 0.4, 0.5, 0.1, 1.0, 1, "test",
-                json.dumps({"__inputs__": {"strict_live_eligibility": {
-                    "mapping_refs": {"strict_mapping_id": automatic.mapping_id}
-                }}}),
-                "input-ref-late", "test-version",
-            ),
+        self.create_pending_order(
+            automatic.mapping_id,
+            order_key="decision-map-2-late",
+            map_number=2,
+            insert_order=False,
         )
-        self.connection.commit()
 
         result = self.query(map_number=2)
         self.assertFalse(result.eligible)
@@ -1311,19 +1574,23 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                     automatic.mapping_id,
                     invalidation_id,
                     "strategy_decision",
-                    "decision-map-2",
+                    "decision-map-2:decision",
                 ),
                 (
                     automatic.mapping_id,
                     invalidation_id,
                     "strategy_decision",
-                    "decision-map-2-late",
+                    "decision-map-2-late:decision",
                 ),
             },
         )
 
     def test_late_direct_dependents_after_invalidation_are_flagged(self) -> None:
         mapping = self.accept()
+        existing_order = self.create_pending_order(
+            mapping.mapping_id,
+            order_key="late-order",
+        )
         invalidation_id = invalidate_strict_live_map_mapping(
             self.connection,
             mapping_id=mapping.mapping_id,
@@ -1331,52 +1598,22 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             invalidated_by="operator-b",
             invalidated_at=RECORDED_AT,
         )
-        mapping_inputs = {"__inputs__": {"strict_live_eligibility": {
-            "mapping_refs": {"strict_mapping_id": mapping.mapping_id}
-        }}}
-        self.connection.execute(
-            """INSERT INTO strategy_decisions VALUES
-               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "late-decision", "match-1", 1, RECORDED_AT.isoformat(),
-                "team_one", 0.4, 0.5, 0.1, 1.0, 1, "test",
-                json.dumps(mapping_inputs), "late-input", "test-version",
-            ),
+        late_decision = self.create_pending_order(
+            mapping.mapping_id,
+            order_key="late-decision",
+            insert_order=False,
         )
-        self.connection.execute(
-            """INSERT INTO odds_transport_observations
-               (observation_key, source, source_event_id, raybet_match_id,
-                observed_at, normalized_state_hash, timing_status,
-                processing_status, normalized_change_count)
-               VALUES (?, 'direct', NULL, ?, ?, ?, 'on_time', 'processed', 0)""",
-            (
-                "late-transport",
-                "match-1",
-                RECORDED_AT.isoformat(),
-                "a" * 64,
-            ),
+        transport_hash = str(
+            self.connection.execute(
+                """SELECT normalized_state_hash FROM odds_transport_observations
+                    WHERE observation_key=?""",
+                (late_decision.signal_transport_key,),
+            ).fetchone()[0]
         )
-        self.connection.execute(
-            """INSERT INTO shadow_orders
-               (order_key, raybet_match_id, strict_mapping_id, odds_id,
-                market_key, signaled_at, model_probability, market_probability,
-                signal_price, signal_transport_key, signal_transport_at,
-                expires_at, signal_odds_group_id, signal_outcome_key,
-                signal_identity_verified, stake, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "late-order", "match-1", mapping.mapping_id, "odds-1",
-                "winner|map_1|team_one|", RECORDED_AT.isoformat(), 0.5, 0.4,
-                2.5, "late-transport", RECORDED_AT.isoformat(),
-                (RECORDED_AT + timedelta(seconds=15)).isoformat(),
-                "group-1", "team_one", 1, 1.0, "pending",
-            ),
-        )
-        self.connection.commit()
         prediction = SimpleNamespace(
             prediction_key="late-prediction",
             schema_version="research-live-v1",
-            raybet_match_id="match-1",
+            raybet_match_id="1001",
             map_number=1,
             observed_at=RECORDED_AT,
             game_clock_seconds=600,
@@ -1388,8 +1625,8 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             feature_hash=None,
             model_hash=None,
             calibration_hash=None,
-            transport_key="late-transport",
-            transport_hash="a" * 64,
+            transport_key=late_decision.signal_transport_key,
+            transport_hash=transport_hash,
             radiant_hero_ids=(1, 2, 3, 4, 5),
             dire_hero_ids=(6, 7, 8, 9, 10),
             radiant_team_side="team_one",
@@ -1419,7 +1656,13 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                     mapping.mapping_id,
                     invalidation_id,
                     "strategy_decision",
-                    "late-decision",
+                    "late-decision:decision",
+                ),
+                (
+                    mapping.mapping_id,
+                    invalidation_id,
+                    "strategy_decision",
+                    "late-order:decision",
                 ),
                 (
                     mapping.mapping_id,
@@ -1431,48 +1674,17 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                     mapping.mapping_id,
                     invalidation_id,
                     "shadow_order",
-                    "late-order",
+                    existing_order.order_key,
                 ),
             },
         )
 
     def test_invalidation_is_append_only_and_flags_dependent_outputs(self) -> None:
         mapping = self.accept()
-        mapping_refs = {"strict_mapping_id": mapping.mapping_id}
-        self.connection.execute(
-            """INSERT INTO strategy_decisions VALUES
-               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "decision-1", "match-1", 1, RECORDED_AT.isoformat(), "team_one",
-                0.4, 0.5, 0.1, 1.0, 1, "test",
-                json.dumps({"__inputs__": {"strict_live_eligibility": {
-                    "mapping_refs": mapping_refs
-                }}}),
-                "input-ref", "test-version",
-            ),
+        order = self.create_pending_order(
+            mapping.mapping_id,
+            order_key="order-1",
         )
-        self.connection.execute(
-            """INSERT INTO shadow_orders
-               (order_key, raybet_match_id, strict_mapping_id, odds_id,
-                market_key, signaled_at,
-                model_probability, market_probability, signal_price,
-                signal_transport_key, signal_transport_at, expires_at,
-                signal_odds_group_id, signal_outcome_key,
-                signal_identity_verified, stake, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "order-1", "match-1", mapping.mapping_id, "odds-1",
-                "winner|map_1|team_one|",
-                RECORDED_AT.isoformat(), 0.5, 0.4, 2.5, "transport-1",
-                RECORDED_AT.isoformat(), (RECORDED_AT + timedelta(seconds=10)).isoformat(),
-                "group-1", "team_one", 1, 1.0, "pending",
-            ),
-        )
-        self.connection.execute(
-            "INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)",
-            ("match-1", 1, "order-1", "pending", RECORDED_AT.isoformat()),
-        )
-        self.connection.commit()
 
         invalidation_id = invalidate_strict_live_map_mapping(
             self.connection,
@@ -1494,7 +1706,10 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             {tuple(row) for row in self.connection.execute(
                 "SELECT dependent_type, dependent_key FROM strict_live_mapping_impacts"
             )},
-            {("strategy_decision", "decision-1"), ("shadow_order", "order-1")},
+            {
+                ("strategy_decision", "order-1:decision"),
+                ("shadow_order", order.order_key),
+            },
         )
         with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
             self.connection.execute(
@@ -1525,7 +1740,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         )
         successor_at = RECORDED_AT + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             order.odds_id,
             order.signal_odds_group_id,
             successor_at,
@@ -1535,14 +1750,10 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         )
 
         with LiveBettingStore(self.path) as store:
-            store.store_odds_observation(
-                source="direct",
+            self.store_winner_response(
+                store,
+                signal=successor,
                 observation_key="strict-order:successor",
-                source_event_id=None,
-                raybet_match_id=order.raybet_match_id,
-                observed_at=successor_at,
-                normalized_state_hash=normalized_state_hash([successor]),
-                snapshots=[successor],
             )
             self.assertEqual(
                 store.pending_order_block_reason(order.order_key),
@@ -1569,7 +1780,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         order = self.create_pending_order(mapping.mapping_id, order_key="filled-order")
         successor_at = RECORDED_AT + timedelta(seconds=2)
         successor = OddsSnapshot(
-            "match-1",
+            "1001",
             order.odds_id,
             order.signal_odds_group_id,
             successor_at,
@@ -1578,14 +1789,10 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             order.market,
         )
         with LiveBettingStore(self.path) as store:
-            store.store_odds_observation(
-                source="direct",
+            self.store_winner_response(
+                store,
+                signal=successor,
                 observation_key="filled-order:successor",
-                source_event_id=None,
-                raybet_match_id=order.raybet_match_id,
-                observed_at=successor_at,
-                normalized_state_hash=normalized_state_hash([successor]),
-                snapshots=[successor],
             )
             resolved = store.process_pending_successor(
                 order, watermark=successor_at
@@ -1669,7 +1876,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.connection.execute(
             """UPDATE settlement_reconciliations
                   SET status='manual_review', reason='existing_manual_reason'
-                WHERE raybet_match_id='match-1' AND map_number=1"""
+                WHERE raybet_match_id='1001' AND map_number=1"""
         )
         self.connection.commit()
 
@@ -1685,7 +1892,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             tuple(
                 self.connection.execute(
                     """SELECT status, reason FROM settlement_reconciliations
-                        WHERE raybet_match_id='match-1' AND map_number=1"""
+                        WHERE raybet_match_id='1001' AND map_number=1"""
                 ).fetchone()
             ),
             ("manual_review", "existing_manual_reason"),
@@ -1698,7 +1905,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             self.assertEqual(
                 store._strict_mapping_context_block_reason(
                     strict_mapping_id=mapping.mapping_id + 10_000,
-                    raybet_match_id="match-1",
+                    raybet_match_id="1001",
                     map_number=1,
                     signal_transport_at=RECORDED_AT,
                 ),
@@ -1720,6 +1927,12 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             "DROP TRIGGER IF EXISTS shadow_orders_require_strict_mapping_insert"
         )
         self.connection.execute(
+            "DROP TRIGGER IF EXISTS shadow_order_draft_authority_insert"
+        )
+        self.connection.execute(
+            "DROP TRIGGER IF EXISTS shadow_order_vision_authority_insert"
+        )
+        self.connection.execute(
             """INSERT INTO shadow_orders
                (order_key, raybet_match_id, strict_mapping_id, odds_id,
                 market_key, signaled_at, model_probability, market_probability,
@@ -1729,7 +1942,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 "legacy-null-mapping",
-                "match-1",
+                "1001",
                 "legacy-odds",
                 "winner|map_1|team_one|",
                 RECORDED_AT.isoformat(),
@@ -1751,7 +1964,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.connection.execute(
             "INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)",
             (
-                "match-1",
+                "1001",
                 1,
                 "legacy-null-mapping",
                 "filled",
@@ -1813,27 +2026,10 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
     def test_replacement_invalidation_does_not_claim_prior_shadow_order(self) -> None:
         original = self.accept()
-        self.connection.execute(
-            """INSERT INTO shadow_orders
-               (order_key, raybet_match_id, strict_mapping_id, odds_id,
-                market_key, signaled_at, model_probability, market_probability,
-                signal_price, signal_transport_key, signal_transport_at,
-                expires_at, signal_odds_group_id, signal_outcome_key,
-                signal_identity_verified, stake, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "original-order", "match-1", original.mapping_id, "odds-1",
-                "winner|map_1|team_one|", RECORDED_AT.isoformat(), 0.5, 0.4,
-                2.5, "transport-original", RECORDED_AT.isoformat(),
-                (RECORDED_AT + timedelta(seconds=15)).isoformat(),
-                "group-1", "team_one", 1, 1.0, "pending",
-            ),
+        original_order = self.create_pending_order(
+            original.mapping_id,
+            order_key="original-order",
         )
-        self.connection.execute(
-            "INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)",
-            ("match-1", 1, "original-order", "pending", RECORDED_AT.isoformat()),
-        )
-        self.connection.commit()
         original_invalidation = invalidate_strict_live_map_mapping(
             self.connection,
             mapping_id=original.mapping_id,
@@ -1857,7 +2053,13 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                      FROM strict_live_mapping_impacts
                     WHERE dependent_type='shadow_order'"""
             )],
-            [(original.mapping_id, original_invalidation, "original-order")],
+            [
+                (
+                    original.mapping_id,
+                    original_invalidation,
+                    original_order.order_key,
+                )
+            ],
         )
 
 
