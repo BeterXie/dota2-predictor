@@ -22,7 +22,11 @@ from typing import Any
 from event_intelligence.raw_archive import RawArchive, schema_fingerprint
 from shared.sqlite import connect, execute_script
 
-from .database_protocol import online_backup, verify_prepared_database
+from .database_protocol import (
+    CUTOVER_SAFETY_MARGIN_BYTES,
+    online_backup,
+    verify_prepared_database,
+)
 from .markets import legacy_normalized_state_hash_v1, normalized_state_hash
 from .models import Market, OddsSnapshot
 from .odds_response_authority import (
@@ -40,7 +44,7 @@ _WORK_DATABASE = "compaction-work.db"
 _OUTPUT_DATABASE = "dota2-compacted.db"
 _RAW_ROOT = Path("live_betting") / "raw-v2"
 _MANIFEST = "compaction-manifest.json"
-_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
+_SAFETY_MARGIN_BYTES = CUTOVER_SAFETY_MARGIN_BYTES
 _COMMIT_BATCH_SIZE = 100
 _LEGACY_COLUMNS = (
     "odds_id",

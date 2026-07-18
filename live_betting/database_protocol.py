@@ -28,6 +28,9 @@ from .strict_eligibility import strict_live_mapping_schema_requires_rebuild
 from .vision_frame_registry import verify_vision_frame_registry
 
 
+CUTOVER_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class DatabasePreparation:
     database: Path
@@ -751,6 +754,7 @@ def prepare_database(
 
 __all__ = [
     "DatabasePreparation",
+    "CUTOVER_SAFETY_MARGIN_BYTES",
     "WalCheckpointResult",
     "check_schema_versions",
     "online_backup",

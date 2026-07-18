@@ -35,10 +35,34 @@ def test_database_operations_runbook_covers_the_published_clis() -> None:
     )
     for command in required:
         assert command in runbook
-    assert "`3L + R + M`" in runbook
-    assert "`C + A + M`" in runbook
+    assert "`M_c = 512 MiB`" in runbook
+    assert "`M_b = 512 MiB`" in runbook
+    assert "`3L + R + M_c`" in runbook
+    assert "`C + A + M_b`" in runbook
     assert "it is not a read-only verification command" in runbook
     assert "--database`, then\n`DATABASE_PATH`, then `web/config.yaml`" in runbook
+
+
+def test_cutover_runbook_uses_one_candidate_database_for_every_process() -> None:
+    runbook = (ROOT / "live_betting" / "README.md").read_text(encoding="utf-8")
+    required = (
+        '$candidateDb = Join-Path $restoreDir "dota2.db"',
+        "python -m web.main --database $candidateDb",
+        "python scripts/run_dota_shadow_service.py",
+        "--database $candidateDb",
+        "--start-collector",
+        "--start-companion",
+        "--start-shadow",
+        "--start-vision",
+        "--start-mail",
+        "--start-strict-ingest",
+        "--start-postmatch",
+        "--start-draft-publisher",
+    )
+    for value in required:
+        assert value in runbook
+    assert "Web process and all workers must use `$candidateDb`" in runbook
+    assert "never run the old\nproduction database and the candidate database" in runbook
 
 
 def test_compactor_help_tracks_the_current_schema_instead_of_a_number() -> None:

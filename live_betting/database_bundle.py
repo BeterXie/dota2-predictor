@@ -24,7 +24,11 @@ from event_intelligence.raw_registry import (
 )
 from shared.sqlite import connect
 
-from .database_protocol import online_backup, verify_prepared_database
+from .database_protocol import (
+    CUTOVER_SAFETY_MARGIN_BYTES,
+    online_backup,
+    verify_prepared_database,
+)
 from .vision_frame_registry import (
     relocate_vision_frame_artifacts,
     verify_vision_frame_registry,
@@ -39,7 +43,24 @@ _RESTORE_MANIFEST_FILE = "restore-manifest.json"
 _STAGING_MANIFEST_FILE = "staging-manifest.json"
 _STAGING_FORMAT = "dota2-database-bundle-staging-v1"
 _RESTORE_STAGING_FORMAT = "dota2-database-bundle-restore-staging-v1"
-_SPACE_MARGIN_BYTES = 1024 * 1024
+_SPACE_MARGIN_BYTES = CUTOVER_SAFETY_MARGIN_BYTES
+_SOURCE_TREE_POLICY_VERSION = "runtime-only-v1"
+_RUNTIME_ONLY_PREFIXES = (
+    "data/",
+    "dogfood-output/",
+    "dist/",
+    "build/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    ".mypy_cache/",
+)
+_RUNTIME_ONLY_EXACT = frozenset(
+    {
+        "web/frontend/tsconfig.app.tsbuildinfo",
+        "web/frontend/tsconfig.node.tsbuildinfo",
+    }
+)
+_RUNTIME_ONLY_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
 
 
 @dataclass(frozen=True)
@@ -195,6 +216,89 @@ def _git_commit() -> str:
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise RuntimeError("source git commit is invalid")
     return commit
+
+
+def _git_status_porcelain() -> tuple[str, ...]:
+    repository = Path(__file__).resolve().parents[1]
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot determine source worktree status") from error
+    return tuple(line for line in completed.stdout.splitlines() if line.strip())
+
+
+def _status_paths(raw: str) -> tuple[str, ...]:
+    """Return every path represented by one porcelain status record.
+
+    Rename records contain both the old and new path.  Treating only the
+    destination as dirty would allow a source file to be renamed into an
+    allowed runtime directory while evading the source-tree guard.
+    """
+
+    path_field = raw[3:] if len(raw) >= 3 else ""
+    paths = path_field.rsplit(" -> ", 1) if " -> " in path_field else [path_field]
+    normalized: list[str] = []
+    for path in paths:
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = path[1:-1]
+        path = path.replace("\\", "/").casefold()
+        if path:
+            normalized.append(path)
+    return tuple(normalized)
+
+
+def _status_path(raw: str) -> str:
+    """Return the destination path for compatibility with older callers."""
+
+    paths = _status_paths(raw)
+    return paths[-1] if paths else ""
+
+
+def _runtime_only_path(path: str) -> bool:
+    normalized = path.casefold()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized in _RUNTIME_ONLY_EXACT:
+        return True
+    if normalized.endswith(_RUNTIME_ONLY_SUFFIXES):
+        return True
+    return any(
+        normalized == prefix[:-1] or normalized.startswith(prefix)
+        for prefix in _RUNTIME_ONLY_PREFIXES
+    )
+
+
+def _source_tree_provenance() -> dict[str, Any]:
+    head = _git_commit()
+    dirty_paths = tuple(
+        sorted(
+            {
+                path
+                for line in _git_status_porcelain()
+                for path in _status_paths(line)
+            }
+        )
+    )
+    disallowed = tuple(path for path in dirty_paths if not _runtime_only_path(path))
+    if disallowed:
+        visible = ", ".join(disallowed[:20])
+        suffix = f"; plus {len(disallowed) - 20} more" if len(disallowed) > 20 else ""
+        raise RuntimeError(
+            "source worktree contains non-runtime changes: " + visible + suffix
+        )
+    return {
+        "source_tree_clean": True,
+        "source_tree_policy_version": _SOURCE_TREE_POLICY_VERSION,
+        "source_tree_head": head,
+        "source_tree_runtime_dirty_paths": list(dirty_paths),
+    }
 
 
 def _artifact_bundle_path(
@@ -377,6 +481,21 @@ def _source_artifact_path(
     return path
 
 
+def _registered_odds_artifact_count(database: Path) -> int:
+    connection = connect(database, read_only=True)
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='odds_raw_artifacts'"
+        ).fetchone()
+        if exists is None:
+            return 0
+        return int(
+            connection.execute("SELECT COUNT(*) FROM odds_raw_artifacts").fetchone()[0]
+        )
+    finally:
+        connection.close()
+
+
 def _required_bundle_bytes(database: Path) -> int:
     connection = connect(database, read_only=True)
     try:
@@ -430,8 +549,14 @@ def create_database_bundle(
     bundle_directory = Path(bundle_directory).resolve()
     if not database.is_file():
         raise FileNotFoundError(f"database does not exist: {database}")
-    if not odds_raw_root.is_dir():
+    odds_artifact_count = _registered_odds_artifact_count(database)
+    if odds_raw_root.exists() and not odds_raw_root.is_dir():
         raise FileNotFoundError(f"odds raw root does not exist: {odds_raw_root}")
+    if not odds_raw_root.exists() and odds_artifact_count:
+        raise FileNotFoundError(
+            "odds raw root is missing for registered raw artifacts: "
+            f"{odds_raw_root}"
+        )
     if bundle_directory.exists():
         raise FileExistsError(f"bundle destination already exists: {bundle_directory}")
     try:
@@ -452,13 +577,17 @@ def create_database_bundle(
             ]
         )
     )
-    effective_git_commit = git_commit or _git_commit()
+    provenance = _source_tree_provenance()
+    effective_git_commit = git_commit or str(provenance["source_tree_head"])
+    if not re.fullmatch(r"[0-9a-f]{40,64}", effective_git_commit):
+        raise ValueError("git commit is invalid")
     binding = {
         "target": str(bundle_directory),
         "source_database": str(database),
         "odds_raw_root": str(odds_raw_root),
         "allowed_source_roots": sorted(str(root) for root in roots),
         "git_commit": effective_git_commit,
+        **provenance,
     }
 
     if staging.exists():
@@ -587,6 +716,7 @@ def create_database_bundle(
             "format": _BUNDLE_FORMAT,
             "created_at": checkpoint["created_at"],
             "git_commit": effective_git_commit,
+            **provenance,
             "publication_target": str(bundle_directory),
             "database": {
                 "path": _DATABASE_FILE,
@@ -633,6 +763,20 @@ def verify_database_bundle(bundle_directory: str | Path) -> dict[str, Any]:
     manifest = _read_manifest(bundle_root)
     if not re.fullmatch(r"[0-9a-f]{40,64}", str(manifest.get("git_commit", ""))):
         raise RuntimeError("backup bundle git commit is invalid")
+    if manifest.get("source_tree_clean") is not True:
+        raise RuntimeError("backup bundle source tree is not clean")
+    if manifest.get("source_tree_policy_version") != _SOURCE_TREE_POLICY_VERSION:
+        raise RuntimeError("backup bundle source tree policy is invalid")
+    if not re.fullmatch(
+        r"[0-9a-f]{40,64}", str(manifest.get("source_tree_head", ""))
+    ):
+        raise RuntimeError("backup bundle source tree head is invalid")
+    runtime_dirty_paths = manifest.get("source_tree_runtime_dirty_paths")
+    if not isinstance(runtime_dirty_paths, list) or any(
+        not isinstance(path, str) or not _runtime_only_path(path)
+        for path in runtime_dirty_paths
+    ):
+        raise RuntimeError("backup bundle runtime dirty path policy is invalid")
     database_meta = manifest.get("database")
     if not isinstance(database_meta, dict):
         raise RuntimeError("backup bundle database manifest is invalid")

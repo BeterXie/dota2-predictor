@@ -219,15 +219,16 @@ placeholder artifact files.
 Check free space on the destination volume before each phase. Let `L` be
 `page_count * page_size` for the prepared source, `R` the registered compressed
 raw bytes, `C` the compacted database bytes, `A` all bundle artifact bytes, and
-`M = 512 MiB`. The code enforces these free-space floors in order:
+`M_c = 512 MiB` for compaction and `M_b = 512 MiB` for bundle/restore. The
+code enforces these free-space floors in order:
 
 1. Migration snapshot: at least `L` additional bytes in `$backupDir`.
-2. Fresh compaction: at least `3L + R + M` free in `$compactionDir`'s volume.
-3. Bundle creation: at least `C + A + M` free in `$bundleDir`'s volume.
-4. Restore: at least `C + A + M` free in `$restoreDir`'s volume.
+2. Fresh compaction: at least `3L + R + M_c` free in `$compactionDir`'s volume.
+3. Bundle creation: at least `C + A + M_b` free in `$bundleDir`'s volume.
+4. Restore: at least `C + A + M_b` free in `$restoreDir`'s volume.
 
 When every new output is retained on D:, a deliberately conservative initial
-budget is `L + (3L + R + M) + (C + A + M) + (C + A + M)` additional free bytes,
+budget is `L + (3L + R + M_c) + (C + A + M_b) + (C + A + M_b)` additional free bytes,
 excluding files already present on D:. Recalculate `C` and `A` from compaction
 and bundle output before proceeding; do not rely only on the estimate.
 
@@ -279,7 +280,21 @@ read-only schema and artifact-authority preflight. Start Web against that exact
 candidate through the single database authority:
 
 ```powershell
-python -m web.main --database (Join-Path $restoreDir "dota2.db")
+$candidateDb = Join-Path $restoreDir "dota2.db"
+python -m web.main --database $candidateDb
+```
+
+Start every supervisor-managed worker against the same candidate path. The
+Web process and all workers must use `$candidateDb`; never run the old
+production database and the candidate database simultaneously:
+
+```powershell
+python scripts/run_dota_shadow_service.py `
+  --database $candidateDb `
+  --start-collector --start-companion --start-shadow --start-vision `
+  --start-mail --start-strict-ingest --start-postmatch `
+  --start-draft-publisher `
+  --vision-jsonl data/live_betting/live_observations
 ```
 
 Web resolves database paths by the documented priority `--database`, then

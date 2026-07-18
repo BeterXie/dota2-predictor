@@ -5,12 +5,14 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import live_betting.database_bundle as database_bundle
+import live_betting.odds_legacy_compactor as odds_legacy_compactor
 
 from event_intelligence.raw_archive import RawArchive
 from event_intelligence.raw_registry import relocate_raw_source_artifacts
@@ -19,7 +21,10 @@ from live_betting.database_bundle import (
     restore_database_bundle,
     verify_database_bundle,
 )
-from live_betting.database_protocol import prepare_database
+from live_betting.database_protocol import (
+    CUTOVER_SAFETY_MARGIN_BYTES,
+    prepare_database,
+)
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
 from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
@@ -31,6 +36,13 @@ from shared.sqlite import connect
 
 
 NOW = datetime(2026, 7, 17, 8, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_git_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep bundle unit tests independent of the caller's worktree state."""
+
+    monkeypatch.setattr(database_bundle, "_git_status_porcelain", lambda: ())
 
 
 def _payload() -> dict[str, object]:
@@ -188,6 +200,13 @@ def test_bundle_restores_database_and_both_raw_registries_relocatably(
     manifest = verify_database_bundle(bundle)
     assert manifest["git_commit"] == "a" * 40
     assert manifest["artifact_count"] == 2
+    assert manifest["source_tree_clean"] is True
+    assert (
+        manifest["source_tree_policy_version"]
+        == database_bundle._SOURCE_TREE_POLICY_VERSION
+    )
+    assert manifest["source_tree_head"] == database_bundle._git_commit()
+    assert manifest["source_tree_runtime_dirty_paths"] == []
 
     restored = restore_database_bundle(bundle, tmp_path / "relocated")
     with LiveBettingStore(restored.database) as store:
@@ -209,6 +228,154 @@ def test_bundle_restores_database_and_both_raw_registries_relocatably(
         "match_id": 9001,
         "radiant_win": True,
     }
+
+
+@pytest.mark.parametrize(
+    "status_line",
+    [
+        " M live_betting/storage.py",
+        "?? tests/untracked_bundle_fixture.py",
+    ],
+)
+def test_bundle_rejects_non_runtime_source_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_line: str,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    monkeypatch.setattr(
+        database_bundle, "_git_status_porcelain", lambda: (status_line,)
+    )
+
+    with pytest.raises(RuntimeError, match="non-runtime changes"):
+        create_database_bundle(
+            database,
+            odds_root,
+            tmp_path / "backup-bundle",
+            allowed_source_roots=[source_root],
+            git_commit="b" * 40,
+        )
+
+
+def test_bundle_checks_both_sides_of_a_rename_for_source_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        database_bundle,
+        "_git_status_porcelain",
+        lambda: ("R  live_betting/storage.py -> data/storage.py",),
+    )
+
+    with pytest.raises(RuntimeError, match="live_betting/storage.py"):
+        database_bundle._source_tree_provenance()
+
+
+def test_bundle_allows_runtime_only_changes_and_records_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    statuses = (
+        " M data/dota2.db",
+        "?? dogfood-output/audit.log",
+        "?? .pytest_cache/v/cache/lastfailed",
+        " M web/frontend/tsconfig.app.tsbuildinfo",
+    )
+    monkeypatch.setattr(database_bundle, "_git_status_porcelain", lambda: statuses)
+
+    bundle = tmp_path / "backup-bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+        git_commit="c" * 40,
+    )
+    manifest = verify_database_bundle(bundle)
+    assert manifest["source_tree_clean"] is True
+    assert manifest["source_tree_policy_version"] == "runtime-only-v1"
+    assert manifest["source_tree_runtime_dirty_paths"] == sorted(
+        (
+            "data/dota2.db",
+            "dogfood-output/audit.log",
+            ".pytest_cache/v/cache/lastfailed",
+            "web/frontend/tsconfig.app.tsbuildinfo",
+        )
+    )
+
+
+def test_bundle_fails_closed_when_git_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(database_bundle.subprocess, "run", unavailable)
+    with pytest.raises(RuntimeError, match="cannot determine the source git commit"):
+        database_bundle._source_tree_provenance()
+
+
+def test_bundle_fails_closed_when_git_head_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def invalid_head(
+        args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, stdout="not-a-commit\n", stderr="")
+
+    monkeypatch.setattr(database_bundle.subprocess, "run", invalid_head)
+    with pytest.raises(RuntimeError, match="source git commit is invalid"):
+        database_bundle._git_commit()
+
+
+def test_bundle_accepts_missing_raw_root_when_registry_is_empty(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    database = root / "dota2.db"
+    odds_root = root / "live_betting" / "raw-v2"
+    prepare_database(database, root / "schema-backups", now=NOW)
+
+    bundle = tmp_path / "backup-bundle"
+    result = create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        git_commit="d" * 40,
+    )
+
+    assert result.artifact_count == 0
+    assert not odds_root.exists()
+    assert verify_database_bundle(bundle)["artifact_count"] == 0
+
+
+def test_bundle_rejects_missing_raw_root_when_registry_has_artifacts(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    shutil.rmtree(odds_root)
+
+    with pytest.raises(FileNotFoundError, match="registered raw artifacts"):
+        create_database_bundle(
+            database,
+            odds_root,
+            tmp_path / "backup-bundle",
+            allowed_source_roots=[source_root],
+            git_commit="e" * 40,
+        )
+
+
+def test_cutover_safety_margin_is_shared_and_512_mib() -> None:
+    expected = 512 * 1024 * 1024
+    assert CUTOVER_SAFETY_MARGIN_BYTES == expected
+    assert database_bundle._SPACE_MARGIN_BYTES == expected
+    assert odds_legacy_compactor._SAFETY_MARGIN_BYTES == expected
 
 
 def test_bundle_roundtrip_relocates_and_reverifies_vision_frame(
