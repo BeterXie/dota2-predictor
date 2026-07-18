@@ -1006,7 +1006,7 @@ def compact_legacy_odds(
     temporary_output = output_database.with_name(f".{output_database.name}.vacuuming")
     try:
         connection = _acquire_compaction_connection(work_database)
-        archive = RawArchive(raw_root)
+        archive = RawArchive(raw_root, cache_paths=False)
         pending = 0
         for group in _iter_legacy_groups(connection):
             if not connection.in_transaction:

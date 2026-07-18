@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+import live_betting.odds_legacy_compactor as odds_legacy_compactor
 from live_betting.database_protocol import prepare_database
 from live_betting.markets import (
     legacy_normalized_state_hash_v1,
@@ -335,6 +336,65 @@ def test_compactor_deduplicates_state_and_raw_variance_without_changing_source(
         assert str(converted_hash[0]) != original_hash
     finally:
         connection.close()
+
+
+def test_compactor_disables_unbounded_raw_archive_path_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "source.db"
+    raw_root = tmp_path / "source-raw"
+    raw_root.mkdir()
+    _prepare(database)
+    _seed_legacy(
+        database,
+        [
+            (
+                f"observation-{index:04d}",
+                NOW + timedelta(seconds=index),
+                [
+                    _outcome(
+                        "winner-one",
+                        price=2.1,
+                        side="team_one",
+                        raw_variant=f"variant-{index}",
+                    ),
+                    _outcome(
+                        "winner-two",
+                        price=1.8,
+                        side="team_two",
+                        raw_variant=f"variant-{index}",
+                    ),
+                ],
+                "on_time",
+            )
+            for index in range(64)
+        ],
+    )
+    original_archive = odds_legacy_compactor.RawArchive
+    instances: list[object] = []
+    max_cache_entries = 0
+
+    class NoCacheArchive(original_archive):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            assert kwargs.get("cache_paths") is False
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+        def archive_json(self, **kwargs: object):
+            nonlocal max_cache_entries
+            receipt = super().archive_json(**kwargs)
+            max_cache_entries = max(max_cache_entries, len(self._known_paths))
+            return receipt
+
+    monkeypatch.setattr(odds_legacy_compactor, "RawArchive", NoCacheArchive)
+
+    result = compact_legacy_odds(database, raw_root, tmp_path / "compaction")
+
+    assert result.observation_count == 64
+    assert result.artifact_count == 64
+    assert instances
+    assert max_cache_entries == 0
 
 
 def test_compactor_interruption_is_resumable_and_never_publishes_partial_output(

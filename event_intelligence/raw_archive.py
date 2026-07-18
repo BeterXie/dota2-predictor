@@ -186,9 +186,12 @@ class RawArchive:
         self,
         root: str | Path,
         observation_sink: ObservationSink | None = None,
+        *,
+        cache_paths: bool = True,
     ) -> None:
         self.root = Path(root).resolve()
         self._observation_sink = observation_sink
+        self._cache_paths = cache_paths
         self._known_paths: dict[tuple[str, str], Path] = {}
         self._legacy_index: dict[tuple[str, str], Path] | None = None
 
@@ -278,7 +281,7 @@ class RawArchive:
     ) -> tuple[Path, bool]:
         cache_key = (source, content_hash)
         target = self.root / source / content_hash[:2] / f"{content_hash}.json.gz"
-        existing = self._known_paths.get(cache_key)
+        existing = self._known_paths.get(cache_key) if self._cache_paths else None
         if existing is None and target.is_file():
             existing = target
         if existing is None and source != "raybet":
@@ -294,7 +297,8 @@ class RawArchive:
             existing = self._legacy_index.get(cache_key)
         if existing is not None:
             self._verify(existing, content_hash)
-            self._known_paths[cache_key] = existing
+            if self._cache_paths:
+                self._known_paths[cache_key] = existing
             return existing, False
 
         # New artifacts use a hash-sharded path so a hot collector never has
@@ -326,7 +330,8 @@ class RawArchive:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-        self._known_paths[cache_key] = target
+        if self._cache_paths:
+            self._known_paths[cache_key] = target
         return target, created
 
     @staticmethod

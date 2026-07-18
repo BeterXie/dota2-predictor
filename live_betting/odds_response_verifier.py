@@ -92,99 +92,135 @@ def _state_groups(
         yield metadata, tuple(outcomes)
 
 
-def _verify_states(
-    connection: sqlite3.Connection,
-) -> dict[str, _StateAuthority]:
-    states: dict[str, _StateAuthority] = {}
-    v2_identities: dict[tuple[str, str], str] = {}
+def _state_authority(
+    metadata: Sequence[Any],
+    raw_outcomes: Sequence[Sequence[Any]],
+) -> _StateAuthority:
+    (
+        raw_state_hash,
+        raw_match_id,
+        raw_normalized_hash,
+        raw_version,
+        raw_original_legacy_hash,
+        raw_outcome_count,
+    ) = metadata
+    state_hash = str(raw_state_hash)
+    match_id = str(raw_match_id)
+    normalized_hash = str(raw_normalized_hash)
+    version = int(raw_version)
+    original_legacy_hash = (
+        None if raw_original_legacy_hash is None else str(raw_original_legacy_hash)
+    )
+    outcomes = canonical_state_outcomes(raw_outcomes)
+    if len(outcomes) != int(raw_outcome_count):
+        raise RuntimeError(f"odds response state outcome count mismatch: {state_hash}")
+    if version == NORMALIZED_STATE_HASH_VERSION:
+        computed_normalized, _, _ = normalized_state_identity(outcomes)
+        if computed_normalized != normalized_hash:
+            raise RuntimeError(
+                f"odds response state v2 normalized hash mismatch: {state_hash}"
+            )
+        computed_state, _, _ = response_state_identity(
+            match_id, normalized_hash, outcomes
+        )
+        if original_legacy_hash is not None:
+            computed_legacy, _, _ = legacy_normalized_state_identity_v1(outcomes)
+            if computed_legacy != original_legacy_hash:
+                raise RuntimeError(
+                    f"odds response state preserved v1 hash mismatch: {state_hash}"
+                )
+    elif version == LEGACY_NORMALIZED_STATE_HASH_VERSION:
+        if original_legacy_hash is not None:
+            raise RuntimeError(
+                f"legacy odds response state has a duplicate preserved hash: {state_hash}"
+            )
+        computed_normalized, _, _ = legacy_normalized_state_identity_v1(outcomes)
+        if computed_normalized != normalized_hash:
+            raise RuntimeError(
+                f"odds response state v1 normalized hash mismatch: {state_hash}"
+            )
+        computed_state, _, _ = legacy_response_state_identity_v1(
+            match_id, normalized_hash, outcomes
+        )
+    else:
+        raise RuntimeError(f"odds response state hash version is invalid: {state_hash}")
+    if computed_state != state_hash:
+        raise RuntimeError(f"odds response state hash mismatch: {state_hash}")
+    return _StateAuthority(
+        match_id,
+        normalized_hash,
+        version,
+        original_legacy_hash,
+        outcomes,
+    )
+
+
+def _verify_states(connection: sqlite3.Connection) -> int:
+    state_count = 0
     for metadata, raw_outcomes in _state_groups(connection):
-        (
-            raw_state_hash,
-            raw_match_id,
-            raw_normalized_hash,
-            raw_version,
-            raw_original_legacy_hash,
-            raw_outcome_count,
-        ) = metadata
-        state_hash = str(raw_state_hash)
-        match_id = str(raw_match_id)
-        normalized_hash = str(raw_normalized_hash)
-        version = int(raw_version)
-        original_legacy_hash = (
-            None
-            if raw_original_legacy_hash is None
-            else str(raw_original_legacy_hash)
+        _state_authority(metadata, raw_outcomes)
+        state_count += 1
+    duplicate = connection.execute(
+        """SELECT 1
+             FROM odds_response_states
+            WHERE normalized_state_hash_version=?
+            GROUP BY raybet_match_id, normalized_state_hash
+           HAVING COUNT(*)>1
+            LIMIT 1""",
+        (NORMALIZED_STATE_HASH_VERSION,),
+    ).fetchone()
+    if duplicate is not None:
+        raise RuntimeError(
+            "v2 normalized state hash maps to multiple response manifests"
         )
-        outcomes = canonical_state_outcomes(raw_outcomes)
-        if len(outcomes) != int(raw_outcome_count):
-            raise RuntimeError(f"odds response state outcome count mismatch: {state_hash}")
-        if version == NORMALIZED_STATE_HASH_VERSION:
-            computed_normalized, _, _ = normalized_state_identity(outcomes)
-            if computed_normalized != normalized_hash:
-                raise RuntimeError(
-                    f"odds response state v2 normalized hash mismatch: {state_hash}"
-                )
-            computed_state, _, _ = response_state_identity(
-                match_id, normalized_hash, outcomes
-            )
-            if original_legacy_hash is not None:
-                computed_legacy, _, _ = legacy_normalized_state_identity_v1(outcomes)
-                if computed_legacy != original_legacy_hash:
-                    raise RuntimeError(
-                        f"odds response state preserved v1 hash mismatch: {state_hash}"
-                    )
-            identity = (match_id, normalized_hash)
-            prior = v2_identities.setdefault(identity, state_hash)
-            if prior != state_hash:
-                raise RuntimeError(
-                    "v2 normalized state hash maps to multiple response manifests"
-                )
-        elif version == LEGACY_NORMALIZED_STATE_HASH_VERSION:
-            if original_legacy_hash is not None:
-                raise RuntimeError(
-                    f"legacy odds response state has a duplicate preserved hash: {state_hash}"
-                )
-            computed_normalized, _, _ = legacy_normalized_state_identity_v1(outcomes)
-            if computed_normalized != normalized_hash:
-                raise RuntimeError(
-                    f"odds response state v1 normalized hash mismatch: {state_hash}"
-                )
-            computed_state, _, _ = legacy_response_state_identity_v1(
-                match_id, normalized_hash, outcomes
-            )
-        else:
-            raise RuntimeError(f"odds response state hash version is invalid: {state_hash}")
-        if computed_state != state_hash:
-            raise RuntimeError(f"odds response state hash mismatch: {state_hash}")
-        states[state_hash] = _StateAuthority(
-            match_id,
-            normalized_hash,
-            version,
-            original_legacy_hash,
-            outcomes,
-        )
-    return states
+    return state_count
 
 
-def _legacy_outcomes(
+def _transport_groups(
     connection: sqlite3.Connection,
-) -> dict[str, list[tuple[Any, ...]]]:
-    grouped: dict[str, list[tuple[Any, ...]]] = {}
-    for row in connection.execute(
-        """SELECT legacy.observation_key, legacy.raybet_match_id,
-                  legacy.received_at, legacy.odds_id, legacy.odds_group_id,
-                  legacy.price, legacy.status, legacy.market_type,
-                  legacy.period, legacy.side, legacy.line, legacy.outcome_key,
-                  legacy.supported, legacy.last_update, legacy.raw_json
-             FROM odds_response_outcomes AS legacy
-             JOIN odds_transport_observations AS transport
-               ON transport.observation_key=legacy.observation_key
-            WHERE transport.response_state_hash IS NULL
+) -> Iterator[tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]]:
+    cursor = connection.execute(
+        """SELECT transport.observation_key, transport.raybet_match_id,
+                  transport.observed_at, transport.normalized_state_hash,
+                  transport.normalized_state_hash_version,
+                  transport.original_legacy_normalized_state_hash,
+                  transport.response_state_hash,
+                  transport.response_artifact_hash,
+                  state.response_state_hash, state.raybet_match_id,
+                  state.normalized_state_hash,
+                  state.normalized_state_hash_version,
+                  state.original_legacy_normalized_state_hash,
+                  legacy.raybet_match_id, legacy.received_at, legacy.odds_id,
+                  legacy.odds_group_id, legacy.price, legacy.status,
+                  legacy.market_type, legacy.period, legacy.side, legacy.line,
+                  legacy.outcome_key, legacy.supported, legacy.last_update,
+                  legacy.raw_json
+             FROM odds_transport_observations AS transport
+             LEFT JOIN odds_response_states AS state
+               ON state.response_state_hash=transport.response_state_hash
+             LEFT JOIN odds_response_outcomes AS legacy
+               ON legacy.observation_key=transport.observation_key
+              AND transport.response_state_hash IS NULL
               AND transport.response_artifact_hash IS NULL
-            ORDER BY legacy.observation_key, legacy.odds_id"""
-    ):
-        grouped.setdefault(str(row[0]), []).append(tuple(row[1:]))
-    return grouped
+            ORDER BY transport.observation_key, legacy.odds_id"""
+    )
+    current_key: str | None = None
+    metadata: tuple[Any, ...] | None = None
+    legacy_rows: list[tuple[Any, ...]] = []
+    for row in cursor:
+        observation_key = str(row[0])
+        if current_key is not None and observation_key != current_key:
+            assert metadata is not None
+            yield metadata, tuple(legacy_rows)
+            legacy_rows = []
+        if observation_key != current_key:
+            current_key = observation_key
+            metadata = tuple(row[:13])
+        if row[13] is not None:
+            legacy_rows.append(tuple(row[13:27]))
+    if current_key is not None:
+        assert metadata is not None
+        yield metadata, tuple(legacy_rows)
 
 
 def _verify_legacy_transport(
@@ -192,7 +228,7 @@ def _verify_legacy_transport(
     match_id: str,
     observed_at: str,
     normalized_hash: str,
-    rows: list[tuple[Any, ...]],
+    rows: Sequence[Sequence[Any]],
 ) -> None:
     outcomes: list[Sequence[Any]] = []
     seen_ids: set[str] = set()
@@ -226,19 +262,10 @@ def _verify_legacy_transport(
 
 def _verify_transports(
     connection: sqlite3.Connection,
-    states: dict[str, _StateAuthority],
-) -> tuple[dict[str, set[str]], int, int]:
-    legacy = _legacy_outcomes(connection)
-    artifact_states: dict[str, set[str]] = {}
+) -> tuple[int, int]:
     transport_count = 0
     legacy_count = 0
-    for row in connection.execute(
-        """SELECT observation_key, raybet_match_id, observed_at,
-                  normalized_state_hash, normalized_state_hash_version,
-                  original_legacy_normalized_state_hash,
-                  response_state_hash, response_artifact_hash
-             FROM odds_transport_observations ORDER BY observation_key"""
-    ):
+    for row, legacy_rows in _transport_groups(connection):
         transport_count += 1
         observation_key = str(row[0])
         match_id = str(row[1])
@@ -266,22 +293,74 @@ def _verify_transports(
                 match_id,
                 observed_at,
                 normalized_hash,
-                legacy.get(observation_key, []),
+                legacy_rows,
             )
             continue
-        state = states.get(state_hash)
-        if state is None:
+        if row[8] is None:
             raise RuntimeError(f"odds transport state is missing: {observation_key}")
         if (
-            state.raybet_match_id != match_id
-            or state.normalized_state_hash != normalized_hash
-            or state.normalized_state_hash_version != version
-            or state.original_legacy_normalized_state_hash != original_legacy_hash
+            str(row[9]) != match_id
+            or str(row[10]) != normalized_hash
+            or int(row[11]) != version
+            or (None if row[12] is None else str(row[12]))
+            != original_legacy_hash
         ):
             raise RuntimeError(f"odds transport state binding mismatch: {observation_key}")
-        assert artifact_hash is not None
-        artifact_states.setdefault(artifact_hash, set()).add(state_hash)
-    return artifact_states, transport_count, legacy_count
+    return transport_count, legacy_count
+
+
+def _artifact_state_groups(
+    connection: sqlite3.Connection,
+) -> Iterator[tuple[str, _StateAuthority]]:
+    # SQLite may spill this distinct-pair grouping to its temporary store; the
+    # Python verifier retains only one state manifest at a time.
+    cursor = connection.execute(
+        """WITH artifact_states AS (
+               SELECT response_artifact_hash AS artifact_hash,
+                      response_state_hash AS state_hash,
+                      MIN(observation_key) AS observation_key
+                 FROM odds_transport_observations
+                WHERE response_artifact_hash IS NOT NULL
+                  AND response_state_hash IS NOT NULL
+                GROUP BY response_artifact_hash, response_state_hash
+           )
+           SELECT mapping.artifact_hash, mapping.state_hash,
+                  mapping.observation_key, state.response_state_hash,
+                  state.raybet_match_id, state.normalized_state_hash,
+                  state.normalized_state_hash_version,
+                  state.original_legacy_normalized_state_hash,
+                  state.outcome_count, outcome.odds_id,
+                  outcome.odds_group_id, outcome.price, outcome.status,
+                  outcome.market_type, outcome.period, outcome.side,
+                  outcome.line, outcome.outcome_key, outcome.supported,
+                  outcome.last_update
+             FROM artifact_states AS mapping
+             LEFT JOIN odds_response_states AS state
+               ON state.response_state_hash=mapping.state_hash
+             LEFT JOIN odds_response_state_outcomes AS outcome
+               ON outcome.response_state_hash=state.response_state_hash
+            ORDER BY mapping.artifact_hash, mapping.state_hash,
+                     outcome.odds_id"""
+    )
+    current: tuple[str, str] | None = None
+    metadata: tuple[Any, ...] | None = None
+    outcomes: list[tuple[Any, ...]] = []
+    for row in cursor:
+        if row[3] is None:
+            raise RuntimeError(f"odds transport state is missing: {row[2]}")
+        key = (str(row[0]), str(row[1]))
+        if current is not None and key != current:
+            assert metadata is not None
+            yield current[0], _state_authority(metadata, tuple(outcomes))
+            outcomes = []
+        if key != current:
+            current = key
+            metadata = tuple(row[3:9])
+        if row[9] is not None:
+            outcomes.append(tuple(row[9:20]))
+    if current is not None:
+        assert metadata is not None
+        yield current[0], _state_authority(metadata, tuple(outcomes))
 
 
 def _artifact_path(root: Path, artifact_hash: str, storage_path: str) -> Path:
@@ -370,10 +449,9 @@ def _verify_full_artifact(
 def _verify_artifacts(
     connection: sqlite3.Connection,
     raw_archive_root: Path,
-    states: dict[str, _StateAuthority],
-    artifact_states: dict[str, set[str]],
 ) -> int:
-    seen: set[str] = set()
+    state_groups = iter(_artifact_state_groups(connection))
+    pending = next(state_groups, None)
     artifact_count = 0
     for row in connection.execute(
         """SELECT artifact_hash, storage_path, uncompressed_bytes,
@@ -382,6 +460,10 @@ def _verify_artifacts(
     ):
         artifact_count += 1
         artifact_hash = str(row[0])
+        if pending is not None and pending[0] < artifact_hash:
+            raise RuntimeError(
+                f"odds transport raw artifact is missing: {pending[0]}"
+            )
         path = _artifact_path(raw_archive_root, artifact_hash, str(row[1]))
         compressed = path.read_bytes()
         if len(compressed) != int(row[3]):
@@ -398,19 +480,17 @@ def _verify_artifacts(
             or schema_fingerprint(payload) != str(row[4])
         ):
             raise RuntimeError(f"odds raw artifact metadata mismatch: {artifact_hash}")
-        seen.add(artifact_hash)
-        bound = [states[state_hash] for state_hash in artifact_states.get(artifact_hash, set())]
-        if not bound:
-            continue
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"odds raw response is not an object: {artifact_hash}")
-        if payload.get("artifact_version") == SNAPSHOT_DERIVED_FORMAT:
-            _verify_snapshot_derived_artifact(payload, bound, artifact_hash)
-        else:
-            _verify_full_artifact(payload, bound, artifact_hash)
-    missing = sorted(artifact_states.keys() - seen)
-    if missing:
-        raise RuntimeError(f"odds transport raw artifact is missing: {missing[0]}")
+        while pending is not None and pending[0] == artifact_hash:
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"odds raw response is not an object: {artifact_hash}")
+            state = pending[1]
+            if payload.get("artifact_version") == SNAPSHOT_DERIVED_FORMAT:
+                _verify_snapshot_derived_artifact(payload, (state,), artifact_hash)
+            else:
+                _verify_full_artifact(payload, (state,), artifact_hash)
+            pending = next(state_groups, None)
+    if pending is not None:
+        raise RuntimeError(f"odds transport raw artifact is missing: {pending[0]}")
     return artifact_count
 
 
@@ -431,13 +511,11 @@ def verify_odds_response_authority(
     if missing:
         raise RuntimeError("odds response authority schema is missing: " + ", ".join(missing))
     root = Path(raw_archive_root).resolve()
-    states = _verify_states(connection)
-    artifact_states, transport_count, legacy_count = _verify_transports(
-        connection, states
-    )
-    artifact_count = _verify_artifacts(connection, root, states, artifact_states)
+    state_count = _verify_states(connection)
+    transport_count, legacy_count = _verify_transports(connection)
+    artifact_count = _verify_artifacts(connection, root)
     return OddsResponseAuthorityVerification(
-        len(states), transport_count, artifact_count, legacy_count
+        state_count, transport_count, artifact_count, legacy_count
     )
 
 

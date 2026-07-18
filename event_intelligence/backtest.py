@@ -427,7 +427,7 @@ def _draft_views_are_current(connection: sqlite3.Connection) -> bool:
             """SELECT name, sql FROM sqlite_master
                  WHERE type='view' AND name IN
                        ('formal_events', 'formal_map_eligibility')"""
-        ).fetchall()
+        )
     }
     return all(
         installed.get(name) == _normalized_sql(sql)
@@ -442,7 +442,7 @@ def _draft_revision_state_is_current(connection: sqlite3.Connection) -> bool:
             """SELECT name, sql FROM sqlite_master
                  WHERE type='table' AND name IN
                        ('draft_lineage_revisions', 'draft_lineage_changes')"""
-        ).fetchall()
+        )
     }
     if (
         schemas.get("draft_lineage_revisions")
@@ -455,48 +455,58 @@ def _draft_revision_state_is_current(connection: sqlite3.Connection) -> bool:
         revisions = connection.execute(
             """SELECT singleton, dependency_revision, artifact_revision
                  FROM draft_lineage_revisions"""
-        ).fetchall()
+        )
+        revision = revisions.fetchone()
+        extra_revision = revisions.fetchone()
+        if not (
+            revision is not None
+            and extra_revision is None
+            and type(revision[0]) is int
+            and int(revision[0]) == 1
+            and type(revision[1]) is int
+            and int(revision[1]) >= 1
+            and type(revision[2]) is int
+            and int(revision[2]) >= 1
+        ):
+            return False
+        dependency_revision = int(revision[1])
         changes = connection.execute(
             """SELECT dependency_revision, affected_from_unix,
                       source_relation, operation, changed_at
                  FROM draft_lineage_changes
                 ORDER BY dependency_revision"""
-        ).fetchall()
+        )
+        first_change: tuple[Any, ...] | None = None
+        change_count = 0
+        for expected_revision, raw in enumerate(changes, start=1):
+            row = tuple(raw)
+            if first_change is None:
+                first_change = row
+            affected_from = row[1]
+            if (
+                type(row[0]) is not int
+                or int(row[0]) != expected_revision
+                or (
+                    affected_from is not None
+                    and (type(affected_from) is not int or int(affected_from) <= 0)
+                )
+                or not isinstance(row[2], str)
+                or not str(row[2])
+                or row[3]
+                not in {"INSERT", "UPDATE", "DELETE", "REPAIR", "INITIALIZE"}
+                or not isinstance(row[4], str)
+                or not str(row[4])
+            ):
+                return False
+            change_count = expected_revision
     except sqlite3.Error:
         return False
-    if not (
-        len(revisions) == 1
-        and type(revisions[0][0]) is int
-        and int(revisions[0][0]) == 1
-        and type(revisions[0][1]) is int
-        and int(revisions[0][1]) >= 1
-        and type(revisions[0][2]) is int
-        and int(revisions[0][2]) >= 1
-    ):
-        return False
-    dependency_revision = int(revisions[0][1])
-    if len(changes) != dependency_revision:
-        return False
-    for expected_revision, row in enumerate(changes, start=1):
-        affected_from = row[1]
-        if (
-            type(row[0]) is not int
-            or int(row[0]) != expected_revision
-            or (
-                affected_from is not None
-                and (type(affected_from) is not int or int(affected_from) <= 0)
-            )
-            or not isinstance(row[2], str)
-            or not str(row[2])
-            or row[3] not in {"INSERT", "UPDATE", "DELETE", "REPAIR", "INITIALIZE"}
-            or not isinstance(row[4], str)
-            or not str(row[4])
-        ):
-            return False
     return (
-        changes[0][1] is None
-        and changes[0][2] == "__tracking__"
-        and changes[0][3] == "INITIALIZE"
+        change_count == dependency_revision
+        and first_change is not None
+        and first_change[1] is None
+        and first_change[2] == "__tracking__"
+        and first_change[3] == "INITIALIZE"
     )
 
 
@@ -686,7 +696,7 @@ def _draft_trigger_definitions(
                 str(row[1])
                 for row in connection.execute(
                     f'PRAGMA table_info("{table}")'
-                ).fetchall()
+                )
             )
             columns = _DRAFT_TRACKED_COLUMNS.get(table, available_columns)
             if not available_columns or not set(columns).issubset(available_columns):
@@ -766,7 +776,7 @@ def ensure_draft_lineage_tracking(connection: sqlite3.Connection) -> None:
             for row in connection.execute(
                 """SELECT name FROM sqlite_master
                      WHERE type IN ('table', 'view')"""
-            ).fetchall()
+            )
         }
         repairable = {
             "draft_lineage_changes",
@@ -812,7 +822,7 @@ def ensure_draft_lineage_tracking(connection: sqlite3.Connection) -> None:
             str(row[0]): "" if row[1] is None else str(row[1]).strip()
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
-            ).fetchall()
+            )
         }
         repaired_revisions = (
             {"dependency_revision"} if views_repaired else set()
@@ -846,7 +856,7 @@ def draft_lineage_tracking_is_current(connection: sqlite3.Connection) -> bool:
             for row in connection.execute(
                 """SELECT name FROM sqlite_master
                      WHERE type IN ('table', 'view')"""
-            ).fetchall()
+            )
         }
         if not _DRAFT_TRACKING_RELATIONS.issubset(existing):
             return False
@@ -859,7 +869,7 @@ def draft_lineage_tracking_is_current(connection: sqlite3.Connection) -> bool:
             str(row[0]): "" if row[1] is None else str(row[1]).strip()
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
-            ).fetchall()
+            )
         }
     except (RuntimeError, sqlite3.Error):
         return False

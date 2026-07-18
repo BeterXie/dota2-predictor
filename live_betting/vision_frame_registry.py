@@ -224,7 +224,7 @@ def _effective_storage_path(
              FROM vision_frame_artifact_relocations
             WHERE frame_ref=? ORDER BY relocation_sequence""",
         (frame_ref,),
-    ).fetchall()
+    )
     for expected_sequence, raw in enumerate(relocations, start=1):
         row = tuple(raw)
         payload = {
@@ -381,7 +381,7 @@ def verify_vision_frame_registry(
     rows = connection.execute(
         """SELECT frame_ref, content_sha256, byte_length
              FROM vision_frame_artifacts ORDER BY frame_ref"""
-    ).fetchall()
+    )
     active = 0
     for raw in rows:
         frame_ref, content_sha256, byte_length = tuple(raw)

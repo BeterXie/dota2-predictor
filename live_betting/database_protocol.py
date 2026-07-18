@@ -291,7 +291,7 @@ def _schema_contract(connection: sqlite3.Connection) -> _SchemaContract:
              FROM sqlite_master
             WHERE name NOT LIKE 'sqlite_%'
               AND type IN ('table', 'index', 'trigger', 'view')"""
-    ).fetchall()
+    )
     tables: dict[str, dict[str, _ColumnContract]] = {}
     checks: dict[str, tuple[str, ...]] = {}
     foreign_keys: dict[
