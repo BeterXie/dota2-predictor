@@ -196,7 +196,9 @@ class BrowserCompanionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["code"], "database_unavailable")
 
-    def test_status_requires_empty_json_and_reports_fresh_shadow(self) -> None:
+    def test_status_requires_empty_json_and_uses_real_shadow_worker_health(
+        self,
+    ) -> None:
         for body in (b"", b"[]", b'{"unexpected":true}', b"null", b"not-json"):
             response = self.client.post(
                 "/v1/status", content=body, headers=self.headers(content_type=True)
@@ -211,6 +213,21 @@ class BrowserCompanionTests(unittest.TestCase):
                 "healthy",
                 heartbeat_at=now,
                 success_at=now,
+            )
+        response = self.client.post(
+            "/v1/status", content=b"{}", headers=self.headers(content_type=True)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["shadow_strategy_active"])
+
+        with LiveBettingStore(self.database) as store:
+            record_health(
+                store.connection,
+                "shadow_worker",
+                "healthy",
+                heartbeat_at=now,
+                success_at=now,
+                details={"source": "worker"},
             )
         response = self.client.post(
             "/v1/status", content=b"{}", headers=self.headers(content_type=True)

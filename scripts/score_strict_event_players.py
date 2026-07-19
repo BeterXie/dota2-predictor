@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 from event_intelligence.benchmarks import (  # noqa: E402
     BENCHMARK_VERSION,
     BenchmarkObservation,
@@ -879,7 +883,7 @@ def _positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument("--match", type=_positive_int, help="one formal match ID")
     parser.add_argument("--assignment-version", help="pin observed-position version")
     parser.add_argument("--min-samples", type=_positive_int, default=5)
@@ -889,13 +893,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = run_scoring(
-        args.database,
-        dry_run=args.dry_run,
-        match_id=args.match,
-        assignment_version=args.assignment_version,
-        min_samples=args.min_samples,
-    )
+    with database_writer_authority(args.database):
+        report = run_scoring(
+            args.database,
+            dry_run=args.dry_run,
+            match_id=args.match,
+            assignment_version=args.assignment_version,
+            min_samples=args.min_samples,
+        )
     print(_json(report.__dict__))
     return 0
 

@@ -15,6 +15,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 from live_betting.strict_eligibility import (  # noqa: E402
     StrictMappingError,
     accept_strict_live_map_mapping,
@@ -42,7 +46,7 @@ def _non_empty(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, required=True)
+    add_single_database_argument(parser, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--raybet-match-id", type=_non_empty, required=True)
     parser.add_argument("--raybet-team-one-id", type=_positive_integer, required=True)
@@ -135,20 +139,21 @@ def accept_batch(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        evidence = load_evidence(args.evidence)
-        result = accept_batch(
-            database=args.database,
-            evidence=evidence,
-            raybet_match_id=args.raybet_match_id,
-            raybet_team_one_id=args.raybet_team_one_id,
-            raybet_team_two_id=args.raybet_team_two_id,
-            canonical_team_one_id=args.canonical_team_one_id,
-            canonical_team_two_id=args.canonical_team_two_id,
-            event_id=args.event_id,
-            source=args.source,
-            actor=args.actor,
-            map_numbers=args.map_number,
-        )
+        with database_writer_authority(args.database):
+            evidence = load_evidence(args.evidence)
+            result = accept_batch(
+                database=args.database,
+                evidence=evidence,
+                raybet_match_id=args.raybet_match_id,
+                raybet_team_one_id=args.raybet_team_one_id,
+                raybet_team_two_id=args.raybet_team_two_id,
+                canonical_team_one_id=args.canonical_team_one_id,
+                canonical_team_two_id=args.canonical_team_two_id,
+                event_id=args.event_id,
+                source=args.source,
+                actor=args.actor,
+                map_numbers=args.map_number,
+            )
     except (EvidenceFileError, StrictMappingError) as error:
         print(
             json.dumps(

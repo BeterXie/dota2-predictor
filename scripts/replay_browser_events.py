@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from live_betting.browser_replay import replay_browser_events
+from live_betting.service_coordination import database_offline_authority
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,13 +25,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    summary = replay_browser_events(
-        args.source,
+    with database_offline_authority(
         args.target,
-        restart_after=args.restart_after,
-        overwrite=args.overwrite,
-        mode=args.mode,
-    )
+        allow_missing=not args.target.resolve().exists(),
+        allow_replacement=bool(args.overwrite),
+    ):
+        summary = replay_browser_events(
+            args.source,
+            args.target,
+            restart_after=args.restart_after,
+            overwrite=args.overwrite,
+            mode=args.mode,
+        )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0
 

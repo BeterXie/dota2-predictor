@@ -24,6 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fetch.client import OpenDotaClient
 from fetch.parser import parse_players
 from fetch.db import Database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 from shared.sqlite import connect as connect_sqlite
 
 logger = logging.getLogger(__name__)
@@ -93,8 +97,12 @@ def update_player_early_game(db_path: str, match_id: int, players: list[dict]) -
     return updated
 
 
-async def backfill(cfg: dict, limit: int | None = None) -> None:
-    db_path = resolve_db_path(cfg)
+async def backfill(
+    cfg: dict,
+    limit: int | None = None,
+    database_path: str | Path | None = None,
+) -> None:
+    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
     db = Database(db_path)
     db.connect()
     db.init_db()
@@ -168,12 +176,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Backfill early-game stats from OpenDota match details"
     )
+    add_single_database_argument(parser)
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of matches to process")
     args = parser.parse_args()
 
     cfg = load_config()
-    asyncio.run(backfill(cfg, args.limit))
+    database = Path(args.database or resolve_db_path(cfg)).resolve()
+    with database_writer_authority(database):
+        asyncio.run(backfill(cfg, args.limit, database))
 
 
 if __name__ == "__main__":

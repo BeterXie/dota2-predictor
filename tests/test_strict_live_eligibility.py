@@ -23,6 +23,7 @@ from live_betting.notifications import claim
 from live_betting.raybet import parse_raybet_map_final
 from live_betting.report import build_report
 from live_betting.storage import LiveBettingStore
+from live_betting.runtime_schema import prepare_runtime_schema
 from live_betting.strict_read_gate import strict_read_gate
 from live_betting.strict_eligibility import (
     StrictMappingConflictError,
@@ -39,7 +40,6 @@ from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
 )
-from web.alerts import init_alert_schema
 from web.monitoring import build_monitor_snapshot, monitor_cursor
 
 
@@ -165,7 +165,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         init_strict_live_eligibility_schema(self.connection)
-        init_alert_schema(self.connection)
+        prepare_runtime_schema(self.connection)
         self.clock = patch(
             "live_betting.strict_eligibility._utc_now", return_value=RECORDED_AT
         )

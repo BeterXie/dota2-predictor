@@ -19,6 +19,10 @@ import yaml
 from curl_cffi import requests as cffi_requests
 
 from .db import Database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,9 +188,13 @@ def fetch_matchups_stratz(
     return fetched, skipped
 
 
-def run(token: str, force: bool) -> None:
+def run(
+    token: str,
+    force: bool,
+    database_path: str | Path | None = None,
+) -> None:
     cfg = load_config()
-    db_path = resolve_db_path(cfg)
+    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
     db = Database(db_path)
     db.connect()
     db.init_db()
@@ -211,6 +219,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch hero matchup data from Stratz GraphQL API"
     )
+    add_single_database_argument(parser)
     parser.add_argument(
         "--force", action="store_true", help="Re-fetch even if already in DB"
     )
@@ -227,7 +236,10 @@ def main() -> None:
             "Stratz token required. Pass --token or set STRATZ_TOKEN env var."
         )
 
-    run(args.token, args.force)
+    cfg = load_config()
+    database = Path(args.database or resolve_db_path(cfg)).resolve()
+    with database_writer_authority(database):
+        run(args.token, args.force, database)
 
 
 if __name__ == "__main__":

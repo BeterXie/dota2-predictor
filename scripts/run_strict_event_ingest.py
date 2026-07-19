@@ -23,6 +23,10 @@ from event_intelligence.ingest import (  # noqa: E402
     completed_match_processing_result,
 )
 from event_intelligence.scheduler import IngestScheduler  # noqa: E402
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -51,11 +55,10 @@ def _non_empty_text(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument(
         "--archive-root",
         type=Path,
-        default=ROOT / "data" / "raw" / "event_intelligence",
     )
     parser.add_argument("--once", action="store_true", help="run one immediate cycle")
     parser.add_argument(
@@ -83,12 +86,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--coverage-report",
         type=Path,
-        default=ROOT / "data" / "reports" / "strict_event_coverage_latest.json",
     )
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
     return parser
+
+
+def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
+    database = Path(args.database).resolve()
+    args.database = database
+    args.archive_root = (
+        Path(args.archive_root).resolve()
+        if args.archive_root is not None
+        else database.parent / "raw-sources"
+    )
+    args.coverage_report = (
+        Path(args.coverage_report).resolve()
+        if args.coverage_report is not None
+        else database.parent / "reports" / "strict_event_coverage_latest.json"
+    )
+    return args
 
 
 @dataclass
@@ -110,6 +128,7 @@ class Runtime:
 
 def build_default_runtime(args: argparse.Namespace) -> Runtime:
     """Late-bind concrete ports so importing this CLI has no database side effects."""
+    args = resolve_data_paths(args)
     try:
         from event_intelligence.opendota import OpenDotaAdapter
         from event_intelligence.raw_archive import RawArchive
@@ -325,7 +344,7 @@ def _report_payload(value: object | None) -> object:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = resolve_data_paths(parser.parse_args(argv))
     if args.match is not None and args.active:
         parser.error("--match cannot be combined with --active")
     if args.scheduler_once and (
@@ -333,7 +352,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         parser.error("--scheduler-once cannot be combined with direct one-shot filters")
     try:
-        return asyncio.run(run(args))
+        with database_writer_authority(args.database):
+            return asyncio.run(run(args))
     except KeyboardInterrupt:
         return 130
     except Exception as error:

@@ -18,6 +18,9 @@ from live_betting.database_bundle import (  # noqa: E402
     restore_database_bundle,
     verify_database_bundle,
 )
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -25,7 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     create = commands.add_parser("create", help="create and fully verify a bundle")
-    create.add_argument("--database", type=Path, required=True)
+    add_single_database_argument(create, required=True)
     create.add_argument("--odds-raw-root", type=Path, required=True)
     create.add_argument("--bundle", type=Path, required=True)
     create.add_argument(

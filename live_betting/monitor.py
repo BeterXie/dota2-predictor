@@ -23,6 +23,10 @@ from .markets import normalized_state_hash, snapshots_from_payload
 from .models import utc_now
 from .raybet import BASE_URL, DOTA2_GAME_ID, RayBetClient
 from .sanitize import sanitize_raybet_payload, verified_public_stream_url
+from .service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 from .storage import LiveBettingStore
 
 
@@ -461,11 +465,23 @@ def collect_completed_once(
     }
 
 
+def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
+    db_path = Path(args.database).resolve()
+    args.database = db_path
+    args.raw_dir = (
+        Path(args.raw_dir).resolve()
+        if args.raw_dir is not None
+        else db_path.parent / "live_betting" / "raw-v2"
+    )
+    return args
+
+
 def run(args: argparse.Namespace) -> int:
     load_dotenv()
-    db_path = Path(args.database)
+    args = resolve_data_paths(args)
+    db_path = args.database
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_dir = Path(args.raw_dir)
+    raw_dir = args.raw_dir
 
     with LiveBettingStore(
         db_path, raw_archive_root=raw_dir
@@ -615,10 +631,10 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", default=str(ROOT / "data" / "dota2.db"))
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument(
         "--raw-dir",
-        default=str(ROOT / "data" / "live_betting" / "raw-v2"),
+        type=Path,
     )
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--list-interval", type=float, default=15.0)
@@ -628,9 +644,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
-    return parser.parse_args()
+    return resolve_data_paths(parser.parse_args())
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    raise SystemExit(run(parse_args()))
+    arguments = parse_args()
+    with database_writer_authority(arguments.database):
+        raise SystemExit(run(arguments))

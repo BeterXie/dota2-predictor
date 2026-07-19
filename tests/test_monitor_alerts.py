@@ -19,6 +19,7 @@ from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
 from live_betting.notifications import claim
 from live_betting.smtp_delivery import SMTPConfig, build_message
+from live_betting.runtime_schema import prepare_runtime_schema
 from live_betting.storage import LiveBettingStore
 from live_betting.strict_eligibility import (
     accept_strict_live_map_mapping,
@@ -32,7 +33,6 @@ from tests.draft_authority_fixture import (
 from web.alerts import (
     acknowledge_alert,
     active_alerts,
-    init_alert_schema,
     reconcile_alerts,
 )
 
@@ -46,7 +46,7 @@ class MonitorAlertTests(unittest.TestCase):
         self.database = Path(self.directory.name) / "alerts.db"
         self.store = LiveBettingStore(self.database)
         self.store.init_schema()
-        init_alert_schema(self.store.connection)
+        prepare_runtime_schema(self.store.connection)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -543,6 +543,121 @@ class MonitorAlertTests(unittest.TestCase):
             ["opened", "observed", "recovered"],
         )
 
+    def test_alert_reconciliation_never_attempts_schema_ddl(self) -> None:
+        schema_actions = {
+            sqlite3.SQLITE_ALTER_TABLE,
+            sqlite3.SQLITE_CREATE_INDEX,
+            sqlite3.SQLITE_CREATE_TABLE,
+            sqlite3.SQLITE_CREATE_TRIGGER,
+            sqlite3.SQLITE_DROP_INDEX,
+            sqlite3.SQLITE_DROP_TABLE,
+            sqlite3.SQLITE_DROP_TRIGGER,
+        }
+        attempted: list[int] = []
+
+        def authorizer(
+            action: int,
+            _arg1: str | None,
+            _arg2: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if action in schema_actions:
+                attempted.append(action)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        self.store.connection.set_authorizer(authorizer)
+        try:
+            reconcile_alerts(
+                self.store.connection,
+                now=NOW,
+                grace_seconds=0,
+                health=[],
+            )
+        finally:
+            self.store.connection.set_authorizer(None)
+
+        self.assertEqual(attempted, [])
+
+    def test_health_query_failure_never_recovers_existing_operational_alert(
+        self,
+    ) -> None:
+        record_health(
+            self.store.connection,
+            "raybet_worker",
+            "degraded",
+            heartbeat_at=NOW,
+            error_at=NOW,
+            error="timeout",
+        )
+        reconcile_alerts(self.store.connection, now=NOW, grace_seconds=0)
+        record_health(
+            self.store.connection,
+            "raybet_worker",
+            "healthy",
+            heartbeat_at=NOW + timedelta(seconds=1),
+            success_at=NOW + timedelta(seconds=1),
+        )
+
+        class FaultingConnection:
+            def __init__(self, wrapped: sqlite3.Connection) -> None:
+                self.wrapped = wrapped
+
+            def execute(
+                self, sql: str, parameters: tuple[object, ...] = ()
+            ) -> sqlite3.Cursor:
+                if "FROM service_health" in sql:
+                    raise sqlite3.OperationalError(
+                        "injected service health query failure"
+                    )
+                return self.wrapped.execute(sql, parameters)
+
+            def __enter__(self):
+                self.wrapped.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return self.wrapped.__exit__(exc_type, exc_value, traceback)
+
+            def __getattr__(self, name: str):
+                return getattr(self.wrapped, name)
+
+        reconcile_alerts(
+            FaultingConnection(self.store.connection),  # type: ignore[arg-type]
+            now=NOW + timedelta(seconds=1),
+            grace_seconds=0,
+        )
+
+        statuses = {
+            str(row[0]): str(row[1])
+            for row in self.store.connection.execute(
+                "SELECT dedupe_key, status FROM monitor_alert_incidents"
+            )
+        }
+        self.assertEqual(statuses["operational:raybet_worker"], "active")
+        self.assertEqual(
+            statuses["operational:service_health_contract"],
+            "active",
+        )
+
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW + timedelta(seconds=2),
+            grace_seconds=0,
+        )
+        statuses = {
+            str(row[0]): str(row[1])
+            for row in self.store.connection.execute(
+                "SELECT dedupe_key, status FROM monitor_alert_incidents"
+            )
+        }
+        self.assertEqual(statuses["operational:raybet_worker"], "recovered")
+        self.assertEqual(
+            statuses["operational:service_health_contract"],
+            "recovered",
+        )
+
     def test_missing_optional_smtp_does_not_remain_an_operational_alert(self) -> None:
         record_health(
             self.store.connection,
@@ -608,6 +723,35 @@ class MonitorAlertTests(unittest.TestCase):
         acknowledged = active_alerts(self.store.connection)[0]
         self.assertIsNotNone(acknowledged["acknowledged_at"])
 
+    def test_acknowledgement_rejects_runtime_contract_drift(self) -> None:
+        self._insert_pending_order(self.store.connection)
+        reconcile_alerts(
+            self.store.connection,
+            now=NOW,
+            grace_seconds=0,
+        )
+        alert = active_alerts(self.store.connection)[0]
+        self.store.connection.execute(
+            "DROP TRIGGER monitor_alert_audit_no_update"
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "missing objects"):
+            acknowledge_alert(
+                self.store.connection,
+                incident_id=alert["incident_id"],
+                actor="local-operator",
+                acknowledged_at=NOW + timedelta(seconds=1),
+            )
+
+        self.assertIsNone(
+            self.store.connection.execute(
+                """SELECT acknowledged_at FROM monitor_alert_incidents
+                    WHERE incident_id=?""",
+                (alert["incident_id"],),
+            ).fetchone()[0]
+        )
+
     def test_paper_signal_fails_closed_when_lineage_relation_is_missing(self) -> None:
         relations = (
             "shadow_orders",
@@ -628,6 +772,7 @@ class MonitorAlertTests(unittest.TestCase):
                     store = LiveBettingStore(Path(directory) / "alerts.db")
                     try:
                         store.init_schema()
+                        prepare_runtime_schema(store.connection)
                         self._insert_pending_order(store.connection)
                         store.connection.execute("PRAGMA foreign_keys=OFF")
                         store.connection.execute(f'DROP TABLE "{relation}"')
@@ -726,6 +871,7 @@ class MonitorAlertTests(unittest.TestCase):
                     store = LiveBettingStore(Path(directory) / "alerts.db")
                     try:
                         store.init_schema()
+                        prepare_runtime_schema(store.connection)
                         self._insert_pending_order(store.connection)
                         columns = [
                             str(row[1])
@@ -970,6 +1116,7 @@ class MonitorAlertTests(unittest.TestCase):
                     store = LiveBettingStore(Path(directory) / "alerts.db")
                     try:
                         store.init_schema()
+                        prepare_runtime_schema(store.connection)
                         source_mapping_id = None
                         strict_mapping_id = None
                         if case == "automatic_source":
@@ -1195,14 +1342,15 @@ class MonitorAlertTests(unittest.TestCase):
             ["unacknowledged-warning", "acknowledged-critical"],
         )
 
-    def test_current_outbox_schema_repairs_missing_artifacts(self) -> None:
+    def test_current_runtime_schema_rejects_missing_outbox_artifacts(self) -> None:
         self.store.connection.execute(
             "DROP TRIGGER notification_outbox_payload_immutable"
         )
         self.store.connection.execute("DROP INDEX idx_notification_outbox_due")
         self.store.connection.commit()
 
-        init_alert_schema(self.store.connection)
+        with self.assertRaisesRegex(RuntimeError, "missing objects"):
+            prepare_runtime_schema(self.store.connection)
 
         objects = {
             (str(row[0]), str(row[1]))
@@ -1212,13 +1360,7 @@ class MonitorAlertTests(unittest.TestCase):
                                    'notification_outbox_payload_immutable')"""
             )
         }
-        self.assertEqual(
-            objects,
-            {
-                ("index", "idx_notification_outbox_due"),
-                ("trigger", "notification_outbox_payload_immutable"),
-            },
-        )
+        self.assertEqual(objects, set())
 
     def test_legacy_outbox_migration_is_atomic_and_retryable(self) -> None:
         connection = sqlite3.connect(":memory:")
@@ -1276,7 +1418,7 @@ class MonitorAlertTests(unittest.TestCase):
                     return getattr(self.wrapped, name)
 
             with self.assertRaises(sqlite3.OperationalError):
-                init_alert_schema(FaultingConnection(connection))  # type: ignore[arg-type]
+                prepare_runtime_schema(FaultingConnection(connection))  # type: ignore[arg-type]
 
             legacy_sql = str(connection.execute(
                 """SELECT sql FROM sqlite_master
@@ -1291,10 +1433,11 @@ class MonitorAlertTests(unittest.TestCase):
             )
             self.assertIsNone(connection.execute(
                 """SELECT 1 FROM sqlite_master
-                    WHERE type='table' AND name='notification_outbox_monitor_v1'"""
+                    WHERE type='table'
+                      AND name='notification_outbox__runtime_schema_v1'"""
             ).fetchone())
 
-            init_alert_schema(connection)
+            prepare_runtime_schema(connection)
 
             upgraded_sql = str(connection.execute(
                 """SELECT sql FROM sqlite_master

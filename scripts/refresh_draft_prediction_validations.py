@@ -15,20 +15,25 @@ if str(ROOT) not in sys.path:
 
 from event_intelligence.incremental import refresh_draft_prediction_validations  # noqa: E402
 from event_intelligence.storage import IntelligenceStorage  # noqa: E402
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db", type=Path, default=Path("data/dota2.db"))
+    add_single_database_argument(parser, default=Path("data/dota2.db"))
     args = parser.parse_args()
 
-    storage = IntelligenceStorage(args.db)
-    started = time.perf_counter()
-    try:
-        storage.init_schema()
-        keys = refresh_draft_prediction_validations(storage.connection)
-    finally:
-        storage.close()
+    with database_writer_authority(args.database):
+        storage = IntelligenceStorage(args.database)
+        started = time.perf_counter()
+        try:
+            storage.init_schema()
+            keys = refresh_draft_prediction_validations(storage.connection)
+        finally:
+            storage.close()
     print(
         json.dumps(
             {

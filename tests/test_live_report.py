@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -17,7 +19,7 @@ from live_betting.markets import normalized_state_hash, snapshots_from_payload
 from live_betting.models import Market, OddsSnapshot
 from live_betting.postmatch_monitor import StoredMapResult
 from live_betting.raybet import parse_raybet_map_final
-from live_betting.report import build_report
+from live_betting.report import build_report, main as report_main
 from live_betting.settlement import (
     persist_authoritative_settlement_snapshot,
     resolve_authoritative_settlement,
@@ -1233,6 +1235,50 @@ class LiveReportCohortTests(unittest.TestCase):
             report["order_audit"]["strict_mapping_unverifiable_orders"],
             1,
         )
+
+
+class ReportCliTests(unittest.TestCase):
+    def test_cli_connection_is_mode_ro_and_query_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "report.db"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE probe (value INTEGER)")
+            connection.commit()
+            connection.close()
+            observed: list[int] = []
+
+            def probe(read_connection: sqlite3.Connection) -> dict[str, str]:
+                query_only = read_connection.execute("PRAGMA query_only").fetchone()
+                assert query_only is not None
+                observed.append(int(query_only[0]))
+                with self.assertRaises(sqlite3.OperationalError):
+                    read_connection.execute("INSERT INTO probe VALUES (1)")
+                return {"status": "ok"}
+
+            with patch("live_betting.report.build_report", side_effect=probe):
+                self.assertEqual(
+                    report_main(["--database", str(database)]),
+                    0,
+                )
+
+            self.assertEqual(observed, [1])
+            check = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    check.execute("SELECT COUNT(*) FROM probe").fetchone()[0],
+                    0,
+                )
+            finally:
+                check.close()
+
+    def test_cli_missing_database_is_not_created(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "missing.db"
+
+            with self.assertRaises(sqlite3.OperationalError):
+                report_main(["--database", str(database)])
+
+            self.assertFalse(database.exists())
 
 
 if __name__ == "__main__":

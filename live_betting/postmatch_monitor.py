@@ -31,6 +31,10 @@ from .direct_response_audit import (
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
 from .raybet import BASE_URL, RayBetClient, RayBetMapFinal, parse_raybet_map_final
+from .service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 from .settlement import (
     SettlementAuthorityError,
     reconcile_map_winners,
@@ -1544,9 +1548,20 @@ async def label_once(
     }
 
 
+def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
+    database = Path(args.database).resolve()
+    args.database = database
+    args.archive_root = (
+        Path(args.archive_root).resolve()
+        if args.archive_root is not None
+        else database.parent / "raw-sources"
+    )
+    return args
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument("--match-id")
     parser.add_argument("--team-id", type=int)
     parser.add_argument("--team-side", choices=("team_one", "team_two"))
@@ -1556,12 +1571,11 @@ def main() -> int:
     parser.add_argument(
         "--archive-root",
         type=Path,
-        default=ROOT / "data" / "raw" / "event_intelligence",
     )
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
-    args = parser.parse_args()
+    args = resolve_data_paths(parser.parse_args())
     if not args.all and not (args.match_id and args.team_id and args.team_side):
         parser.error("provide --all or --match-id, --team-id, and --team-side")
 
@@ -1674,7 +1688,8 @@ def main() -> int:
             await client.close()
             raybet_client.close()
 
-    return asyncio.run(run())
+    with database_writer_authority(args.database):
+        return asyncio.run(run())
 
 
 if __name__ == "__main__":

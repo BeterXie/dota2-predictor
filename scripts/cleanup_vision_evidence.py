@@ -14,6 +14,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+    service_data_paths,
+)
 from live_betting.vision_retention import (  # noqa: E402
     DEFAULT_MAX_UNPROTECTED_PER_MATCH,
     DEFAULT_RETENTION_TTL,
@@ -22,13 +27,10 @@ from live_betting.vision_retention import (  # noqa: E402
 )
 
 
-DEFAULT_EVIDENCE_DIR = ROOT / "data" / "live_betting" / "live_evidence"
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
-    parser.add_argument("--evidence-dir", type=Path, default=DEFAULT_EVIDENCE_DIR)
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument(
         "--ttl-days",
         type=int,
@@ -45,18 +47,24 @@ def main(argv: list[str] | None = None) -> int:
         help="apply the plan; omission is always a read-only dry run",
     )
     args = parser.parse_args(argv)
+    evidence_dir = (
+        args.evidence_dir.resolve()
+        if args.evidence_dir is not None
+        else service_data_paths(args.database).vision_evidence
+    )
     if args.ttl_days <= 0:
         parser.error("--ttl-days must be positive")
     if args.max_unprotected_per_match < 0:
         parser.error("--max-unprotected-per-match cannot be negative")
     try:
-        result = prune_vision_evidence(
-            args.database,
-            args.evidence_dir,
-            ttl=timedelta(days=args.ttl_days),
-            max_unprotected_per_match=args.max_unprotected_per_match,
-            dry_run=not args.delete,
-        )
+        with database_writer_authority(args.database):
+            result = prune_vision_evidence(
+                args.database,
+                evidence_dir,
+                ttl=timedelta(days=args.ttl_days),
+                max_unprotected_per_match=args.max_unprotected_per_match,
+                dry_run=not args.delete,
+            )
     except (OSError, sqlite3.Error, RetentionSafetyError, ValueError) as error:
         print(json.dumps({
             "status": "error",

@@ -12,6 +12,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 from fetch.client import OpenDotaClient  # noqa: E402
 from fetch.db import Database  # noqa: E402
 
@@ -49,13 +53,17 @@ async def backfill(database: Path, team_ids: list[int], limit: int, rate_limit: 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument("--team-id", type=int, action="append", required=True)
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--rate-limit", type=int, default=50)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    print(asyncio.run(backfill(args.database, args.team_id, args.limit, args.rate_limit)))
+    with database_writer_authority(args.database):
+        result = asyncio.run(
+            backfill(args.database, args.team_id, args.limit, args.rate_limit)
+        )
+    print(result)
     return 0
 
 

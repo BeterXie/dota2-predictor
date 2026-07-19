@@ -11,10 +11,16 @@ from typing import Mapping, Sequence
 import uvicorn
 import yaml
 
+from live_betting.database_protocol import verify_prepared_database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    service_data_paths,
+)
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path)
+    add_single_database_argument(parser)
     parser.add_argument(
         "--config",
         type=Path,
@@ -78,6 +84,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         config,
         config_path,
         os.environ,
+    )
+    paths = service_data_paths(database)
+    verify_prepared_database(
+        paths.database,
+        odds_raw_root=paths.odds_raw_root,
     )
     # The environment handoff keeps uvicorn reload children on this same path.
     os.environ["DATABASE_PATH"] = str(database)

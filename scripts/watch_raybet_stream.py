@@ -27,6 +27,11 @@ from live_betting.raybet_state import (  # noqa: E402
 )
 from live_betting.raybet import BASE_URL, RayBetClient  # noqa: E402
 from live_betting.sanitize import stored_public_stream_url  # noqa: E402
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+    service_data_paths,
+)
 from live_betting.storage import LiveBettingStore  # noqa: E402
 from live_betting.vision_frame_registry import (  # noqa: E402
     VisionFrameReceipt,
@@ -47,9 +52,6 @@ from vision.team_side import TeamSideRecognizer, TeamSideTracker  # noqa: E402
 
 
 COMPLETION_CHECK_INTERVAL = 15
-LIVE_BETTING_DATA = ROOT / "data" / "live_betting"
-DEFAULT_OBSERVATION_DIR = LIVE_BETTING_DATA / "live_observations"
-DEFAULT_EVIDENCE_DIR = LIVE_BETTING_DATA / "live_evidence"
 DEFAULT_FEATURES = ROOT / "vision" / "templates" / "hero_features.npz"
 ALLOWED_STREAM_HOSTS = frozenset(
     {
@@ -324,11 +326,29 @@ def _write_evidence_frame(
         raise OSError("failed to write content-addressed evidence frame") from error
 
 
-def main() -> int:
+def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
+    if args.database is not None:
+        args.database = Path(args.database).resolve()
+    if args.output is None or args.evidence_dir is None:
+        if args.database is None:
+            raise ValueError(
+                "--database is required when --output or --evidence-dir is omitted"
+            )
+        paths = service_data_paths(args.database)
+        if args.output is None:
+            args.output = paths.vision_observations / f"{args.match_id}.jsonl"
+        if args.evidence_dir is None:
+            args.evidence_dir = paths.vision_evidence
+    args.output = Path(args.output).resolve()
+    args.evidence_dir = Path(args.evidence_dir).resolve()
+    return args
+
+
+def _parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--match-id", required=True)
     parser.add_argument("--url")
-    parser.add_argument("--database", type=Path)
+    add_single_database_argument(parser)
     parser.add_argument("--map-number", type=int)
     parser.add_argument("--radiant-side", choices=("team_one", "team_two"))
     parser.add_argument("--output", type=Path)
@@ -343,19 +363,23 @@ def main() -> int:
         help="fetch an ephemeral signed stream URL instead of reading it from SQLite",
     )
     args = parser.parse_args()
-
     try:
-        url, map_number = resolve_source(
-            url=args.url,
-            database=args.database,
-            match_id=args.match_id,
-            map_number=args.map_number,
-            refresh_url=args.refresh_url,
-        )
+        args = resolve_data_paths(args)
     except ValueError as error:
         parser.error(str(error))
-    output = args.output or DEFAULT_OBSERVATION_DIR / f"{args.match_id}.jsonl"
-    evidence_dir = args.evidence_dir or DEFAULT_EVIDENCE_DIR
+    return parser, args
+
+
+def _run_cli(args: argparse.Namespace) -> int:
+    url, map_number = resolve_source(
+        url=args.url,
+        database=args.database,
+        match_id=args.match_id,
+        map_number=args.map_number,
+        refresh_url=args.refresh_url,
+    )
+    output = args.output
+    evidence_dir = args.evidence_dir
 
     clock_reader = ClockReader()
     clock_tracker = MapStateTracker()
@@ -454,6 +478,17 @@ def main() -> int:
                 print(observation.model_dump_json())
                 previous = observation
     return 0
+
+
+def main() -> int:
+    parser, args = _parse_args()
+    try:
+        if args.database is None:
+            return _run_cli(args)
+        with database_writer_authority(args.database):
+            return _run_cli(args)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

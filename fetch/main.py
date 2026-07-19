@@ -10,11 +10,16 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
 import yaml
 
 from .client import OpenDotaClient
 from .db import Database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +32,9 @@ def load_config() -> dict:
     return cfg
 
 
-def resolve_db_path(cfg: dict) -> str:
+def resolve_db_path(cfg: dict, database: str | Path | None = None) -> str:
+    if database is not None:
+        return str(Path(database).resolve())
     raw: str = cfg.get("database", "../data/dota2.db")
     if os.path.isabs(raw):
         return raw
@@ -134,8 +141,13 @@ async def fetch_matches(
     return fetched, skipped
 
 
-async def run(cfg: dict, force: bool, single_match_id: int | None) -> None:
-    db_path = resolve_db_path(cfg)
+async def run(
+    cfg: dict,
+    force: bool,
+    single_match_id: int | None,
+    database_path: str | Path | None = None,
+) -> None:
+    db_path = resolve_db_path(cfg, database_path)
     db = Database(db_path)
     db.connect()
     db.init_db()
@@ -167,7 +179,7 @@ async def run(cfg: dict, force: bool, single_match_id: int | None) -> None:
         db.close()
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -177,10 +189,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch Dota 2 match data from OpenDota")
     parser.add_argument("--force", action="store_true", help="Re-fetch even if already in DB")
     parser.add_argument("--match-id", type=int, default=None, help="Fetch a single match by ID")
-    args = parser.parse_args()
+    add_single_database_argument(parser)
+    args = parser.parse_args(argv)
 
     cfg = load_config()
-    asyncio.run(run(cfg, args.force, args.match_id))
+    database = Path(resolve_db_path(cfg, args.database)).resolve()
+    with database_writer_authority(database):
+        asyncio.run(run(cfg, args.force, args.match_id, database))
 
 
 if __name__ == "__main__":

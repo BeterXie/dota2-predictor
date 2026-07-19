@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +22,14 @@ from event_intelligence.storage import (
 )
 from live_betting.database_protocol import (
     check_schema_versions,
+    immutable_checkpoint_reader,
     online_backup,
     prepare_database,
     restore_database_backup,
+    vacuum_into_immutable_checkpoint,
     verify_prepared_database,
 )
+from live_betting.service_coordination import SingleInstanceLock
 from live_betting.storage import CURRENT_SCHEMA_VERSION as LIVE_VERSION
 from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
@@ -111,6 +115,165 @@ def test_execute_script_does_not_commit_the_callers_transaction() -> None:
         ).fetchone() is None
     finally:
         connection.close()
+
+
+def test_immutable_checkpoint_reader_preserves_quiescent_sidecars(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "immutable.db"
+    writer = connect(database)
+    try:
+        writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+        writer.execute("INSERT INTO marker VALUES ('stable')")
+        writer.commit()
+    finally:
+        writer.close()
+    shm = Path(f"{database}-shm")
+    shm.write_bytes(b"quiescent")
+    before = database_protocol.sqlite_sidecar_state(database)
+    lock_path = tmp_path / "immutable.lock"
+
+    with SingleInstanceLock(lock_path):
+        with immutable_checkpoint_reader(
+            database,
+            label="test database",
+            required_locks=(lock_path,),
+        ) as reader:
+            assert reader.execute("SELECT value FROM marker").fetchone()[0] == "stable"
+
+    assert database_protocol.sqlite_sidecar_state(database) == before
+
+
+def test_immutable_checkpoint_reader_rejects_transactional_sidecars(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "immutable.db"
+    writer = connect(database)
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.commit()
+    writer.close()
+    Path(f"{database}-wal").write_bytes(b"active")
+    lock_path = tmp_path / "immutable.lock"
+
+    with SingleInstanceLock(lock_path):
+        with pytest.raises(RuntimeError, match="non-empty transactional sidecars"):
+            with immutable_checkpoint_reader(
+                database,
+                label="test database",
+                required_locks=(lock_path,),
+            ):
+                pytest.fail("transactional database was opened as immutable")
+
+
+def test_immutable_checkpoint_reader_rejects_sidecar_change(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "immutable.db"
+    writer = connect(database)
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.commit()
+    writer.close()
+    shm = Path(f"{database}-shm")
+    shm.write_bytes(b"before")
+    lock_path = tmp_path / "immutable.lock"
+
+    with SingleInstanceLock(lock_path):
+        with pytest.raises(RuntimeError, match="sidecars changed during immutable read"):
+            with immutable_checkpoint_reader(
+                database,
+                label="test database",
+                required_locks=(lock_path,),
+            ):
+                shm.write_bytes(b"after!")
+
+
+def test_immutable_checkpoint_reader_rejects_same_size_database_change(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "immutable.db"
+    writer = connect(database)
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.execute("INSERT INTO marker VALUES ('before')")
+    writer.commit()
+    writer.close()
+    lock_path = tmp_path / "immutable.lock"
+
+    with SingleInstanceLock(lock_path):
+        with pytest.raises(RuntimeError, match="database changed during immutable read"):
+            with immutable_checkpoint_reader(
+                database,
+                label="test database",
+                required_locks=(lock_path,),
+            ):
+                with database.open("r+b") as handle:
+                    handle.seek(-1, 2)
+                    original = handle.read(1)
+                    handle.seek(-1, 2)
+                    handle.write(b"0" if original != b"0" else b"1")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+
+def test_immutable_checkpoint_reader_preserves_body_base_exception(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "immutable.db"
+    writer = connect(database)
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.commit()
+    writer.close()
+    shm = Path(f"{database}-shm")
+    shm.write_bytes(b"before")
+    lock_path = tmp_path / "immutable.lock"
+
+    with SingleInstanceLock(lock_path):
+        with pytest.raises(KeyboardInterrupt, match="body") as raised:
+            with immutable_checkpoint_reader(
+                database,
+                label="test database",
+                required_locks=(lock_path,),
+            ):
+                shm.write_bytes(b"after!")
+                raise KeyboardInterrupt("body")
+
+    assert any(
+        "sidecars changed during immutable read" in note
+        for note in raised.value.__notes__
+    )
+
+
+def test_vacuum_into_immutable_checkpoint_preserves_source_sidecars(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "source.db"
+    output = tmp_path / "vacuumed.db"
+    writer = connect(database)
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.execute("INSERT INTO marker VALUES ('stable')")
+    writer.commit()
+    writer.close()
+    shm = Path(f"{database}-shm")
+    shm.write_bytes(b"quiescent")
+    before = database_protocol.sqlite_sidecar_state(database)
+    checks: list[str] = []
+    lock_path = tmp_path / "immutable.lock"
+
+    with SingleInstanceLock(lock_path):
+        vacuum_into_immutable_checkpoint(
+            database,
+            output,
+            label="test vacuum source",
+            required_locks=(lock_path,),
+            authority_check=lambda: checks.append("checked"),
+        )
+
+    reader = connect(output, read_only=True)
+    try:
+        assert reader.execute("SELECT value FROM marker").fetchone()[0] == "stable"
+    finally:
+        reader.close()
+    assert checks == ["checked", "checked"]
+    assert database_protocol.sqlite_sidecar_state(database) == before
 
 
 def test_shared_connection_policy_applies_to_read_write_and_read_only(
@@ -1278,6 +1441,142 @@ def test_verify_prepared_database_rejects_missing_schema_object(
         verify_prepared_database(database)
 
 
+@pytest.mark.parametrize(
+    ("object_type", "statement", "message"),
+    (
+        (
+            "index",
+            "CREATE INDEX unauthorized_core_index "
+            "ON raybet_matches(raybet_match_id)",
+            "unexpected indexes: unauthorized_core_index",
+        ),
+        (
+            "index-runtime",
+            "CREATE INDEX unauthorized_runtime_index "
+            "ON monitor_process_registry(status)",
+            "unexpected indexes: unauthorized_runtime_index",
+        ),
+        (
+            "trigger",
+            """CREATE TRIGGER unauthorized_cross_table_trigger
+               AFTER INSERT ON application_events
+               BEGIN
+                   DELETE FROM raybet_matches;
+               END""",
+            "unexpected triggers: unauthorized_cross_table_trigger",
+        ),
+        (
+            "trigger-unrelated",
+            """CREATE TRIGGER unauthorized_application_trigger
+               AFTER INSERT ON application_events
+               BEGIN
+                   INSERT INTO application_audit (event_id, detail)
+                   VALUES (NEW.event_id, 'created');
+               END""",
+            "unexpected triggers: unauthorized_application_trigger",
+        ),
+        (
+            "view",
+            """CREATE VIEW unauthorized_core_view AS
+               SELECT raybet_match_id FROM raybet_matches""",
+            "unexpected views: unauthorized_core_view",
+        ),
+    ),
+)
+def test_verify_prepared_database_rejects_unexpected_core_schema_object(
+    tmp_path: Path,
+    object_type: str,
+    statement: str,
+    message: str,
+) -> None:
+    database = tmp_path / f"unexpected-{object_type}.db"
+    prepare_database(database, tmp_path / "migration-backups")
+    connection = connect(database)
+    connection.execute(
+        "CREATE TABLE application_events (event_id INTEGER PRIMARY KEY)"
+    )
+    connection.execute(
+        """CREATE TABLE application_audit (
+               event_id INTEGER NOT NULL,
+               detail TEXT NOT NULL
+           )"""
+    )
+    connection.execute(statement)
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match=message):
+        verify_prepared_database(database)
+
+
+def test_verify_prepared_database_allows_unrelated_application_objects(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "application-objects.db"
+    prepare_database(database, tmp_path / "migration-backups")
+    connection = connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE application_events (
+            event_id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE live_matches (
+            match_id INTEGER PRIMARY KEY,
+            league_id INTEGER,
+            state TEXT
+        );
+        CREATE TABLE live_players (
+            player_id INTEGER PRIMARY KEY,
+            hero_id INTEGER,
+            match_id INTEGER
+        );
+        CREATE TABLE live_winrates (
+            winrate_id INTEGER PRIMARY KEY,
+            match_id INTEGER
+        );
+        CREATE INDEX idx_live_matches_league ON live_matches(league_id);
+        CREATE INDEX idx_live_matches_state ON live_matches(state);
+        CREATE INDEX idx_live_players_hero ON live_players(hero_id);
+        CREATE INDEX idx_live_players_match ON live_players(match_id);
+        CREATE INDEX idx_live_winrates_match ON live_winrates(match_id);
+        """
+    )
+    object_names = {
+        str(row[0])
+        for row in connection.execute(
+            """SELECT name FROM sqlite_master
+                 WHERE name IN (
+                     'sqlite_autoindex_application_events_1',
+                     'monitor_process_registry',
+                     'idx_notification_due',
+                     'idx_live_matches_league',
+                     'idx_live_matches_state',
+                     'idx_live_players_hero',
+                     'idx_live_players_match',
+                     'idx_live_winrates_match'
+                 )"""
+        )
+    }
+    connection.commit()
+    connection.close()
+
+    result = verify_prepared_database(database)
+
+    assert object_names == {
+        "sqlite_autoindex_application_events_1",
+        "monitor_process_registry",
+        "idx_notification_due",
+        "idx_live_matches_league",
+        "idx_live_matches_state",
+        "idx_live_players_hero",
+        "idx_live_players_match",
+        "idx_live_winrates_match",
+    }
+    assert result.live_schema_version == LIVE_VERSION
+    assert result.intelligence_schema_version == INTELLIGENCE_VERSION
+
+
 def test_future_schema_is_rejected_before_backup_or_mutation(tmp_path: Path) -> None:
     database = tmp_path / "future.db"
     connection = connect(database)
@@ -1450,6 +1749,92 @@ def test_live_v1_schema_migrates_to_current_and_is_idempotent(tmp_path: Path) ->
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
         ] == [1, LIVE_VERSION]
+
+
+def test_live_v8_migration_installs_bounded_monitor_candidate_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live-v8-monitor.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.connection.executescript(
+            """DROP TRIGGER raybet_match_activity_from_transport;
+               DROP TRIGGER raybet_match_activity_from_snapshot;
+               DROP TABLE raybet_match_odds_activity;
+               DROP INDEX idx_raybet_matches_status_updated;
+               DROP INDEX idx_raybet_matches_updated;
+               DROP INDEX idx_raybet_matches_schedule_utc;
+               DROP INDEX idx_raybet_matches_ended_schedule_review;
+               DROP INDEX idx_raybet_matches_timeline;
+               DROP INDEX idx_vision_confirmed_game_captured;
+               DELETE FROM live_schema_version;
+               INSERT INTO live_schema_version VALUES (8, 'v8');"""
+        )
+        for match_id in ("match-a", "match-b"):
+            store.connection.execute(
+                """INSERT INTO raybet_matches
+                   (raybet_match_id, tournament, team_one, team_two,
+                    scheduled_at, best_of, status, live_url, raw_json, updated_at)
+                   VALUES (?, 'Cup', 'One', 'Two', NULL, 3, '2', NULL, '{}', ?)""",
+                (match_id, "2026-07-18T00:00:00+00:00"),
+            )
+        store.connection.executemany(
+            """INSERT INTO odds_snapshots
+               (raybet_match_id, odds_id, odds_group_id, received_at, price,
+                status, market_type, period, side, line, outcome_key, supported,
+                last_update, raw_json)
+               VALUES (?, ?, 'winner', ?, 2.0, '1', 'winner', 'map_1',
+                       'team_one', NULL, 'team_one', 1, NULL, '{}')""",
+            (
+                ("match-a", "a-old", "2026-07-18T00:01:00+00:00"),
+                ("match-a", "a-new", "2026-07-18T00:03:00+00:00"),
+                ("match-b", "b-only", "2026-07-18T00:02:00+00:00"),
+            ),
+        )
+        store.connection.commit()
+
+    with LiveBettingStore(database) as migrated:
+        migrated.init_schema()
+        migrated.init_schema()
+        assert [
+            int(row[0])
+            for row in migrated.connection.execute(
+                "SELECT version FROM live_schema_version ORDER BY version"
+            )
+        ] == [8, 9]
+        installed = {
+            str(row[0])
+            for row in migrated.connection.execute(
+                """SELECT name FROM sqlite_master
+                    WHERE name IN (
+                        'idx_raybet_matches_status_updated',
+                        'idx_raybet_matches_updated',
+                        'idx_raybet_matches_schedule_utc',
+                        'idx_raybet_matches_ended_schedule_review',
+                        'idx_raybet_matches_timeline',
+                        'idx_vision_confirmed_game_captured',
+                        'idx_raybet_match_odds_activity_time',
+                        'raybet_match_activity_from_transport',
+                        'raybet_match_activity_from_snapshot'
+                    )"""
+            )
+        }
+        assert len(installed) == 9
+        activity = migrated.connection.execute(
+            """SELECT match_row.raybet_match_id,
+                      cache.latest_odds_activity_at,
+                      (SELECT MAX(snapshot.received_at)
+                         FROM odds_snapshots AS snapshot
+                        WHERE snapshot.raybet_match_id=match_row.raybet_match_id)
+                 FROM raybet_matches AS match_row
+                 JOIN raybet_match_odds_activity AS cache
+                   ON cache.raybet_match_id=match_row.raybet_match_id
+                ORDER BY match_row.raybet_match_id"""
+        ).fetchall()
+        assert [tuple(row) for row in activity] == [
+            ("match-a", "2026-07-18T00:03:00+00:00", "2026-07-18T00:03:00+00:00"),
+            ("match-b", "2026-07-18T00:02:00+00:00", "2026-07-18T00:02:00+00:00"),
+        ]
 
 
 def test_prepare_database_migrates_live_v3_contract_to_current(tmp_path: Path) -> None:

@@ -6,13 +6,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import live_betting.database_bundle as database_bundle
+import live_betting.hash_authority as hash_authority
 import live_betting.odds_legacy_compactor as odds_legacy_compactor
+import live_betting.service_coordination as service_coordination
 
 from event_intelligence.raw_archive import RawArchive
 from event_intelligence.raw_registry import relocate_raw_source_artifacts
@@ -26,6 +29,16 @@ from live_betting.database_protocol import (
     prepare_database,
 )
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
+from live_betting.runtime_schema import CURRENT_RUNTIME_SCHEMA_VERSION
+from live_betting.service_coordination import (
+    SingleInstanceLock,
+    WriterScanResult,
+    database_authority_lock_paths,
+    database_global_authority_lock_paths,
+    database_global_service_lock_path,
+    database_global_web_lock_path,
+    database_offline_authority,
+)
 from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
 from live_betting.vision_frame_registry import (
@@ -36,6 +49,7 @@ from shared.sqlite import connect
 
 
 NOW = datetime(2026, 7, 17, 8, 0, tzinfo=timezone.utc)
+HEAD = database_bundle._git_commit()
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +82,224 @@ def _payload() -> dict[str, object]:
             ],
         }
     }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows prevents renaming an open file")
+def test_single_fd_json_reader_rejects_aba_path_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "authority.json"
+    displaced = tmp_path / "authority-original.json"
+    malicious = tmp_path / "authority-malicious.json"
+    captured = tmp_path / "authority-captured.json"
+    path.write_text('{"trusted":true}\n', encoding="utf-8")
+    malicious.write_text('{"trusted":false}\n', encoding="utf-8")
+    real_open = os.open
+    attacked = False
+
+    def aba_open(target: object, flags: int, mode: int = 0o777) -> int:
+        nonlocal attacked
+        logical = Path(os.path.abspath(os.fspath(target)))
+        if logical == path.absolute() and not attacked:
+            attacked = True
+            os.replace(path, displaced)
+            os.replace(malicious, path)
+            descriptor = real_open(target, flags, mode)
+            os.replace(path, captured)
+            os.replace(displaced, path)
+            return descriptor
+        return real_open(target, flags, mode)
+
+    monkeypatch.setattr(service_coordination.os, "open", aba_open)
+
+    with pytest.raises(RuntimeError, match="file changed"):
+        database_bundle._read_json_with_authority(path, label="ABA JSON")
+
+    assert attacked
+    assert json.loads(path.read_text(encoding="utf-8")) == {"trusted": True}
+    assert json.loads(captured.read_text(encoding="utf-8")) == {"trusted": False}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows prevents renaming an open file")
+def test_bundle_verify_rejects_manifest_aba_during_single_fd_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    manifest = bundle / "manifest.json"
+    displaced = tmp_path / "manifest-original.json"
+    malicious = tmp_path / "manifest-malicious.json"
+    captured = tmp_path / "manifest-captured.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["created_at"] = "attacker-manifest"
+    malicious.write_text(json.dumps(payload), encoding="utf-8")
+    real_open = os.open
+    attacked = False
+
+    def aba_open(target: object, flags: int, mode: int = 0o777) -> int:
+        nonlocal attacked
+        logical = Path(os.path.abspath(os.fspath(target)))
+        if logical == manifest.absolute() and not attacked:
+            attacked = True
+            os.replace(manifest, displaced)
+            os.replace(malicious, manifest)
+            descriptor = real_open(target, flags, mode)
+            os.replace(manifest, captured)
+            os.replace(displaced, manifest)
+            return descriptor
+        return real_open(target, flags, mode)
+
+    monkeypatch.setattr(service_coordination.os, "open", aba_open)
+    with pytest.raises(RuntimeError, match="file changed"):
+        verify_database_bundle(bundle)
+    assert attacked
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows prevents renaming an open file")
+def test_bundle_verify_rejects_gzip_artifact_aba_during_single_fd_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    manifest_payload = json.loads(
+        (bundle / "manifest.json").read_text(encoding="utf-8")
+    )
+    record = next(
+        item
+        for item in manifest_payload["artifacts"]
+        if item["registry"] != "vision_frame_artifacts"
+    )
+    artifact = bundle / str(record["bundle_path"])
+    displaced = tmp_path / "artifact-original.gz"
+    malicious = tmp_path / "artifact-malicious.gz"
+    captured = tmp_path / "artifact-captured.gz"
+    shutil.copy2(artifact, malicious)
+    real_open = os.open
+    attacked = False
+
+    def aba_open(target: object, flags: int, mode: int = 0o777) -> int:
+        nonlocal attacked
+        logical = Path(os.path.abspath(os.fspath(target)))
+        if logical == artifact.absolute() and not attacked:
+            attacked = True
+            os.replace(artifact, displaced)
+            os.replace(malicious, artifact)
+            descriptor = real_open(target, flags, mode)
+            os.replace(artifact, captured)
+            os.replace(displaced, artifact)
+            return descriptor
+        return real_open(target, flags, mode)
+
+    monkeypatch.setattr(service_coordination.os, "open", aba_open)
+    with pytest.raises(RuntimeError, match="file changed"):
+        verify_database_bundle(bundle)
+    assert attacked
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows prevents renaming locked roots")
+def test_global_authority_lock_survives_database_root_swap(tmp_path: Path) -> None:
+    root = tmp_path / "restore"
+    root.mkdir()
+    database = root / "dota2.db"
+    database.write_bytes(b"original")
+    displaced_root = tmp_path / "restore-displaced"
+    global_locks = database_global_authority_lock_paths(database)
+
+    with pytest.raises(RuntimeError, match="directory identity changed"):
+        with database_offline_authority(
+            database,
+            writer_scanner=lambda _: WriterScanResult((), ()),
+        ):
+            os.replace(root, displaced_root)
+            root.mkdir()
+            replacement = root / "dota2.db"
+            replacement.write_bytes(b"replacement")
+            assert database_global_authority_lock_paths(replacement) == global_locks
+            for global_lock in global_locks:
+                with pytest.raises(RuntimeError, match="already held|collision"):
+                    with SingleInstanceLock(global_lock):
+                        pass
+
+
+def test_atomic_json_fsync_failure_leaves_resumable_published_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "checkpoint.json"
+    real_fsync = database_bundle.fsync_directory
+
+    def fail_fsync(_: Path) -> None:
+        raise RuntimeError("injected directory fsync failure")
+
+    monkeypatch.setattr(database_bundle, "fsync_directory", fail_fsync)
+    with pytest.raises(RuntimeError, match="directory fsync failure"):
+        database_bundle._write_json(path, {"generation": 1})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"generation": 1}
+    monkeypatch.setattr(database_bundle, "fsync_directory", real_fsync)
+    database_bundle._write_json(path, {"generation": 2})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"generation": 2}
+
+
+@pytest.mark.parametrize("implementation", ["bundle", "compactor"])
+def test_sidecar_cleanup_quarantines_and_retains_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+) -> None:
+    module = (
+        database_bundle
+        if implementation == "bundle"
+        else odds_legacy_compactor
+    )
+    database = tmp_path / f"{implementation}.db"
+    database.write_bytes(b"database")
+    sidecar = Path(f"{database}-shm")
+    sidecar.touch()
+    displaced = tmp_path / f"{implementation}-authorized-shm"
+    replacement_bytes = b"replacement-sidecar-must-not-be-deleted"
+    real_replace = module._replace_and_fsync
+    attacked = False
+
+    def replace_at_quarantine(source: Path, target: Path) -> None:
+        nonlocal attacked
+        if source == sidecar and ".quarantine." in target.name and not attacked:
+            attacked = True
+            os.replace(sidecar, displaced)
+            sidecar.write_bytes(replacement_bytes)
+        real_replace(source, target)
+
+    monkeypatch.setattr(module, "_replace_and_fsync", replace_at_quarantine)
+    with pytest.raises(RuntimeError, match="quarantined.*authority changed"):
+        if implementation == "bundle":
+            module._clear_quiescent_sqlite_sidecars(database)
+        else:
+            module._clear_quiescent_sqlite_sidecars(database, label="test database")
+
+    quarantined = list(tmp_path.glob(f".{sidecar.name}.quarantine.*"))
+    assert attacked
+    assert displaced.is_file()
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == replacement_bytes
 
 
 def _database_with_artifacts(
@@ -150,6 +382,326 @@ def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _bundle_database_path(bundle: Path) -> Path:
+    return bundle / database_bundle._BUNDLE_DATABASE_PATH
+
+
+def _restore_staging_database_path(target: Path) -> Path:
+    return (
+        database_bundle._restore_staging_directory(target)
+        / database_bundle._DATABASE_DIRECTORY
+        / "dota2.db"
+    )
+
+
+def _track_physical_database_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Path, str]]:
+    calls: list[tuple[Path, str]] = []
+    real_read = hash_authority.read_stable_regular_file
+
+    def tracked_read(
+        path: Path,
+        *,
+        label: str,
+        include_payload: bool = True,
+    ):
+        logical = Path(path).resolve()
+        if logical.suffix in {".db", ".sqlite"}:
+            calls.append((logical, label))
+        return real_read(path, label=label, include_payload=include_payload)
+
+    monkeypatch.setattr(hash_authority, "read_stable_regular_file", tracked_read)
+    return calls
+
+
+def _isolate_managed_writer_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        service_coordination,
+        "scan_managed_writers",
+        lambda *_args, **_kwargs: WriterScanResult((), ()),
+    )
+
+
+def _empty_bundle_source(root: Path) -> tuple[Path, Path]:
+    root.mkdir()
+    database = root / "dota2.db"
+    odds_root = root / "live_betting" / "raw-v2"
+    prepare_database(database, root / "schema-backups", now=NOW)
+    return database, odds_root
+
+
+def _database_hash_trace(calls: list[tuple[Path, str]]) -> str:
+    return "\n".join(
+        f"{index}: {path} [{label}]"
+        for index, (path, label) in enumerate(calls, start=1)
+    )
+
+
+def test_staging_database_paths_preserve_legacy_checkpoint_layout(
+    tmp_path: Path,
+) -> None:
+    bundle_staging = tmp_path / "bundle-staging"
+    restore_staging = tmp_path / "restore-staging"
+
+    assert database_bundle._bundle_staging_database_path(
+        bundle_staging,
+        {},
+    ) == (bundle_staging / "database.sqlite").resolve()
+    assert database_bundle._bundle_staging_database_path(
+        bundle_staging,
+        {"database_path": "database/database.sqlite"},
+    ) == (bundle_staging / "database" / "database.sqlite").resolve()
+    assert database_bundle._restore_staging_database_path(
+        restore_staging,
+        {},
+        "dota2.db",
+    ) == (restore_staging / "dota2.db").resolve()
+    assert database_bundle._restore_staging_database_path(
+        restore_staging,
+        {"staging_database_path": "database/dota2.db"},
+        "dota2.db",
+    ) == (restore_staging / "database" / "dota2.db").resolve()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("database_path", "other/database.sqlite"),
+        ("staging_database_path", "other/dota2.db"),
+    ],
+)
+def test_staging_database_paths_reject_uncontrolled_checkpoint_layout(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    if field == "database_path":
+        with pytest.raises(RuntimeError, match="not controlled"):
+            database_bundle._bundle_staging_database_path(
+                tmp_path,
+                {field: value},
+            )
+    else:
+        with pytest.raises(RuntimeError, match="not controlled"):
+            database_bundle._restore_staging_database_path(
+                tmp_path,
+                {field: value},
+                "dota2.db",
+            )
+
+
+def test_create_database_bundle_hashes_databases_at_most_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    calls = _track_physical_database_hashes(monkeypatch)
+
+    create_database_bundle(database, odds_root, tmp_path / "bundle")
+
+    assert len(calls) <= 2, _database_hash_trace(calls)
+    paths = [path for path, _label in calls]
+    assert [path.suffix for path in paths].count(".db") == 1
+    assert [path.suffix for path in paths].count(".sqlite") == 1
+
+
+def test_standalone_bundle_verify_rehashes_once_per_public_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_database_bundle(database, odds_root, bundle)
+    calls = _track_physical_database_hashes(monkeypatch)
+    bundle_database = _bundle_database_path(bundle).resolve()
+
+    verify_database_bundle(bundle)
+    first = tuple(calls)
+    calls.clear()
+    verify_database_bundle(bundle)
+    second = tuple(calls)
+
+    assert [path for path, _label in first] == [bundle_database]
+    assert [path for path, _label in second] == [bundle_database]
+
+
+def test_bundle_verify_does_not_reuse_unrelated_hash_authority_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_database_bundle(database, odds_root, bundle)
+    unrelated_lock = tmp_path / "unrelated.operation.lock"
+    bundle_lock = database_bundle._operation_lock_path(bundle.resolve())
+
+    with (
+        SingleInstanceLock(unrelated_lock),
+        hash_authority.file_hash_authority_scope(required_locks=(unrelated_lock,)),
+        SingleInstanceLock(bundle_lock),
+    ):
+        with pytest.raises(RuntimeError, match="lock is already held"):
+            verify_database_bundle(bundle)
+
+
+def test_restore_database_bundle_hashes_databases_at_most_three_times(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_database_bundle(database, odds_root, bundle)
+    calls = _track_physical_database_hashes(monkeypatch)
+
+    result = restore_database_bundle(bundle, tmp_path / "restore")
+
+    assert result.database.is_file()
+    assert len(calls) <= 3, _database_hash_trace(calls)
+    paths = [path for path, _label in calls]
+    assert _bundle_database_path(bundle).resolve() in paths
+    assert any(path.name == "dota2.db" for path in paths)
+
+
+def test_bundle_verify_rejects_same_size_in_place_database_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_database_bundle(database, odds_root, bundle)
+    bundle_database = _bundle_database_path(bundle).resolve()
+    original_size = bundle_database.stat().st_size
+    real_require = database_bundle._require_database_file_authority
+    attacked = False
+
+    def change_before_final_authority(
+        path: Path,
+        expected: object,
+        **kwargs: object,
+    ):
+        nonlocal attacked
+        if Path(path).resolve() == bundle_database and not attacked:
+            attacked = True
+            with bundle_database.open("r+b") as handle:
+                handle.seek(-1, os.SEEK_END)
+                value = handle.read(1)
+                handle.seek(-1, os.SEEK_END)
+                handle.write(bytes((value[0] ^ 0x01,)))
+                handle.flush()
+                os.fsync(handle.fileno())
+            assert bundle_database.stat().st_size == original_size
+        return real_require(path, expected, **kwargs)
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_require_database_file_authority",
+        change_before_final_authority,
+    )
+    with pytest.raises(RuntimeError, match="file authority changed"):
+        verify_database_bundle(bundle)
+    assert attacked
+
+
+def test_bundle_verify_rehashes_after_external_database_rename_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_database_bundle(database, odds_root, bundle)
+    bundle_database = _bundle_database_path(bundle).resolve()
+    displaced = tmp_path / "bundle-original.sqlite"
+    replacement = tmp_path / "bundle-replacement.sqlite"
+    captured = tmp_path / "bundle-captured.sqlite"
+    shutil.copy2(bundle_database, replacement)
+    calls = _track_physical_database_hashes(monkeypatch)
+    real_require = database_bundle._require_database_file_authority
+    attacked = False
+
+    def rename_aba_before_final_authority(
+        path: Path,
+        expected: object,
+        **kwargs: object,
+    ):
+        nonlocal attacked
+        if Path(path).resolve() == bundle_database and not attacked:
+            attacked = True
+            os.replace(bundle_database, displaced)
+            os.replace(replacement, bundle_database)
+            os.replace(bundle_database, captured)
+            os.replace(displaced, bundle_database)
+        return real_require(path, expected, **kwargs)
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_require_database_file_authority",
+        rename_aba_before_final_authority,
+    )
+    verify_database_bundle(bundle)
+
+    assert attacked
+    assert [path for path, _label in calls] == [bundle_database, bundle_database]
+
+
+def test_bundle_verify_rehashes_when_database_sidecar_state_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root = _empty_bundle_source(tmp_path / "source")
+    bundle = tmp_path / "bundle"
+    create_database_bundle(database, odds_root, bundle)
+    bundle_database = _bundle_database_path(bundle).resolve()
+    sidecar = Path(f"{bundle_database}-shm")
+    calls = _track_physical_database_hashes(monkeypatch)
+    real_require = database_bundle._require_database_file_authority
+    attacked = False
+
+    def add_sidecar_before_final_authority(
+        path: Path,
+        expected: object,
+        **kwargs: object,
+    ):
+        nonlocal attacked
+        if Path(path).resolve() == bundle_database and not attacked:
+            attacked = True
+            sidecar.touch()
+        return real_require(path, expected, **kwargs)
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_require_database_file_authority",
+        add_sidecar_before_final_authority,
+    )
+    try:
+        verify_database_bundle(bundle)
+    finally:
+        sidecar.unlink(missing_ok=True)
+
+    assert attacked
+    assert [path for path, _label in calls] == [bundle_database, bundle_database]
+
+
+def _open_wal_only_writer(database: Path, table: str):
+    writer = connect(database, wal=True)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    before = _hash(database)
+    assert _hash(database) == before
+    writer.execute(f"CREATE TABLE {table}(value INTEGER NOT NULL)")
+    writer.execute(f"INSERT INTO {table} VALUES (1)")
+    writer.commit()
+    assert _hash(database) == before
+    assert Path(f"{database}-wal").stat().st_size > 0
+    return writer
+
+
 def _add_vision_frame(database: Path, root: Path):
     receipt = publish_vision_frame_bytes(
         root / "live_betting" / "live_evidence",
@@ -192,13 +744,13 @@ def test_bundle_restores_database_and_both_raw_registries_relocatably(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="a" * 40,
+        git_commit=HEAD,
     )
 
     assert result.artifact_count == 2
     assert _hash(database) == source_hash
     manifest = verify_database_bundle(bundle)
-    assert manifest["git_commit"] == "a" * 40
+    assert manifest["git_commit"] == HEAD
     assert manifest["artifact_count"] == 2
     assert manifest["source_tree_clean"] is True
     assert (
@@ -207,6 +759,9 @@ def test_bundle_restores_database_and_both_raw_registries_relocatably(
     )
     assert manifest["source_tree_head"] == database_bundle._git_commit()
     assert manifest["source_tree_runtime_dirty_paths"] == []
+    assert manifest["schema"]["versions"]["runtime_schema_version"] == (
+        CURRENT_RUNTIME_SCHEMA_VERSION
+    )
 
     restored = restore_database_bundle(bundle, tmp_path / "relocated")
     with LiveBettingStore(restored.database) as store:
@@ -255,8 +810,93 @@ def test_bundle_rejects_non_runtime_source_changes(
             odds_root,
             tmp_path / "backup-bundle",
             allowed_source_roots=[source_root],
-            git_commit="b" * 40,
+            git_commit=HEAD,
         )
+
+
+def test_bundle_rejects_hardlinked_source_database(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    alias = tmp_path / "database-alias.db"
+    os.link(database, alias)
+    bundle = tmp_path / "backup-bundle"
+
+    with pytest.raises(RuntimeError, match="exactly one hard link"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            git_commit=HEAD,
+        )
+
+    assert not bundle.exists()
+    assert not (tmp_path / ".backup-bundle.staging").exists()
+
+
+def test_bundle_rejects_source_hardlink_created_during_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source-runtime-hardlink"
+    )
+    alias = tmp_path / "runtime-database-alias.db"
+    bundle = tmp_path / "runtime-hardlink-bundle"
+    original_backup = database_bundle.online_backup
+
+    def backup_and_link(
+        source: Path,
+        destination: Path,
+        **kwargs: object,
+    ) -> None:
+        original_backup(source, destination, **kwargs)
+        os.link(source, alias)
+
+    monkeypatch.setattr(database_bundle, "online_backup", backup_and_link)
+    try:
+        with pytest.raises(RuntimeError, match="exactly one hard link"):
+            create_database_bundle(
+                database,
+                odds_root,
+                bundle,
+                allowed_source_roots=[source_root],
+                git_commit=HEAD,
+            )
+    finally:
+        alias.unlink(missing_ok=True)
+
+    assert not bundle.exists()
+    assert (tmp_path / ".runtime-hardlink-bundle.staging").is_dir()
+
+
+@pytest.mark.parametrize(
+    "lock_index",
+    [0, 1, 2, 3],
+    ids=["global-service", "global-web", "service", "web"],
+)
+def test_bundle_requires_all_source_authority_locks(
+    tmp_path: Path,
+    lock_index: int,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "backup-bundle"
+    lock_path = database_authority_lock_paths(database)[lock_index]
+
+    with database_bundle.SingleInstanceLock(lock_path):
+        with pytest.raises(RuntimeError, match="lock is already held"):
+            create_database_bundle(
+                database,
+                odds_root,
+                bundle,
+                allowed_source_roots=[source_root],
+            )
+
+    assert not bundle.exists()
+    assert not (tmp_path / ".backup-bundle.staging").exists()
 
 
 def test_bundle_checks_both_sides_of_a_rename_for_source_changes(
@@ -293,7 +933,7 @@ def test_bundle_allows_runtime_only_changes_and_records_provenance(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="c" * 40,
+        git_commit=HEAD,
     )
     manifest = verify_database_bundle(bundle)
     assert manifest["source_tree_clean"] is True
@@ -311,7 +951,9 @@ def test_bundle_allows_runtime_only_changes_and_records_provenance(
 def test_bundle_fails_closed_when_git_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unavailable(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def unavailable(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("git")
 
     monkeypatch.setattr(database_bundle.subprocess, "run", unavailable)
@@ -345,7 +987,7 @@ def test_bundle_accepts_missing_raw_root_when_registry_is_empty(tmp_path: Path) 
         database,
         odds_root,
         bundle,
-        git_commit="d" * 40,
+        git_commit=HEAD,
     )
 
     assert result.artifact_count == 0
@@ -367,7 +1009,7 @@ def test_bundle_rejects_missing_raw_root_when_registry_has_artifacts(
             odds_root,
             tmp_path / "backup-bundle",
             allowed_source_roots=[source_root],
-            git_commit="e" * 40,
+            git_commit=HEAD,
         )
 
 
@@ -382,9 +1024,7 @@ def test_bundle_roundtrip_relocates_and_reverifies_vision_frame(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "source"
-    database, odds_root, raw_source_root, _, _ = _database_with_artifacts(
-        source_root
-    )
+    database, odds_root, raw_source_root, _, _ = _database_with_artifacts(source_root)
     original = _add_vision_frame(database, source_root)
     bundle = tmp_path / "backup-bundle"
     created = create_database_bundle(
@@ -392,7 +1032,7 @@ def test_bundle_roundtrip_relocates_and_reverifies_vision_frame(
         odds_root,
         bundle,
         allowed_source_roots=[raw_source_root],
-        git_commit="e" * 40,
+        git_commit=HEAD,
     )
     assert created.artifact_count == 3
     manifest = verify_database_bundle(bundle)
@@ -439,9 +1079,7 @@ def test_bundle_roundtrip_relocates_and_reverifies_vision_frame(
 
 def test_bundle_rejects_tampered_registered_vision_frame(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
-    database, odds_root, raw_source_root, _, _ = _database_with_artifacts(
-        source_root
-    )
+    database, odds_root, raw_source_root, _, _ = _database_with_artifacts(source_root)
     _add_vision_frame(database, source_root)
     bundle = tmp_path / "backup-bundle"
     create_database_bundle(
@@ -449,7 +1087,7 @@ def test_bundle_rejects_tampered_registered_vision_frame(tmp_path: Path) -> None
         odds_root,
         bundle,
         allowed_source_roots=[raw_source_root],
-        git_commit="d" * 40,
+        git_commit=HEAD,
     )
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     vision = next(
@@ -463,16 +1101,19 @@ def test_bundle_rejects_tampered_registered_vision_frame(tmp_path: Path) -> None
         verify_database_bundle(bundle)
     with pytest.raises(RuntimeError, match="artifact|vision"):
         restore_database_bundle(bundle, tmp_path / "must-not-restore")
-    assert not (tmp_path / "must-not-restore").exists()
+    failed_target = tmp_path / "must-not-restore"
+    assert {path.name for path in failed_target.iterdir()} == {
+        "dota2.service.lock",
+        "dota2.web.lock",
+    }
+    assert not (failed_target / "dota2.db").exists()
 
 
 def test_bundle_rejects_registered_vision_frame_with_hardlink(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "source"
-    database, odds_root, raw_source_root, _, _ = _database_with_artifacts(
-        source_root
-    )
+    database, odds_root, raw_source_root, _, _ = _database_with_artifacts(source_root)
     receipt = _add_vision_frame(database, source_root)
     alias = receipt.storage_path.with_name("alias.jpg")
     try:
@@ -487,7 +1128,7 @@ def test_bundle_rejects_registered_vision_frame_with_hardlink(
             odds_root,
             bundle,
             allowed_source_roots=[raw_source_root],
-            git_commit="1" * 40,
+            git_commit=HEAD,
         )
     assert not bundle.exists()
 
@@ -506,7 +1147,7 @@ def test_bundle_verification_and_restore_reject_missing_or_corrupt_artifact(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="b" * 40,
+        git_commit=HEAD,
     )
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     artifact = bundle / manifest["artifacts"][0]["bundle_path"]
@@ -520,7 +1161,11 @@ def test_bundle_verification_and_restore_reject_missing_or_corrupt_artifact(
     target = tmp_path / "must-not-publish"
     with pytest.raises(RuntimeError, match="artifact"):
         restore_database_bundle(bundle, target)
-    assert not target.exists()
+    assert {path.name for path in target.iterdir()} == {
+        "dota2.service.lock",
+        "dota2.web.lock",
+    }
+    assert not (target / "dota2.db").exists()
 
 
 def test_restore_records_audited_relocation_and_preserves_registry_guard(
@@ -535,7 +1180,7 @@ def test_restore_records_audited_relocation_and_preserves_registry_guard(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="c" * 40,
+        git_commit=HEAD,
     )
 
     restored = restore_database_bundle(bundle, tmp_path / "relocated")
@@ -579,7 +1224,7 @@ def test_bundle_artifacts_are_independent_copies(tmp_path: Path) -> None:
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="f" * 40,
+        git_commit=HEAD,
     )
     manifest = verify_database_bundle(bundle)
     for record in manifest["artifacts"]:
@@ -616,7 +1261,7 @@ def test_bundle_staging_is_target_bound_fail_closed_and_resumable(
             odds_root,
             bundle,
             allowed_source_roots=[source_root],
-            git_commit="1" * 40,
+            git_commit=HEAD,
         )
     staging = tmp_path / ".backup-bundle.staging"
     assert staging.is_dir()
@@ -628,15 +1273,15 @@ def test_bundle_staging_is_target_bound_fail_closed_and_resumable(
             odds_root,
             bundle,
             allowed_source_roots=[source_root],
-            git_commit="1" * 40,
+            git_commit=HEAD,
         )
     with pytest.raises(RuntimeError, match="binding mismatch"):
         create_database_bundle(
             database,
             odds_root,
             bundle,
-            allowed_source_roots=[source_root],
-            git_commit="2" * 40,
+            allowed_source_roots=[source_root, tmp_path / "other-source-root"],
+            git_commit=HEAD,
             resume=True,
         )
 
@@ -646,7 +1291,7 @@ def test_bundle_staging_is_target_bound_fail_closed_and_resumable(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="1" * 40,
+        git_commit=HEAD,
         resume=True,
     )
     assert result.bundle_directory == bundle
@@ -662,7 +1307,20 @@ def test_bundle_space_preflight_counts_database_and_raw_artifacts(
     database, odds_root, source_root, _, _ = _database_with_artifacts(
         tmp_path / "source"
     )
-    required = database_bundle._required_bundle_bytes(database)
+    bundle = tmp_path / "backup-bundle"
+    operation_lock = database_bundle._operation_lock_path(bundle.resolve())
+    immutable_locks = (
+        *database_authority_lock_paths(database.resolve()),
+        operation_lock,
+    )
+    with (
+        database_offline_authority(database, lock_factory=SingleInstanceLock),
+        SingleInstanceLock(operation_lock),
+    ):
+        required = database_bundle._required_bundle_bytes(
+            database,
+            immutable_locks=immutable_locks,
+        )
     connection = connect(database, read_only=True)
     try:
         raw_bytes = sum(
@@ -682,14 +1340,13 @@ def test_bundle_space_preflight_counts_database_and_raw_artifacts(
         lambda path: SimpleNamespace(free=required - 1),
     )
 
-    bundle = tmp_path / "backup-bundle"
     with pytest.raises(RuntimeError, match="insufficient free space"):
         create_database_bundle(
             database,
             odds_root,
             bundle,
             allowed_source_roots=[source_root],
-            git_commit="3" * 40,
+            git_commit=HEAD,
         )
     assert not bundle.exists()
     assert not (tmp_path / ".backup-bundle.staging").exists()
@@ -708,7 +1365,7 @@ def test_restore_staging_is_target_bound_fail_closed_and_resumable(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="4" * 40,
+        git_commit=HEAD,
     )
     target = tmp_path / "restored"
     original_copy = database_bundle._copy_artifact
@@ -726,7 +1383,11 @@ def test_restore_staging_is_target_bound_fail_closed_and_resumable(
         restore_database_bundle(bundle, target)
     staging = tmp_path / ".restored.restore-staging"
     assert staging.is_dir()
-    assert not target.exists()
+    assert {path.name for path in target.iterdir()} == {
+        "dota2.service.lock",
+        "dota2.web.lock",
+    }
+    assert not (target / "dota2.db").exists()
 
     with pytest.raises(FileExistsError, match="resume=True"):
         restore_database_bundle(bundle, target)
@@ -759,7 +1420,7 @@ def test_restore_resume_recovers_commit_before_checkpoint_update(
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="5" * 40,
+        git_commit=HEAD,
     )
     target = tmp_path / "restored"
     original_write = database_bundle._write_json
@@ -785,12 +1446,15 @@ def test_restore_resume_recovers_commit_before_checkpoint_update(
         (staging / "staging-manifest.json").read_text(encoding="utf-8")
     )
     assert checkpoint["status"] == "relocating"
-    staged = connect(staging / "dota2.db", read_only=True)
+    staged = connect(_restore_staging_database_path(target), read_only=True)
     try:
-        assert staged.execute(
-            "SELECT COUNT(*) FROM raw_source_artifact_relocations WHERE artifact_id=?",
-            (artifact_id,),
-        ).fetchone()[0] == 1
+        assert (
+            staged.execute(
+                "SELECT COUNT(*) FROM raw_source_artifact_relocations WHERE artifact_id=?",
+                (artifact_id,),
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         staged.close()
 
@@ -798,10 +1462,13 @@ def test_restore_resume_recovers_commit_before_checkpoint_update(
     restored = restore_database_bundle(bundle, target, resume=True)
     connection = connect(restored.database, read_only=True)
     try:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM raw_source_artifact_relocations WHERE artifact_id=?",
-            (artifact_id,),
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM raw_source_artifact_relocations WHERE artifact_id=?",
+                (artifact_id,),
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         connection.close()
 
@@ -816,12 +1483,15 @@ def test_restore_resume_rejects_unknown_or_tampered_staging(tmp_path: Path) -> N
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="6" * 40,
+        git_commit=HEAD,
     )
     target = tmp_path / "restored"
     staging = tmp_path / ".restored.restore-staging"
     staging.mkdir()
-    with pytest.raises(RuntimeError, match="missing or invalid"):
+    with pytest.raises(
+        RuntimeError,
+        match="restore staging manifest file is missing",
+    ):
         restore_database_bundle(bundle, target, resume=True)
 
     staging_manifest = {
@@ -852,7 +1522,7 @@ def test_bundle_does_not_scan_or_copy_unregistered_raw_files(tmp_path: Path) -> 
         odds_root,
         bundle,
         allowed_source_roots=[source_root],
-        git_commit="d" * 40,
+        git_commit=HEAD,
     )
 
     assert all(path.name != unregistered.name for path in bundle.rglob("*"))
@@ -868,7 +1538,11 @@ def test_bundle_rejects_source_artifact_outside_allowed_roots(tmp_path: Path) ->
     outside = tmp_path / "outside.json.gz"
     try:
         original = Path(
-            str(connection.execute("SELECT storage_path FROM raw_source_artifacts").fetchone()[0])
+            str(
+                connection.execute(
+                    "SELECT storage_path FROM raw_source_artifacts"
+                ).fetchone()[0]
+            )
         )
         shutil.copy2(original, outside)
         relocate_raw_source_artifacts(
@@ -888,5 +1562,1353 @@ def test_bundle_rejects_source_artifact_outside_allowed_roots(tmp_path: Path) ->
             database,
             odds_root,
             tmp_path / "backup-bundle",
-            git_commit="e" * 40,
+            git_commit=HEAD,
         )
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_bundle_create_and_resume_reject_nonempty_source_wal_before_target_mutation(
+    tmp_path: Path,
+    resume: bool,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "backup-bundle"
+    staging = tmp_path / ".backup-bundle.staging"
+    if resume:
+        staging.mkdir()
+        (staging / "sentinel").write_text("unchanged", encoding="ascii")
+    writer = connect(database)
+    try:
+        writer.execute("CREATE TABLE bundle_wal_gate(value INTEGER)")
+        writer.commit()
+        assert Path(f"{database}-wal").stat().st_size > 0
+
+        with pytest.raises(RuntimeError, match="non-empty SQLite sidecars"):
+            create_database_bundle(
+                database,
+                odds_root,
+                bundle,
+                allowed_source_roots=[source_root],
+                resume=resume,
+            )
+    finally:
+        writer.close()
+
+    assert not bundle.exists()
+    assert not database_bundle._operation_lock_path(bundle).exists()
+    if resume:
+        assert (staging / "sentinel").read_text(encoding="ascii") == "unchanged"
+    else:
+        assert not staging.exists()
+
+
+def test_bundle_verify_and_restore_reject_committed_wal_only_data(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    bundle_database = _bundle_database_path(bundle)
+    writer = _open_wal_only_writer(bundle_database, "wal_only_bundle_tamper")
+    try:
+        with pytest.raises(RuntimeError, match="non-empty SQLite sidecars"):
+            verify_database_bundle(bundle)
+        with pytest.raises(RuntimeError, match="non-empty SQLite sidecars"):
+            restore_database_bundle(bundle, tmp_path / "restore")
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-journal"])
+def test_bundle_verify_rejects_nonempty_transaction_sidecar(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    sidecar = Path(f"{_bundle_database_path(bundle)}{suffix}")
+    sidecar.write_bytes(b"unpublished-transaction-state")
+
+    with pytest.raises(RuntimeError, match="non-empty SQLite sidecars"):
+        verify_database_bundle(bundle)
+
+    assert sidecar.read_bytes() == b"unpublished-transaction-state"
+
+
+def test_bundle_verify_ignores_shm_content_as_non_durable_state(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    shm = Path(f"{_bundle_database_path(bundle)}-shm")
+    shm.write_bytes(b"coordination-only-state")
+
+    manifest = verify_database_bundle(bundle)
+
+    assert manifest["database"]["sha256"] == _hash(_bundle_database_path(bundle))
+
+
+def test_bundle_rejects_claimed_git_commit_that_is_not_head(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    claimed = "0" * len(HEAD) if HEAD != "0" * len(HEAD) else "1" * len(HEAD)
+
+    with pytest.raises(ValueError, match="must equal the current source HEAD"):
+        create_database_bundle(
+            database,
+            odds_root,
+            tmp_path / "must-not-publish",
+            allowed_source_roots=[source_root],
+            git_commit=claimed,
+        )
+
+
+def test_bundle_resume_rejects_in_place_source_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    original_copy = database_bundle._copy_artifact
+    interrupted = False
+
+    def interrupt(source: Path, destination: Path) -> None:
+        nonlocal interrupted
+        original_copy(source, destination)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupt bundle")
+
+    monkeypatch.setattr(database_bundle, "_copy_artifact", interrupt)
+    with pytest.raises(RuntimeError, match="interrupt bundle"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    monkeypatch.setattr(database_bundle, "_copy_artifact", original_copy)
+    with database.open("r+b") as handle:
+        handle.seek(-1, os.SEEK_END)
+        original = handle.read(1)
+        handle.seek(-1, os.SEEK_END)
+        handle.write(bytes([original[0] ^ 0x01]))
+
+    with pytest.raises(RuntimeError, match="source database file authority changed"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            resume=True,
+        )
+
+
+def test_bundle_resume_rejects_same_path_source_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    original_copy = database_bundle._copy_artifact
+
+    def interrupt(source: Path, destination: Path) -> None:
+        original_copy(source, destination)
+        raise RuntimeError("interrupt bundle")
+
+    monkeypatch.setattr(database_bundle, "_copy_artifact", interrupt)
+    with pytest.raises(RuntimeError, match="interrupt bundle"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    monkeypatch.setattr(database_bundle, "_copy_artifact", original_copy)
+    replacement = database.with_name("replacement.db")
+    shutil.copy2(database, replacement)
+    os.replace(replacement, database)
+
+    with pytest.raises(RuntimeError, match="source database file authority changed"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            resume=True,
+        )
+
+
+def test_bundle_resume_rejects_runtime_dirty_set_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    original_copy = database_bundle._copy_artifact
+
+    def interrupt(source: Path, destination: Path) -> None:
+        original_copy(source, destination)
+        raise RuntimeError("interrupt bundle")
+
+    monkeypatch.setattr(database_bundle, "_copy_artifact", interrupt)
+    with pytest.raises(RuntimeError, match="interrupt bundle"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    monkeypatch.setattr(database_bundle, "_copy_artifact", original_copy)
+    monkeypatch.setattr(
+        database_bundle,
+        "_git_status_porcelain",
+        lambda: ("?? data/new-runtime-output.log",),
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint binding mismatch"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            resume=True,
+        )
+
+
+def test_bundle_rechecks_provenance_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    clean = {
+        "source_tree_head": HEAD,
+        "source_tree_clean": True,
+        "source_tree_policy_version": database_bundle._SOURCE_TREE_POLICY_VERSION,
+        "source_tree_runtime_dirty_paths": [],
+    }
+    changed = {
+        **clean,
+        "source_tree_runtime_dirty_paths": ["data/changed-during-create.log"],
+    }
+    calls = 0
+
+    def changing_provenance() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return clean if calls == 1 else changed
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_source_tree_provenance",
+        changing_provenance,
+    )
+    with pytest.raises(RuntimeError, match="provenance changed"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    checkpoint = json.loads(
+        (tmp_path / ".bundle.staging" / "staging-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert checkpoint["status"] == "ready"
+    assert not bundle.exists()
+
+
+def test_bundle_resume_recovers_runtime_prepare_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    connection = connect(database)
+    try:
+        connection.execute("DROP TABLE runtime_schema_version")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+    source_hash = _hash(database)
+    bundle = tmp_path / "bundle"
+    original_prepare = database_bundle._prepare_runtime_database
+    interrupted = False
+
+    def prepare_then_crash(snapshot: Path) -> None:
+        nonlocal interrupted
+        original_prepare(snapshot)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("crash after runtime prepare")
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_prepare_runtime_database",
+        prepare_then_crash,
+    )
+    with pytest.raises(RuntimeError, match="crash after runtime prepare"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    staging = tmp_path / ".bundle.staging"
+    checkpoint = json.loads(
+        (staging / "staging-manifest.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["status"] == "snapshot_pending"
+    assert _bundle_database_path(staging).is_file()
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_prepare_runtime_database",
+        original_prepare,
+    )
+    resumed = create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+        resume=True,
+    )
+    assert resumed.bundle_directory == bundle
+    assert _hash(database) == source_hash
+    verify_database_bundle(bundle)
+
+
+def test_bundle_resume_completes_after_rename_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    original_publish = database_bundle._publish_directory
+
+    def publish_then_crash(staging: Path, target: Path) -> None:
+        original_publish(staging, target)
+        raise RuntimeError("crash after rename")
+
+    monkeypatch.setattr(database_bundle, "_publish_directory", publish_then_crash)
+    with pytest.raises(RuntimeError, match="crash after rename"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    assert bundle.is_dir()
+    assert not (tmp_path / ".bundle.staging").exists()
+    checkpoint = json.loads(
+        (bundle / "staging-manifest.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["status"] == "publishing"
+    with pytest.raises(RuntimeError, match="publication is incomplete"):
+        verify_database_bundle(bundle)
+
+    monkeypatch.setattr(database_bundle, "_publish_directory", original_publish)
+    resumed = create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+        resume=True,
+    )
+    assert resumed.bundle_directory == bundle
+    assert not (bundle / "staging-manifest.json").exists()
+    verify_database_bundle(bundle)
+
+
+def test_completed_bundle_resume_is_idempotent(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    created = create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+
+    resumed = create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+        resume=True,
+    )
+    assert resumed.database_sha256 == created.database_sha256
+
+
+def test_concurrent_create_resume_is_rejected_by_target_lock(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+
+    with database_bundle.SingleInstanceLock(
+        database_bundle._operation_lock_path(bundle.resolve())
+    ):
+        with pytest.raises(RuntimeError, match="lock is already held"):
+            create_database_bundle(
+                database,
+                odds_root,
+                bundle,
+                allowed_source_roots=[source_root],
+                resume=True,
+            )
+    assert not bundle.exists()
+
+
+def test_bundle_database_hardlink_is_rejected(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    alias = tmp_path / "bundle-database-alias.db"
+    try:
+        os.link(_bundle_database_path(bundle), alias)
+    except OSError:
+        pytest.skip("filesystem does not support hardlinks")
+
+    with pytest.raises(RuntimeError, match="backup bundle database file is unsafe"):
+        verify_database_bundle(bundle)
+
+
+def test_restore_resume_rejects_same_path_bundle_database_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    original_copy = database_bundle._copy_artifact
+
+    def interrupt(source: Path, destination: Path) -> None:
+        original_copy(source, destination)
+        raise RuntimeError("interrupt restore")
+
+    monkeypatch.setattr(database_bundle, "_copy_artifact", interrupt)
+    with pytest.raises(RuntimeError, match="interrupt restore"):
+        restore_database_bundle(bundle, target)
+    monkeypatch.setattr(database_bundle, "_copy_artifact", original_copy)
+    bundle_database = _bundle_database_path(bundle)
+    replacement = bundle / "replacement.sqlite"
+    shutil.copy2(bundle_database, replacement)
+    os.replace(replacement, bundle_database)
+
+    with pytest.raises(RuntimeError, match="checkpoint binding mismatch"):
+        restore_database_bundle(bundle, target, resume=True)
+
+
+def test_restore_rejects_manifest_replacement_after_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    original_verify = database_bundle.verify_database_bundle
+    replaced = False
+
+    def verify_then_replace(
+        bundle_directory: str | Path,
+        *,
+        _allow_staging_checkpoint: bool = False,
+    ) -> dict[str, object]:
+        nonlocal replaced
+        manifest = original_verify(
+            bundle_directory,
+            _allow_staging_checkpoint=_allow_staging_checkpoint,
+        )
+        if not replaced:
+            replaced = True
+            replacement = dict(manifest)
+            replacement["created_at"] = "2026-07-19T00:00:00+00:00"
+            database_bundle._write_json(
+                bundle / database_bundle._MANIFEST_FILE,
+                replacement,
+            )
+        return manifest
+
+    monkeypatch.setattr(
+        database_bundle,
+        "verify_database_bundle",
+        verify_then_replace,
+    )
+    with pytest.raises(RuntimeError, match="manifest changed after verification"):
+        restore_database_bundle(bundle, target)
+    assert {path.name for path in target.iterdir()} == {
+        "dota2.service.lock",
+        "dota2.web.lock",
+    }
+    assert not (target / "dota2.db").exists()
+    assert not (tmp_path / ".restore.restore-staging").exists()
+
+
+def test_restore_resume_rejects_artifact_change_after_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    original_clear = database_bundle._clear_quiescent_sqlite_sidecars
+
+    def interrupt_before_staging_clear(restored_database: Path) -> None:
+        if ".restore.restore-staging" in restored_database.parts:
+            raise RuntimeError("interrupt before restore verification")
+        original_clear(restored_database)
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_clear_quiescent_sqlite_sidecars",
+        interrupt_before_staging_clear,
+    )
+    with pytest.raises(RuntimeError, match="interrupt before restore verification"):
+        restore_database_bundle(bundle, target)
+    staging = tmp_path / ".restore.restore-staging"
+    checkpoint = json.loads(
+        (staging / "staging-manifest.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["status"] == "preparing"
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_clear_quiescent_sqlite_sidecars",
+        original_clear,
+    )
+    original_verify = database_bundle.verify_database_bundle
+    changed = False
+
+    def verify_then_change_artifact(
+        bundle_directory: str | Path,
+        *,
+        _allow_staging_checkpoint: bool = False,
+    ) -> dict[str, object]:
+        nonlocal changed
+        manifest = original_verify(
+            bundle_directory,
+            _allow_staging_checkpoint=_allow_staging_checkpoint,
+        )
+        if not changed:
+            changed = True
+            artifact = bundle / str(manifest["artifacts"][0]["bundle_path"])
+            payload = bytearray(artifact.read_bytes())
+            payload[-1] ^= 0x01
+            artifact.write_bytes(payload)
+        return manifest
+
+    monkeypatch.setattr(
+        database_bundle,
+        "verify_database_bundle",
+        verify_then_change_artifact,
+    )
+    with pytest.raises(RuntimeError, match="source artifact differs from manifest"):
+        restore_database_bundle(bundle, target, resume=True)
+    assert {path.name for path in target.iterdir()} == {
+        "dota2.service.lock",
+        "dota2.web.lock",
+    }
+    assert not (target / "dota2.db").exists()
+    assert staging.is_dir()
+
+
+def test_restore_resume_recovers_prepared_verification_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    original_verify = database_bundle.verify_prepared_database
+    interrupted = False
+
+    def verify_then_crash(restored_database: Path, **kwargs: object) -> object:
+        nonlocal interrupted
+        result = original_verify(restored_database, **kwargs)
+        if (
+            ".restore.restore-staging" in restored_database.parts
+            and not interrupted
+        ):
+            interrupted = True
+            raise RuntimeError("crash after restore prepared verification")
+        return result
+
+    monkeypatch.setattr(
+        database_bundle,
+        "verify_prepared_database",
+        verify_then_crash,
+    )
+    with pytest.raises(RuntimeError, match="crash after restore prepared verification"):
+        restore_database_bundle(bundle, target)
+    staging = tmp_path / ".restore.restore-staging"
+    checkpoint = json.loads(
+        (staging / "staging-manifest.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["status"] == "preparing"
+
+    monkeypatch.setattr(
+        database_bundle,
+        "verify_prepared_database",
+        original_verify,
+    )
+    restored = restore_database_bundle(bundle, target, resume=True)
+    assert restored.database.is_file()
+    assert not staging.exists()
+
+
+def test_restore_resume_completes_after_rename_crash(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+
+    def publish_then_crash(phase: str) -> None:
+        if phase == "published:database:renamed":
+            raise RuntimeError("crash after restore rename")
+
+    with pytest.raises(RuntimeError, match="crash after restore rename"):
+        restore_database_bundle(bundle, target, _phase_hook=publish_then_crash)
+    staging = tmp_path / ".restore.restore-staging"
+    checkpoint = json.loads(
+        (staging / "staging-manifest.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["status"] == "publishing"
+    assert checkpoint["database_published"] is False
+    assert (target / "dota2.db").is_file()
+
+    restored = restore_database_bundle(bundle, target, resume=True)
+    assert restored.database.is_file()
+    assert not staging.exists()
+
+
+def test_restore_resume_rejects_committed_wal_only_staging_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    original_publish = database_bundle._publish_restore_items
+
+    def interrupt_before_publish(*_: object, **__: object) -> None:
+        raise RuntimeError("interrupt before restore publication")
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_publish_restore_items",
+        interrupt_before_publish,
+    )
+    with pytest.raises(RuntimeError, match="interrupt before restore publication"):
+        restore_database_bundle(bundle, target)
+    monkeypatch.setattr(
+        database_bundle,
+        "_publish_restore_items",
+        original_publish,
+    )
+
+    staging_database = _restore_staging_database_path(target)
+    writer = _open_wal_only_writer(
+        staging_database,
+        "wal_only_restore_tamper",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="non-empty SQLite sidecars"):
+            restore_database_bundle(bundle, target, resume=True)
+    finally:
+        writer.close()
+
+
+def test_final_database_managed_writer_is_excluded_through_final_review(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    probe_result: subprocess.CompletedProcess[str] | None = None
+    probe = "\n".join(
+        (
+            "import sqlite3, sys",
+            "from pathlib import Path",
+            "from live_betting.service_coordination import database_writer_authority",
+            "database = Path(sys.argv[1])",
+            "with database_writer_authority(database):",
+            "    connection = sqlite3.connect(database)",
+            "    connection.execute('CREATE TABLE forbidden_racing_writer(value)')",
+            "    connection.commit()",
+            "    connection.close()",
+        )
+    )
+
+    def race_after_rename(phase: str) -> None:
+        nonlocal probe_result
+        if phase != "published:database:renamed":
+            return
+        probe_result = subprocess.run(
+            [sys.executable, "-c", probe, str(target / "dota2.db")],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    restored = restore_database_bundle(
+        bundle,
+        target,
+        _phase_hook=race_after_rename,
+    )
+
+    assert probe_result is not None
+    assert probe_result.returncode != 0
+    assert "lock is already held" in probe_result.stderr
+    connection = connect(restored.database, read_only=True)
+    try:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='forbidden_racing_writer'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_completed_restore_resume_is_idempotent(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    first = restore_database_bundle(bundle, target)
+
+    resumed = restore_database_bundle(bundle, target, resume=True)
+    assert resumed.restored_database_sha256 == first.restored_database_sha256
+
+
+def test_restore_rejects_target_database_hardlink_after_publish(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    alias = tmp_path / "target-database-alias.db"
+
+    def publish_and_link(phase: str) -> None:
+        if phase == "published:database:renamed":
+            os.link(target / "dota2.db", alias)
+
+    try:
+        with pytest.raises(RuntimeError, match="exactly one hard link"):
+            restore_database_bundle(bundle, target, _phase_hook=publish_and_link)
+    except OSError:
+        pytest.skip("filesystem does not support hardlinks")
+    finally:
+        alias.unlink(missing_ok=True)
+
+    restored = restore_database_bundle(bundle, target, resume=True)
+    assert restored.database.is_file()
+
+
+def test_restore_final_review_rejects_replacement_after_checkpoint_cleanup(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    final_database = target / "dota2.db"
+    displaced_database = tmp_path / "verified-restore.db"
+    replacement = tmp_path / "replacement.db"
+    replacement_bytes = b"not-a-sqlite-database"
+    replacement.write_bytes(replacement_bytes)
+
+    def replace_after_checkpoint_cleanup(phase: str) -> None:
+        if phase == "published:checkpoint-cleared":
+            os.replace(final_database, displaced_database)
+            os.replace(replacement, final_database)
+
+    with pytest.raises(
+        RuntimeError,
+        match="final restored database file authority|identity changed",
+    ):
+        restore_database_bundle(
+            bundle,
+            target,
+            _phase_hook=replace_after_checkpoint_cleanup,
+        )
+
+    assert final_database.read_bytes() == replacement_bytes
+    assert displaced_database.is_file()
+    assert (target / "restore-manifest.json").is_file()
+
+
+def test_restore_final_review_rejects_partially_forged_completed_manifest(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    completed_manifest = target / "restore-manifest.json"
+
+    def forge_after_checkpoint_cleanup(phase: str) -> None:
+        if phase != "published:checkpoint-cleared":
+            return
+        payload = json.loads(completed_manifest.read_text(encoding="utf-8"))
+        payload["artifact_count"] = int(payload["artifact_count"]) + 1
+        completed_manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="completed restore manifest"):
+        restore_database_bundle(
+            bundle,
+            target,
+            _phase_hook=forge_after_checkpoint_cleanup,
+        )
+
+    forged = json.loads(completed_manifest.read_text(encoding="utf-8"))
+    assert forged["artifact_count"] == 3
+    assert (target / "dota2.db").is_file()
+
+
+def test_restore_lock_exit_rejects_database_replacement_after_final_review(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    final_database = target / "dota2.db"
+    displaced = tmp_path / "reviewed-restore.db"
+    replacement = tmp_path / "replacement-restore.db"
+
+    def replace_after_final_review(phase: str) -> None:
+        if phase != "completed:authority-reviewed":
+            return
+        os.replace(final_database, displaced)
+        shutil.copy2(displaced, replacement)
+        os.replace(replacement, final_database)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        restore_database_bundle(
+            bundle,
+            target,
+            _phase_hook=replace_after_final_review,
+        )
+
+    assert final_database.is_file()
+    assert displaced.is_file()
+    assert _hash(final_database) == _hash(displaced)
+    assert final_database.stat().st_ino != displaced.stat().st_ino
+
+
+def test_restore_lock_exit_rejects_replacement_at_database_publish_boundary(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    final_database = target / "dota2.db"
+    displaced = tmp_path / "published-restore.db"
+    replacement = tmp_path / "replacement-restore.db"
+
+    def replace_at_publish(phase: str) -> None:
+        if phase != "published:database:renamed":
+            return
+        os.replace(final_database, displaced)
+        shutil.copy2(displaced, replacement)
+        os.replace(replacement, final_database)
+        raise RuntimeError("failure after database publication")
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        restore_database_bundle(
+            bundle,
+            target,
+            _phase_hook=replace_at_publish,
+        )
+
+    assert final_database.is_file()
+    assert displaced.is_file()
+    assert _hash(final_database) == _hash(displaced)
+    assert final_database.stat().st_ino != displaced.stat().st_ino
+
+
+def test_restore_binds_published_identity_before_directory_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    final_database = target / "dota2.db"
+    displaced = tmp_path / "published-before-fsync.db"
+    replacement = tmp_path / "replacement-before-fsync.db"
+    replacement.write_bytes(b"replacement-after-publish-before-fsync")
+    real_fsync = database_bundle.fsync_directory
+    injected = False
+
+    def replace_then_fail_fsync(path: Path) -> None:
+        nonlocal injected
+        if final_database.exists() and not injected:
+            injected = True
+            os.replace(final_database, displaced)
+            os.replace(replacement, final_database)
+            raise RuntimeError("injected database publish fsync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(
+        database_bundle,
+        "fsync_directory",
+        replace_then_fail_fsync,
+    )
+    with pytest.raises(RuntimeError, match="identity changed"):
+        restore_database_bundle(bundle, target)
+
+    assert injected
+    assert displaced.is_file()
+    assert final_database.read_bytes() == b"replacement-after-publish-before-fsync"
+
+
+@pytest.mark.parametrize("attack", ["replace", "hardlink", "symlink"])
+def test_restore_rejects_completed_manifest_authority_change_after_review(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    manifest_path = target / "restore-manifest.json"
+    displaced = tmp_path / "reviewed-restore-manifest.json"
+    alias = tmp_path / "restore-manifest-alias.json"
+
+    def attack_after_final_review(phase: str) -> None:
+        if phase != "completed:authority-reviewed":
+            return
+        if attack == "replace":
+            os.replace(manifest_path, displaced)
+            shutil.copy2(displaced, manifest_path)
+        elif attack == "hardlink":
+            try:
+                os.link(manifest_path, alias)
+            except OSError as error:
+                pytest.skip(f"filesystem does not support hardlinks: {error}")
+        else:
+            os.replace(manifest_path, displaced)
+            try:
+                os.symlink(displaced, manifest_path)
+            except OSError as error:
+                os.replace(displaced, manifest_path)
+                pytest.skip(f"filesystem does not support symlinks: {error}")
+
+    try:
+        with pytest.raises(RuntimeError):
+            restore_database_bundle(
+                bundle,
+                target,
+                _phase_hook=attack_after_final_review,
+            )
+    finally:
+        alias.unlink(missing_ok=True)
+
+
+def test_restore_rejects_manifest_replacement_after_publication_rename(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    manifest_path = target / "restore-manifest.json"
+    displaced = tmp_path / "published-restore-manifest.json"
+
+    def replace_after_rename(phase: str) -> None:
+        if phase != "published:restore-manifest.json:renamed":
+            return
+        os.replace(manifest_path, displaced)
+        shutil.copy2(displaced, manifest_path)
+
+    with pytest.raises(RuntimeError, match="file authority changed"):
+        restore_database_bundle(
+            bundle,
+            target,
+            _phase_hook=replace_after_rename,
+        )
+
+    assert manifest_path.is_file()
+    assert displaced.is_file()
+    assert _hash(manifest_path) == _hash(displaced)
+    assert manifest_path.stat().st_ino != displaced.stat().st_ino
+
+
+def test_concurrent_restore_resume_is_rejected_by_target_lock(tmp_path: Path) -> None:
+    target = tmp_path / "restore"
+    with database_bundle.SingleInstanceLock(
+        database_bundle._operation_lock_path(target.resolve())
+    ):
+        with pytest.raises(RuntimeError, match="lock is already held"):
+            restore_database_bundle(tmp_path / "bundle", target, resume=True)
+
+
+def test_restore_publishes_dependencies_before_database_visibility(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    phases: list[str] = []
+
+    def observe(phase: str) -> None:
+        phases.append(phase)
+        for lock_path in (
+            target / "dota2.service.lock",
+            target / "dota2.web.lock",
+            database_bundle._operation_lock_path(target.resolve()),
+        ):
+            with pytest.raises(RuntimeError, match="lock is already held"):
+                with SingleInstanceLock(lock_path):
+                    pass
+        if phase == "published:database:renamed":
+            assert (target / "live_betting").is_dir()
+            assert (target / "raw-sources").is_dir()
+            assert (target / "restore-manifest.json").is_file()
+            assert (target / "dota2.db").is_file()
+        elif phase.endswith(":renamed"):
+            assert not (target / "dota2.db").exists()
+
+    restored = restore_database_bundle(bundle, target, _phase_hook=observe)
+
+    assert restored.database.is_file()
+    assert phases[-4:] == [
+        "published:database:renamed",
+        "published:ready",
+        "published:checkpoint-cleared",
+        "completed:authority-reviewed",
+    ]
+
+
+def test_restore_recovers_each_publication_move_boundary(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    phases = (
+        "published:live_betting:renamed",
+        "published:raw-sources:renamed",
+        "published:restore-manifest.json:renamed",
+        "published:database:renamed",
+    )
+    for index, crash_phase in enumerate(phases):
+        target = tmp_path / f"restore-{index}"
+
+        def crash(phase: str, expected: str = crash_phase) -> None:
+            if phase == expected:
+                raise RuntimeError(f"injected {expected}")
+
+        with pytest.raises(RuntimeError, match="injected published"):
+            restore_database_bundle(bundle, target, _phase_hook=crash)
+        if crash_phase == "published:database:renamed":
+            assert (target / "dota2.db").is_file()
+        else:
+            assert not (target / "dota2.db").exists()
+
+        restored = restore_database_bundle(bundle, target, resume=True)
+        assert restored.database.is_file()
+        assert not (tmp_path / f".restore-{index}.restore-staging").exists()
+
+
+def test_restore_accepts_preexisting_root_with_only_canonical_lock_files(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+    target.mkdir()
+    (target / "dota2.service.lock").write_bytes(b"stale")
+    (target / "dota2.web.lock").write_bytes(b"stale")
+
+    restored = restore_database_bundle(bundle, target)
+
+    assert restored.database.is_file()
+
+
+def test_restore_resume_recovers_empty_staging_after_checkpoint_clear(
+    tmp_path: Path,
+) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+    target = tmp_path / "restore"
+
+    def crash(phase: str) -> None:
+        if phase == "published:checkpoint-cleared":
+            raise RuntimeError("injected checkpoint cleanup crash")
+
+    with pytest.raises(RuntimeError, match="checkpoint cleanup crash"):
+        restore_database_bundle(bundle, target, _phase_hook=crash)
+    staging = tmp_path / ".restore.restore-staging"
+    assert staging.is_dir()
+    assert list(staging.iterdir()) == []
+    assert (target / "dota2.db").is_file()
+
+    restored = restore_database_bundle(bundle, target, resume=True)
+
+    assert restored.database.is_file()
+    assert not staging.exists()
+
+
+@pytest.mark.parametrize(
+    "lock_kind",
+    ["global-service", "global-web", "service", "web"],
+)
+def test_restore_is_blocked_by_each_final_database_lock(
+    tmp_path: Path,
+    lock_kind: str,
+) -> None:
+    target = tmp_path / "restore"
+    target.mkdir()
+    final_database = target / "dota2.db"
+
+    lock_path = {
+        "global-service": database_global_service_lock_path(final_database),
+        "global-web": database_global_web_lock_path(final_database),
+        "service": final_database.with_suffix(".service.lock"),
+        "web": final_database.with_suffix(".web.lock"),
+    }[lock_kind]
+    with SingleInstanceLock(lock_path):
+        with pytest.raises(RuntimeError, match="lock is already held"):
+            restore_database_bundle(tmp_path / "missing-bundle", target)
+
+    assert not final_database.exists()
+
+
+def test_core_only_source_produces_runtime_ready_bundle(tmp_path: Path) -> None:
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    connection = connect(database)
+    try:
+        connection.execute("DROP TABLE runtime_schema_version")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+    source_hash = _hash(database)
+    bundle = tmp_path / "bundle"
+
+    create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+    )
+
+    assert _hash(database) == source_hash
+    verify_database_bundle(bundle)
+    bundled = connect(_bundle_database_path(bundle), read_only=True)
+    try:
+        assert (
+            bundled.execute(
+                "SELECT MAX(version) FROM runtime_schema_version"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        bundled.close()

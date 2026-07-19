@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sqlite3
+import stat
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Mapping
 
 from event_intelligence.backtest import (
     draft_lineage_tracking_is_current,
@@ -19,16 +24,22 @@ from event_intelligence.storage import (
     IntelligenceStorage,
 )
 from fetch.db import Database
-from shared.sqlite import connect
+from shared.sqlite import BUSY_TIMEOUT_MS, configure_connection, connect
 
+from .service_coordination import require_current_process_lock
 from .storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
 from .storage import LiveBettingStore, init_draft_authority_revision_schema
 from .odds_response_verifier import verify_odds_response_authority
+from .runtime_schema import (
+    prepare_runtime_schema,
+    verify_runtime_schema,
+)
 from .strict_eligibility import strict_live_mapping_schema_requires_rebuild
 from .vision_frame_registry import verify_vision_frame_registry
 
 
 CUTOVER_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 
 @dataclass(frozen=True)
@@ -37,6 +48,7 @@ class DatabasePreparation:
     backup: Path | None
     live_schema_version: int
     intelligence_schema_version: int
+    runtime_schema_version: int
 
 
 @dataclass(frozen=True)
@@ -46,12 +58,19 @@ class WalCheckpointResult:
     log: int
     checkpoint: int
     wal_bytes: int
+    sidecars: Mapping[str, Mapping[str, int | bool | str | None]] | None = None
 
     @property
     def safe(self) -> bool:
+        journal_bytes = (
+            int(self.sidecars.get("journal", {}).get("bytes", 0))
+            if self.sidecars is not None
+            else 0
+        )
         return (
             (self.busy, self.log, self.checkpoint) == (0, 0, 0)
             and self.wal_bytes == 0
+            and journal_bytes == 0
         )
 
 
@@ -158,6 +177,283 @@ def check_schema_versions(database: Path) -> tuple[int, int]:
         connection.close()
 
 
+def sqlite_sidecar_state(
+    database: Path,
+) -> dict[str, dict[str, int | bool | str | None]]:
+    """Return one fail-closed identity snapshot for SQLite sidecar files."""
+
+    resolved = database.resolve()
+    result: dict[str, dict[str, int | bool | str | None]] = {}
+    for name, suffix in (("wal", "-wal"), ("shm", "-shm"), ("journal", "-journal")):
+        path = Path(f"{resolved}{suffix}")
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            result[name] = {
+                "path": str(path),
+                "exists": False,
+                "bytes": 0,
+                "device": None,
+                "inode": None,
+                "mtime_ns": None,
+            }
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or int(metadata.st_nlink) != 1:
+            raise RuntimeError(f"SQLite sidecar is unsafe: {path}")
+        result[name] = {
+            "path": str(path),
+            "exists": True,
+            "bytes": int(metadata.st_size),
+            "device": int(metadata.st_dev),
+            "inode": int(metadata.st_ino),
+            "mtime_ns": int(metadata.st_mtime_ns),
+        }
+    return result
+
+
+def _stable_database_metadata(database: Path, *, label: str) -> tuple[object, ...]:
+    logical = Path(os.path.abspath(os.fspath(database)))
+    try:
+        initial = logical.lstat()
+        resolved = logical.resolve(strict=True)
+        completed = logical.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{label} database is unverifiable: {logical}") from error
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        not stat.S_ISREG(initial.st_mode)
+        or int(initial.st_nlink) != 1
+        or (
+            os.name == "nt"
+            and int(getattr(initial, "st_file_attributes", 0))
+            & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        or any(
+            int(getattr(initial, field)) != int(getattr(completed, field))
+            for field in fields
+        )
+        or int(completed.st_ino) <= 0
+    ):
+        raise RuntimeError(f"{label} database identity is unsafe: {logical}")
+    return (
+        resolved,
+        *(int(getattr(completed, field)) for field in fields),
+    )
+
+
+def _require_immutable_sidecars(
+    database: Path,
+    *,
+    label: str,
+) -> dict[str, tuple[object, ...]]:
+    resolved = database.resolve()
+    sidecars: dict[str, tuple[object, ...]] = {}
+    for name, suffix in (("wal", "-wal"), ("shm", "-shm"), ("journal", "-journal")):
+        path = Path(f"{resolved}{suffix}")
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            sidecars[name] = (
+                str(path),
+                False,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            continue
+        except OSError as error:
+            raise RuntimeError(f"{label} sidecar is unverifiable: {path}") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_nlink) != 1
+            or (
+                os.name == "nt"
+                and int(getattr(metadata, "st_file_attributes", 0))
+                & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        ):
+            raise RuntimeError(f"{label} sidecar is unsafe: {path}")
+        sidecars[name] = (
+            str(path),
+            True,
+            int(metadata.st_size),
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_mode),
+            int(metadata.st_nlink),
+            int(metadata.st_mtime_ns),
+            int(metadata.st_ctime_ns),
+        )
+    transactional = [
+        str(sidecars[name][0])
+        for name in ("wal", "journal")
+        if int(sidecars[name][2])
+    ]
+    if transactional:
+        raise RuntimeError(
+            f"{label} has non-empty transactional sidecars: "
+            + ", ".join(transactional)
+        )
+    return sidecars
+
+
+@contextmanager
+def _immutable_checkpoint_connection(
+    database: Path,
+    *,
+    label: str,
+    required_locks: Iterable[Path],
+    row_factory: type[sqlite3.Row] | None = None,
+    busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+    query_only: bool,
+) -> Iterator[sqlite3.Connection]:
+    locks = tuple(dict.fromkeys(Path(path).absolute() for path in required_locks))
+    if not locks:
+        raise ValueError("immutable checkpoint reader requires held locks")
+    for lock in locks:
+        require_current_process_lock(lock)
+    before_database = _stable_database_metadata(database, label=label)
+    before_sidecars = _require_immutable_sidecars(database, label=label)
+    resolved = Path(before_database[0])
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"{resolved.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=busy_timeout_ms / 1_000,
+        )
+        if row_factory is not None:
+            connection.row_factory = row_factory
+        configure_connection(connection, busy_timeout_ms=busy_timeout_ms)
+        if query_only:
+            connection.execute("PRAGMA query_only=ON")
+            query_only_row = connection.execute("PRAGMA query_only").fetchone()
+            if query_only_row is None or int(query_only_row[0]) != 1:
+                raise RuntimeError(f"{label} immutable query-only mode is unavailable")
+    except BaseException as error:
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "immutable checkpoint connection cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        raise
+
+    def verify_unchanged() -> None:
+        for lock in locks:
+            require_current_process_lock(lock)
+        after_database = _stable_database_metadata(database, label=label)
+        after_sidecars = _require_immutable_sidecars(database, label=label)
+        if after_database != before_database:
+            raise RuntimeError(f"{label} database changed during immutable read")
+        if after_sidecars != before_sidecars:
+            raise RuntimeError(f"{label} sidecars changed during immutable read")
+
+    try:
+        yield connection
+    except BaseException as error:
+        try:
+            connection.close()
+        except BaseException as cleanup_error:
+            error.add_note(
+                "immutable checkpoint connection cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        try:
+            verify_unchanged()
+        except BaseException as cleanup_error:
+            error.add_note(
+                "immutable checkpoint verification failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
+    else:
+        close_error: BaseException | None = None
+        try:
+            connection.close()
+        except BaseException as error:
+            close_error = error
+        try:
+            verify_unchanged()
+        except BaseException as verification_error:
+            if close_error is None:
+                raise
+            close_error.add_note(
+                "immutable checkpoint verification failed: "
+                f"{type(verification_error).__name__}: {verification_error}"
+            )
+        if close_error is not None:
+            raise close_error
+
+
+@contextmanager
+def immutable_checkpoint_reader(
+    database: Path,
+    *,
+    label: str,
+    required_locks: Iterable[Path],
+    row_factory: type[sqlite3.Row] | None = None,
+    busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+) -> Iterator[sqlite3.Connection]:
+    """Read one lock-fenced, checkpointed SQLite file without touching SHM."""
+
+    with _immutable_checkpoint_connection(
+        database,
+        label=label,
+        required_locks=required_locks,
+        row_factory=row_factory,
+        busy_timeout_ms=busy_timeout_ms,
+        query_only=True,
+    ) as connection:
+        yield connection
+
+
+def vacuum_into_immutable_checkpoint(
+    database: Path,
+    destination: Path,
+    *,
+    label: str,
+    required_locks: Iterable[Path],
+    authority_check: Callable[[], None] | None = None,
+) -> None:
+    """VACUUM a sealed database without creating source WAL/SHM sidecars."""
+
+    logical_output = Path(os.path.abspath(os.fspath(destination)))
+    if logical_output.exists() or logical_output.is_symlink():
+        raise FileExistsError(
+            f"VACUUM INTO destination already exists: {logical_output}"
+        )
+    if logical_output.parent.is_symlink() or not logical_output.parent.is_dir():
+        raise RuntimeError(
+            f"VACUUM INTO destination parent is unsafe: {logical_output.parent}"
+        )
+    output = logical_output.resolve()
+    check = authority_check or (lambda: None)
+    with _immutable_checkpoint_connection(
+        database,
+        label=label,
+        required_locks=required_locks,
+        query_only=False,
+    ) as connection:
+        check()
+        connection.execute("VACUUM INTO ?", (str(output),))
+        check()
+
+
 def truncate_wal_checkpoint(database: Path) -> WalCheckpointResult:
     """Run a non-blocking WAL TRUNCATE checkpoint on an existing database."""
 
@@ -177,16 +473,14 @@ def truncate_wal_checkpoint(database: Path) -> WalCheckpointResult:
         connection.close()
     if row is None or len(row) != 3:
         raise RuntimeError("SQLite did not return a WAL checkpoint triplet")
+    sidecars = sqlite_sidecar_state(database)
     result = WalCheckpointResult(
         database=database,
         busy=int(row[0]),
         log=int(row[1]),
         checkpoint=int(row[2]),
-        wal_bytes=(
-            Path(f"{database}-wal").stat().st_size
-            if Path(f"{database}-wal").exists()
-            else 0
-        ),
+        wal_bytes=int(sidecars["wal"]["bytes"]),
+        sidecars=sidecars,
     )
     return result
 
@@ -355,8 +649,8 @@ def _schema_contract(connection: sqlite3.Connection) -> _SchemaContract:
     return _SchemaContract(tables, checks, foreign_keys, indexes, triggers, views)
 
 
-@lru_cache(maxsize=1)
-def _expected_schema_contract() -> _SchemaContract:
+@lru_cache(maxsize=2)
+def _expected_schema_contract(*, include_runtime: bool = False) -> _SchemaContract:
     connection = sqlite3.connect(":memory:")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
@@ -369,6 +663,8 @@ def _expected_schema_contract() -> _SchemaContract:
             Database(connection=intelligence.connection).init_db()
         init_draft_authority_revision_schema(connection)
         ensure_draft_lineage_tracking(connection)
+        if include_runtime:
+            prepare_runtime_schema(connection)
         connection.commit()
         return _schema_contract(connection)
     finally:
@@ -378,7 +674,10 @@ def _expected_schema_contract() -> _SchemaContract:
 def _schema_contract_errors(
     expected: _SchemaContract,
     actual: _SchemaContract,
+    *,
+    allowed: _SchemaContract | None = None,
 ) -> list[str]:
+    allowed = expected if allowed is None else allowed
     errors: list[str] = []
     missing_tables = sorted(expected.tables.keys() - actual.tables.keys())
     if missing_tables:
@@ -428,6 +727,23 @@ def _schema_contract_errors(
         )
         if mismatched:
             errors.append(f"mismatched {label}: " + ", ".join(mismatched))
+    protected_tables = {name.casefold() for name in allowed.tables}
+    unexpected_indexes = sorted(
+        name
+        for name, contract in actual.indexes.items()
+        if (
+            name not in allowed.indexes
+            and contract[0].casefold() in protected_tables
+        )
+    )
+    if unexpected_indexes:
+        errors.append("unexpected indexes: " + ", ".join(unexpected_indexes))
+    unexpected_triggers = sorted(actual.triggers.keys() - allowed.triggers.keys())
+    if unexpected_triggers:
+        errors.append("unexpected triggers: " + ", ".join(unexpected_triggers))
+    unexpected_views = sorted(actual.views.keys() - allowed.views.keys())
+    if unexpected_views:
+        errors.append("unexpected views: " + ", ".join(unexpected_views))
     return errors
 
 
@@ -436,29 +752,66 @@ def verify_prepared_database(
     *,
     odds_raw_root: str | Path | None = None,
     verify_vision_frames: bool = True,
+    core_only: bool = False,
+    immutable_locks: Iterable[Path] | None = None,
 ) -> DatabasePreparation:
-    """Verify a current service schema without taking a backup or mutating it."""
+    """Verify a current service schema without taking a backup or mutating it.
+
+    Production callers use the default runtime-prepared contract.  Offline
+    core transformations must opt out explicitly with ``core_only=True``.
+    """
 
     database = database.resolve()
-    live_version, intelligence_version = check_schema_versions(database)
-    if (
-        live_version != LIVE_SCHEMA_VERSION
-        or intelligence_version != INTELLIGENCE_SCHEMA_VERSION
-    ):
-        raise RuntimeError(
-            "database schema is not prepared: "
-            f"live={live_version}/{LIVE_SCHEMA_VERSION}, "
-            f"intelligence={intelligence_version}/{INTELLIGENCE_SCHEMA_VERSION}; "
-            "run the supervisor with --migrate"
+    runtime_version = 0
+    with ExitStack() as readers:
+        if immutable_locks is None:
+            connection = _connect_query_only(database)
+            readers.callback(connection.close)
+        else:
+            connection = readers.enter_context(
+                immutable_checkpoint_reader(
+                    database,
+                    label="prepared database",
+                    required_locks=immutable_locks,
+                )
+            )
+        live_version = _schema_version(
+            connection,
+            "live_schema_version",
+            LIVE_SCHEMA_VERSION,
         )
-    connection = _connect_query_only(database)
-    try:
+        intelligence_version = _schema_version(
+            connection,
+            "intelligence_schema_version",
+            INTELLIGENCE_SCHEMA_VERSION,
+        )
+        if (
+            live_version != LIVE_SCHEMA_VERSION
+            or intelligence_version != INTELLIGENCE_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                "database schema is not prepared: "
+                f"live={live_version}/{LIVE_SCHEMA_VERSION}, "
+                f"intelligence={intelligence_version}/{INTELLIGENCE_SCHEMA_VERSION}; "
+                "run the supervisor with --migrate"
+            )
+        allowed_contract = _expected_schema_contract(include_runtime=True)
         errors = _schema_contract_errors(
-            _expected_schema_contract(),
+            (
+                _expected_schema_contract()
+                if core_only
+                else allowed_contract
+            ),
             _schema_contract(connection),
+            allowed=allowed_contract,
         )
         if not draft_lineage_tracking_is_current(connection):
             errors.append("draft lineage tracking is not current")
+        if not core_only:
+            try:
+                runtime_version = verify_runtime_schema(connection).version
+            except RuntimeError as error:
+                errors.append(f"runtime schema failed: {error}")
         if not errors:
             try:
                 verify_odds_response_authority(
@@ -487,13 +840,12 @@ def verify_prepared_database(
                 + "; ".join(visible)
                 + suffix
             )
-    finally:
-        connection.close()
     return DatabasePreparation(
         database,
         None,
         live_version,
         intelligence_version,
+        runtime_version,
     )
 
 
@@ -533,14 +885,27 @@ def _backup_connection(
         target.close()
 
 
-def online_backup(database: Path, destination: Path) -> None:
-    """Take a consistent SQLite snapshot, including committed WAL contents."""
+def online_backup(
+    database: Path,
+    destination: Path,
+    *,
+    immutable_locks: Iterable[Path] | None = None,
+) -> None:
+    """Take a consistent snapshot; immutable mode requires a checkpointed source."""
 
-    source = connect(database.resolve(), read_only=True)
-    try:
+    if immutable_locks is None:
+        source = connect(database.resolve(), read_only=True)
+        try:
+            _backup_connection(source, destination)
+        finally:
+            source.close()
+        return
+    with immutable_checkpoint_reader(
+        database,
+        label="online backup source",
+        required_locks=immutable_locks,
+    ) as source:
         _backup_connection(source, destination)
-    finally:
-        source.close()
 
 
 def _acquire_exclusive(connection: sqlite3.Connection, operation: str) -> None:
@@ -689,6 +1054,7 @@ def prepare_database(
             )
         init_draft_authority_revision_schema(migration)
         ensure_draft_lineage_tracking(migration)
+        prepare_runtime_schema(migration, external_transaction=True)
         if migration.execute("PRAGMA busy_timeout").fetchone()[0] != 5_000:
             raise RuntimeError("migration connection lost the 5-second busy timeout")
         foreign_key_issue = migration.execute("PRAGMA foreign_key_check").fetchone()
@@ -698,7 +1064,7 @@ def prepare_database(
                 f"table={foreign_key_issue[0]} rowid={foreign_key_issue[1]}"
             )
         errors = _schema_contract_errors(
-            _expected_schema_contract(),
+            _expected_schema_contract(include_runtime=True),
             _schema_contract(migration),
         )
         if not draft_lineage_tracking_is_current(migration):
@@ -749,6 +1115,7 @@ def prepare_database(
         backup,
         verified.live_schema_version,
         verified.intelligence_schema_version,
+        verified.runtime_schema_version,
     )
 
 
@@ -757,9 +1124,12 @@ __all__ = [
     "CUTOVER_SAFETY_MARGIN_BYTES",
     "WalCheckpointResult",
     "check_schema_versions",
+    "immutable_checkpoint_reader",
     "online_backup",
     "prepare_database",
     "restore_database_backup",
+    "sqlite_sidecar_state",
     "truncate_wal_checkpoint",
+    "vacuum_into_immutable_checkpoint",
     "verify_prepared_database",
 ]

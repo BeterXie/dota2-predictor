@@ -51,7 +51,7 @@ from .vision_frame_registry import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 
 _DIRECT_RESPONSE_ENDPOINTS = {
@@ -551,6 +551,81 @@ CREATE TABLE IF NOT EXISTS raybet_matches (
     raw_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_raybet_matches_status_updated
+    ON raybet_matches(status, updated_at DESC, raybet_match_id DESC);
+CREATE INDEX IF NOT EXISTS idx_raybet_matches_updated
+    ON raybet_matches(updated_at DESC, raybet_match_id DESC);
+CREATE INDEX IF NOT EXISTS idx_raybet_matches_schedule_utc
+    ON raybet_matches(
+        (CASE
+            WHEN length(scheduled_at)=19
+             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+             AND strftime(
+                 '%Y-%m-%d %H:%M:%S',
+                 julianday(scheduled_at)
+             )=scheduled_at
+            THEN julianday(scheduled_at, '-8 hours')
+            WHEN length(scheduled_at)=25
+             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+             AND strftime(
+                 '%Y-%m-%dT%H:%M:%S+00:00',
+                 julianday(scheduled_at)
+             )=scheduled_at
+            THEN julianday(scheduled_at)
+            ELSE NULL
+         END),
+        raybet_match_id
+    );
+CREATE INDEX IF NOT EXISTS idx_raybet_matches_ended_schedule_review
+    ON raybet_matches(
+        (CASE
+            WHEN length(scheduled_at)=19
+             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+             AND strftime(
+                 '%Y-%m-%d %H:%M:%S',
+                 julianday(scheduled_at)
+             )=scheduled_at
+            THEN julianday(scheduled_at, '-8 hours')
+            WHEN length(scheduled_at)=25
+             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+             AND strftime(
+                 '%Y-%m-%dT%H:%M:%S+00:00',
+                 julianday(scheduled_at)
+             )=scheduled_at
+            THEN julianday(scheduled_at)
+            ELSE NULL
+         END),
+        updated_at DESC,
+        raybet_match_id DESC
+    )
+    WHERE lower(status) IN
+        ('3', '5', 'closed', 'ended', 'finished', 'settled')
+      AND scheduled_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_raybet_matches_timeline
+    ON raybet_matches(
+        CAST(COALESCE(
+            (CASE
+                WHEN length(scheduled_at)=19
+                 AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+                 AND strftime(
+                     '%Y-%m-%d %H:%M:%S',
+                     julianday(scheduled_at)
+                 )=scheduled_at
+                THEN julianday(scheduled_at, '-8 hours')
+                WHEN length(scheduled_at)=25
+                 AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+                 AND strftime(
+                     '%Y-%m-%dT%H:%M:%S+00:00',
+                     julianday(scheduled_at)
+                 )=scheduled_at
+                THEN julianday(scheduled_at)
+                ELSE NULL
+             END),
+            julianday(updated_at),
+            0
+        ) * 86400000 AS INTEGER) DESC,
+        raybet_match_id DESC
+    );
 CREATE TABLE IF NOT EXISTS match_links (
     raybet_match_id TEXT NOT NULL,
     provider TEXT NOT NULL,
@@ -784,6 +859,39 @@ CREATE INDEX IF NOT EXISTS idx_odds_transport_match_time
     ON odds_transport_observations(raybet_match_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_odds_transport_hash_time
     ON odds_transport_observations(normalized_state_hash, observed_at);
+CREATE TABLE IF NOT EXISTS raybet_match_odds_activity (
+    raybet_match_id TEXT PRIMARY KEY,
+    latest_odds_activity_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_raybet_match_odds_activity_time
+    ON raybet_match_odds_activity(
+        latest_odds_activity_at DESC,
+        raybet_match_id DESC
+    );
+CREATE TRIGGER IF NOT EXISTS raybet_match_activity_from_transport
+AFTER INSERT ON odds_transport_observations
+WHEN julianday(NEW.observed_at) IS NOT NULL
+BEGIN
+    INSERT INTO raybet_match_odds_activity
+        (raybet_match_id, latest_odds_activity_at)
+    VALUES (NEW.raybet_match_id, NEW.observed_at)
+    ON CONFLICT(raybet_match_id) DO UPDATE SET
+        latest_odds_activity_at=excluded.latest_odds_activity_at
+    WHERE julianday(excluded.latest_odds_activity_at)>
+          julianday(raybet_match_odds_activity.latest_odds_activity_at);
+END;
+CREATE TRIGGER IF NOT EXISTS raybet_match_activity_from_snapshot
+AFTER INSERT ON odds_snapshots
+WHEN julianday(NEW.received_at) IS NOT NULL
+BEGIN
+    INSERT INTO raybet_match_odds_activity
+        (raybet_match_id, latest_odds_activity_at)
+    VALUES (NEW.raybet_match_id, NEW.received_at)
+    ON CONFLICT(raybet_match_id) DO UPDATE SET
+        latest_odds_activity_at=excluded.latest_odds_activity_at
+    WHERE julianday(excluded.latest_odds_activity_at)>
+          julianday(raybet_match_odds_activity.latest_odds_activity_at);
+END;
 CREATE TRIGGER IF NOT EXISTS odds_transport_observations_guard_update
 BEFORE UPDATE ON odds_transport_observations
 WHEN OLD.observation_key IS NOT NEW.observation_key
@@ -1715,6 +1823,9 @@ CREATE TABLE IF NOT EXISTS vision_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_vision_match_map_time
     ON vision_observations(raybet_match_id, map_number, captured_at);
+CREATE INDEX IF NOT EXISTS idx_vision_confirmed_game_captured
+    ON vision_observations(captured_at DESC, raybet_match_id DESC)
+    WHERE confirmed=1 AND screen_state='game';
 CREATE TRIGGER IF NOT EXISTS vision_observation_frame_identity_immutable
 BEFORE UPDATE ON vision_observations
 WHEN OLD.source_frame_ref IS NOT NEW.source_frame_ref
@@ -3713,6 +3824,7 @@ class LiveBettingStore:
                DROP TRIGGER IF EXISTS settlements_authority_insert_guard;"""
         )
         execute_script(self.connection, SCHEMA_SQL)
+        self._migrate_monitor_match_activity()
         self._migrate_settlement_authority_audit()
         from .strict_eligibility import init_strict_live_eligibility_schema
 
@@ -3742,6 +3854,62 @@ class LiveBettingStore:
         )
         if not external_transaction:
             self.connection.commit()
+
+    def _migrate_monitor_match_activity(self) -> None:
+        """Seed v9 activity state through existing per-match time indexes."""
+
+        row = self.connection.execute(
+            "SELECT MAX(version) FROM live_schema_version"
+        ).fetchone()
+        previous_version = int(row[0]) if row and row[0] is not None else 0
+        if previous_version >= 9:
+            return
+        self.connection.execute("DELETE FROM raybet_match_odds_activity")
+        latest: dict[str, tuple[datetime, str]] = {}
+        for match in self.connection.execute(
+            "SELECT raybet_match_id FROM raybet_matches"
+        ).fetchall():
+            match_id = str(match["raybet_match_id"])
+            activity_rows = (
+                self.connection.execute(
+                    """SELECT MAX(observed_at) AS activity_at
+                         FROM odds_transport_observations
+                        WHERE raybet_match_id=?""",
+                    (match_id,),
+                ).fetchone(),
+                self.connection.execute(
+                    """SELECT MAX(received_at) AS activity_at
+                         FROM odds_snapshots
+                        WHERE raybet_match_id=?""",
+                    (match_id,),
+                ).fetchone(),
+            )
+            for activity in activity_rows:
+                if activity is None or activity["activity_at"] is None:
+                    continue
+                raw_time = str(activity["activity_at"])
+                try:
+                    parsed = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    continue
+                parsed = parsed.astimezone(timezone.utc)
+                current = latest.get(match_id)
+                if current is None or parsed > current[0]:
+                    latest[match_id] = (parsed, raw_time)
+        self.connection.executemany(
+            """INSERT INTO raybet_match_odds_activity
+                   (raybet_match_id, latest_odds_activity_at)
+               VALUES (?, ?)
+               ON CONFLICT(raybet_match_id) DO UPDATE SET
+                   latest_odds_activity_at=excluded.latest_odds_activity_at
+               WHERE julianday(excluded.latest_odds_activity_at)>
+                     julianday(
+                         raybet_match_odds_activity.latest_odds_activity_at
+                     )""",
+            ((match_id, value[1]) for match_id, value in latest.items()),
+        )
 
     def _migrate_settlement_authority_audit(self) -> None:
         """Quarantine legacy ledgers without inventing settlement authority."""

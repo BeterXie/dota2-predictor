@@ -20,6 +20,10 @@ from fastapi.responses import JSONResponse, Response
 from .browser_origin import SlidingWindowRateLimiter, is_extension_origin
 from .browser_contract import BrowserEvent, find_forbidden_batch_key
 from .browser_ingest import BrowserEventIngestor
+from .service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 from .storage import LiveBettingStore
 
 
@@ -342,7 +346,7 @@ def create_app(
             ).fetchone()[0])
             shadow_active = store.connection.execute(
                 """SELECT 1 FROM service_health
-                    WHERE component='shadow'
+                    WHERE component='shadow_worker'
                       AND status IN ('healthy', 'degraded')
                       AND last_heartbeat_at IS NOT NULL
                       AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 <= 90
@@ -369,7 +373,7 @@ def create_app(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=CompanionConfig().database)
+    add_single_database_argument(parser, default=CompanionConfig().database)
     parser.add_argument("--extension-origin", default=DEFAULT_EXTENSION_ORIGIN)
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument(
@@ -378,9 +382,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    config = CompanionConfig(database=args.database, extension_origin=args.extension_origin)
+def _run_cli(args: argparse.Namespace, config: CompanionConfig) -> int:
     if not getattr(args, "schema_prepared", False):
         with LiveBettingStore(config.database) as database:
             database.init_schema()
@@ -396,6 +398,13 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app(config, initialize_schema=False)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    config = CompanionConfig(database=args.database, extension_origin=args.extension_origin)
+    with database_writer_authority(config.database):
+        return _run_cli(args, config)
 
 
 if __name__ == "__main__":

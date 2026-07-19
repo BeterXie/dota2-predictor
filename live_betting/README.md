@@ -140,7 +140,11 @@ takes a full online backup:
 python scripts/run_dota_shadow_service.py --migrate --once --database data/dota2.db
 ```
 
-The current protocol target is live schema `v8` and intelligence schema `v9`.
+The current protocol target is live schema `v9` and intelligence schema `v9`.
+Live schema v9 adds bounded monitor-candidate indexes and a trigger-maintained
+per-match odds-activity projection. Its migration scans the much smaller match
+registry and uses existing per-match time indexes, rather than aggregating the
+complete legacy odds tables.
 The live migration does not invent hashes for legacy visual evidence: a frame
 without its registered SHA-256 and byte length remains audit-only and cannot
 authorize a decision, order, notification, report score, or settlement.
@@ -192,10 +196,12 @@ python scripts/run_dota_shadow_service.py --migrate --once `
 ```
 
 `--migrate --once` is a write phase. After it exits, use the formal checkpoint
-command. It acquires the same service lock as the supervisor, uses a non-blocking
-`wal_checkpoint(TRUNCATE)`, prints the `busy`, `log`, and `checkpoint` triplet,
-and exits successfully only for `(0, 0, 0)` with `wal_bytes=0`. A held service
-lock, an active SQLite writer, or a non-empty WAL fails closed:
+command. It acquires both root-external role locks and both local database
+locks, then uses a non-blocking
+`wal_checkpoint(TRUNCATE)`, prints the `busy`, `log`, and `checkpoint` triplet
+plus the bound WAL/SHM/journal identity state, and exits successfully only for
+`(0, 0, 0)` with `wal_bytes=0`. A held database lock, an unverifiable offline
+process, an active SQLite writer, or a non-empty WAL fails closed:
 
 ```powershell
 python scripts/database_cutover.py checkpoint --database data/dota2.db
@@ -205,9 +211,14 @@ python scripts/database_cutover.py verify-prepared `
   --odds-raw-root data/live_betting/raw-v2
 ```
 
-The service lock covers supervisor-managed writers. SQLite cannot identify a
-different process that merely has an idle writable connection, so stopping Web
-and every standalone worker remains a mandatory operator gate. Do not restart
+The per-user service-role and Web-role authority locks are keyed by the logical
+database path and live outside the replaceable database root. This lets Web and
+the supervisor coexist while an offline operation can exclude either role. The
+matching local service and Web locks bind each role to the current database
+root. The offline process
+scan also recognizes legacy writers, `web.main`, and `uvicorn web.app:app`; an
+unknown Python process is unverifiable rather than silently ignored. Stopping
+every standalone process remains a mandatory operator gate. Do not restart
 anything between checkpoint and publication.
 
 Keep the migration backup and any existing `data/live_betting/raw-v2` tree
@@ -223,14 +234,23 @@ raw bytes, `C` the compacted database bytes, `A` all bundle artifact bytes, and
 code enforces these free-space floors in order:
 
 1. Migration snapshot: at least `L` additional bytes in `$backupDir`.
-2. Fresh compaction: at least `3L + R + M_c` free in `$compactionDir`'s volume.
+2. Fresh compaction: at least `5L + R + M_c` free in `$compactionDir`'s volume.
+   This reserves `2L` for the work database while legacy and v2 rows coexist,
+   `2L` for the `VACUUM INTO` output at that high-water mark, `L` for generated
+   raw artifacts, `R` for registered raw artifacts, and the safety margin.
 3. Bundle creation: at least `C + A + M_b` free in `$bundleDir`'s volume.
 4. Restore: at least `C + A + M_b` free in `$restoreDir`'s volume.
 
 When every new output is retained on D:, a deliberately conservative initial
-budget is `L + (3L + R + M_c) + (C + A + M_b) + (C + A + M_b)` additional free bytes,
+budget is `L + (5L + R + M_c) + (C + A + M_b) + (C + A + M_b)` additional free bytes,
 excluding files already present on D:. Recalculate `C` and `A` from compaction
 and bundle output before proceeding; do not rely only on the estimate.
+
+On `--resume`, the compactor recomputes only the remaining allocation: a
+missing work database, a missing compacted output, registered source raw files
+not yet copied, and the unused portion of the `L` budget reserved for newly
+generated raw artifacts. Work and raw bytes already present under the guarded
+destination are not charged a second time.
 
 The compactor rejects a source with a non-empty WAL and never modifies the
 source database or source raw tree. Its destination must be a new directory:
@@ -248,7 +268,8 @@ resumes only with `--resume`; never point the destination at the production
 directory.
 
 Create and verify a self-contained publication bundle from that compacted pair.
-The bundle destination must not already exist. Add one `--allow-source-root`
+Create and resume both require an empty source WAL/journal while holding the
+two global role locks and both local locks. The bundle destination must not already exist. Add one `--allow-source-root`
 for each audited `raw_source_artifacts` root outside the database directory:
 
 ```powershell
@@ -272,12 +293,23 @@ python scripts/database_cutover.py verify-prepared `
 The bundle contains only artifacts registered by its database snapshot:
 RayBet raw responses, completed-match source artifacts, and active visual
 frames. Creation and verification recompute every artifact identity and reject
-links, hardlinks, missing files, or byte mismatches. `restore` also requires a
-new destination, restores visual frames under the shared
+links, hardlinks, missing files, or byte mismatches. `restore` pre-creates a
+controlled destination containing only its canonical locks, restores visual frames under the shared
 `live_betting/live_evidence` content-addressed root, appends audited relocation
 records, and verifies every manifest byte. The final command above is the
 read-only schema and artifact-authority preflight. Start Web against that exact
 candidate through the single database authority:
+
+Bundle creation holds both source database role locks and both local lifetime locks,
+plus a target operation lock, for the complete snapshot and publication. Its
+checkpoint binds the source file identity, size, SHA-256, and source-tree
+provenance, including live, intelligence, and runtime schema versions. Restore
+holds both final database role locks, both local locks, and the operation lock. It
+publishes dependency trees and the restore manifest in checkpointed order, then
+atomically publishes the database file last and runs the full verifier before
+marking ready. `--resume` audits both staging and target after every move boundary;
+unknown or conflicting files fail closed. Published or staged database hardlinks
+are rejected.
 
 ```powershell
 $candidateDb = Join-Path $restoreDir "dota2.db"
@@ -289,13 +321,19 @@ Web process and all workers must use `$candidateDb`; never run the old
 production database and the candidate database simultaneously:
 
 ```powershell
+$candidateVision = Join-Path $restoreDir "live_betting/live_observations"
 python scripts/run_dota_shadow_service.py `
   --database $candidateDb `
   --start-collector --start-companion --start-shadow --start-vision `
   --start-mail --start-strict-ingest --start-postmatch `
   --start-draft-publisher `
-  --vision-jsonl data/live_betting/live_observations
+  --vision-jsonl $candidateVision
 ```
+
+The supervisor rejects a visual-observation path outside the candidate database
+directory. Odds raw responses, observations, visual evidence, and watcher logs
+are rooted under `$restoreDir/live_betting`; completed-match source artifacts
+are rooted under `$restoreDir/raw-sources`.
 
 Web resolves database paths by the documented priority `--database`, then
 `DATABASE_PATH`, then `web/config.yaml`, then the project default. Query and

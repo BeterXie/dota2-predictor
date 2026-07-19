@@ -38,6 +38,10 @@ from .research import (
     record_research_prediction,
 )
 from .shadow_strategy import ComebackShadowStrategy
+from .service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 from .storage import LiveBettingStore
 from .strict_eligibility import query_strict_live_eligibility
 from .vision import VisionObservation, read_jsonl
@@ -1171,16 +1175,7 @@ def run_once(
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
-    parser.add_argument("--vision-jsonl", type=Path, required=True)
-    parser.add_argument("--interval", type=float, default=3.0)
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument(
-        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
-    )
-    args = parser.parse_args()
+def _run_cli(args: argparse.Namespace) -> int:
     strategy = ComebackShadowStrategy()
     with LiveBettingStore(args.database) as store:
         if not getattr(args, "schema_prepared", False):
@@ -1226,6 +1221,20 @@ def main() -> int:
             if args.once:
                 return 0
             time.sleep(args.interval)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument("--vision-jsonl", type=Path, required=True)
+    parser.add_argument("--interval", type=float, default=3.0)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--schema-prepared", action="store_true", help=argparse.SUPPRESS
+    )
+    args = parser.parse_args()
+    with database_writer_authority(args.database):
+        return _run_cli(args)
 
 
 if __name__ == "__main__":

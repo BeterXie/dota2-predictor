@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import unittest
 from pathlib import Path
+import sqlite3
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,7 +12,13 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
+from live_betting.service_coordination import (
+    ProcessIdentity,
+    SingleInstanceLock,
+    TerminationResult,
+)
 from web import app as web_app
+from web import queries
 from web.queries import _sort_heroes_by_position
 from web.schemas import PrematchRequest
 
@@ -72,9 +81,15 @@ class PrematchSchemaTests(unittest.TestCase):
 class FetchAdminTests(unittest.TestCase):
     def setUp(self) -> None:
         web_app._fetch_process = None
+        web_app._fetch_process_identity = None
+        web_app._fetch_authority_environment = None
+        web_app._fetch_authority_context = None
 
     def tearDown(self) -> None:
         web_app._fetch_process = None
+        web_app._fetch_process_identity = None
+        web_app._fetch_authority_environment = None
+        web_app._fetch_authority_context = None
 
     @staticmethod
     def request(host: str) -> SimpleNamespace:
@@ -89,25 +104,290 @@ class FetchAdminTests(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.status_code, 403)
 
-    def test_only_one_fetch_process_can_run(self) -> None:
-        process = SimpleNamespace(poll=lambda: None)
-        with patch.object(web_app.subprocess, "Popen", return_value=process) as popen:
-            result = web_app.trigger_fetch(
-                self.request("127.0.0.1"),
-                match_id=123,
-                force=True,
-                admin_action="fetch",
+    def test_fetch_registration_baseexception_terminates_and_cleans_authority(
+        self,
+    ) -> None:
+        for interruption in (KeyboardInterrupt(), SystemExit(9)):
+            with self.subTest(interruption=type(interruption).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / "candidate.db"
+                    sqlite3.connect(database).close()
+                    handle = SimpleNamespace(pid=7601, poll=lambda: None)
+                    exited: list[bool] = []
+                    real_process = web_app.psutil.Process
+
+                    def interrupt_child(pid: int):
+                        if pid == handle.pid:
+                            raise interruption
+                        return real_process(pid)
+
+                    @contextlib.contextmanager
+                    def authority(_: Path):
+                        try:
+                            yield {"DOTA2_WEB_FETCH_AUTHORITY_V1": "marker"}
+                        finally:
+                            exited.append(True)
+
+                    with (
+                        patch.object(queries, "DB_PATH", str(database)),
+                        patch.object(web_app, "web_fetch_child_authority", authority),
+                        patch.object(web_app.subprocess, "Popen", return_value=handle),
+                        patch.object(
+                            web_app.psutil,
+                            "Process",
+                            side_effect=interrupt_child,
+                        ),
+                        patch.object(
+                            web_app,
+                            "terminate_subprocess_tree",
+                            return_value=TerminationResult(True),
+                        ) as terminate,
+                    ):
+                        with self.assertRaises(type(interruption)):
+                            web_app.trigger_fetch(
+                                self.request("127.0.0.1"),
+                                match_id=123,
+                                admin_action="fetch",
+                            )
+
+                    terminate.assert_called_once()
+                    self.assertIs(terminate.call_args.args[0], handle)
+                    self.assertEqual(exited, [True])
+                    self.assertIsNone(web_app._fetch_process)
+                    self.assertIsNone(web_app._fetch_authority_context)
+
+    def test_fetch_popen_baseexception_cleans_published_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            sqlite3.connect(database).close()
+            exited: list[bool] = []
+
+            @contextlib.contextmanager
+            def authority(_: Path):
+                try:
+                    yield {"DOTA2_WEB_FETCH_AUTHORITY_V1": "marker"}
+                finally:
+                    exited.append(True)
+
+            with (
+                patch.object(queries, "DB_PATH", str(database)),
+                patch.object(web_app, "web_fetch_child_authority", authority),
+                patch.object(
+                    web_app.subprocess,
+                    "Popen",
+                    side_effect=KeyboardInterrupt(),
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    web_app.trigger_fetch(
+                        self.request("127.0.0.1"),
+                        match_id=123,
+                        admin_action="fetch",
+                    )
+
+            self.assertEqual(exited, [True])
+            self.assertIsNone(web_app._fetch_process)
+            self.assertIsNone(web_app._fetch_authority_context)
+
+    def test_fetch_cleanup_failure_retains_handle_and_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            sqlite3.connect(database).close()
+            handle = SimpleNamespace(pid=7602, poll=lambda: None)
+            real_process = web_app.psutil.Process
+
+            def interrupt_child(pid: int):
+                if pid == handle.pid:
+                    raise KeyboardInterrupt
+                return real_process(pid)
+
+            @contextlib.contextmanager
+            def authority(_: Path):
+                try:
+                    yield {"DOTA2_WEB_FETCH_AUTHORITY_V1": "marker"}
+                finally:
+                    raise RuntimeError("injected authority cleanup failure")
+
+            with (
+                patch.object(queries, "DB_PATH", str(database)),
+                patch.object(web_app, "web_fetch_child_authority", authority),
+                patch.object(web_app.subprocess, "Popen", return_value=handle),
+                patch.object(
+                    web_app.psutil,
+                    "Process",
+                    side_effect=interrupt_child,
+                ),
+                patch.object(
+                    web_app,
+                    "terminate_subprocess_tree",
+                    return_value=TerminationResult(True),
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    web_app.trigger_fetch(
+                        self.request("127.0.0.1"),
+                        match_id=123,
+                        admin_action="fetch",
+                    )
+
+            self.assertTrue(
+                any(
+                    "authority cleanup failure" in note
+                    for note in getattr(raised.exception, "__notes__", ())
+                )
             )
-            self.assertEqual(result["status"], "started")
-            with self.assertRaises(HTTPException) as raised:
-                web_app.trigger_fetch(
+            self.assertIs(web_app._fetch_process, handle)
+            self.assertIsNotNone(web_app._fetch_authority_context)
+            web_app._clear_fetch_process()
+            self.assertIsNone(web_app._fetch_process)
+            self.assertIsNone(web_app._fetch_authority_context)
+
+    def test_only_one_fetch_process_can_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            sqlite3.connect(database).close()
+            command: list[str] = []
+            child_environment: dict[str, str] = {}
+            handle = SimpleNamespace(pid=7301, poll=lambda: None)
+
+            def popen(value: list[str], **kwargs: object) -> object:
+                command[:] = value
+                child_environment.update(kwargs["env"])
+                return handle
+
+            process = SimpleNamespace(
+                pid=7301,
+                create_time=lambda: 123.5,
+                cmdline=lambda: list(command),
+            )
+            with (
+                patch.object(queries, "DB_PATH", str(database)),
+                patch.object(web_app.subprocess, "Popen", side_effect=popen) as spawn,
+                patch.object(web_app.psutil, "Process", return_value=process),
+                patch.object(
+                    web_app,
+                    "web_fetch_child_authority",
+                    return_value=contextlib.nullcontext({
+                        "DOTA2_WEB_FETCH_AUTHORITY_V1": "test-marker"
+                    }),
+                ) as issue_authority,
+            ):
+                result = web_app.trigger_fetch(
                     self.request("127.0.0.1"),
                     match_id=123,
                     force=True,
                     admin_action="fetch",
                 )
+                self.assertEqual(result["status"], "started")
+                self.assertEqual(
+                    command[3:5],
+                    ["--database", str(database.resolve())],
+                )
+                self.assertEqual(
+                    web_app._fetch_process_identity,
+                    ProcessIdentity(7301, 123.5),
+                )
+                self.assertEqual(
+                    child_environment["DOTA2_WEB_FETCH_AUTHORITY_V1"],
+                    "test-marker",
+                )
+                with self.assertRaises(HTTPException) as raised:
+                    web_app.trigger_fetch(
+                        self.request("127.0.0.1"),
+                        match_id=123,
+                        force=True,
+                        admin_action="fetch",
+                    )
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(spawn.call_count, 1)
+                issue_authority.assert_called_once_with(database.resolve())
+
+    def test_fetch_does_not_spawn_while_supervisor_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            sqlite3.connect(database).close()
+            with (
+                patch.object(queries, "DB_PATH", str(database)),
+                patch.object(web_app.subprocess, "Popen") as spawn,
+                SingleInstanceLock(database.with_suffix(".service.lock")),
+                self.assertRaises(HTTPException) as raised,
+            ):
+                web_app.trigger_fetch(
+                    self.request("127.0.0.1"),
+                    match_id=123,
+                    admin_action="fetch",
+                )
+
             self.assertEqual(raised.exception.status_code, 409)
-            self.assertEqual(popen.call_count, 1)
+            spawn.assert_not_called()
+
+    def test_each_fetch_process_gets_a_fresh_authority_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            sqlite3.connect(database).close()
+            commands: list[list[str]] = []
+            child_markers: list[str] = []
+            issued = 0
+
+            def authority(_: Path) -> contextlib.AbstractContextManager[dict[str, str]]:
+                nonlocal issued
+                issued += 1
+                return contextlib.nullcontext({
+                    "DOTA2_WEB_FETCH_AUTHORITY_V1": f"marker-{issued}"
+                })
+
+            def popen(value: list[str], **kwargs: object) -> object:
+                commands.append(list(value))
+                child_markers.append(
+                    kwargs["env"]["DOTA2_WEB_FETCH_AUTHORITY_V1"]
+                )
+                return SimpleNamespace(pid=7500 + len(commands), poll=lambda: None)
+
+            def process(pid: int) -> object:
+                index = pid - 7501
+                return SimpleNamespace(
+                    pid=pid,
+                    create_time=lambda: float(pid),
+                    cmdline=lambda: list(commands[index]),
+                )
+
+            with (
+                patch.object(queries, "DB_PATH", str(database)),
+                patch.object(web_app, "web_fetch_child_authority", side_effect=authority),
+                patch.object(web_app.subprocess, "Popen", side_effect=popen),
+                patch.object(web_app.psutil, "Process", side_effect=process),
+            ):
+                for match_id in (101, 102):
+                    result = web_app.trigger_fetch(
+                        self.request("127.0.0.1"),
+                        match_id=match_id,
+                        admin_action="fetch",
+                    )
+                    self.assertEqual(result["status"], "started")
+                    web_app._clear_fetch_process()
+
+            self.assertEqual(child_markers, ["marker-1", "marker-2"])
+
+    def test_fetch_shutdown_uses_registered_pid_and_creation_time(self) -> None:
+        handle = SimpleNamespace(pid=7401, poll=lambda: None)
+        identity = ProcessIdentity(7401, 456.5)
+        web_app._fetch_process = handle
+        web_app._fetch_process_identity = identity
+        process = SimpleNamespace(pid=7401)
+
+        with (
+            patch.object(web_app.psutil, "Process", return_value=process),
+            patch.object(
+                web_app,
+                "terminate_process_tree",
+                return_value=TerminationResult(True),
+            ) as terminate,
+        ):
+            web_app._shutdown_fetch_process()
+
+        self.assertIsNone(web_app._fetch_process)
+        self.assertIsNone(web_app._fetch_process_identity)
+        self.assertEqual(terminate.call_args.kwargs["expected_root"], identity)
 
 
 class PrematchMarkupTests(unittest.TestCase):

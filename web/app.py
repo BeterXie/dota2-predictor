@@ -7,14 +7,27 @@ import os
 import subprocess
 import sys
 import threading
-import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+import psutil
 
-from . import alerts, monitoring, queries
+from live_betting.service_coordination import (
+    ProcessIdentity,
+    SingleInstanceLock,
+    TerminationResult,
+    database_service_authority_lock_paths,
+    database_web_authority_lock_paths,
+    require_unique_database_file,
+    terminate_process_tree,
+    terminate_subprocess_tree,
+    web_fetch_child_authority,
+    web_fetch_process_environment,
+)
+
+from . import queries
 from .routers import (
     control,
     heroes,
@@ -40,8 +53,14 @@ if _project_root_str not in sys.path:
 
 _prediction_module = None
 _fetch_process: subprocess.Popen[bytes] | None = None
+_fetch_process_identity: ProcessIdentity | None = None
 _fetch_process_lock = threading.Lock()
-_alert_task: asyncio.Task[None] | None = None
+_fetch_poll_task: asyncio.Task[None] | None = None
+_fetch_authority_environment: dict[str, str] | None = None
+_fetch_authority_context: contextlib.AbstractContextManager[
+    dict[str, str]
+] | None = None
+_FETCH_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _get_prediction_module():
@@ -54,20 +73,52 @@ def _get_prediction_module():
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
-    global _alert_task
-    connection = queries.get_db()
-    try:
-        alerts.init_alert_schema(connection)
-    finally:
-        connection.close()
-    _alert_task = asyncio.create_task(_alert_reconciliation_loop())
-    try:
-        yield
-    finally:
-        _alert_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _alert_task
-        _alert_task = None
+    global _fetch_authority_environment, _fetch_authority_context, _fetch_poll_task
+    database = Path(queries.DB_PATH).resolve()
+    initial_identity = require_unique_database_file(database)
+    assert initial_identity is not None
+    with contextlib.ExitStack() as lifetime:
+        for lock_path in database_web_authority_lock_paths(database):
+            lifetime.enter_context(SingleInstanceLock(lock_path))
+        require_unique_database_file(
+            database,
+            expected_identity=initial_identity,
+        )
+        _fetch_poll_task = asyncio.create_task(_fetch_process_poll_loop())
+        try:
+            yield
+        finally:
+            try:
+                _fetch_poll_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await _fetch_poll_task
+                _fetch_poll_task = None
+            finally:
+                try:
+                    _shutdown_fetch_process()
+                finally:
+                    try:
+                        connection = queries.get_db()
+                        try:
+                            control.control_service.shutdown(
+                                connection,
+                                database_path=database,
+                            )
+                        finally:
+                            connection.close()
+                    finally:
+                        try:
+                            control.control_sessions.clear()
+                            control.control_service.close()
+                        finally:
+                            try:
+                                require_unique_database_file(
+                                    database,
+                                    expected_identity=initial_identity,
+                                )
+                            finally:
+                                _fetch_authority_environment = None
+                                _fetch_authority_context = None
 
 
 app = FastAPI(
@@ -87,19 +138,96 @@ app.include_router(mappings.router)
 app.include_router(intelligence.router)
 
 
-async def _alert_reconciliation_loop() -> None:
-    await asyncio.sleep(1)
-    while True:
+def _note_fetch_cleanup_error(
+    primary: BaseException,
+    cleanup: BaseException,
+    *,
+    label: str,
+) -> None:
+    primary.add_note(f"{label}: {type(cleanup).__name__}: {cleanup}")
+
+
+def _clear_fetch_process() -> None:
+    global _fetch_process, _fetch_process_identity
+    global _fetch_authority_environment, _fetch_authority_context
+    authority_context = _fetch_authority_context
+    if authority_context is not None:
+        authority_context.__exit__(None, None, None)
+    _fetch_process = None
+    _fetch_process_identity = None
+    _fetch_authority_environment = None
+    _fetch_authority_context = None
+
+
+def _poll_fetch_process_once() -> None:
+    """Reap one completed fetch without weakening an unverifiable handle."""
+
+    with _fetch_process_lock:
+        if _fetch_process is None:
+            return
         try:
-            connection = queries.get_db()
-            try:
-                health = monitoring.derive_health(connection)
-                alerts.reconcile_alerts(connection, health=health)
-            finally:
-                connection.close()
-        except Exception:
-            logging.getLogger("web.alerts").exception("alert reconciliation failed")
-        await asyncio.sleep(5)
+            completed = _fetch_process.poll() is not None
+        except (AttributeError, OSError):
+            return
+        if completed:
+            _clear_fetch_process()
+
+
+async def _fetch_process_poll_loop() -> None:
+    while True:
+        await asyncio.sleep(_FETCH_POLL_INTERVAL_SECONDS)
+        _poll_fetch_process_once()
+
+
+def _terminate_fetch_handle(
+    process_handle: subprocess.Popen[bytes],
+    identity: ProcessIdentity | None,
+) -> TerminationResult:
+    try:
+        if process_handle.poll() is not None:
+            return TerminationResult(True)
+    except (AttributeError, OSError) as error:
+        return TerminationResult(
+            False,
+            f"fetch_process_poll_failed:{type(error).__name__}",
+        )
+    if identity is None:
+        return terminate_subprocess_tree(
+            process_handle,
+            process_factory=psutil.Process,
+        )
+    try:
+        process = psutil.Process(identity.pid)
+    except (psutil.NoSuchProcess, KeyError):
+        try:
+            return TerminationResult(process_handle.poll() is not None)
+        except (AttributeError, OSError):
+            return TerminationResult(False, "fetch_process_identity_missing")
+    except (AttributeError, OSError, TypeError, ValueError, psutil.Error) as error:
+        return TerminationResult(
+            False,
+            f"fetch_process_identity_unverifiable:{type(error).__name__}",
+        )
+    return terminate_process_tree(
+        process,
+        process_factory=psutil.Process,
+        expected_root=identity,
+    )
+
+
+def _shutdown_fetch_process() -> None:
+    with _fetch_process_lock:
+        if _fetch_process is None:
+            return
+        result = _terminate_fetch_handle(
+            _fetch_process,
+            _fetch_process_identity,
+        )
+        if not result.ok:
+            raise RuntimeError(
+                f"fetch process shutdown incomplete: {result.detail}"
+            )
+        _clear_fetch_process()
 
 # ---- Hero grid endpoint (for pre-match hero picker) ----
 
@@ -152,25 +280,131 @@ def trigger_fetch(
     client_host = request.client.host if request.client is not None else ""
     if client_host not in {"127.0.0.1", "::1"} or admin_action != "fetch":
         raise HTTPException(status_code=403, detail="Local admin request required")
-    global _fetch_process
+    global _fetch_process, _fetch_process_identity
+    global _fetch_authority_environment, _fetch_authority_context
     try:
-        cmd = [sys.executable, "-m", "fetch.main"]
+        database = Path(queries.DB_PATH).resolve()
+        database_identity = require_unique_database_file(database)
+        assert database_identity is not None
+        try:
+            with contextlib.ExitStack() as service_authority:
+                for lock_path in database_service_authority_lock_paths(database):
+                    service_authority.enter_context(SingleInstanceLock(lock_path))
+                require_unique_database_file(
+                    database,
+                    expected_identity=database_identity,
+                )
+        except (OSError, RuntimeError) as error:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Database service authority is unavailable: {error}",
+            ) from error
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "fetch.main",
+            "--database",
+            str(database),
+        ]
         if match_id is not None:
             cmd.extend(["--match-id", str(match_id)])
         if force:
             cmd.append("--force")
         with _fetch_process_lock:
-            if _fetch_process is not None and _fetch_process.poll() is None:
-                raise HTTPException(status_code=409, detail="A fetch is already running")
-            _fetch_process = subprocess.Popen(
-                cmd,
-                cwd=str(_PROJECT_DIR),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=(
-                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                ),
-            )
+            if _fetch_process is not None:
+                try:
+                    running = _fetch_process.poll() is None
+                except (AttributeError, OSError):
+                    running = True
+                if running:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A fetch is already running or unverifiable",
+                    )
+                _clear_fetch_process()
+            authority_context = web_fetch_child_authority(database)
+            authority = authority_context.__enter__()
+            _fetch_authority_context = authority_context
+            _fetch_authority_environment = authority
+            try:
+                child_environment = web_fetch_process_environment(authority)
+                _fetch_process = subprocess.Popen(
+                    cmd,
+                    cwd=str(_PROJECT_DIR),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=(
+                        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    ),
+                    env=child_environment,
+                )
+            except BaseException as error:
+                try:
+                    _clear_fetch_process()
+                except BaseException as cleanup_error:
+                    _note_fetch_cleanup_error(
+                        error,
+                        cleanup_error,
+                        label="fetch authority cleanup failed",
+                    )
+                raise
+            _fetch_process_identity = None
+            try:
+                process = psutil.Process(int(_fetch_process.pid))
+                created_at = float(process.create_time())
+                actual_command = list(process.cmdline())
+                if _fetch_process.poll() is not None:
+                    raise RuntimeError("fetch process exited during registration")
+                if actual_command != cmd:
+                    raise RuntimeError("fetch process command identity changed")
+                require_unique_database_file(
+                    database,
+                    expected_identity=database_identity,
+                )
+                _fetch_process_identity = ProcessIdentity(
+                    int(_fetch_process.pid),
+                    created_at,
+                )
+            except BaseException as error:
+                try:
+                    cleanup = terminate_subprocess_tree(
+                        _fetch_process,
+                        process_factory=psutil.Process,
+                    )
+                except BaseException as cleanup_error:
+                    _note_fetch_cleanup_error(
+                        error,
+                        cleanup_error,
+                        label="fetch process cleanup failed",
+                    )
+                    raise error
+                if cleanup.ok:
+                    try:
+                        _clear_fetch_process()
+                    except BaseException as cleanup_error:
+                        _note_fetch_cleanup_error(
+                            error,
+                            cleanup_error,
+                            label="fetch authority cleanup failed",
+                        )
+                        if not isinstance(error, Exception):
+                            raise error
+                        raise RuntimeError(
+                            "fetch process registration failed; authority cleanup "
+                            "is incomplete"
+                        ) from error
+                else:
+                    error.add_note(
+                        "fetch process cleanup failed: "
+                        f"{cleanup.detail or 'unknown error'}"
+                    )
+                if not isinstance(error, Exception):
+                    raise error
+                raise RuntimeError(
+                    "fetch process registration failed: "
+                    f"{type(error).__name__}:{error}; cleanup={cleanup.detail}"
+                ) from error
         parts = []
         if match_id:
             parts.append(f"match {match_id}")

@@ -19,6 +19,10 @@ import yaml
 
 from .client import OpenDotaClient
 from .db import Database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,8 +216,12 @@ async def compute_scaling_scores(db: Database, hero_ids: list[int]) -> None:
     logger.info("Computed scaling scores for %d heroes.", len(hero_ids))
 
 
-async def run(cfg: dict, force: bool) -> None:
-    db_path = resolve_db_path(cfg)
+async def run(
+    cfg: dict,
+    force: bool,
+    database_path: str | Path | None = None,
+) -> None:
+    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
     db = Database(db_path)
     db.connect()
     db.init_db()
@@ -274,13 +282,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch hero meta statistics from OpenDota API"
     )
+    add_single_database_argument(parser)
     parser.add_argument(
         "--force", action="store_true", help="Re-fetch even if already in DB"
     )
     args = parser.parse_args()
 
     cfg = load_config()
-    asyncio.run(run(cfg, args.force))
+    database = Path(args.database or resolve_db_path(cfg)).resolve()
+    with database_writer_authority(database):
+        asyncio.run(run(cfg, args.force, database))
 
 
 if __name__ == "__main__":

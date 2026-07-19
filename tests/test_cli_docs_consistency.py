@@ -37,7 +37,10 @@ def test_database_operations_runbook_covers_the_published_clis() -> None:
         assert command in runbook
     assert "`M_c = 512 MiB`" in runbook
     assert "`M_b = 512 MiB`" in runbook
-    assert "`3L + R + M_c`" in runbook
+    assert "`5L + R + M_c`" in runbook
+    assert "`2L` for the work database" in runbook
+    assert "`2L` for the `VACUUM INTO` output" in runbook
+    assert "`L` for generated\n   raw artifacts" in runbook
     assert "`C + A + M_b`" in runbook
     assert "it is not a read-only verification command" in runbook
     assert "--database`, then\n`DATABASE_PATH`, then `web/config.yaml`" in runbook

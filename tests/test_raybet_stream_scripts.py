@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from io import StringIO
@@ -15,15 +16,18 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+import scripts.supervise_raybet_streams as visual_supervisor
+import scripts.watch_raybet_stream as visual_watcher
 from scripts.supervise_raybet_streams import (
-    DEFAULT_OBSERVATION_DIR as SUPERVISOR_OBSERVATION_DIR,
     MAX_CONCURRENT_WATCHERS,
     WATCHER_MAX_START_FAILURES,
     active_match_evidence,
     active_matches,
     reap_children,
     record_supervisor_health,
+    resolve_data_paths as resolve_supervisor_data_paths,
     run_evidence_retention,
+    spawn_watcher,
     startable_matches,
     supervisor_health,
     watcher_retry_after_failure,
@@ -32,7 +36,6 @@ from scripts.supervise_raybet_streams import (
 from scripts.invalidate_vision_observations import freeze_draft_map, invalidate
 from scripts.watch_raybet_stream import (
     ALLOWED_STREAM_HOSTS,
-    DEFAULT_OBSERVATION_DIR as WATCHER_OBSERVATION_DIR,
     ROOT,
     _meaningful,
     _should_persist_frame,
@@ -43,10 +46,18 @@ from scripts.watch_raybet_stream import (
     match_is_complete,
     match_source,
     resolve_source,
+    resolve_data_paths as resolve_watcher_data_paths,
 )
 from contracts.live_observation import LiveObservation
 from vision.map_state import ConfirmedClock
 from live_betting.storage import LiveBettingStore
+from live_betting.service_coordination import (
+    TerminationResult,
+    WriterScanResult,
+    database_service_authority_lock_paths,
+    database_web_authority_lock_paths,
+    database_writer_authority,
+)
 from live_betting.sanitize import (
     PUBLIC_STREAM_EVIDENCE_KEY,
     public_stream_evidence,
@@ -129,6 +140,192 @@ def test_visual_supervisor_cli_constructs_parser() -> None:
     assert result.returncode == 0, result.stderr
     assert "--database" in result.stdout
 
+
+def test_visual_supervisor_and_database_watcher_hold_lifetime_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "candidate.db"
+    held: list[Path] = []
+
+    @contextlib.contextmanager
+    def authority(path: Path):
+        held.append(path)
+        try:
+            yield
+        finally:
+            held.remove(path)
+
+    supervisor_args = SimpleNamespace(database=database)
+    monkeypatch.setattr(visual_supervisor, "_parse_args", lambda: supervisor_args)
+    monkeypatch.setattr(visual_supervisor, "database_writer_authority", authority)
+    monkeypatch.setattr(
+        visual_supervisor,
+        "_run_cli",
+        lambda args: 17 if held == [args.database] else -1,
+    )
+    assert visual_supervisor.main() == 17
+    assert held == []
+
+    watcher_args = SimpleNamespace(database=database)
+    parser = SimpleNamespace(error=lambda message: pytest.fail(message))
+    monkeypatch.setattr(
+        visual_watcher,
+        "_parse_args",
+        lambda: (parser, watcher_args),
+    )
+    monkeypatch.setattr(visual_watcher, "database_writer_authority", authority)
+    monkeypatch.setattr(
+        visual_watcher,
+        "_run_cli",
+        lambda args: 23 if held == [args.database] else -1,
+    )
+    assert visual_watcher.main() == 23
+    assert held == []
+
+
+def test_standalone_supervisor_spawns_real_child_without_reacquiring_locks(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candidate.db"
+    database.touch()
+    probe = tmp_path / "watcher_probe.py"
+    probe.write_text(
+        "import sys\n"
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "from live_betting.service_coordination import database_writer_authority\n"
+        "db = Path(sys.argv[sys.argv.index('--database') + 1])\n"
+        "with database_writer_authority(db):\n"
+        "    print('watcher-authorized', flush=True)\n"
+        "marker = json.loads(os.environ['DOTA2_MANAGER_CHILD_AUTHORITY_V1'])\n"
+        "print('watcher-locks=' + json.dumps([\n"
+        "    owner['lock_path'] for owner in marker['root_lock_owners']\n"
+        "]), flush=True)\n",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(probe),
+        "--database",
+        str(database.resolve()),
+    ]
+
+    with database_writer_authority(
+        database,
+        environ={},
+        writer_scanner=lambda _: WriterScanResult((), ()),
+    ):
+        process, authority = spawn_watcher(
+            database,
+            command,
+            subprocess.PIPE,
+            subprocess.PIPE,
+        )
+        stdout, stderr = process.communicate(timeout=15)
+        authority.__exit__(None, None, None)
+
+    assert process.returncode == 0, stderr.decode("utf-8", errors="replace")
+    assert b"watcher-authorized" in stdout
+    lock_line = next(
+        line
+        for line in stdout.decode("utf-8").splitlines()
+        if line.startswith("watcher-locks=")
+    )
+    lock_paths = tuple(
+        Path(path).resolve()
+        for path in json.loads(lock_line.removeprefix("watcher-locks="))
+    )
+    assert lock_paths == database_service_authority_lock_paths(database)
+    assert not set(lock_paths).intersection(database_web_authority_lock_paths(database))
+
+
+def test_watcher_bind_keyboard_interrupt_terminates_and_cleans_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "watcher-interrupt.db"
+    database.touch()
+    exited: list[bool] = []
+
+    class Authority:
+        def __enter__(self) -> dict[str, str]:
+            return {"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+
+        def __exit__(self, *_: object) -> None:
+            exited.append(True)
+
+    process = SimpleNamespace(pid=8801, poll=lambda: None)
+    monkeypatch.setattr(visual_supervisor, "managed_child_command", lambda value: value)
+    monkeypatch.setattr(
+        visual_supervisor,
+        "delegated_writer_process_environment",
+        lambda *_args, **_kwargs: Authority(),
+    )
+    monkeypatch.setattr(visual_supervisor.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(
+        visual_supervisor,
+        "bind_manager_child_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        visual_supervisor,
+        "terminate_subprocess_tree",
+        lambda *_args, **_kwargs: TerminationResult(True),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        spawn_watcher(database, [sys.executable, "target.py"], None, None)
+    assert exited == [True]
+
+
+def test_watcher_registration_system_exit_terminates_and_cleans_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "watcher-register.db"
+    database.touch()
+    exited: list[bool] = []
+
+    class Authority:
+        def __enter__(self) -> dict[str, str]:
+            return {"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+
+        def __exit__(self, *_: object) -> None:
+            exited.append(True)
+
+    process = SimpleNamespace(pid=8802, poll=lambda: None)
+    monkeypatch.setattr(visual_supervisor, "managed_child_command", lambda value: value)
+    monkeypatch.setattr(
+        visual_supervisor,
+        "delegated_writer_process_environment",
+        lambda *_args, **_kwargs: Authority(),
+    )
+    monkeypatch.setattr(visual_supervisor.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(
+        visual_supervisor,
+        "bind_manager_child_authority",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        visual_supervisor,
+        "terminate_subprocess_tree",
+        lambda *_args, **_kwargs: TerminationResult(True),
+    )
+
+    def interrupt_registration(*_: object) -> None:
+        raise SystemExit(23)
+
+    with pytest.raises(SystemExit, match="23"):
+        spawn_watcher(
+            database,
+            [sys.executable, "target.py"],
+            None,
+            None,
+            register=interrupt_registration,
+        )
+    assert exited == [True]
 
 def test_visual_supervisor_records_worker_heartbeat(tmp_path: Path) -> None:
     database = tmp_path / "vision-health.db"
@@ -1302,7 +1499,36 @@ def test_supervisor_never_exceeds_global_watcher_limit() -> None:
     assert startable_matches(active, children, {}, now=now) == []
 
 
-def test_observation_defaults_are_anchored_in_predictor() -> None:
-    expected = ROOT / "data" / "live_betting" / "live_observations"
-    assert WATCHER_OBSERVATION_DIR == expected
-    assert SUPERVISOR_OBSERVATION_DIR == expected
+def test_vision_defaults_follow_the_selected_database(tmp_path: Path) -> None:
+    database = tmp_path / "candidate" / "dota2.db"
+    supervisor = resolve_supervisor_data_paths(SimpleNamespace(
+        database=database,
+        output_dir=None,
+        evidence_dir=None,
+        log_dir=None,
+    ))
+    watcher = resolve_watcher_data_paths(SimpleNamespace(
+        database=database,
+        output=None,
+        evidence_dir=None,
+        match_id="42",
+    ))
+    live_root = database.resolve().parent / "live_betting"
+
+    assert supervisor.database == database.resolve()
+    assert supervisor.output_dir == live_root / "live_observations"
+    assert supervisor.evidence_dir == live_root / "live_evidence"
+    assert supervisor.log_dir == live_root / "watcher_logs"
+    assert watcher.database == database.resolve()
+    assert watcher.output == live_root / "live_observations" / "42.jsonl"
+    assert watcher.evidence_dir == live_root / "live_evidence"
+
+
+def test_url_only_watcher_requires_explicit_output_roots() -> None:
+    with pytest.raises(ValueError, match="--database is required"):
+        resolve_watcher_data_paths(SimpleNamespace(
+            database=None,
+            output=None,
+            evidence_dir=None,
+            match_id="42",
+        ))

@@ -18,6 +18,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 from event_intelligence.raw_archive import canonical_json_bytes  # noqa: E402
 from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 from event_intelligence.team_profiles import (  # noqa: E402
@@ -595,7 +599,7 @@ def _cutoff(value: str) -> datetime:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument(
         "--cutoff",
         type=_cutoff,
@@ -607,7 +611,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = build_strict_profiles(args.database, args.cutoff or datetime.now(UTC))
+    with database_writer_authority(args.database):
+        report = build_strict_profiles(
+            args.database,
+            args.cutoff or datetime.now(UTC),
+        )
     print(json.dumps(asdict(report), sort_keys=True))
     return 0
 

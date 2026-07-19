@@ -14,6 +14,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 from event_intelligence.backtest import (  # noqa: E402
     report_as_dict,
     run_strict_draft_backtest,
@@ -41,7 +45,7 @@ def _positive_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument(
         "--availability-mode",
         choices=tuple(mode.value for mode in AvailabilityMode),
@@ -69,14 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = run_strict_draft_backtest(
-        args.database,
-        availability_mode=AvailabilityMode(args.availability_mode),
-        assignment_version=args.assignment_version,
-        dry_run=args.dry_run,
-        min_samples=args.min_samples,
-        l2_regularization=args.l2_regularization,
-    )
+    with database_writer_authority(args.database):
+        report = run_strict_draft_backtest(
+            args.database,
+            availability_mode=AvailabilityMode(args.availability_mode),
+            assignment_version=args.assignment_version,
+            dry_run=args.dry_run,
+            min_samples=args.min_samples,
+            l2_regularization=args.l2_regularization,
+        )
     print(json.dumps(report_as_dict(report), ensure_ascii=True, sort_keys=True))
     return 0
 

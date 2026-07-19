@@ -14,57 +14,7 @@ from live_betting.notifications import (
     decision_lineage_block_reason,
     enqueue,
 )
-
-
-_ALERT_TABLES = """
-CREATE TABLE IF NOT EXISTS monitor_alert_candidates (
-    dedupe_key TEXT PRIMARY KEY,
-    first_detected_at TEXT NOT NULL,
-    last_detected_at TEXT NOT NULL,
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS monitor_alert_incidents (
-    incident_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    dedupe_key TEXT NOT NULL,
-    episode INTEGER NOT NULL CHECK (episode > 0),
-    category TEXT NOT NULL CHECK (category IN ('operational', 'paper_signal')),
-    severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('active', 'recovered')),
-    first_detected_at TEXT NOT NULL,
-    opened_at TEXT NOT NULL,
-    last_detected_at TEXT NOT NULL,
-    recovered_at TEXT,
-    acknowledged_at TEXT,
-    acknowledged_by TEXT,
-    source_json TEXT NOT NULL,
-    occurrence_count INTEGER NOT NULL DEFAULT 1 CHECK (occurrence_count > 0),
-    UNIQUE (dedupe_key, episode)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_monitor_alert_active_key
-    ON monitor_alert_incidents(dedupe_key) WHERE status='active';
-CREATE INDEX IF NOT EXISTS idx_monitor_alert_status_opened
-    ON monitor_alert_incidents(status, opened_at DESC);
-CREATE TABLE IF NOT EXISTS monitor_alert_audit (
-    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id INTEGER NOT NULL REFERENCES monitor_alert_incidents(incident_id),
-    action TEXT NOT NULL CHECK (action IN ('opened', 'observed', 'acknowledged', 'recovered')),
-    actor TEXT NOT NULL,
-    detail TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TRIGGER IF NOT EXISTS monitor_alert_audit_no_update
-BEFORE UPDATE ON monitor_alert_audit
-BEGIN
-    SELECT RAISE(ABORT, 'monitor alert audit rows are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS monitor_alert_audit_no_delete
-BEFORE DELETE ON monitor_alert_audit
-BEGIN
-    SELECT RAISE(ABORT, 'monitor alert audit rows cannot be deleted');
-END;
-"""
+from live_betting.runtime_schema import verify_runtime_schema
 
 _OBSERVATION_AUDIT_SECONDS = 60
 
@@ -213,12 +163,6 @@ _PAPER_SIGNAL_QUERY = """
 """
 
 
-def init_alert_schema(connection: sqlite3.Connection) -> None:
-    _migrate_notification_outbox(connection)
-    connection.executescript(_ALERT_TABLES)
-    connection.commit()
-
-
 def reconcile_alerts(
     connection: sqlite3.Connection,
     *,
@@ -230,7 +174,7 @@ def reconcile_alerts(
     now = _aware(now or datetime.now(timezone.utc))
     if grace_seconds < 0:
         raise ValueError("grace_seconds must be non-negative")
-    init_alert_schema(connection)
+    verify_runtime_schema(connection)
     email_recipient = (
         str(email_recipient).strip()
         if email_recipient is not None
@@ -239,7 +183,11 @@ def reconcile_alerts(
     now_iso = now.isoformat()
     connection.execute("BEGIN IMMEDIATE")
     with connection:
-        conditions, paper_signal_available = _conditions(connection, health)
+        (
+            conditions,
+            operational_health_available,
+            paper_signal_available,
+        ) = _conditions(connection, health)
         for dedupe_key, condition in conditions.items():
             active = connection.execute(
                 """SELECT incident_id FROM monitor_alert_incidents
@@ -346,7 +294,6 @@ def reconcile_alerts(
                 recipient=email_recipient,
             )
 
-        placeholders = ",".join("?" for _ in conditions)
         active_rows = connection.execute(
             """SELECT incident_id, dedupe_key, category, severity, title, body,
                       source_json
@@ -355,7 +302,12 @@ def reconcile_alerts(
         for row in active_rows:
             if str(row[1]) in conditions:
                 continue
-            if str(row[2]) == "paper_signal" and not paper_signal_available:
+            if not _alert_source_is_available(
+                dedupe_key=str(row[1]),
+                category=str(row[2]),
+                operational_health_available=operational_health_available,
+                paper_signal_available=paper_signal_available,
+            ):
                 continue
             incident_id = int(row[0])
             connection.execute(
@@ -378,13 +330,31 @@ def reconcile_alerts(
                 now=now,
                 recipient=email_recipient,
             )
-        if conditions:
+        candidate_rows = connection.execute(
+            "SELECT dedupe_key, payload_json FROM monitor_alert_candidates"
+        ).fetchall()
+        for dedupe_key, payload_json in candidate_rows:
+            dedupe_key = str(dedupe_key)
+            if dedupe_key in conditions:
+                continue
+            category = "operational"
+            try:
+                payload = json.loads(str(payload_json))
+                if isinstance(payload, dict):
+                    category = str(payload.get("category") or category)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            if not _alert_source_is_available(
+                dedupe_key=dedupe_key,
+                category=category,
+                operational_health_available=operational_health_available,
+                paper_signal_available=paper_signal_available,
+            ):
+                continue
             connection.execute(
-                f"DELETE FROM monitor_alert_candidates WHERE dedupe_key NOT IN ({placeholders})",
-                tuple(conditions),
+                "DELETE FROM monitor_alert_candidates WHERE dedupe_key=?",
+                (dedupe_key,),
             )
-        else:
-            connection.execute("DELETE FROM monitor_alert_candidates")
     return active_alerts(connection)
 
 
@@ -433,6 +403,7 @@ def acknowledge_alert(
     actor = " ".join(str(actor).split())[:100]
     if incident_id <= 0 or not actor:
         raise ValueError("valid incident and actor are required")
+    verify_runtime_schema(connection)
     with connection:
         changed = connection.execute(
             """UPDATE monitor_alert_incidents
@@ -456,7 +427,9 @@ def acknowledge_alert(
 def _conditions(
     connection: sqlite3.Connection,
     health: Sequence[Mapping[str, Any]] | None,
-) -> tuple[dict[str, dict[str, Any]], bool]:
+) -> tuple[dict[str, dict[str, Any]], bool, bool]:
+    operational_health_available = True
+    operational_contract_failure: dict[str, dict[str, Any]] = {}
     if health is None:
         try:
             rows = connection.execute(
@@ -472,8 +445,12 @@ def _conditions(
                 }
                 for row in rows
             ]
-        except sqlite3.OperationalError:
+        except sqlite3.Error as exc:
             health = []
+            operational_health_available = False
+            operational_contract_failure = _operational_health_contract_failure(
+                exc
+            )
     conditions: dict[str, dict[str, Any]] = {}
     for item in health:
         component = str(item.get("component") or "").strip()
@@ -496,8 +473,43 @@ def _conditions(
             "source": {"component": component, "status": status, "last_error": last_error},
         }
     paper_conditions, paper_signal_available = _paper_signal_conditions(connection)
+    conditions.update(operational_contract_failure)
     conditions.update(paper_conditions)
-    return conditions, paper_signal_available
+    return conditions, operational_health_available, paper_signal_available
+
+
+def _operational_health_contract_failure(
+    error: sqlite3.Error,
+) -> dict[str, dict[str, Any]]:
+    issue = f"{type(error).__name__}: {error}"
+    return {
+        "operational:service_health_contract": {
+            "category": "operational",
+            "severity": "critical",
+            "title": "Service health data is unavailable",
+            "body": "operational health reconciliation suppressed: " + issue,
+            "source": {
+                "component": "service_health",
+                "status": "unavailable",
+                "reason": "query_failed",
+                "issues": [issue],
+            },
+        }
+    }
+
+
+def _alert_source_is_available(
+    *,
+    dedupe_key: str,
+    category: str,
+    operational_health_available: bool,
+    paper_signal_available: bool,
+) -> bool:
+    if category == "paper_signal" or dedupe_key == (
+        "operational:paper_signal_contract"
+    ):
+        return paper_signal_available
+    return operational_health_available
 
 
 def _paper_signal_conditions(
@@ -695,98 +707,6 @@ def _audit(
     )
 
 
-def _migrate_notification_outbox(connection: sqlite3.Connection) -> None:
-    row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notification_outbox'"
-    ).fetchone()
-    if row is None:
-        return
-    nested = connection.in_transaction
-    if nested:
-        connection.execute("SAVEPOINT notification_outbox_monitor_migration")
-    else:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
-        if "monitor_alert" not in str(row[0]):
-            connection.execute(
-                "DROP TRIGGER IF EXISTS notification_outbox_payload_immutable"
-            )
-            connection.execute("DROP TABLE IF EXISTS notification_outbox_monitor_v1")
-            connection.execute(
-                """CREATE TABLE notification_outbox_monitor_v1 (
-                    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_key TEXT NOT NULL,
-                    event_type TEXT NOT NULL CHECK (event_type IN
-                        ('filled', 'settled', 'monitor_alert', 'monitor_recovery')),
-                    channel TEXT NOT NULL DEFAULT 'email',
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'leased', 'sent', 'dead_letter')),
-                    recipient TEXT NOT NULL,
-                    message_id TEXT NOT NULL UNIQUE,
-                    payload_json TEXT NOT NULL,
-                    statistics_cutoff TEXT NOT NULL,
-                    template_version TEXT NOT NULL,
-                    lease_token TEXT,
-                    lease_until TEXT,
-                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-                    next_attempt_at TEXT,
-                    last_error TEXT,
-                    sent_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (order_key, event_type, channel)
-                )"""
-            )
-            columns = (
-                "outbox_id, order_key, event_type, channel, status, recipient, "
-                "message_id, payload_json, statistics_cutoff, template_version, "
-                "lease_token, lease_until, attempt_count, next_attempt_at, "
-                "last_error, sent_at, created_at, updated_at"
-            )
-            connection.execute(
-                f"""INSERT INTO notification_outbox_monitor_v1 ({columns})
-                    SELECT {columns} FROM notification_outbox"""
-            )
-            connection.execute("DROP TABLE notification_outbox")
-            connection.execute(
-                "ALTER TABLE notification_outbox_monitor_v1 "
-                "RENAME TO notification_outbox"
-            )
-        connection.execute("DROP INDEX IF EXISTS idx_notification_outbox_due")
-        connection.execute(
-            """CREATE INDEX idx_notification_outbox_due
-                 ON notification_outbox(status, next_attempt_at, lease_until)"""
-        )
-        connection.execute(
-            "DROP TRIGGER IF EXISTS notification_outbox_payload_immutable"
-        )
-        connection.execute(
-            """CREATE TRIGGER notification_outbox_payload_immutable
-               BEFORE UPDATE ON notification_outbox
-               WHEN OLD.order_key IS NOT NEW.order_key
-                 OR OLD.event_type IS NOT NEW.event_type
-                 OR OLD.channel IS NOT NEW.channel
-                 OR OLD.payload_json IS NOT NEW.payload_json
-                 OR OLD.statistics_cutoff IS NOT NEW.statistics_cutoff
-                 OR OLD.template_version IS NOT NEW.template_version
-                 OR OLD.recipient IS NOT NEW.recipient
-                 OR OLD.message_id IS NOT NEW.message_id
-               BEGIN
-                   SELECT RAISE(ABORT, 'notification outbox payload is immutable');
-               END"""
-        )
-    except Exception:
-        if nested:
-            connection.execute("ROLLBACK TO notification_outbox_monitor_migration")
-            connection.execute("RELEASE notification_outbox_monitor_migration")
-        else:
-            connection.rollback()
-        raise
-    else:
-        if nested:
-            connection.execute("RELEASE notification_outbox_monitor_migration")
-        else:
-            connection.commit()
 
 
 def _aware(value: datetime) -> datetime:

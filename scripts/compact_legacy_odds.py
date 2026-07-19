@@ -15,11 +15,14 @@ from live_betting.odds_legacy_compactor import (  # noqa: E402
     compact_legacy_odds,
     result_json,
 )
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, required=True)
+    add_single_database_argument(parser, required=True)
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--destination-root", type=Path, required=True)
     parser.add_argument(

@@ -43,6 +43,7 @@ from scripts.run_strict_event_ingest import (
     _record_runtime_health,
     build_default_runtime,
     build_parser,
+    resolve_data_paths,
     run,
 )
 
@@ -1521,6 +1522,24 @@ class IngestAdapterTests(unittest.TestCase):
             import asyncio
 
             asyncio.run(runtime.close())
+
+    def test_cli_default_data_paths_follow_the_selected_database(self) -> None:
+        database = Path(self.directory.name) / "candidate" / "strict.db"
+
+        args = resolve_data_paths(build_parser().parse_args([
+            "--database",
+            str(database),
+            "--once",
+        ]))
+
+        self.assertEqual(args.database, database.resolve())
+        self.assertEqual(args.archive_root, database.resolve().parent / "raw-sources")
+        self.assertEqual(
+            args.coverage_report,
+            database.resolve().parent
+            / "reports"
+            / "strict_event_coverage_latest.json",
+        )
 
     def test_cli_event_and_reconcile_filters_are_one_shot(self) -> None:
         class FakeIngestor:

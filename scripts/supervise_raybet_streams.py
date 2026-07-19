@@ -10,14 +10,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-LIVE_BETTING_DATA = ROOT / "data" / "live_betting"
-DEFAULT_OBSERVATION_DIR = LIVE_BETTING_DATA / "live_observations"
 
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
 from live_betting.browser_contract import (  # noqa: E402
@@ -27,10 +25,17 @@ from live_betting.browser_contract import (  # noqa: E402
 from live_betting.health import record_health  # noqa: E402
 from live_betting.raybet_state import raybet_match_is_live  # noqa: E402
 from live_betting.sanitize import stored_public_stream_url  # noqa: E402
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    bind_manager_child_authority,
+    database_writer_authority,
+    delegated_writer_process_environment,
+    managed_child_command,
+    service_data_paths,
+    terminate_subprocess_tree,
+)
 from live_betting.vision_retention import prune_vision_evidence  # noqa: E402
 
-DEFAULT_EVIDENCE_DIR = LIVE_BETTING_DATA / "live_evidence"
-DEFAULT_LOG_DIR = LIVE_BETTING_DATA / "watcher_logs"
 OUTPUT_MAX_AGE = timedelta(seconds=90)
 WATCHER_STARTUP_GRACE = timedelta(seconds=90)
 RETENTION_INTERVAL_SECONDS = 60 * 60
@@ -41,6 +46,19 @@ VIDEO_SOURCE_PATHS = frozenset({"/live", "/video", "/playback", "/v2/video"})
 
 Child = tuple[subprocess.Popen, object, object]
 OutputSignature = tuple[int, int]
+
+
+class AuthorityCleanupError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        process: subprocess.Popen | None = None,
+        authority: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.process = process
+        self.authority = authority
 
 
 @dataclass(frozen=True)
@@ -352,13 +370,13 @@ def watcher_command(
     output_dir: Path,
     evidence_dir: Path,
 ) -> list[str]:
-    return [
+    return managed_child_command([
         sys.executable,
         str(ROOT / "scripts" / "watch_raybet_stream.py"),
         "--match-id",
         match_id,
         "--database",
-        str(database),
+        str(database.resolve()),
         "--output",
         str(output_dir / f"{match_id}.jsonl"),
         "--evidence-dir",
@@ -368,12 +386,78 @@ def watcher_command(
         "--evidence-interval",
         "30",
         "--refresh-url",
-    ]
+    ])
+
+
+def spawn_watcher(
+    database: Path,
+    command: list[str],
+    stdout: object,
+    stderr: object,
+    *,
+    register: Callable[[subprocess.Popen, object], None] | None = None,
+) -> tuple[subprocess.Popen, object]:
+    """Spawn one exact watcher without making the child reacquire root locks."""
+
+    command = managed_child_command(command)
+    authority_context = delegated_writer_process_environment(
+        database,
+        role="vision_watcher",
+        command=command,
+    )
+    authority_entered = True
+    try:
+        child_environment = authority_context.__enter__()
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=child_environment,
+        )
+        try:
+            bind_manager_child_authority(child_environment, process)
+            if register is not None:
+                register(process, authority_context)
+        except BaseException as bind_error:
+            termination = terminate_subprocess_tree(process)
+            if not termination.ok:
+                raise AuthorityCleanupError(
+                    "watcher authority binding failed and termination is unproven: "
+                    f"{termination.detail}",
+                    process=process,
+                    authority=authority_context,
+                ) from bind_error
+            try:
+                authority_context.__exit__(None, None, None)
+            except BaseException as cleanup_error:
+                raise AuthorityCleanupError(
+                    "watcher authority cleanup failed after binding error",
+                    process=process,
+                    authority=authority_context,
+                ) from cleanup_error
+            authority_entered = False
+            raise
+    except AuthorityCleanupError:
+        raise
+    except BaseException:
+        if authority_entered:
+            try:
+                authority_context.__exit__(None, None, None)
+            except BaseException as cleanup_error:
+                raise AuthorityCleanupError(
+                    "watcher authority cleanup failed after spawn error",
+                    authority=authority_context,
+                ) from cleanup_error
+        raise
+    return process, authority_context
 
 
 def reap_children(
     children: dict[str, Child],
     active: set[str],
+    authorities: dict[str, object] | None = None,
 ) -> dict[str, int]:
     exited: dict[str, int] = {}
     for match_id, (process, stdout, stderr) in list(children.items()):
@@ -389,7 +473,28 @@ def reap_children(
             exited[match_id] = int(exit_code) if exit_code is not None else -1
             stdout.close()
             stderr.close()
+            if authorities is not None:
+                authority = authorities.get(match_id)
+                if authority is not None:
+                    try:
+                        authority.__exit__(None, None, None)
+                    except Exception as error:
+                        raise AuthorityCleanupError(
+                            f"watcher authority cleanup failed: {match_id}"
+                        ) from error
+                    authorities.pop(match_id, None)
             children.pop(match_id)
+    if authorities is not None:
+        for match_id in tuple(set(authorities) - set(children)):
+            authority = authorities[match_id]
+            try:
+                authority.__exit__(None, None, None)
+            except BaseException as error:
+                raise AuthorityCleanupError(
+                    f"watcher authority cleanup failed: {match_id}",
+                    authority=authority,
+                ) from error
+            authorities.pop(match_id, None)
     return exited
 
 
@@ -444,17 +549,41 @@ def startable_matches(
     return result
 
 
-def main() -> int:
+def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
+    paths = service_data_paths(args.database)
+    args.database = paths.database
+    args.output_dir = (
+        args.output_dir.resolve()
+        if args.output_dir is not None
+        else paths.vision_observations
+    )
+    args.evidence_dir = (
+        args.evidence_dir.resolve()
+        if args.evidence_dir is not None
+        else paths.vision_evidence
+    )
+    args.log_dir = (
+        args.log_dir.resolve()
+        if args.log_dir is not None
+        else paths.vision_logs
+    )
+    return args
+
+
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OBSERVATION_DIR)
-    parser.add_argument("--evidence-dir", type=Path, default=DEFAULT_EVIDENCE_DIR)
-    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
+    add_single_database_argument(parser, required=True)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
-    args = parser.parse_args()
+    return resolve_data_paths(parser.parse_args())
+
+
+def _run_cli(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     args.log_dir.mkdir(parents=True, exist_ok=True)
@@ -462,6 +591,7 @@ def main() -> int:
     started_at: dict[str, datetime] = {}
     output_baselines: dict[str, OutputSignature | None] = {}
     retry_states: dict[str, WatcherRetryState] = {}
+    child_authorities: dict[str, object] = {}
     last_retention_at: float | None = None
     retention_details: dict[str, object] = {"status": "pending"}
     try:
@@ -477,7 +607,7 @@ def main() -> int:
                     for match_id, (process, _, _) in children.items()
                     if match_id in active and process.poll() is not None
                 }
-                exited = reap_children(children, active)
+                exited = reap_children(children, active, child_authorities)
                 failed_at = datetime.now(timezone.utc)
                 for match_id, exit_code in exited.items():
                     if match_id not in active:
@@ -508,23 +638,40 @@ def main() -> int:
                     output_baselines[match_id] = _output_signature(
                         args.output_dir / f"{match_id}.jsonl"
                     )
+
+                    def register_watcher(
+                        spawned: subprocess.Popen,
+                        authority: object,
+                    ) -> None:
+                        children[match_id] = (spawned, stdout, stderr)
+                        child_authorities[match_id] = authority
+
                     try:
-                        process = subprocess.Popen(
-                            watcher_command(
-                                args.database,
-                                match_id,
-                                args.output_dir,
-                                args.evidence_dir,
-                            ),
-                            cwd=ROOT,
-                            stdout=stdout,
-                            stderr=stderr,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        command = watcher_command(
+                            args.database,
+                            match_id,
+                            args.output_dir,
+                            args.evidence_dir,
                         )
-                    except Exception:
+                        process, authority_context = spawn_watcher(
+                            args.database,
+                            command,
+                            stdout,
+                            stderr,
+                            register=register_watcher,
+                        )
+                    except AuthorityCleanupError as error:
+                        if error.authority is not None:
+                            child_authorities[match_id] = error.authority
+                        if error.process is not None:
+                            children[match_id] = (error.process, stdout, stderr)
+                        raise
+                    except BaseException as error:
                         stdout.close()
                         stderr.close()
                         output_baselines.pop(match_id, None)
+                        if not isinstance(error, Exception):
+                            raise
                         retry_states[match_id] = watcher_retry_after_failure(
                             retry_states.get(match_id),
                             exit_code=None,
@@ -533,6 +680,7 @@ def main() -> int:
                             failure_reason="watcher_spawn_failed",
                         )
                         continue
+                    child_authorities[match_id] = authority_context
                     children[match_id] = (process, stdout, stderr)
                     started_at[match_id] = datetime.now(timezone.utc)
                 monotonic_now = time.monotonic()
@@ -573,6 +721,8 @@ def main() -> int:
                     error=error,
                     details=details,
                 )
+            except AuthorityCleanupError:
+                raise
             except Exception as error:
                 try:
                     record_supervisor_health(
@@ -587,13 +737,19 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        reap_children(children, set())
+        reap_children(children, set(), child_authorities)
         try:
             record_supervisor_health(
                 args.database, "stopped", active_matches=0
             )
         except Exception:
             pass
+
+
+def main() -> int:
+    args = _parse_args()
+    with database_writer_authority(args.database):
+        return _run_cli(args)
 
 
 if __name__ == "__main__":

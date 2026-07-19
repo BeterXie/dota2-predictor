@@ -1,19 +1,40 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
+from io import StringIO
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import psutil
 
 from event_intelligence.storage import (
     CURRENT_SCHEMA_VERSION as INTELLIGENCE_SCHEMA_VERSION,
 )
 from live_betting.health import read_health, record_health
+from live_betting.monitor import resolve_data_paths as resolve_collector_data_paths
+from live_betting.runtime_schema import (
+    CURRENT_RUNTIME_SCHEMA_VERSION,
+    prepare_runtime_schema,
+)
+from live_betting.service_coordination import (
+    DatabaseFileIdentity,
+    ProcessIdentity,
+    TerminationResult,
+    WriterScanResult,
+    database_service_authority_lock_paths,
+    database_writer_authority,
+    require_unique_database_file,
+    scan_managed_writers,
+)
 from live_betting.storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
 from live_betting.storage import LiveBettingStore
 from scripts.run_dota_shadow_service import (
@@ -23,9 +44,13 @@ from scripts.run_dota_shadow_service import (
     SingleInstanceLock,
     _commands,
     _companion_health,
+    _capture_subprocess_tree_identities,
     _database_health,
     _periodic_database_health,
+    _reconcile_managed_children,
+    _replacement_authority_gate,
     _run_database_audit,
+    _shutdown_children_under_authority,
     main,
     service_once,
 )
@@ -34,7 +59,85 @@ from scripts.run_dota_shadow_service import (
 NOW = datetime(2026, 7, 14, 2, 0, tzinfo=timezone.utc)
 
 
+def _terminate_fake_tree(process: object) -> TerminationResult:
+    process.terminate()  # type: ignore[attr-defined]
+    return TerminationResult(True)
+
+
 class ServiceHealthTests(unittest.TestCase):
+    def test_subtree_capture_rejects_five_millisecond_root_change(self) -> None:
+        class Process:
+            pid = 991_100
+
+            def __init__(self) -> None:
+                self.identity_reads = 0
+
+            def create_time(self) -> float:
+                self.identity_reads += 1
+                return 10.0 if self.identity_reads == 1 else 10.005
+
+            @staticmethod
+            def children(recursive: bool = False) -> list[object]:
+                return []
+
+        process = Process()
+        handle = Mock(pid=process.pid)
+        handle.poll.return_value = None
+
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            _capture_subprocess_tree_identities(
+                handle,
+                process_factory=lambda _pid: process,
+            )
+
+    def test_database_file_identity_rejects_hardlinks_and_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "authority.db"
+            alias = Path(directory) / "authority-alias.db"
+            database.write_bytes(b"first")
+            identity = require_unique_database_file(database)
+            self.assertIsNotNone(identity)
+
+            os.link(database, alias)
+            self.assertTrue(os.path.samefile(database, alias))
+            self.assertNotEqual(
+                database.with_suffix(".service.lock"),
+                alias.with_suffix(".service.lock"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "exactly one hard link"):
+                require_unique_database_file(database)
+            alias.unlink()
+
+            database.unlink()
+            database.write_bytes(b"replacement")
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                require_unique_database_file(
+                    database,
+                    expected_identity=identity,
+                )
+
+    def test_database_file_identity_allows_only_explicit_missing_files(self) -> None:
+        missing = Path("missing-authority.db")
+        self.assertIsNone(
+            require_unique_database_file(missing, allow_missing=True)
+        )
+        with self.assertRaises(FileNotFoundError):
+            require_unique_database_file(missing)
+
+    def test_collector_default_raw_root_follows_selected_database(self) -> None:
+        database = Path("candidate") / "collector.db"
+
+        args = resolve_collector_data_paths(Namespace(
+            database=database,
+            raw_dir=None,
+        ))
+
+        self.assertEqual(args.database, database.resolve())
+        self.assertEqual(
+            args.raw_dir,
+            database.resolve().parent / "live_betting" / "raw-v2",
+        )
+
     def test_database_integrity_failure_is_unhealthy(self) -> None:
         connection = Mock()
         connection.execute.side_effect = [
@@ -63,6 +166,7 @@ class ServiceHealthTests(unittest.TestCase):
             path = Path(directory) / "health.db"
             with LiveBettingStore(path) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
                 record_health(
                     store.connection,
                     "collector",
@@ -87,6 +191,9 @@ class ServiceHealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "service.db"
             report = Path(directory) / "report.json"
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+                prepare_runtime_schema(store.connection)
             with patch.dict(os.environ, {}, clear=True):
                 result = service_once(database, report)
             self.assertTrue(report.exists())
@@ -106,6 +213,9 @@ class ServiceHealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "service.db"
             report = Path(directory) / "report.json"
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+                prepare_runtime_schema(store.connection)
             with (
                 patch.dict(os.environ, {}, clear=True),
                 patch("scripts.run_dota_shadow_service.build_report") as shadow,
@@ -141,6 +251,7 @@ class ServiceHealthTests(unittest.TestCase):
             database = Path(directory) / "service.db"
             with LiveBettingStore(database) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
             _DATABASE_HEALTH_CACHE.clear()
             _DATABASE_AUDIT_THREADS.clear()
             with (
@@ -286,6 +397,7 @@ class ServiceHealthTests(unittest.TestCase):
             stale = datetime.now(timezone.utc) - timedelta(days=1)
             with LiveBettingStore(database) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
                 record_health(
                     store.connection,
                     "mail_worker",
@@ -314,6 +426,7 @@ class ServiceHealthTests(unittest.TestCase):
             now = datetime.now(timezone.utc)
             with LiveBettingStore(database) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
                 for component in ("raybet_worker", "shadow_worker", "mail_worker"):
                     record_health(
                         store.connection,
@@ -348,6 +461,7 @@ class ServiceHealthTests(unittest.TestCase):
             stale = datetime.now(timezone.utc) - timedelta(minutes=5)
             with LiveBettingStore(database) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
                 record_health(
                     store.connection,
                     "shadow_worker",
@@ -373,6 +487,1258 @@ class ServiceHealthTests(unittest.TestCase):
                     with SingleInstanceLock(path):
                         pass
 
+    def test_stale_lock_text_never_blocks_and_probes_do_not_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.lock"
+            path.write_bytes(b"stale-pid-text" * 20)
+
+            with SingleInstanceLock(path):
+                pass
+            first = path.read_bytes()
+            with SingleInstanceLock(path):
+                pass
+            second = path.read_bytes()
+
+            self.assertEqual(len(first), 4096)
+            self.assertEqual(len(second), 4096)
+            first_owner = json.loads(first.rstrip(b" ").decode("ascii"))
+            second_owner = json.loads(second.rstrip(b" ").decode("ascii"))
+            self.assertEqual(first_owner["pid"], os.getpid())
+            self.assertEqual(second_owner["pid"], os.getpid())
+            self.assertNotEqual(first_owner["nonce"], second_owner["nonce"])
+
+    def test_writer_scan_fails_closed_for_opaque_python_process(self) -> None:
+        opaque = Mock(
+            info={
+                "pid": 4210,
+                "name": "python.exe",
+                "cmdline": None,
+                "create_time": None,
+            }
+        )
+
+        result = scan_managed_writers(
+            Path("candidate.db"),
+            process_iter=lambda _: [opaque],
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4210,))
+
+    def test_writer_scan_drops_unverifiable_process_that_exited(self) -> None:
+        opaque = Mock(
+            info={
+                "pid": 4218,
+                "name": "python.exe",
+                "cmdline": None,
+                "create_time": 109.0,
+            }
+        )
+
+        def exited(pid: int) -> object:
+            raise psutil.NoSuchProcess(pid)
+
+        result = scan_managed_writers(
+            Path("candidate.db"),
+            process_iter=lambda _: [opaque],
+            process_factory=exited,
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_writer_scan_keeps_living_unreadable_python_process(self) -> None:
+        opaque = Mock(
+            info={
+                "pid": 4219,
+                "name": "python.exe",
+                "cmdline": None,
+                "create_time": 110.0,
+            }
+        )
+        factory_calls: list[int] = []
+
+        def still_running(pid: int) -> object:
+            factory_calls.append(pid)
+            return opaque
+
+        result = scan_managed_writers(
+            Path("candidate.db"),
+            process_iter=lambda _: [opaque],
+            process_factory=still_running,
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4219,))
+        self.assertEqual(factory_calls, [4219, 4219])
+
+    def test_writer_scan_reclassifies_reused_pid(self) -> None:
+        database = Path("candidate.db")
+        opaque = Mock(
+            info={
+                "pid": 4223,
+                "name": "python.exe",
+                "cmdline": None,
+                "create_time": 111.0,
+            }
+        )
+        replacement = Mock(
+            info={
+                "pid": 4223,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "live_betting.monitor",
+                    "--database",
+                    str(database.resolve()),
+                ],
+                "create_time": 112.0,
+            }
+        )
+
+        result = scan_managed_writers(
+            database,
+            process_iter=lambda _: [opaque],
+            process_factory=lambda _: replacement,
+        )
+
+        self.assertEqual(result.conflicts, (ProcessIdentity(4223, 112.0),))
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_writer_scan_recovers_pid_name_and_classifies_access_denied(self) -> None:
+        class ProtectedProcess:
+            def __init__(self, pid: int, name: str) -> None:
+                self.pid = pid
+                self._name = name
+
+            @property
+            def info(self) -> dict[str, object]:
+                raise psutil.AccessDenied(self.pid)
+
+            def name(self) -> str:
+                return self._name
+
+            def exe(self) -> str:
+                return self._name
+
+            def cmdline(self) -> list[str]:
+                raise psutil.AccessDenied(self.pid)
+
+        protected_python = ProtectedProcess(4211, "python.exe")
+        protected_system = ProtectedProcess(4212, "System")
+
+        result = scan_managed_writers(
+            Path("candidate.db"),
+            process_iter=lambda _: [protected_python, protected_system],
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4211,))
+
+    def test_writer_scan_keeps_opaque_user_process_but_skips_protected_system(
+        self,
+    ) -> None:
+        class OpaqueProcess:
+            def __init__(self, pid: int, parent_pid: int) -> None:
+                self.pid = pid
+                self.parent_pid = parent_pid
+
+            @property
+            def info(self) -> dict[str, object]:
+                raise psutil.AccessDenied(self.pid)
+
+            def name(self) -> str:
+                raise psutil.AccessDenied(self.pid)
+
+            def exe(self) -> str:
+                raise psutil.AccessDenied(self.pid)
+
+            def cmdline(self) -> list[str]:
+                raise psutil.AccessDenied(self.pid)
+
+            def ppid(self) -> int:
+                return self.parent_pid
+
+        opaque_user = OpaqueProcess(4214, 500)
+        protected_system = OpaqueProcess(4215, 4)
+
+        with patch("live_betting.service_coordination.os.name", "nt"):
+            result = scan_managed_writers(
+                Path("candidate.db"),
+                process_iter=lambda _: [opaque_user, protected_system],
+            )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4214,))
+
+    def test_writer_scan_rejects_relative_database_without_guessing_cwd(self) -> None:
+        relative = Mock(
+            info={
+                "pid": 4213,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "live_betting.monitor",
+                    "--database",
+                    "relative.db",
+                ],
+                "create_time": 104.0,
+            }
+        )
+
+        result = scan_managed_writers(
+            Path("candidate.db"),
+            process_iter=lambda _: [relative],
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4213,))
+
+    def test_writer_scan_rejects_duplicate_database_arguments(self) -> None:
+        database = Path("candidate.db")
+        duplicate = Mock(
+            info={
+                "pid": 4217,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "live_betting.monitor",
+                    "--database",
+                    str((Path("other.db")).resolve()),
+                    "--database",
+                    str(database.resolve()),
+                ],
+                "create_time": 108.0,
+            }
+        )
+
+        result = scan_managed_writers(
+            database,
+            process_iter=lambda _: [duplicate],
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4217,))
+
+    def test_writer_scan_rejects_hardlinked_expected_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            alias = Path(directory) / "candidate-alias.db"
+            database.write_bytes(b"sqlite")
+            os.link(database, alias)
+            iterator_called = False
+
+            def processes(_: object) -> list[object]:
+                nonlocal iterator_called
+                iterator_called = True
+                return []
+
+            with self.assertRaisesRegex(RuntimeError, "exactly one hard link"):
+                scan_managed_writers(database, process_iter=processes)
+            self.assertFalse(iterator_called)
+
+    def test_writer_scan_rejects_database_appearing_during_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "appeared.db"
+
+            def processes(_: object) -> list[object]:
+                database.write_bytes(b"sqlite")
+                return []
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "identity changed during writer scan",
+            ):
+                scan_managed_writers(database, process_iter=processes)
+
+    def test_writer_scan_rejects_known_writer_without_explicit_database(self) -> None:
+        missing_database = Mock(
+            info={
+                "pid": 4216,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "scripts/run_dota_shadow_service.py",
+                    "--once",
+                ],
+                "create_time": 105.0,
+            }
+        )
+
+        result = scan_managed_writers(
+            Path("candidate.db"),
+            process_iter=lambda _: [missing_database],
+        )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4216,))
+
+    def test_external_writer_scan_matches_only_the_exact_database(self) -> None:
+        database = Path("candidate") / "dota2.db"
+        exact = Mock(
+            info={
+                "pid": 4201,
+                "name": "python.exe",
+                "create_time": 101.0,
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "live_betting.monitor",
+                    "--database",
+                    str(database.resolve()),
+                ],
+            }
+        )
+        other_database = Mock(
+            info={
+                "pid": 4202,
+                "name": "python.exe",
+                "create_time": 102.0,
+                "cmdline": [
+                    "python",
+                    "scripts/run_comeback_shadow.py",
+                    "--database",
+                    str((Path("other") / "dota2.db").resolve()),
+                ],
+            }
+        )
+        unrelated = Mock(
+            info={
+                "pid": 4203,
+                "name": "python.exe",
+                "create_time": 103.0,
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "tools.readonly",
+                    "--database",
+                    str(database.resolve()),
+                ],
+            }
+        )
+        result = scan_managed_writers(
+            database,
+            process_iter=lambda _: [exact, other_database, unrelated],
+        )
+        self.assertEqual(result.conflicts, (ProcessIdentity(4201, 101.0),))
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_writer_scan_recognizes_wrappers_but_ignores_read_only_web(self) -> None:
+        database = Path("candidate") / "dota2.db"
+        processes = [
+            Mock(info={
+                "pid": 4204,
+                "name": "python.exe",
+                "create_time": 106.0,
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "scripts.run_comeback_shadow",
+                    "--database",
+                    str(database.resolve()),
+                ],
+            }),
+            Mock(info={
+                "pid": 4205,
+                "name": "python.exe",
+                "create_time": 107.0,
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "web.main",
+                    "--database",
+                    str(database.resolve()),
+                ],
+            }),
+        ]
+
+        result = scan_managed_writers(
+            database,
+            process_iter=lambda _: processes,
+        )
+
+        self.assertEqual(result.conflicts, (ProcessIdentity(4204, 106.0),))
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_supervisor_refuses_orphaned_writer_before_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(root / "candidate.db"),
+                "--lock",
+                str(root / "candidate.service.lock"),
+                "--once",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers",
+                    return_value=WriterScanResult(
+                        (ProcessIdentity(4201, 101.0),),
+                        (),
+                    ),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database"
+                ) as verify,
+                patch(
+                    "scripts.run_dota_shadow_service.subprocess.Popen"
+                ) as spawn,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "managed writers already target this database: 4201",
+                ):
+                    main()
+
+            verify.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_supervisor_rejects_database_appearing_before_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "appeared.db"
+            identity = DatabaseFileIdentity(
+                database.resolve(),
+                1,
+                2,
+            )
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--once",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch(
+                    "scripts.run_dota_shadow_service.require_unique_database_file",
+                    side_effect=[None, identity],
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers"
+                ) as scan,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "identity changed before service lock",
+                ):
+                    main()
+
+            scan.assert_not_called()
+
+    def test_custom_lock_cannot_replace_standard_database_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "candidate.db"
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--lock",
+                str(root / "custom.lock"),
+                "--once",
+            ]
+            with (
+                SingleInstanceLock(database.with_suffix(".service.lock")),
+                patch.object(sys, "argv", argv),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers"
+                ) as scan,
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database"
+                ) as verify,
+                patch(
+                    "scripts.run_dota_shadow_service.subprocess.Popen"
+                ) as spawn,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    main()
+
+            scan.assert_not_called()
+            verify.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_supervisor_proves_child_shutdown_before_releasing_standard_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "service.db"
+            database.touch()
+            standard_lock = database.with_suffix(".service.lock")
+            custom_lock = root / "custom.lock"
+            lock_was_held: list[bool] = []
+
+            class Child:
+                def poll(self) -> None:
+                    return None
+
+            def terminate_tree(_: object) -> TerminationResult:
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    with SingleInstanceLock(standard_lock):
+                        pass
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    with SingleInstanceLock(custom_lock):
+                        pass
+                lock_was_held.append(True)
+                return TerminationResult(True)
+
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--lock",
+                str(custom_lock),
+                "--once",
+                "--start-companion",
+            ]
+            preparation = Mock(
+                backup=None,
+                live_schema_version=LIVE_SCHEMA_VERSION,
+                intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
+            )
+            output = StringIO()
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "stdout", output),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers",
+                    return_value=WriterScanResult((), ()),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database",
+                    return_value=preparation,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.subprocess.Popen",
+                    return_value=Child(),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    return_value=ProcessIdentity(1, 1.0),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.service_once",
+                    return_value={"shadow": {"orders": {"signals": 0}}},
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.terminate_subprocess_tree",
+                    side_effect=terminate_tree,
+                ),
+            ):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(lock_was_held, [True])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(
+                payload["schema_versions"],
+                {
+                    "live": LIVE_SCHEMA_VERSION,
+                    "intelligence": INTELLIGENCE_SCHEMA_VERSION,
+                    "runtime": CURRENT_RUNTIME_SCHEMA_VERSION,
+                },
+            )
+            with SingleInstanceLock(standard_lock), SingleInstanceLock(custom_lock):
+                pass
+
+    def test_quarantined_replacement_never_overwrites_exited_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "replacement.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            exited = Mock()
+            exited.poll.return_value = 1
+            children = {"collector": exited}
+            spawn = Mock()
+
+            result = _reconcile_managed_children(
+                children,
+                {"collector": ["python", "collector.py"]},
+                database,
+                identity,
+                authority_gate=lambda *_: TerminationResult(
+                    False,
+                    "orphan_writer_conflict:9001",
+                ),
+                popen_factory=spawn,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIs(children["collector"], exited)
+            spawn.assert_not_called()
+
+    def test_each_supervisor_child_gets_one_exact_live_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "exact-children.db"
+            database.touch()
+            live_root = database.parent / "live_betting"
+            commands = _commands(Namespace(
+                database=database,
+                start_collector=True,
+                start_companion=True,
+                start_shadow=True,
+                start_vision=True,
+                start_mail=True,
+                start_strict_ingest=True,
+                start_postmatch=True,
+                start_draft_publisher=True,
+                vision_jsonl=live_root / "live_observations",
+            ))
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            captured: dict[str, tuple[int, dict[str, str]]] = {}
+            fake_processes: dict[int, object] = {}
+            next_pid = 95_000
+
+            class Child:
+                def __init__(self, pid: int) -> None:
+                    self.pid = pid
+
+                @staticmethod
+                def poll() -> None:
+                    return None
+
+            def spawn(
+                command: list[str],
+                **kwargs: object,
+            ) -> Child:
+                nonlocal next_pid
+                next_pid += 1
+                name = next(
+                    key for key, expected in commands.items() if expected == command
+                )
+                captured[name] = (
+                    next_pid,
+                    dict(kwargs["env"]),  # type: ignore[arg-type]
+                )
+                fake_processes[next_pid] = SimpleNamespace(
+                    pid=next_pid,
+                    create_time=lambda pid=next_pid: float(pid),
+                    cmdline=lambda value=list(command): list(value),
+                )
+                return Child(next_pid)
+
+            marker_paths: list[Path] = []
+            root = psutil.Process(os.getpid())
+
+            def spawned_process(pid: int) -> object:
+                if pid == root.pid:
+                    return root
+                return fake_processes[pid]
+
+            with ExitStack() as authority:
+                for lock_path in database_service_authority_lock_paths(database):
+                    authority.enter_context(SingleInstanceLock(lock_path))
+                children: dict[str, object] = {}
+                result = _reconcile_managed_children(
+                    children,
+                    commands,
+                    database,
+                    identity,
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                    process_factory=spawned_process,
+                )
+                self.assertTrue(result.ok)
+                self.assertEqual(set(captured), set(commands))
+
+                marker_values: set[str] = set()
+                for name, command in commands.items():
+                    child_pid, environment = captured[name]
+                    marker = environment["DOTA2_MANAGER_CHILD_AUTHORITY_V1"]
+                    payload = json.loads(marker)
+                    marker_values.add(marker)
+                    marker_path = Path(payload["marker_path"])
+                    marker_paths.append(marker_path)
+                    self.assertEqual(payload["command"], command)
+                    self.assertEqual(
+                        payload["role"],
+                        "vision_supervisor" if name == "vision" else name,
+                    )
+                    self.assertEqual(
+                        payload["delegate_roles"],
+                        ["vision_watcher"] if name == "vision" else [],
+                    )
+                    bound_payload = json.loads(
+                        marker_path.read_text(encoding="ascii")
+                    )
+                    self.assertEqual(
+                        bound_payload["child_identity"],
+                        {"pid": child_pid, "created_at": float(child_pid)},
+                    )
+
+                    child = fake_processes[child_pid]
+
+                    def process_factory(
+                        pid: int,
+                        *,
+                        current: object = child,
+                    ) -> object:
+                        if pid == root.pid:
+                            return root
+                        if pid == current.pid:
+                            return current
+                        raise KeyError(pid)
+
+                    with database_writer_authority(
+                        database,
+                        environ={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": marker},
+                        process_factory=process_factory,
+                        parent_pid=root.pid,
+                        current_pid=child_pid,
+                    ):
+                        pass
+
+                self.assertEqual(len(marker_values), len(commands))
+                shutdown = _shutdown_children_under_authority(
+                    children,
+                    database,
+                    identity,
+                    terminator=lambda _: TerminationResult(True),
+                    writer_scanner=lambda _, **__: WriterScanResult((), ()),
+                    retry_hook=lambda *_: False,
+                    sleeper=lambda _: None,
+                )
+                self.assertTrue(shutdown.ok, shutdown.detail)
+
+            self.assertTrue(all(not path.exists() for path in marker_paths))
+
+    def test_supervisor_marker_context_covers_spawn_restart_and_shutdown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "marker-lifecycle.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            events: list[str] = []
+
+            class Authority:
+                def __init__(self, name: str) -> None:
+                    self.name = name
+
+                def __enter__(self) -> dict[str, str]:
+                    events.append(f"enter:{self.name}")
+                    return {"DOTA2_MANAGER_CHILD_AUTHORITY_V1": self.name}
+
+                def __exit__(self, *_: object) -> None:
+                    events.append(f"exit:{self.name}")
+
+            first_process = Mock()
+            first_process.poll.return_value = None
+            second_process = Mock()
+            second_process.poll.return_value = None
+            spawned = iter((first_process, second_process))
+
+            def spawn(*_: object, **__: object) -> object:
+                process = next(spawned)
+                events.append(
+                    "spawn:first" if process is first_process else "spawn:second"
+                )
+                return process
+
+            def bind(_: object, process: object, **__: object) -> ProcessIdentity:
+                events.append(
+                    "bind:first" if process is first_process else "bind:second"
+                )
+                return ProcessIdentity(1 if process is first_process else 2, 1.0)
+
+            children: dict[str, object] = {}
+            termination_attempts = 0
+
+            def terminate(_: object) -> TerminationResult:
+                nonlocal termination_attempts
+                termination_attempts += 1
+                return TerminationResult(
+                    termination_attempts > 1,
+                    "first exit proof failed",
+                )
+
+            with (
+                patch(
+                    "scripts.run_dota_shadow_service.manager_child_authority",
+                    side_effect=(Authority("first"), Authority("second")),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    side_effect=bind,
+                ),
+            ):
+                first = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                )
+                self.assertTrue(first.ok)
+                first_process.poll.return_value = 1
+                second = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                )
+                self.assertTrue(second.ok)
+
+            shutdown = _shutdown_children_under_authority(
+                children,
+                database,
+                identity,
+                terminator=terminate,
+                writer_scanner=lambda _, **__: WriterScanResult((), ()),
+                retry_hook=lambda *_: True,
+                sleeper=lambda _: None,
+            )
+            self.assertTrue(shutdown.ok, shutdown.detail)
+            self.assertEqual(termination_attempts, 2)
+            self.assertEqual(
+                events,
+                [
+                    "enter:first",
+                    "spawn:first",
+                    "bind:first",
+                    "exit:first",
+                    "enter:second",
+                    "spawn:second",
+                    "bind:second",
+                    "exit:second",
+                ],
+            )
+
+    def test_supervisor_bind_base_exceptions_cleanup_before_propagation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "bind-interrupt.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            for error in (KeyboardInterrupt(), SystemExit(9)):
+                with self.subTest(error=type(error).__name__):
+                    exited: list[bool] = []
+
+                    class Authority:
+                        def __enter__(self) -> dict[str, str]:
+                            return {"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+
+                        def __exit__(self, *_: object) -> None:
+                            exited.append(True)
+
+                    process = Mock(pid=7711)
+                    process.poll.return_value = None
+                    children: dict[str, object] = {}
+                    with (
+                        patch(
+                            "scripts.run_dota_shadow_service.manager_child_authority",
+                            return_value=Authority(),
+                        ),
+                        patch(
+                            "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                            side_effect=error,
+                        ),
+                        patch(
+                            "scripts.run_dota_shadow_service.terminate_subprocess_tree",
+                            return_value=TerminationResult(True),
+                        ) as terminate,
+                    ):
+                        with self.assertRaises(type(error)):
+                            _reconcile_managed_children(
+                                children,
+                                {"collector": ["python", "collector.py"]},
+                                database,
+                                identity,
+                                authority_gate=lambda *_: TerminationResult(True),
+                                popen_factory=lambda *_args, **_kwargs: process,
+                            )
+
+                    terminate.assert_called_once()
+                    self.assertEqual(exited, [True])
+                    self.assertEqual(children, {})
+
+    def test_supervisor_interrupt_keeps_unproven_child_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "bind-quarantine.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            class Authority:
+                def __enter__(self) -> dict[str, str]:
+                    return {"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+
+                def __exit__(self, *_: object) -> None:
+                    raise AssertionError(
+                        "unproven child authority must remain published"
+                    )
+
+            process = Mock(pid=7712)
+            process.poll.return_value = None
+            children: dict[str, object] = {}
+            with (
+                patch(
+                    "scripts.run_dota_shadow_service.manager_child_authority",
+                    return_value=Authority(),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    side_effect=KeyboardInterrupt(),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.terminate_subprocess_tree",
+                    return_value=TerminationResult(False, "still alive"),
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    _reconcile_managed_children(
+                        children,
+                        {"collector": ["python", "collector.py"]},
+                        database,
+                        identity,
+                        authority_gate=lambda *_: TerminationResult(True),
+                        popen_factory=lambda *_args, **_kwargs: process,
+                    )
+
+            self.assertIn("collector", children)
+
+    def test_clean_scan_cannot_release_unproven_child_termination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "unproven-exit.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            standard_lock = database.with_suffix(".service.lock")
+            lock_checks: list[bool] = []
+
+            def stop_quarantine(_: int, __: str) -> bool:
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    with SingleInstanceLock(standard_lock):
+                        pass
+                lock_checks.append(True)
+                return False
+
+            with SingleInstanceLock(standard_lock):
+                result = _shutdown_children_under_authority(
+                    {"collector": object()},
+                    database,
+                    identity,
+                    terminator=lambda _: TerminationResult(
+                        False,
+                        "identity unverifiable",
+                    ),
+                    writer_scanner=lambda _, **__: WriterScanResult((), ()),
+                    retry_hook=stop_quarantine,
+                    sleeper=lambda _: None,
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("termination_unproven:collector", result.detail)
+            self.assertEqual(lock_checks, [True])
+
+    def test_spawn_failure_closes_its_unpublished_child_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "spawn-failure.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            authority = Mock()
+            authority.__enter__ = Mock(
+                return_value={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+            )
+            authority.__exit__ = Mock(return_value=None)
+            children: dict[str, object] = {}
+
+            with patch(
+                "scripts.run_dota_shadow_service.manager_child_authority",
+                return_value=authority,
+            ):
+                with self.assertRaisesRegex(OSError, "spawn failed"):
+                    _reconcile_managed_children(
+                        children,
+                        {"collector": ["python", "collector.py"]},
+                        database,
+                        identity,
+                        authority_gate=lambda *_: TerminationResult(True),
+                        popen_factory=Mock(side_effect=OSError("spawn failed")),
+                    )
+
+            authority.__exit__.assert_called_once_with(None, None, None)
+            self.assertEqual(children, {})
+
+    def test_marker_cleanup_failure_stays_quarantined_while_lock_is_held(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "cleanup-quarantine.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            authority = Mock()
+            authority.__enter__ = Mock(
+                return_value={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+            )
+            authority.__exit__ = Mock(side_effect=RuntimeError("cannot unlink"))
+            children: dict[str, object] = {}
+            attempts: list[int] = []
+            standard_lock = database.with_suffix(".service.lock")
+
+            def retry(attempt: int, _: str) -> bool:
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    with SingleInstanceLock(standard_lock):
+                        pass
+                attempts.append(attempt)
+                return attempt < 2
+
+            with (
+                SingleInstanceLock(standard_lock),
+                patch(
+                    "scripts.run_dota_shadow_service.manager_child_authority",
+                    return_value=authority,
+                ),
+            ):
+                reconciliation = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=Mock(side_effect=OSError("spawn failed")),
+                )
+                self.assertFalse(reconciliation.ok)
+                self.assertIn("child_authority_cleanup_failed", reconciliation.detail)
+                quarantine = _shutdown_children_under_authority(
+                    children,
+                    database,
+                    identity,
+                    terminator=lambda _: TerminationResult(True),
+                    writer_scanner=lambda _, **__: WriterScanResult((), ()),
+                    retry_hook=retry,
+                    sleeper=lambda _: None,
+                )
+
+            self.assertFalse(quarantine.ok)
+            self.assertIn("authority cleanup is quarantined", quarantine.detail)
+            self.assertEqual(attempts, [1, 2])
+            authority.__exit__.assert_called_once_with(None, None, None)
+
+    def test_replacement_gate_allows_only_stable_healthy_subtrees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "healthy-tree.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            class Process:
+                def __init__(
+                    self,
+                    pid: int,
+                    created_at: float,
+                    children: list["Process"] | None = None,
+                ) -> None:
+                    self.pid = pid
+                    self.created_at = created_at
+                    self._children = children or []
+
+                def create_time(self) -> float:
+                    return self.created_at
+
+                def children(self, recursive: bool = False) -> list["Process"]:
+                    return list(self._children)
+
+                def is_running(self) -> bool:
+                    return True
+
+                def status(self) -> str:
+                    return "running"
+
+            descendant = Process(9102, 12.0)
+            root_process = Process(9101, 11.0, [descendant])
+            handle = Mock(pid=9101)
+            handle.poll.return_value = None
+            observed_allowed: list[tuple[ProcessIdentity, ...]] = []
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                observed_allowed.append(tuple(allowed_identities))
+                return WriterScanResult((ProcessIdentity(9199, 19.0),), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: root_process,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "orphan_writer_conflict:9199")
+            self.assertEqual(
+                observed_allowed,
+                [(ProcessIdentity(9101, 11.0), ProcessIdentity(9102, 12.0))],
+            )
+
+    def test_replacement_gate_allows_read_only_web_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "web-peer.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            web_peer = Mock(info={
+                "pid": 9150,
+                "name": "python.exe",
+                "create_time": 15.0,
+                "cmdline": [
+                    "python",
+                    "-m",
+                    "web.main",
+                    "--database",
+                    str(database.resolve()),
+                ],
+            })
+
+            result = _replacement_authority_gate(
+                {},
+                database,
+                identity,
+                writer_scanner=lambda path, **kwargs: scan_managed_writers(
+                    path,
+                    allowed_identities=kwargs["allowed_identities"],
+                    process_iter=lambda _: [web_peer],
+                ),
+            )
+
+            self.assertTrue(result.ok)
+
+    def test_shutdown_quarantine_retries_while_standard_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "shutdown-retry.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            standard = database.with_suffix(".service.lock")
+            termination_attempts = 0
+            scan_attempts = 0
+            retry_lock_checks: list[bool] = []
+
+            def terminate(_: object) -> TerminationResult:
+                nonlocal termination_attempts
+                termination_attempts += 1
+                return TerminationResult(termination_attempts > 1, "first failure")
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                nonlocal scan_attempts
+                self.assertEqual(allowed_identities, ())
+                scan_attempts += 1
+                return (
+                    WriterScanResult((ProcessIdentity(9201, 20.0),), ())
+                    if scan_attempts == 1
+                    else WriterScanResult((), ())
+                )
+
+            def retry(_: int, __: str) -> bool:
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    with SingleInstanceLock(standard):
+                        pass
+                retry_lock_checks.append(True)
+                return True
+
+            with SingleInstanceLock(standard):
+                result = _shutdown_children_under_authority(
+                    {"collector": object()},
+                    database,
+                    identity,
+                    terminator=terminate,
+                    writer_scanner=scan,
+                    retry_hook=retry,
+                    sleeper=lambda _: None,
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(termination_attempts, 2)
+            self.assertEqual(retry_lock_checks, [True])
+            with SingleInstanceLock(standard):
+                pass
+
+    def test_shutdown_quarantine_has_bounded_persistent_failure_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "persistent-quarantine.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            attempts: list[int] = []
+
+            result = _shutdown_children_under_authority(
+                {"collector": object()},
+                database,
+                identity,
+                terminator=lambda _: TerminationResult(False, "cannot terminate"),
+                writer_scanner=lambda _, **__: WriterScanResult(
+                    (ProcessIdentity(9301, 30.0),),
+                    (),
+                ),
+                retry_hook=lambda attempt, _: (
+                    attempts.append(attempt) is None and attempt < 2
+                ),
+                sleeper=lambda _: None,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("quarantined:2", str(result.detail))
+            self.assertEqual(attempts, [1, 2])
+
+    def test_runtime_hardlink_quarantine_stops_children_and_blocks_release(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime-hardlink.db"
+            alias = Path(directory) / "runtime-hardlink-alias.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            os.link(database, alias)
+            terminated: list[bool] = []
+
+            gate = _replacement_authority_gate(
+                {},
+                database,
+                identity,
+                writer_scanner=lambda _, **__: WriterScanResult((), ()),
+            )
+            self.assertFalse(gate.ok)
+            self.assertIn("replacement_authority_unverifiable", str(gate.detail))
+
+            result = _shutdown_children_under_authority(
+                {"collector": object()},
+                database,
+                identity,
+                terminator=lambda _: (
+                    terminated.append(True) or TerminationResult(True)
+                ),
+                writer_scanner=lambda _, **__: WriterScanResult((), ()),
+                retry_hook=lambda *_: False,
+                sleeper=lambda _: None,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("database_authority_unverifiable", str(result.detail))
+            self.assertEqual(terminated, [True])
+
     def test_supervisor_commands_include_vision_strict_ingest_and_postmatch(self) -> None:
         database = Path("service.db")
         commands = _commands(Namespace(
@@ -389,14 +1755,30 @@ class ServiceHealthTests(unittest.TestCase):
         self.assertEqual(
             set(commands), {"companion", "vision", "strict_ingest", "postmatch"}
         )
-        self.assertIn("scripts/supervise_raybet_streams.py", commands["vision"])
-        self.assertIn("scripts/run_strict_event_ingest.py", commands["strict_ingest"])
-        self.assertIn("scripts/run_postmatch_labeler.py", commands["postmatch"])
+        self.assertIn(
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "supervise_raybet_streams.py"
+            ),
+            commands["vision"],
+        )
+        project_root = Path(__file__).resolve().parents[1]
+        self.assertIn(
+            str(project_root / "scripts" / "run_strict_event_ingest.py"),
+            commands["strict_ingest"],
+        )
+        self.assertIn(
+            str(project_root / "scripts" / "run_postmatch_labeler.py"),
+            commands["postmatch"],
+        )
         self.assertIn("--all", commands["postmatch"])
 
     def test_all_managed_workers_skip_redundant_schema_preparation(self) -> None:
+        database = Path("service.db")
+        live_root = database.resolve().parent / "live_betting"
         commands = _commands(Namespace(
-            database=Path("service.db"),
+            database=database,
             start_collector=True,
             start_companion=True,
             start_shadow=True,
@@ -404,7 +1786,7 @@ class ServiceHealthTests(unittest.TestCase):
             start_mail=True,
             start_strict_ingest=True,
             start_postmatch=True,
-            vision_jsonl=Path("vision.jsonl"),
+            vision_jsonl=live_root / "live_observations",
         ))
 
         self.assertEqual(
@@ -422,6 +1804,43 @@ class ServiceHealthTests(unittest.TestCase):
         )
         for command in commands.values():
             self.assertIn("--schema-prepared", command)
+            self.assertIn(str(database.resolve()), command)
+        self.assertIn(str(live_root / "raw-v2"), commands["collector"])
+        self.assertIn(str(live_root / "live_observations"), commands["shadow"])
+        self.assertIn(str(live_root / "live_observations"), commands["vision"])
+        self.assertIn(str(live_root / "live_evidence"), commands["vision"])
+        self.assertIn(str(live_root / "watcher_logs"), commands["vision"])
+        self.assertIn(
+            str(database.resolve().parent / "raw-sources"),
+            commands["strict_ingest"],
+        )
+        self.assertIn(
+            str(
+                database.resolve().parent
+                / "reports"
+                / "strict_event_coverage_latest.json"
+            ),
+            commands["strict_ingest"],
+        )
+        self.assertIn(
+            str(database.resolve().parent / "raw-sources"),
+            commands["postmatch"],
+        )
+
+    def test_supervisor_rejects_cross_database_vision_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must equal <database-dir>"):
+            _commands(Namespace(
+                database=Path("candidate") / "dota2.db",
+                start_collector=False,
+                start_companion=False,
+                start_shadow=True,
+                start_vision=False,
+                start_mail=False,
+                start_strict_ingest=False,
+                start_postmatch=False,
+                start_draft_publisher=False,
+                vision_jsonl=Path("project-data") / "live_observations",
+            ))
 
     def test_supervisor_aggregates_new_worker_and_companion_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -429,6 +1848,7 @@ class ServiceHealthTests(unittest.TestCase):
             now = datetime.now(timezone.utc)
             with LiveBettingStore(database) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
                 for component in (
                     "vision_worker",
                     "strict_ingest_worker",
@@ -480,6 +1900,7 @@ class ServiceHealthTests(unittest.TestCase):
             root = Path(directory)
             events: list[str] = []
             backup_dir = root / "external-volume-backups"
+            (root / "service.db").touch()
 
             class Child:
                 def poll(self) -> None:
@@ -494,6 +1915,7 @@ class ServiceHealthTests(unittest.TestCase):
                     backup=None,
                     live_schema_version=LIVE_SCHEMA_VERSION,
                     intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                    runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
                 )
 
             def spawn(*args: object, **kwargs: object) -> Child:
@@ -531,8 +1953,16 @@ class ServiceHealthTests(unittest.TestCase):
                     side_effect=spawn,
                 ),
                 patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    return_value=ProcessIdentity(1, 1.0),
+                ),
+                patch(
                     "scripts.run_dota_shadow_service.service_once",
                     side_effect=run_once,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.terminate_subprocess_tree",
+                    side_effect=_terminate_fake_tree,
                 ),
             ):
                 self.assertEqual(main(), 0)
@@ -556,6 +1986,7 @@ class ServiceHealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             events: list[str] = []
+            (root / "service.db").touch()
 
             class Child:
                 def poll(self) -> None:
@@ -570,6 +2001,7 @@ class ServiceHealthTests(unittest.TestCase):
                     backup=None,
                     live_schema_version=LIVE_SCHEMA_VERSION,
                     intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                    runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
                 )
 
             def spawn(*args: object, **kwargs: object) -> Child:
@@ -599,20 +2031,33 @@ class ServiceHealthTests(unittest.TestCase):
                     side_effect=spawn,
                 ),
                 patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    return_value=ProcessIdentity(1, 1.0),
+                ),
+                patch(
                     "scripts.run_dota_shadow_service.service_once",
                     return_value={"shadow": {"orders": {"signals": 0}}},
                 ) as service,
+                patch(
+                    "scripts.run_dota_shadow_service.terminate_subprocess_tree",
+                    side_effect=_terminate_fake_tree,
+                ),
             ):
                 self.assertEqual(main(), 0)
 
             migrate.assert_not_called()
             self.assertLess(events.index("verify"), events.index("spawn"))
+            self.assertEqual(
+                service.call_args.args[1],
+                root / "live_betting" / "service_report.json",
+            )
             self.assertFalse(service.call_args.kwargs["health_only"])
 
     def test_recurring_supervisor_keeps_health_and_reporting_separate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             reporter = Mock()
+            (root / "service.db").touch()
             argv = [
                 "run_dota_shadow_service.py",
                 "--database",
@@ -626,6 +2071,7 @@ class ServiceHealthTests(unittest.TestCase):
                 backup=None,
                 live_schema_version=LIVE_SCHEMA_VERSION,
                 intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
             )
             with (
                 patch.object(sys, "argv", argv),
@@ -655,12 +2101,14 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertIsNone(service.call_args.args[1])
             self.assertTrue(service.call_args.kwargs["health_only"])
             reporter.start_if_idle.assert_called_once_with()
+            reporter.wait.assert_called_once_with()
 
     def test_expensive_database_audit_is_cached_between_service_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "service.db"
             with LiveBettingStore(database) as store:
                 store.init_schema()
+                prepare_runtime_schema(store.connection)
                 _DATABASE_HEALTH_CACHE.clear()
                 with patch(
                     "scripts.run_dota_shadow_service._database_health",

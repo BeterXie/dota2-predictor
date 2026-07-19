@@ -63,6 +63,10 @@ from .draft_evidence import (
     prospective_outcome_authority,
 )
 from .health import record_health
+from .service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 from .storage import LiveBettingStore
 from .strict_eligibility import StrictLiveMapMapping, query_strict_live_eligibility
 from .vision import VisionObservation
@@ -2002,7 +2006,7 @@ def run_publisher(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--rebuild-artifacts", action="store_true")
@@ -2010,17 +2014,19 @@ def main() -> int:
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval <= 0.0:
         parser.error("--interval must be positive")
-    if args.schema_prepared:
-        verify_prepared_database(args.database)
-    else:
-        with LiveBettingStore(args.database) as store:
-            store.init_schema()
-    return run_publisher(
-        args.database.resolve(),
-        once=args.once,
-        interval_seconds=float(args.interval),
-        rebuild_artifacts=bool(args.rebuild_artifacts),
-    )
+    database = args.database.resolve()
+    with database_writer_authority(database):
+        if args.schema_prepared:
+            verify_prepared_database(database)
+        else:
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+        return run_publisher(
+            database,
+            once=args.once,
+            interval_seconds=float(args.interval),
+            rebuild_artifacts=bool(args.rebuild_artifacts),
+        )
 
 
 if __name__ == "__main__":

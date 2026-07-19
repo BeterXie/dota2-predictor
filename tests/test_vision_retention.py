@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import scripts.cleanup_vision_evidence as cleanup_script
 
 from live_betting.storage import LiveBettingStore
 from live_betting.vision import VisionObservation
@@ -586,3 +588,39 @@ def test_cleanup_cli_is_dry_run_and_reports_fail_closed_error(
         "status": "error",
     }
     assert stale.exists()
+
+
+def test_cleanup_cli_default_evidence_follows_selected_database(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "candidate" / "dota2.db"
+    database.parent.mkdir()
+    database.touch()
+    observed: list[Path] = []
+
+    @contextmanager
+    def authority(_: Path):
+        yield
+
+    class Result:
+        unsafe_paths = 0
+        delete_errors = 0
+
+        @staticmethod
+        def as_dict() -> dict[str, str]:
+            return {"status": "ok"}
+
+    def prune(_: Path, evidence_dir: Path, **__: object) -> Result:
+        observed.append(evidence_dir)
+        return Result()
+
+    monkeypatch.setattr(cleanup_script, "database_writer_authority", authority)
+    monkeypatch.setattr(cleanup_script, "prune_vision_evidence", prune)
+
+    assert cleanup_script.main(["--database", str(database)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "ok"}
+    assert observed == [
+        database.resolve().parent / "live_betting" / "live_evidence"
+    ]

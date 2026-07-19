@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shared.sqlite import connect
+
 from .evaluation import brier_score, log_loss, shadow_summary
 from .draft_authority import (
     authority_from_row,
@@ -22,6 +24,7 @@ from .draft_authority import (
 )
 from .health import read_health
 from .research import research_summary
+from .service_coordination import add_single_database_argument
 from .settlement import persisted_settlement_authority_reason
 from .strict_read_gate import StrictReadGate, strict_read_gate, table_has_columns
 from .vision_frame_registry import verify_registered_vision_frame
@@ -1763,15 +1766,17 @@ def _drawdown(rows: Sequence[Mapping[str, object]]) -> float:
     return worst
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, required=True)
+    add_single_database_argument(parser, required=True)
     parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-    connection = sqlite3.connect(args.database, timeout=5.0)
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=5000")
+    args = parser.parse_args(argv)
+    connection = connect(args.database, read_only=True)
     try:
+        connection.execute("PRAGMA query_only=ON")
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            raise RuntimeError("report connection did not enter query_only mode")
         report = build_report(connection)
     finally:
         connection.close()

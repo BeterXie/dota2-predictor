@@ -20,6 +20,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from live_betting.service_coordination import (  # noqa: E402
+    add_single_database_argument,
+    database_writer_authority,
+)
 from event_intelligence.roles import (  # noqa: E402
     HistoricalPositionEvidence,
     PROSPECTIVE_ASSIGNMENT_VERSION,
@@ -476,7 +480,7 @@ def _positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=ROOT / "data" / "dota2.db")
+    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
     parser.add_argument("--match", type=_positive_int, help="one formal match ID")
     parser.add_argument("--dry-run", action="store_true", help="compute without writes")
     parser.add_argument(
@@ -490,12 +494,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = run_assignment(
-        args.database,
-        dry_run=args.dry_run,
-        match_id=args.match,
-        availability_mode=AvailabilityMode(args.availability_mode),
-    )
+    with database_writer_authority(args.database):
+        report = run_assignment(
+            args.database,
+            dry_run=args.dry_run,
+            match_id=args.match,
+            availability_mode=AvailabilityMode(args.availability_mode),
+        )
     print(json.dumps(report.__dict__, sort_keys=True))
     return 0
 

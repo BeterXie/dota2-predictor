@@ -19,6 +19,10 @@ import yaml
 
 from .client import OpenDotaClient
 from .db import Database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,8 +210,13 @@ async def fetch_matchups_endpoint(
     return fetched, skipped
 
 
-async def run(cfg: dict, force: bool, source: str) -> None:
-    db_path = resolve_db_path(cfg)
+async def run(
+    cfg: dict,
+    force: bool,
+    source: str,
+    database_path: str | Path | None = None,
+) -> None:
+    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
     db = Database(db_path)
     db.connect()
     db.init_db()
@@ -240,6 +249,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch hero matchup data from OpenDota"
     )
+    add_single_database_argument(parser)
     parser.add_argument(
         "--force", action="store_true", help="Re-fetch even if already in DB"
     )
@@ -253,7 +263,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    asyncio.run(run(cfg, args.force, args.source))
+    database = Path(args.database or resolve_db_path(cfg)).resolve()
+    with database_writer_authority(database):
+        asyncio.run(run(cfg, args.force, args.source, database))
 
 
 if __name__ == "__main__":
