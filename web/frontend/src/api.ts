@@ -10,6 +10,7 @@ import type {
   IntelligenceTeamPage,
   MappingRecord,
   MatchDetail,
+  MonitorHistoryPage,
   MonitorSnapshot,
 } from "./types";
 
@@ -55,6 +56,18 @@ async function mutateJson<T>(
 
 export function fetchBootstrap(signal?: AbortSignal): Promise<MonitorSnapshot> {
   return getJson<MonitorSnapshot>(`${MONITOR_API}/bootstrap`, signal);
+}
+
+export function fetchMonitorHistory(
+  cursor?: string | null,
+  signal?: AbortSignal,
+): Promise<MonitorHistoryPage> {
+  const query = new URLSearchParams({ limit: "20" });
+  if (cursor) query.set("cursor", cursor);
+  return getJson<MonitorHistoryPage>(
+    `${MONITOR_API}/history?${query.toString()}`,
+    signal,
+  );
 }
 
 export function fetchMatchDetail(

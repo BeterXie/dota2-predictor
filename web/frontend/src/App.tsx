@@ -21,6 +21,7 @@ import {
   fetchControlComponents,
   fetchMappings,
   fetchMatchDetail,
+  fetchMonitorHistory,
   invalidateMapping,
   snapshotStream,
 } from "./api";
@@ -34,6 +35,7 @@ import type {
   ControlSession,
   MappingRecord,
   MatchDetail,
+  MonitorMatch,
   MonitorLifecycleCounts,
   MonitorSnapshot,
 } from "./types";
@@ -59,6 +61,12 @@ export default function App() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [view, setView] = useState<ViewMode>(initialView);
+  const [historyMatches, setHistoryMatches] = useState<MonitorMatch[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const historyViewRef = useRef<HistoryView>(
     view === "intelligence" ? "intelligence" : "replay",
   );
@@ -80,9 +88,12 @@ export default function App() {
     () => localStorage.getItem("dota2-monitor-browser-alerts") === "on",
   );
   const cursorRef = useRef<string | undefined>(undefined);
+  const historyPageRequestRef = useRef<AbortController | null>(null);
   const notifiedAlerts = useRef(new Set<number>());
+  const realtimeEnabled = view === "live" || view === "operations";
 
   useEffect(() => {
+    if (!realtimeEnabled || snapshot) return;
     let controller: AbortController | null = null;
     let retryTimer: number | null = null;
     let disposed = false;
@@ -93,9 +104,10 @@ export default function App() {
           if (disposed) return;
           cursorRef.current = data.cursor;
           setSnapshot(data);
-          setSelectedId((current) => current || preferredMatch(
-            data,
-            view === "replay" ? "replay" : "live",
+          setSelectedId((current) => (
+            current && data.matches.some((match) => match.raybet_match_id === current)
+              ? current
+              : preferredMatch(data.matches, "live")
           ));
           setError(null);
         })
@@ -112,6 +124,53 @@ export default function App() {
       controller?.abort();
       if (retryTimer != null) window.clearTimeout(retryTimer);
     };
+  }, [realtimeEnabled]);
+
+  useEffect(() => {
+    if (view !== "replay") return;
+    const controller = new AbortController();
+    let disposed = false;
+    setHistoryLoading(true);
+    fetchMonitorHistory(null, controller.signal)
+      .then((page) => {
+        if (disposed) return;
+        if (page.has_more && !page.next_cursor) {
+          throw new Error("历史分页响应缺少游标");
+        }
+        setHistoryMatches(dedupeMatches(page.items));
+        setHistoryCursor(page.next_cursor);
+        setHistoryHasMore(page.has_more);
+        setHistoryLoaded(true);
+        setHistoryLoading(false);
+        setHistoryError(null);
+        setSelectedId((current) => (
+          current && page.items.some((match) => match.raybet_match_id === current)
+              ? current
+              : page.items[0]?.raybet_match_id || null
+        ));
+      })
+      .catch((reason: Error) => {
+        if (!disposed && reason.name !== "AbortError") {
+          setHistoryLoading(false);
+          setHistoryError(reason.message || "无法加载历史比赛");
+        }
+      });
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+  }, [view]);
+
+  useEffect(() => {
+    if (view === "replay") return;
+    historyPageRequestRef.current?.abort();
+    historyPageRequestRef.current = null;
+    setHistoryLoading(false);
+  }, [view]);
+
+  useEffect(() => () => {
+    historyPageRequestRef.current?.abort();
+    historyPageRequestRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -193,45 +252,82 @@ export default function App() {
   }, [controlSession, view]);
 
   useEffect(() => {
-    if (!snapshot) return;
+    if (!snapshot || !realtimeEnabled) return;
     let source: EventSource | null = null;
     let pollTimer: number | null = null;
     let reconnectTimer: number | null = null;
+    let pollController: AbortController | null = null;
+    let pollGeneration = 0;
     let disposed = false;
+
+    const cancelPoll = () => {
+      pollGeneration += 1;
+      pollController?.abort();
+      pollController = null;
+      if (pollTimer != null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    const refreshFromPoll = async () => {
+      if (disposed || pollController !== null) return;
+      const generation = pollGeneration;
+      const controller = new AbortController();
+      pollController = controller;
+      try {
+        const data = await fetchBootstrap(controller.signal);
+        if (
+          disposed
+          || controller.signal.aborted
+          || generation !== pollGeneration
+          || pollController !== controller
+        ) return;
+        cursorRef.current = data.cursor;
+        setSnapshot(data);
+        setError(null);
+      } catch (reason) {
+        if (
+          !disposed
+          && !controller.signal.aborted
+          && generation === pollGeneration
+          && pollController === controller
+        ) {
+          setError(errorText(reason, "轮询失败"));
+        }
+      } finally {
+        if (pollController === controller) pollController = null;
+      }
+    };
 
     const poll = () => {
       if (pollTimer != null) return;
       setConnection("fallback");
-      pollTimer = window.setInterval(() => {
-        fetchBootstrap()
-          .then((data) => {
-            cursorRef.current = data.cursor;
-            setSnapshot(data);
-            setError(null);
-          })
-          .catch((reason: Error) => setError(reason.message || "轮询失败"));
-      }, 5_000);
+      pollTimer = window.setInterval(() => void refreshFromPoll(), 5_000);
     };
 
     const connect = () => {
       if (disposed) return;
-      source = snapshotStream(cursorRef.current);
+      const connectedSource = snapshotStream(cursorRef.current);
+      source = connectedSource;
       setConnection("connecting");
-      source.onopen = () => {
-        if (pollTimer != null) {
-          window.clearInterval(pollTimer);
-          pollTimer = null;
-        }
+      connectedSource.onopen = () => {
+        if (disposed || source !== connectedSource) return;
+        cancelPoll();
         setConnection("live");
       };
-      source.addEventListener("snapshot", (event) => {
+      connectedSource.addEventListener("snapshot", (event) => {
+        if (disposed || source !== connectedSource) return;
+        cancelPoll();
         const data = JSON.parse((event as MessageEvent<string>).data) as MonitorSnapshot;
         cursorRef.current = data.cursor;
         setSnapshot(data);
         setError(null);
+        setConnection("live");
       });
-      source.onerror = () => {
-        source?.close();
+      connectedSource.onerror = () => {
+        if (disposed || source !== connectedSource) return;
+        connectedSource.close();
         source = null;
         poll();
         if (reconnectTimer == null) {
@@ -247,10 +343,10 @@ export default function App() {
     return () => {
       disposed = true;
       source?.close();
-      if (pollTimer != null) window.clearInterval(pollTimer);
+      cancelPoll();
       if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
     };
-  }, [Boolean(snapshot)]);
+  }, [Boolean(snapshot), realtimeEnabled]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -304,14 +400,23 @@ export default function App() {
   }, [selectedId, view]);
 
   useEffect(() => {
-    if (!snapshot || (view !== "live" && view !== "replay")) return;
-    const visible = matchesForView(snapshot.matches, view);
-    setSelectedId((current) => (
-      current && visible.some((match) => match.raybet_match_id === current)
-        ? current
-        : preferredMatch(snapshot, view)
-    ));
-  }, [snapshot, view]);
+    if (view === "live" && snapshot) {
+      const visible = matchesForView(snapshot.matches, "live");
+      setSelectedId((current) => (
+        current && visible.some((match) => match.raybet_match_id === current)
+          ? current
+          : preferredMatch(snapshot.matches, "live")
+      ));
+      return;
+    }
+    if (view === "replay" && historyLoaded) {
+      setSelectedId((current) => (
+        current && historyMatches.some((match) => match.raybet_match_id === current)
+          ? current
+          : historyMatches[0]?.raybet_match_id || null
+      ));
+    }
+  }, [historyLoaded, historyMatches, snapshot, view]);
 
   useEffect(() => {
     if (!selectedId || view !== "operations") {
@@ -350,7 +455,56 @@ export default function App() {
     }
   }, [browserAlerts, snapshot?.alerts, soundEnabled]);
 
-  const matches = snapshot?.matches || [];
+  const loadMoreHistory = async () => {
+    if (
+      historyPageRequestRef.current
+      || historyLoading
+      || (historyLoaded && !historyHasMore)
+    ) return;
+    const requestedCursor = historyLoaded ? historyCursor : null;
+    if (historyLoaded && !requestedCursor) {
+      setHistoryHasMore(false);
+      setHistoryError("历史分页游标已失效");
+      return;
+    }
+    const controller = new AbortController();
+    historyPageRequestRef.current = controller;
+    setHistoryLoading(true);
+    try {
+      const page = await fetchMonitorHistory(requestedCursor, controller.signal);
+      if (
+        controller.signal.aborted
+        || historyPageRequestRef.current !== controller
+      ) return;
+      if (
+        page.has_more
+        && (!page.next_cursor || page.next_cursor === requestedCursor)
+      ) {
+        setHistoryHasMore(false);
+        throw new Error("历史分页游标没有向前推进");
+      }
+      setHistoryMatches((current) => dedupeMatches([...current, ...page.items]));
+      setHistoryCursor(page.next_cursor);
+      setHistoryHasMore(page.has_more);
+      setHistoryLoaded(true);
+      setHistoryError(null);
+    } catch (reason) {
+      if (
+        historyPageRequestRef.current === controller
+        && (!(reason instanceof Error) || reason.name !== "AbortError")
+      ) {
+        setHistoryError(errorText(reason, "无法加载更多历史比赛"));
+      }
+    } finally {
+      if (historyPageRequestRef.current === controller) {
+        historyPageRequestRef.current = null;
+        setHistoryLoading(false);
+      }
+    }
+  };
+
+  const liveMatches = snapshot?.matches || [];
+  const matches = view === "replay" ? historyMatches : liveMatches;
   const railMatches = view === "replay" || view === "live"
     ? matchesForView(matches, view)
     : [];
@@ -363,6 +517,8 @@ export default function App() {
     [snapshot?.alerts],
   );
   const viewSummary = snapshot ? summaryForView(snapshot.summary, view) : null;
+  const historySummary = lifecycleCounts(historyMatches);
+  const displayedError = view === "replay" ? historyError : error;
 
   const changeView = (next: ViewMode) => {
     if (next === "replay" || next === "intelligence") {
@@ -378,8 +534,16 @@ export default function App() {
       "",
       `${window.location.pathname}${search ? `?${search}` : ""}${window.location.hash}`,
     );
-    if (snapshot && (next === "live" || next === "replay")) {
-      setSelectedId(preferredMatch(snapshot, next));
+    if (next === "live" && snapshot) {
+      setSelectedId(preferredMatch(snapshot.matches, "live"));
+    } else if (
+      next === "operations"
+      && snapshot
+      && !snapshot.matches.some((match) => match.raybet_match_id === selectedId)
+    ) {
+      setSelectedId(preferredMatch(snapshot.matches, "live"));
+    } else if (next === "replay") {
+      setSelectedId(historyMatches[0]?.raybet_match_id || null);
     }
   };
 
@@ -525,7 +689,7 @@ export default function App() {
         </TabList>
 
         <div className="topbar-status">
-          <ConnectionBadge state={connection} />
+          {realtimeEnabled && <ConnectionBadge state={connection} />}
           <span className="compact-switch" title="声音告警">
             <SpeakerHigh size={16} aria-hidden="true" />
             <Switch
@@ -565,31 +729,51 @@ export default function App() {
         </div>
       )}
 
-      {view !== "intelligence" && snapshot && (
-        <section className="summary-bar" aria-label="赛事与系统摘要">
+      {view === "replay" ? (
+        <section className="summary-bar" aria-label="历史赔率加载摘要">
           <SummaryItem
-            label={view === "replay" ? "历史比赛" : "滚球确认"}
-            value={view === "replay" ? viewSummary?.total || 0 : viewSummary?.live || 0}
-            tone={view === "replay" ? "neutral" : "live"}
+            label="已加载历史"
+            value={historyMatches.length}
           />
           <SummaryItem
-            label={view === "replay" ? "历史降级" : "数据降级"}
+            label="历史降级"
+            value={historySummary.degraded}
+            tone="warning"
+          />
+          <SummaryItem label="已完赛" value={historySummary.ended} />
+          <span className="snapshot-time">
+            {historyLoading
+              ? "正在加载"
+              : historyHasMore
+                ? "还有更多"
+                : historyLoaded ? "已全部加载" : "尚未加载"}
+          </span>
+        </section>
+      ) : view !== "intelligence" && snapshot && (
+        <section className="summary-bar" aria-label="赛事与系统摘要">
+          <SummaryItem
+            label="滚球确认"
+            value={viewSummary?.live || 0}
+            tone="live"
+          />
+          <SummaryItem
+            label="数据降级"
             value={viewSummary?.degraded || 0}
             tone="warning"
           />
           <SummaryItem
-            label={view === "replay" ? "已完赛" : "即将开始"}
-            value={view === "replay" ? viewSummary?.ended || 0 : viewSummary?.upcoming || 0}
+            label="即将开始"
+            value={viewSummary?.upcoming || 0}
           />
           <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
           <span className="snapshot-time">快照 {new Date(snapshot.generated_at).toLocaleTimeString("zh-CN", { hour12: false })}</span>
         </section>
       )}
 
-      {view !== "intelligence" && error && (
+      {view !== "intelligence" && displayedError && (
         <div className="global-error" role="alert">
-          <strong>监控连接异常</strong>
-          <span>{error}</span>
+          <strong>{view === "replay" ? "历史赔率加载异常" : "监控连接异常"}</strong>
+          <span>{displayedError}</span>
         </div>
       )}
 
@@ -618,9 +802,12 @@ export default function App() {
       ) : (
         <div className={`cockpit-grid ${view === "replay" ? "history-replay" : ""}`}>
           <MatchRail
+            historyHasMore={historyHasMore || (!historyLoaded && Boolean(historyError))}
+            historyLoading={historyLoading}
             matches={railMatches}
             mode={view === "replay" ? "history" : "live"}
             now={now}
+            onLoadMore={() => void loadMoreHistory()}
             onSelect={setSelectedId}
             selectedId={selectedId}
           />
@@ -670,15 +857,34 @@ function playAlertTone(critical: boolean): void {
 }
 
 function preferredMatch(
-  snapshot: MonitorSnapshot,
+  matches: MonitorMatch[],
   view: "live" | "replay",
 ): string | null {
   const preferred = view === "replay"
-    ? snapshot.matches.find(isHistoricalMatch)
-    : snapshot.matches.find((match) => isLiveEligible(match) && match.lifecycle === "live")
-      || snapshot.matches.find((match) => isLiveEligible(match) && match.lifecycle === "degraded")
-      || snapshot.matches.find((match) => isLiveEligible(match) && match.lifecycle === "upcoming");
+    ? matches.find(isHistoricalMatch)
+    : matches.find((match) => isLiveEligible(match) && match.lifecycle === "live")
+      || matches.find((match) => isLiveEligible(match) && match.lifecycle === "degraded")
+      || matches.find((match) => isLiveEligible(match) && match.lifecycle === "upcoming");
   return preferred?.raybet_match_id || null;
+}
+
+function dedupeMatches(matches: MonitorMatch[]): MonitorMatch[] {
+  const seen = new Set<string>();
+  return matches.filter((match) => {
+    if (seen.has(match.raybet_match_id)) return false;
+    seen.add(match.raybet_match_id);
+    return true;
+  });
+}
+
+function lifecycleCounts(matches: MonitorMatch[]): MonitorLifecycleCounts {
+  return {
+    total: matches.length,
+    upcoming: matches.filter((match) => match.lifecycle === "upcoming").length,
+    live: matches.filter((match) => match.lifecycle === "live").length,
+    degraded: matches.filter((match) => match.lifecycle === "degraded").length,
+    ended: matches.filter((match) => match.lifecycle === "ended").length,
+  };
 }
 
 function matchesForView(

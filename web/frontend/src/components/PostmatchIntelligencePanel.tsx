@@ -60,8 +60,6 @@ const AVAILABILITY_LABELS: Array<[
 export function PostmatchIntelligencePanel({
   mapNumber,
   raybetMatchId,
-  teamOne,
-  teamTwo,
 }: PostmatchIntelligencePanelProps) {
   const [result, setResult] = useState<ExactPostmatchAttribution | null>(null);
   const [loading, setLoading] = useState(false);
@@ -142,8 +140,6 @@ export function PostmatchIntelligencePanel({
         <AvailablePostmatch
           payload={result.postmatch}
           result={result}
-          teamOne={teamOne}
-          teamTwo={teamTwo}
         />
       ) : result ? (
         <PostmatchNotice
@@ -159,16 +155,15 @@ export function PostmatchIntelligencePanel({
 function AvailablePostmatch({
   payload,
   result,
-  teamOne,
-  teamTwo,
 }: {
   payload: ExactPostmatchPayload;
   result: ExactPostmatchAttribution;
-  teamOne: string;
-  teamTwo: string;
 }) {
-  const radiant = teamName(payload.match.radiant_team_name, payload.match.radiant_team_id, "天辉");
-  const dire = teamName(payload.match.dire_team_name, payload.match.dire_team_id, "夜魇");
+  const teamNames = resolvePostmatchTeamNames(
+    result.mapping,
+    payload.match.radiant_team_id,
+    payload.match.dire_team_id,
+  );
   const players = useMemo(
     () => mergePlayers(payload.player_performance, payload.player_scores),
     [payload.player_performance, payload.player_scores],
@@ -195,8 +190,8 @@ function AvailablePostmatch({
       </div>
 
       <div className="postmatch-state-grid">
-        <StateSummary name={radiant} state={payload.states.radiant} />
-        <StateSummary name={dire} state={payload.states.dire} />
+        <StateSummary name={teamNames.radiant} state={payload.states.radiant} />
+        <StateSummary name={teamNames.dire} state={payload.states.dire} />
       </div>
 
       <div className="postmatch-availability" aria-label="赛后事件来源完整性">
@@ -222,7 +217,11 @@ function AvailablePostmatch({
           <ClockCounterClockwise size={18} aria-hidden="true" />
         </div>
         {payload.events.length ? (
-          <EventTable events={payload.events} teamOne={teamOne} teamTwo={teamTwo} />
+          <EventTable
+            events={payload.events}
+            teamOne={teamNames.teamOne}
+            teamTwo={teamNames.teamTwo}
+          />
         ) : (
           <div className="postmatch-empty">
             {eventSourcesComplete(payload.event_availability)
@@ -307,7 +306,7 @@ function EventTable({
       <table className="postmatch-table">
         <thead><tr>
           <th>时间</th><th>类型</th><th>事件</th><th>天辉金币差</th><th>天辉经验差</th>
-          <th>{teamOne || "队伍一"} 概率</th><th>{teamTwo || "队伍二"} 概率</th>
+          <th>{teamOne}（team_one）概率</th><th>{teamTwo}（team_two）概率</th>
         </tr></thead>
         <tbody>
           {events.map((event, index) => (
@@ -395,8 +394,61 @@ function sideLabel(side: "radiant" | "dire" | null): string {
   return side === "radiant" ? "天辉" : side === "dire" ? "夜魇" : "未知";
 }
 
-function teamName(value: string | null, id: number | null, fallback: string): string {
-  return value || (id ? `球队 ${id}` : fallback);
+const MISSING_MAPPING_NAME = "映射名称缺失";
+
+interface PostmatchTeamNames {
+  teamOne: string;
+  teamTwo: string;
+  radiant: string;
+  dire: string;
+}
+
+function resolvePostmatchTeamNames(
+  mapping: ExactPostmatchAttribution["mapping"],
+  radiantTeamId: number | null,
+  direTeamId: number | null,
+): PostmatchTeamNames {
+  const missing = {
+    teamOne: MISSING_MAPPING_NAME,
+    teamTwo: MISSING_MAPPING_NAME,
+    radiant: MISSING_MAPPING_NAME,
+    dire: MISSING_MAPPING_NAME,
+  };
+  const canonicalTeams = mapping?.canonical_teams;
+  if (!Array.isArray(canonicalTeams)) return missing;
+
+  const teamOneCandidates = canonicalTeams.filter((team) => team?.side === "team_one");
+  const teamTwoCandidates = canonicalTeams.filter((team) => team?.side === "team_two");
+  if (teamOneCandidates.length !== 1 || teamTwoCandidates.length !== 1) return missing;
+
+  const teamOne = teamOneCandidates[0];
+  const teamTwo = teamTwoCandidates[0];
+  const validTeam = (team: typeof teamOne) => Number.isSafeInteger(team.team_id)
+    && team.team_id > 0
+    && typeof team.team_name === "string"
+    && team.team_name.trim().length > 0;
+  if (!validTeam(teamOne) || !validTeam(teamTwo) || teamOne.team_id === teamTwo.team_id) {
+    return missing;
+  }
+
+  const teamOneName = teamOne.team_name.trim();
+  const teamTwoName = teamTwo.team_name.trim();
+  const namesById = new Map([
+    [teamOne.team_id, teamOneName],
+    [teamTwo.team_id, teamTwoName],
+  ]);
+  const radiantName = radiantTeamId == null ? undefined : namesById.get(radiantTeamId);
+  const direName = direTeamId == null ? undefined : namesById.get(direTeamId);
+  const hasUniqueStateMapping = radiantTeamId !== direTeamId
+    && radiantName !== undefined
+    && direName !== undefined;
+
+  return {
+    teamOne: teamOneName,
+    teamTwo: teamTwoName,
+    radiant: hasUniqueStateMapping ? radiantName : MISSING_MAPPING_NAME,
+    dire: hasUniqueStateMapping ? direName : MISSING_MAPPING_NAME,
+  };
 }
 
 function signedAmount(value: number | null | undefined): string {

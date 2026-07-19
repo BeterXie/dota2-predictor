@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -16,11 +19,16 @@ from live_betting.health import record_health
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, OddsSnapshot
 from live_betting.storage import LiveBettingStore
+from live_betting.vision import VisionObservation
+from live_betting.vision_frame_registry import (
+    publish_vision_frame_bytes,
+    retire_vision_frame_artifact,
+)
 from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
 )
-from web import queries
+from web import monitoring, queries
 from web.app import app
 from web.monitoring import (
     _current_winner,
@@ -28,6 +36,7 @@ from web.monitoring import (
     current_markets,
     derive_health,
     monitor_match_detail,
+    monitor_history_page,
     monitor_cursor,
     winner_timeline,
 )
@@ -99,6 +108,51 @@ class MonitoringDashboardTests(unittest.TestCase):
             updated_at,
         )
         self.store.connection.commit()
+
+    def add_frame_observation(
+        self,
+        *,
+        match_id: str = "match-1",
+        captured_at: datetime,
+        label: str,
+        game_clock_seconds: int = 120,
+    ):
+        encoded = b"\xff\xd8\xff\xe0" + label.encode("ascii") + b"\xff\xd9"
+        receipt = publish_vision_frame_bytes(
+            Path(self.directory.name) / "vision-frames",
+            encoded,
+        )
+        observation = VisionObservation(
+            raybet_match_id=match_id,
+            map_number=1,
+            captured_at=captured_at,
+            game_clock_seconds=game_clock_seconds,
+            is_paused=False,
+            radiant_hero_ids=(1, 2, 3, 4, 5),
+            dire_hero_ids=(6, 7, 8, 9, 10),
+            clock_confidence=0.99,
+            draft_confidence=0.99,
+            source_frame_ref=receipt.frame_ref,
+            screen_state="game",
+            radiant_team_side="team_one",
+            source_frame_sha256=receipt.content_sha256,
+            source_frame_bytes=receipt.byte_length,
+            source_frame_path=str(receipt.storage_path),
+        )
+        self.store.insert_vision_observation(observation)
+        self.store.connection.commit()
+        return observation, receipt, encoded
+
+    def get_frame(self, match_id: str, digest: str):
+        previous_path = queries.DB_PATH
+        queries.init_db(str(self.database))
+        try:
+            with TestClient(app) as client:
+                return client.get(
+                    f"/api/monitor/matches/{match_id}/vision-frames/{digest}.jpg"
+                )
+        finally:
+            queries.init_db(previous_path)
 
     def add_browser_page_event(
         self,
@@ -630,7 +684,7 @@ class MonitoringDashboardTests(unittest.TestCase):
             ["older-valid"],
         )
 
-    def test_latest_vision_requires_a_confirmed_frame_after_invalidation(self) -> None:
+    def test_vision_views_exclude_only_the_invalidated_observation(self) -> None:
         self.add_match(status=2)
         older = make_test_vision_observation(
             raybet_match_id="match-1",
@@ -678,12 +732,23 @@ class MonitoringDashboardTests(unittest.TestCase):
         )
         self.store.connection.commit()
 
-        blocked = build_monitor_snapshot(
+        latest = build_monitor_snapshot(
             self.store.connection,
             now=NOW,
         )["matches"][0]["latest_vision"]
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
 
-        self.assertIsNone(blocked)
+        self.assertEqual(latest["observed_at"], older.captured_at.isoformat())
+        assert detail is not None
+        self.assertEqual(
+            [point["source_frame_ref"] for point in detail["vision"]],
+            [older.source_frame_ref],
+        )
+        invalidated_response = self.get_frame(
+            "match-1",
+            str(invalidated.source_frame_sha256),
+        )
+        self.assertEqual(invalidated_response.status_code, 404)
 
         restored = make_test_vision_observation(
             raybet_match_id="match-1",
@@ -706,6 +771,168 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(latest["observed_at"], restored.captured_at.isoformat())
         self.assertEqual(latest["game_clock_seconds"], 118)
         self.assertEqual(latest["confirmed"], 1)
+
+    def test_vision_views_exclude_observations_at_or_after_draft_conflict(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        before, before_receipt, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=20),
+            label="before-conflict",
+            game_clock_seconds=100,
+        )
+        after, after_receipt, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=5),
+            label="after-conflict",
+            game_clock_seconds=115,
+        )
+        conflict_at = NOW - timedelta(seconds=10)
+        self.store.connection.execute(
+            """UPDATE vision_draft_anchors
+                  SET status='conflict', conflict_at=?
+                WHERE raybet_match_id='match-1' AND map_number=1""",
+            (conflict_at.isoformat(),),
+        )
+        self.store.connection.execute(
+            """INSERT INTO vision_draft_conflicts
+               (raybet_match_id, map_number, captured_at, source_frame_ref,
+                observed_draft_hash, radiant_hero_ids, dire_hero_ids,
+                observed_radiant_team_side, reason, recorded_at)
+               VALUES ('match-1', 1, ?, ?, ?, '[1,2,3,4,5]',
+                       '[6,7,8,9,10]', 'team_two', 'confirmed_draft_conflict', ?)""",
+            (conflict_at.isoformat(), after.source_frame_ref, "f" * 64, NOW.isoformat()),
+        )
+        self.store.connection.commit()
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        self.assertEqual(
+            snapshot["matches"][0]["latest_vision"]["source_frame_ref"],
+            before.source_frame_ref,
+        )
+        assert detail is not None
+        self.assertEqual(
+            [point["source_frame_ref"] for point in detail["vision"]],
+            [before.source_frame_ref],
+        )
+        before_response = self.get_frame("match-1", before_receipt.content_sha256)
+        after_response = self.get_frame("match-1", after_receipt.content_sha256)
+        self.assertEqual(before_response.status_code, 200)
+        self.assertEqual(after_response.status_code, 404)
+
+    def test_vision_timeline_keeps_latest_bounded_points_in_ascending_order(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        observations = [
+            self.add_frame_observation(
+                captured_at=NOW - timedelta(seconds=seconds),
+                label=f"bounded-{seconds}",
+                game_clock_seconds=120 - seconds,
+            )[0]
+            for seconds in (40, 30, 20, 10)
+        ]
+
+        detail = monitor_match_detail(
+            self.store.connection,
+            "match-1",
+            now=NOW,
+            max_points=2,
+        )
+
+        assert detail is not None
+        self.assertEqual(
+            [point["source_frame_ref"] for point in detail["vision"]],
+            [observations[2].source_frame_ref, observations[3].source_frame_ref],
+        )
+
+    def test_vision_frame_endpoint_returns_exact_registered_jpeg(self) -> None:
+        self.add_match(status=2)
+        observation, receipt, encoded = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=5),
+            label="served-frame",
+        )
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        point = detail["vision"][-1]
+        self.assertEqual(point["frame_digest"], receipt.content_sha256)
+        self.assertEqual(
+            point["frame_url"],
+            f"/api/monitor/matches/match-1/vision-frames/{receipt.content_sha256}.jpg",
+        )
+        self.assertEqual(point["source_frame_ref"], observation.source_frame_ref)
+
+        response = self.get_frame("match-1", receipt.content_sha256)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, encoded)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["etag"], f'"{receipt.content_sha256}"')
+        self.assertIn("immutable", response.headers["cache-control"])
+
+    def test_vision_frame_endpoint_rejects_cross_match_reference(self) -> None:
+        self.add_match(status=2)
+        self.add_match(match_id="match-2", status=2)
+        _, receipt, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=5),
+            label="match-one-only",
+        )
+
+        response = self.get_frame("match-2", receipt.content_sha256)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(str(receipt.storage_path), response.text)
+
+    def test_vision_frame_endpoint_rejects_retired_and_missing_files(self) -> None:
+        self.add_match(status=2)
+        _, retired, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=10),
+            label="retired-frame",
+        )
+        _, missing, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=5),
+            label="missing-frame",
+        )
+        retire_vision_frame_artifact(
+            self.store.connection,
+            retired.frame_ref,
+            reason="test retirement",
+            actor="test_monitoring_dashboard",
+            retired_at=NOW,
+        )
+        missing.storage_path.unlink()
+
+        retired_response = self.get_frame("match-1", retired.content_sha256)
+        missing_response = self.get_frame("match-1", missing.content_sha256)
+
+        self.assertIn(retired_response.status_code, {404, 409})
+        self.assertIn(missing_response.status_code, {404, 409})
+        self.assertNotIn(str(retired.storage_path), retired_response.text)
+        self.assertNotIn(str(missing.storage_path), missing_response.text)
+
+    def test_vision_frame_endpoint_rejects_tamper_and_hardlink(self) -> None:
+        self.add_match(status=2)
+        _, tampered, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=10),
+            label="tampered-frame",
+        )
+        _, linked, _ = self.add_frame_observation(
+            captured_at=NOW - timedelta(seconds=5),
+            label="hardlinked-frame",
+        )
+        tampered.storage_path.write_bytes(b"\xff\xd8tampered\xff\xd9")
+        os.link(linked.storage_path, linked.storage_path.with_suffix(".link.jpg"))
+
+        tampered_response = self.get_frame("match-1", tampered.content_sha256)
+        linked_response = self.get_frame("match-1", linked.content_sha256)
+
+        self.assertEqual(tampered_response.status_code, 409)
+        self.assertEqual(linked_response.status_code, 409)
+        self.assertNotIn(str(tampered.storage_path), tampered_response.text)
+        self.assertNotIn(str(linked.storage_path), linked_response.text)
 
     def test_provider_status_two_is_live_only_while_fresh(self) -> None:
         self.add_match(status=2)
@@ -752,6 +979,14 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(match["lifecycle"], "degraded")
         self.assertFalse(match["history_eligible"])
         self.assertEqual(match["latest_odds_activity_at"], recent.isoformat())
+        self.assertEqual(
+            monitor_history_page(
+                self.store.connection,
+                limit=10,
+                now=NOW,
+            )["items"],
+            [],
+        )
 
     def test_audit_only_transport_activity_also_blocks_history_archive(self) -> None:
         self.add_match(
@@ -809,6 +1044,618 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertFalse(snapshot["matches"][0]["history_eligible"])
 
+    def test_realtime_snapshot_bounds_history_projection_and_keeps_live_priority(self) -> None:
+        history_rows = [
+            (
+                f"history-{index:04d}",
+                "Archive Cup",
+                "One",
+                "Two",
+                (NOW - timedelta(days=index + 2)).isoformat(),
+                3,
+                "5",
+                None,
+                "{}",
+                (NOW - timedelta(days=index + 1)).isoformat(),
+            )
+            for index in range(500)
+        ]
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            history_rows,
+        )
+        self.add_match(
+            match_id="live-priority",
+            status=2,
+            scheduled_at="2026-07-14 21:30:00",
+            updated_at=NOW,
+        )
+
+        with patch(
+            "web.monitoring._monitor_match",
+            wraps=monitoring._monitor_match,
+        ) as projected:
+            snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertLessEqual(projected.call_count, 128)
+        self.assertLessEqual(len(snapshot["matches"]), 64)
+        self.assertIn(
+            "live-priority",
+            [match["raybet_match_id"] for match in snapshot["matches"]],
+        )
+
+    def test_history_keyset_pages_are_stable_unique_and_include_null_schedule(self) -> None:
+        rows = []
+        for index in range(37):
+            rows.append(
+                (
+                    f"ended-{index:02d}",
+                    "History Cup",
+                    "One",
+                    "Two",
+                    None if index == 0 else (NOW - timedelta(days=index)).isoformat(),
+                    3,
+                    "5",
+                    None,
+                    "{}",
+                    (NOW - timedelta(days=index)).isoformat(),
+                )
+            )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        self.store.connection.commit()
+
+        seen: list[str] = []
+        cursor = None
+        while True:
+            page = monitor_history_page(
+                self.store.connection,
+                cursor=cursor,
+                limit=7,
+                now=NOW,
+            )
+            seen.extend(item["raybet_match_id"] for item in page["items"])
+            if not page["has_more"]:
+                break
+            self.assertIsNotNone(page["next_cursor"])
+            self.assertNotEqual(cursor, page["next_cursor"])
+            cursor = page["next_cursor"]
+
+        self.assertEqual(len(seen), 37)
+        self.assertEqual(len(set(seen)), 37)
+        self.assertIn("ended-00", seen)
+
+    def test_history_cursor_fixes_cutoff_and_rejects_tampering(self) -> None:
+        self.add_match(
+            match_id="older-ended",
+            status=5,
+            scheduled_at=None,
+            updated_at=NOW - timedelta(days=2),
+        )
+        self.add_match(
+            match_id="clock-boundary",
+            status=2,
+            scheduled_at="2026-07-13 20:00:00",
+            updated_at=NOW - timedelta(minutes=10),
+        )
+        self.add_match(
+            match_id="newer-ended",
+            status=5,
+            scheduled_at=None,
+            updated_at=NOW - timedelta(days=1),
+        )
+
+        first = monitor_history_page(self.store.connection, limit=1, now=NOW)
+        cursor = first["next_cursor"]
+        self.assertTrue(first["has_more"])
+        self.assertIsNotNone(cursor)
+        second = monitor_history_page(
+            self.store.connection,
+            cursor=cursor,
+            limit=1,
+            now=NOW + timedelta(hours=1),
+        )
+        self.assertEqual(
+            [item["raybet_match_id"] for item in second["items"]],
+            ["older-ended"],
+        )
+        tampered = f"{cursor[:-1]}{'0' if cursor[-1] != '0' else '1'}"
+        with self.assertRaisesRegex(ValueError, "invalid history cursor"):
+            monitor_history_page(
+                self.store.connection,
+                cursor=tampered,
+                limit=1,
+            )
+        encoded = cursor.split(".", 1)[0]
+        padding = "=" * (-len(encoded) % 4)
+        body = base64.urlsafe_b64decode(encoded + padding)
+        public_checksum = hashlib.sha256(
+            monitoring._HISTORY_CURSOR_DOMAIN + body
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "invalid history cursor"):
+            monitor_history_page(
+                self.store.connection,
+                cursor=f"{encoded}.{public_checksum}",
+                limit=1,
+            )
+        self.store.connection.execute(
+            """UPDATE raybet_matches SET updated_at=?
+                WHERE raybet_match_id='newer-ended'""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.commit()
+        with self.assertRaisesRegex(ValueError, "history cursor anchor changed"):
+            monitor_history_page(
+                self.store.connection,
+                cursor=cursor,
+                limit=1,
+            )
+
+    def test_empty_history_window_advances_cursor_without_unbounded_scan(self) -> None:
+        self.add_match(
+            match_id="old-ended",
+            status=5,
+            scheduled_at=None,
+            updated_at=NOW - timedelta(days=5),
+        )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    f"screened-live-{index:03d}",
+                    "Live Cup",
+                    "One",
+                    "Two",
+                    (NOW - timedelta(minutes=index + 1)).isoformat(),
+                    3,
+                    "2",
+                    None,
+                    "{}",
+                    NOW.isoformat(),
+                )
+                for index in range(205)
+            ],
+        )
+        self.store.connection.commit()
+
+        with patch(
+            "web.monitoring._monitor_match",
+            wraps=monitoring._monitor_match,
+        ) as projected:
+            first = monitor_history_page(self.store.connection, limit=5, now=NOW)
+            self.assertEqual(first["items"], [])
+            self.assertTrue(first["has_more"])
+            self.assertIsNotNone(first["next_cursor"])
+            self.assertEqual(projected.call_count, 200)
+            first_projection_count = projected.call_count
+            second = monitor_history_page(
+                self.store.connection,
+                cursor=first["next_cursor"],
+                limit=5,
+                now=NOW + timedelta(days=30),
+            )
+            self.assertEqual(projected.call_count - first_projection_count, 6)
+        self.assertEqual(
+            [item["raybet_match_id"] for item in second["items"]],
+            ["old-ended"],
+        )
+
+    def test_recent_timeline_ended_match_is_not_buried_by_future_rows(self) -> None:
+        self.add_match(
+            match_id="old-row-recent-event",
+            status=1,
+            scheduled_at=(NOW - timedelta(days=2)).isoformat(),
+            updated_at=NOW - timedelta(days=2),
+        )
+        future_rows = [
+            (
+                f"future-event-{index:04d}",
+                "Future Cup",
+                "One",
+                "Two",
+                (NOW + timedelta(days=1, minutes=index)).isoformat(),
+                3,
+                "1",
+                None,
+                "{}",
+                NOW.isoformat(),
+            )
+            for index in range(500)
+        ]
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            future_rows,
+        )
+        self.add_match(
+            match_id="old-row-recent-event",
+            status=5,
+            scheduled_at=(NOW - timedelta(hours=1)).isoformat(),
+            updated_at=NOW,
+        )
+
+        page = monitor_history_page(
+            self.store.connection,
+            limit=20,
+            now=NOW,
+        )
+
+        self.assertEqual(
+            [item["raybet_match_id"] for item in page["items"]],
+            ["old-row-recent-event"],
+        )
+        self.assertFalse(page["has_more"])
+
+    def test_activity_projection_prevents_noisy_match_starvation_and_duplicate_rows(self) -> None:
+        for match_id in ("quiet", "noisy"):
+            self.add_match(
+                match_id=match_id,
+                status=2,
+                scheduled_at="2026-07-13 20:00:00",
+                updated_at=NOW - timedelta(days=1),
+            )
+        market = Market("winner", "map_1", "team_one", None, "team_one", True)
+        quiet_at = NOW - timedelta(minutes=10)
+        self.add_winner_response(
+            quiet_at,
+            2.0,
+            2.0,
+            match_id="quiet",
+            observation_key="quiet-response",
+        )
+        for index in range(300):
+            self.store.insert_odds(
+                OddsSnapshot(
+                    "noisy",
+                    f"noisy-{index}",
+                    "noisy-group",
+                    NOW - timedelta(minutes=5) + timedelta(microseconds=index),
+                    2.0,
+                    1,
+                    market,
+                )
+            )
+        self.store.connection.commit()
+
+        activity = self.store.connection.execute(
+            """SELECT raybet_match_id, latest_odds_activity_at
+                 FROM raybet_match_odds_activity ORDER BY raybet_match_id"""
+        ).fetchall()
+        self.assertEqual([row["raybet_match_id"] for row in activity], ["noisy", "quiet"])
+        self.assertEqual(activity[1]["latest_odds_activity_at"], quiet_at.isoformat())
+        direct_latest = max(
+            self.store.connection.execute(
+                """SELECT MAX(observed_at) FROM odds_transport_observations
+                    WHERE raybet_match_id='quiet'"""
+            ).fetchone()[0],
+            self.store.connection.execute(
+                """SELECT MAX(received_at) FROM odds_snapshots
+                    WHERE raybet_match_id='quiet'"""
+            ).fetchone()[0],
+        )
+        self.assertEqual(activity[1]["latest_odds_activity_at"], direct_latest)
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM raybet_match_odds_activity
+                    WHERE raybet_match_id='quiet'"""
+            ).fetchone()[0],
+            1,
+        )
+        candidates = monitoring._realtime_match_candidates(
+            self.store.connection,
+            NOW,
+        )
+        self.assertTrue(
+            {"quiet", "noisy"}.issubset(
+                {str(row["raybet_match_id"]) for row in candidates}
+            )
+        )
+
+    def test_realtime_candidate_queries_use_v9_indexes_without_temp_sort(self) -> None:
+        checks = (
+            (
+                """SELECT raybet_match_id FROM raybet_matches
+                    WHERE status='2' AND updated_at>=? AND updated_at<=?
+                    ORDER BY updated_at DESC, raybet_match_id DESC LIMIT 64""",
+                (
+                    (NOW - timedelta(seconds=90)).isoformat(),
+                    NOW.isoformat(),
+                ),
+                "idx_raybet_matches_status_updated",
+            ),
+            (
+                """SELECT raybet_match_id FROM raybet_matches
+                    WHERE updated_at>=? AND updated_at<=?
+                    ORDER BY updated_at DESC, raybet_match_id DESC LIMIT 64""",
+                (
+                    (NOW - timedelta(hours=24)).isoformat(),
+                    NOW.isoformat(),
+                ),
+                "idx_raybet_matches_updated",
+            ),
+            (
+                f"""SELECT raybet_match_id FROM raybet_matches
+                    WHERE {monitoring._SCHEDULE_UTC_JULIANDAY}>julianday(?)
+                    ORDER BY {monitoring._SCHEDULE_UTC_JULIANDAY},
+                             raybet_match_id LIMIT 64""",
+                ((NOW + timedelta(minutes=15)).isoformat(),),
+                "idx_raybet_matches_schedule_utc",
+            ),
+            (
+                f"""SELECT raybet_match_id FROM raybet_matches
+                    INDEXED BY idx_raybet_matches_ended_schedule_review
+                    WHERE {monitoring._ENDED_STATUS_SQL}
+                      AND scheduled_at IS NOT NULL
+                      AND ({monitoring._SCHEDULE_UTC_JULIANDAY})>julianday(?)
+                    ORDER BY ({monitoring._SCHEDULE_UTC_JULIANDAY}),
+                             updated_at DESC, raybet_match_id DESC LIMIT 64""",
+                (NOW.isoformat(),),
+                "idx_raybet_matches_ended_schedule_review",
+            ),
+            (
+                f"""SELECT raybet_match_id FROM raybet_matches
+                    INDEXED BY idx_raybet_matches_ended_schedule_review
+                    WHERE {monitoring._ENDED_STATUS_SQL}
+                      AND scheduled_at IS NOT NULL
+                      AND ({monitoring._SCHEDULE_UTC_JULIANDAY}) IS NULL
+                      AND updated_at<=?
+                    ORDER BY updated_at DESC, raybet_match_id DESC LIMIT 64""",
+                (NOW.isoformat(),),
+                "idx_raybet_matches_ended_schedule_review",
+            ),
+            (
+                f"""SELECT raybet_match_id FROM raybet_matches
+                    WHERE {monitoring._TIMELINE_KEY_SQL}<=
+                          CAST(julianday(?) * 86400000 AS INTEGER)
+                    ORDER BY {monitoring._TIMELINE_KEY_SQL} DESC,
+                             raybet_match_id DESC LIMIT 201""",
+                (NOW.isoformat(),),
+                "idx_raybet_matches_timeline",
+            ),
+            (
+                """SELECT raybet_match_id FROM vision_observations
+                    WHERE confirmed=1 AND screen_state='game'
+                      AND captured_at>=? AND captured_at<=?
+                    ORDER BY captured_at DESC, raybet_match_id DESC LIMIT 256""",
+                (
+                    (NOW - timedelta(seconds=120)).isoformat(),
+                    NOW.isoformat(),
+                ),
+                "idx_vision_confirmed_game_captured",
+            ),
+            (
+                """SELECT raybet_match_id FROM raybet_match_odds_activity
+                    WHERE latest_odds_activity_at>=?
+                      AND latest_odds_activity_at<=?
+                    ORDER BY latest_odds_activity_at DESC,
+                             raybet_match_id DESC LIMIT 64""",
+                (
+                    (NOW - timedelta(minutes=15)).isoformat(),
+                    NOW.isoformat(),
+                ),
+                "idx_raybet_match_odds_activity_time",
+            ),
+        )
+        for sql, params, expected_index in checks:
+            with self.subTest(index=expected_index):
+                details = [
+                    str(row[3])
+                    for row in self.store.connection.execute(
+                        f"EXPLAIN QUERY PLAN {sql}",
+                        params,
+                    )
+                ]
+                self.assertTrue(
+                    any(expected_index in detail for detail in details),
+                    details,
+                )
+                self.assertFalse(
+                    any("USE TEMP B-TREE" in detail for detail in details),
+                    details,
+                )
+
+    def test_realtime_bucket_sql_limits_raw_index_windows_before_projection(self) -> None:
+        rows = []
+        for index in range(80):
+            rows.extend(
+                (
+                    (
+                        f"future-poison-{index:03d}",
+                        "Poison Cup",
+                        "One",
+                        "Two",
+                        (NOW + timedelta(hours=1, minutes=index)).isoformat(),
+                        3,
+                        "5",
+                        None,
+                        "{}",
+                        (NOW - timedelta(minutes=index)).isoformat(),
+                    ),
+                    (
+                        f"past-poison-{index:03d}",
+                        "Poison Cup",
+                        "One",
+                        "Two",
+                        (NOW - timedelta(minutes=index + 1)).isoformat(),
+                        3,
+                        "2",
+                        None,
+                        "{}",
+                        (NOW - timedelta(minutes=index)).isoformat(),
+                    ),
+                )
+            )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        self.store.connection.commit()
+
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            candidates = monitoring._realtime_match_candidates(
+                self.store.connection,
+                NOW,
+            )
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        self.assertLessEqual(len(candidates), 128)
+        normalized = [" ".join(statement.lower().split()) for statement in statements]
+        upcoming = [
+            statement
+            for statement in normalized
+            if "from raybet_matches" in statement
+            and "then julianday(scheduled_at, '-8 hours')" in statement
+            and ">julianday(" in statement
+            and "indexed by idx_raybet_matches_ended_schedule_review" not in statement
+        ]
+        metadata = [
+            statement
+            for statement in normalized
+            if "from raybet_matches where updated_at>=" in statement
+        ]
+        history = [
+            statement
+            for statement in normalized
+            if "from raybet_matches where cast(coalesce(" in statement
+            and "<= cast(julianday(" in statement
+        ]
+        ended_review = [
+            statement
+            for statement in normalized
+            if "indexed by idx_raybet_matches_ended_schedule_review" in statement
+        ]
+        self.assertEqual(len(upcoming), 1, normalized)
+        self.assertEqual(len(metadata), 1, normalized)
+        self.assertEqual(len(history), 1, normalized)
+        self.assertEqual(
+            len(ended_review),
+            2,
+            normalized,
+        )
+        self.assertIn("limit 64", upcoming[0])
+        self.assertIn("limit 64", metadata[0])
+        self.assertIn("limit 16", history[0])
+        for statement in (*upcoming, *metadata, *history, *ended_review):
+            if statement in ended_review:
+                self.assertIn("limit 64", statement)
+            self.assertNotIn("coalesce(status", statement)
+            self.assertNotIn(" not in ", statement)
+
+    def test_future_timestamp_poison_cannot_starve_realtime_candidate_buckets(self) -> None:
+        old = (NOW - timedelta(days=1)).isoformat()
+        future = (NOW + timedelta(days=1)).isoformat()
+        match_rows = []
+        for bucket in ("provider", "metadata", "activity", "vision"):
+            for index in range(70):
+                match_rows.append(
+                    (
+                        f"{bucket}-future-{index:02d}",
+                        "Poison Cup",
+                        "One",
+                        "Two",
+                        None,
+                        3,
+                        "2" if bucket == "provider" else "0",
+                        None,
+                        "{}",
+                        future if bucket in {"provider", "metadata"} else old,
+                    )
+                )
+        for match_id, status, updated_at in (
+            ("provider-real", "2", NOW.isoformat()),
+            ("metadata-real", "0", NOW.isoformat()),
+            ("activity-real", "0", old),
+            ("vision-real", "0", old),
+        ):
+            match_rows.append(
+                (
+                    match_id,
+                    "Real Cup",
+                    "One",
+                    "Two",
+                    None,
+                    3,
+                    status,
+                    None,
+                    "{}",
+                    updated_at,
+                )
+            )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            match_rows,
+        )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_match_odds_activity
+               (raybet_match_id, latest_odds_activity_at) VALUES (?, ?)""",
+            [
+                (f"activity-future-{index:02d}", future)
+                for index in range(70)
+            ] + [("activity-real", (NOW - timedelta(minutes=5)).isoformat())],
+        )
+        vision_rows = [
+            (
+                f"vision-future-{index:02d}",
+                future,
+                f"future-frame-{index:02d}",
+            )
+            for index in range(70)
+        ] + [
+            (
+                "vision-real",
+                (NOW - timedelta(seconds=10)).isoformat(),
+                "real-frame",
+            )
+        ]
+        self.store.connection.executemany(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                clock_confidence, draft_confidence, source_frame_ref,
+                source_frame_sha256, source_frame_bytes, screen_state, confirmed)
+               VALUES (?, 1, ?, 120, 0, '[1,2,3,4,5]', '[6,7,8,9,10]',
+                       'team_one', 0.99, 0.99, ?, NULL, NULL, 'game', 1)""",
+            vision_rows,
+        )
+        self.store.connection.commit()
+
+        candidates = monitoring._realtime_match_candidates(
+            self.store.connection,
+            NOW,
+        )
+        candidate_ids = {str(row["raybet_match_id"]) for row in candidates}
+        self.assertTrue(
+            {
+                "provider-real",
+                "metadata-real",
+                "activity-real",
+                "vision-real",
+            }.issubset(candidate_ids),
+            candidate_ids,
+        )
+
     def test_history_and_live_summary_counts_use_their_view_filters(self) -> None:
         self.add_match(
             match_id="live",
@@ -858,13 +1705,193 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertEqual([row["raybet_match_id"] for row in matches], ["newer", "older"])
 
-    def test_provider_status_five_is_ended(self) -> None:
-        self.add_match(status=5)
+    def test_provider_status_five_with_real_raybet_schedule_is_ended(self) -> None:
+        self.add_match(status=5, scheduled_at="2026-07-11 20:00:00")
 
         snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        history = monitor_history_page(self.store.connection, limit=10, now=NOW)
+        schedule_key = self.store.connection.execute(
+            f"""SELECT {monitoring._SCHEDULE_UTC_JULIANDAY}
+                   FROM raybet_matches WHERE raybet_match_id='match-1'"""
+        ).fetchone()[0]
 
+        self.assertIsNotNone(schedule_key)
         self.assertEqual(snapshot["matches"][0]["lifecycle"], "ended")
         self.assertTrue(snapshot["matches"][0]["history_eligible"])
+        self.assertEqual(snapshot["summary"]["live_view"]["total"], 0)
+        self.assertEqual(snapshot["summary"]["history_view"]["total"], 1)
+        self.assertEqual(
+            [item["raybet_match_id"] for item in history["items"]],
+            ["match-1"],
+        )
+
+    def test_future_scheduled_ended_match_stays_visible_but_out_of_history(
+        self,
+    ) -> None:
+        self.add_match(
+            status=5,
+            scheduled_at=(NOW + timedelta(minutes=10)).isoformat(),
+            updated_at=NOW - timedelta(days=2),
+        )
+        for index in range(64):
+            self.add_match(
+                match_id=f"normal-ended-{index:02d}",
+                status=5,
+                scheduled_at=(NOW - timedelta(minutes=index + 1)).isoformat(),
+                updated_at=NOW - timedelta(days=1),
+            )
+
+        candidate_ids = {
+            str(row["raybet_match_id"])
+            for row in monitoring._realtime_match_candidates(
+                self.store.connection,
+                NOW,
+            )
+        }
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        history = monitor_history_page(self.store.connection, limit=10, now=NOW)
+
+        self.assertIn("match-1", candidate_ids)
+        match = next(
+            item
+            for item in snapshot["matches"]
+            if item["raybet_match_id"] == "match-1"
+        )
+        self.assertEqual(match["lifecycle"], "degraded")
+        self.assertFalse(match["history_eligible"])
+        self.assertEqual(snapshot["summary"]["live_view"]["degraded"], 1)
+        self.assertNotIn(
+            "match-1",
+            {item["raybet_match_id"] for item in history["items"]},
+        )
+
+    def test_submillisecond_schedule_boundary_is_decided_by_python(self) -> None:
+        self.add_match(
+            status=5,
+            scheduled_at="2026-07-14 22:00:00",
+            updated_at=NOW - timedelta(days=2),
+        )
+        future_clock = NOW - timedelta(microseconds=500)
+        past_clock = NOW + timedelta(microseconds=500)
+
+        future_review_ids = {
+            str(row["raybet_match_id"])
+            for row in monitoring._ended_review_match_candidates(
+                self.store.connection,
+                future_clock,
+            )
+        }
+        past_review_ids = {
+            str(row["raybet_match_id"])
+            for row in monitoring._ended_review_match_candidates(
+                self.store.connection,
+                past_clock,
+            )
+        }
+        future = build_monitor_snapshot(
+            self.store.connection,
+            now=future_clock,
+        )["matches"][0]
+        past = build_monitor_snapshot(
+            self.store.connection,
+            now=past_clock,
+        )["matches"][0]
+
+        self.assertIn("match-1", future_review_ids)
+        self.assertEqual(future["lifecycle"], "degraded")
+        self.assertFalse(future["history_eligible"])
+        self.assertNotIn("match-1", past_review_ids)
+        self.assertEqual(past["lifecycle"], "ended")
+        self.assertTrue(past["history_eligible"])
+
+    def test_sqlite_permissive_noncanonical_ended_schedules_require_review(
+        self,
+    ) -> None:
+        cases = {
+            "whitespace-separator": "2026-07-13    22:00:00",
+            "hour-24": "2026-07-13 24:00:00",
+            "february-30": "2026-02-30 22:00:00",
+            "trailing-space": "2026-07-13 22:00:00 ",
+        }
+        for match_id, scheduled_at in cases.items():
+            self.add_match(
+                match_id=match_id,
+                status=5,
+                scheduled_at=scheduled_at,
+                updated_at=NOW - timedelta(days=2),
+            )
+
+        candidate_ids = {
+            str(row["raybet_match_id"])
+            for row in monitoring._realtime_match_candidates(
+                self.store.connection,
+                NOW,
+            )
+        }
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        matches = {item["raybet_match_id"]: item for item in snapshot["matches"]}
+        history_ids = {
+            item["raybet_match_id"]
+            for item in monitor_history_page(
+                self.store.connection,
+                limit=50,
+                now=NOW,
+            )["items"]
+        }
+
+        for match_id in cases:
+            with self.subTest(match_id=match_id):
+                schedule_key = self.store.connection.execute(
+                    f"""SELECT {monitoring._SCHEDULE_UTC_JULIANDAY}
+                           FROM raybet_matches WHERE raybet_match_id=?""",
+                    (match_id,),
+                ).fetchone()[0]
+                self.assertIsNone(schedule_key)
+                self.assertIsNone(monitoring._parse_schedule(cases[match_id]))
+                self.assertIn(match_id, candidate_ids)
+                self.assertEqual(matches[match_id]["lifecycle"], "degraded")
+                self.assertFalse(matches[match_id]["history_eligible"])
+                self.assertNotIn(match_id, history_ids)
+
+    def test_malformed_scheduled_ended_match_stays_visible_but_out_of_history(
+        self,
+    ) -> None:
+        self.add_match(
+            status=5,
+            scheduled_at="not-a-timestamp",
+            updated_at=NOW - timedelta(days=2),
+        )
+        for index in range(64):
+            self.add_match(
+                match_id=f"normal-ended-{index:02d}",
+                status=5,
+                scheduled_at=(NOW - timedelta(minutes=index + 1)).isoformat(),
+                updated_at=NOW - timedelta(days=1),
+            )
+
+        candidate_ids = {
+            str(row["raybet_match_id"])
+            for row in monitoring._realtime_match_candidates(
+                self.store.connection,
+                NOW,
+            )
+        }
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        history = monitor_history_page(self.store.connection, limit=10, now=NOW)
+
+        self.assertIn("match-1", candidate_ids)
+        match = next(
+            item
+            for item in snapshot["matches"]
+            if item["raybet_match_id"] == "match-1"
+        )
+        self.assertEqual(match["lifecycle"], "degraded")
+        self.assertFalse(match["history_eligible"])
+        self.assertEqual(snapshot["summary"]["live_view"]["degraded"], 1)
+        self.assertNotIn(
+            "match-1",
+            {item["raybet_match_id"] for item in history["items"]},
+        )
 
     def test_provider_completed_list_status_three_is_ended(self) -> None:
         self.add_match(status=3)
@@ -1052,18 +2079,122 @@ class MonitoringDashboardTests(unittest.TestCase):
 
     def test_cursor_changes_only_after_monitor_data_changes(self) -> None:
         self.add_match()
-        before = monitor_cursor(self.store.connection)
-        self.assertEqual(before, monitor_cursor(self.store.connection))
+        before = monitor_cursor(self.store.connection, now=NOW)
+        self.assertEqual(before, monitor_cursor(self.store.connection, now=NOW))
 
         self.add_winner_pair(NOW, 2.0, 2.0)
 
-        self.assertNotEqual(before, monitor_cursor(self.store.connection))
+        self.assertNotEqual(before, monitor_cursor(self.store.connection, now=NOW))
+
+    def test_snapshot_cursor_ignores_clock_only_age_changes(self) -> None:
+        self.add_match(status=2)
+
+        first = build_monitor_snapshot(self.store.connection, now=NOW)
+        second = build_monitor_snapshot(
+            self.store.connection,
+            now=NOW + timedelta(seconds=1),
+        )
+
+        self.assertNotEqual(first["generated_at"], second["generated_at"])
+        self.assertEqual(first["cursor"], second["cursor"])
+
+    def test_snapshot_cursor_ignores_large_invisible_audit_history_without_full_scan(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        before = build_monitor_snapshot(self.store.connection, now=NOW)
+        artifact_hash = "f" * 64
+        self.store.connection.execute(
+            """INSERT INTO odds_raw_artifacts
+               (artifact_hash, source, storage_path, uncompressed_bytes,
+                compressed_bytes, schema_fingerprint)
+               VALUES (?, 'raybet', 'unused-test-artifact', 2, 2, ?)""",
+            (artifact_hash, "e" * 64),
+        )
+        hidden_rows = 600
+        self.store.connection.executemany(
+            """INSERT INTO browser_events
+               (event_id, schema_version, capture_session_id, captured_at,
+                received_at, transport, event_type, raybet_match_id, game_id,
+                page_origin, page_path, source_path, payload_hash,
+                payload_bytes, payload_json, payload_artifact_hash,
+                payload_storage, capture_reason, extension_version,
+                recognized, processing_status, processing_reason)
+               VALUES (?, 1, ?, ?, ?, 'xhr', 'odds', 'hidden-match', 151,
+                       'https://www.ray086.com', '/sports/esports', '/v2/odds',
+                       ?, 2, '{}', ?, 'external', NULL, 'test', 1,
+                       'processed', NULL)""",
+            [
+                (
+                    hashlib.sha256(f"hidden-browser-{index}".encode()).hexdigest(),
+                    "b" * 32,
+                    (NOW - timedelta(days=30, seconds=index)).isoformat(),
+                    (NOW - timedelta(days=30, seconds=index)).isoformat(),
+                    artifact_hash,
+                    artifact_hash,
+                )
+                for index in range(hidden_rows)
+            ],
+        )
+        self.store.connection.executemany(
+            """INSERT INTO vision_observations
+               (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                is_paused, radiant_hero_ids, dire_hero_ids,
+                radiant_team_side, clock_confidence, draft_confidence,
+                source_frame_ref, source_frame_sha256, source_frame_bytes,
+                screen_state, confirmed)
+               VALUES ('hidden-match', 1, ?, 120, 0, '[]', '[]',
+                       'team_one', 0.9, 0.9, ?, NULL, NULL, 'game', 1)""",
+            [
+                (
+                    (NOW - timedelta(days=30, seconds=index)).isoformat(),
+                    f"frame-sha256:{hashlib.sha256(f'hidden-vision-{index}'.encode()).hexdigest()}",
+                )
+                for index in range(hidden_rows)
+            ],
+        )
+        self.store.connection.commit()
+
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            after = build_monitor_snapshot(self.store.connection, now=NOW)
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        self.assertEqual(before["cursor"], after["cursor"])
+        normalized = [" ".join(statement.lower().split()) for statement in statements]
+        revision_tables = (
+            "vision_observations",
+            "browser_events",
+            "vision_observation_invalidations",
+            "vision_draft_conflicts",
+            "vision_derived_invalidations",
+        )
+        self.assertFalse(
+            any(
+                ("count(" in statement or "max(" in statement)
+                and any(f"from {table}" in statement for table in revision_tables)
+                for statement in normalized
+            ),
+            normalized,
+        )
+        bounded_reads = [
+            statement
+            for statement in normalized
+            if any(f"from {table}" in statement for table in ("vision_observations", "browser_events"))
+        ]
+        self.assertTrue(bounded_reads)
+        self.assertTrue(
+            all("limit" in statement for statement in bounded_reads),
+            bounded_reads,
+        )
 
     def test_cursor_changes_for_an_unchanged_complete_transport(self) -> None:
         self.add_match()
         first = NOW - timedelta(seconds=6)
         self.add_winner_response(first, 2.0, 2.0, observation_key="response-1")
-        before = monitor_cursor(self.store.connection)
+        before = monitor_cursor(self.store.connection, now=NOW)
         snapshot_count = self.store.connection.execute(
             "SELECT COUNT(*) FROM odds_snapshots WHERE raybet_match_id='match-1'"
         ).fetchone()[0]
@@ -1076,9 +2207,10 @@ class MonitoringDashboardTests(unittest.TestCase):
             ).fetchone()[0],
             snapshot_count,
         )
-        self.assertNotEqual(before, monitor_cursor(self.store.connection))
+        self.assertNotEqual(before, monitor_cursor(self.store.connection, now=NOW))
 
     def test_cursor_changes_for_vision_invalidation_and_confirmed_downgrade(self) -> None:
+        self.add_match(status=2)
         observation = make_test_vision_observation(
             raybet_match_id="match-1",
             map_number=1,
@@ -1091,7 +2223,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         )
         self.store.insert_vision_observation(observation)
         self.store.connection.commit()
-        before = monitor_cursor(self.store.connection)
+        before = monitor_cursor(self.store.connection, now=NOW)
 
         self.store.connection.execute(
             """INSERT INTO vision_observation_invalidations
@@ -1117,11 +2249,14 @@ class MonitoringDashboardTests(unittest.TestCase):
         )
         self.store.connection.commit()
 
-        after = monitor_cursor(self.store.connection)
+        after = monitor_cursor(self.store.connection, now=NOW)
         self.assertNotEqual(before, after)
-        self.assertEqual(after, monitor_cursor(self.store.connection))
+        self.assertEqual(after, monitor_cursor(self.store.connection, now=NOW))
 
-    def test_cursor_changes_for_draft_and_derived_invalidations(self) -> None:
+    def test_cursor_ignores_conflict_and_derived_writes_without_visible_change(
+        self,
+    ) -> None:
+        self.add_match(status=2)
         observation = make_test_vision_observation(
             raybet_match_id="match-1",
             map_number=1,
@@ -1134,7 +2269,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         )
         self.store.insert_vision_observation(observation)
         self.store.connection.commit()
-        before = monitor_cursor(self.store.connection)
+        before = monitor_cursor(self.store.connection, now=NOW)
         anchor = self.store.connection.execute(
             """SELECT draft_hash, radiant_hero_ids, dire_hero_ids
                  FROM vision_draft_anchors
@@ -1172,8 +2307,8 @@ class MonitoringDashboardTests(unittest.TestCase):
         )
         self.store.connection.commit()
 
-        conflict_cursor = monitor_cursor(self.store.connection)
-        self.assertNotEqual(before, conflict_cursor)
+        conflict_cursor = monitor_cursor(self.store.connection, now=NOW)
+        self.assertEqual(before, conflict_cursor)
 
         self.store.connection.execute(
             """INSERT INTO vision_derived_invalidations
@@ -1192,12 +2327,15 @@ class MonitoringDashboardTests(unittest.TestCase):
         )
         self.store.connection.commit()
 
-        derived_cursor = monitor_cursor(self.store.connection)
-        self.assertNotEqual(conflict_cursor, derived_cursor)
-        self.assertEqual(derived_cursor, monitor_cursor(self.store.connection))
+        derived_cursor = monitor_cursor(self.store.connection, now=NOW)
+        self.assertEqual(conflict_cursor, derived_cursor)
+        self.assertEqual(
+            derived_cursor,
+            monitor_cursor(self.store.connection, now=NOW),
+        )
 
     def test_monitor_api_exposes_bootstrap_and_match_detail(self) -> None:
-        self.add_match()
+        self.add_match(status=5)
         self.add_winner_response(
             NOW, 2.0, 2.0, observation_key="monitor-api-response"
         )
@@ -1207,6 +2345,9 @@ class MonitoringDashboardTests(unittest.TestCase):
             with TestClient(app) as client:
                 bootstrap = client.get("/api/monitor/bootstrap")
                 detail = client.get("/api/monitor/matches/match-1")
+                history = client.get("/api/monitor/history?limit=1")
+                invalid_cursor = client.get("/api/monitor/history?cursor=broken")
+                invalid_limit = client.get("/api/monitor/history?limit=51")
         finally:
             queries.init_db(previous_path)
 
@@ -1214,6 +2355,10 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(bootstrap.json()["matches"][0]["raybet_match_id"], "match-1")
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(len(detail.json()["winner_timeline"]), 1)
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(history.json()["items"][0]["raybet_match_id"], "match-1")
+        self.assertEqual(invalid_cursor.status_code, 400)
+        self.assertEqual(invalid_limit.status_code, 422)
 
 
 if __name__ == "__main__":

@@ -14,9 +14,21 @@ interface MatchRailProps {
   selectedId: string | null;
   onSelect: (matchId: string) => void;
   now: number;
+  historyHasMore?: boolean;
+  historyLoading?: boolean;
+  onLoadMore?: () => void;
 }
 
-export function MatchRail({ matches, mode, selectedId, onSelect, now }: MatchRailProps) {
+export function MatchRail({
+  matches,
+  mode,
+  selectedId,
+  onSelect,
+  now,
+  historyHasMore = false,
+  historyLoading = false,
+  onLoadMore,
+}: MatchRailProps) {
   const [query, setQuery] = useState("");
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
@@ -99,8 +111,23 @@ export function MatchRail({ matches, mode, selectedId, onSelect, now }: MatchRai
         {!filtered.length && (
           <div className="rail-empty">
             <MagnifyingGlass size={24} aria-hidden="true" />
-            <span>{query ? "没有匹配的赛事" : mode === "history" ? "暂无历史比赛" : "暂无滚球赛事"}</span>
+            <span>{query
+              ? "没有匹配的赛事"
+              : mode === "history" && historyLoading
+                ? "正在加载历史比赛"
+                : mode === "history" ? "暂无历史比赛" : "暂无滚球赛事"}</span>
           </div>
+        )}
+        {mode === "history" && (historyHasMore || historyLoading) && (
+          <button
+            aria-label="加载更多历史比赛"
+            className="history-load-more"
+            disabled={historyLoading || !historyHasMore}
+            onClick={onLoadMore}
+            type="button"
+          >
+            {historyLoading ? "正在加载" : "加载更多"}
+          </button>
         )}
       </nav>
     </aside>

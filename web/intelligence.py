@@ -7,6 +7,7 @@ import math
 import sqlite3
 import threading
 from contextlib import contextmanager
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -49,6 +50,9 @@ from .monitoring import winner_timeline
 MODEL_KINDS = ("pure_draft", "context_adjusted")
 LANDMARK_MINUTES = (10, 20, 30, 40, 50)
 DEFAULT_ECE_BINS = 5
+MATCH_RATING_VERSION = "match-rating-v1-current-player-score-mean"
+MATCH_RATING_ROUNDING = "decimal-half-up-2dp"
+_MATCH_RATING_QUANTUM = Decimal("0.01")
 STATE_JSON_COLUMNS = (
     "crossings_json",
     "objective_conversion_json",
@@ -1357,10 +1361,12 @@ def _match_players(
                 "hero_name": raw.get("hero_name"),
                 "performance": raw.get("performance"),
                 "position": row["position"],
-                "execution_score": row["execution_score"],
-                "result_adjusted_score": row["result_adjusted_score"],
-                "coverage": row["coverage"],
-                "role_confidence": row["role_confidence"],
+                "execution_score": _finite_number(row["execution_score"]),
+                "result_adjusted_score": _finite_number(
+                    row["result_adjusted_score"]
+                ),
+                "coverage": _finite_number(row["coverage"]),
+                "role_confidence": _finite_number(row["role_confidence"]),
                 "ranking_eligible": bool(explanation.get("ranking_eligible", False)),
                 "benchmark_cutoff": row["benchmark_cutoff"],
                 "score_version": row["score_version"],
@@ -1371,6 +1377,62 @@ def _match_players(
             }
         )
     return result
+
+
+def _match_rating(
+    player_scores: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    expected_radiant = frozenset(range(5))
+    expected_dire = frozenset(range(128, 133))
+    if len(player_scores) != 10:
+        return None
+
+    slots = [row.get("player_slot") for row in player_scores]
+    if any(type(slot) is not int for slot in slots) or len(set(slots)) != 10:
+        return None
+    radiant_slots = frozenset(slot for slot in slots if 0 <= slot <= 4)
+    dire_slots = frozenset(slot for slot in slots if 128 <= slot <= 132)
+    if radiant_slots != expected_radiant or dire_slots != expected_dire:
+        return None
+
+    fields = ("execution_score", "result_adjusted_score", "coverage")
+    for row in player_scores:
+        if row.get("score_version") != SCORE_VERSION:
+            return None
+        if any(_finite_number(row.get(field)) is None for field in fields):
+            return None
+    cutoffs = {row.get("benchmark_cutoff") for row in player_scores}
+    if (
+        len(cutoffs) != 1
+        or not isinstance(next(iter(cutoffs)), str)
+        or not str(next(iter(cutoffs))).strip()
+    ):
+        return None
+    benchmark_cutoff = str(next(iter(cutoffs)))
+
+    def averages(rows: list[dict[str, Any]]) -> dict[str, float]:
+        return {
+            field: float(
+                (
+                    sum(Decimal(str(row[field])) for row in rows)
+                    / Decimal(len(rows))
+                ).quantize(_MATCH_RATING_QUANTUM, rounding=ROUND_HALF_UP)
+            )
+            for field in fields
+        }
+
+    radiant = [row for row in player_scores if int(row["player_slot"]) < 128]
+    dire = [row for row in player_scores if int(row["player_slot"]) >= 128]
+    return {
+        "rating_version": MATCH_RATING_VERSION,
+        "rounding": MATCH_RATING_ROUNDING,
+        "source_score_version": SCORE_VERSION,
+        "benchmark_cutoff": benchmark_cutoff,
+        "player_count": len(player_scores),
+        "overall": averages(player_scores),
+        "radiant": averages(radiant),
+        "dire": averages(dire),
+    }
 
 
 def _match_draft_predictions(
@@ -1449,8 +1511,10 @@ def _match_detail_payload(
         "dire_state": states["dire"],
         "player_performance": player_performance,
         "player_scores": player_scores,
+        "match_rating": _match_rating(player_scores),
         "draft_predictions": draft_predictions,
         "versions": {
+            "match_rating": MATCH_RATING_VERSION,
             "player_score": SCORE_VERSION,
             "team_state": LABEL_VERSION,
             "team_profile": PROFILE_VERSION,
@@ -2780,6 +2844,8 @@ def list_teams() -> dict[str, Any]:
 
 
 __all__ = [
+    "MATCH_RATING_ROUNDING",
+    "MATCH_RATING_VERSION",
     "get_match",
     "get_overview",
     "get_raybet_postmatch",

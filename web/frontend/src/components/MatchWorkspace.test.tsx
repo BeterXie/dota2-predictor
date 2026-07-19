@@ -84,6 +84,16 @@ function detail(
   };
 }
 
+function detailWithFrame(): MatchDetail {
+  const value = detail(1, "ready");
+  const latest = value.latest_vision!;
+  latest.source_frame_ref = `vision-frame:sha256:${"a".repeat(64)}`;
+  latest.frame_digest = "a".repeat(64);
+  latest.frame_url = `/api/monitor/matches/match-1/vision-frames/${"a".repeat(64)}.jpg`;
+  value.vision = [latest];
+  return value;
+}
+
 describe("MatchWorkspace trusted vision clock", () => {
   afterEach(cleanup);
 
@@ -127,6 +137,71 @@ describe("MatchWorkspace trusted vision clock", () => {
       />,
     );
     expect(screen.getByText("可信时钟 2:00")).toBeInTheDocument();
+  });
+
+  it("renders the latest captured frame from the match-scoped API URL", () => {
+    const framed = detailWithFrame();
+    framed.watch_link = {
+      kind: "public_stream",
+      availability: "available",
+      url: "https://qplay.ehome.gg/live/42.m3u8",
+      reason: "verified_unsigned_stream",
+    };
+
+    render(
+      <MatchWorkspace
+        detail={framed}
+        error={null}
+        loading={false}
+        match={framed}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const image = screen.getByRole("img", { name: "最近有效视觉观测画面" });
+    expect(image).toHaveAttribute("src", framed.latest_vision!.frame_url);
+    expect(image).not.toHaveAttribute("src", framed.watch_link.url);
+    expect(screen.getByText("已确认")).toBeInTheDocument();
+    expect(screen.getByText("game")).toBeInTheDocument();
+  });
+
+  it("shows an explicit empty state when a frame is missing or fails to load", () => {
+    const withoutFrame = detail(1, "ready");
+    withoutFrame.watch_link = {
+      kind: "public_stream",
+      availability: "available",
+      url: "https://qplay.ehome.gg/live/42.m3u8",
+      reason: "verified_unsigned_stream",
+    };
+    const view = render(
+      <MatchWorkspace
+        detail={withoutFrame}
+        error={null}
+        loading={false}
+        match={withoutFrame}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByText("暂无可用的已捕获画面")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+
+    const framed = detailWithFrame();
+    view.rerender(
+      <MatchWorkspace
+        detail={framed}
+        error={null}
+        loading={false}
+        match={framed}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+    fireEvent.error(screen.getByRole("img", { name: "最近有效视觉观测画面" }));
+    expect(screen.getByText("已捕获画面加载失败")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
   it("labels available entry links by their proven kind", () => {

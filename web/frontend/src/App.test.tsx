@@ -21,6 +21,7 @@ const api = vi.hoisted(() => ({
   fetchControlComponents: vi.fn(),
   fetchMappings: vi.fn(),
   fetchMatchDetail: vi.fn(),
+  fetchMonitorHistory: vi.fn(),
   invalidateMapping: vi.fn(),
   snapshotStream: vi.fn(),
 }));
@@ -51,9 +52,12 @@ vi.mock("@fluentui/react-components", () => ({
   ),
 }));
 vi.mock("./components/MatchRail", () => ({
-  MatchRail: ({ matches, onSelect }: {
+  MatchRail: ({ matches, onSelect, historyHasMore, historyLoading, onLoadMore }: {
     matches: MonitorMatch[];
     onSelect: (matchId: string) => void;
+    historyHasMore?: boolean;
+    historyLoading?: boolean;
+    onLoadMore?: () => void;
   }) => (
     <nav>
       {matches.map((match) => (
@@ -61,6 +65,11 @@ vi.mock("./components/MatchRail", () => ({
           select-{match.raybet_match_id}
         </button>
       ))}
+      {(historyHasMore || historyLoading) && (
+        <button disabled={historyLoading} onClick={onLoadMore}>
+          load-more-history
+        </button>
+      )}
     </nav>
   ),
 }));
@@ -220,13 +229,18 @@ describe("App data recovery and ownership", () => {
   });
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     localStorage.clear();
     window.history.replaceState(null, "", "/");
     api.fetchBootstrap.mockResolvedValue(snapshot);
     api.fetchMatchDetail.mockImplementation((matchId: string) => (
       Promise.resolve({ ...match(matchId), winner_timeline: [], decisions: [], vision: [], markets: [] })
     ));
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
     api.fetchMappings.mockImplementation((matchId: string) => (
       matchId === "a" ? Promise.resolve([mapping]) : new Promise(() => undefined)
     ));
@@ -274,27 +288,30 @@ describe("App data recovery and ownership", () => {
     expect(screen.queryByText("odds-replay")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
-    expect(await screen.findByTestId("selected-match")).toHaveTextContent("none");
+    expect(await screen.findByTestId("selected-match")).toHaveTextContent("a");
     expect(screen.queryByText("opendota-postmatch")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-a" })).not.toBeInTheDocument();
   });
 
-  it("uses view-specific summary counters on the history tab", async () => {
-    api.fetchBootstrap.mockResolvedValue({
-      ...snapshot,
-      summary: {
-        ...snapshot.summary,
-        live_view: { total: 4, upcoming: 2, live: 1, degraded: 1, ended: 0 },
-        history_view: { total: 7, upcoming: 0, live: 0, degraded: 2, ended: 5 },
-      },
+  it("labels history counters as the loaded page rather than an all-time total", async () => {
+    const loaded = Array.from({ length: 7 }, (_, index): MonitorMatch => ({
+      ...match(`history-${index}`),
+      lifecycle: index < 5 ? "ended" : "degraded",
+      history_eligible: true,
+    }));
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: loaded,
+      next_cursor: "history-cursor-1",
+      has_more: true,
     });
     render(<App />);
 
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
-    expect(await screen.findByText("历史比赛")).toBeInTheDocument();
+    expect(await screen.findByText("已加载历史")).toBeInTheDocument();
     expect(screen.getByText("7")).toBeInTheDocument();
     expect(screen.getByText("历史降级")).toBeInTheDocument();
     expect(screen.getByText("已完赛")).toBeInTheDocument();
+    expect(await screen.findByText("还有更多")).toBeInTheDocument();
   });
 
   it("keeps legacy history deep links working", async () => {
@@ -304,6 +321,204 @@ describe("App data recovery and ownership", () => {
 
     expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
+    expect(api.fetchBootstrap).not.toHaveBeenCalled();
+    expect(api.snapshotStream).not.toHaveBeenCalled();
+  });
+
+  it("closes realtime transport in replay and reconnects when live is reopened", async () => {
+    const close = vi.fn();
+    api.snapshotStream.mockReturnValue({
+      addEventListener: vi.fn(),
+      close,
+      onerror: null,
+      onopen: null,
+    });
+    render(<App />);
+
+    await waitFor(() => expect(api.snapshotStream).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "滚球列表" }));
+    await waitFor(() => expect(api.snapshotStream).toHaveBeenCalledTimes(2));
+  });
+
+  it("advances across an empty history page and merges later pages without duplicates", async () => {
+    const first = { ...match("history-a"), lifecycle: "ended", history_eligible: true };
+    const second = { ...match("history-b"), lifecycle: "ended", history_eligible: true };
+    api.fetchMonitorHistory
+      .mockResolvedValueOnce({
+        items: [first],
+        next_cursor: "history-cursor-1",
+        has_more: true,
+      })
+      .mockResolvedValueOnce({
+        items: [],
+        next_cursor: "history-cursor-2",
+        has_more: true,
+      })
+      .mockResolvedValueOnce({
+        items: [first, second],
+        next_cursor: null,
+        has_more: false,
+      });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+
+    expect(await screen.findByRole("button", { name: "select-history-a" })).toBeInTheDocument();
+    const firstLoadMore = screen.getByRole("button", { name: "load-more-history" });
+    await waitFor(() => expect(firstLoadMore).not.toBeDisabled());
+    fireEvent.click(firstLoadMore);
+    await waitFor(() => {
+      expect(api.fetchMonitorHistory).toHaveBeenCalledWith(
+        "history-cursor-1",
+        expect.any(AbortSignal),
+      );
+    });
+    const secondLoadMore = screen.getByRole("button", { name: "load-more-history" });
+    await waitFor(() => expect(secondLoadMore).not.toBeDisabled());
+    fireEvent.click(secondLoadMore);
+
+    expect(await screen.findByRole("button", { name: "select-history-b" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "select-history-a" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "load-more-history" })).not.toBeInTheDocument();
+  });
+
+  it("keeps history load-more single-flight and aborts it when replay closes", async () => {
+    const first = { ...match("history-a"), lifecycle: "ended", history_eligible: true };
+    let resolveMore: ((value: {
+      items: MonitorMatch[];
+      next_cursor: string | null;
+      has_more: boolean;
+    }) => void) | undefined;
+    api.fetchMonitorHistory
+      .mockResolvedValueOnce({
+        items: [first],
+        next_cursor: "history-cursor-1",
+        has_more: true,
+      })
+      .mockReturnValueOnce(new Promise((resolve) => {
+        resolveMore = resolve;
+      }));
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+
+    expect(await screen.findByRole("button", { name: "select-history-a" })).toBeInTheDocument();
+    const loadMore = screen.getByRole("button", { name: "load-more-history" });
+    await waitFor(() => expect(loadMore).not.toBeDisabled());
+    act(() => {
+      loadMore.click();
+      loadMore.click();
+    });
+    expect(api.fetchMonitorHistory).toHaveBeenCalledTimes(2);
+    const signal = api.fetchMonitorHistory.mock.calls[1][1] as AbortSignal;
+
+    fireEvent.click(screen.getByRole("button", { name: "OpenDota 赛后情报" }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      resolveMore?.({ items: [], next_cursor: null, has_more: false });
+      await Promise.resolve();
+    });
+    expect(api.fetchMonitorHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces stale replay eligibility when reentering history", async () => {
+    const old = { ...match("history-old"), lifecycle: "degraded", history_eligible: true };
+    const recent = { ...match("history-new"), lifecycle: "ended", history_eligible: true };
+    api.fetchMonitorHistory
+      .mockResolvedValueOnce({
+        items: [old],
+        next_cursor: "history-cursor-1",
+        has_more: true,
+      })
+      .mockResolvedValueOnce({
+        items: [recent],
+        next_cursor: null,
+        has_more: false,
+      });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(await screen.findByRole("button", { name: "select-history-old" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "滚球列表" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+
+    expect(await screen.findByRole("button", { name: "select-history-new" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-history-old" })).not.toBeInTheDocument();
+    expect(api.fetchMonitorHistory).toHaveBeenNthCalledWith(
+      2,
+      null,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("aborts an in-flight fallback poll and ignores its result after SSE recovers", async () => {
+    vi.useFakeTimers();
+    let resolvePoll: ((value: MonitorSnapshot) => void) | undefined;
+    api.fetchBootstrap
+      .mockResolvedValueOnce(snapshot)
+      .mockReturnValueOnce(new Promise((resolve) => {
+        resolvePoll = resolve;
+      }));
+    const listeners: Array<((event: MessageEvent<string>) => void) | null> = [];
+    const sources = Array.from({ length: 2 }, () => ({
+      addEventListener: vi.fn((name: string, listener: (event: MessageEvent<string>) => void) => {
+        if (name === "snapshot") listeners.push(listener);
+      }),
+      close: vi.fn(),
+      onerror: null as ((event: Event) => void) | null,
+      onopen: null as ((event: Event) => void) | null,
+    }));
+    api.snapshotStream
+      .mockReturnValueOnce(sources[0])
+      .mockReturnValueOnce(sources[1]);
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.snapshotStream).toHaveBeenCalledTimes(1);
+
+    act(() => sources[0].onerror?.(new Event("error")));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+    });
+    expect(api.fetchBootstrap).toHaveBeenCalledTimes(2);
+    const pollSignal = api.fetchBootstrap.mock.calls[1][0] as AbortSignal;
+    expect(pollSignal.aborted).toBe(false);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+    });
+    expect(api.snapshotStream).toHaveBeenCalledTimes(2);
+    act(() => sources[1].onopen?.(new Event("open")));
+    expect(pollSignal.aborted).toBe(true);
+
+    const sseSnapshot = {
+      ...snapshot,
+      cursor: "cursor-sse",
+      matches: [match("sse-new")],
+    };
+    act(() => listeners[1]?.(new MessageEvent("snapshot", {
+      data: JSON.stringify(sseSnapshot),
+    })));
+    expect(screen.getByRole("button", { name: "select-sse-new" })).toBeInTheDocument();
+
+    await act(async () => {
+      resolvePoll?.({
+        ...snapshot,
+        cursor: "cursor-stale-poll",
+        matches: [match("stale-poll")],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "select-sse-new" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "select-stale-poll" })).not.toBeInTheDocument();
+    expect(api.fetchBootstrap).toHaveBeenCalledTimes(2);
   });
 
   it("stops hidden monitor detail, mapping, and control refreshes in OpenDota view", async () => {
@@ -347,15 +562,21 @@ describe("App data recovery and ownership", () => {
     };
     const replaySnapshot = {
       ...snapshot,
-      matches: [liveMatch, replayMatch],
+      matches: [liveMatch],
     };
     let snapshotListener: ((event: MessageEvent<string>) => void) | null = null;
+    const close = vi.fn();
     api.fetchBootstrap.mockResolvedValue(replaySnapshot);
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [replayMatch],
+      next_cursor: null,
+      has_more: false,
+    });
     api.snapshotStream.mockReturnValue({
       addEventListener: vi.fn((name: string, listener: (event: MessageEvent<string>) => void) => {
         if (name === "snapshot") snapshotListener = listener;
       }),
-      close: vi.fn(),
+      close,
       onerror: null,
       onopen: null,
     });
@@ -364,6 +585,7 @@ describe("App data recovery and ownership", () => {
     expect(await screen.findByText("live-workspace")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
     expect(await screen.findByText("odds-replay")).toBeInTheDocument();
+    expect(close).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(api.fetchMatchDetail).toHaveBeenCalledWith("replay", expect.any(AbortSignal));
     });
@@ -446,7 +668,12 @@ describe("App data recovery and ownership", () => {
     };
     api.fetchBootstrap.mockResolvedValue({
       ...snapshot,
-      matches: [match("live"), endedMatch],
+      matches: [match("live")],
+    });
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [endedMatch],
+      next_cursor: null,
+      has_more: false,
     });
 
     render(<App />);
@@ -455,16 +682,17 @@ describe("App data recovery and ownership", () => {
     expect(screen.queryByRole("button", { name: "select-ended" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
-    expect(screen.getByRole("button", { name: "select-ended" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "select-ended" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
   });
 
   it("fails closed when an ended match is missing the archive eligibility flag", async () => {
     const malformed = { ...match("missing-eligibility"), lifecycle: "ended" } as MonitorMatch;
     delete (malformed as Partial<MonitorMatch>).history_eligible;
-    api.fetchBootstrap.mockResolvedValue({
-      ...snapshot,
-      matches: [malformed],
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [malformed],
+      next_cursor: null,
+      has_more: false,
     });
 
     render(<App />);
@@ -485,7 +713,12 @@ describe("App data recovery and ownership", () => {
     };
     api.fetchBootstrap.mockResolvedValue({
       ...snapshot,
-      matches: [match("live"), archivedMatch],
+      matches: [match("live")],
+    });
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [archivedMatch],
+      next_cursor: null,
+      has_more: false,
     });
 
     render(<App />);
@@ -494,7 +727,7 @@ describe("App data recovery and ownership", () => {
     expect(screen.queryByRole("button", { name: "select-archived" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
-    expect(screen.getByRole("button", { name: "select-archived" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "select-archived" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
   });
 

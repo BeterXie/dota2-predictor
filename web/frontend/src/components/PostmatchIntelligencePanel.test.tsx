@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { fetchExactPostmatchAttribution } from "../api";
@@ -28,6 +28,51 @@ describe("PostmatchIntelligencePanel", () => {
     expect(screen.getByText("57.0%")).toBeInTheDocument();
     expect(screen.getByText("团战事件 缺失")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith("match-1", 2, expect.any(AbortSignal));
+  });
+
+  it("keeps historical mapping names on their exact probability sides", async () => {
+    const result = available();
+    result.postmatch!.match.radiant_team_id = 202;
+    result.postmatch!.match.dire_team_id = 101;
+    result.postmatch!.states.radiant = state("radiant", "comeback", 202);
+    result.postmatch!.states.dire = state("dire", "throw", 101);
+    fetchMock.mockResolvedValue(result);
+    const { container } = renderPanel("Current Beacon", "Current Aurora");
+
+    expect(await screen.findByText("Historical Aurora")).toBeInTheDocument();
+    expect(screen.getByText("Historical Beacon")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", {
+      name: "Historical Aurora（team_one）概率",
+    })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", {
+      name: "Historical Beacon（team_two）概率",
+    })).toBeInTheDocument();
+    const eventRow = screen.getByText("肉山击杀").closest("tr");
+    expect(eventRow).not.toBeNull();
+    const cells = within(eventRow!).getAllByRole("cell");
+    expect(cells[5]).toHaveTextContent("57.0%");
+    expect(cells[6]).toHaveTextContent("43.0%");
+    const stateCards = container.querySelectorAll(".postmatch-state");
+    expect(stateCards).toHaveLength(2);
+    expect(within(stateCards[0] as HTMLElement).getByText("Historical Beacon")).toBeInTheDocument();
+    expect(within(stateCards[1] as HTMLElement).getByText("Historical Aurora")).toBeInTheDocument();
+    expect(screen.queryByText("Current Beacon")).not.toBeInTheDocument();
+    expect(screen.queryByText("Current Aurora")).not.toBeInTheDocument();
+  });
+
+  it("fails closed when a legacy available response has no mapping names", async () => {
+    fetchMock.mockResolvedValue({ ...available(), mapping: null });
+    renderPanel("Current Team One", "Current Team Two");
+
+    expect(await screen.findByRole("columnheader", {
+      name: "映射名称缺失（team_one）概率",
+    })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", {
+      name: "映射名称缺失（team_two）概率",
+    })).toBeInTheDocument();
+    expect(screen.getAllByText("映射名称缺失")).toHaveLength(2);
+    expect(screen.queryByText("Current Team One")).not.toBeInTheDocument();
+    expect(screen.queryByText("Current Team Two")).not.toBeInTheDocument();
   });
 
   it("shows current mapping warnings without hiding immutable postmatch facts", async () => {
@@ -98,13 +143,13 @@ describe("PostmatchIntelligencePanel", () => {
   });
 });
 
-function renderPanel() {
+function renderPanel(teamOne = "Aurora", teamTwo = "Beacon") {
   return render(
     <PostmatchIntelligencePanel
       mapNumber={2}
       raybetMatchId="match-1"
-      teamOne="Aurora"
-      teamTwo="Beacon"
+      teamOne={teamOne}
+      teamTwo={teamTwo}
     />,
   );
 }
@@ -115,7 +160,26 @@ function available(): ExactPostmatchAttribution {
     map_number: 2,
     status: "available",
     reason: "confirmed",
-    mapping: { mapping_id: 12 },
+    mapping: {
+      mapping_id: 12,
+      event_id: "strict-event-1",
+      acceptance_mode: "manual_exact",
+      mapping_version: "strict-live-map-v1",
+      canonical_teams: [
+        {
+          side: "team_one",
+          team_id: 101,
+          team_name: "Historical Aurora",
+        },
+        {
+          side: "team_two",
+          team_id: 202,
+          team_name: "Historical Beacon",
+        },
+      ],
+      accepted_at: "2026-07-17T00:00:00Z",
+      recorded_at: "2026-07-17T00:00:01Z",
+    },
     reconciliation: { reconciliation_id: 18, status: "confirmed" },
     odds_timeline: [{
       observed_at: "2026-07-17T00:20:00Z",

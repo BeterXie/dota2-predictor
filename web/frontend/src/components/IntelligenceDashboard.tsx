@@ -35,6 +35,7 @@ import type {
   IntelligenceDraftQualitySlice,
   IntelligenceMatchDetail,
   IntelligenceMatchPage,
+  IntelligenceMatchRating,
   IntelligenceMatchSummary,
   IntelligenceOverview,
   IntelligencePagination,
@@ -705,13 +706,18 @@ function MatchDetailPanel({
             比赛 #{match.match_id}　{formatUnixTime(match.start_time)}　时长 {formatDuration(match.duration)}
           </p>
         </div>
-        <span className="intel-method-note">不合成未定义的比赛总分，保留各项可审计结果</span>
       </header>
 
       <ScoreEvidenceStrip
         benchmarkCutoffs={scoreEvidence.benchmarkCutoffs}
         scoreVersions={scoreEvidence.scoreVersions}
         source="本场逐局评分"
+      />
+
+      <MatchRatingPanel
+        rating={value.matchRating}
+        radiant={radiant}
+        dire={dire}
       />
 
       <section className="intel-detail-section">
@@ -745,7 +751,7 @@ function MatchDetailPanel({
       <section className="intel-detail-section">
         <div className="intel-section-heading compact">
           <div>
-            <h3>阵容胜率切片</h3>
+            <h3>阵容评分（胜率）</h3>
             <p>历史重建与真实前瞻数据严格分开显示</p>
           </div>
           <Sword size={19} aria-hidden="true" />
@@ -753,6 +759,64 @@ function MatchDetailPanel({
         <DraftPredictionTable predictions={value.draftPredictions} />
       </section>
     </main>
+  );
+}
+
+function MatchRatingPanel({
+  rating,
+  radiant,
+  dire,
+}: {
+  rating: IntelligenceMatchRating | null;
+  radiant: string;
+  dire: string;
+}) {
+  if (!rating) {
+    return (
+      <section className="intel-match-rating unavailable" aria-label="比赛综合评分">
+        <strong>比赛综合评分</strong>
+        <span>当前评分证据不满足 10 人同版本、同基准截止条件</span>
+      </section>
+    );
+  }
+  return (
+    <section className="intel-match-rating" aria-label="比赛综合评分">
+      <header>
+        <div>
+          <h3>比赛综合评分</h3>
+          <p>{rating.player_count} 名当前版本选手评分的算术平均</p>
+        </div>
+        <code>{rating.rating_version}</code>
+      </header>
+      <div className="intel-match-rating-groups">
+        <MatchRatingGroup label="全场" values={rating.overall} />
+        <MatchRatingGroup label={radiant} values={rating.radiant} />
+        <MatchRatingGroup label={dire} values={rating.dire} />
+      </div>
+      <footer>
+        <span>来源版本 <code>{rating.source_score_version}</code></span>
+        <span>基准截止 <code>{formatCutoff(rating.benchmark_cutoff)}</code></span>
+      </footer>
+    </section>
+  );
+}
+
+function MatchRatingGroup({
+  label,
+  values,
+}: {
+  label: string;
+  values: IntelligenceMatchRating["overall"];
+}) {
+  return (
+    <div className="intel-match-rating-group">
+      <strong>{label}</strong>
+      <dl>
+        <div><dt>执行分</dt><dd>{decimal(values.execution_score, 2)}</dd></div>
+        <div><dt>赛果修正</dt><dd>{decimal(values.result_adjusted_score, 2)}</dd></div>
+        <div><dt>覆盖率</dt><dd>{percent(values.coverage)}</dd></div>
+      </dl>
+    </div>
   );
 }
 
@@ -1268,6 +1332,7 @@ function normalizedDetail(detail: IntelligenceMatchDetail) {
       direState: detail.dire_state,
       playerPerformance: detail.player_performance || [],
       playerScores: detail.player_scores,
+      matchRating: detail.match_rating,
       draftPredictions: detail.draft_predictions,
     };
   }
@@ -1277,6 +1342,7 @@ function normalizedDetail(detail: IntelligenceMatchDetail) {
     direState: detail.states?.dire ?? detail.dire_state ?? null,
     playerPerformance: detail.player_performance || [],
     playerScores: detail.player_scores,
+    matchRating: detail.match_rating,
     draftPredictions: detail.draft_predictions,
   };
 }

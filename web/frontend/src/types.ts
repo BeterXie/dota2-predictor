@@ -37,6 +37,8 @@ export interface VisionPoint {
   clock_confidence: number;
   draft_confidence: number;
   source_frame_ref?: string;
+  frame_digest?: string | null;
+  frame_url?: string | null;
 }
 
 export interface StrategyDecision {
@@ -218,6 +220,12 @@ export interface MonitorSnapshot {
   };
 }
 
+export interface MonitorHistoryPage {
+  items: MonitorMatch[];
+  next_cursor: string | null;
+  has_more: boolean;
+}
+
 export interface MonitorLifecycleCounts {
   total: number;
   upcoming: number;
@@ -318,17 +326,34 @@ export interface IntelligencePlayerPerformance {
 
 export interface IntelligencePlayerMapScore extends IntelligencePlayerPerformance {
   position: number | null;
-  execution_score: number;
-  result_adjusted_score: number;
-  coverage: number;
-  role_confidence: number;
+  execution_score: number | null;
+  result_adjusted_score: number | null;
+  coverage: number | null;
+  role_confidence: number | null;
   ranking_eligible: boolean;
-  benchmark_cutoff: string;
+  benchmark_cutoff: string | null;
   score_version: string;
   component_facts: unknown[] | Record<string, unknown>;
   component_scores: unknown[] | Record<string, unknown>;
   weights: unknown[] | Record<string, unknown>;
   explanation: Record<string, unknown>;
+}
+
+export interface IntelligenceMatchRatingValues {
+  execution_score: number;
+  result_adjusted_score: number;
+  coverage: number;
+}
+
+export interface IntelligenceMatchRating {
+  rating_version: string;
+  rounding: "decimal-half-up-2dp";
+  source_score_version: string;
+  benchmark_cutoff: string;
+  player_count: 10;
+  overall: IntelligenceMatchRatingValues;
+  radiant: IntelligenceMatchRatingValues;
+  dire: IntelligenceMatchRatingValues;
 }
 
 export interface IntelligenceDraftPrediction {
@@ -356,6 +381,7 @@ export interface IntelligenceFlatMatchDetail extends IntelligenceMatchSummary {
   };
   player_performance?: IntelligencePlayerPerformance[];
   player_scores: IntelligencePlayerMapScore[];
+  match_rating: IntelligenceMatchRating | null;
   draft_predictions: IntelligenceDraftPrediction[];
 }
 
@@ -365,6 +391,7 @@ export interface IntelligenceNestedMatchDetail {
   dire_state: IntelligenceTeamState | null;
   player_performance?: IntelligencePlayerPerformance[];
   player_scores: IntelligencePlayerMapScore[];
+  match_rating: IntelligenceMatchRating | null;
   draft_predictions: IntelligenceDraftPrediction[];
 }
 
@@ -406,12 +433,28 @@ export interface ExactPostmatchPayload {
   };
 }
 
+export interface ExactPostmatchMappingTeam {
+  side: "team_one" | "team_two";
+  team_id: number;
+  team_name: string;
+}
+
+export interface ExactPostmatchMapping {
+  mapping_id: number;
+  event_id: string;
+  acceptance_mode: string;
+  mapping_version: string;
+  canonical_teams: ExactPostmatchMappingTeam[];
+  accepted_at: string;
+  recorded_at: string;
+}
+
 export interface ExactPostmatchAttribution {
   raybet_match_id: string;
   map_number: number;
   status: ExactPostmatchStatus;
   reason: string;
-  mapping: Record<string, unknown> | null;
+  mapping: ExactPostmatchMapping | null;
   reconciliation: Record<string, unknown> | null;
   odds_timeline: WinnerTimelinePoint[];
   postmatch: ExactPostmatchPayload | null;

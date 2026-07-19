@@ -2,29 +2,37 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import math
 import re
+import secrets
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
+from urllib.parse import quote as url_quote
 
 from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
 from live_betting.sanitize import stored_public_stream_url
 from live_betting.strict_eligibility import query_strict_live_eligibility
+from live_betting.vision_frame_registry import VISION_FRAME_REF_PREFIX
 
 from .alerts import active_alerts
 
 
-_LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 _OPEN_MATCH_STATUSES = {"1", "2", "open", "active", "running"}
 _ENDED_MATCH_STATUSES = {"3", "5", "ended", "finished", "settled", "closed"}
+_ENDED_STATUS_SQL = (
+    "lower(status) IN ('3', '5', 'closed', 'ended', 'finished', 'settled')"
+)
 _UPCOMING_MATCH_STATUSES = {"1", "upcoming", "scheduled", "not_started"}
 _HISTORY_SCHEDULE_GRACE = timedelta(hours=12)
 _HISTORY_ACTIVITY_GRACE = timedelta(minutes=15)
+_SQLITE_DATETIME_ROUNDING_GRACE = timedelta(milliseconds=1)
 _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
     "shadow_worker": 45.0,
@@ -35,6 +43,52 @@ _RAYBET_PAGE_ORIGINS = frozenset(
 )
 _RAYBET_PAGE_PREFIXES = ("/sports/esports", "/esports", "/dota2")
 _RAYBET_PAGE_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
+_MAX_VISION_TIMELINE_POINTS = 5_000
+_MATCH_COLUMN_NAMES = (
+    "raybet_match_id",
+    "tournament",
+    "team_one",
+    "team_two",
+    "scheduled_at",
+    "best_of",
+    "status",
+    "live_url",
+    "raw_json",
+    "updated_at",
+)
+_REALTIME_MATCH_LIMIT = 64
+_REALTIME_BUCKET_LIMIT = 64
+_REALTIME_REVIEW_LIMIT = 16
+_REALTIME_CANDIDATE_LIMIT = 128
+_REALTIME_HISTORY_LIMIT = 16
+_REALTIME_VISION_SCAN_LIMIT = 256
+_HISTORY_DEFAULT_LIMIT = 20
+_HISTORY_MAX_LIMIT = 50
+_HISTORY_SCAN_LIMIT = 200
+_HISTORY_CURSOR_MAX_LENGTH = 768
+_HISTORY_CURSOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
+_HISTORY_CURSOR_DOMAIN = b"dota2-monitor-history-v1\0"
+_HISTORY_CURSOR_SECRET = secrets.token_bytes(32)
+_CURSOR_VOLATILE_FIELDS = frozenset({"cursor", "generated_at", "age_seconds"})
+_SCHEDULE_UTC_JULIANDAY = """CASE
+    WHEN length(scheduled_at)=19
+     AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+     AND strftime('%Y-%m-%d %H:%M:%S', julianday(scheduled_at))=scheduled_at
+    THEN julianday(scheduled_at, '-8 hours')
+    WHEN length(scheduled_at)=25
+     AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
+     AND strftime(
+         '%Y-%m-%dT%H:%M:%S+00:00',
+         julianday(scheduled_at)
+     )=scheduled_at
+    THEN julianday(scheduled_at)
+    ELSE NULL
+END"""
+_TIMELINE_KEY_SQL = f"""CAST(COALESCE(
+    ({_SCHEDULE_UTC_JULIANDAY}),
+    julianday(updated_at),
+    0
+) * 86400000 AS INTEGER)"""
 
 
 def utc_now() -> datetime:
@@ -123,9 +177,8 @@ def build_monitor_snapshot(
     all_counts = _lifecycle_counts(matches)
     live_view = [item for item in matches if not _is_historical_match(item)]
     history_view = [item for item in matches if _is_historical_match(item)]
-    return {
+    snapshot = {
         "generated_at": checked_at.isoformat(),
-        "cursor": monitor_cursor(connection),
         "mapping_revision": mapping_revision(connection),
         "health": health,
         "matches": matches,
@@ -148,6 +201,8 @@ def build_monitor_snapshot(
             "active_alerts": len(alerts),
         },
     }
+    snapshot["cursor"] = _snapshot_cursor(snapshot)
+    return snapshot
 
 
 def monitor_matches(
@@ -156,13 +211,7 @@ def monitor_matches(
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     checked_at = _aware_utc(now or utc_now())
-    rows = _rows(
-        connection,
-        """SELECT raybet_match_id, tournament, team_one, team_two,
-                  scheduled_at, best_of, status, live_url, raw_json, updated_at
-             FROM raybet_matches
-            ORDER BY scheduled_at DESC, raybet_match_id DESC""",
-    )
+    rows = _realtime_match_candidates(connection, checked_at)
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
@@ -178,7 +227,75 @@ def monitor_matches(
             str(item["raybet_match_id"]),
         )
     )
-    return output
+    return output[:_REALTIME_MATCH_LIMIT]
+
+
+def monitor_history_page(
+    connection: sqlite3.Connection,
+    *,
+    cursor: str | None = None,
+    limit: int = _HISTORY_DEFAULT_LIMIT,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return a bounded immutable-odds replay page.
+
+    The first page fixes the eligibility clock.  Later pages recover that
+    clock from the cursor, so a long pagination session cannot move matches
+    across the archive boundary merely because wall time advanced.
+    """
+
+    if type(limit) is not int or not 1 <= limit <= _HISTORY_MAX_LIMIT:
+        raise ValueError("history limit is out of range")
+    if cursor is None:
+        checked_at = _aware_utc(now or utc_now())
+        before = None
+    else:
+        decoded = _decode_history_cursor(cursor)
+        checked_at = decoded["checked_at"]
+        before = (int(decoded["timeline_key"]), str(decoded["match_id"]))
+        _require_history_cursor_anchor(connection, decoded)
+
+    rows = _history_candidate_window(
+        connection,
+        checked_at=checked_at,
+        before=before,
+    )
+    raw_more = len(rows) > _HISTORY_SCAN_LIMIT
+    candidates = rows[:_HISTORY_SCAN_LIMIT]
+    health_by_component = {
+        item["component"]: item for item in derive_health(connection, now=checked_at)
+    }
+    items: list[dict[str, Any]] = []
+    returned_rows: list[sqlite3.Row] = []
+    last_scanned: sqlite3.Row | None = None
+    found_extra = False
+    for row in candidates:
+        last_scanned = row
+        item = _monitor_match(connection, row, checked_at, health_by_component)
+        if item.get("history_eligible") is not True:
+            continue
+        if len(items) == limit:
+            found_extra = True
+            break
+        items.append(item)
+        returned_rows.append(row)
+
+    has_more = found_extra or raw_more
+    anchor: sqlite3.Row | None = None
+    if found_extra:
+        anchor = returned_rows[-1]
+    elif raw_more:
+        anchor = last_scanned
+    next_cursor = (
+        _encode_history_cursor(anchor, checked_at)
+        if has_more and anchor is not None
+        else None
+    )
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "has_more": bool(next_cursor),
+    }
 
 
 def monitor_match_detail(
@@ -207,7 +324,12 @@ def monitor_match_detail(
             connection, raybet_match_id, max_points=max_points
         ),
         "decisions": _strategy_decisions(connection, raybet_match_id),
-        "vision": _vision_timeline(connection, raybet_match_id),
+        "vision": _vision_timeline(
+            connection,
+            raybet_match_id,
+            now=checked_at,
+            max_points=max_points,
+        ),
         "markets": current_markets(connection, raybet_match_id),
     }
 
@@ -479,58 +601,412 @@ def current_markets(
     return [dict(row) for row in rows]
 
 
-def monitor_cursor(connection: sqlite3.Connection) -> str:
-    values = {
-        "match": _max_value(connection, "raybet_matches", "updated_at"),
-        "odds": _max_value(connection, "odds_snapshots", "id"),
-        "transport": _latest_transport_identity(connection),
-        "browser_page": _browser_page_revision(connection),
-        "vision": _vision_revision(connection),
-        "vision_invalidation": _append_only_revision(
-            connection,
-            "vision_observation_invalidations",
-            time_column="invalidated_at",
-        ),
-        "vision_draft_conflict": _append_only_revision(
-            connection,
-            "vision_draft_conflicts",
-            id_column="conflict_id",
-            time_column="recorded_at",
-        ),
-        "vision_derived_invalidation": _append_only_revision(
-            connection,
-            "vision_derived_invalidations",
-            time_column="recorded_at",
-        ),
-        "decision": _max_value(connection, "strategy_decisions", "decided_at"),
-        "health": _max_value(connection, "service_health", "updated_at"),
-        "mapping": mapping_revision(connection),
-        "control": _max_value(connection, "monitor_control_audit", "audit_id"),
-        "alerts": _max_value(connection, "monitor_alert_audit", "audit_id"),
-    }
-    payload = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
+def monitor_cursor(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Return the cursor for the bounded client-visible monitor snapshot."""
+
+    return str(build_monitor_snapshot(connection, now=now)["cursor"])
+
+
+def _snapshot_cursor(snapshot: dict[str, Any]) -> str:
+    projection = _stable_cursor_projection(snapshot)
+    payload = json.dumps(
+        projection,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _stable_cursor_projection(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _stable_cursor_projection(item)
+            for key, item in value.items()
+            if key not in _CURSOR_VOLATILE_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_cursor_projection(item) for item in value]
+    return value
 
 
 def mapping_revision(connection: sqlite3.Connection) -> str:
     try:
-        impact_revision = _max_value(
+        impact_revision = _latest_value(
             connection, "strict_live_mapping_impacts", "impact_id"
         )
     except sqlite3.OperationalError:
         impact_revision = "unavailable"
     values = {
-        "mapping": _max_value(connection, "strict_live_map_mappings", "mapping_id"),
-        "approval": _max_value(
+        "mapping": _latest_value(
+            connection, "strict_live_map_mappings", "mapping_id"
+        ),
+        "approval": _latest_value(
             connection, "strict_live_automatic_evidence_approvals", "approval_id"
         ),
-        "invalidation": _max_value(
+        "invalidation": _latest_value(
             connection, "strict_live_map_mapping_invalidations", "invalidation_id"
         ),
         "impact": impact_revision,
     }
     payload = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _selected_match_columns(alias: str | None = None) -> str:
+    prefix = f"{alias}." if alias else ""
+    return ", ".join(
+        f"{prefix}{column} AS {column}" for column in _MATCH_COLUMN_NAMES
+    )
+
+
+def _realtime_match_candidates(
+    connection: sqlite3.Connection,
+    checked_at: datetime,
+) -> list[sqlite3.Row]:
+    """Return bounded candidates before any per-match projection queries."""
+
+    selected = _selected_match_columns()
+    qualified = _selected_match_columns("match_row")
+    buckets: list[tuple[int, list[sqlite3.Row]]] = []
+
+    provider_live = _rows(
+        connection,
+        f"""SELECT rowid AS _candidate_rowid, {selected}
+               FROM raybet_matches
+              WHERE status='2'
+                AND updated_at>=?
+                AND updated_at<=?
+              ORDER BY updated_at DESC, raybet_match_id DESC
+              LIMIT ?""",
+        (
+            (checked_at - timedelta(seconds=90)).isoformat(),
+            checked_at.isoformat(),
+            _REALTIME_BUCKET_LIMIT,
+        ),
+    )
+    buckets.append((0, provider_live))
+
+    ended_review = _ended_review_match_candidates(connection, checked_at)
+    buckets.append((1, ended_review))
+
+    vision_ids = _recent_vision_match_ids(connection, checked_at)
+    if vision_ids:
+        placeholders = ",".join("?" for _ in vision_ids)
+        vision_rows = _rows(
+            connection,
+            f"""SELECT rowid AS _candidate_rowid, {selected}
+                   FROM raybet_matches
+                  WHERE raybet_match_id IN ({placeholders})
+                  LIMIT ?""",
+            (*vision_ids, _REALTIME_BUCKET_LIMIT),
+        )
+        buckets.append((2, vision_rows))
+
+    activity_rows = _rows(
+        connection,
+        f"""SELECT match_row.rowid AS _candidate_rowid, {qualified}
+               FROM raybet_match_odds_activity AS activity
+               JOIN raybet_matches AS match_row
+                 ON match_row.raybet_match_id=activity.raybet_match_id
+              WHERE activity.latest_odds_activity_at>=?
+                AND activity.latest_odds_activity_at<=?
+              ORDER BY activity.latest_odds_activity_at DESC,
+                       activity.raybet_match_id DESC
+              LIMIT ?""",
+        (
+            (checked_at - _HISTORY_ACTIVITY_GRACE).isoformat(),
+            checked_at.isoformat(),
+            _REALTIME_BUCKET_LIMIT,
+        ),
+    )
+    buckets.append((3, activity_rows))
+
+    upcoming = _rows(
+        connection,
+        f"""SELECT rowid AS _candidate_rowid, {selected}
+               FROM raybet_matches
+              WHERE {_SCHEDULE_UTC_JULIANDAY}>julianday(?)
+              ORDER BY {_SCHEDULE_UTC_JULIANDAY}, raybet_match_id
+              LIMIT ?""",
+        (
+            (checked_at + timedelta(minutes=15)).isoformat(),
+            _REALTIME_BUCKET_LIMIT,
+        ),
+    )
+    buckets.append((4, upcoming))
+
+    recent_metadata = _rows(
+        connection,
+        f"""SELECT rowid AS _candidate_rowid, {selected}
+               FROM raybet_matches
+              WHERE updated_at>=?
+                AND updated_at<=?
+              ORDER BY updated_at DESC, raybet_match_id DESC
+              LIMIT ?""",
+        (
+            (checked_at - timedelta(hours=24)).isoformat(),
+            checked_at.isoformat(),
+            _REALTIME_BUCKET_LIMIT,
+        ),
+    )
+    buckets.append((5, recent_metadata))
+
+    recent_history = _rows(
+        connection,
+        f"""SELECT rowid AS _candidate_rowid, {selected}
+               FROM raybet_matches
+              WHERE {_TIMELINE_KEY_SQL}<=
+                    CAST(julianday(?) * 86400000 AS INTEGER)
+              ORDER BY {_TIMELINE_KEY_SQL} DESC, raybet_match_id DESC
+              LIMIT ?""",
+        (
+            checked_at.isoformat(),
+            _REALTIME_HISTORY_LIMIT,
+        ),
+    )
+    buckets.append((6, recent_history))
+
+    by_match: dict[str, tuple[int, sqlite3.Row]] = {}
+    for priority, rows in buckets:
+        for row in rows:
+            match_id = str(row["raybet_match_id"])
+            previous = by_match.get(match_id)
+            if previous is None or priority < previous[0]:
+                by_match[match_id] = (priority, row)
+    ordered = sorted(
+        by_match.values(),
+        key=lambda value: (
+            value[0],
+            -int(value[1]["_candidate_rowid"]),
+            str(value[1]["raybet_match_id"]),
+        ),
+    )
+    return [row for _, row in ordered[:_REALTIME_CANDIDATE_LIMIT]]
+
+
+def _ended_review_match_candidates(
+    connection: sqlite3.Connection,
+    checked_at: datetime,
+) -> list[sqlite3.Row]:
+    """Return a bounded indexed window of contradictory ended rows."""
+
+    selected = _selected_match_columns()
+    future = _rows(
+        connection,
+        f"""SELECT rowid AS _candidate_rowid, {selected}
+               FROM raybet_matches
+                    INDEXED BY idx_raybet_matches_ended_schedule_review
+              WHERE {_ENDED_STATUS_SQL}
+                AND scheduled_at IS NOT NULL
+                AND ({_SCHEDULE_UTC_JULIANDAY})>julianday(?)
+              ORDER BY ({_SCHEDULE_UTC_JULIANDAY}),
+                       updated_at DESC, raybet_match_id DESC
+              LIMIT ?""",
+        (
+            (checked_at - _SQLITE_DATETIME_ROUNDING_GRACE).isoformat(),
+            _REALTIME_BUCKET_LIMIT,
+        ),
+    )
+    malformed = _rows(
+        connection,
+        f"""SELECT rowid AS _candidate_rowid, {selected}
+               FROM raybet_matches
+                    INDEXED BY idx_raybet_matches_ended_schedule_review
+              WHERE {_ENDED_STATUS_SQL}
+                AND scheduled_at IS NOT NULL
+                AND ({_SCHEDULE_UTC_JULIANDAY}) IS NULL
+                AND updated_at<=?
+              ORDER BY updated_at DESC, raybet_match_id DESC
+              LIMIT ?""",
+        (checked_at.isoformat(), _REALTIME_BUCKET_LIMIT),
+    )
+    candidates = [
+        row
+        for row in (*future, *malformed)
+        if not _ended_schedule_is_trustworthy(
+            row["scheduled_at"],
+            checked_at,
+        )
+    ]
+    candidates.sort(
+        key=lambda row: (
+            (_parse_time(row["updated_at"]) or datetime.min.replace(tzinfo=timezone.utc)),
+            int(row["_candidate_rowid"]),
+            str(row["raybet_match_id"]),
+        ),
+        reverse=True,
+    )
+    return candidates[:_REALTIME_REVIEW_LIMIT]
+
+
+def _recent_vision_match_ids(
+    connection: sqlite3.Connection,
+    checked_at: datetime,
+) -> tuple[str, ...]:
+    rows = _rows(
+        connection,
+        """SELECT raybet_match_id, captured_at
+             FROM vision_observations
+            WHERE confirmed=1 AND screen_state='game'
+              AND captured_at>=? AND captured_at<=?
+            ORDER BY captured_at DESC, raybet_match_id DESC
+            LIMIT ?""",
+        (
+            (checked_at - timedelta(seconds=120)).isoformat(),
+            checked_at.isoformat(),
+            _REALTIME_VISION_SCAN_LIMIT,
+        ),
+    )
+    output: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        captured_at = _parse_time(row["captured_at"])
+        match_id = str(row["raybet_match_id"])
+        if (
+            captured_at is None
+            or captured_at > checked_at
+            or not match_id
+            or match_id in seen
+        ):
+            continue
+        seen.add(match_id)
+        output.append(match_id)
+        if len(output) >= _REALTIME_BUCKET_LIMIT:
+            break
+    return tuple(output)
+
+
+def _history_candidate_window(
+    connection: sqlite3.Connection,
+    *,
+    checked_at: datetime,
+    before: tuple[int, str] | None,
+) -> list[sqlite3.Row]:
+    selected = _selected_match_columns()
+    if before is None:
+        keyset_clause = ""
+        keyset_params: tuple[Any, ...] = ()
+    else:
+        keyset_clause = f"""AND (
+            {_TIMELINE_KEY_SQL}<?
+            OR (
+                {_TIMELINE_KEY_SQL}=?
+                AND raybet_match_id<?
+            )
+        )"""
+        keyset_params = (before[0], before[0], before[1])
+    return _rows(
+        connection,
+        f"""SELECT {_TIMELINE_KEY_SQL} AS _timeline_key, {selected}
+               FROM raybet_matches
+              WHERE {_TIMELINE_KEY_SQL}<=
+                    CAST(julianday(?) * 86400000 AS INTEGER)
+                {keyset_clause}
+              ORDER BY {_TIMELINE_KEY_SQL} DESC, raybet_match_id DESC
+              LIMIT ?""",
+        (
+            checked_at.isoformat(),
+            *keyset_params,
+            _HISTORY_SCAN_LIMIT + 1,
+        ),
+    )
+
+
+def _encode_history_cursor(row: sqlite3.Row, checked_at: datetime) -> str:
+    payload = {
+        "checked_at": checked_at.isoformat(),
+        "match_id": str(row["raybet_match_id"]),
+        "timeline_key": int(row["_timeline_key"]),
+        "v": 1,
+    }
+    body = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    encoded = base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+    digest = hmac.new(
+        _HISTORY_CURSOR_SECRET,
+        _HISTORY_CURSOR_DOMAIN + body,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{encoded}.{digest}"
+
+
+def _decode_history_cursor(cursor: str) -> dict[str, Any]:
+    if (
+        not isinstance(cursor, str)
+        or not 1 <= len(cursor) <= _HISTORY_CURSOR_MAX_LENGTH
+        or _HISTORY_CURSOR_PATTERN.fullmatch(cursor) is None
+    ):
+        raise ValueError("invalid history cursor")
+    encoded, supplied_digest = cursor.split(".", 1)
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        body = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+    except (ValueError, TypeError):
+        raise ValueError("invalid history cursor") from None
+    if base64.urlsafe_b64encode(body).decode("ascii").rstrip("=") != encoded:
+        raise ValueError("invalid history cursor")
+    expected_digest = hmac.new(
+        _HISTORY_CURSOR_SECRET,
+        _HISTORY_CURSOR_DOMAIN + body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_digest, expected_digest):
+        raise ValueError("invalid history cursor")
+    try:
+        payload = json.loads(body.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("invalid history cursor") from None
+    if not isinstance(payload, dict) or set(payload) != {
+        "checked_at",
+        "match_id",
+        "timeline_key",
+        "v",
+    }:
+        raise ValueError("invalid history cursor")
+    checked_at = _parse_time(payload["checked_at"])
+    if (
+        payload["v"] != 1
+        or type(payload["timeline_key"]) is not int
+        or not 0 <= payload["timeline_key"] <= 10**18
+        or not isinstance(payload["match_id"], str)
+        or not 1 <= len(payload["match_id"]) <= 256
+        or checked_at is None
+    ):
+        raise ValueError("invalid history cursor")
+    return {
+        **payload,
+        "checked_at": checked_at,
+    }
+
+
+def _require_history_cursor_anchor(
+    connection: sqlite3.Connection,
+    cursor: dict[str, Any],
+) -> None:
+    row = connection.execute(
+        f"""SELECT {_TIMELINE_KEY_SQL} AS timeline_key
+              FROM raybet_matches WHERE raybet_match_id=?""",
+        (cursor["match_id"],),
+    ).fetchone()
+    if (
+        row is None
+        or int(row["timeline_key"]) != cursor["timeline_key"]
+    ):
+        raise ValueError("history cursor anchor changed")
 
 
 def _monitor_match(
@@ -557,55 +1033,7 @@ def _monitor_match(
                 WHERE raybet_match_id=? ORDER BY received_at DESC, id DESC LIMIT 1""",
             (match_id,),
         )
-    latest_vision = _latest_row(
-        connection,
-        """SELECT observation.captured_at AS observed_at,
-                  observation.map_number, observation.game_clock_seconds,
-                  observation.screen_state, observation.confirmed,
-                  observation.clock_confidence, observation.draft_confidence
-             FROM vision_observations AS observation
-             JOIN vision_draft_anchors AS anchor
-               ON anchor.raybet_match_id=observation.raybet_match_id
-              AND anchor.map_number=observation.map_number
-              AND (
-                    anchor.status='anchored'
-                     OR (
-                         anchor.status='conflict'
-                         AND anchor.conflict_at IS NOT NULL
-                         AND julianday(anchor.conflict_at) IS NOT NULL
-                         AND julianday(anchor.conflict_at)>julianday(?)
-                         AND NOT EXISTS (
-                             SELECT 1 FROM vision_draft_conflicts AS conflict
-                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
-                                AND conflict.map_number=anchor.map_number
-                                AND (
-                                      julianday(conflict.captured_at) IS NULL
-                                      OR julianday(conflict.captured_at)<=julianday(?)
-                                )
-                         )
-                     )
-              )
-            WHERE observation.raybet_match_id=?
-              AND julianday(observation.captured_at)<=julianday(?)
-              AND NOT EXISTS (
-                  SELECT 1
-                    FROM vision_observation_invalidations AS invalidation
-                    JOIN vision_observations AS invalidated
-                      ON invalidated.raybet_match_id=invalidation.raybet_match_id
-                     AND invalidated.captured_at=invalidation.captured_at
-                     AND invalidated.source_frame_ref=invalidation.source_frame_ref
-                   WHERE invalidated.raybet_match_id=observation.raybet_match_id
-                     AND invalidated.map_number=observation.map_number
-                     AND (
-                           julianday(invalidation.captured_at) IS NULL
-                           OR julianday(observation.captured_at) IS NULL
-                           OR julianday(invalidation.captured_at)>=
-                              julianday(observation.captured_at)
-                     )
-              )
-            ORDER BY observation.captured_at DESC LIMIT 1""",
-         (now.isoformat(), now.isoformat(), match_id, now.isoformat()),
-    )
+    latest_vision = _latest_valid_vision_row(connection, match_id, now=now)
     latest_decision = _latest_strategy_decision(connection, match_id)
     mapping_readiness = _mapping_readiness(connection, match_id, now)
     latest_odds_activity = _latest_odds_activity(connection, match_id)
@@ -660,7 +1088,9 @@ def _monitor_match(
         "lifecycle": lifecycle,
         "history_eligible": history_eligible,
         "winner": current_winner,
-        "latest_vision": dict(latest_vision) if latest_vision else None,
+        "latest_vision": (
+            _vision_point(latest_vision, match_id) if latest_vision else None
+        ),
         "latest_decision": dict(latest_decision) if latest_decision else None,
         "readiness": {
             "odds": odds_readiness,
@@ -1050,19 +1480,168 @@ def _latest_strategy_decision(
 def _vision_timeline(
     connection: sqlite3.Connection,
     raybet_match_id: str,
+    *,
+    now: datetime | None = None,
+    max_points: int = 1200,
 ) -> list[dict[str, Any]]:
     return [
-        dict(row)
-        for row in _rows(
+        _vision_point(row, raybet_match_id)
+        for row in _valid_vision_rows(
             connection,
-            """SELECT captured_at, map_number, game_clock_seconds, is_paused,
-                      radiant_team_side, clock_confidence, draft_confidence,
-                      source_frame_ref, screen_state, confirmed
-                 FROM vision_observations WHERE raybet_match_id=?
-                ORDER BY captured_at, source_frame_ref""",
-            (raybet_match_id,),
+            raybet_match_id,
+            now=_aware_utc(now or utc_now()),
+            max_points=max_points,
         )
     ]
+
+
+def valid_vision_frame_observation(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    frame_ref: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    rows = _valid_vision_rows(
+        connection,
+        raybet_match_id,
+        now=_aware_utc(now or utc_now()),
+        max_points=1,
+        source_frame_ref=frame_ref,
+    )
+    return _vision_point(rows[0], raybet_match_id) if rows else None
+
+
+def _latest_valid_vision_row(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    *,
+    now: datetime,
+) -> sqlite3.Row | None:
+    rows = _valid_vision_rows(
+        connection,
+        raybet_match_id,
+        now=now,
+        max_points=1,
+    )
+    return rows[0] if rows else None
+
+
+def _valid_vision_rows(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    *,
+    now: datetime,
+    max_points: int,
+    source_frame_ref: str | None = None,
+) -> list[sqlite3.Row]:
+    if type(max_points) is not int or max_points <= 0:
+        raise ValueError("max_points must be a positive integer")
+    limit = min(max_points, _MAX_VISION_TIMELINE_POINTS)
+    frame_filter = (
+        "AND observation.source_frame_ref=?" if source_frame_ref is not None else ""
+    )
+    params: tuple[Any, ...] = (raybet_match_id, now.isoformat())
+    if source_frame_ref is not None:
+        params += (source_frame_ref,)
+    params += (limit,)
+    try:
+        return list(
+            connection.execute(
+                f"""SELECT recent.*
+                       FROM (
+                            SELECT observation.captured_at,
+                                   observation.captured_at AS observed_at,
+                                   observation.map_number,
+                                   observation.game_clock_seconds,
+                                   observation.is_paused,
+                                   observation.radiant_team_side,
+                                   observation.clock_confidence,
+                                   observation.draft_confidence,
+                                   observation.source_frame_ref,
+                                   observation.screen_state,
+                                   observation.confirmed,
+                                   CASE
+                                       WHEN frame.frame_ref IS NOT NULL
+                                        AND observation.source_frame_ref=
+                                            ? || frame.content_sha256
+                                       THEN frame.content_sha256
+                                       ELSE NULL
+                                   END AS _frame_digest
+                              FROM vision_observations AS observation
+                              JOIN vision_draft_anchors AS anchor
+                                ON anchor.raybet_match_id=
+                                   observation.raybet_match_id
+                               AND anchor.map_number=observation.map_number
+                              LEFT JOIN active_vision_frame_artifacts AS frame
+                                ON frame.frame_ref=observation.source_frame_ref
+                               AND frame.content_sha256=
+                                   observation.source_frame_sha256
+                               AND frame.byte_length=observation.source_frame_bytes
+                             WHERE observation.raybet_match_id=?
+                               AND julianday(observation.captured_at) IS NOT NULL
+                               AND julianday(observation.captured_at)<=julianday(?)
+                               AND anchor.status IN ('anchored', 'conflict')
+                               AND (
+                                    anchor.status='anchored'
+                                    OR (
+                                        anchor.conflict_at IS NOT NULL
+                                        AND julianday(anchor.conflict_at) IS NOT NULL
+                                        AND julianday(anchor.conflict_at)>
+                                            julianday(observation.captured_at)
+                                    )
+                               )
+                               AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM vision_observation_invalidations AS invalidation
+                                     WHERE invalidation.raybet_match_id=
+                                           observation.raybet_match_id
+                                       AND invalidation.captured_at=
+                                           observation.captured_at
+                                       AND invalidation.source_frame_ref=
+                                           observation.source_frame_ref
+                               )
+                               AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM vision_draft_conflicts AS conflict
+                                     WHERE conflict.raybet_match_id=
+                                           observation.raybet_match_id
+                                       AND conflict.map_number=observation.map_number
+                                       AND (
+                                            julianday(conflict.captured_at) IS NULL
+                                            OR julianday(conflict.captured_at)<=
+                                               julianday(observation.captured_at)
+                                       )
+                               )
+                               {frame_filter}
+                             ORDER BY observation.captured_at DESC,
+                                      observation.source_frame_ref DESC
+                             LIMIT ?
+                       ) AS recent
+                      ORDER BY recent.captured_at, recent.source_frame_ref""",
+                (VISION_FRAME_REF_PREFIX, *params),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError as error:
+        message = str(error).casefold()
+        if "no such table" in message or "no such column" in message:
+            return []
+        raise
+
+
+def _vision_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
+    point = dict(row)
+    digest = point.pop("_frame_digest", None)
+    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+        point["frame_digest"] = digest
+        point["frame_url"] = (
+            f"/api/monitor/matches/{url_quote(raybet_match_id, safe='')}"
+            f"/vision-frames/{digest}.jpg"
+        )
+    else:
+        point["frame_digest"] = None
+        point["frame_url"] = None
+    return point
 
 
 def _freshness(
@@ -1097,7 +1676,11 @@ def _lifecycle(
 ) -> str:
     normalized = provider_status.casefold()
     if normalized in _ENDED_MATCH_STATUSES:
-        return "ended"
+        return (
+            "ended"
+            if _ended_schedule_is_trustworthy(scheduled_at, checked_at)
+            else "degraded"
+        )
     if raybet_match_is_live(provider_status, updated_at, now=checked_at):
         return "live"
     if (
@@ -1125,7 +1708,7 @@ def _history_eligible(
 ) -> bool:
     """Expose old odds for replay without claiming provider settlement."""
     if lifecycle == "ended":
-        return True
+        return _ended_schedule_is_trustworthy(scheduled_at, checked_at)
     if lifecycle != "degraded":
         return False
     scheduled = _parse_schedule(scheduled_at)
@@ -1145,6 +1728,16 @@ def _history_eligible(
         scheduled <= checked_at - _HISTORY_SCHEDULE_GRACE
         and activity <= checked_at - _HISTORY_ACTIVITY_GRACE
     )
+
+
+def _ended_schedule_is_trustworthy(
+    scheduled_at: object,
+    checked_at: datetime,
+) -> bool:
+    if scheduled_at is None:
+        return True
+    scheduled = _parse_schedule(scheduled_at)
+    return scheduled is not None and scheduled <= checked_at
 
 
 def _latest_odds_activity(
@@ -1222,13 +1815,29 @@ def _match_time_sort_value(
 def _parse_schedule(value: object) -> datetime | None:
     if value is None:
         return None
+    text = str(value)
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        if len(text) == 19:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            if parsed.year < 1000 or parsed.strftime("%Y-%m-%d %H:%M:%S") != text:
+                return None
+            parsed = parsed.replace(tzinfo=_LOCAL_TIMEZONE)
+        elif len(text) == 25:
+            parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
+            if (
+                parsed.year < 1000
+                or parsed.isoformat(timespec="seconds") != text
+                or parsed.utcoffset() != timedelta(0)
+            ):
+                return None
+        else:
+            return None
+    except (OverflowError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_LOCAL_TIMEZONE)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:
+        return None
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -1264,80 +1873,6 @@ def _has_transport_observations(
             default=0,
         )
     )
-
-
-def _latest_transport_identity(connection: sqlite3.Connection) -> list[str] | None:
-    row = _latest_row(
-        connection,
-        """SELECT observed_at, observation_key
-             FROM odds_transport_observations
-            WHERE timing_status='on_time' AND processing_status='processed'
-            ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
-        (),
-    )
-    if row is None:
-        return None
-    return [str(row["observed_at"]), str(row["observation_key"])]
-
-
-def _vision_revision(connection: sqlite3.Connection) -> list[Any] | None:
-    try:
-        row = connection.execute(
-            """SELECT COUNT(*) AS row_count,
-                      COALESCE(SUM(CASE WHEN confirmed=1 THEN 1 ELSE 0 END), 0)
-                          AS confirmed_count,
-                      MAX(captured_at) AS latest_captured_at,
-                      MAX(CASE WHEN confirmed=1 THEN captured_at END)
-                          AS latest_confirmed_at
-                 FROM vision_observations"""
-        ).fetchone()
-    except sqlite3.OperationalError as error:
-        if "no such table" in str(error):
-            return None
-        raise
-    if row is None:
-        return None
-    return [int(row[0]), int(row[1]), row[2], row[3]]
-
-
-def _browser_page_revision(connection: sqlite3.Connection) -> list[Any] | None:
-    try:
-        row = connection.execute(
-            """SELECT COUNT(*), MAX(event_id), MAX(captured_at)
-                 FROM browser_events
-                WHERE game_id=151
-                  AND recognized=1
-                  AND event_type IN ('odds', 'market_update', 'video')
-                  AND processing_status IN ('processed', 'audit_only')"""
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
-    if row is None:
-        return None
-    return [int(row[0]), row[1], row[2]]
-
-
-def _append_only_revision(
-    connection: sqlite3.Connection,
-    table: str,
-    *,
-    time_column: str,
-    id_column: str = "rowid",
-) -> list[Any] | None:
-    try:
-        row = connection.execute(
-            f"""SELECT COUNT(*) AS row_count,
-                       MAX({id_column}) AS latest_id,
-                       MAX({time_column}) AS latest_at
-                  FROM {table}"""
-        ).fetchone()
-    except sqlite3.OperationalError as error:
-        if "no such table" in str(error):
-            return None
-        raise
-    if row is None:
-        return None
-    return [int(row[0]), row[1], row[2]]
 
 
 def _rows(
@@ -1382,8 +1917,12 @@ def _scalar(
     return row[0] if row is not None else default
 
 
-def _max_value(connection: sqlite3.Connection, table: str, column: str) -> Any:
-    return _scalar(connection, f"SELECT MAX({column}) FROM {table}", default=None)
+def _latest_value(connection: sqlite3.Connection, table: str, column: str) -> Any:
+    return _scalar(
+        connection,
+        f"SELECT {column} FROM {table} ORDER BY {column} DESC LIMIT 1",
+        default=None,
+    )
 
 
 def _json_object(value: object) -> dict[str, Any]:
@@ -1410,6 +1949,7 @@ __all__ = [
     "derive_health",
     "mapping_revision",
     "monitor_cursor",
+    "monitor_history_page",
     "monitor_match_detail",
     "monitor_matches",
     "winner_timeline",

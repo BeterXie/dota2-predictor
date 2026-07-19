@@ -1,5 +1,5 @@
 import { FluentProvider, webDarkTheme } from "@fluentui/react-components";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -278,6 +278,28 @@ describe("IntelligenceDashboard", () => {
         weights: [],
         explanation: {},
       }],
+      match_rating: {
+        rating_version: "match-rating-v1-current-player-score-mean",
+        rounding: "decimal-half-up-2dp",
+        source_score_version: "player-score-v3+observed-role=role-v1",
+        benchmark_cutoff: "2026-07-01T00:00:00Z",
+        player_count: 10,
+        overall: {
+          execution_score: 57,
+          result_adjusted_score: 57.3,
+          coverage: 0.82,
+        },
+        radiant: {
+          execution_score: 56,
+          result_adjusted_score: 56.4,
+          coverage: 0.82,
+        },
+        dire: {
+          execution_score: 58,
+          result_adjusted_score: 58.2,
+          coverage: 0.82,
+        },
+      },
       draft_predictions: [{
         model_version: "draft-v1",
         model_kind: "context_adjusted",
@@ -303,13 +325,26 @@ describe("IntelligenceDashboard", () => {
     expect(screen.getAllByText("翻盘局").length).toBeGreaterThan(0);
     expect(screen.getAllByText("被翻盘局").length).toBeGreaterThan(0);
     expect(screen.getByText("78.2")).toBeInTheDocument();
-    expect(screen.getByText("player-score-v3+observed-role=role-v1")).toBeInTheDocument();
-    expect(screen.getByText("2026-07-01")).toBeInTheDocument();
+    expect(screen.getAllByText("player-score-v3+observed-role=role-v1").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("2026-07-01").length).toBeGreaterThan(0);
     expect(screen.getByText("K/D/A 8 / 2 / 11")).toBeInTheDocument();
     expect(screen.getByText(/GPM\/XPM 650 \/ 720/)).toBeInTheDocument();
     expect(screen.getByText(/英雄\/建筑伤害 24,000 \/ 9,000/)).toBeInTheDocument();
     expect(screen.getByText("Delta")).toBeInTheDocument();
     expect(screen.getByText("K/D/A 2 / 7 / 16")).toBeInTheDocument();
+    const matchRating = screen.getByRole("region", { name: "比赛综合评分" });
+    expect(within(matchRating).getByText("比赛综合评分")).toBeInTheDocument();
+    expect(within(matchRating).getByText("match-rating-v1-current-player-score-mean")).toBeInTheDocument();
+    expect(within(matchRating).getByText("player-score-v3+observed-role=role-v1")).toBeInTheDocument();
+    expect(within(matchRating).getByText("2026-07-01")).toBeInTheDocument();
+    expect(within(matchRating).getByText("全场")).toBeInTheDocument();
+    expect(within(matchRating).getByText("Aurora")).toBeInTheDocument();
+    expect(within(matchRating).getByText("Beacon")).toBeInTheDocument();
+    expect(within(matchRating).getByText("57.00")).toBeInTheDocument();
+    expect(within(matchRating).getByText("57.30")).toBeInTheDocument();
+    expect(within(matchRating).getAllByText("82.0%")).toHaveLength(3);
+    expect(screen.getByText("阵容评分（胜率）")).toBeInTheDocument();
+    expect(screen.queryByText("不合成未定义的比赛总分，保留各项可审计结果")).not.toBeInTheDocument();
     expect(screen.getByText("评分待处理")).toBeInTheDocument();
     expect(screen.getAllByText("历史重建").length).toBeGreaterThan(0);
     expect(screen.getAllByText("击杀比分 31 : 18")).toHaveLength(2);
@@ -405,6 +440,7 @@ describe("IntelligenceDashboard", () => {
         },
       }],
       player_scores: [],
+      match_rating: null,
       draft_predictions: [],
     });
 
@@ -415,6 +451,9 @@ describe("IntelligenceDashboard", () => {
     });
     expect(screen.getByText("K/D/A 8 / 2 / 11")).toBeInTheDocument();
     expect(screen.getAllByText("评分待处理").length).toBeGreaterThan(0);
+    expect(screen.getByRole("region", { name: "比赛综合评分" })).toHaveTextContent(
+      "当前评分证据不满足 10 人同版本、同基准截止条件",
+    );
     expect(detailMock).not.toHaveBeenCalledWith(9002, expect.anything());
   });
 

@@ -68,9 +68,11 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
-def inspect_vision_frame(path: str | Path) -> VisionFrameReceipt:
-    """Hash one regular file while rejecting links and path replacement."""
-
+def _inspect_vision_frame(
+    path: str | Path,
+    *,
+    capture_bytes: bool,
+) -> tuple[VisionFrameReceipt, bytes | None]:
     candidate = Path(path)
     if _is_link(candidate):
         raise RuntimeError(f"vision frame path is unsafe: {candidate}")
@@ -79,6 +81,7 @@ def inspect_vision_frame(path: str | Path) -> VisionFrameReceipt:
         before = candidate.stat(follow_symlinks=False)
         digest = hashlib.sha256()
         byte_length = 0
+        chunks: list[bytes] | None = [] if capture_bytes else None
         with candidate.open("rb") as handle:
             opened = os.fstat(handle.fileno())
             if not _same_file(before, opened):
@@ -86,6 +89,8 @@ def inspect_vision_frame(path: str | Path) -> VisionFrameReceipt:
             while chunk := handle.read(1024 * 1024):
                 byte_length += len(chunk)
                 digest.update(chunk)
+                if chunks is not None:
+                    chunks.append(chunk)
             after_read = os.fstat(handle.fileno())
         after_path = candidate.stat(follow_symlinks=False)
     except OSError as error:
@@ -98,12 +103,22 @@ def inspect_vision_frame(path: str | Path) -> VisionFrameReceipt:
     ):
         raise RuntimeError("vision frame changed during verification")
     content_sha256 = digest.hexdigest()
-    return VisionFrameReceipt(
-        frame_ref=vision_frame_ref(content_sha256),
-        content_sha256=content_sha256,
-        byte_length=byte_length,
-        storage_path=resolved,
+    return (
+        VisionFrameReceipt(
+            frame_ref=vision_frame_ref(content_sha256),
+            content_sha256=content_sha256,
+            byte_length=byte_length,
+            storage_path=resolved,
+        ),
+        b"".join(chunks) if chunks is not None else None,
     )
+
+
+def inspect_vision_frame(path: str | Path) -> VisionFrameReceipt:
+    """Hash one regular file while rejecting links and path replacement."""
+
+    receipt, _ = _inspect_vision_frame(path, capture_bytes=False)
+    return receipt
 
 
 def verify_vision_frame_receipt(receipt: VisionFrameReceipt) -> VisionFrameReceipt:
@@ -335,6 +350,46 @@ def verify_registered_vision_frame(
     if expected_bytes is not None and int(expected_bytes) != receipt.byte_length:
         raise RuntimeError("vision frame bound byte length differs from registry")
     return verify_vision_frame_receipt(receipt)
+
+
+def read_registered_vision_frame_bytes(
+    connection: sqlite3.Connection,
+    frame_ref: str,
+    *,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+) -> bytes:
+    """Read and verify an active frame without reopening its path."""
+
+    artifact, path = _effective_storage_path(connection, frame_ref)
+    if _retired(connection, frame_ref):
+        raise RuntimeError("vision frame is retired")
+    receipt = VisionFrameReceipt(
+        frame_ref=str(artifact[0]),
+        content_sha256=str(artifact[1]),
+        byte_length=int(artifact[2]),
+        storage_path=path,
+    )
+    expected_hash = _digest(receipt.content_sha256)
+    if receipt.frame_ref != vision_frame_ref(expected_hash):
+        raise RuntimeError("vision frame reference does not match its SHA-256")
+    if receipt.byte_length <= 0:
+        raise RuntimeError("vision frame byte length is invalid")
+    if expected_sha256 is not None and _digest(expected_sha256) != expected_hash:
+        raise RuntimeError("vision frame bound SHA-256 differs from registry")
+    if expected_bytes is not None and int(expected_bytes) != receipt.byte_length:
+        raise RuntimeError("vision frame bound byte length differs from registry")
+
+    actual, encoded = _inspect_vision_frame(path, capture_bytes=True)
+    if (
+        actual.frame_ref != receipt.frame_ref
+        or actual.content_sha256 != expected_hash
+        or actual.byte_length != receipt.byte_length
+        or actual.storage_path.name.casefold() != f"{expected_hash}.jpg"
+        or encoded is None
+    ):
+        raise RuntimeError("vision frame registry differs from its file")
+    return encoded
 
 
 def verify_bound_order_vision_frame(
@@ -613,6 +668,7 @@ __all__ = [
     "VisionFrameReceipt",
     "inspect_vision_frame",
     "publish_vision_frame_bytes",
+    "read_registered_vision_frame_bytes",
     "register_vision_frame_artifact",
     "relocate_vision_frame_artifacts",
     "retire_vision_frame_artifact",

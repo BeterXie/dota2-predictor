@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+
+from live_betting.vision_frame_registry import (
+    read_registered_vision_frame_bytes,
+    vision_frame_ref,
+)
 
 from .. import intelligence, monitoring, queries
 
@@ -50,6 +56,25 @@ def matches() -> dict[str, object]:
         connection.close()
 
 
+@router.get("/history")
+def history(
+    cursor: str | None = Query(None, max_length=768),
+    limit: int = Query(20, ge=1, le=50),
+) -> dict[str, object]:
+    connection = queries.get_db()
+    try:
+        try:
+            return monitoring.monitor_history_page(
+                connection,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+    finally:
+        connection.close()
+
+
 @router.get("/matches/{raybet_match_id}")
 def match_detail(
     raybet_match_id: str,
@@ -83,6 +108,53 @@ def postmatch_detail(
     if detail is None:
         raise HTTPException(status_code=404, detail="RayBet match not found")
     return detail
+
+
+@router.get("/matches/{raybet_match_id}/vision-frames/{frame_digest}.jpg")
+def vision_frame(raybet_match_id: str, frame_digest: str) -> Response:
+    try:
+        frame_ref = vision_frame_ref(frame_digest)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Vision frame not found") from None
+
+    connection = queries.get_db()
+    try:
+        try:
+            observation = monitoring.valid_vision_frame_observation(
+                connection,
+                raybet_match_id,
+                frame_ref,
+            )
+        except sqlite3.Error:
+            raise HTTPException(
+                status_code=409,
+                detail="Vision frame authority is unavailable",
+            ) from None
+        if observation is None or observation.get("frame_digest") != frame_digest:
+            raise HTTPException(status_code=404, detail="Vision frame not found")
+        try:
+            encoded = read_registered_vision_frame_bytes(
+                connection,
+                frame_ref,
+                expected_sha256=frame_digest,
+            )
+        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+            raise HTTPException(
+                status_code=409,
+                detail="Vision frame integrity check failed",
+            ) from None
+    finally:
+        connection.close()
+
+    return Response(
+        content=encoded,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": f'"{frame_digest}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/events")

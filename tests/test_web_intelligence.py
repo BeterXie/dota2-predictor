@@ -23,6 +23,7 @@ from event_intelligence.player_scoring import score_version_for_role
 from event_intelligence.team_profiles import PROFILE_VERSION
 from event_intelligence.team_states import LABEL_VERSION
 from web import queries
+from web.intelligence import MATCH_RATING_ROUNDING, MATCH_RATING_VERSION
 from web.routers.intelligence import router
 
 
@@ -709,6 +710,31 @@ class IntelligenceApiTests(unittest.TestCase):
             payload["player_scores"][0]["performance"],
         )
         self.assertIsInstance(payload["player_scores"][0]["component_facts"], dict)
+        self.assertEqual(
+            payload["match_rating"],
+            {
+                "rating_version": MATCH_RATING_VERSION,
+                "rounding": MATCH_RATING_ROUNDING,
+                "source_score_version": SCORE_VERSION,
+                "benchmark_cutoff": "2026-07-13T00:00:00+00:00",
+                "player_count": 10,
+                "overall": {
+                    "execution_score": 57.0,
+                    "result_adjusted_score": 57.3,
+                    "coverage": 0.82,
+                },
+                "radiant": {
+                    "execution_score": 56.0,
+                    "result_adjusted_score": 56.4,
+                    "coverage": 0.82,
+                },
+                "dire": {
+                    "execution_score": 58.0,
+                    "result_adjusted_score": 58.2,
+                    "coverage": 0.82,
+                },
+            },
+        )
         self.assertEqual(len(payload["draft_predictions"]), 1)
         self.assertEqual(payload["draft_predictions"][0]["probability"], 0.8)
         self.assertEqual(
@@ -726,6 +752,7 @@ class IntelligenceApiTests(unittest.TestCase):
         payload = self.client.get("/api/intelligence/matches/1").json()
 
         self.assertEqual(payload["versions"]["player_score"], SCORE_VERSION)
+        self.assertEqual(payload["versions"]["match_rating"], MATCH_RATING_VERSION)
         self.assertEqual(payload["versions"]["team_state"], LABEL_VERSION)
         self.assertEqual(payload["versions"]["draft_model"], DRAFT_MODEL_VERSION)
         self.assertTrue(any(value.startswith("2026-07-13") for value in payload["cutoffs"]["player_score"]))
@@ -734,6 +761,139 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["states"]["radiant"]["label"], "comeback")
         self.assertEqual(payload["match_id"], 1)
         self.assertEqual(payload["player_performance"][0]["performance"]["kills"], 8)
+
+    def test_match_rating_fails_closed_for_missing_score_row(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "DELETE FROM player_map_scores "
+            "WHERE match_id=1 AND player_slot=4 AND score_version=?",
+            (SCORE_VERSION,),
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertIsNone(payload["match_rating"])
+        self.assertEqual(payload["player_scores"], [])
+
+    def test_match_rating_fails_closed_for_invalid_dota_side_slot(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE player_map_scores SET player_slot=5 "
+            "WHERE match_id=1 AND player_slot=4 AND score_version=?",
+            (SCORE_VERSION,),
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(len(payload["player_scores"]), 10)
+        self.assertIsNone(payload["match_rating"])
+
+    def test_match_rating_fails_closed_for_duplicate_player_slot(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE player_map_scores SET player_slot=3 "
+            "WHERE match_id=1 AND player_slot=4 AND score_version=?",
+            (SCORE_VERSION,),
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(payload["player_scores"], [])
+        self.assertIsNone(payload["match_rating"])
+
+    def test_match_rating_uses_decimal_half_up_rounding(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE player_map_scores SET execution_score=50.05 "
+            "WHERE match_id=1 AND player_slot=1 AND score_version=?",
+            (SCORE_VERSION,),
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(payload["match_rating"]["overall"]["execution_score"], 57.01)
+
+    def test_match_rating_fails_closed_for_null_nan_and_nonfinite_values(
+        self,
+    ) -> None:
+        cases = (
+            ("execution_score", None, 50.0),
+            ("result_adjusted_score", float("nan"), 50.0),
+            ("coverage", float("inf"), 0.8),
+            (
+                "benchmark_cutoff",
+                None,
+                "2026-07-13T00:00:00+00:00",
+            ),
+            (
+                "benchmark_cutoff",
+                "   ",
+                "2026-07-13T00:00:00+00:00",
+            ),
+        )
+        for column, invalid, restored in cases:
+            with self.subTest(column=column, invalid=invalid):
+                connection = sqlite3.connect(self.path)
+                connection.execute(
+                    f"UPDATE player_map_scores SET {column}=? "
+                    "WHERE match_id=1 AND player_slot=1 AND score_version=?",
+                    (invalid, SCORE_VERSION),
+                )
+                connection.commit()
+                connection.close()
+
+                payload = self.client.get("/api/intelligence/matches/1").json()
+                self.assertIsNone(payload["match_rating"])
+
+                connection = sqlite3.connect(self.path)
+                connection.execute(
+                    f"UPDATE player_map_scores SET {column}=? "
+                    "WHERE match_id=1 AND player_slot=1 AND score_version=?",
+                    (restored, SCORE_VERSION),
+                )
+                connection.commit()
+                connection.close()
+
+    def test_match_rating_fails_closed_for_mixed_benchmark_cutoffs(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE player_map_scores SET benchmark_cutoff=? "
+            "WHERE match_id=1 AND player_slot=1 AND score_version=?",
+            ("2026-07-12T00:00:00+00:00", SCORE_VERSION),
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(len(payload["player_scores"]), 10)
+        self.assertIsNone(payload["match_rating"])
+
+    def test_match_rating_never_uses_noncurrent_score_rows(self) -> None:
+        initial = self.client.get("/api/intelligence/matches/1").json()
+        self.assertEqual(initial["match_rating"]["overall"]["execution_score"], 57.0)
+
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "UPDATE player_map_scores SET score_version=? "
+            "WHERE match_id=1 AND player_slot=1 AND score_version=?",
+            (OLD_SCORE_VERSION, SCORE_VERSION),
+        )
+        connection.commit()
+        connection.close()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(payload["player_scores"], [])
+        self.assertIsNone(payload["match_rating"])
 
     def test_match_detail_keeps_independent_performance_when_score_columns_are_legacy(self) -> None:
         connection = sqlite3.connect(self.path)

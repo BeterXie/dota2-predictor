@@ -312,7 +312,8 @@ function DecisionTimeline({ decisions }: { decisions: MatchDetail["decisions"] }
 }
 
 function EvidenceSummary({ detail }: { detail: MatchDetail | null }) {
-  const latestVision = detail?.vision.at(-1);
+  const latestVision = detail?.latest_vision || null;
+  const frameUrl = safeVisionFrameUrl(detail, latestVision);
   return (
     <section className="workspace-section evidence-section">
       <div className="section-heading compact">
@@ -322,6 +323,7 @@ function EvidenceSummary({ detail }: { detail: MatchDetail | null }) {
         </div>
         <Database size={19} aria-hidden="true" />
       </div>
+      <VisionFramePreview frameUrl={frameUrl} vision={latestVision} />
       <dl className="evidence-list">
         <div>
           <dt>赔率快照</dt>
@@ -331,20 +333,64 @@ function EvidenceSummary({ detail }: { detail: MatchDetail | null }) {
           <dt>视觉观测</dt>
           <dd>{detail?.vision.length || 0} 条</dd>
         </div>
-        <div>
-          <dt>最近画面</dt>
-          <dd>{latestVision ? formatDateTime(latestVision.captured_at) : "无"}</dd>
-        </div>
-        <div>
-          <dt>画面状态</dt>
-          <dd className="inline-value">
-            <Eye size={15} aria-hidden="true" />
-            {latestVision?.screen_state || "未识别"}
-          </dd>
-        </div>
       </dl>
     </section>
   );
+}
+
+function VisionFramePreview({
+  frameUrl,
+  vision,
+}: {
+  frameUrl: string | null;
+  vision: MatchDetail["latest_vision"];
+}) {
+  const [failedFrameUrl, setFailedFrameUrl] = useState<string | null>(null);
+  const failed = frameUrl !== null && failedFrameUrl === frameUrl;
+  return (
+    <div className="vision-frame-preview" aria-label="最近有效视觉观测">
+      <div className="vision-frame-stage">
+        {frameUrl && !failed ? (
+          <img
+            alt="最近有效视觉观测画面"
+            onError={() => setFailedFrameUrl(frameUrl)}
+            src={frameUrl}
+          />
+        ) : (
+          <div className="vision-frame-empty" role="status">
+            <Eye size={22} aria-hidden="true" />
+            <span>{failed ? "已捕获画面加载失败" : "暂无可用的已捕获画面"}</span>
+          </div>
+        )}
+      </div>
+      <dl className="vision-frame-meta">
+        <div><dt>捕获时间</dt><dd>{vision ? formatDateTime(vision.captured_at) : "无"}</dd></div>
+        <div><dt>确认状态</dt><dd>{vision ? (vision.confirmed === 1 ? "已确认" : "未确认") : "无观测"}</dd></div>
+        <div><dt>画面状态</dt><dd>{vision?.screen_state || "未识别"}</dd></div>
+      </dl>
+    </div>
+  );
+}
+
+function safeVisionFrameUrl(
+  detail: MatchDetail | null,
+  vision: MatchDetail["latest_vision"],
+): string | null {
+  const digest = vision?.frame_digest;
+  const url = vision?.frame_url;
+  if (
+    !detail
+    || !vision
+    || typeof digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(digest)
+    || typeof url !== "string"
+    || vision.source_frame_ref !== `vision-frame:sha256:${digest}`
+  ) {
+    return null;
+  }
+  const expected = `/api/monitor/matches/${encodeURIComponent(detail.raybet_match_id)}`
+    + `/vision-frames/${digest}.jpg`;
+  return url === expected ? url : null;
 }
 
 function MarketDrawer({ detail }: { detail: MatchDetail | null }) {
