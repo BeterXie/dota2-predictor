@@ -39,6 +39,10 @@ test("manifest has the fixed minimal permission surface", () => {
     ]);
     assert.equal(script.all_frames, false);
   }
+  const mainHook = manifest.content_scripts.find((script) => script.js.includes("src/main-hook.js"));
+  const bridge = manifest.content_scripts.find((script) => script.js.includes("src/content-bridge.js"));
+  assert.equal(mainHook.world, "MAIN");
+  assert.equal(bridge.world, "ISOLATED");
 });
 
 test("extension and companion protocol versions cannot drift independently", () => {

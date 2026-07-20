@@ -25,39 +25,49 @@ function fixture(name) {
   return JSON.parse(readFileSync(join(root, "tests", "fixtures", name), "utf8"));
 }
 
-function loadBridge(pageUrl = "https://www.ray086.com/esports", rejectConfig = false) {
+function loadBridge(pageUrl = "https://www.ray086.com/esports", options = {}) {
+  const settings = typeof options === "boolean"
+    ? {rejectConfig: options}
+    : options;
   const events = [];
   const eventMessages = [];
   const counters = [];
   const diagnostics = [];
   const stateListeners = [];
+  const runtimeMessages = [];
   const window = new FakeWindow();
+  const sendMessage = (message) => {
+    runtimeMessages.push(message);
+    if (settings.throwAction === message.action) throw new Error("runtime unavailable");
+    if (settings.rejectAction === message.action) {
+      return Promise.reject(new Error("runtime rejected"));
+    }
+    if (message.action === "raybet.capture.getConfig") {
+      if (settings.rejectConfig) throw new Error("config unavailable");
+      return {
+        paused: false,
+        enabled: true,
+        enabledDomains: {ray086: true, raylinks: true},
+        captureSessionId: "a".repeat(32),
+      };
+    }
+    if (message.action === "raybet.capture.event") {
+      eventMessages.push(message);
+      events.push(message.event);
+    }
+    if (message.action === "raybet.capture.counter") counters.push(message);
+    if (message.action === "raybet.capture.diagnostic") diagnostics.push(message);
+    return {accepted: true};
+  };
   const chrome = {
     runtime: {
-      sendMessage: async (message) => {
-        if (message.action === "raybet.capture.getConfig") {
-          if (rejectConfig) throw new Error("config unavailable");
-          return {
-            paused: false,
-            enabled: true,
-            enabledDomains: {ray086: true, raylinks: true},
-            captureSessionId: "a".repeat(32),
-          };
-        }
-        if (message.action === "raybet.capture.event") {
-          eventMessages.push(message);
-          events.push(message.event);
-        }
-        if (message.action === "raybet.capture.counter") counters.push(message);
-        if (message.action === "raybet.capture.diagnostic") diagnostics.push(message);
-        return {accepted: true};
-      },
+      sendMessage,
       onMessage: {addListener: (listener) => stateListeners.push(listener)},
     },
   };
-  const context = vm.createContext({
+  if (settings.sendMessageUndefined) delete chrome.runtime.sendMessage;
+  const globals = {
     window,
-    chrome,
     location: new URL(pageUrl),
     performance,
     crypto,
@@ -78,14 +88,18 @@ function loadBridge(pageUrl = "https://www.ray086.com/esports", rejectConfig = f
     Date,
     Promise,
     setTimeout,
-  });
+  };
+  if (!settings.chromeUndefined) globals.chrome = settings.runtimeUndefined ? {} : chrome;
+  const context = vm.createContext(globals);
   context.globalThis = context;
   for (const file of [
     "constants.js", "canonical-json.js", "redact.js", "classify.js", "content-bridge.js",
   ]) {
     vm.runInContext(readFileSync(join(root, "src", file), "utf8"), context, {filename: file});
   }
-  return {window, events, eventMessages, counters, diagnostics, stateListeners};
+  return {
+    window, events, eventMessages, counters, diagnostics, stateListeners, runtimeMessages,
+  };
 }
 
 function rawCandidate({
@@ -106,11 +120,14 @@ function rawCandidate({
   });
 }
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 30));
+const flush = () => new Promise((resolve) => setTimeout(resolve, 100));
 
 test("bridge emits sanitized per-match envelopes and honors pause", async () => {
   const harness = loadBridge();
   await flush();
+  assert.ok(harness.runtimeMessages.some(
+    (message) => message.action === "raybet.capture.getConfig",
+  ));
   harness.window.postMessage(rawCandidate({
     sequence: 1,
     path: "/v2/match",
@@ -240,6 +257,57 @@ test("bridge diagnostics distinguish a failed config load", async () => {
   assert.equal(ready.config_loaded, false);
 });
 
+test("bridge fails closed when the extension runtime is unavailable", async () => {
+  for (const [options, listenerCount] of [
+    [{runtimeUndefined: true}, 0],
+    [{chromeUndefined: true}, 0],
+    [{sendMessageUndefined: true}, 1],
+  ]) {
+    const harness = loadBridge("https://ray086.com/esports", options);
+    await flush();
+    harness.window.postMessage(rawCandidate({
+      sequence: 1,
+      path: "/v2/odds?match_id=410001",
+      matchId: "410001",
+      payload: fixture("odds.json"),
+    }));
+    await flush();
+    assert.equal(harness.events.length, 0);
+    assert.equal(harness.stateListeners.length, listenerCount);
+    assert.equal(harness.diagnostics.length, 0);
+  }
+});
+
+test("bridge absorbs a synchronous runtime send failure", async () => {
+  const harness = loadBridge("https://www.ray086.com/esports", {
+    throwAction: "raybet.capture.getConfig",
+  });
+  await flush();
+  assert.equal(harness.events.length, 0);
+  const ready = harness.diagnostics.find((item) => item.kind === "bridge_ready");
+  assert.equal(ready.config_loaded, false);
+  assert.ok(harness.runtimeMessages.some(
+    (message) => message.action === "raybet.capture.getConfig",
+  ));
+});
+
+test("bridge fails closed when event forwarding rejects", async () => {
+  const harness = loadBridge("https://www.ray086.com/esports", {
+    rejectAction: "raybet.capture.event",
+  });
+  await flush();
+  harness.window.postMessage(rawCandidate({
+    sequence: 1,
+    path: "/v2/match",
+    payload: fixture("match-list.json"),
+  }));
+  await flush();
+  assert.equal(harness.events.length, 0);
+  assert.ok(harness.runtimeMessages.some(
+    (message) => message.action === "raybet.capture.event",
+  ));
+});
+
 test("bridge accepts allowlisted WSS market events end to end", async () => {
   const harness = loadBridge();
   await flush();
@@ -258,6 +326,7 @@ test("bridge accepts allowlisted WSS market events end to end", async () => {
     origin: "wss://cfinfo.365raylinks.com",
     payload: fixture("odds.json"),
   }));
+  await flush();
   await flush();
 
   const event = harness.events.at(-1);

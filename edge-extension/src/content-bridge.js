@@ -19,6 +19,30 @@
   let diagnosticTokens = 20;
   let lastDiagnosticRefill = performance.now();
 
+  function safeRuntimeSendMessage(message) {
+    try {
+      const runtime = root.chrome?.runtime;
+      if (typeof runtime?.sendMessage !== "function") return Promise.resolve(null);
+      return Promise.resolve(runtime.sendMessage.call(runtime, message)).then(
+        (value) => value === undefined ? null : value,
+        () => null,
+      );
+    } catch {
+      return Promise.resolve(null);
+    }
+  }
+
+  function addRuntimeMessageListener(listener) {
+    try {
+      const onMessage = root.chrome?.runtime?.onMessage;
+      if (typeof onMessage?.addListener !== "function") return false;
+      onMessage.addListener.call(onMessage, listener);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function frameContext() {
     return window.top === undefined || window === window.top ? "top" : "child";
   }
@@ -42,17 +66,17 @@
   }
 
   function count(counter, amount = 1) {
-    void chrome.runtime.sendMessage({action: api.ACTIONS.COUNTER, counter, amount}).catch(() => undefined);
+    void safeRuntimeSendMessage({action: api.ACTIONS.COUNTER, counter, amount});
   }
 
   function diagnostic(kind, detail = {}) {
-    void chrome.runtime.sendMessage({
+    void safeRuntimeSendMessage({
       action: api.ACTIONS.DIAGNOSTIC,
       kind,
       observed_at_utc: new Date().toISOString(),
       frame_context: frameContext(),
       ...detail,
-    }).catch(() => undefined);
+    });
   }
 
   function ignored(reason) {
@@ -65,7 +89,7 @@
   }
 
   async function forwardEvent(origin, event) {
-    const response = await chrome.runtime.sendMessage({
+    const response = await safeRuntimeSendMessage({
       action: api.ACTIONS.EVENT,
       source_origin: origin,
       event,
@@ -313,7 +337,7 @@
     void processRaw(raw).catch(() => ignored("processing_error"));
   });
 
-  chrome.runtime.onMessage.addListener((message) => {
+  addRuntimeMessageListener((message) => {
     if (message?.action === api.ACTIONS.STATE) {
       config = {
         ...config,
@@ -325,12 +349,9 @@
   });
 
   diagnostic("bridge_initialized");
-  chrome.runtime.sendMessage({action: api.ACTIONS.GET_CONFIG}).then((value) => {
+  safeRuntimeSendMessage({action: api.ACTIONS.GET_CONFIG}).then((value) => {
     if (value && typeof value.captureSessionId === "string") config = value;
     diagnostic("bridge_ready", {config_loaded: Boolean(config.captureSessionId)});
-    window.postMessage(api.BRIDGE_READY_CHANNEL, "*");
-  }).catch(() => {
-    diagnostic("bridge_ready", {config_loaded: false});
     window.postMessage(api.BRIDGE_READY_CHANNEL, "*");
   });
 
