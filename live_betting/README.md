@@ -290,6 +290,25 @@ python scripts/database_cutover.py verify-prepared `
   --odds-raw-root (Join-Path $restoreDir "live_betting/raw-v2")
 ```
 
+If a code fix advances `HEAD` after bundle creation stopped at
+`snapshot_pending`, resume only by explicitly confirming the full commit stored
+in `staging-manifest.json`:
+
+```powershell
+python scripts/database_bundle.py create `
+  --database (Join-Path $compactionDir "dota2-compacted.db") `
+  --odds-raw-root (Join-Path $compactionDir "live_betting/raw-v2") `
+  --bundle $bundleDir `
+  --resume `
+  --adopt-resume-from-git-commit $checkpointHead
+```
+
+This exception applies only to `snapshot_pending`. The confirmed commit must
+exactly match the checkpoint and be an ancestor of current `HEAD`; source and
+target bindings and source database authority remain unchanged. Adoption is
+recorded in the completed bundle manifest before the old snapshot is discarded
+and copied again.
+
 The bundle contains only artifacts registered by its database snapshot:
 RayBet raw responses, completed-match source artifacts, and active visual
 frames. Creation and verification recompute every artifact identity and reject

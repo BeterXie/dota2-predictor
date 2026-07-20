@@ -713,6 +713,131 @@ def _require_current_provenance(expected: Mapping[str, Any]) -> dict[str, Any]:
     return current
 
 
+def _require_git_commit_ancestor(ancestor: str, descendant: str) -> None:
+    for label, commit in (("checkpoint", ancestor), ("current", descendant)):
+        if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+            raise RuntimeError(f"{label} git commit is invalid")
+    repository = Path(__file__).resolve().parents[1]
+    try:
+        completed = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify checkpoint git ancestry") from error
+    if completed.returncode == 0:
+        return
+    if completed.returncode == 1:
+        raise RuntimeError("checkpoint git commit is not an ancestor of current HEAD")
+    raise RuntimeError("cannot verify checkpoint git ancestry")
+
+
+def _provenance_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "git_commit": value.get("git_commit"),
+        **_provenance_from(value),
+    }
+
+
+def _valid_provenance_snapshot(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    expected_keys = {"git_commit", *_PROVENANCE_FIELDS}
+    if set(value) != expected_keys:
+        return False
+    head = value.get("source_tree_head")
+    dirty_paths = value.get("source_tree_runtime_dirty_paths")
+    return bool(
+        re.fullmatch(r"[0-9a-f]{40,64}", str(value.get("git_commit", "")))
+        and value.get("git_commit") == head
+        and value.get("source_tree_clean") is True
+        and value.get("source_tree_policy_version") == _SOURCE_TREE_POLICY_VERSION
+        and isinstance(dirty_paths, list)
+        and all(
+            isinstance(path, str) and _runtime_only_path(path)
+            for path in dirty_paths
+        )
+    )
+
+
+def _require_provenance_recovery_audit(
+    value: object,
+    current: Mapping[str, Any],
+) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "from",
+        "to",
+        "adopted_at",
+    }:
+        raise RuntimeError("backup bundle provenance recovery audit is invalid")
+    before = value.get("from")
+    after = value.get("to")
+    if (
+        not _valid_provenance_snapshot(before)
+        or not _valid_provenance_snapshot(after)
+        or before == after
+        or after != _provenance_snapshot(current)
+    ):
+        raise RuntimeError("backup bundle provenance recovery audit is invalid")
+    adopted_at = value.get("adopted_at")
+    try:
+        parsed = datetime.fromisoformat(str(adopted_at))
+    except ValueError as error:
+        raise RuntimeError(
+            "backup bundle provenance recovery timestamp is invalid"
+        ) from error
+    if not isinstance(adopted_at, str) or parsed.utcoffset() is None:
+        raise RuntimeError("backup bundle provenance recovery timestamp is invalid")
+
+
+def _adopt_snapshot_pending_provenance(
+    staging: Path,
+    checkpoint: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    expected_old_head: str,
+) -> dict[str, Any]:
+    if checkpoint.get("status") != "snapshot_pending":
+        raise RuntimeError(
+            "bundle provenance adoption requires a snapshot_pending checkpoint"
+        )
+    if "provenance_recovery" in checkpoint:
+        raise RuntimeError("bundle checkpoint provenance was already adopted")
+    old_provenance = _provenance_snapshot(checkpoint)
+    current_provenance = _provenance_snapshot(binding)
+    if not _valid_provenance_snapshot(old_provenance):
+        raise RuntimeError("bundle checkpoint provenance is invalid")
+    if not _valid_provenance_snapshot(current_provenance):
+        raise RuntimeError("current bundle provenance is invalid")
+    old_head = str(old_provenance["git_commit"])
+    current_head = str(current_provenance["git_commit"])
+    if expected_old_head != old_head:
+        raise RuntimeError("confirmed resume git commit differs from checkpoint")
+    if old_head == current_head:
+        raise RuntimeError("bundle checkpoint already uses the current git commit")
+    for key in (
+        "target",
+        "source_database",
+        "odds_raw_root",
+        "allowed_source_roots",
+    ):
+        if checkpoint.get(key) != binding.get(key):
+            raise RuntimeError("backup bundle staging checkpoint binding mismatch")
+    _require_git_commit_ancestor(old_head, current_head)
+    updated = dict(checkpoint)
+    updated.update(binding)
+    updated["provenance_recovery"] = {
+        "from": old_provenance,
+        "to": current_provenance,
+        "adopted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(staging / _STAGING_MANIFEST_FILE, updated)
+    return updated
+
+
 def _artifact_bundle_path(
     registry: str,
     key: str,
@@ -1025,6 +1150,7 @@ def create_database_bundle(
     allowed_source_roots: Iterable[str | Path] = (),
     git_commit: str | None = None,
     resume: bool = False,
+    adopt_resume_from_git_commit: str | None = None,
 ) -> BundleResult:
     """Snapshot a database and copy only artifacts registered by that snapshot."""
 
@@ -1055,6 +1181,7 @@ def create_database_bundle(
             allowed_source_roots=allowed_source_roots,
             git_commit=git_commit,
             resume=resume,
+            adopt_resume_from_git_commit=adopt_resume_from_git_commit,
         )
         _require_checkpointed_source(database_path)
         return result
@@ -1068,7 +1195,10 @@ def _create_database_bundle_locked(
     allowed_source_roots: Iterable[str | Path],
     git_commit: str | None,
     resume: bool,
+    adopt_resume_from_git_commit: str | None,
 ) -> BundleResult:
+    if adopt_resume_from_git_commit is not None and not resume:
+        raise ValueError("resume provenance adoption requires resume=True")
     if not database.is_file():
         raise FileNotFoundError(f"database does not exist: {database}")
     if bundle_directory.exists() and not resume:
@@ -1108,6 +1238,10 @@ def _create_database_bundle_locked(
     }
     staging = _staging_directory(bundle_directory)
     if bundle_directory.exists():
+        if adopt_resume_from_git_commit is not None:
+            raise RuntimeError(
+                "bundle provenance adoption requires a snapshot_pending checkpoint"
+            )
         if staging.exists():
             raise RuntimeError("bundle target and staging both exist")
         if bundle_directory.is_symlink() or not bundle_directory.is_dir():
@@ -1162,13 +1296,20 @@ def _create_database_bundle_locked(
                 "to continue"
             )
         checkpoint = _read_staging_manifest(staging)
-        if not _create_binding_matches(checkpoint, static_binding):
-            raise RuntimeError("backup bundle staging checkpoint binding mismatch")
         _require_database_file_authority(
             database,
             checkpoint.get("source_database_identity"),
             label="source database",
         )
+        if adopt_resume_from_git_commit is not None:
+            checkpoint = _adopt_snapshot_pending_provenance(
+                staging,
+                checkpoint,
+                static_binding,
+                adopt_resume_from_git_commit,
+            )
+        if not _create_binding_matches(checkpoint, static_binding):
+            raise RuntimeError("backup bundle staging checkpoint binding mismatch")
     else:
         if resume:
             raise FileNotFoundError("backup bundle staging checkpoint does not exist")
@@ -1323,6 +1464,8 @@ def _create_database_bundle_locked(
             "artifact_count": len(records),
             "artifact_bytes": artifact_bytes,
         }
+        if "provenance_recovery" in checkpoint:
+            manifest["provenance_recovery"] = checkpoint["provenance_recovery"]
         _write_json(staging / _MANIFEST_FILE, manifest)
         _verify_database_bundle(
             staging,
@@ -1445,6 +1588,11 @@ def _verify_database_bundle(
         for path in runtime_dirty_paths
     ):
         raise RuntimeError("backup bundle runtime dirty path policy is invalid")
+    if "provenance_recovery" in manifest:
+        _require_provenance_recovery_audit(
+            manifest["provenance_recovery"],
+            manifest,
+        )
     source_identity = manifest.get("source_database_identity")
     if (
         not isinstance(source_identity, dict)

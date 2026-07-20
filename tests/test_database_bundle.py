@@ -443,6 +443,108 @@ def _database_hash_trace(calls: list[tuple[Path, str]]) -> str:
     )
 
 
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "status",
+        "wrong-head",
+        "nonancestor",
+        "target",
+        "source-database",
+        "odds-root",
+        "allowed-roots",
+        "already-adopted",
+    ],
+)
+def test_snapshot_pending_provenance_adoption_rejects_invalid_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    old_head = "1" * 40
+    current_head = "2" * 40
+    old_provenance = {
+        "source_tree_clean": True,
+        "source_tree_policy_version": database_bundle._SOURCE_TREE_POLICY_VERSION,
+        "source_tree_head": old_head,
+        "source_tree_runtime_dirty_paths": [],
+    }
+    current_provenance = {
+        **old_provenance,
+        "source_tree_head": current_head,
+    }
+    binding = {
+        "target": str(tmp_path / "bundle"),
+        "source_database": str(tmp_path / "source.db"),
+        "odds_raw_root": str(tmp_path / "raw"),
+        "allowed_source_roots": [str(tmp_path)],
+        "git_commit": current_head,
+        **current_provenance,
+    }
+    checkpoint: dict[str, object] = {
+        "format": database_bundle._STAGING_FORMAT,
+        "status": "snapshot_pending",
+        "git_commit": old_head,
+        **old_provenance,
+        **{
+            key: value
+            for key, value in binding.items()
+            if key
+            in {
+                "target",
+                "source_database",
+                "odds_raw_root",
+                "allowed_source_roots",
+            }
+        },
+    }
+    confirmed = old_head
+    if attack == "status":
+        checkpoint["status"] = "copying"
+    elif attack == "wrong-head":
+        confirmed = "3" * 40
+    elif attack == "target":
+        checkpoint["target"] = str(tmp_path / "other-bundle")
+    elif attack == "source-database":
+        checkpoint["source_database"] = str(tmp_path / "other.db")
+    elif attack == "odds-root":
+        checkpoint["odds_raw_root"] = str(tmp_path / "other-raw")
+    elif attack == "allowed-roots":
+        checkpoint["allowed_source_roots"] = [str(tmp_path / "other-root")]
+    elif attack == "already-adopted":
+        checkpoint["provenance_recovery"] = {}
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    checkpoint_path = staging / database_bundle._STAGING_MANIFEST_FILE
+    database_bundle._write_json(checkpoint_path, checkpoint)
+    original = checkpoint_path.read_bytes()
+
+    if attack == "nonancestor":
+        def reject_ancestor(_old: str, _current: str) -> None:
+            raise RuntimeError("checkpoint git commit is not an ancestor")
+
+        monkeypatch.setattr(
+            database_bundle,
+            "_require_git_commit_ancestor",
+            reject_ancestor,
+        )
+    else:
+        monkeypatch.setattr(
+            database_bundle,
+            "_require_git_commit_ancestor",
+            lambda _old, _current: None,
+        )
+
+    with pytest.raises(RuntimeError):
+        database_bundle._adopt_snapshot_pending_provenance(
+            staging,
+            checkpoint,
+            binding,
+            confirmed,
+        )
+    assert checkpoint_path.read_bytes() == original
+
+
 @pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
 def test_runtime_prepare_commits_without_transactional_sidecars(
     tmp_path: Path,
@@ -2033,6 +2135,192 @@ def test_bundle_resume_recovers_runtime_prepare_crash(
     assert _hash(database) == source_hash
     assert len(calls) <= 2, _database_hash_trace(calls)
     verify_database_bundle(bundle)
+
+
+def test_bundle_resume_adopts_ancestor_revision_only_from_snapshot_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
+    database, odds_root, source_root, _, _ = _database_with_artifacts(
+        tmp_path / "source"
+    )
+    bundle = tmp_path / "bundle"
+    current_provenance = database_bundle._source_tree_provenance()
+    old_head = subprocess.run(
+        ["git", "rev-parse", f"{HEAD}^"],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout.strip()
+    assert old_head != HEAD
+    old_provenance = {
+        **current_provenance,
+        "source_tree_head": old_head,
+    }
+    original_provenance = database_bundle._source_tree_provenance
+    original_prepare = database_bundle._prepare_runtime_database
+
+    def prepare_then_crash(snapshot: Path) -> None:
+        original_prepare(snapshot)
+        raise RuntimeError("crash before snapshot checkpoint")
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_source_tree_provenance",
+        lambda: dict(old_provenance),
+    )
+    monkeypatch.setattr(
+        database_bundle,
+        "_prepare_runtime_database",
+        prepare_then_crash,
+    )
+    with pytest.raises(RuntimeError, match="crash before snapshot checkpoint"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+        )
+    staging = tmp_path / ".bundle.staging"
+    checkpoint_path = staging / database_bundle._STAGING_MANIFEST_FILE
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "snapshot_pending"
+    assert checkpoint["git_commit"] == old_head
+    original_checkpoint = checkpoint_path.read_bytes()
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_source_tree_provenance",
+        original_provenance,
+    )
+    monkeypatch.setattr(
+        database_bundle,
+        "_prepare_runtime_database",
+        original_prepare,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint binding mismatch"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            resume=True,
+        )
+    with pytest.raises(RuntimeError, match="differs from checkpoint"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            resume=True,
+            adopt_resume_from_git_commit="0" * len(old_head),
+        )
+
+    real_ancestor_check = database_bundle._require_git_commit_ancestor
+
+    def reject_ancestor(_old: str, _current: str) -> None:
+        raise RuntimeError("checkpoint git commit is not an ancestor")
+
+    monkeypatch.setattr(
+        database_bundle,
+        "_require_git_commit_ancestor",
+        reject_ancestor,
+    )
+    with pytest.raises(RuntimeError, match="not an ancestor"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root],
+            resume=True,
+            adopt_resume_from_git_commit=old_head,
+        )
+    monkeypatch.setattr(
+        database_bundle,
+        "_require_git_commit_ancestor",
+        real_ancestor_check,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint binding mismatch"):
+        create_database_bundle(
+            database,
+            odds_root,
+            bundle,
+            allowed_source_roots=[source_root, tmp_path / "changed-root"],
+            resume=True,
+            adopt_resume_from_git_commit=old_head,
+        )
+
+    displaced = tmp_path / "original-source.db"
+    os.replace(database, displaced)
+    shutil.copy2(displaced, database)
+    try:
+        with pytest.raises(RuntimeError, match="source database file authority changed"):
+            create_database_bundle(
+                database,
+                odds_root,
+                bundle,
+                allowed_source_roots=[source_root],
+                resume=True,
+                adopt_resume_from_git_commit=old_head,
+            )
+    finally:
+        database.unlink()
+        os.replace(displaced, database)
+    assert checkpoint_path.read_bytes() == original_checkpoint
+
+    calls = _track_physical_database_hashes(monkeypatch)
+    backup_calls: list[Path] = []
+    original_backup = database_bundle.online_backup
+
+    def tracked_backup(
+        source: Path,
+        destination: Path,
+        **kwargs: object,
+    ) -> None:
+        backup_calls.append(destination.resolve())
+        original_backup(source, destination, **kwargs)
+
+    monkeypatch.setattr(database_bundle, "online_backup", tracked_backup)
+    resumed = create_database_bundle(
+        database,
+        odds_root,
+        bundle,
+        allowed_source_roots=[source_root],
+        resume=True,
+        adopt_resume_from_git_commit=old_head,
+    )
+
+    assert resumed.bundle_directory == bundle
+    assert backup_calls == [_bundle_database_path(staging).resolve()]
+    assert len(calls) <= 2, _database_hash_trace(calls)
+    manifest = verify_database_bundle(bundle)
+    recovery = manifest["provenance_recovery"]
+    assert recovery["from"] == {
+        "git_commit": old_head,
+        **old_provenance,
+    }
+    assert recovery["to"] == {
+        "git_commit": HEAD,
+        **current_provenance,
+    }
+    assert datetime.fromisoformat(recovery["adopted_at"]).utcoffset() is not None
+
+    tampered = dict(manifest)
+    tampered_recovery = dict(recovery)
+    tampered_to = dict(tampered_recovery["to"])
+    tampered_to["git_commit"] = old_head
+    tampered_recovery["to"] = tampered_to
+    tampered["provenance_recovery"] = tampered_recovery
+    (bundle / "manifest.json").write_text(
+        json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="provenance recovery audit is invalid"):
+        verify_database_bundle(bundle)
 
 
 def test_bundle_resume_completes_after_rename_crash(

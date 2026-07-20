@@ -100,3 +100,21 @@ def test_database_cutover_help_publishes_the_documented_commands() -> None:
             text=True,
         )
         assert "--database" in help_result.stdout
+
+
+def test_database_bundle_create_help_exposes_explicit_revision_adoption() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "database_bundle.py"),
+            "create",
+            "--help",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--resume" in completed.stdout
+    assert "--adopt-resume-from-git-commit" in completed.stdout

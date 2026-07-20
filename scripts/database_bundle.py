@@ -43,6 +43,13 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="resume a target-bound staging checkpoint",
     )
+    create.add_argument(
+        "--adopt-resume-from-git-commit",
+        help=(
+            "explicitly adopt an ancestor revision for a snapshot_pending "
+            "checkpoint; requires --resume"
+        ),
+    )
 
     verify = commands.add_parser("verify", help="verify every bundled byte")
     verify.add_argument("--bundle", type=Path, required=True)
@@ -68,6 +75,7 @@ def main() -> int:
             args.bundle,
             allowed_source_roots=args.allow_source_root,
             resume=args.resume,
+            adopt_resume_from_git_commit=args.adopt_resume_from_git_commit,
         )
         print(bundle_result_json(result))
         return 0
