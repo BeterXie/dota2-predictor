@@ -27,9 +27,14 @@ from live_betting.database_bundle import (
 from live_betting.database_protocol import (
     CUTOVER_SAFETY_MARGIN_BYTES,
     prepare_database,
+    sqlite_sidecar_state,
 )
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
-from live_betting.runtime_schema import CURRENT_RUNTIME_SCHEMA_VERSION
+from live_betting.runtime_schema import (
+    CURRENT_RUNTIME_SCHEMA_VERSION,
+    RUNTIME_SCHEMA_CONTRACT_DIGEST,
+    verify_runtime_schema,
+)
 from live_betting.service_coordination import (
     SingleInstanceLock,
     WriterScanResult,
@@ -436,6 +441,103 @@ def _database_hash_trace(calls: list[tuple[Path, str]]) -> str:
         f"{index}: {path} [{label}]"
         for index, (path, label) in enumerate(calls, start=1)
     )
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_runtime_prepare_commits_without_transactional_sidecars(
+    tmp_path: Path,
+    journal_mode: str,
+) -> None:
+    database = tmp_path / f"runtime-{journal_mode.casefold()}.db"
+    connection = connect(database)
+    try:
+        assert connection.execute(
+            f"PRAGMA journal_mode={journal_mode}"
+        ).fetchone()[0] == journal_mode.casefold()
+        connection.execute("CREATE TABLE application_state(value INTEGER)")
+        connection.execute("INSERT INTO application_state VALUES (42)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database_bundle._prepare_runtime_database(database)
+
+    sidecars = sqlite_sidecar_state(database)
+    assert int(sidecars["wal"]["bytes"]) == 0
+    assert int(sidecars["journal"]["bytes"]) == 0
+    prepared = connect(database)
+    try:
+        assert prepared.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert prepared.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (
+            0,
+            -1,
+            -1,
+        )
+        assert prepared.execute("SELECT value FROM application_state").fetchone()[
+            0
+        ] == 42
+        status = verify_runtime_schema(prepared)
+        assert status.version == CURRENT_RUNTIME_SCHEMA_VERSION
+        assert status.contract_digest == RUNTIME_SCHEMA_CONTRACT_DIGEST
+    finally:
+        prepared.close()
+
+
+def test_runtime_prepare_rejects_busy_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "busy-wal.db"
+    setup = connect(database)
+    try:
+        assert setup.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        setup.execute("CREATE TABLE application_state(value INTEGER)")
+        setup.execute("INSERT INTO application_state VALUES (42)")
+        setup.commit()
+    finally:
+        setup.close()
+    reader = connect(database, read_only=True)
+    reader.execute("BEGIN")
+    assert reader.execute("SELECT value FROM application_state").fetchone()[0] == 42
+    real_connect = connect
+
+    def short_timeout_connect(path: Path):
+        return real_connect(path, busy_timeout_ms=10)
+
+    monkeypatch.setattr(database_bundle, "connect", short_timeout_connect)
+    try:
+        with pytest.raises(RuntimeError, match="left an unsafe WAL"):
+            database_bundle._prepare_runtime_database(database)
+        assert int(sqlite_sidecar_state(database)["wal"]["bytes"]) > 0
+    finally:
+        reader.close()
+
+
+def test_runtime_prepare_rejects_nonempty_rollback_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "persistent-journal.db"
+    connection = connect(database)
+    try:
+        connection.execute("CREATE TABLE application_state(value INTEGER)")
+        connection.commit()
+    finally:
+        connection.close()
+    real_connect = connect
+
+    def persistent_journal_connect(path: Path):
+        prepared = real_connect(path)
+        assert prepared.execute("PRAGMA journal_mode=PERSIST").fetchone()[0] == (
+            "persist"
+        )
+        return prepared
+
+    monkeypatch.setattr(database_bundle, "connect", persistent_journal_connect)
+
+    with pytest.raises(RuntimeError, match="non-empty SQLite sidecars"):
+        database_bundle._prepare_runtime_database(database)
+    assert int(sqlite_sidecar_state(database)["journal"]["bytes"]) > 0
 
 
 def test_staging_database_paths_preserve_legacy_checkpoint_layout(
@@ -1858,6 +1960,7 @@ def test_bundle_resume_recovers_runtime_prepare_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _isolate_managed_writer_scan(monkeypatch)
     database, odds_root, source_root, _, _ = _database_with_artifacts(
         tmp_path / "source"
     )
@@ -1866,9 +1969,13 @@ def test_bundle_resume_recovers_runtime_prepare_crash(
         connection.execute("DROP TABLE runtime_schema_version")
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == (
+            "delete"
+        )
     finally:
         connection.close()
     source_hash = _hash(database)
+    calls = _track_physical_database_hashes(monkeypatch)
     bundle = tmp_path / "bundle"
     original_prepare = database_bundle._prepare_runtime_database
     interrupted = False
@@ -1897,13 +2004,24 @@ def test_bundle_resume_recovers_runtime_prepare_crash(
         (staging / "staging-manifest.json").read_text(encoding="utf-8")
     )
     assert checkpoint["status"] == "snapshot_pending"
-    assert _bundle_database_path(staging).is_file()
+    staging_database = _bundle_database_path(staging)
+    assert staging_database.is_file()
+    sidecars = sqlite_sidecar_state(staging_database)
+    assert int(sidecars["wal"]["bytes"]) == 0
+    assert int(sidecars["journal"]["bytes"]) == 0
+    prepared = connect(staging_database, read_only=True)
+    try:
+        status = verify_runtime_schema(prepared)
+        assert status.contract_digest == RUNTIME_SCHEMA_CONTRACT_DIGEST
+    finally:
+        prepared.close()
 
     monkeypatch.setattr(
         database_bundle,
         "_prepare_runtime_database",
         original_prepare,
     )
+    calls.clear()
     resumed = create_database_bundle(
         database,
         odds_root,
@@ -1913,6 +2031,7 @@ def test_bundle_resume_recovers_runtime_prepare_crash(
     )
     assert resumed.bundle_directory == bundle
     assert _hash(database) == source_hash
+    assert len(calls) <= 2, _database_hash_trace(calls)
     verify_database_bundle(bundle)
 
 

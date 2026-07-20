@@ -298,15 +298,27 @@ def _prepare_runtime_database(database: Path) -> None:
     invalidate_hashed_paths(database)
     connection = connect(database)
     try:
+        journal_mode_row = connection.execute("PRAGMA journal_mode").fetchone()
+        if journal_mode_row is None:
+            raise RuntimeError("runtime schema preparation journal mode is unavailable")
+        journal_mode = str(journal_mode_row[0]).casefold()
         connection.execute("BEGIN IMMEDIATE")
         prepare_runtime_schema(connection, external_transaction=True)
         connection.commit()
         checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        if checkpoint is None or tuple(int(value) for value in checkpoint) != (0, 0, 0):
+        expected_checkpoint = (0, 0, 0) if journal_mode == "wal" else (0, -1, -1)
+        if (
+            checkpoint is None
+            or tuple(int(value) for value in checkpoint) != expected_checkpoint
+        ):
             raise RuntimeError("runtime schema preparation left an unsafe WAL")
-        journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
-        if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
-            raise RuntimeError("runtime schema preparation could not disable WAL")
+        if journal_mode == "wal":
+            rollback_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if (
+                rollback_mode is None
+                or str(rollback_mode[0]).casefold() != "delete"
+            ):
+                raise RuntimeError("runtime schema preparation could not disable WAL")
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -314,6 +326,10 @@ def _prepare_runtime_database(database: Path) -> None:
     finally:
         connection.close()
         invalidate_hashed_paths(database)
+    _require_transaction_free_database(
+        database,
+        label="runtime-prepared database",
+    )
 
 
 def _require_checkpointed_source(database: Path) -> None:
