@@ -772,7 +772,10 @@ def test_live_and_completed_odds_share_exact_success_receipts(
             "result": {
                 "id": "1001",
                 "game_id": 151,
-                "team": [],
+                "team": [
+                    {"pos": 1, "team_name": "One"},
+                    {"pos": 2, "team_name": "Two"},
+                ],
                 "odds": [],
             },
         },
@@ -860,7 +863,10 @@ def test_bare_dict_compatibility_response_is_not_labeled_as_http_receipt(
                 "result": {
                     "id": "1001",
                     "game_id": 151,
-                    "team": [],
+                    "team": [
+                        {"pos": 1, "team_name": "One"},
+                        {"pos": 2, "team_name": "Two"},
+                    ],
                     "odds": [],
                 },
             }

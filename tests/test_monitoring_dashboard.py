@@ -4,6 +4,7 @@ import base64
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -108,6 +109,183 @@ class MonitoringDashboardTests(unittest.TestCase):
             updated_at,
         )
         self.store.connection.commit()
+
+    def test_storage_rejects_non_head_to_head_out_right(self) -> None:
+        payload = {
+            "id": "out-right",
+            "match_name": "Champion",
+            "match_short_name": "Outright",
+            "tournament_name": "World Cup",
+            "start_time": "2026-07-13 22:00:00",
+            "round": "bo1",
+            "status": 3,
+            "team": [
+                {"pos": position, "team_name": f"Team {position}"}
+                for position in range(1, 25)
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "raybet_non_head_to_head_match"):
+            self.store.upsert_raybet_match(payload, NOW)
+
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM raybet_matches WHERE raybet_match_id='out-right'"
+            ).fetchone()
+        )
+
+    def test_legacy_out_right_is_excluded_from_history_and_replay(self) -> None:
+        payload = {
+            "id": "out-right",
+            "match_short_name": "Outright",
+            "team": [
+                {"pos": position, "team_name": f"Team {position}"}
+                for position in range(1, 25)
+            ],
+        }
+        self.store.connection.execute(
+            """INSERT INTO raybet_matches VALUES
+               ('out-right', 'World Cup', 'Team 1', 'Team 2',
+                '2026-07-12 22:00:00', 1, '3', NULL, ?, ?)""",
+            (json.dumps(payload), (NOW - timedelta(days=1)).isoformat()),
+        )
+        self.store.connection.execute(
+            """INSERT INTO raybet_matches VALUES
+               ('marked-out-right', 'World Cup', 'Team 1', 'Team 2',
+                '2026-07-12 21:00:00', 1, '3', NULL, ?, ?)""",
+            (
+                json.dumps({"match_short_name": "Outright"}),
+                (NOW - timedelta(days=1, minutes=1)).isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+
+        history = monitor_history_page(
+            self.store.connection,
+            now=NOW + timedelta(days=1),
+        )
+
+        self.assertEqual(history["items"], [])
+        self.assertIsNone(
+            monitor_match_detail(
+                self.store.connection,
+                "out-right",
+                now=NOW + timedelta(days=1),
+            )
+        )
+        self.assertIsNone(
+            monitor_match_detail(
+                self.store.connection,
+                "marked-out-right",
+                now=NOW + timedelta(days=1),
+            )
+        )
+
+    def test_valid_two_team_match_remains_visible(self) -> None:
+        self.add_match(status=3, scheduled_at="2026-07-12 22:00:00")
+
+        history = monitor_history_page(
+            self.store.connection,
+            now=NOW + timedelta(days=1),
+        )
+
+        self.assertEqual(
+            [item["raybet_match_id"] for item in history["items"]],
+            ["match-1"],
+        )
+
+    def test_out_right_rows_do_not_starve_later_head_to_head_history(self) -> None:
+        self.add_match(
+            match_id="old-head-to-head",
+            status=5,
+            scheduled_at=None,
+            updated_at=NOW - timedelta(days=5),
+        )
+        payload = json.dumps(
+            {
+                "match_short_name": "Outright",
+                "team": [
+                    {"pos": position, "team_name": f"Team {position}"}
+                    for position in range(1, 25)
+                ],
+            }
+        )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, 'World Cup', 'Team 1', 'Team 2', ?, 1, '3',
+                       NULL, ?, ?)""",
+            [
+                (
+                    f"out-right-{index:03d}",
+                    (NOW - timedelta(minutes=index + 1)).isoformat(),
+                    payload,
+                    NOW.isoformat(),
+                )
+                for index in range(205)
+            ],
+        )
+        self.store.connection.commit()
+
+        page = monitor_history_page(self.store.connection, limit=5, now=NOW)
+
+        self.assertEqual(
+            [item["raybet_match_id"] for item in page["items"]],
+            ["old-head-to-head"],
+        )
+        self.assertFalse(page["has_more"])
+
+    def test_out_right_history_scan_is_bounded_and_resumable(self) -> None:
+        self.add_match(
+            match_id="old-head-to-head",
+            status=5,
+            scheduled_at=None,
+            updated_at=NOW - timedelta(days=5),
+        )
+        payload = json.dumps(
+            {
+                "match_short_name": "Outright",
+                "team": [
+                    {"pos": position, "team_name": f"Team {position}"}
+                    for position in range(1, 25)
+                ],
+            }
+        )
+        self.store.connection.executemany(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, tournament, team_one, team_two,
+                scheduled_at, best_of, status, live_url, raw_json, updated_at)
+               VALUES (?, 'World Cup', 'Team 1', 'Team 2', ?, 1, '3',
+                       NULL, ?, ?)""",
+            [
+                (
+                    f"out-right-{index:04d}",
+                    (NOW - timedelta(minutes=index + 1)).isoformat(),
+                    payload,
+                    NOW.isoformat(),
+                )
+                for index in range(monitoring._HISTORY_RAW_SCAN_LIMIT + 5)
+            ],
+        )
+        self.store.connection.commit()
+
+        first = monitor_history_page(self.store.connection, limit=5, now=NOW)
+        self.assertEqual(first["items"], [])
+        self.assertTrue(first["has_more"])
+        self.assertIsNotNone(first["next_cursor"])
+
+        second = monitor_history_page(
+            self.store.connection,
+            cursor=first["next_cursor"],
+            limit=5,
+            now=NOW + timedelta(days=30),
+        )
+        self.assertEqual(
+            [item["raybet_match_id"] for item in second["items"]],
+            ["old-head-to-head"],
+        )
+        self.assertFalse(second["has_more"])
 
     def add_frame_observation(
         self,
@@ -490,10 +668,11 @@ class MonitoringDashboardTests(unittest.TestCase):
         public_url = "https://qplay.ehome.gg/live/42.m3u8"
         self.store.upsert_raybet_match(
             {
-                "id": "42",
-                "game_id": 151,
-                "status": 2,
-                "team": [],
+                "id": "42", "game_id": 151, "status": 2,
+                "team": [
+                    {"pos": 1, "team_name": "One"},
+                    {"pos": 2, "team_name": "Two"},
+                ],
             },
             NOW,
             public_live_url=public_url,
@@ -517,7 +696,13 @@ class MonitoringDashboardTests(unittest.TestCase):
     ) -> None:
         public_url = "https://qplay.ehome.gg/live/42.m3u8"
         self.store.upsert_raybet_match(
-            {"id": "42", "game_id": 151, "status": 2, "team": []},
+            {
+                "id": "42", "game_id": 151, "status": 2,
+                "team": [
+                    {"pos": 1, "team_name": "One"},
+                    {"pos": 2, "team_name": "Two"},
+                ],
+            },
             NOW,
             public_live_url=public_url,
         )

@@ -780,21 +780,28 @@ def _causal_draft_cutoffs(
     """
     if not map_numbers:
         return {}
-    rows = store.connection.execute(
-        """SELECT attempt.map_number, orders.order_key,
-                  orders.signal_transport_at
-             FROM shadow_orders AS orders
-             JOIN shadow_map_attempts AS attempt
-               ON attempt.order_key=orders.order_key
-            WHERE attempt.raybet_match_id=? AND orders.status='filled'""",
-        (match_id,),
-    ).fetchall()
+    try:
+        rows = store.connection.execute(
+            """SELECT attempt.map_number, orders.order_key,
+                      orders.signal_transport_at
+                 FROM shadow_orders AS orders
+                 JOIN shadow_map_attempts AS attempt
+                   ON attempt.order_key=orders.order_key
+                WHERE attempt.raybet_match_id=? AND orders.status='filled'""",
+            (match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
     output: dict[int, datetime] = {}
     for row in rows:
         map_number = int(row["map_number"])
         if map_number not in map_numbers:
             continue
-        if store.order_block_reason(str(row["order_key"])) is not None:
+        try:
+            blocked = store.order_block_reason(str(row["order_key"]))
+        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+            blocked = "causal_lineage_unverifiable"
+        if blocked is not None:
             continue
         cutoff = _parse_utc(row["signal_transport_at"])
         if cutoff is not None:
@@ -900,6 +907,46 @@ def _causal_draft_cutoffs(
             continue
         output[map_number] = max(output.get(map_number, cutoff), cutoff)
     return output
+
+
+class _ReadOnlyCausalStore(LiveBettingStore):
+    """Bind the worker's read-only causal gates to an existing web snapshot."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+
+def _causal_vision_drafts(
+    store: LiveBettingStore,
+    match_id: str,
+    map_numbers: set[int],
+) -> dict[int, set[VisionDraftIdentity]]:
+    """Use the worker's cutoff and draft predicates for exactly these maps."""
+    cutoffs = _causal_draft_cutoffs(store, match_id, map_numbers)
+    drafts = _vision_drafts(
+        store.connection,
+        match_id,
+        causal_cutoffs=cutoffs,
+    )
+    return {
+        map_number: identities
+        for map_number, identities in drafts.items()
+        if map_number in map_numbers
+    }
+
+
+def has_trusted_confirmed_draft(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    map_number: int,
+) -> bool:
+    """Apply the worker's complete causal draft gate to one requested map."""
+    store = _ReadOnlyCausalStore(connection)
+    try:
+        drafts = _causal_vision_drafts(store, raybet_match_id, {map_number})
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        return False
+    return bool(drafts.get(map_number))
 
 
 def _settle_winner_orders(
@@ -1300,12 +1347,8 @@ async def label_once(
             (match_id,),
         )
     }
-    drafts = _vision_drafts(
-        store.connection,
-        match_id,
-        causal_cutoffs=_causal_draft_cutoffs(store, match_id, unresolved_maps),
-    )
-    if not drafts:
+    drafts = _causal_vision_drafts(store, match_id, strict_maps)
+    if unresolved_maps and not (unresolved_maps & drafts.keys()):
         return {"status": "waiting_for_confirmed_draft"}
     try:
         event = store.connection.execute(

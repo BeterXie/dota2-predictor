@@ -348,7 +348,15 @@ class BrowserSchemaTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "parser"):
                         with store.savepoint("normalization"):
                             store.insert_browser_raybet_match(
-                                {"id": "match-1", "tournament_name": "Test"}, NOW
+                                {
+                                    "id": "match-1",
+                                    "tournament_name": "Test",
+                                    "team": [
+                                        {"pos": 1, "team_name": "One"},
+                                        {"pos": 2, "team_name": "Two"},
+                                    ],
+                                },
+                                NOW,
                             )
                             raise ValueError("parser")
                     store.update_browser_event_status(
@@ -614,6 +622,127 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
             self.assertEqual(len(files), 2)
             self.assertTrue(all(len(path.name) == 72 for path in files))
 
+    def test_completed_out_right_is_audited_skip_not_collection_error(self) -> None:
+        payload = {
+            "result": {
+                "id": "1001",
+                "game_id": 151,
+                "status": 3,
+                "match_short_name": "Outright",
+                "team": [
+                    {
+                        "team_id": position,
+                        "pos": position,
+                        "team_name": f"Team {position}",
+                    }
+                    for position in range(1, 25)
+                ],
+                "odds": [],
+            }
+        }
+
+        class Client:
+            def match_odds(self, _match_id: str) -> dict[str, object]:
+                return payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            raw_dir = Path(directory) / "raw"
+            with LiveBettingStore(
+                Path(directory) / "test.db", raw_archive_root=raw_dir
+            ) as store:
+                store.init_schema()
+
+                summary = collect_completed_once(
+                    store,
+                    Client(),
+                    raw_dir,
+                    completed_rows=[{"id": "1001", "status": 3}],
+                )
+
+                self.assertEqual(
+                    (summary["matches"], summary["skipped"], summary["errors"]),
+                    (0, 1, 0),
+                )
+                self.assertIsNone(
+                    store.connection.execute(
+                        "SELECT 1 FROM raybet_matches WHERE raybet_match_id='1001'"
+                    ).fetchone()
+                )
+                audit = store.connection.execute(
+                    """SELECT disposition, reason FROM direct_response_audit
+                        WHERE response_kind='completed_odds'"""
+                ).fetchone()
+                self.assertEqual(
+                    tuple(audit),
+                    ("audit_only", "non_head_to_head_match"),
+                )
+                collector = store.connection.execute(
+                    """SELECT last_success_at, last_error
+                         FROM collector_runs WHERE collector='raybet_completed'"""
+                ).fetchone()
+                self.assertIsNotNone(collector["last_success_at"])
+                self.assertIsNone(collector["last_error"])
+
+    def test_worker_health_stays_healthy_for_completed_out_right_skip(self) -> None:
+        payload = {
+            "result": {
+                "id": "1001",
+                "game_id": 151,
+                "status": 3,
+                "match_short_name": "Outright",
+                "team": [
+                    {"pos": position, "team_name": f"Team {position}"}
+                    for position in range(1, 25)
+                ],
+                "odds": [],
+            }
+        }
+
+        class Client:
+            def __enter__(self) -> "Client":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def live_matches(self) -> list[dict[str, object]]:
+                return []
+
+            def completed_matches(self) -> list[dict[str, object]]:
+                return [{"id": "1001", "game_id": 151, "status": 3}]
+
+            def match_odds(self, _match_id: str) -> dict[str, object]:
+                return payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            args = SimpleNamespace(
+                database=database,
+                raw_dir=Path(directory) / "raw",
+                interval=0.0,
+                list_interval=15.0,
+                completed_interval=300.0,
+                max_backoff=300.0,
+                once=True,
+                schema_prepared=False,
+            )
+            with patch("live_betting.monitor.RayBetClient", return_value=Client()):
+                self.assertEqual(run(args), 0)
+            with LiveBettingStore(database) as store:
+                health = store.connection.execute(
+                    """SELECT status, last_error, details_json
+                         FROM service_health WHERE component='raybet_worker'"""
+                ).fetchone()
+                self.assertEqual((health["status"], health["last_error"]), ("healthy", None))
+                details = json.loads(health["details_json"])
+                self.assertEqual(details["completed"]["skipped"], 1)
+                self.assertEqual(details["completed"]["errors"], 0)
+                self.assertIsNone(
+                    store.connection.execute(
+                        "SELECT 1 FROM raybet_matches WHERE raybet_match_id='1001'"
+                    ).fetchone()
+                )
+
     def test_completed_collector_isolates_one_match_failure(self) -> None:
         payload = {
             "result": {
@@ -869,7 +998,10 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
             "result": {
                 "id": "1002",
                 "game_id": 151,
-                "team": [],
+                "team": [
+                    {"pos": 1, "team_name": "One"},
+                    {"pos": 2, "team_name": "Two"},
+                ],
                 "odds": [],
             }
         }
@@ -933,7 +1065,10 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
             "result": {
                 "id": "1002",
                 "game_id": 151,
-                "team": [],
+                "team": [
+                    {"pos": 1, "team_name": "One"},
+                    {"pos": 2, "team_name": "Two"},
+                ],
                 "odds": [],
             }
         }
@@ -985,7 +1120,10 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
         }
         browser = {
             "id": "match-1", "tournament_name": "Browser Cup",
-            "team": [{"pos": 1, "team_name": "Wrong"}],
+            "team": [
+                {"pos": 1, "team_name": "Wrong One"},
+                {"pos": 2, "team_name": "Wrong Two"},
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             raw_dir = Path(directory) / "raw"
@@ -1003,6 +1141,172 @@ class OwnershipAndAtomicityTests(unittest.TestCase):
                     ("Direct Cup", "One", None),
                 )
                 self.assertIn("Direct Cup", row["raw_json"])
+
+    def test_teamless_update_reuses_existing_head_to_head_identity(self) -> None:
+        initial = {
+            "id": "match-1",
+            "game_id": 151,
+            "tournament_name": "Direct Cup",
+            "start_time": "2026-07-13 20:00:00",
+            "round": "bo3",
+            "team": [
+                {"team_id": 11, "pos": 1, "team_name": "One"},
+                {"team_id": 22, "pos": 2, "team_name": "Two"},
+            ],
+            "status": 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                store.upsert_raybet_match(initial, NOW)
+                store.upsert_raybet_match(
+                    {"id": "match-1", "status": 3},
+                    NOW + timedelta(seconds=1),
+                )
+
+                row = store.connection.execute(
+                    """SELECT tournament, team_one, team_two, scheduled_at,
+                              best_of, status, raw_json
+                         FROM raybet_matches WHERE raybet_match_id='match-1'"""
+                ).fetchone()
+
+                self.assertEqual(
+                    tuple(row[:6]),
+                    (
+                        "Direct Cup",
+                        "One",
+                        "Two",
+                        "2026-07-13 20:00:00",
+                        3,
+                        "3",
+                    ),
+                )
+                stored = json.loads(row["raw_json"])
+                self.assertEqual(
+                    [team["team_id"] for team in stored["team"]],
+                    [11, 22],
+                )
+                self.assertEqual(stored["game_id"], 151)
+                self.assertEqual(stored["tournament_name"], "Direct Cup")
+                self.assertEqual(stored["start_time"], "2026-07-13 20:00:00")
+                self.assertEqual(stored["round"], "bo3")
+
+    def test_explicit_invalid_teams_never_reuse_existing_identity(self) -> None:
+        initial = {
+            "id": "match-1",
+            "tournament_name": "Direct Cup",
+            "team": [
+                {"pos": 1, "team_name": "One"},
+                {"pos": 2, "team_name": "Two"},
+            ],
+            "status": 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                store.upsert_raybet_match(initial, NOW)
+
+                with self.assertRaisesRegex(
+                    ValueError, "raybet_exact_team_metadata_missing"
+                ):
+                    store.upsert_raybet_match(
+                        {
+                            "id": "match-1",
+                            "team": [
+                                {
+                                    "pos": position,
+                                    "team_name": f"Team {position}",
+                                }
+                                for position in range(1, 25)
+                            ],
+                            "status": 3,
+                        },
+                        NOW + timedelta(seconds=1),
+                    )
+
+                row = store.connection.execute(
+                    """SELECT team_one, team_two, status
+                         FROM raybet_matches WHERE raybet_match_id='match-1'"""
+                ).fetchone()
+                self.assertEqual(tuple(row), ("One", "Two", "2"))
+
+    def test_explicit_outright_marker_rejects_even_with_two_teams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+
+                with self.assertRaisesRegex(
+                    ValueError, "raybet_non_head_to_head_match"
+                ):
+                    store.upsert_raybet_match(
+                        {
+                            "id": "outright-without-teams",
+                            "match_short_name": "Outright",
+                        },
+                        NOW,
+                    )
+
+                with self.assertRaisesRegex(
+                    ValueError, "raybet_non_head_to_head_match"
+                ):
+                    store.upsert_raybet_match(
+                        {
+                            "id": "outright-2",
+                            "match_short_name": "Outright",
+                            "team": [
+                                {"pos": 1, "team_name": "One"},
+                                {"pos": 2, "team_name": "Two"},
+                            ],
+                        },
+                        NOW,
+                    )
+
+                self.assertIsNone(
+                    store.connection.execute(
+                        "SELECT 1 FROM raybet_matches WHERE raybet_match_id='outright-2'"
+                    ).fetchone()
+                )
+
+    def test_teamless_update_rejects_legacy_outright_marker_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with LiveBettingStore(Path(directory) / "test.db") as store:
+                store.init_schema()
+                store.connection.execute(
+                    """INSERT INTO raybet_matches VALUES
+                       ('legacy-outright', 'Cup', 'One', 'Two',
+                        '2026-07-13 20:00:00', 3, '2', NULL, ?, ?)""",
+                    (
+                        json.dumps({"match_short_name": "Outright"}),
+                        NOW,
+                    ),
+                )
+                store.connection.commit()
+                before = tuple(
+                    store.connection.execute(
+                        """SELECT tournament, team_one, team_two, status,
+                                  raw_json, updated_at
+                             FROM raybet_matches
+                            WHERE raybet_match_id='legacy-outright'"""
+                    ).fetchone()
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "raybet_non_head_to_head_match"
+                ):
+                    store.upsert_raybet_match(
+                        {"id": "legacy-outright", "status": 3},
+                        NOW + timedelta(seconds=1),
+                    )
+
+                after = tuple(
+                    store.connection.execute(
+                        """SELECT tournament, team_one, team_two, status,
+                                  raw_json, updated_at
+                             FROM raybet_matches
+                            WHERE raybet_match_id='legacy-outright'"""
+                    ).fetchone()
+                )
+                self.assertEqual(after, before)
 
     def test_direct_complete_response_rolls_back_on_market_failure(self) -> None:
         payload = {

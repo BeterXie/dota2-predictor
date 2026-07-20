@@ -28,6 +28,10 @@ from .service_coordination import (
     database_writer_authority,
 )
 from .storage import LiveBettingStore
+from .strict_eligibility import (
+    RAYBET_MATCH_NON_HEAD_TO_HEAD,
+    classify_raybet_match_format,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -230,7 +234,7 @@ def _collect_odds_response(
     match_id: str,
     response_kind: str,
     list_row: dict[str, Any],
-) -> tuple[int, int, str]:
+) -> tuple[int, int, str, bool]:
     endpoint = f"{BASE_URL}/odds"
     request_identity = f"{endpoint}?match_id={match_id}"
 
@@ -252,6 +256,17 @@ def _collect_odds_response(
                 f"{response_kind} response identity mismatch"
             )
         fingerprint = _fingerprint(payload)
+        if (
+            response_kind == "completed_odds"
+            and classify_raybet_match_format(result)
+            == RAYBET_MATCH_NON_HEAD_TO_HEAD
+        ):
+            return DirectResponseDecision(
+                (0, 0, fingerprint, True),
+                disposition="audit_only",
+                reason="non_head_to_head_match",
+                observed_raybet_match_id=observed_match_id,
+            )
         snapshots = snapshots_from_payload(payload, received_at=observed_at)
         stored_result = dict(result)
         if (
@@ -284,7 +299,7 @@ def _collect_odds_response(
                 raw_artifact=context.receipt,
             )
         return DirectResponseDecision(
-            (changes, len(snapshots), fingerprint),
+            (changes, len(snapshots), fingerprint, False),
             disposition="audit_only" if timing_status == "late" else "accepted",
             reason="late_transport" if timing_status == "late" else "normalized",
             observed_raybet_match_id=observed_match_id,
@@ -348,7 +363,7 @@ def collect_once(
             match_id = str(list_row.get("id") or "")
             if not match_id.isdigit():
                 raise ValueError("live match list id is invalid")
-            changes, snapshot_count, fingerprint = _collect_odds_response(
+            changes, snapshot_count, fingerprint, _ = _collect_odds_response(
                 store,
                 client,
                 match_id=match_id,
@@ -413,6 +428,7 @@ def collect_completed_once(
     odds_count = 0
     changed_count = 0
     error_count = 0
+    skipped_count = 0
     if completed_rows is not None and audit_match_list:
         _audit_match_list(
             store,
@@ -429,7 +445,7 @@ def collect_completed_once(
             match_id = str(list_row.get("id") or "")
             if not match_id.isdigit():
                 raise ValueError("completed match list id is invalid")
-            changes, snapshot_count, _ = _collect_odds_response(
+            changes, snapshot_count, _, skipped = _collect_odds_response(
                 store,
                 client,
                 match_id=match_id,
@@ -438,6 +454,9 @@ def collect_completed_once(
             )
             changed_count += changes
             odds_count += snapshot_count
+            if skipped:
+                skipped_count += 1
+                continue
             fetched_matches += 1
         except Exception as error:
             error_count += 1
@@ -462,6 +481,7 @@ def collect_completed_once(
         "odds": odds_count,
         "changed": changed_count,
         "errors": error_count,
+        "skipped": skipped_count,
     }
 
 
@@ -519,6 +539,7 @@ def run(args: argparse.Namespace) -> int:
                     "odds": 0,
                     "changed": 0,
                     "errors": 0,
+                    "skipped": 0,
                 }
                 if completed_refresh_due(
                     completed_rows, monotonic_now, next_completed_refresh
@@ -580,6 +601,7 @@ def run(args: argparse.Namespace) -> int:
                 collection_succeeded = any(
                     (
                         item["matches"] > 0
+                        or item.get("skipped", 0) > 0
                         or (item["listed"] == 0 and item["errors"] == 0)
                     )
                     for item in (summary, completed_summary)

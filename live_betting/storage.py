@@ -43,6 +43,11 @@ from .sanitize import (
     sanitize_raybet_payload,
 )
 from .strategy import attempt_fill, is_open
+from .strict_eligibility import (
+    RAYBET_MATCH_NON_HEAD_TO_HEAD,
+    classify_raybet_match_format,
+    strict_raybet_head_to_head_teams,
+)
 from .vision_frame_registry import (
     VisionFrameReceipt,
     register_vision_frame_artifact,
@@ -6685,12 +6690,9 @@ class LiveBettingStore:
         else:
             safe_row["live_url"] = evidence["url"]
             safe_row[PUBLIC_STREAM_EVIDENCE_KEY] = evidence
-        teams = sorted(
-            safe_row.get("team") or [],
-            key=lambda item: int(item.get("pos") or 0),
-        )
-        team_one = str(teams[0].get("team_name") or "") if teams else ""
-        team_two = str(teams[1].get("team_name") or "") if len(teams) > 1 else ""
+        team_one_row, team_two_row = self._raybet_teams_for_write(safe_row)
+        team_one = str(team_one_row.get("team_name") or "")
+        team_two = str(team_two_row.get("team_name") or "")
         round_name = str(safe_row.get("round") or "").lower()
         best_of = int(round_name[2:]) if round_name.startswith("bo") and round_name[2:].isdigit() else None
         self.execute(
@@ -6728,12 +6730,9 @@ class LiveBettingStore:
         safe_row = sanitize_raybet_payload(row)
         if not isinstance(safe_row, dict):
             raise ValueError("RayBet browser metadata must be an object")
-        teams = sorted(
-            safe_row.get("team") or [],
-            key=lambda item: int(item.get("pos") or 0),
-        )
-        team_one = str(teams[0].get("team_name") or "") if teams else ""
-        team_two = str(teams[1].get("team_name") or "") if len(teams) > 1 else ""
+        team_one_row, team_two_row = self._raybet_teams_for_write(safe_row)
+        team_one = str(team_one_row.get("team_name") or "")
+        team_two = str(team_two_row.get("team_name") or "")
         round_name = str(safe_row.get("round") or "").lower()
         best_of = (
             int(round_name[2:])
@@ -6753,11 +6752,89 @@ class LiveBettingStore:
                 safe_row.get("start_time"),
                 best_of,
                 str(safe_row.get("status") or ""),
-                self.json({}),
+                self.json(safe_row),
                 updated_at.isoformat(),
             ),
         )
         return cursor.rowcount == 1
+
+    def _raybet_teams_for_write(
+        self,
+        safe_row: dict[str, Any],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """Resolve an explicit pair or reuse one already stored for this match."""
+        if (
+            classify_raybet_match_format(safe_row) == RAYBET_MATCH_NON_HEAD_TO_HEAD
+            and str(safe_row.get("match_short_name") or "").strip().casefold()
+            == "outright"
+        ):
+            raise ValueError("raybet_non_head_to_head_match")
+        if "team" in safe_row:
+            return strict_raybet_head_to_head_teams(safe_row)
+
+        match_id = str(safe_row.get("id") or "").strip()
+        existing = self.connection.execute(
+            """SELECT tournament, team_one, team_two, scheduled_at,
+                      best_of, status, raw_json
+                 FROM raybet_matches WHERE raybet_match_id=?""",
+            (match_id,),
+        ).fetchone()
+        if existing is None:
+            raise ValueError("raybet_exact_team_metadata_missing")
+        team_one = str(existing["team_one"] or "").strip()
+        team_two = str(existing["team_two"] or "").strip()
+        if (
+            not team_one
+            or not team_two
+            or team_one.casefold() == team_two.casefold()
+        ):
+            raise ValueError("raybet_existing_team_identity_invalid")
+        try:
+            existing_payload = json.loads(str(existing["raw_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("raybet_existing_team_identity_invalid") from error
+        if not isinstance(existing_payload, dict):
+            raise ValueError("raybet_existing_team_identity_invalid")
+        if (
+            classify_raybet_match_format(existing_payload)
+            == RAYBET_MATCH_NON_HEAD_TO_HEAD
+            and str(existing_payload.get("match_short_name") or "")
+            .strip()
+            .casefold()
+            == "outright"
+        ):
+            raise ValueError("raybet_non_head_to_head_match")
+        for key in (
+            "game_id",
+            "tournament_id",
+            "tournament_name",
+            "match_name",
+            "match_short_name",
+            "start_time",
+            "round",
+            "status",
+        ):
+            if key not in safe_row and key in existing_payload:
+                safe_row[key] = existing_payload[key]
+        if "tournament_name" not in safe_row and existing["tournament"]:
+            safe_row["tournament_name"] = str(existing["tournament"])
+        if "start_time" not in safe_row and existing["scheduled_at"] is not None:
+            safe_row["start_time"] = existing["scheduled_at"]
+        if "round" not in safe_row and existing["best_of"] is not None:
+            safe_row["round"] = f"bo{int(existing['best_of'])}"
+        if "status" not in safe_row and existing["status"] is not None:
+            safe_row["status"] = existing["status"]
+        if "team" in existing_payload:
+            existing_one, existing_two = strict_raybet_head_to_head_teams(
+                existing_payload
+            )
+            safe_row["team"] = [dict(existing_one), dict(existing_two)]
+        else:
+            safe_row["team"] = [
+                {"pos": 1, "team_name": team_one},
+                {"pos": 2, "team_name": team_two},
+            ]
+        return strict_raybet_head_to_head_teams(safe_row)
 
     def insert_browser_event(
         self,

@@ -107,6 +107,7 @@ describe("PostmatchIntelligencePanel", () => {
   });
 
   it.each([
+    ["unavailable", "waiting_for_confirmed_draft", "该局已有 strict mapping，但仍缺少可信的已确认阵容与选边证据，赛后分析正在等待。"],
     ["review", "reconciliation_causal_order_invalid", "结算核对时间早于 mapping、时间顺序异常，或缺少可验证时区。"],
     ["unavailable", "reconciliation_schema_unavailable", "当前数据库缺少赛后结算核对协议结构。"],
     ["review", "opendota_match_identity_invalid", "已确认结算中的 OpenDota 比赛 ID 无效。"],
@@ -158,6 +159,7 @@ function available(): ExactPostmatchAttribution {
   return {
     raybet_match_id: "match-1",
     map_number: 2,
+    checked_at: "2026-07-17T00:00:00+00:00",
     status: "available",
     reason: "confirmed",
     mapping: {

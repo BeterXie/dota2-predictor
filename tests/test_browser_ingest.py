@@ -180,6 +180,29 @@ class BrowserIngestTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(row), ("error", "normalization_failed"))
 
+    def test_out_right_rolls_back_authority_but_keeps_error_audit(self) -> None:
+        payload = odds_payload()
+        payload["result"]["team"] = [
+            {"pos": position, "team_name": f"Team {position}"}
+            for position in range(1, 25)
+        ]
+
+        result = self.ingestor.ingest(
+            self.store,
+            event("8" * 64, payload=payload),
+        )
+
+        self.assertEqual(
+            (result.outcome, result.processing_status, result.reason),
+            ("accepted", "error", "normalization_failed"),
+        )
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM browser_events"), 1)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM raybet_matches"), 0)
+        self.assertEqual(
+            self.scalar("SELECT COUNT(*) FROM odds_transport_observations"),
+            0,
+        )
+
     def test_page_state_odds_cannot_enter_normalization(self) -> None:
         item = event(
             "e" * 64,

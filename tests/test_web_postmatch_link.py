@@ -18,7 +18,13 @@ from web.routers.monitor import router
 
 
 SCHEMA = """
-CREATE TABLE raybet_matches (raybet_match_id TEXT PRIMARY KEY);
+CREATE TABLE raybet_matches (
+    raybet_match_id TEXT PRIMARY KEY,
+    team_one TEXT NOT NULL DEFAULT 'Alpha',
+    team_two TEXT NOT NULL DEFAULT 'Beta',
+    raw_json TEXT NOT NULL DEFAULT
+        '{"team":[{"pos":1,"team_name":"Alpha"},{"pos":2,"team_name":"Beta"}]}'
+);
 CREATE TABLE odds_snapshots (
     id INTEGER PRIMARY KEY,
     raybet_match_id TEXT,
@@ -243,7 +249,9 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
 
     @staticmethod
     def _seed(connection: sqlite3.Connection) -> None:
-        connection.execute("INSERT INTO raybet_matches VALUES ('ray-1')")
+        connection.execute(
+            "INSERT INTO raybet_matches (raybet_match_id) VALUES ('ray-1')"
+        )
         connection.executemany(
             """INSERT INTO odds_snapshots VALUES
                (?, 'ray-1', ?, ?, '5', 'map_1', ?, ?, 'winner-map-1',
@@ -372,8 +380,57 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
-    def test_missing_reconciliation_never_fuzzy_links_opendota(self) -> None:
+    def test_missing_confirmed_draft_reports_exact_wait_reason(self) -> None:
         response = self.client.get("/api/monitor/matches/ray-1/maps/1/postmatch")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["reason"], "waiting_for_confirmed_draft")
+        self.assertIsNotNone(datetime.fromisoformat(payload["checked_at"]))
+        self.assertIsNone(payload["postmatch"])
+        self.assertEqual(payload["mapping"]["mapping_id"], 7)
+
+    def test_out_right_match_never_enters_postmatch_api(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, team_one, team_two, raw_json)
+               VALUES ('38401042', 'Team 1', 'Team 2', ?)""",
+            (
+                json.dumps(
+                    {
+                        "id": "38401042",
+                        "match_short_name": "Outright",
+                        "team": [
+                            {
+                                "pos": position,
+                                "team_name": f"Team {position}",
+                            }
+                            for position in range(1, 25)
+                        ],
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        response = self.client.get(
+            "/api/monitor/matches/38401042/maps/1/postmatch"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_trusted_draft_still_never_fuzzy_links_without_reconciliation(self) -> None:
+        with patch.object(
+            intelligence,
+            "has_trusted_confirmed_draft",
+            return_value=True,
+        ):
+            response = self.client.get(
+                "/api/monitor/matches/ray-1/maps/1/postmatch"
+            )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()

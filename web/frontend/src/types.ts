@@ -452,6 +452,7 @@ export interface ExactPostmatchMapping {
 export interface ExactPostmatchAttribution {
   raybet_match_id: string;
   map_number: number;
+  checked_at: string;
   status: ExactPostmatchStatus;
   reason: string;
   mapping: ExactPostmatchMapping | null;

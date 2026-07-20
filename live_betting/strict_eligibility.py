@@ -20,6 +20,45 @@ from typing import Any, Iterator, Mapping, Sequence
 
 STRICT_MAPPING_VERSION = "strict-live-map-v3"
 MINIMUM_PRIZE_POOL_USD = 1_000_000
+RAYBET_MATCH_HEAD_TO_HEAD = "head_to_head"
+RAYBET_MATCH_NON_HEAD_TO_HEAD = "non_head_to_head"
+RAYBET_MATCH_FORMAT_UNKNOWN = "unknown"
+
+
+def strict_raybet_head_to_head_teams(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Return the exact position-one/position-two pair or fail closed."""
+    teams = payload.get("team")
+    if not isinstance(teams, list) or len(teams) != 2:
+        raise ValueError("raybet_exact_team_metadata_missing")
+    by_position: dict[int, Mapping[str, Any]] = {}
+    for team in teams:
+        if not isinstance(team, Mapping) or type(team.get("pos")) is not int:
+            raise ValueError("raybet_exact_team_metadata_missing")
+        position = team["pos"]
+        if position not in {1, 2} or position in by_position:
+            raise ValueError("raybet_exact_team_order_invalid")
+        by_position[position] = team
+    if set(by_position) != {1, 2}:
+        raise ValueError("raybet_exact_team_order_invalid")
+    return by_position[1], by_position[2]
+
+
+def classify_raybet_match_format(payload: Mapping[str, Any]) -> str:
+    """Classify structured match cardinality without treating missing data as Outright."""
+    if str(payload.get("match_short_name") or "").strip().casefold() == "outright":
+        return RAYBET_MATCH_NON_HEAD_TO_HEAD
+    teams = payload.get("team")
+    if not isinstance(teams, list):
+        return RAYBET_MATCH_FORMAT_UNKNOWN
+    if len(teams) > 2:
+        return RAYBET_MATCH_NON_HEAD_TO_HEAD
+    try:
+        strict_raybet_head_to_head_teams(payload)
+    except ValueError:
+        return RAYBET_MATCH_FORMAT_UNKNOWN
+    return RAYBET_MATCH_HEAD_TO_HEAD
 
 
 _TABLE_STATEMENTS = (
@@ -1455,20 +1494,10 @@ def _read_raybet_identity(
     if raw.get("round") != f"bo{best_of}":
         raise _FailClosed("raybet_best_of_metadata_conflict")
 
-    teams = raw.get("team")
-    if not isinstance(teams, list) or len(teams) != 2:
-        raise _FailClosed("raybet_exact_team_metadata_missing")
-    by_position: dict[int, Mapping[str, Any]] = {}
-    for team in teams:
-        if not isinstance(team, Mapping) or type(team.get("pos")) is not int:
-            raise _FailClosed("raybet_exact_team_metadata_missing")
-        position = team["pos"]
-        if position not in {1, 2} or position in by_position:
-            raise _FailClosed("raybet_exact_team_order_invalid")
-        by_position[position] = team
-    if set(by_position) != {1, 2}:
-        raise _FailClosed("raybet_exact_team_order_invalid")
-    one, two = by_position[1], by_position[2]
+    try:
+        one, two = strict_raybet_head_to_head_teams(raw)
+    except ValueError as error:
+        raise _FailClosed(str(error)) from error
     one_id = _strict_positive_int(one.get("team_id"))
     two_id = _strict_positive_int(two.get("team_id"))
     if one_id is None or two_id is None:
@@ -2746,7 +2775,12 @@ __all__ = [
     "accept_strict_live_map_mapping",
     "check_strict_live_eligibility",
     "init_strict_live_eligibility_schema",
+    "classify_raybet_match_format",
     "query_strict_live_eligibility",
     "record_strict_live_mapping_candidate",
+    "strict_raybet_head_to_head_teams",
     "strict_live_mapping_schema_requires_rebuild",
+    "RAYBET_MATCH_FORMAT_UNKNOWN",
+    "RAYBET_MATCH_HEAD_TO_HEAD",
+    "RAYBET_MATCH_NON_HEAD_TO_HEAD",
 ]

@@ -115,7 +115,14 @@ class BrowserEventIngestor:
             try:
                 with store.savepoint("browser_normalization"):
                     result = _validated_odds_result(event)
-                    store.insert_browser_raybet_match(result, event.captured_at_utc)
+                    try:
+                        store.insert_browser_raybet_match(
+                            result, event.captured_at_utc
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise BrowserNormalizationError(
+                            "RayBet match identity is not head-to-head"
+                        ) from error
                     try:
                         snapshots = list(self.parser(event.payload, event.captured_at_utc))
                         state_hash = self.state_hasher(snapshots)

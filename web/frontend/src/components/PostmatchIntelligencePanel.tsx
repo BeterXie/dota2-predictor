@@ -471,6 +471,7 @@ function reasonText(reason: string, fallback: string): string {
     strict_mapping_schema_missing: "当前数据库缺少 strict mapping 协议结构。",
     raybet_metadata_missing: "该局缺少 RayBet 身份元数据。",
     canonical_team_missing: "该局映射缺少规范球队身份。",
+    waiting_for_confirmed_draft: "该局已有 strict mapping，但仍缺少可信的已确认阵容与选边证据，赛后分析正在等待。",
     reconciliation_missing: "该局尚未建立赛后结算核对。",
     reconciliation_pending: "赛后结算核对尚未确认。",
     reconciliation_review_required: "赛后结算核对已进入人工复核。",

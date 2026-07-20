@@ -118,7 +118,15 @@ def test_unsigned_allowlisted_stream_requires_writer_provenance() -> None:
         with LiveBettingStore(Path(directory) / "live.db") as store:
             store.init_schema()
             store.upsert_raybet_match(
-                {"id": "42", "game_id": 151, "live_url": public_url},
+                {
+                    "id": "42",
+                    "game_id": 151,
+                    "live_url": public_url,
+                    "team": [
+                        {"pos": 1, "team_name": "One"},
+                        {"pos": 2, "team_name": "Two"},
+                    ],
+                },
                 NOW,
                 public_live_url=public_url,
             )
@@ -142,7 +150,10 @@ def test_direct_collector_records_only_originally_unsigned_public_stream() -> No
                     "id": match_id,
                     "game_id": 151,
                     "live_url": self.live_url,
-                    "team": [],
+                    "team": [
+                        {"pos": 1, "team_name": "One"},
+                        {"pos": 2, "team_name": "Two"},
+                    ],
                     "odds": [],
                 }
             }

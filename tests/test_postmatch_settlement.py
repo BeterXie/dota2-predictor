@@ -25,10 +25,12 @@ from live_betting.postmatch_monitor import (
     StoredMapResult,
     VisionDraftIdentity,
     _causal_draft_cutoffs,
+    _causal_vision_drafts,
     _latest_exact_raybet_final,
     _reconcile_and_settle,
     _refresh_raybet_final,
     _vision_drafts,
+    has_trusted_confirmed_draft,
     label_once,
 )
 from live_betting.raybet import RayBetMapFinal, parse_raybet_map_final
@@ -1118,6 +1120,13 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
                 }
             },
         )
+        self.assertTrue(
+            has_trusted_confirmed_draft(
+                self.store.connection,
+                "1001",
+                1,
+            )
+        )
         self.assertEqual(
             _vision_drafts(
                 self.store.connection,
@@ -1125,6 +1134,32 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
                 causal_cutoffs={1: NOW + timedelta(seconds=1)},
             ),
             {},
+        )
+
+    def test_confirmed_draft_check_does_not_cross_map_boundaries(self) -> None:
+        self.store.insert_vision_observation(
+            VisionObservation(
+                "1001", 1, NOW, 600, False,
+                (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
+                0.95, 0.95, "other-map", "game", "team_one",
+            )
+        )
+
+        drafts = _causal_vision_drafts(self.store, "1001", {1, 2})
+        self.assertIn(1, drafts)
+        self.assertNotIn(2, drafts)
+
+        self.assertTrue(
+            has_trusted_confirmed_draft(
+                self.store.connection,
+                "1001", 1,
+            )
+        )
+        self.assertFalse(
+            has_trusted_confirmed_draft(
+                self.store.connection,
+                "1001", 2,
+            )
         )
 
     def test_postmatch_team_side_promotion_respects_causal_cutoff(self) -> None:
@@ -1314,6 +1349,13 @@ class PostmatchSettlementPersistenceTests(unittest.TestCase):
         )
         self.store.insert_vision_observation(conflicting)
         self.latest_stored_raybet_final(raybet_final_payload())
+        self.assertTrue(
+            has_trusted_confirmed_draft(
+                self.store.connection,
+                "1001",
+                1,
+            )
+        )
 
         class FakeOpenDotaClient:
             async def get_team_matches(self, team_id: int) -> list[dict[str, int]]:

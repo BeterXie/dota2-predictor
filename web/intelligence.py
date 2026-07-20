@@ -37,6 +37,7 @@ from event_intelligence.player_scoring import score_version_for_role
 from event_intelligence.roles import PROSPECTIVE_ASSIGNMENT_VERSION
 from event_intelligence.team_profiles import PROFILE_VERSION
 from event_intelligence.team_states import LABEL_VERSION
+from live_betting.postmatch_monitor import has_trusted_confirmed_draft
 from live_betting.strict_eligibility import (
     StrictLiveMapMapping,
     query_strict_live_eligibility,
@@ -44,7 +45,7 @@ from live_betting.strict_eligibility import (
 )
 
 from . import queries
-from .monitoring import winner_timeline
+from .monitoring import is_head_to_head_match_row, winner_timeline
 
 
 MODEL_KINDS = ("pure_draft", "context_adjusted")
@@ -1561,10 +1562,13 @@ def _postmatch_base(
     raybet_match_id: str,
     map_number: int,
     odds_timeline: list[dict[str, Any]],
+    *,
+    checked_at: datetime,
 ) -> dict[str, Any]:
     return {
         "raybet_match_id": raybet_match_id,
         "map_number": map_number,
+        "checked_at": checked_at.isoformat(),
         "status": "unavailable",
         "reason": "reconciliation_missing",
         "mapping": None,
@@ -2327,16 +2331,27 @@ def get_raybet_postmatch(
     read_cutoff = datetime.now(timezone.utc)
     with _database() as connection:
         raybet_columns = _relation_columns(connection, "raybet_matches")
-        if "raybet_match_id" not in raybet_columns:
+        if not {
+            "raybet_match_id",
+            "team_one",
+            "team_two",
+            "raw_json",
+        }.issubset(raybet_columns):
             return {
-                **_postmatch_base(clean_match_id, map_number, []),
+                **_postmatch_base(
+                    clean_match_id,
+                    map_number,
+                    [],
+                    checked_at=read_cutoff,
+                ),
                 "reason": "raybet_match_schema_unavailable",
             }
-        exists = connection.execute(
-            "SELECT 1 FROM raybet_matches WHERE raybet_match_id=?",
+        match_row = connection.execute(
+            """SELECT raybet_match_id, team_one, team_two, raw_json
+                 FROM raybet_matches WHERE raybet_match_id=?""",
             (clean_match_id,),
         ).fetchone()
-        if exists is None:
+        if match_row is None or not is_head_to_head_match_row(match_row):
             return None
         full_odds = winner_timeline(
             connection,
@@ -2345,7 +2360,12 @@ def get_raybet_postmatch(
             period=f"map_{map_number}",
         )
         odds = _downsample_timeline(full_odds, max_points)
-        response = _postmatch_base(clean_match_id, map_number, odds)
+        response = _postmatch_base(
+            clean_match_id,
+            map_number,
+            odds,
+            checked_at=read_cutoff,
+        )
         reconciliation_columns = _relation_columns(
             connection, "settlement_reconciliations"
         )
@@ -2390,6 +2410,12 @@ def get_raybet_postmatch(
                     "canonical_team_missing",
                 }:
                     response["status"] = "review"
+            elif not has_trusted_confirmed_draft(
+                connection,
+                clean_match_id,
+                map_number,
+            ):
+                response["reason"] = "waiting_for_confirmed_draft"
             return response
         response["reconciliation"] = _reconciliation_payload(reconciliation)
         strict_mapping_id = reconciliation["strict_mapping_id"]

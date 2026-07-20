@@ -17,7 +17,12 @@ from urllib.parse import quote as url_quote
 
 from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
 from live_betting.sanitize import stored_public_stream_url
-from live_betting.strict_eligibility import query_strict_live_eligibility
+from live_betting.strict_eligibility import (
+    RAYBET_MATCH_HEAD_TO_HEAD,
+    RAYBET_MATCH_NON_HEAD_TO_HEAD,
+    classify_raybet_match_format,
+    query_strict_live_eligibility,
+)
 from live_betting.vision_frame_registry import VISION_FRAME_REF_PREFIX
 
 from .alerts import active_alerts
@@ -65,6 +70,7 @@ _REALTIME_VISION_SCAN_LIMIT = 256
 _HISTORY_DEFAULT_LIMIT = 20
 _HISTORY_MAX_LIMIT = 50
 _HISTORY_SCAN_LIMIT = 200
+_HISTORY_RAW_SCAN_LIMIT = 1000
 _HISTORY_CURSOR_MAX_LENGTH = 768
 _HISTORY_CURSOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
 _HISTORY_CURSOR_DOMAIN = b"dota2-monitor-history-v1\0"
@@ -255,12 +261,12 @@ def monitor_history_page(
         before = (int(decoded["timeline_key"]), str(decoded["match_id"]))
         _require_history_cursor_anchor(connection, decoded)
 
-    rows = _history_candidate_window(
+    rows, raw_more, raw_anchor = _history_candidate_window(
         connection,
         checked_at=checked_at,
         before=before,
     )
-    raw_more = len(rows) > _HISTORY_SCAN_LIMIT
+    candidate_more = len(rows) > _HISTORY_SCAN_LIMIT
     candidates = rows[:_HISTORY_SCAN_LIMIT]
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
@@ -280,12 +286,14 @@ def monitor_history_page(
         items.append(item)
         returned_rows.append(row)
 
-    has_more = found_extra or raw_more
+    has_more = found_extra or candidate_more or raw_more
     anchor: sqlite3.Row | None = None
     if found_extra:
         anchor = returned_rows[-1]
-    elif raw_more:
+    elif candidate_more:
         anchor = last_scanned
+    elif raw_more:
+        anchor = raw_anchor
     next_cursor = (
         _encode_history_cursor(anchor, checked_at)
         if has_more and anchor is not None
@@ -312,7 +320,7 @@ def monitor_match_detail(
              FROM raybet_matches WHERE raybet_match_id=?""",
         (raybet_match_id,),
     ).fetchone()
-    if row is None:
+    if row is None or not is_head_to_head_match_row(row):
         return None
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
@@ -775,6 +783,8 @@ def _realtime_match_candidates(
     by_match: dict[str, tuple[int, sqlite3.Row]] = {}
     for priority, rows in buckets:
         for row in rows:
+            if not is_head_to_head_match_row(row):
+                continue
             match_id = str(row["raybet_match_id"])
             previous = by_match.get(match_id)
             if previous is None or priority < previous[0]:
@@ -887,7 +897,7 @@ def _history_candidate_window(
     *,
     checked_at: datetime,
     before: tuple[int, str] | None,
-) -> list[sqlite3.Row]:
+) -> tuple[list[sqlite3.Row], bool, sqlite3.Row | None]:
     selected = _selected_match_columns()
     if before is None:
         keyset_clause = ""
@@ -901,7 +911,7 @@ def _history_candidate_window(
             )
         )"""
         keyset_params = (before[0], before[0], before[1])
-    return _rows(
+    raw_rows = _rows(
         connection,
         f"""SELECT {_TIMELINE_KEY_SQL} AS _timeline_key, {selected}
                FROM raybet_matches
@@ -913,11 +923,41 @@ def _history_candidate_window(
         (
             checked_at.isoformat(),
             *keyset_params,
-            _HISTORY_SCAN_LIMIT + 1,
+            _HISTORY_RAW_SCAN_LIMIT + 1,
         ),
     )
+    raw_more = len(raw_rows) > _HISTORY_RAW_SCAN_LIMIT
+    candidates: list[sqlite3.Row] = []
+    raw_anchor: sqlite3.Row | None = None
+    for row in raw_rows[:_HISTORY_RAW_SCAN_LIMIT]:
+        raw_anchor = row
+        if is_head_to_head_match_row(row):
+            candidates.append(row)
+            if len(candidates) > _HISTORY_SCAN_LIMIT:
+                raw_more = True
+                break
+    return candidates, raw_more, raw_anchor
 
 
+def is_head_to_head_match_row(row: sqlite3.Row) -> bool:
+    try:
+        payload = json.loads(str(row["raw_json"]))
+        if not isinstance(payload, dict):
+            return False
+        classification = classify_raybet_match_format(payload)
+        if classification == RAYBET_MATCH_HEAD_TO_HEAD:
+            return True
+        if classification == RAYBET_MATCH_NON_HEAD_TO_HEAD:
+            return False
+        team_one = str(row["team_one"] or "").strip()
+        team_two = str(row["team_two"] or "").strip()
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        team_one
+        and team_two
+        and team_one.casefold() != team_two.casefold()
+    )
 def _encode_history_cursor(row: sqlite3.Row, checked_at: datetime) -> str:
     payload = {
         "checked_at": checked_at.isoformat(),
