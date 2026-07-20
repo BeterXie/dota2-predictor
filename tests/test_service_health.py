@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -2052,6 +2053,186 @@ class ServiceHealthTests(unittest.TestCase):
                 root / "live_betting" / "service_report.json",
             )
             self.assertFalse(service.call_args.kwargs["health_only"])
+
+    def test_supervisor_retries_busy_and_locked_without_stopping_children(self) -> None:
+        busy = sqlite3.OperationalError("wrapped busy")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        locked = sqlite3.OperationalError("database table is locked")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "service.db"
+            database.touch()
+            child = object()
+            events: list[str] = []
+            sleep_durations: list[float] = []
+            service_calls = 0
+            output = StringIO()
+            errors = StringIO()
+            preparation = Mock(
+                backup=None,
+                live_schema_version=LIVE_SCHEMA_VERSION,
+                intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
+            )
+
+            def reconcile(children: dict[str, object], *_: object) -> TerminationResult:
+                children.setdefault("companion", child)
+                events.append("reconcile")
+                return TerminationResult(True)
+
+            def run_once(*_: object, **__: object) -> dict[str, object]:
+                nonlocal service_calls
+                service_calls += 1
+                events.append(f"service-{service_calls}")
+                if service_calls == 1:
+                    raise busy
+                if service_calls == 2:
+                    raise locked
+                return {"shadow": {"orders": {"signals": 0}}}
+
+            def sleep(seconds: float) -> None:
+                self.assertGreater(seconds, 0)
+                self.assertNotIn("shutdown", events)
+                sleep_durations.append(seconds)
+                events.append("sleep")
+
+            def shutdown(children: dict[str, object], *_: object) -> TerminationResult:
+                self.assertEqual(children, {"companion": child})
+                events.append("shutdown")
+                return TerminationResult(True)
+
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--once",
+                "--interval",
+                "0",
+                "--start-companion",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "stdout", output),
+                patch.object(sys, "stderr", errors),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers",
+                    return_value=WriterScanResult((), ()),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database",
+                    return_value=preparation,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._reconcile_managed_children",
+                    side_effect=reconcile,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.service_once",
+                    side_effect=run_once,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._shutdown_children_under_authority",
+                    side_effect=shutdown,
+                ),
+                patch("scripts.run_dota_shadow_service.time.sleep", side_effect=sleep),
+            ):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(
+                events,
+                [
+                    "reconcile",
+                    "service-1",
+                    "sleep",
+                    "reconcile",
+                    "service-2",
+                    "sleep",
+                    "reconcile",
+                    "service-3",
+                    "shutdown",
+                ],
+            )
+            self.assertEqual(sleep_durations, [0.05, 0.05])
+            self.assertEqual(
+                [json.loads(line) for line in errors.getvalue().splitlines()],
+                [
+                    {
+                        "status": "degraded",
+                        "detail": "database_lock_contention",
+                        "sqlite_result": "SQLITE_BUSY",
+                    },
+                    {
+                        "status": "degraded",
+                        "detail": "database_lock_contention",
+                        "sqlite_result": "SQLITE_LOCKED",
+                    },
+                ],
+            )
+
+    def test_supervisor_non_lock_operational_error_still_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "service.db"
+            database.touch()
+            child = object()
+            events: list[str] = []
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = sqlite3.SQLITE_READONLY
+            preparation = Mock(
+                backup=None,
+                live_schema_version=LIVE_SCHEMA_VERSION,
+                intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
+            )
+
+            def reconcile(children: dict[str, object], *_: object) -> TerminationResult:
+                children["companion"] = child
+                return TerminationResult(True)
+
+            def shutdown(children: dict[str, object], *_: object) -> TerminationResult:
+                self.assertEqual(children, {"companion": child})
+                events.append("shutdown")
+                return TerminationResult(True)
+
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--once",
+                "--start-companion",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "stderr", StringIO()),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers",
+                    return_value=WriterScanResult((), ()),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database",
+                    return_value=preparation,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._reconcile_managed_children",
+                    side_effect=reconcile,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.service_once",
+                    side_effect=error,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._shutdown_children_under_authority",
+                    side_effect=shutdown,
+                ),
+                patch("scripts.run_dota_shadow_service.time.sleep") as sleep,
+            ):
+                with self.assertRaises(sqlite3.OperationalError) as raised:
+                    main()
+
+            self.assertIs(raised.exception, error)
+            self.assertEqual(events, ["shutdown"])
+            sleep.assert_not_called()
 
     def test_recurring_supervisor_keeps_health_and_reporting_separate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

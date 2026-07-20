@@ -85,6 +85,7 @@ WORKER_MAX_AGE = {
 COLLECTOR_MAX_AGE = timedelta(seconds=60)
 DATABASE_AUDIT_MAX_AGE = timedelta(minutes=15)
 DATABASE_FAILURE_RECHECK = timedelta(seconds=60)
+LOCK_CONTENTION_RETRY_MIN_SECONDS = 0.05
 COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
 _DATABASE_HEALTH_CACHE: dict[
     str,
@@ -92,6 +93,23 @@ _DATABASE_HEALTH_CACHE: dict[
 ] = {}
 _DATABASE_AUDIT_THREADS: dict[str, threading.Thread] = {}
 _DATABASE_AUDIT_LOCK = threading.Lock()
+
+
+def _transient_sqlite_lock_kind(error: sqlite3.OperationalError) -> str | None:
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is int:
+        primary = code & 0xFF
+        if primary == sqlite3.SQLITE_BUSY:
+            return "SQLITE_BUSY"
+        if primary == sqlite3.SQLITE_LOCKED:
+            return "SQLITE_LOCKED"
+        return None
+    message = " ".join(str(error).split()).casefold()
+    if message == "database is locked":
+        return "SQLITE_BUSY"
+    if message in {"database table is locked", "database schema is locked"}:
+        return "SQLITE_LOCKED"
+    return None
 
 
 def _write_service_report(report_path: Path, result: Mapping[str, Any]) -> None:
@@ -1232,13 +1250,32 @@ def main() -> int:
                     args.database,
                     expected_identity=database_identity,
                 )
-                result = service_once(
-                    args.database,
-                    args.report if args.once else None,
-                    active_components=set(commands),
-                    initialize_schema=False,
-                    health_only=report_worker is not None,
-                )
+                try:
+                    result = service_once(
+                        args.database,
+                        args.report if args.once else None,
+                        active_components=set(commands),
+                        initialize_schema=False,
+                        health_only=report_worker is not None,
+                    )
+                except sqlite3.OperationalError as error:
+                    lock_kind = _transient_sqlite_lock_kind(error)
+                    if lock_kind is None:
+                        raise
+                    print(
+                        json.dumps(
+                            {
+                                "status": "degraded",
+                                "detail": "database_lock_contention",
+                                "sqlite_result": lock_kind,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(max(args.interval, LOCK_CONTENTION_RETRY_MIN_SECONDS))
+                    continue
                 if report_worker is not None:
                     report_worker.start_if_idle()
                 print(json.dumps({"status": "ok", "components": list(commands),
