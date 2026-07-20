@@ -231,7 +231,11 @@ def _verify_prepared(args: argparse.Namespace) -> int:
     )
     try:
         with _database_authority(database, additional_lock):
-            result = verify_prepared_database(database, odds_raw_root=odds_raw_root)
+            result = verify_prepared_database(
+                database,
+                odds_raw_root=odds_raw_root,
+                immutable_locks=database_authority_lock_paths(database),
+            )
     except Exception as error:
         print(
             json.dumps(

@@ -21,7 +21,9 @@ from live_betting.service_coordination import (
     DatabaseFileIdentity,
     ProcessIdentity,
     WriterScanResult,
+    database_authority_lock_paths,
     database_global_authority_lock_paths,
+    require_current_process_lock,
 )
 from scripts.database_cutover import main
 from scripts.run_dota_shadow_service import SingleInstanceLock
@@ -528,6 +530,60 @@ def test_verify_prepared_cli_is_read_only(
     assert payload["query_only"] is True
     assert payload["runtime_schema_version"] == 1
     assert _hash(database) == before
+
+
+def test_verify_prepared_cli_preserves_checkpointed_wal_sidecars(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "checkpointed-wal.db"
+    prepare_database(database, tmp_path / "schema-backups")
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+    assert truncate_wal_checkpoint(database).safe
+    before = database_protocol.sqlite_sidecar_state(database)
+    expected_locks = database_authority_lock_paths(database)
+    observed_locks: tuple[Path, ...] = ()
+    real_verify = database_cutover.verify_prepared_database
+
+    def verify(
+        path: Path,
+        *,
+        odds_raw_root: Path,
+        immutable_locks: tuple[Path, ...],
+    ) -> object:
+        nonlocal observed_locks
+        observed_locks = immutable_locks
+        assert observed_locks == expected_locks
+        for lock in observed_locks:
+            assert require_current_process_lock(lock).pid == os.getpid()
+        return real_verify(
+            path,
+            odds_raw_root=odds_raw_root,
+            immutable_locks=immutable_locks,
+        )
+
+    monkeypatch.setattr(database_cutover, "verify_prepared_database", verify)
+
+    exit_code = main(
+        [
+            "verify-prepared",
+            "--database",
+            str(database),
+            "--odds-raw-root",
+            str(tmp_path / "missing-but-empty-raw-v2"),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["status"] == "ok"
+    assert observed_locks == expected_locks
+    assert database_protocol.sqlite_sidecar_state(database) == before
 
 
 def test_prepared_verifier_enforces_query_only_on_a_mode_ro_connection(
