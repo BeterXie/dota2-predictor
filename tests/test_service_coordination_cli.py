@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import psutil
+import managed_child_bootstrap
 import live_betting.service_coordination as service_coordination
 
 from live_betting.service_coordination import (
@@ -358,6 +359,90 @@ def test_windows_marker_retry_revalidates_after_sleep_before_replace(
     assert replace_calls == 1
     assert source.read_bytes() == b"bound"
     assert destination.read_bytes() == b"changed"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows marker replacement read window")
+def test_windows_bootstrap_retries_transient_marker_read_permission_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_path = (tmp_path / "manager-marker.json").resolve()
+    marker_payload = {"marker_path": str(marker_path)}
+    marker = json.dumps(marker_payload, sort_keys=True, separators=(",", ":"))
+    bound_payload = {
+        **marker_payload,
+        "child_identity": {"pid": os.getpid(), "created_at": 1.0},
+    }
+    bound = json.dumps(bound_payload, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    attempts = 0
+
+    def read_bytes(path: Path) -> bytes:
+        nonlocal attempts
+        assert path == marker_path
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(13, "marker replacement in progress")
+        return bound
+
+    monkeypatch.setenv("DOTA2_MANAGER_CHILD_AUTHORITY_V1", marker)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    managed_child_bootstrap._wait_for_parent_binding()
+
+    assert attempts == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows marker replacement read window")
+def test_windows_bootstrap_permission_error_remains_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_path = (tmp_path / "manager-marker.json").resolve()
+    marker = json.dumps({"marker_path": str(marker_path)})
+    monotonic_values = iter((10.0, 11.0))
+
+    def read_bytes(path: Path) -> bytes:
+        assert path == marker_path
+        raise PermissionError(13, "marker remains unavailable")
+
+    monkeypatch.setenv("DOTA2_MANAGER_CHILD_AUTHORITY_V1", marker)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(
+        managed_child_bootstrap.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    with pytest.raises(RuntimeError, match="marker is unavailable") as raised:
+        managed_child_bootstrap._wait_for_parent_binding()
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+
+
+def test_bootstrap_non_permission_marker_error_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_path = (tmp_path / "missing-marker.json").resolve()
+    marker = json.dumps({"marker_path": str(marker_path)})
+    attempts = 0
+
+    def read_bytes(path: Path) -> bytes:
+        nonlocal attempts
+        assert path == marker_path
+        attempts += 1
+        raise FileNotFoundError(path)
+
+    monkeypatch.setenv("DOTA2_MANAGER_CHILD_AUTHORITY_V1", marker)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    with pytest.raises(RuntimeError, match="marker is unavailable") as raised:
+        managed_child_bootstrap._wait_for_parent_binding()
+
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
+    assert attempts == 1
 
 
 def test_web_fetch_cleanup_attempts_all_and_preserves_body_baseexception(

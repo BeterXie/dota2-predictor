@@ -95,14 +95,26 @@ def _wait_for_parent_binding() -> None:
 
     deadline = time.monotonic() + _BIND_TIMEOUT_SECONDS
     while True:
+        permission_error: PermissionError | None = None
         try:
             persisted = marker_path.read_bytes()
+        except PermissionError as error:
+            if os.name != "nt":
+                raise RuntimeError(
+                    "manager child authority marker is unavailable"
+                ) from error
+            permission_error = error
         except OSError as error:
             raise RuntimeError("manager child authority marker is unavailable") from error
-        if _bound_marker(marker, persisted):
-            return
+        else:
+            if _bound_marker(marker, persisted):
+                return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if permission_error is not None:
+                raise RuntimeError(
+                    "manager child authority marker is unavailable"
+                ) from permission_error
             raise RuntimeError("manager child authority binding timed out")
         time.sleep(min(_BIND_POLL_SECONDS, remaining))
 
