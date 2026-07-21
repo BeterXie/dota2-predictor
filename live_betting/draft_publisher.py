@@ -7,7 +7,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -15,7 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
+
+import psutil
 
 from event_intelligence.backtest import HORIZONS, draft_dependency_fingerprint
 from event_intelligence.deployment import (
@@ -80,6 +84,163 @@ LINEUP_ROLE_VERSION = "live-unknown-role-v1"
 PURE_MODEL_FEATURE_SCHEMA_HASH = FeatureSchema.from_names(
     PURE_FEATURE_SCHEMA
 ).schema_hash
+HISTORY_LOAD_TIMEOUT_SECONDS = 120.0
+SAFE_FAILURE_MESSAGE_MAX_LENGTH = 240
+_SQL_DIAGNOSTIC_RE = re.compile(
+    r"(?:\bselect\b.+?\bfrom\b|\binsert\s+into\b|\bupdate\s+\S+\s+set\b|"
+    r"\bdelete\s+from\b|\bcreate\s+table\b|\balter\s+table\b|"
+    r"\bdrop\s+table\b|\bpragma\b|\bwith\s+recursive\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_QUOTED_PATH_RE = re.compile(
+    r'"(?:[A-Za-z]:[\\/]|\\\\|/)[^"\r\n]*"'
+    r"|'(?:[A-Za-z]:[\\/]|\\\\|/)[^'\r\n]*'"
+)
+_WINDOWS_OR_UNC_SPACED_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)"
+    r"[^<>|?*:\"'\r\n,;]*?"
+    r"(?:\.[A-Za-z0-9][A-Za-z0-9_-]{0,15})+"
+    r"(?=$|[\s,;:)\]}])"
+)
+_POSIX_SPACED_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])/"
+    r"(?:[^/\"'\r\n,;]+/)+"
+    r"[^/\"'\r\n,;]*?"
+    r"(?:\.[A-Za-z0-9][A-Za-z0-9_-]{0,15})+"
+    r"(?=$|[\s,;:)\]}])"
+)
+_PATH_ERROR_TRAILER_PATTERN = (
+    r"(?:was\s+not\s+found|not\s+found|does\s+not\s+exist|"
+    r"permission\s+denied|access\s+denied|failed|missing|denied|"
+    r"errno(?:\s+\d+)?|because|at\s+line)"
+)
+_WINDOWS_OR_UNC_BOUNDED_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)"
+    r"(?=[^<>|?*:\"'\r\n,;]*\s)"
+    r"[^<>|?*:\"'\r\n,;]*?"
+    r"(?=$|[,;)\]}]|\s+" + _PATH_ERROR_TRAILER_PATTERN + r"\b)",
+    re.IGNORECASE,
+)
+_POSIX_BOUNDED_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])/"
+    r"(?=[^\s/\"'\r\n,;]+/)"
+    r"(?=[^\"'\r\n,;]*\s)"
+    r"[^\"'\r\n,;]*?"
+    r"(?=$|[,;)\]}]|\s+" + _PATH_ERROR_TRAILER_PATTERN + r"\b)",
+    re.IGNORECASE,
+)
+_WINDOWS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|,;)\]}]+"
+)
+_UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;)\]}]+")
+_POSIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])/(?:[^\s\"'<>|,;)\]}]+)"
+)
+_AUTHORIZATION_KEY_PATTERN = (
+    r"(?<![A-Za-z0-9_-])(?:[A-Za-z0-9]+[_-])*authorization"
+    r"(?![A-Za-z0-9_-])"
+)
+_OPAQUE_CREDENTIAL_PATTERN = (
+    r"(?:\"[^\"]*\"|'[^']*'|"
+    r"(?=\S*(?:[0-9]|[^A-Za-z\s]))\S+|[A-Za-z]{16,})"
+)
+_AUTHORIZATION_EXPLICIT_RE = re.compile(
+    _AUTHORIZATION_KEY_PATTERN
+    + r"\s*[:=/]\s*(?:\"[^\"]+\"|'[^']+'|"
+    + r"[A-Za-z][A-Za-z0-9._~+-]*\s+\S+).*$",
+    re.IGNORECASE,
+)
+_AUTHORIZATION_SPACED_RE = re.compile(
+    _AUTHORIZATION_KEY_PATTERN
+    + r"\s+[A-Za-z][A-Za-z0-9._~+-]*\s+"
+    + _OPAQUE_CREDENTIAL_PATTERN
+    + r".*$",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"\bbearer\s+\S+", re.IGNORECASE)
+_CREDENTIAL_KEY_PATTERN = (
+    r"(?:(?:[A-Za-z0-9]+[_-])*(?:password|passwd|secret|token|api[_-]?key)"
+    r"|smtp[_-]?code)"
+)
+_CREDENTIAL_EXPLICIT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    + _CREDENTIAL_KEY_PATTERN
+    + r"(?![A-Za-z0-9_-])\s*[:=/]\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|\S+)",
+    re.IGNORECASE,
+)
+_PREFIXED_CREDENTIAL_SPACED_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[_-])"
+    + _CREDENTIAL_KEY_PATTERN
+    + r"(?![A-Za-z0-9_-])\s+(?:\"[^\"]*\"|'[^']*'|\S+)",
+    re.IGNORECASE,
+)
+_OPAQUE_CREDENTIAL_SPACED_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    + _CREDENTIAL_KEY_PATTERN
+    + r"(?![A-Za-z0-9_-])\s+"
+    + _OPAQUE_CREDENTIAL_PATTERN,
+    re.IGNORECASE,
+)
+
+
+class _FrozenDeploymentLineageError(ValueError):
+    pass
+
+
+class _HistoryLoadTimeoutError(TimeoutError):
+    pass
+
+
+def _safe_offline_rebuild_failure(error: Exception) -> dict[str, object]:
+    exception_type = type(error).__name__
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", exception_type) is None:
+        exception_type = "Exception"
+    message = " ".join(str(error).split())
+    if _SQL_DIAGNOSTIC_RE.search(message) is not None:
+        message = "sensitive SQL diagnostic removed"
+    else:
+        message = _URL_RE.sub("[url]", message)
+        message = _QUOTED_PATH_RE.sub("[path]", message)
+        message = _WINDOWS_OR_UNC_SPACED_PATH_RE.sub("[path]", message)
+        message = _POSIX_SPACED_PATH_RE.sub("[path]", message)
+        message = _WINDOWS_OR_UNC_BOUNDED_PATH_RE.sub("[path]", message)
+        message = _POSIX_BOUNDED_PATH_RE.sub("[path]", message)
+        message = _WINDOWS_PATH_RE.sub("[path]", message)
+        message = _UNC_PATH_RE.sub("[path]", message)
+        message = _POSIX_PATH_RE.sub("[path]", message)
+        message = _AUTHORIZATION_EXPLICIT_RE.sub("[credential]", message)
+        message = _AUTHORIZATION_SPACED_RE.sub("[credential]", message)
+        message = _BEARER_RE.sub("[credential]", message)
+        message = _CREDENTIAL_EXPLICIT_RE.sub("[credential]", message)
+        message = _PREFIXED_CREDENTIAL_SPACED_RE.sub("[credential]", message)
+        message = _OPAQUE_CREDENTIAL_SPACED_RE.sub("[credential]", message)
+    if not message:
+        message = "offline artifact rebuild failed"
+    truncated = len(message) > SAFE_FAILURE_MESSAGE_MAX_LENGTH
+    if truncated:
+        message = message[: SAFE_FAILURE_MESSAGE_MAX_LENGTH - 3] + "..."
+    return {
+        "exception_type": exception_type,
+        "message": message,
+        "message_truncated": truncated,
+    }
+
+
+def _publisher_process_generation(pid: int, created_at: float) -> str:
+    return f"{pid}:{created_at:.9f}"
+
+
+def _publisher_process_details() -> dict[str, object]:
+    process = psutil.Process(os.getpid())
+    pid = int(process.pid)
+    created_at = float(process.create_time())
+    return {
+        "process_pid": pid,
+        "process_created_at": created_at,
+        "process_generation": _publisher_process_generation(pid, created_at),
+    }
 
 
 @contextmanager
@@ -599,7 +760,9 @@ def _load_frozen_deployment_snapshot(
             raise ValueError("prospective calibration predates its frozen model")
     dependency_reason = _deployment_training_reason(connection, deployment)
     if dependency_reason is not None:
-        raise ValueError(f"draft deployment lineage is stale: {dependency_reason}")
+        raise _FrozenDeploymentLineageError(
+            f"draft deployment lineage is stale: {dependency_reason}"
+        )
     assert_draft_models_match_database(
         connection,
         deployment.models,
@@ -1824,8 +1987,34 @@ def _current_dependency_revision(database: Path) -> int:
 
 def _load_history(
     database: Path,
+    *,
+    timeout_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> ProspectiveHistorySnapshot:
     reader = connect(database, read_only=True, row_factory=sqlite3.Row)
+    deadline = None
+    timed_out = False
+    if timeout_seconds is not None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+            reader.close()
+            raise ValueError("history load timeout must be positive")
+        deadline = monotonic() + timeout_seconds
+
+        def interrupt_expired_query() -> int:
+            nonlocal timed_out
+            if monotonic() >= deadline:
+                timed_out = True
+                return 1
+            return 0
+
+        reader.set_progress_handler(interrupt_expired_query, 1_000)
+
+    def require_time_remaining() -> None:
+        nonlocal timed_out
+        if deadline is not None and monotonic() >= deadline:
+            timed_out = True
+            raise _HistoryLoadTimeoutError("history_load_timeout")
+
     try:
         reader.execute("BEGIN")
         revision_row = reader.execute(
@@ -1834,16 +2023,39 @@ def _load_history(
         ).fetchone()
         if revision_row is None:
             raise RuntimeError("draft dependency revision is unavailable")
+        require_time_remaining()
         fingerprint = draft_dependency_fingerprint(reader)
+        require_time_remaining()
         history = load_prospective_history(reader)
+        require_time_remaining()
         reader.rollback()
         return ProspectiveHistorySnapshot(
             dependency_revision=int(revision_row[0]),
             dependency_fingerprint=fingerprint,
             maps=history,
         )
+    except sqlite3.OperationalError as error:
+        if timed_out:
+            raise _HistoryLoadTimeoutError("history_load_timeout") from error
+        raise
     finally:
-        reader.close()
+        if deadline is not None:
+            reader.set_progress_handler(None, 0)
+        try:
+            if reader.in_transaction:
+                reader.rollback()
+        finally:
+            reader.close()
+
+
+def _load_history_with_timeout(
+    database: Path,
+    *,
+    timeout_seconds: float,
+) -> ProspectiveHistorySnapshot:
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+        raise ValueError("history load timeout must be positive")
+    return _load_history(database, timeout_seconds=timeout_seconds)
 
 
 def _refresh_dependency_inputs(
@@ -1853,22 +2065,16 @@ def _refresh_dependency_inputs(
     *,
     now: datetime,
 ) -> tuple[FrozenDraftDeployment, ProspectiveHistorySnapshot]:
+    del now
     current_revision = _current_dependency_revision(database)
-    if (
-        history.dependency_revision == current_revision
-        and deployment.dependency_revision == current_revision
-    ):
-        return deployment, history
     if deployment.dependency_revision != current_revision:
-        reader = connect(database, read_only=True, row_factory=sqlite3.Row)
-        try:
-            training_reason = _deployment_training_reason(reader, deployment)
-        finally:
-            reader.close()
-        if training_reason is not None:
-            deployment = _build_and_persist(database, now)
+        raise _FrozenDeploymentLineageError(
+            "draft deployment dependency revision changed"
+        )
     if history.dependency_revision != current_revision:
-        history = _load_history(database)
+        raise _FrozenDeploymentLineageError(
+            "draft history dependency revision changed"
+        )
     return deployment, history
 
 
@@ -1879,9 +2085,12 @@ def _record_cycle_health(
     now: datetime,
     report: PublisherCycleReport | None = None,
     error: str | None = None,
+    phase: str | None = None,
+    failure: Mapping[str, object] | None = None,
 ) -> None:
     details: dict[str, Any] = {
         "publisher_version": PUBLISHER_VERSION,
+        **_publisher_process_details(),
     }
     if report is not None:
         details.update(
@@ -1894,6 +2103,10 @@ def _record_cycle_health(
                 "outcomes_inserted": report.outcomes_inserted,
             }
         )
+    if phase is not None:
+        details["phase"] = phase
+    if failure is not None:
+        details["failure"] = dict(failure)
     record_health(
         connection,
         PUBLISHER_COMPONENT,
@@ -1906,23 +2119,143 @@ def _record_cycle_health(
     )
 
 
+def _record_database_health(
+    database: Path,
+    *,
+    status: str,
+    phase: str,
+    error: str | None = None,
+    failure: Mapping[str, object] | None = None,
+) -> None:
+    with LiveBettingStore(database) as store:
+        _record_cycle_health(
+            store.connection,
+            status=status,
+            now=datetime.now(timezone.utc),
+            error=error,
+            phase=phase,
+            failure=failure,
+        )
+
+
 def _run_publisher_locked(
     database: Path,
     *,
     once: bool,
     interval_seconds: float,
     rebuild_artifacts: bool,
+    history_timeout_seconds: float = HISTORY_LOAD_TIMEOUT_SECONDS,
 ) -> int:
-    now = datetime.now(timezone.utc)
-    with LiveBettingStore(database) as store:
-        deployment = None if rebuild_artifacts else load_latest_frozen_deployment(
-            store.connection
+    if rebuild_artifacts:
+        if not once:
+            _record_database_health(
+                database,
+                status="unhealthy",
+                phase="offline_rebuild",
+                error="offline_rebuild_requires_once",
+            )
+            return 2
+        _record_database_health(
+            database,
+            status="starting",
+            phase="offline_rebuild",
         )
-        if deployment is None:
-            _record_cycle_health(store.connection, status="starting", now=now)
+        try:
+            _build_and_persist(database, datetime.now(timezone.utc))
+        except Exception as error:
+            failure = _safe_offline_rebuild_failure(error)
+            _record_database_health(
+                database,
+                status="unhealthy",
+                phase="offline_rebuild",
+                error="offline_rebuild_failed",
+                failure=failure,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "offline_rebuild_failed",
+                        "failure": failure,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        _record_database_health(
+            database,
+            status="healthy",
+            phase="offline_rebuild_complete",
+        )
+        return 0
+    _record_database_health(
+        database,
+        status="starting",
+        phase="loading_deployment",
+    )
+    try:
+        with LiveBettingStore(database) as store:
+            deployment = load_latest_frozen_deployment(store.connection)
+    except _FrozenDeploymentLineageError:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_deployment",
+            error="frozen_deployment_lineage_invalid",
+        )
+        return 2
+    except ValueError:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_deployment",
+            error="frozen_deployment_invalid",
+        )
+        return 2
+    except Exception:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_deployment",
+            error="frozen_deployment_load_failed",
+        )
+        return 2
     if deployment is None:
-        deployment = _build_and_persist(database, now)
-    history = _load_history(database)
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_deployment",
+            error="frozen_deployment_missing",
+        )
+        return 2
+    _record_database_health(
+        database,
+        status="starting",
+        phase="loading_history",
+    )
+    try:
+        history = _load_history_with_timeout(
+            database,
+            timeout_seconds=history_timeout_seconds,
+        )
+    except _HistoryLoadTimeoutError:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_history",
+            error="history_load_timeout",
+        )
+        return 2
+    except Exception:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_history",
+            error="history_load_failed",
+        )
+        return 2
     while True:
         cycle_at = datetime.now(timezone.utc)
         try:
@@ -1939,24 +2272,13 @@ def _run_publisher_locked(
                     history=history,
                     now=cycle_at,
                 )
-                refreshed = build_prospective_calibration_deployment(
-                    store.connection,
-                    deployment,
-                )
-                if refreshed is not None:
-                    persist_frozen_deployment(
-                        store.connection,
-                        refreshed,
-                        created_at=cycle_at,
-                    )
                 _record_cycle_health(
                     store.connection,
                     status="healthy",
                     now=cycle_at,
                     report=report,
+                    phase="healthy",
                 )
-            if refreshed is not None:
-                deployment = refreshed
             print(
                 json.dumps(
                     {
@@ -1972,6 +2294,14 @@ def _run_publisher_locked(
                 ),
                 flush=True,
             )
+        except _FrozenDeploymentLineageError:
+            _record_database_health(
+                database,
+                status="unhealthy",
+                phase="loading_deployment",
+                error="frozen_deployment_lineage_invalid",
+            )
+            return 2
         except Exception as error:
             message = f"{type(error).__name__}: {' '.join(str(error).split())[:500]}"
             with LiveBettingStore(database) as store:
@@ -2014,6 +2344,8 @@ def main() -> int:
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval <= 0.0:
         parser.error("--interval must be positive")
+    if args.rebuild_artifacts and not args.once:
+        parser.error("--rebuild-artifacts requires --once")
     database = args.database.resolve()
     with database_writer_authority(database):
         if args.schema_prepared:

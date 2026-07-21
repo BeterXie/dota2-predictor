@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -89,6 +90,7 @@ DATABASE_FAILURE_RECHECK = timedelta(seconds=60)
 LOCK_CONTENTION_RETRY_MIN_SECONDS = 0.05
 CHILD_RESTART_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 CHILD_STABLE_RESET_SECONDS = 60.0
+DRAFT_PUBLISHER_WEDGE_STARTUP_GRACE_SECONDS = 60.0
 COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
 _DATABASE_HEALTH_CACHE: dict[
     str,
@@ -310,6 +312,78 @@ def _worker_health(
         "worker_details": details,
         "reason": reason,
     }
+
+
+def _draft_publisher_heartbeat_expired(
+    database: Path,
+    *,
+    expected_identities: tuple[ProcessIdentity, ...],
+    child_runtime_seconds: float,
+    now: datetime | None = None,
+) -> bool | None:
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{database.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=0.05,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=50")
+        row = connection.execute(
+            "SELECT last_heartbeat_at, details_json FROM service_health "
+            "WHERE component=?",
+            (WORKER_COMPONENTS["draft_publisher"],),
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if _transient_sqlite_lock_kind(error) is not None:
+            return None
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+    hard_limit = WORKER_MAX_AGE["draft_publisher"].total_seconds() * 2
+    child_hard_expired = child_runtime_seconds > hard_limit
+    if row is None:
+        return child_hard_expired
+    try:
+        details = json.loads(str(row["details_json"]))
+    except (TypeError, ValueError):
+        details = None
+    health_identity = _publisher_health_identity(details)
+    if health_identity is None or health_identity not in expected_identities:
+        return child_hard_expired
+    heartbeat = _parse_time(row["last_heartbeat_at"])
+    if heartbeat is None:
+        return child_hard_expired
+    return max(0.0, (checked_at - heartbeat).total_seconds()) > hard_limit
+
+
+def _publisher_process_generation(identity: ProcessIdentity) -> str:
+    return f"{identity.pid}:{identity.created_at:.9f}"
+
+
+def _publisher_health_identity(details: object) -> ProcessIdentity | None:
+    if not isinstance(details, dict):
+        return None
+    pid = details.get("process_pid")
+    created_at = details.get("process_created_at")
+    generation = details.get("process_generation")
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or not isinstance(created_at, (int, float))
+        or isinstance(created_at, bool)
+        or not math.isfinite(float(created_at))
+        or float(created_at) <= 0.0
+    ):
+        return None
+    identity = ProcessIdentity(pid, float(created_at))
+    if generation != _publisher_process_generation(identity):
+        return None
+    return identity
 
 
 def _database_health(connection: Any) -> tuple[str, str | None, dict[str, Any]]:
@@ -1064,6 +1138,60 @@ def _reconcile_managed_children(
             continue
         if now >= state.next_restart_at:
             pending[name] = command
+
+    publisher = children.get("draft_publisher")
+    publisher_state = states.get("draft_publisher")
+    publisher_wedged = False
+    if (
+        publisher is not None
+        and publisher_state is not None
+        and publisher.poll() is None
+        and publisher_state.started_at is not None
+        and now - publisher_state.started_at
+        >= DRAFT_PUBLISHER_WEDGE_STARTUP_GRACE_SECONDS
+    ):
+        try:
+            publisher_identities = _capture_subprocess_tree_identities(
+                publisher,
+                process_factory=process_factory,
+            )
+        except (psutil.Error, RuntimeError):
+            publisher_identities = ()
+        if publisher_identities:
+            publisher_wedged = _draft_publisher_heartbeat_expired(
+                database,
+                expected_identities=publisher_identities,
+                child_runtime_seconds=now - publisher_state.started_at,
+            ) is True
+    if publisher_wedged:
+        gate = authority_gate(children, database, database_identity)
+        if not gate.ok:
+            return gate
+        termination = terminate_subprocess_tree(
+            publisher,
+            process_factory=process_factory,
+        )
+        if not termination.ok:
+            return TerminationResult(
+                False,
+                "wedged_child_termination_unproven:draft_publisher:"
+                f"{termination.detail}",
+            )
+        try:
+            _close_child_authority(publisher)
+        except Exception as error:
+            return TerminationResult(
+                False,
+                "wedged_child_authority_cleanup_failed:draft_publisher:"
+                f"{type(error).__name__}:{error}",
+            )
+        children.pop("draft_publisher", None)
+        _schedule_child_restart(
+            publisher_state,
+            failed_at=now,
+            exit_code=None,
+        )
+        publisher_state.observed_exit_handle = None
 
     gate_checked = False
     if newly_exited:

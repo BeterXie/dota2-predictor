@@ -352,6 +352,558 @@ def test_publisher_singleton_lock_fences_hard_link_alias(tmp_path: Path) -> None
                 raise AssertionError("hard-link alias acquired a second lock")
 
 
+def test_runtime_publisher_fails_closed_without_frozen_deployment(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("runtime publisher attempted to build or recalibrate")
+
+    monkeypatch.setattr(draft_publisher_module, "_build_and_persist", forbidden)
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "build_prospective_calibration_deployment",
+        forbidden,
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=False,
+        history_timeout_seconds=0.1,
+    )
+
+    assert result == 2
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error, details_json FROM service_health "
+            "WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health[:2]) == ("unhealthy", "frozen_deployment_missing")
+    assert json.loads(str(health[2]))["phase"] == "loading_deployment"
+
+
+def test_runtime_publisher_history_timeout_is_bounded_and_recorded(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = SimpleNamespace(dependency_revision=1)
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_latest_frozen_deployment",
+        lambda _connection: deployment,
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_load_history_with_timeout",
+        lambda _database, *, timeout_seconds: (_ for _ in ()).throw(
+            draft_publisher_module._HistoryLoadTimeoutError(
+                "history_load_timeout"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "build_prospective_calibration_deployment",
+        lambda *_args, **_kwargs: pytest.fail(
+            "runtime publisher attempted to recalibrate"
+        ),
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=False,
+        history_timeout_seconds=0.05,
+    )
+
+    assert result == 2
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error, details_json FROM service_health "
+            "WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health[:2]) == ("unhealthy", "history_load_timeout")
+    assert json.loads(str(health[2]))["phase"] == "loading_history"
+
+
+def test_history_timeout_interrupts_sqlite_and_closes_connection(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_connect = draft_publisher_module.connect
+    closed: list[bool] = []
+
+    class TrackingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+        def close(self) -> None:
+            self.connection.close()
+            closed.append(True)
+
+    def tracked_connect(*args: object, **kwargs: object) -> TrackingConnection:
+        return TrackingConnection(original_connect(*args, **kwargs))
+
+    def slow_history(connection: sqlite3.Connection) -> tuple[()]:
+        connection.execute(
+            "WITH RECURSIVE counter(value) AS ("
+            "SELECT 1 UNION ALL SELECT value + 1 FROM counter "
+            "WHERE value < 1000000000) SELECT sum(value) FROM counter"
+        ).fetchone()
+        return ()
+
+    monkeypatch.setattr(draft_publisher_module, "connect", tracked_connect)
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "draft_dependency_fingerprint",
+        lambda _connection: "fingerprint",
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_prospective_history",
+        slow_history,
+    )
+
+    with pytest.raises(
+        draft_publisher_module._HistoryLoadTimeoutError,
+        match="history_load_timeout",
+    ):
+        draft_publisher_module._load_history_with_timeout(
+            prepared_database,
+            timeout_seconds=0.01,
+        )
+
+    assert closed == [True]
+
+
+def test_explicit_offline_rebuild_is_the_only_runtime_build_path(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[Path] = []
+    deployment = SimpleNamespace(deployment_key="offline-deployment")
+
+    def build(database: Path, _now: datetime) -> SimpleNamespace:
+        built.append(database)
+        return deployment
+
+    monkeypatch.setattr(draft_publisher_module, "_build_and_persist", build)
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_latest_frozen_deployment",
+        lambda _connection: pytest.fail("offline rebuild entered runtime load"),
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_load_history_with_timeout",
+        lambda *_args, **_kwargs: pytest.fail("offline rebuild loaded history"),
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "build_prospective_calibration_deployment",
+        lambda *_args, **_kwargs: pytest.fail("offline rebuild recalibrated"),
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=True,
+        history_timeout_seconds=0.1,
+    )
+
+    assert result == 0
+    assert built == [prepared_database]
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error, details_json FROM service_health "
+            "WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health[:2]) == ("healthy", None)
+    assert json.loads(str(health[2]))["phase"] == "offline_rebuild_complete"
+
+
+def test_offline_rebuild_requires_once(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_build_and_persist",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-once offline rebuild attempted to build"
+        ),
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=False,
+        interval_seconds=0.01,
+        rebuild_artifacts=True,
+        history_timeout_seconds=0.1,
+    )
+
+    assert result == 2
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error FROM service_health WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health) == ("unhealthy", "offline_rebuild_requires_once")
+
+
+@pytest.mark.parametrize(
+    ("failure", "forbidden", "expected", "expected_truncated"),
+    [
+        (
+            RuntimeError(
+                "artifact source C:\\private\\model.db "
+                "https://user:pass@example.test/model?token=url-secret "
+                "password=hunter2 api_key=key-secret "
+                + "diagnostic " * 100
+            ),
+            (
+                "C:\\private\\model.db",
+                "user:pass",
+                "url-secret",
+                "hunter2",
+                "key-secret",
+            ),
+            ("[path]", "[url]", "[credential]"),
+            True,
+        ),
+        (
+            ValueError(
+                "SELECT password FROM credentials WHERE token='sql-secret'"
+            ),
+            ("SELECT", "credentials", "sql-secret"),
+            ("sensitive SQL diagnostic removed",),
+            False,
+        ),
+        (
+            RuntimeError(
+                'paths "C:\\Program Files\\Private Models\\model.bin" '
+                "'\\\\server\\secret share\\draft model.bin' "
+                "'/srv/private models/draft model.bin' ordinary text remains"
+            ),
+            ("Program Files", "secret share", "private models", "model.bin"),
+            ("paths [path] [path] [path] ordinary text remains",),
+            False,
+        ),
+        (
+            RuntimeError(
+                "paths C:\\Program Files\\Private Models\\model.bin; "
+                "\\\\server\\secret share\\draft.bin, "
+                "/srv/private models/draft.bin ordinary text remains"
+            ),
+            ("Program Files", "secret share", "/srv/private", "draft.bin"),
+            ("paths [path]; [path], [path] ordinary text remains",),
+            False,
+        ),
+        (
+            RuntimeError(
+                "request rejected Authorization: Basic "
+                "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+            ),
+            ("Basic", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            ("request rejected [credential]",),
+            False,
+        ),
+        (
+            RuntimeError(
+                'request rejected AUTHORIZATION Digest username="private", '
+                'realm="secret", nonce="bm9uY2U="'
+            ),
+            ("Digest", "private", "secret", "bm9uY2U="),
+            ("request rejected [credential]",),
+            False,
+        ),
+        (
+            RuntimeError(
+                "request rejected authorization=CustomScheme "
+                "Y3VzdG9tLXNlY3JldA=="
+            ),
+            ("CustomScheme", "Y3VzdG9tLXNlY3JldA=="),
+            ("request rejected [credential]",),
+            False,
+        ),
+        (
+            RuntimeError(
+                "keep client_secret=s1 X-API-Key: QWxhZGRpbjpvcGVu "
+                "OAUTH_TOKEN s3 db-password/s4 "
+                "MixedCase-Secret='s five' keep-tail"
+            ),
+            (
+                "client_secret",
+                "s1",
+                "X-API-Key",
+                "QWxhZGRpbjpvcGVu",
+                "OAUTH_TOKEN",
+                "s3",
+                "db-password",
+                "s4",
+                "MixedCase-Secret",
+                "s five",
+            ),
+            (
+                "keep [credential] [credential] [credential] "
+                "[credential] [credential] keep-tail",
+            ),
+            False,
+        ),
+        (
+            RuntimeError(
+                "route /api returned ordinary text and relative "
+                "./not/absolute remains"
+            ),
+            ("/api",),
+            (
+                "route [path] returned ordinary text and relative "
+                "./not/absolute remains",
+            ),
+            False,
+        ),
+        (
+            RuntimeError(
+                "paths C:\\Program Files\\Private Models denied; "
+                "\\\\server\\secret share\\draft model not found, "
+                "/srv/private models/draft model permission denied "
+                "ordinary text remains"
+            ),
+            (
+                "Program Files",
+                "Private Models",
+                "secret share",
+                "draft model",
+                "/srv/private",
+            ),
+            (
+                "paths [path] denied; [path] not found, [path] "
+                "permission denied ordinary text remains",
+            ),
+            False,
+        ),
+        (
+            RuntimeError(
+                "windows C:\\Program Files\\Private Models; "
+                "unc \\\\server\\secret share\\draft model; "
+                "posix /srv/private models/draft model"
+            ),
+            ("Program Files", "secret share", "/srv/private", "draft model"),
+            ("windows [path]; unc [path]; posix [path]",),
+            False,
+        ),
+        (
+            RuntimeError(
+                "authorization failed because token expired while password "
+                "validation continued"
+            ),
+            (),
+            (
+                "authorization failed because token expired while password "
+                "validation continued",
+            ),
+            False,
+        ),
+        (
+            RuntimeError(
+                "keep token abc123 password hunter2 client_secret alpha "
+                "keep-tail"
+            ),
+            ("abc123", "hunter2", "alpha"),
+            (
+                "keep [credential] [credential] [credential] keep-tail",
+            ),
+            False,
+        ),
+    ],
+)
+def test_offline_rebuild_failure_uses_one_bounded_redacted_summary(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: Exception,
+    forbidden: tuple[str, ...],
+    expected: tuple[str, ...],
+    expected_truncated: bool,
+) -> None:
+    def fail_build(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(draft_publisher_module, "_build_and_persist", fail_build)
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=True,
+        history_timeout_seconds=0.1,
+    )
+
+    assert result == 2
+    stderr_payload = json.loads(capsys.readouterr().err)
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error, details_json FROM service_health "
+            "WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health[:2]) == ("unhealthy", "offline_rebuild_failed")
+    details = json.loads(str(health[2]))
+    summary = details["failure"]
+    assert stderr_payload == {
+        "error": "offline_rebuild_failed",
+        "failure": summary,
+        "status": "error",
+    }
+    assert summary["exception_type"] == type(failure).__name__
+    assert len(summary["message"]) <= 240
+    assert summary["message_truncated"] is expected_truncated
+    serialized = json.dumps(
+        {"health": dict(health), "stderr": stderr_payload},
+        ensure_ascii=False,
+    )
+    for sensitive in forbidden:
+        assert sensitive not in serialized
+    for fragment in expected:
+        assert fragment in summary["message"]
+
+
+@pytest.mark.parametrize(
+    ("load_error", "error_code"),
+    [
+        (
+            draft_publisher_module._FrozenDeploymentLineageError("stale"),
+            "frozen_deployment_lineage_invalid",
+        ),
+        (ValueError("invalid artifact"), "frozen_deployment_invalid"),
+    ],
+)
+def test_runtime_publisher_records_stable_deployment_failures(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    load_error: Exception,
+    error_code: str,
+) -> None:
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_latest_frozen_deployment",
+        lambda _connection: (_ for _ in ()).throw(load_error),
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_build_and_persist",
+        lambda *_args, **_kwargs: pytest.fail(
+            "runtime publisher attempted to rebuild a deployment"
+        ),
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=False,
+        history_timeout_seconds=0.1,
+    )
+
+    assert result == 2
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error FROM service_health WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health) == ("unhealthy", error_code)
+
+
+def test_runtime_publisher_success_never_recalibrates(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = SimpleNamespace(dependency_revision=1)
+    history = SimpleNamespace(dependency_revision=1)
+    report = SimpleNamespace(
+        deployment_key="frozen-deployment",
+        candidates=0,
+        inserted=0,
+        unchanged=0,
+        skipped=0,
+        outcomes_inserted=0,
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_latest_frozen_deployment",
+        lambda _connection: deployment,
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_load_history_with_timeout",
+        lambda _database, *, timeout_seconds: history,
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_refresh_dependency_inputs",
+        lambda _database, current, current_history, *, now: (
+            current,
+            current_history,
+        ),
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "publish_cycle",
+        lambda *_args, **_kwargs: report,
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "build_prospective_calibration_deployment",
+        lambda *_args, **_kwargs: pytest.fail(
+            "runtime publisher attempted to recalibrate"
+        ),
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=False,
+        history_timeout_seconds=0.1,
+    )
+
+    assert result == 0
+    with LiveBettingStore(prepared_database) as store:
+        health = store.connection.execute(
+            "SELECT status, last_error, details_json FROM service_health "
+            "WHERE component=?",
+            (draft_publisher_module.PUBLISHER_COMPONENT,),
+        ).fetchone()
+    assert health is not None
+    assert tuple(health[:2]) == ("healthy", None)
+    details = json.loads(str(health[2]))
+    assert details["phase"] == "healthy"
+    assert details["process_pid"] == os.getpid()
+    assert details["process_created_at"] > 0
+    assert details["process_generation"] == (
+        draft_publisher_module._publisher_process_generation(
+            details["process_pid"],
+            details["process_created_at"],
+        )
+    )
+
+
 def _insert_anchor(store: LiveBettingStore, *, captured_at: datetime = CUTOFF) -> None:
     assert store.insert_vision_observation(
         make_test_vision_observation(

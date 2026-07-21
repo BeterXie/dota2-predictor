@@ -17,6 +17,8 @@ from unittest.mock import Mock, patch
 
 import psutil
 
+import scripts.run_dota_shadow_service as service_module
+
 from event_intelligence.storage import (
     CURRENT_SCHEMA_VERSION as INTELLIGENCE_SCHEMA_VERSION,
 )
@@ -1187,6 +1189,314 @@ class ServiceHealthTests(unittest.TestCase):
             )
             self.assertIs(children["companion"], peer)
             spawn.assert_called_once()
+
+    def test_expired_live_publisher_is_isolated_and_uses_existing_backoff(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-wedged.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            publisher = Mock(pid=8810)
+            publisher.poll.return_value = None
+            publisher_authority = Mock()
+            publisher_authority.__exit__ = Mock(return_value=None)
+            publisher._dota2_manager_authority_context = publisher_authority
+            publisher._dota2_manager_authority_cleanup_error = None
+            peer = Mock(pid=8811)
+            peer.poll.return_value = None
+            children = {"draft_publisher": publisher, "shadow": peer}
+            states = {
+                "draft_publisher": _ChildRestartState(started_at=0.0),
+                "shadow": _ChildRestartState(started_at=0.0),
+            }
+            gate = Mock(return_value=TerminationResult(True))
+
+            with (
+                patch.object(
+                    service_module,
+                    "_capture_subprocess_tree_identities",
+                    return_value=(ProcessIdentity(8810, 10.0),),
+                ),
+                patch.object(
+                    service_module,
+                    "_draft_publisher_heartbeat_expired",
+                    return_value=True,
+                ),
+                patch.object(
+                    service_module,
+                    "terminate_subprocess_tree",
+                    return_value=TerminationResult(True),
+                ) as terminate,
+            ):
+                result = _reconcile_managed_children(
+                    children,
+                    {
+                        "draft_publisher": ["python", "publisher.py"],
+                        "shadow": ["python", "shadow.py"],
+                    },
+                    database,
+                    identity,
+                    restart_states=states,
+                    monotonic=lambda: 120.0,
+                    authority_gate=gate,
+                )
+
+            self.assertTrue(result.ok)
+            self.assertNotIn("draft_publisher", children)
+            self.assertIs(children["shadow"], peer)
+            self.assertEqual(states["draft_publisher"].consecutive_failures, 1)
+            self.assertEqual(states["draft_publisher"].next_restart_at, 121.0)
+            terminate.assert_called_once_with(publisher, process_factory=psutil.Process)
+            publisher_authority.__exit__.assert_called_once_with(None, None, None)
+            gate.assert_called_once()
+            peer.terminate.assert_not_called()
+
+    def test_busy_health_probe_never_marks_publisher_wedged(self) -> None:
+        with patch.object(
+            service_module.sqlite3,
+            "connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            self.assertIsNone(
+                service_module._draft_publisher_heartbeat_expired(
+                    Path("busy.db"),
+                    expected_identities=(ProcessIdentity(8810, 10.0),),
+                    child_runtime_seconds=120.0,
+                    now=NOW,
+                )
+            )
+
+    def test_publisher_wedge_probe_uses_hard_expiry_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-health.db"
+            identity = ProcessIdentity(8812, 10.0)
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+                record_health(
+                    store.connection,
+                    "draft_publisher_worker",
+                    "starting",
+                    heartbeat_at=NOW - timedelta(minutes=31),
+                    details={
+                        "phase": "loading_history",
+                        "process_pid": identity.pid,
+                        "process_created_at": identity.created_at,
+                        "process_generation": (
+                            service_module._publisher_process_generation(identity)
+                        ),
+                    },
+                )
+
+            self.assertTrue(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(identity,),
+                    child_runtime_seconds=31 * 60,
+                    now=NOW,
+                )
+            )
+            self.assertFalse(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(identity,),
+                    child_runtime_seconds=29 * 60,
+                    now=NOW - timedelta(minutes=2),
+                )
+            )
+
+    def test_old_publisher_health_cannot_kill_new_generation_after_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-generation.db"
+            old_identity = ProcessIdentity(8840, 10.0)
+            new_identity = ProcessIdentity(8841, 20.0)
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+                record_health(
+                    store.connection,
+                    "draft_publisher_worker",
+                    "starting",
+                    heartbeat_at=NOW - timedelta(hours=1),
+                    details={
+                        "process_pid": old_identity.pid,
+                        "process_created_at": old_identity.created_at,
+                        "process_generation": (
+                            service_module._publisher_process_generation(old_identity)
+                        ),
+                    },
+                )
+
+            self.assertFalse(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(new_identity,),
+                    child_runtime_seconds=60.0,
+                    now=NOW,
+                )
+            )
+            self.assertTrue(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(new_identity,),
+                    child_runtime_seconds=31 * 60,
+                    now=NOW,
+                )
+            )
+
+    def test_missing_or_invalid_health_requires_current_child_hard_timeout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-missing-health.db"
+            identity = ProcessIdentity(8842, 30.0)
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+
+            self.assertFalse(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(identity,),
+                    child_runtime_seconds=60.0,
+                    now=NOW,
+                )
+            )
+            self.assertTrue(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(identity,),
+                    child_runtime_seconds=31 * 60,
+                    now=NOW,
+                )
+            )
+
+            with LiveBettingStore(database) as store:
+                record_health(
+                    store.connection,
+                    "draft_publisher_worker",
+                    "starting",
+                    heartbeat_at=NOW,
+                    details={"process_pid": "invalid"},
+                )
+                store.connection.execute(
+                    "UPDATE service_health SET last_heartbeat_at='invalid' "
+                    "WHERE component='draft_publisher_worker'"
+                )
+                store.connection.commit()
+            self.assertFalse(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(identity,),
+                    child_runtime_seconds=60.0,
+                    now=NOW,
+                )
+            )
+            self.assertTrue(
+                service_module._draft_publisher_heartbeat_expired(
+                    database,
+                    expected_identities=(identity,),
+                    child_runtime_seconds=31 * 60,
+                    now=NOW,
+                )
+            )
+
+    def test_publisher_startup_grace_prevents_stale_row_misfire(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-startup-grace.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            publisher = Mock(pid=8820)
+            publisher.poll.return_value = None
+            children = {"draft_publisher": publisher}
+            states = {"draft_publisher": _ChildRestartState(started_at=100.0)}
+
+            with (
+                patch.object(
+                    service_module,
+                    "_capture_subprocess_tree_identities",
+                    return_value=(ProcessIdentity(8830, 10.0),),
+                ),
+                patch.object(
+                    service_module,
+                    "_draft_publisher_heartbeat_expired",
+                    return_value=True,
+                ) as probe,
+                patch.object(service_module, "terminate_subprocess_tree") as terminate,
+            ):
+                result = _reconcile_managed_children(
+                    children,
+                    {"draft_publisher": ["python", "publisher.py"]},
+                    database,
+                    identity,
+                    restart_states=states,
+                    monotonic=lambda: 130.0,
+                    authority_gate=lambda *_: TerminationResult(True),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIs(children["draft_publisher"], publisher)
+            probe.assert_not_called()
+            terminate.assert_not_called()
+
+    def test_unproven_wedged_termination_preserves_publisher_quarantine(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-quarantine.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            publisher = Mock(pid=8830)
+            publisher.poll.return_value = None
+            authority = Mock()
+            authority.__exit__ = Mock(return_value=None)
+            publisher._dota2_manager_authority_context = authority
+            publisher._dota2_manager_authority_cleanup_error = None
+            peer = Mock(pid=8831)
+            peer.poll.return_value = None
+            children = {"draft_publisher": publisher, "shadow": peer}
+            states = {
+                "draft_publisher": _ChildRestartState(started_at=0.0),
+                "shadow": _ChildRestartState(started_at=0.0),
+            }
+
+            with (
+                patch.object(
+                    service_module,
+                    "_capture_subprocess_tree_identities",
+                    return_value=(ProcessIdentity(8830, 10.0),),
+                ),
+                patch.object(
+                    service_module,
+                    "_draft_publisher_heartbeat_expired",
+                    return_value=True,
+                ),
+                patch.object(
+                    service_module,
+                    "terminate_subprocess_tree",
+                    return_value=TerminationResult(False, "identity_changed"),
+                ),
+            ):
+                result = _reconcile_managed_children(
+                    children,
+                    {
+                        "draft_publisher": ["python", "publisher.py"],
+                        "shadow": ["python", "shadow.py"],
+                    },
+                    database,
+                    identity,
+                    restart_states=states,
+                    monotonic=lambda: 120.0,
+                    authority_gate=lambda *_: TerminationResult(True),
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("termination_unproven", str(result.detail))
+            self.assertIs(children["draft_publisher"], publisher)
+            self.assertIs(children["shadow"], peer)
+            self.assertEqual(states["draft_publisher"].consecutive_failures, 0)
+            authority.__exit__.assert_not_called()
 
     def test_spawn_oserror_uses_deterministic_bounded_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
