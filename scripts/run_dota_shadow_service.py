@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.request
 from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -86,6 +87,8 @@ COLLECTOR_MAX_AGE = timedelta(seconds=60)
 DATABASE_AUDIT_MAX_AGE = timedelta(minutes=15)
 DATABASE_FAILURE_RECHECK = timedelta(seconds=60)
 LOCK_CONTENTION_RETRY_MIN_SECONDS = 0.05
+CHILD_RESTART_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+CHILD_STABLE_RESET_SECONDS = 60.0
 COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
 _DATABASE_HEALTH_CACHE: dict[
     str,
@@ -93,6 +96,54 @@ _DATABASE_HEALTH_CACHE: dict[
 ] = {}
 _DATABASE_AUDIT_THREADS: dict[str, threading.Thread] = {}
 _DATABASE_AUDIT_LOCK = threading.Lock()
+
+
+@dataclass
+class _ChildRestartState:
+    consecutive_failures: int = 0
+    next_restart_at: float = 0.0
+    started_at: float | None = None
+    last_exit_code: int | None = None
+    observed_exit_handle: Any | None = None
+
+
+def _schedule_child_restart(
+    state: _ChildRestartState,
+    *,
+    failed_at: float,
+    exit_code: int | None,
+) -> None:
+    state.consecutive_failures += 1
+    delay = CHILD_RESTART_DELAYS_SECONDS[
+        min(state.consecutive_failures - 1, len(CHILD_RESTART_DELAYS_SECONDS) - 1)
+    ]
+    state.next_restart_at = failed_at + delay
+    state.started_at = None
+    state.last_exit_code = exit_code
+
+
+def _restart_sleep_seconds(
+    restart_states: Mapping[str, _ChildRestartState],
+    interval: float,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> float:
+    delay = max(interval, LOCK_CONTENTION_RETRY_MIN_SECONDS)
+    now = monotonic()
+    if any(
+        state.started_at is None
+        and 0.0 < state.next_restart_at <= now
+        for state in restart_states.values()
+    ):
+        return 0.0
+    pending = [
+        state.next_restart_at - now
+        for state in restart_states.values()
+        if state.next_restart_at > now
+    ]
+    if pending:
+        delay = min(delay, min(pending))
+    return max(delay, LOCK_CONTENTION_RETRY_MIN_SECONDS)
 
 
 def _transient_sqlite_lock_kind(error: sqlite3.OperationalError) -> str | None:
@@ -981,22 +1032,71 @@ def _reconcile_managed_children(
     commands: Mapping[str, list[str]],
     database: Path,
     database_identity: DatabaseFileIdentity,
+    restart_states: dict[str, _ChildRestartState] | None = None,
     *,
+    monotonic: Callable[[], float] = time.monotonic,
     authority_gate: Callable[..., TerminationResult] | None = None,
     popen_factory: Callable[..., Any] | None = None,
     process_factory: Callable[[int], Any] = psutil.Process,
 ) -> TerminationResult:
-    pending = {
-        name: command
-        for name, command in commands.items()
-        if children.get(name) is None or children[name].poll() is not None
-    }
+    states = restart_states if restart_states is not None else {}
+    now = monotonic()
+    authority_gate = authority_gate or _replacement_authority_gate
+    pending: dict[str, list[str]] = {}
+    newly_exited: list[tuple[str, Any, _ChildRestartState, int]] = []
+    for name, command in commands.items():
+        state = states.setdefault(name, _ChildRestartState())
+        child = children.get(name)
+        if child is None:
+            if now >= state.next_restart_at:
+                pending[name] = command
+            continue
+        exit_code = child.poll()
+        if exit_code is None:
+            if state.started_at is None:
+                state.started_at = now
+            elif now - state.started_at >= CHILD_STABLE_RESET_SECONDS:
+                state.consecutive_failures = 0
+                state.last_exit_code = None
+            continue
+        if state.observed_exit_handle is not child:
+            newly_exited.append((name, child, state, int(exit_code)))
+            continue
+        if now >= state.next_restart_at:
+            pending[name] = command
+
+    gate_checked = False
+    if newly_exited:
+        gate = authority_gate(children, database, database_identity)
+        if not gate.ok:
+            return gate
+        gate_checked = True
+        for name, child, state, exit_code in newly_exited:
+            try:
+                _close_child_authority(child)
+            except Exception as error:
+                return TerminationResult(
+                    False,
+                    f"child_authority_cleanup_failed:{name}:"
+                    f"{type(error).__name__}:{error}",
+                )
+            if (
+                state.started_at is not None
+                and now - state.started_at >= CHILD_STABLE_RESET_SECONDS
+            ):
+                state.consecutive_failures = 0
+            _schedule_child_restart(
+                state,
+                failed_at=now,
+                exit_code=exit_code,
+            )
+            state.observed_exit_handle = child
     if not pending:
         return TerminationResult(True)
-    authority_gate = authority_gate or _replacement_authority_gate
-    gate = authority_gate(children, database, database_identity)
-    if not gate.ok:
-        return gate
+    if not gate_checked:
+        gate = authority_gate(children, database, database_identity)
+        if not gate.ok:
+            return gate
     popen_factory = popen_factory or subprocess.Popen
     for name, command in pending.items():
         previous = children.get(name)
@@ -1021,6 +1121,29 @@ def _reconcile_managed_children(
         process_handle: Any | None = None
         try:
             authority = authority_context.__enter__()
+        except BaseException as authority_error:
+            try:
+                _close_child_authority(managed_child)
+            except BaseException as cleanup_error:
+                children[name] = managed_child
+                if not isinstance(authority_error, Exception):
+                    raise authority_error
+                return TerminationResult(
+                    False,
+                    f"child_authority_enter_failed:{name}:"
+                    f"{type(authority_error).__name__}:{authority_error};"
+                    f"child_authority_cleanup_failed:{name}:"
+                    f"{type(cleanup_error).__name__}:{cleanup_error}",
+                )
+            children.pop(name, None)
+            if not isinstance(authority_error, Exception):
+                raise
+            return TerminationResult(
+                False,
+                f"child_authority_enter_failed:{name}:"
+                f"{type(authority_error).__name__}:{authority_error}",
+            )
+        try:
             process_handle = popen_factory(
                 command,
                 cwd=ROOT,
@@ -1062,7 +1185,15 @@ def _reconcile_managed_children(
                     f"{type(cleanup_error).__name__}:{cleanup_error}",
                 )
             children.pop(name, None)
-            raise
+            if not isinstance(spawn_error, OSError):
+                raise
+            _schedule_child_restart(
+                states[name],
+                failed_at=now,
+                exit_code=None,
+            )
+            states[name].observed_exit_handle = None
+            continue
         try:
             bind_manager_child_authority(
                 authority,
@@ -1103,6 +1234,10 @@ def _reconcile_managed_children(
                 f"child_authority_bind_failed:{name}:"
                 f"{type(bind_error).__name__}:{bind_error}",
             )
+        state = states[name]
+        state.next_restart_at = 0.0
+        state.started_at = monotonic()
+        state.observed_exit_handle = None
     return TerminationResult(True)
 
 
@@ -1152,7 +1287,9 @@ def main() -> int:
     except ValueError as error:
         parser.error(str(error))
     children: dict[str, Any] = {}
+    restart_states: dict[str, _ChildRestartState] = {}
     report_worker: _ReportWorker | None = None
+    children_shutdown = False
     initial_database_identity = require_unique_database_file(
         args.database,
         allow_missing=True,
@@ -1215,18 +1352,28 @@ def main() -> int:
                         args.database,
                         expected_identity=database_identity,
                     )
-                except Exception:
-                    _shutdown_children_under_authority(
+                except Exception as error:
+                    shutdown = _shutdown_children_under_authority(
                         children,
                         args.database,
                         database_identity,
                     )
-                    continue
+                    if not shutdown.ok:
+                        raise RuntimeError(
+                            "database authority shutdown remains quarantined: "
+                            f"{shutdown.detail}"
+                        ) from error
+                    children.clear()
+                    children_shutdown = True
+                    raise RuntimeError(
+                        f"database authority failed: {type(error).__name__}: {error}"
+                    ) from error
                 reconciliation = _reconcile_managed_children(
                     children,
                     commands,
                     args.database,
                     database_identity,
+                    restart_states,
                 )
                 if not reconciliation.ok:
                     print(
@@ -1240,12 +1387,22 @@ def main() -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                    _shutdown_children_under_authority(
+                    shutdown = _shutdown_children_under_authority(
                         children,
                         args.database,
                         database_identity,
                     )
-                    continue
+                    if not shutdown.ok:
+                        raise RuntimeError(
+                            "managed child authority shutdown remains quarantined: "
+                            f"{shutdown.detail}"
+                        )
+                    children.clear()
+                    children_shutdown = True
+                    raise RuntimeError(
+                        "managed child authority failed: "
+                        f"{reconciliation.detail}"
+                    )
                 require_unique_database_file(
                     args.database,
                     expected_identity=database_identity,
@@ -1274,7 +1431,9 @@ def main() -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                    time.sleep(max(args.interval, LOCK_CONTENTION_RETRY_MIN_SECONDS))
+                    time.sleep(
+                        _restart_sleep_seconds(restart_states, args.interval)
+                    )
                     continue
                 if report_worker is not None:
                     report_worker.start_if_idle()
@@ -1299,7 +1458,7 @@ def main() -> int:
                                  ensure_ascii=False))
                 if args.once:
                     break
-                time.sleep(args.interval)
+                time.sleep(_restart_sleep_seconds(restart_states, args.interval))
         finally:
             if report_worker is not None:
                 report_worker.wait()
@@ -1309,7 +1468,7 @@ def main() -> int:
                     args.database,
                     database_identity,
                 )
-                if database_identity is not None
+                if database_identity is not None and not children_shutdown
                 else TerminationResult(not children, "database_identity_unavailable")
             )
             if not shutdown.ok:

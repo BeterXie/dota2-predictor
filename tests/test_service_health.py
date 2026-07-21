@@ -39,6 +39,7 @@ from live_betting.service_coordination import (
 from live_betting.storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
 from live_betting.storage import LiveBettingStore
 from scripts.run_dota_shadow_service import (
+    _ChildRestartState,
     _DATABASE_AUDIT_THREADS,
     _DATABASE_HEALTH_CACHE,
     _ReportWorker,
@@ -50,6 +51,7 @@ from scripts.run_dota_shadow_service import (
     _periodic_database_health,
     _reconcile_managed_children,
     _replacement_authority_gate,
+    _restart_sleep_seconds,
     _run_database_audit,
     _shutdown_children_under_authority,
     main,
@@ -1048,7 +1050,9 @@ class ServiceHealthTests(unittest.TestCase):
             with SingleInstanceLock(standard_lock), SingleInstanceLock(custom_lock):
                 pass
 
-    def test_quarantined_replacement_never_overwrites_exited_handle(self) -> None:
+    def test_first_exited_child_gate_preserves_marker_for_live_writer(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "replacement.db"
             database.write_bytes(b"sqlite")
@@ -1056,7 +1060,28 @@ class ServiceHealthTests(unittest.TestCase):
             assert isinstance(identity, DatabaseFileIdentity)
             exited = Mock()
             exited.poll.return_value = 1
+            authority = Mock()
+            authority.__exit__ = Mock(return_value=None)
+            exited._dota2_manager_authority_context = authority
+            exited._dota2_manager_authority_cleanup_error = None
             children = {"collector": exited}
+            restart_states: dict[str, _ChildRestartState] = {}
+            descendant = ProcessIdentity(9001, 11.0)
+            allowed_scans: list[tuple[ProcessIdentity, ...]] = []
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                allowed_scans.append(allowed_identities)
+                return WriterScanResult((descendant,), ())
+
+            def gate(*args: object) -> TerminationResult:
+                return _replacement_authority_gate(
+                    *args,  # type: ignore[arg-type]
+                    writer_scanner=scan,
+                )
             spawn = Mock()
 
             result = _reconcile_managed_children(
@@ -1064,16 +1089,262 @@ class ServiceHealthTests(unittest.TestCase):
                 {"collector": ["python", "collector.py"]},
                 database,
                 identity,
-                authority_gate=lambda *_: TerminationResult(
-                    False,
-                    "orphan_writer_conflict:9001",
-                ),
+                restart_states=restart_states,
+                monotonic=lambda: 10.0,
+                authority_gate=gate,
                 popen_factory=spawn,
             )
 
             self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "orphan_writer_conflict:9001")
             self.assertIs(children["collector"], exited)
+            self.assertEqual(allowed_scans, [()])
+            authority.__exit__.assert_not_called()
+            self.assertEqual(restart_states["collector"], _ChildRestartState())
             spawn.assert_not_called()
+
+    def test_exited_child_restarts_after_backoff_without_touching_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "isolated-restart.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            exited = Mock()
+            exited.poll.return_value = 9
+            peer = Mock()
+            peer.poll.return_value = None
+            replacement = Mock(pid=8801)
+            replacement.poll.return_value = None
+            children = {"collector": exited, "companion": peer}
+            states = {
+                "collector": _ChildRestartState(started_at=0.0),
+                "companion": _ChildRestartState(started_at=10.0),
+            }
+            now = [10.0]
+            spawn = Mock(return_value=replacement)
+            authority = Mock()
+            authority.__enter__ = Mock(
+                return_value={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+            )
+            authority.__exit__ = Mock(return_value=None)
+
+            first = _reconcile_managed_children(
+                children,
+                {"collector": ["python", "collector.py"]},
+                database,
+                identity,
+                restart_states=states,
+                monotonic=lambda: now[0],
+                authority_gate=lambda *_: TerminationResult(True),
+                popen_factory=spawn,
+            )
+            self.assertTrue(first.ok)
+            self.assertIs(children["collector"], exited)
+            self.assertIs(children["companion"], peer)
+            self.assertEqual(states["collector"].next_restart_at, 11.0)
+            spawn.assert_not_called()
+
+            now[0] = 10.999
+            deferred = _reconcile_managed_children(
+                children,
+                {"collector": ["python", "collector.py"]},
+                database,
+                identity,
+                restart_states=states,
+                monotonic=lambda: now[0],
+                authority_gate=lambda *_: TerminationResult(True),
+                popen_factory=spawn,
+            )
+            self.assertTrue(deferred.ok)
+            spawn.assert_not_called()
+
+            now[0] = 11.0
+            with (
+                patch(
+                    "scripts.run_dota_shadow_service.manager_child_authority",
+                    return_value=authority,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    return_value=ProcessIdentity(8801, 11.0),
+                ),
+            ):
+                restarted = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    restart_states=states,
+                    monotonic=lambda: now[0],
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                )
+
+            self.assertTrue(restarted.ok)
+            self.assertIs(
+                children["collector"]._process_handle,  # type: ignore[attr-defined]
+                replacement,
+            )
+            self.assertIs(children["companion"], peer)
+            spawn.assert_called_once()
+
+    def test_spawn_oserror_uses_deterministic_bounded_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "spawn-backoff.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            children: dict[str, object] = {}
+            states: dict[str, _ChildRestartState] = {}
+            now = [0.0]
+            spawn = Mock(side_effect=OSError("spawn failed"))
+            authorities: list[Mock] = []
+
+            def authority_factory(*_: object, **__: object) -> Mock:
+                authority = Mock()
+                authority.__enter__ = Mock(
+                    return_value={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+                )
+                authority.__exit__ = Mock(return_value=None)
+                authorities.append(authority)
+                return authority
+
+            attempts = [0.0, 1.0, 3.0, 7.0, 15.0, 31.0, 61.0]
+            expected_next = [1.0, 3.0, 7.0, 15.0, 31.0, 61.0, 91.0]
+            with patch(
+                "scripts.run_dota_shadow_service.manager_child_authority",
+                side_effect=authority_factory,
+            ):
+                for attempted_at, retry_at in zip(attempts, expected_next):
+                    now[0] = attempted_at
+                    result = _reconcile_managed_children(
+                        children,
+                        {"companion": ["python", "companion.py"]},
+                        database,
+                        identity,
+                        restart_states=states,
+                        monotonic=lambda: now[0],
+                        authority_gate=lambda *_: TerminationResult(True),
+                        popen_factory=spawn,
+                    )
+                    self.assertTrue(result.ok)
+                    self.assertEqual(
+                        states["companion"].next_restart_at,
+                        retry_at,
+                    )
+                    self.assertEqual(children, {})
+
+            self.assertEqual(spawn.call_count, len(attempts))
+            self.assertEqual(len(authorities), len(attempts))
+            for authority in authorities:
+                authority.__exit__.assert_called_once_with(None, None, None)
+
+    def test_child_restart_failures_reset_after_sixty_stable_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "stable-reset.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            child = Mock()
+            child.poll.return_value = None
+            children = {"collector": child}
+            states = {
+                "collector": _ChildRestartState(
+                    consecutive_failures=5,
+                    started_at=0.0,
+                )
+            }
+            now = [59.999]
+
+            for current in (59.999, 60.0):
+                now[0] = current
+                result = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    restart_states=states,
+                    monotonic=lambda: now[0],
+                )
+                self.assertTrue(result.ok)
+
+            self.assertEqual(states["collector"].consecutive_failures, 0)
+            child.poll.return_value = 4
+            now[0] = 61.0
+            failed = _reconcile_managed_children(
+                children,
+                {"collector": ["python", "collector.py"]},
+                database,
+                identity,
+                restart_states=states,
+                monotonic=lambda: now[0],
+            )
+            self.assertTrue(failed.ok)
+            self.assertEqual(states["collector"].consecutive_failures, 1)
+            self.assertEqual(states["collector"].next_restart_at, 62.0)
+
+    def test_due_restart_skips_the_regular_supervisor_interval(self) -> None:
+        state = _ChildRestartState(
+            consecutive_failures=1,
+            next_restart_at=10.0,
+        )
+
+        self.assertEqual(
+            _restart_sleep_seconds(
+                {"companion": state},
+                15.0,
+                monotonic=lambda: 10.0,
+            ),
+            0.0,
+        )
+
+    def test_successful_spawn_uses_post_bind_monotonic_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "slow-spawn.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            clock = [10.0]
+            process = Mock(pid=8810)
+            process.poll.return_value = None
+            authority = Mock()
+            authority.__enter__ = Mock(
+                return_value={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+            )
+            authority.__exit__ = Mock(return_value=None)
+            states: dict[str, _ChildRestartState] = {}
+
+            def spawn(*_: object, **__: object) -> object:
+                clock[0] = 20.0
+                return process
+
+            def bind(*_: object, **__: object) -> ProcessIdentity:
+                clock[0] = 25.0
+                return ProcessIdentity(8810, 25.0)
+
+            with (
+                patch(
+                    "scripts.run_dota_shadow_service.manager_child_authority",
+                    return_value=authority,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    side_effect=bind,
+                ),
+            ):
+                result = _reconcile_managed_children(
+                    {},
+                    {"companion": ["python", "companion.py"]},
+                    database,
+                    identity,
+                    states,
+                    monotonic=lambda: clock[0],
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(states["companion"].started_at, 25.0)
 
     def test_each_supervisor_child_gets_one_exact_live_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1252,6 +1523,8 @@ class ServiceHealthTests(unittest.TestCase):
                 return ProcessIdentity(1 if process is first_process else 2, 1.0)
 
             children: dict[str, object] = {}
+            restart_states: dict[str, _ChildRestartState] = {}
+            now = [0.0]
             termination_attempts = 0
 
             def terminate(_: object) -> TerminationResult:
@@ -1277,16 +1550,33 @@ class ServiceHealthTests(unittest.TestCase):
                     {"collector": ["python", "collector.py"]},
                     database,
                     identity,
+                    restart_states=restart_states,
+                    monotonic=lambda: now[0],
                     authority_gate=lambda *_: TerminationResult(True),
                     popen_factory=spawn,
                 )
                 self.assertTrue(first.ok)
                 first_process.poll.return_value = 1
+                now[0] = 1.0
+                deferred = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    restart_states=restart_states,
+                    monotonic=lambda: now[0],
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                )
+                self.assertTrue(deferred.ok)
+                now[0] = 2.0
                 second = _reconcile_managed_children(
                     children,
                     {"collector": ["python", "collector.py"]},
                     database,
                     identity,
+                    restart_states=restart_states,
+                    monotonic=lambda: now[0],
                     authority_gate=lambda *_: TerminationResult(True),
                     popen_factory=spawn,
                 )
@@ -1445,7 +1735,7 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertIn("termination_unproven:collector", result.detail)
             self.assertEqual(lock_checks, [True])
 
-    def test_spawn_failure_closes_its_unpublished_child_marker(self) -> None:
+    def test_spawn_failure_closes_marker_and_schedules_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "spawn-failure.db"
             database.touch()
@@ -1457,22 +1747,58 @@ class ServiceHealthTests(unittest.TestCase):
             )
             authority.__exit__ = Mock(return_value=None)
             children: dict[str, object] = {}
+            restart_states: dict[str, _ChildRestartState] = {}
 
             with patch(
                 "scripts.run_dota_shadow_service.manager_child_authority",
                 return_value=authority,
             ):
-                with self.assertRaisesRegex(OSError, "spawn failed"):
-                    _reconcile_managed_children(
-                        children,
-                        {"collector": ["python", "collector.py"]},
-                        database,
-                        identity,
-                        authority_gate=lambda *_: TerminationResult(True),
-                        popen_factory=Mock(side_effect=OSError("spawn failed")),
-                    )
+                result = _reconcile_managed_children(
+                    children,
+                    {"collector": ["python", "collector.py"]},
+                    database,
+                    identity,
+                    restart_states=restart_states,
+                    monotonic=lambda: 10.0,
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=Mock(side_effect=OSError("spawn failed")),
+                )
 
+            self.assertTrue(result.ok)
             authority.__exit__.assert_called_once_with(None, None, None)
+            self.assertEqual(children, {})
+            self.assertEqual(restart_states["collector"].next_restart_at, 11.0)
+
+    def test_authority_enter_failure_is_fatal_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "authority-enter.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            authority = Mock()
+            authority.__enter__ = Mock(side_effect=RuntimeError("invalid marker"))
+            authority.__exit__ = Mock(return_value=None)
+            children: dict[str, object] = {}
+            spawn = Mock()
+
+            with patch(
+                "scripts.run_dota_shadow_service.manager_child_authority",
+                return_value=authority,
+            ):
+                result = _reconcile_managed_children(
+                    children,
+                    {"companion": ["python", "companion.py"]},
+                    database,
+                    identity,
+                    {},
+                    authority_gate=lambda *_: TerminationResult(True),
+                    popen_factory=spawn,
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("child_authority_enter_failed:companion", result.detail)
+            authority.__exit__.assert_called_once_with(None, None, None)
+            spawn.assert_not_called()
             self.assertEqual(children, {})
 
     def test_marker_cleanup_failure_stays_quarantined_while_lock_is_held(
@@ -2233,6 +2559,150 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertIs(raised.exception, error)
             self.assertEqual(events, ["shutdown"])
             sleep.assert_not_called()
+
+    def test_proven_authority_failure_exits_without_reconcile_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "authority-fatal.db"
+            database.touch()
+            standard_lock = database.with_suffix(".service.lock")
+            preparation = Mock(
+                backup=None,
+                live_schema_version=LIVE_SCHEMA_VERSION,
+                intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
+            )
+            reconcile = Mock(
+                return_value=TerminationResult(
+                    False,
+                    "child_authority_bind_failed:companion:RuntimeError:bad marker",
+                )
+            )
+            service = Mock()
+            shutdown_calls = 0
+
+            def shutdown(*_: object, **__: object) -> TerminationResult:
+                nonlocal shutdown_calls
+                shutdown_calls += 1
+                with self.assertRaisesRegex(RuntimeError, "already held"):
+                    with SingleInstanceLock(standard_lock):
+                        pass
+                return TerminationResult(True, "shutdown_proven_after_attempt:1")
+
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--once",
+                "--start-companion",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "stdout", StringIO()),
+                patch.object(sys, "stderr", StringIO()),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers",
+                    return_value=WriterScanResult((), ()),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database",
+                    return_value=preparation,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._reconcile_managed_children",
+                    reconcile,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.service_once",
+                    service,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._shutdown_children_under_authority",
+                    side_effect=shutdown,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "managed child authority failed",
+                ):
+                    main()
+
+            reconcile.assert_called_once()
+            service.assert_not_called()
+            self.assertEqual(shutdown_calls, 1)
+
+    def test_proven_database_authority_failure_never_reconciles_children(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "database-authority-fatal.db"
+            database.touch()
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            preparation = Mock(
+                backup=None,
+                live_schema_version=LIVE_SCHEMA_VERSION,
+                intelligence_schema_version=INTELLIGENCE_SCHEMA_VERSION,
+                runtime_schema_version=CURRENT_RUNTIME_SCHEMA_VERSION,
+            )
+            identity_checks = 0
+
+            def check_identity(*_: object, **__: object) -> DatabaseFileIdentity:
+                nonlocal identity_checks
+                identity_checks += 1
+                if identity_checks <= 3:
+                    return identity
+                raise RuntimeError("database file identity changed")
+
+            shutdown = Mock(
+                return_value=TerminationResult(
+                    True,
+                    "shutdown_proven_after_attempt:1",
+                )
+            )
+            reconcile = Mock()
+            service = Mock()
+            argv = [
+                "run_dota_shadow_service.py",
+                "--database",
+                str(database),
+                "--once",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch(
+                    "scripts.run_dota_shadow_service.require_unique_database_file",
+                    side_effect=check_identity,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.scan_managed_writers",
+                    return_value=WriterScanResult((), ()),
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.verify_prepared_database",
+                    return_value=preparation,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._reconcile_managed_children",
+                    reconcile,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.service_once",
+                    service,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service._shutdown_children_under_authority",
+                    shutdown,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "database authority failed",
+                ):
+                    main()
+
+            shutdown.assert_called_once()
+            reconcile.assert_not_called()
+            service.assert_not_called()
 
     def test_recurring_supervisor_keeps_health_and_reporting_separate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
