@@ -18,9 +18,9 @@ function storageArea() {
   };
 }
 
-function jsonResponse(payload) {
+function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
-    status: 200,
+    status,
     headers: {"Content-Type": "application/json"},
   });
 }
@@ -338,6 +338,9 @@ test("popup status derives current-page readiness with deterministic priority", 
     if (companionMode === "database") {
       return jsonResponse({protocol_version: 1, database_health: "unavailable"});
     }
+    if (companionMode === "rate_limited") {
+      return jsonResponse({code: "rate_limited", detail: "request rejected"}, 429);
+    }
     return jsonResponse({protocol_version: 1, database_health: "ok"});
   };
   globalThis.chrome = {
@@ -431,6 +434,11 @@ test("popup status derives current-page readiness with deterministic priority", 
       name: "database status failure is degraded",
       mode: "database",
       expected: ["degraded", "database_unavailable"],
+    },
+    {
+      name: "companion rate limit is reconnecting",
+      mode: "rate_limited",
+      expected: ["reconnecting", "companion_rate_limited"],
     },
     {
       name: "small queued retry is reconnecting",

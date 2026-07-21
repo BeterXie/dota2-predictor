@@ -1,3 +1,7 @@
+const i18n = globalThis.RaybetI18n;
+let currentLanguage = i18n.preferredLanguage();
+let currentStatus = null;
+
 function stateTone(state) {
   if (state === "capturing") return "ok";
   if ([
@@ -11,46 +15,77 @@ function stateTone(state) {
   return "error";
 }
 
+function text(key) {
+  return i18n.translate(currentLanguage, key);
+}
+
+function code(category, value) {
+  return i18n.translateCode(currentLanguage, category, value);
+}
+
+function time(value) {
+  return new Date(value).toLocaleTimeString(currentLanguage);
+}
+
 function render(status) {
+  currentStatus = status;
   const state = status.captureStatus || status.state || "error";
   const dot = document.querySelector("#stateDot");
   const stateText = document.querySelector("#stateText");
   dot.className = stateTone(state);
-  stateText.textContent = state.replaceAll("_", " ");
-  stateText.title = (status.statusReason || "").replaceAll("_", " ");
+  stateText.textContent = code("captureStatus", state);
+  stateText.title = code("statusReason", status.statusReason);
   document.querySelector("#captureToggle").checked = !status.paused;
   document.querySelector("#companionValue").textContent =
     status.companion?.reachable && status.companion?.connected
-      ? "Connected" : "Unavailable";
+      ? text("common.connected") : text("common.unavailable");
   document.querySelector("#matchCount").textContent = String(status.recognizedMatches?.length || 0);
   document.querySelector("#queueCount").textContent = String(status.queue?.length || 0);
   document.querySelector("#dropCount").textContent = String(status.counters?.dropped || 0);
   const last = status.lastEvent;
   document.querySelector("#lastEvent").textContent = last
-    ? `${last.eventType} · ${new Date(last.capturedAt).toLocaleTimeString()}` : "None";
+    ? i18n.format(currentLanguage, "popup.lastEventValue", {
+      eventType: code("eventType", last.eventType),
+      time: time(last.capturedAt),
+    }) : text("common.none");
   const diagnostics = status.diagnostics || {};
   const initialization = diagnostics.initialization || {};
   const initText = (value) => {
     const top = Number(value?.top || 0);
     const child = Number(value?.child || 0);
-    return top || child ? `top ${top} | child ${child}` : "Not seen";
+    return top || child
+      ? i18n.format(currentLanguage, "popup.initialization", {top, child})
+      : text("common.notSeen");
   };
   document.querySelector("#hookStatus").textContent = initText(initialization.hook);
   document.querySelector("#bridgeStatus").textContent = diagnostics.bridgeConfigLoaded === false
-    ? "Config failed" : initText(initialization.ready);
+    ? text("common.configFailed") : initText(initialization.ready);
   const transports = diagnostics.transports || {};
   document.querySelector("#observedCount").textContent =
-    `F ${Number(transports.fetch || 0)} | X ${Number(transports.xhr || 0)} | W ${Number(transports.websocket || 0)}`;
+    i18n.format(currentLanguage, "popup.observedCounts", {
+      fetch: Number(transports.fetch || 0),
+      xhr: Number(transports.xhr || 0),
+      websocket: Number(transports.websocket || 0),
+    });
   const classification = diagnostics.classification || {};
   document.querySelector("#classifiedCount").textContent =
-    `${Number(classification.accepted || 0)} accepted | ${Number(classification.ignored || 0)} ignored`;
+    i18n.format(currentLanguage, "popup.classifiedCounts", {
+      accepted: Number(classification.accepted || 0),
+      ignored: Number(classification.ignored || 0),
+    });
   const observed = diagnostics.lastObserved;
   document.querySelector("#lastObserved").textContent = observed
-    ? `${observed.sourceHost}${observed.sourcePath} | ${new Date(observed.observedAt).toLocaleTimeString()}`
-    : "None";
+    ? i18n.format(currentLanguage, "popup.lastObservedValue", {
+      host: observed.sourceHost,
+      path: observed.sourcePath,
+      time: time(observed.observedAt),
+    }) : text("common.none");
   const decision = diagnostics.lastClassification;
   document.querySelector("#lastDecision").textContent = decision
-    ? `${decision.outcome}: ${decision.reason}` : "None";
+    ? i18n.format(currentLanguage, "popup.lastDecisionValue", {
+      outcome: code("outcome", decision.outcome),
+      reason: code("reason", decision.reason),
+    }) : text("common.none");
   const report = status.remote?.report_url;
   const link = document.querySelector("#reportLink");
   if (report && /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(report)) {
@@ -97,4 +132,15 @@ document.querySelector("#captureToggle").addEventListener("change", async (event
   render(await getStatus());
 });
 document.querySelector("#openOptions").addEventListener("click", () => chrome.runtime.openOptionsPage());
-void getStatus().then(render);
+const languageController = i18n.createLanguageController({
+  document,
+  page: "popup",
+  select: document.querySelector("#languageSelect"),
+  chrome,
+  navigator: globalThis.navigator,
+  onLanguageChanged(language) {
+    currentLanguage = language;
+    if (currentStatus) render(currentStatus);
+  },
+});
+void Promise.all([languageController.ready, getStatus()]).then(([, status]) => render(status));

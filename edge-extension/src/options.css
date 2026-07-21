@@ -6,9 +6,11 @@ header { display: flex; align-items: center; padding: 18px 20px; border-bottom: 
 h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
 h2 { margin: 0 0 14px; font-size: 14px; letter-spacing: 0; }
 section { padding: 18px 20px; border-bottom: 1px solid #e1e5ea; }
-label, input, button { font: inherit; font-size: 13px; }
-input { min-width: 0; height: 34px; border: 1px solid #bdc6cf; border-radius: 4px; padding: 6px 8px; }
+label, input, select, button { font: inherit; font-size: 13px; }
+input, select { min-width: 0; height: 34px; border: 1px solid #bdc6cf; border-radius: 4px; padding: 6px 8px; background: #fff; }
 button { min-height: 34px; border: 1px solid #1d6f52; border-radius: 4px; padding: 6px 14px; color: #fff; background: #167052; cursor: pointer; }
+.select-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 38px; }
+.select-row select { width: min(220px, 55%); }
 .check-row { display: flex; align-items: center; gap: 10px; min-height: 38px; }
 .check-row input { width: 16px; height: 16px; }
 #saveMessage { min-height: 16px; margin: 8px 0 0; color: #59636e; font-size: 12px; }
