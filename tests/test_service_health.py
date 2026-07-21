@@ -2229,6 +2229,212 @@ class ServiceHealthTests(unittest.TestCase):
                 [(ProcessIdentity(9101, 11.0), ProcessIdentity(9102, 12.0))],
             )
 
+    def test_replacement_gate_rescans_legal_descendant_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sibling-startup.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            class Process:
+                def __init__(self, pid: int, created_at: float) -> None:
+                    self.pid = pid
+                    self.created_at = created_at
+                    self.descendants: list["Process"] = []
+
+                def create_time(self) -> float:
+                    return self.created_at
+
+                def children(self, recursive: bool = False) -> list["Process"]:
+                    return list(self.descendants)
+
+                def is_running(self) -> bool:
+                    return True
+
+                def status(self) -> str:
+                    return "running"
+
+            root = Process(9201, 21.0)
+            worker = Process(9202, 22.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            observed_allowed: list[tuple[ProcessIdentity, ...]] = []
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                observed_allowed.append(tuple(allowed_identities))
+                if not root.descendants:
+                    root.descendants.append(worker)
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: root,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                observed_allowed,
+                [
+                    (ProcessIdentity(9201, 21.0),),
+                    (ProcessIdentity(9201, 21.0),),
+                ],
+            )
+
+    def test_replacement_gate_rejects_unknown_managed_root_during_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "unknown-root.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            class Process:
+                def __init__(self, pid: int, created_at: float) -> None:
+                    self.pid = pid
+                    self.created_at = created_at
+
+                def create_time(self) -> float:
+                    return self.created_at
+
+                def children(self, recursive: bool = False) -> list[object]:
+                    return []
+
+                def is_running(self) -> bool:
+                    return True
+
+                def status(self) -> str:
+                    return "running"
+
+            roots = {9301: Process(9301, 31.0), 9302: Process(9302, 32.0)}
+            first = Mock(pid=9301)
+            first.poll.return_value = None
+            unknown = Mock(pid=9302)
+            unknown.poll.return_value = None
+            children = {"collector": first}
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                children["unknown"] = unknown
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                children,
+                database,
+                identity,
+                process_factory=lambda pid: roots[pid],
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
+
+    def test_replacement_gate_rejects_direct_child_exit_during_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "child-exit.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            process = Mock(pid=9401)
+            process.create_time.return_value = 41.0
+            process.children.return_value = []
+            handle = Mock(pid=9401)
+            handle.poll.return_value = None
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                handle.poll.return_value = 9
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: process,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
+
+    def test_replacement_gate_rejects_root_identity_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "root-replacement.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            process = Mock(pid=9501)
+            process.create_time.return_value = 51.0
+            process.children.return_value = []
+            handle = Mock(pid=9501)
+            handle.poll.return_value = None
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                process.create_time.return_value = 52.0
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: process,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
+
+    def test_replacement_gate_rejects_descendant_disappearance_after_rescan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "descendant-toctou.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+
+            class Process:
+                def __init__(self, pid: int, created_at: float) -> None:
+                    self.pid = pid
+                    self.created_at = created_at
+                    self.descendants: list["Process"] = []
+
+                def create_time(self) -> float:
+                    return self.created_at
+
+                def children(self, recursive: bool = False) -> list["Process"]:
+                    return list(self.descendants)
+
+                def is_running(self) -> bool:
+                    return True
+
+                def status(self) -> str:
+                    return "running"
+
+            root = Process(9601, 61.0)
+            worker = Process(9602, 62.0)
+            root.descendants.append(worker)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                root.descendants.clear()
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: root,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "healthy_subtree_changed_during_writer_gate")
+
     def test_replacement_gate_allows_read_only_web_peer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "web-peer.db"

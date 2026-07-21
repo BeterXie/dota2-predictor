@@ -913,17 +913,37 @@ def _healthy_subtree_identities(
     *,
     process_factory: Callable[[int], Any] = psutil.Process,
 ) -> tuple[ProcessIdentity, ...]:
+    _, identities = _healthy_subtree_snapshot(
+        children,
+        process_factory=process_factory,
+    )
+    return identities
+
+
+def _healthy_subtree_snapshot(
+    children: Mapping[str, Any],
+    *,
+    process_factory: Callable[[int], Any] = psutil.Process,
+) -> tuple[tuple[ProcessIdentity, ...], tuple[ProcessIdentity, ...]]:
+    roots: set[ProcessIdentity] = set()
     identities: set[ProcessIdentity] = set()
     for process_handle in children.values():
         if process_handle.poll() is not None:
             continue
-        identities.update(
-            _capture_subprocess_tree_identities(
-                process_handle,
-                process_factory=process_factory,
-            )
+        subtree = _capture_subprocess_tree_identities(
+            process_handle,
+            process_factory=process_factory,
         )
-    return tuple(sorted(identities))
+        root_pid = int(process_handle.pid)
+        root_identity = next(
+            (identity for identity in subtree if identity.pid == root_pid),
+            None,
+        )
+        if root_identity is None:
+            raise RuntimeError("healthy child root is absent from subtree capture")
+        roots.add(root_identity)
+        identities.update(subtree)
+    return tuple(sorted(roots)), tuple(sorted(identities))
 
 
 def _replacement_authority_gate(
@@ -933,46 +953,65 @@ def _replacement_authority_gate(
     *,
     process_factory: Callable[[int], Any] = psutil.Process,
     writer_scanner: Callable[..., WriterScanResult] | None = None,
+    max_passes: int = 8,
 ) -> TerminationResult:
+    if max_passes <= 0:
+        raise ValueError("writer gate max passes must be positive")
     writer_scanner = writer_scanner or scan_managed_writers
     try:
         require_unique_database_file(
             database,
             expected_identity=database_identity,
         )
-        before = _healthy_subtree_identities(
+        expected_roots, allowed = _healthy_subtree_snapshot(
             children,
             process_factory=process_factory,
         )
-        scan = writer_scanner(database, allowed_identities=before)
-        if scan.unverifiable_pids:
-            return TerminationResult(
-                False,
-                "writer_scan_unverifiable:"
-                + ",".join(str(pid) for pid in scan.unverifiable_pids),
+        observed = allowed
+        for _ in range(max_passes):
+            scan = writer_scanner(database, allowed_identities=allowed)
+            if scan.unverifiable_pids:
+                return TerminationResult(
+                    False,
+                    "writer_scan_unverifiable:"
+                    + ",".join(str(pid) for pid in scan.unverifiable_pids),
+                )
+            if scan.conflicts:
+                return TerminationResult(
+                    False,
+                    "orphan_writer_conflict:"
+                    + ",".join(str(item.pid) for item in scan.conflicts),
+                )
+            current_roots, current = _healthy_subtree_snapshot(
+                children,
+                process_factory=process_factory,
             )
-        if scan.conflicts:
-            return TerminationResult(
-                False,
-                "orphan_writer_conflict:"
-                + ",".join(str(item.pid) for item in scan.conflicts),
+            require_unique_database_file(
+                database,
+                expected_identity=database_identity,
             )
-        after = _healthy_subtree_identities(
-            children,
-            process_factory=process_factory,
-        )
-        require_unique_database_file(
-            database,
-            expected_identity=database_identity,
-        )
+            if current_roots != expected_roots:
+                return TerminationResult(
+                    False,
+                    "healthy_roots_changed_during_writer_gate",
+                )
+            if not set(observed).issubset(current):
+                return TerminationResult(
+                    False,
+                    "healthy_subtree_changed_during_writer_gate",
+                )
+            if current == observed:
+                return TerminationResult(True)
+            observed = current
     except Exception as error:
         return TerminationResult(
             False,
             f"replacement_authority_unverifiable:{type(error).__name__}:{error}",
         )
-    if before != after:
-        return TerminationResult(False, "healthy_subtree_changed_during_writer_gate")
-    return TerminationResult(True)
+    return TerminationResult(
+        False,
+        "healthy_subtree_did_not_stabilize_during_writer_gate",
+    )
 
 
 def _shutdown_children_under_authority(
