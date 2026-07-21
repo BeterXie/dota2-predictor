@@ -197,6 +197,65 @@ class StrictRoleAssignmentCliTests(unittest.TestCase):
             )
             self.assertTrue(all(row["position"] is None for row in live))
 
+    def test_prospective_expected_roles_use_only_prior_usable_map(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "strict.db"
+            with IntelligenceStorage(database) as storage:
+                storage.init_schema()
+                EventRegistry(storage).seed_approved_events()
+                self._add_map(
+                    storage,
+                    root,
+                    match_id=9_001,
+                    started_at=START,
+                    first_usable_at=START + timedelta(minutes=31),
+                )
+                second_start = START + timedelta(hours=2)
+                self._add_map(
+                    storage,
+                    root,
+                    match_id=9_002,
+                    started_at=second_start,
+                    first_usable_at=second_start + timedelta(minutes=31),
+                )
+                storage.connection.execute(
+                    """UPDATE player_map_facts
+                          SET account_id=CASE player_slot
+                              WHEN 4 THEN 10005 WHEN 132 THEN 10105 END
+                        WHERE match_id IN (9001, 9002)
+                          AND player_slot IN (4, 132)"""
+                )
+                storage.connection.commit()
+
+            run_assignment(
+                database,
+                availability_mode=AvailabilityMode.PROSPECTIVE,
+            )
+
+            with IntelligenceStorage(database) as storage:
+                rows = storage.connection.execute(
+                    """SELECT match_id, player_slot, position, input_cutoff
+                         FROM player_role_assignments
+                        WHERE purpose='expected_position'
+                          AND assignment_version=?
+                        ORDER BY match_id, player_slot""",
+                    (ASSIGNMENT_VERSIONS[AvailabilityMode.PROSPECTIVE],),
+                ).fetchall()
+            first = [row for row in rows if row["match_id"] == 9_001]
+            second = [row for row in rows if row["match_id"] == 9_002]
+            self.assertTrue(all(row["position"] is None for row in first))
+            self.assertEqual(
+                [row["position"] for row in second],
+                [1, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+            )
+            self.assertTrue(
+                all(
+                    datetime.fromisoformat(row["input_cutoff"]) == second_start
+                    for row in second
+                )
+            )
+
     def test_dry_run_repeated_write_and_audit_fields_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = self._database(Path(directory))

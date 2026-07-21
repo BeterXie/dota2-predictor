@@ -9,7 +9,7 @@ import json
 import math
 import sqlite3
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -64,6 +64,7 @@ class StrictRoleMap:
     match_id: int
     started_at: datetime
     completed_at: datetime
+    source_content_hash: str
     players: tuple[StrictRolePlayer, ...]
 
 
@@ -243,10 +244,26 @@ def load_strict_maps(
                 match_id,
                 started_at,
                 started_at + timedelta(seconds=duration),
+                artifacts[match_id][1],
                 tuple(sorted(players, key=lambda row: row.player_slot)),
             )
         )
     return tuple(sorted(maps, key=lambda row: (row.started_at, row.match_id)))
+
+
+def strict_role_dependency_fingerprint(games: Sequence[StrictRoleMap]) -> str:
+    """Hash the complete canonical input consumed by role assignment."""
+
+    payload = json.dumps(
+        [asdict(game) for game in games],
+        default=lambda value: value.isoformat()
+        if isinstance(value, datetime)
+        else value.value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def build_assignments(
@@ -345,12 +362,43 @@ def persist_assignments(
     rows: Sequence[PersistedAssignment],
     *,
     dry_run: bool,
+    preserve_existing: bool = False,
+    database_path: Path | None = None,
+    required_dependency_fingerprint: str | None = None,
+    required_certification_authorities: Mapping[int, object] | None = None,
 ) -> tuple[int, int, int]:
     inserted = updated = unchanged = 0
     now = datetime.now(UTC).isoformat()
     if not dry_run:
         connection.execute("BEGIN IMMEDIATE")
     try:
+        if required_dependency_fingerprint is not None:
+            if database_path is None:
+                raise ValueError("database_path is required for dependency validation")
+            current_games = load_strict_maps(
+                connection,
+                database_path=database_path,
+            )
+            if (
+                strict_role_dependency_fingerprint(current_games)
+                != required_dependency_fingerprint
+            ):
+                raise RuntimeError(
+                    "prospective role dependencies changed while assigning"
+                )
+        if required_certification_authorities is not None:
+            from event_intelligence.incremental import (
+                strict_certification_authorities,
+            )
+
+            current_authorities = strict_certification_authorities(
+                connection,
+                required_certification_authorities,
+            )
+            if current_authorities != dict(required_certification_authorities):
+                raise RuntimeError(
+                    "strict certification authority changed while assigning"
+                )
         for row in rows:
             assignment = row.assignment
             existing = connection.execute(
@@ -378,6 +426,12 @@ def persist_assignments(
             if existing is not None and tuple(existing) == expected:
                 unchanged += 1
                 continue
+            if existing is not None and preserve_existing:
+                raise RuntimeError(
+                    "existing role assignment conflicts with canonical result for "
+                    f"match {assignment.match_id}, slot {row.player_slot}, "
+                    f"purpose {assignment.purpose.value}"
+                )
             inserted += existing is None
             updated += existing is not None
             if dry_run:
@@ -425,6 +479,8 @@ def run_assignment(
     match_id: int | None = None,
     match_ids: Collection[int] | None = None,
     availability_mode: AvailabilityMode = AvailabilityMode.RECONSTRUCTED_WALK_FORWARD,
+    preserve_existing: bool = False,
+    required_certification_authorities: Mapping[int, object] | None = None,
 ) -> AssignmentReport:
     if match_id is not None and match_ids is not None:
         raise ValueError("match_id and match_ids are mutually exclusive")
@@ -438,6 +494,7 @@ def run_assignment(
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
     try:
+        connection.execute("BEGIN")
         games = load_strict_maps(connection, database_path=database)
         available_ids = {game.match_id for game in games}
         requested_ids = {match_id} if match_id is not None else selected_ids
@@ -447,14 +504,34 @@ def run_assignment(
                 "formal ready match not found: "
                 + ",".join(str(value) for value in sorted(missing_ids))
             )
+        if required_certification_authorities is not None:
+            guarded_ids = {
+                int(value) for value in required_certification_authorities
+            }
+            if requested_ids is None or guarded_ids != requested_ids:
+                raise ValueError(
+                    "certification authorities must exactly match selected maps"
+                )
+        dependency_fingerprint = (
+            strict_role_dependency_fingerprint(games)
+            if required_certification_authorities is not None
+            else None
+        )
         rows = build_assignments(
             games,
             availability_mode=availability_mode,
             match_id=match_id,
             match_ids=selected_ids,
         )
+        connection.rollback()
         inserted, updated, unchanged = persist_assignments(
-            connection, rows, dry_run=dry_run
+            connection,
+            rows,
+            dry_run=dry_run,
+            preserve_existing=preserve_existing,
+            database_path=database,
+            required_dependency_fingerprint=dependency_fingerprint,
+            required_certification_authorities=required_certification_authorities,
         )
         return AssignmentReport(
             ASSIGNMENT_VERSIONS[availability_mode],
@@ -468,6 +545,8 @@ def run_assignment(
             unchanged,
         )
     finally:
+        if connection.in_transaction:
+            connection.rollback()
         connection.close()
 
 

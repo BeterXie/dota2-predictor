@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from event_intelligence.benchmarks import BENCHMARK_VERSION
+from event_intelligence.deployment import load_bounded_prospective_history
 from event_intelligence.facts import extract_completed_match_facts
 from event_intelligence.incremental import (
     ROLE_VERSION,
@@ -31,6 +32,7 @@ from event_intelligence.ingest_adapters import (
 )
 from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
 from event_intelligence.raw_registry import relocate_raw_source_artifacts
+from event_intelligence.roles import PROSPECTIVE_ASSIGNMENT_VERSION
 from event_intelligence.opendota import OpenDotaAdapter
 from event_intelligence.registry import EventRegistry
 from event_intelligence.scheduler import ScheduleRun, SchedulerRetryState
@@ -646,9 +648,15 @@ class IngestAdapterTests(unittest.TestCase):
         requested_again = pipeline.run(ingest_report.changed_match_ids)
 
         self.assertEqual((first.derived_maps, first.assignment_rows), (1, 20))
+        self.assertEqual(
+            (first.prospective_pending_maps, first.prospective_assignment_rows),
+            (1, 20),
+        )
         self.assertEqual((first.score_rows, first.state_rows), (10, 2))
         self.assertEqual(second.derived_maps, 0)
+        self.assertEqual(second.prospective_assignment_rows, 0)
         self.assertEqual(requested_again.derived_maps, 1)
+        self.assertEqual(requested_again.prospective_assignment_rows, 0)
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         try:
@@ -663,6 +671,52 @@ class IngestAdapterTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM strict_derived_status").fetchone()[0],
                 1,
             )
+            prospective = connection.execute(
+                """SELECT purpose, COUNT(*) AS rows,
+                          COUNT(DISTINCT player_slot) AS slots
+                     FROM player_role_assignments
+                    WHERE match_id=8001 AND assignment_version=?
+                    GROUP BY purpose ORDER BY purpose""",
+                (PROSPECTIVE_ASSIGNMENT_VERSION,),
+            ).fetchall()
+            self.assertEqual(
+                [(row["purpose"], row["rows"], row["slots"]) for row in prospective],
+                [("expected_position", 10, 10), ("observed_position", 10, 10)],
+            )
+            self.assertEqual(
+                connection.execute(
+                    """SELECT COUNT(*) FROM player_role_assignments
+                        WHERE match_id=8001 AND assignment_version=?
+                          AND purpose='expected_position' AND position IS NOT NULL""",
+                    (PROSPECTIVE_ASSIGNMENT_VERSION,),
+                ).fetchone()[0],
+                0,
+            )
+            _, cold_start_history = load_bounded_prospective_history(
+                connection,
+                max_rows=100_000,
+                max_bytes=128 * 1024 * 1024,
+                max_value_bytes=8 * 1024 * 1024,
+            )
+            self.assertEqual(cold_start_history, ())
+            connection.execute(
+                """DELETE FROM player_role_assignments
+                    WHERE match_id=8001 AND player_slot=0
+                      AND purpose='expected_position' AND assignment_version=?""",
+                (PROSPECTIVE_ASSIGNMENT_VERSION,),
+            )
+            connection.commit()
+            recovered = pipeline.run(())
+            recovered_again = pipeline.run(())
+            self.assertEqual(
+                (
+                    recovered.derived_maps,
+                    recovered.prospective_pending_maps,
+                    recovered.prospective_assignment_rows,
+                ),
+                (0, 1, 1),
+            )
+            self.assertEqual(recovered_again.prospective_assignment_rows, 0)
             status = connection.execute(
                 """SELECT normalizer_version, benchmark_version
                      FROM strict_derived_status WHERE match_id=8001"""
@@ -713,6 +767,31 @@ class IngestAdapterTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM team_style_profiles").fetchone()[0],
                 2,
             )
+            connection.execute(
+                """DELETE FROM player_role_assignments
+                    WHERE match_id=8001 AND player_slot=0
+                      AND purpose='expected_position' AND assignment_version=?""",
+                (PROSPECTIVE_ASSIGNMENT_VERSION,),
+            )
+            connection.execute(
+                """UPDATE player_role_assignments SET input_hash=?
+                    WHERE match_id=8001 AND player_slot=1
+                      AND purpose='expected_position' AND assignment_version=?""",
+                ("0" * 64, PROSPECTIVE_ASSIGNMENT_VERSION),
+            )
+            connection.commit()
+            with self.assertRaisesRegex(
+                RuntimeError, "conflicts with canonical result"
+            ):
+                pipeline.run(())
+            self.assertEqual(
+                connection.execute(
+                    """SELECT COUNT(*) FROM player_role_assignments
+                        WHERE match_id=8001 AND assignment_version=?""",
+                    (PROSPECTIVE_ASSIGNMENT_VERSION,),
+                ).fetchone()[0],
+                19,
+            )
         finally:
             connection.close()
 
@@ -754,6 +833,94 @@ class IngestAdapterTests(unittest.TestCase):
         self.assertEqual(first_ingest.changed_match_ids, (8_001, 8_002))
         pipeline = StrictDerivedPipeline(self.path)
         self.assertEqual(pipeline.run(first_ingest.changed_match_ids).derived_maps, 2)
+
+        from scripts import assign_strict_event_roles as role_assignment_module
+
+        real_persist_assignments = role_assignment_module.persist_assignments
+        prospective_version = PROSPECTIVE_ASSIGNMENT_VERSION
+        self.storage.connection.execute(
+            """DELETE FROM player_role_assignments
+                WHERE match_id=8002 AND player_slot=0
+                  AND purpose='expected_position' AND assignment_version=?""",
+            (prospective_version,),
+        )
+        original_usable_at = self.storage.connection.execute(
+            """SELECT first_usable_at FROM player_map_facts
+                WHERE match_id=8001 AND player_slot=0"""
+        ).fetchone()[0]
+        self.storage.connection.commit()
+
+        def change_earlier_history(*args: object, **kwargs: object):
+            with sqlite3.connect(self.path) as writer:
+                writer.execute(
+                    """UPDATE player_map_facts
+                          SET first_usable_at=?
+                        WHERE match_id=8001 AND player_slot=0""",
+                    ((datetime.fromisoformat(original_usable_at) + timedelta(seconds=1)).isoformat(),),
+                )
+            return real_persist_assignments(*args, **kwargs)
+
+        with patch.object(
+            role_assignment_module,
+            "persist_assignments",
+            side_effect=change_earlier_history,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dependencies changed"):
+                pipeline.run(())
+        self.assertEqual(
+            self.storage.connection.execute(
+                """SELECT COUNT(*) FROM player_role_assignments
+                    WHERE match_id=8002 AND assignment_version=?""",
+                (prospective_version,),
+            ).fetchone()[0],
+            19,
+        )
+        self.storage.connection.execute(
+            """UPDATE player_map_facts SET first_usable_at=?
+                WHERE match_id=8001 AND player_slot=0""",
+            (original_usable_at,),
+        )
+        self.storage.connection.commit()
+        self.assertEqual(pipeline.run(()).prospective_assignment_rows, 1)
+
+        self.storage.connection.execute(
+            """DELETE FROM player_role_assignments
+                WHERE match_id=8002 AND player_slot=0
+                  AND purpose='expected_position' AND assignment_version=?""",
+            (prospective_version,),
+        )
+        self.storage.connection.commit()
+
+        def change_target_authority(*args: object, **kwargs: object):
+            with sqlite3.connect(self.path) as writer:
+                writer.execute(
+                    """UPDATE strict_derived_status SET benchmark_version='race'
+                        WHERE match_id=8002"""
+                )
+            return real_persist_assignments(*args, **kwargs)
+
+        with patch.object(
+            role_assignment_module,
+            "persist_assignments",
+            side_effect=change_target_authority,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "authority changed"):
+                pipeline.run(())
+        self.assertEqual(
+            self.storage.connection.execute(
+                """SELECT COUNT(*) FROM player_role_assignments
+                    WHERE match_id=8002 AND assignment_version=?""",
+                (prospective_version,),
+            ).fetchone()[0],
+            19,
+        )
+        self.storage.connection.execute(
+            """UPDATE strict_derived_status SET benchmark_version=?
+                WHERE match_id=8002""",
+            (BENCHMARK_VERSION,),
+        )
+        self.storage.connection.commit()
+        self.assertEqual(pipeline.run(()).prospective_assignment_rows, 1)
 
         self.storage.connection.execute(
             """UPDATE strict_derived_status
@@ -1055,6 +1222,14 @@ class IngestAdapterTests(unittest.TestCase):
         self.assertEqual(
             self.storage.connection.execute(
                 "SELECT COUNT(*) FROM strict_derived_status"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.storage.connection.execute(
+                """SELECT COUNT(*) FROM player_role_assignments
+                    WHERE assignment_version=?""",
+                (PROSPECTIVE_ASSIGNMENT_VERSION,),
             ).fetchone()[0],
             0,
         )

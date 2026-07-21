@@ -16,7 +16,7 @@ from typing import Callable, Collection, Iterator, Mapping
 
 from .benchmarks import BENCHMARK_VERSION
 from .player_scoring import score_version_for_role
-from .roles import RECONSTRUCTED_ASSIGNMENT_VERSION
+from .roles import PROSPECTIVE_ASSIGNMENT_VERSION, RECONSTRUCTED_ASSIGNMENT_VERSION
 from .team_profiles import PROFILE_VERSION
 from .team_states import LABEL_VERSION
 
@@ -45,6 +45,8 @@ class DerivedRunReport:
     pending_maps: int
     derived_maps: int
     assignment_rows: int
+    prospective_pending_maps: int
+    prospective_assignment_rows: int
     score_rows: int
     state_rows: int
     profile_rows: int
@@ -56,6 +58,29 @@ class _SourceSnapshot:
     content_hash: str
     normalizer_version: str
     profile_context_hash: str
+
+
+@dataclass(frozen=True)
+class StrictCertificationAuthority:
+    match_id: int
+    source_content_hash: str
+    role_assignment_version: str
+    score_version: str
+    team_state_version: str
+    profile_version: str
+    profile_cutoff: str
+    derived_at: str
+    derived_normalizer_version: str
+    benchmark_version: str
+    profile_context_hash: str
+    status_event_id: str
+    latest_raw_content_hash: str
+    status_normalizer_version: str
+    eligible_event_id: str
+    player_readiness: str
+    state_readiness: str
+    draft_readiness: str
+    current_profile_context_hash: str
 
 
 @dataclass(frozen=True)
@@ -921,7 +946,21 @@ class StrictDerivedPipeline:
                         raise
                     else:
                         connection.commit()
-            return DerivedRunReport(len(requested), 0, 0, 0, 0, 0, 0, None)
+            prospective_pending, prospective_rows = (
+                self._complete_pending_prospective_assignments()
+            )
+            return DerivedRunReport(
+                len(requested),
+                0,
+                0,
+                0,
+                prospective_pending,
+                prospective_rows,
+                0,
+                0,
+                0,
+                None,
+            )
 
         ordered = tuple(sorted(pending))
         player_ordered = tuple(sorted(player_pending))
@@ -1039,16 +1078,107 @@ class StrictDerivedPipeline:
                 raise
             else:
                 connection.commit()
+        prospective_pending, prospective_rows = (
+            self._complete_pending_prospective_assignments(ordered)
+        )
         return DerivedRunReport(
             len(requested),
             len(ordered),
             len(ordered),
             assignment_rows,
+            prospective_pending,
+            prospective_rows,
             score_rows,
             state_rows,
             profile_rows,
             cutoff.isoformat() if state_ordered else None,
         )
+
+    def _complete_pending_prospective_assignments(
+        self,
+        match_ids: Collection[int] | None = None,
+    ) -> tuple[int, int]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            authorities = self._pending_prospective_authorities(
+                connection,
+                match_ids,
+            )
+            connection.rollback()
+        if not authorities:
+            return 0, 0
+
+        from scripts.assign_strict_event_roles import AvailabilityMode, run_assignment
+
+        report = run_assignment(
+            self.database,
+            match_ids=tuple(sorted(authorities)),
+            availability_mode=AvailabilityMode.PROSPECTIVE,
+            preserve_existing=True,
+            required_certification_authorities=authorities,
+        )
+        return len(authorities), report.inserted
+
+    @classmethod
+    def _pending_prospective_authorities(
+        cls,
+        connection: sqlite3.Connection,
+        match_ids: Collection[int] | None = None,
+    ) -> dict[int, StrictCertificationAuthority]:
+        selected = None if match_ids is None else {int(value) for value in match_ids}
+        if selected == set():
+            return {}
+        restriction = ""
+        parameters: list[object] = [PROSPECTIVE_ASSIGNMENT_VERSION]
+        if selected is not None:
+            placeholders = ",".join("?" for _ in selected)
+            restriction = f" AND derived.match_id IN ({placeholders})"
+            parameters.extend(sorted(selected))
+        rows = connection.execute(
+            """SELECT derived.match_id
+                 FROM strict_derived_status AS derived
+                 JOIN match_ingest_status AS status USING(match_id)
+                 JOIN formal_map_eligibility AS eligible USING(match_id)
+                WHERE eligible.player_readiness='ready'
+                  AND eligible.event_id=status.event_id
+                  AND derived.source_content_hash=status.latest_raw_content_hash
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM player_role_assignments AS roles
+                       WHERE roles.match_id=derived.match_id
+                         AND roles.assignment_version=?
+                       GROUP BY roles.match_id
+                      HAVING COUNT(*)=20
+                         AND COUNT(DISTINCT CASE
+                               WHEN roles.purpose='expected_position'
+                               THEN roles.player_slot END)=10
+                         AND COUNT(DISTINCT CASE
+                               WHEN roles.purpose='observed_position'
+                               THEN roles.player_slot END)=10
+                  )"""
+            + restriction,
+            tuple(parameters),
+        ).fetchall()
+        authorities = strict_certification_authorities(
+            connection,
+            {int(row["match_id"]) for row in rows},
+        )
+        return {
+            match_id: authority
+            for match_id, authority in authorities.items()
+            if authority.source_content_hash == authority.latest_raw_content_hash
+            and authority.role_assignment_version == ROLE_VERSION
+            and authority.score_version == SCORE_VERSION
+            and authority.team_state_version == LABEL_VERSION
+            and authority.profile_version == PROFILE_VERSION
+            and authority.derived_normalizer_version
+            == authority.status_normalizer_version
+            and authority.benchmark_version == BENCHMARK_VERSION
+            and authority.status_event_id == authority.eligible_event_id
+            and authority.player_readiness == "ready"
+            and authority.profile_context_hash
+            == authority.current_profile_context_hash
+        }
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -1502,14 +1632,84 @@ class StrictDerivedPipeline:
                     )
 
 
+def strict_certification_authorities(
+    connection: sqlite3.Connection,
+    match_ids: Collection[int],
+) -> dict[int, StrictCertificationAuthority]:
+    """Read the complete target certification authority in one snapshot."""
+
+    selected = {int(value) for value in match_ids}
+    if not selected:
+        return {}
+    placeholders = ",".join("?" for _ in selected)
+    rows = connection.execute(
+        f"""SELECT derived.match_id, derived.source_content_hash,
+                   derived.role_assignment_version, derived.score_version,
+                   derived.team_state_version, derived.profile_version,
+                   derived.profile_cutoff, derived.derived_at,
+                   derived.normalizer_version AS derived_normalizer_version,
+                   derived.benchmark_version, derived.profile_context_hash,
+                   status.event_id AS status_event_id,
+                   status.latest_raw_content_hash,
+                   status.normalizer_version AS status_normalizer_version,
+                   eligible.event_id AS eligible_event_id,
+                   eligible.player_readiness, eligible.state_readiness,
+                   eligible.draft_readiness
+              FROM strict_derived_status AS derived
+              JOIN match_ingest_status AS status USING(match_id)
+              JOIN formal_map_eligibility AS eligible USING(match_id)
+             WHERE derived.match_id IN ({placeholders})""",
+        tuple(sorted(selected)),
+    ).fetchall()
+    contexts = StrictDerivedPipeline._profile_context_hashes(
+        connection,
+        {str(row["status_event_id"]) for row in rows},
+    )
+
+    def text_value(value: object) -> str:
+        return "" if value is None else str(value)
+
+    return {
+        int(row["match_id"]): StrictCertificationAuthority(
+            match_id=int(row["match_id"]),
+            source_content_hash=text_value(row["source_content_hash"]),
+            role_assignment_version=text_value(row["role_assignment_version"]),
+            score_version=text_value(row["score_version"]),
+            team_state_version=text_value(row["team_state_version"]),
+            profile_version=text_value(row["profile_version"]),
+            profile_cutoff=text_value(row["profile_cutoff"]),
+            derived_at=text_value(row["derived_at"]),
+            derived_normalizer_version=text_value(
+                row["derived_normalizer_version"]
+            ),
+            benchmark_version=text_value(row["benchmark_version"]),
+            profile_context_hash=text_value(row["profile_context_hash"]),
+            status_event_id=text_value(row["status_event_id"]),
+            latest_raw_content_hash=text_value(row["latest_raw_content_hash"]),
+            status_normalizer_version=text_value(row["status_normalizer_version"]),
+            eligible_event_id=text_value(row["eligible_event_id"]),
+            player_readiness=text_value(row["player_readiness"]),
+            state_readiness=text_value(row["state_readiness"]),
+            draft_readiness=text_value(row["draft_readiness"]),
+            current_profile_context_hash=contexts.get(
+                text_value(row["status_event_id"]),
+                "",
+            ),
+        )
+        for row in rows
+    }
+
+
 __all__ = [
     "CurrentDerivedScopes",
     "DerivedRunReport",
     "ROLE_VERSION",
     "SCORE_VERSION",
+    "StrictCertificationAuthority",
     "StrictDerivedPipeline",
     "current_derived_scopes",
     "current_state_input_hashes",
     "profile_weighting_is_current",
     "refresh_draft_prediction_validations",
+    "strict_certification_authorities",
 ]
