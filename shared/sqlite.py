@@ -4,11 +4,34 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 
 BUSY_TIMEOUT_MS = 5_000
 PathLike: TypeAlias = str | Path
+SQLiteErrorKind: TypeAlias = Literal["busy", "schema_missing", "other"]
+
+
+def classify_sqlite_error(error: sqlite3.Error) -> SQLiteErrorKind:
+    """Classify only the SQLite failures callers may safely recover from."""
+
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        primary_code = code & 0xFF
+        if primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return "busy"
+    message = str(error).strip().casefold()
+    if any(message.startswith(prefix) for prefix in (
+        "no such table: ",
+        "no such column: ",
+        "no such view: ",
+    )):
+        return "schema_missing"
+    if isinstance(code, int):
+        return "other"
+    if message in {"database is locked", "database table is locked"}:
+        return "busy"
+    return "other"
 
 
 def configure_connection(
@@ -81,4 +104,10 @@ def connect(
     return connection
 
 
-__all__ = ["BUSY_TIMEOUT_MS", "configure_connection", "connect", "execute_script"]
+__all__ = [
+    "BUSY_TIMEOUT_MS",
+    "classify_sqlite_error",
+    "configure_connection",
+    "connect",
+    "execute_script",
+]

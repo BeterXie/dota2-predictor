@@ -1,0 +1,415 @@
+{
+  "lineup": {
+    "data": {
+      "active_curve": {
+        "data": {
+          "active_horizon_minutes": 10,
+          "curve_key": "8fed164982266bcde8ac3a80eedcb115839115b29158bd8b2b0599d49d97e03c",
+          "first_usable_at": "2026-07-14T13:59:54+00:00",
+          "points": [
+            {
+              "active": true,
+              "conditional": false,
+              "horizon_minutes": 10,
+              "landmark_key": "98ba93ab336602d61789598598f00d50db7a50a6aa540bdc1934841091c1d28f",
+              "model_version": "test-draft-model-v1",
+              "quality": 0.8,
+              "radiant_probability": 0.6,
+              "support": 500,
+              "uncertainty": 0.02,
+              "validation_status": "passed"
+            }
+          ]
+        },
+        "reason": "active_curve_available",
+        "status": "available"
+      },
+      "as_of": "2026-07-14T13:59:55+00:00",
+      "dire": {"hero_ids": [6, 7, 8, 9, 10]},
+      "evidence": {
+        "anchor_source_frame_ref": "vision-frame:sha256:c94b2828537f62c00953ff70c8fe2bca741433cfbca250b21df2786b94e2dac0",
+        "anchored_at": "2026-07-14T13:59:48+00:00",
+        "draft_hash": "d67fcba0a6956921cceee6d723126ba8928a468c6753c43835db325a6dda8a6a",
+        "strict_mapping_id": 1
+      },
+      "map_number": 1,
+      "players": {
+        "data": null,
+        "reason": "live_player_identity_unavailable",
+        "status": "unavailable"
+      },
+      "radiant": {"hero_ids": [1, 2, 3, 4, 5]},
+      "radiant_team_side": "team_one"
+    },
+    "reason": "lineup_available",
+    "status": "available"
+  },
+  "odds": {
+    "data": {
+      "latest_observed_at": "2026-07-14T13:59:55+00:00",
+      "periods": ["map_1"],
+      "point_count": 2
+    },
+    "reason": "odds_available",
+    "status": "available"
+  },
+  "strategy": {
+    "data": {
+      "count_scope": "recent_scanned_window",
+      "decisions": [
+        {
+          "conservative_contributions": {
+            "draft_curve": 0.11619842121469831,
+            "late_game_style": 0.0,
+            "market_movement": 0.0,
+            "player_form": 0.0448,
+            "team_style": 0.11776
+          },
+          "contributions": {
+            "draft_curve": 0.14596743891893912,
+            "late_game_style": 0.0,
+            "market_movement": 0.0,
+            "player_form": 0.055999999999999994,
+            "team_style": 0.1472
+          },
+          "data_quality": 0.83,
+          "decided_at": "2026-07-14T13:59:50+00:00",
+          "decision_key": "bcf1302c5cbd9fe613b200d476f0afb0",
+          "draft_authority": {
+            "authority_revision": 17,
+            "calibration_hash": "04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+            "curve_key": "31083d053907af50b161832a591a9ea978051705b7b589668322a71b6a9c0760",
+            "dependency_revision": 1,
+            "deployment_key": "9d425b2cfc4f1e57138b5d2d6b76f6ef56291fec43fdc61cf1ccdcf99eb4d314",
+            "feature_hash": "826cf0df512297b3e4a5150ad5ee77eecf905ce871a95bb202a71c43d0b19a32",
+            "global_gate_ref": "draft-calibration:04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+            "input_snapshot_hash": "e9dd1eec9b7939b780f38870dd71d2a1f3203c5e0d52b1fd1f3420282612d11d",
+            "landmark_horizon_minutes": 10,
+            "landmark_key": "8597a3c9520fb5c114a7669069ea65ab9b08b4bcd0456b533b2aa637c78e542f",
+            "landmark_quality": 0.8,
+            "landmark_radiant_probability": 0.6,
+            "landmark_support": 500,
+            "landmark_target": "radiant_win",
+            "landmark_uncertainty": 0.02,
+            "model_hash": "3e6bf4c4e665e1dad63fe3bb9189ae1d1ecd019942ac7b4630a46498cafbc6e2",
+            "model_version": "test-draft-model-v1",
+            "radiant_team_side": "team_one",
+            "source_ref": "prospective-draft:31083d053907af50b161832a591a9ea978051705b7b589668322a71b6a9c0760",
+            "strict_mapping_id": 1,
+            "target_snapshot_hash": "6ca9723ebd8995f2bfe594853924fbe406c1ace812435f22691e662d267d7eb3"
+          },
+          "edge": 0.08592929884539513,
+          "eligible": 0,
+          "input_ref": "549ef22be108e24d84602907",
+          "inputs": {
+            "conservative_contributions": {
+              "draft_curve": 0.11619842121469831,
+              "late_game_style": 0.0,
+              "market_movement": 0.0,
+              "player_form": 0.0448,
+              "team_style": 0.11776
+            },
+            "conservative_probability": 0.46836563999846803,
+            "draft_authority": {
+              "authority_revision": 17,
+              "calibration_hash": "04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+              "curve_key": "31083d053907af50b161832a591a9ea978051705b7b589668322a71b6a9c0760",
+              "dependency_revision": 1,
+              "deployment_key": "9d425b2cfc4f1e57138b5d2d6b76f6ef56291fec43fdc61cf1ccdcf99eb4d314",
+              "feature_hash": "826cf0df512297b3e4a5150ad5ee77eecf905ce871a95bb202a71c43d0b19a32",
+              "global_gate_ref": "draft-calibration:04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+              "horizon_minutes": 10,
+              "input_snapshot_hash": "e9dd1eec9b7939b780f38870dd71d2a1f3203c5e0d52b1fd1f3420282612d11d",
+              "landmark_key": "8597a3c9520fb5c114a7669069ea65ab9b08b4bcd0456b533b2aa637c78e542f",
+              "model_hash": "3e6bf4c4e665e1dad63fe3bb9189ae1d1ecd019942ac7b4630a46498cafbc6e2",
+              "model_version": "test-draft-model-v1",
+              "quality": 0.8,
+              "radiant_probability": 0.6,
+              "radiant_team_side": "team_one",
+              "source_ref": "prospective-draft:31083d053907af50b161832a591a9ea978051705b7b589668322a71b6a9c0760",
+              "strict_mapping_id": 1,
+              "support": 500,
+              "target": "radiant_win",
+              "target_snapshot_hash": "6ca9723ebd8995f2bfe594853924fbe406c1ace812435f22691e662d267d7eb3",
+              "uncertainty": 0.02
+            },
+            "draft_landmark": {
+              "availability_mode": "prospective",
+              "calibration_hash": "04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+              "calibration_ref": "draft-calibration:04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+              "curve_key": "31083d053907af50b161832a591a9ea978051705b7b589668322a71b6a9c0760",
+              "deployment_key": "9d425b2cfc4f1e57138b5d2d6b76f6ef56291fec43fdc61cf1ccdcf99eb4d314",
+              "feature_hash": "826cf0df512297b3e4a5150ad5ee77eecf905ce871a95bb202a71c43d0b19a32",
+              "global_calibration_passed": true,
+              "global_gate_ref": "draft-calibration:04f33ba501afba9a3e9e3fda81f59eb847254ba392c2c9248fe065f118b01d88",
+              "input_refs": ["test"],
+              "input_snapshot_hash": "e9dd1eec9b7939b780f38870dd71d2a1f3203c5e0d52b1fd1f3420282612d11d",
+              "landmark_key": "8597a3c9520fb5c114a7669069ea65ab9b08b4bcd0456b533b2aa637c78e542f",
+              "minute": 10,
+              "model_hash": "3e6bf4c4e665e1dad63fe3bb9189ae1d1ecd019942ac7b4630a46498cafbc6e2",
+              "model_kind": "pure_draft",
+              "model_version": "test-draft-model-v1",
+              "quality": 0.8,
+              "radiant_probability": 0.6,
+              "status": "validated",
+              "support": 500,
+              "target_snapshot_hash": "6ca9723ebd8995f2bfe594853924fbe406c1ace812435f22691e662d267d7eb3",
+              "uncertainty": 0.02,
+              "validation_reason": null
+            },
+            "independent_positive": true,
+            "market": {
+              "duration_minutes": 36.5,
+              "kill_handicap": -3.5,
+              "missing_markets": [],
+              "probability_move": 0.0,
+              "quality": 1.0,
+              "total_kills": 48.5,
+              "underdog_price": 2.5,
+              "underdog_probability": 0.4,
+              "underdog_side": "team_one"
+            },
+            "quality": {
+              "aggregate": 0.83,
+              "draft": 0.8,
+              "player": 0.8,
+              "team": 0.8
+            },
+            "strict_live_eligibility": {
+              "mapping_refs": {
+                "strict_automatic_approval_id": "",
+                "strict_canonical_identity_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_canonical_team_one_id": 11,
+                "strict_canonical_team_one_name": "Radiant Five",
+                "strict_canonical_team_two_id": 22,
+                "strict_canonical_team_two_name": "Dire Five",
+                "strict_crosswalk_evidence_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_event_id": "monitor-test",
+                "strict_mapping_acceptance_mode": "manual_exact",
+                "strict_mapping_accepted_at": "2026-07-13T14:00:00+00:00",
+                "strict_mapping_evidence_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_mapping_id": 1,
+                "strict_mapping_recorded_at": "2026-07-13T14:00:00+00:00",
+                "strict_mapping_source": "test",
+                "strict_mapping_version": "test-v1",
+                "strict_raybet_best_of": 3,
+                "strict_raybet_identity_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_raybet_metadata_updated_at": "2026-07-13T14:00:00+00:00",
+                "strict_raybet_team_one_id": 11,
+                "strict_raybet_team_two_id": 22,
+                "strict_scheduled_at_utc": "2026-07-13T14:00:00+00:00",
+                "strict_stage_scope": "main_event"
+              }
+            },
+            "transport": {
+              "current_at": "2026-07-14T13:59:50+00:00",
+              "current_key": "monitor-scored-blocked-transport:blocked-golden-v1"
+            },
+            "vision": {
+              "captured_at": "2026-07-14T13:59:50+00:00",
+              "game_clock_seconds": 600,
+              "radiant_team_side": "team_one",
+              "source_frame_ref": "vision-frame:sha256:4d0ef64b45b55450ed8ac8989ed3a1dec215286889ad500c1b1c38b7b81751dd"
+            }
+          },
+          "map_number": 1,
+          "market_probability": 0.4,
+          "model_probability": 0.48592929884539515,
+          "reason": "edge_below_threshold",
+          "strategy_version": "comeback-shadow-v2-strict-landmarks",
+          "underdog_side": "team_one",
+          "vision_authority": {
+            "aligned_game_clock_seconds": 600,
+            "alignment_lag_seconds": 0.0,
+            "alignment_method": "anchor",
+            "captured_at": "2026-07-14T13:59:50+00:00",
+            "clock_confidence": 0.95,
+            "confirmed": 1,
+            "dire_hero_ids_json": [6, 7, 8, 9, 10],
+            "draft_confidence": 0.95,
+            "is_paused": 0,
+            "map_number": 1,
+            "observed_game_clock_seconds": 600,
+            "radiant_hero_ids_json": [1, 2, 3, 4, 5],
+            "radiant_team_side": "team_one",
+            "raybet_match_id": "match-1",
+            "screen_state": "game",
+            "source_frame_bytes": 168,
+            "source_frame_ref": "vision-frame:sha256:4d0ef64b45b55450ed8ac8989ed3a1dec215286889ad500c1b1c38b7b81751dd",
+            "source_frame_sha256": "4d0ef64b45b55450ed8ac8989ed3a1dec215286889ad500c1b1c38b7b81751dd",
+            "transport_at": "2026-07-14T13:59:50+00:00",
+            "transport_key": "monitor-scored-blocked-transport:blocked-golden-v1"
+          }
+        },
+        {
+          "conservative_contributions": {
+            "draft_curve": 0.04,
+            "late_game_style": 0.0,
+            "market_movement": 0.01,
+            "player_form": -0.02,
+            "team_style": 0.52
+          },
+          "contributions": {
+            "draft_curve": 0.08,
+            "late_game_style": 0.0,
+            "market_movement": 0.01,
+            "player_form": -0.02,
+            "team_style": 0.65
+          },
+          "data_quality": 0.9,
+          "decided_at": "2026-07-14T13:59:55+00:00",
+          "decision_key": "43be3924a8ea09045121c17c295fdcf7",
+          "draft_authority": {
+            "authority_revision": 30,
+            "calibration_hash": "07150e29ddfc538f5ba8fb9433d99c6c2cf14dc69700f22b99a43616b8403525",
+            "curve_key": "8fed164982266bcde8ac3a80eedcb115839115b29158bd8b2b0599d49d97e03c",
+            "dependency_revision": 1,
+            "deployment_key": "089073ee3e072ba364421180a1a4a8531c3f25c98f35b0175ebf87a0d827ee71",
+            "feature_hash": "b9a638318a2b07adcc30102274192467f6e643027aab96e9f9a08b861e8dd323",
+            "global_gate_ref": "draft-calibration:07150e29ddfc538f5ba8fb9433d99c6c2cf14dc69700f22b99a43616b8403525",
+            "input_snapshot_hash": "d2a76824ea4a282392c1255094e68cf1c3076e2b17f5a62a7043f50c3b866033",
+            "landmark_horizon_minutes": 10,
+            "landmark_key": "98ba93ab336602d61789598598f00d50db7a50a6aa540bdc1934841091c1d28f",
+            "landmark_quality": 0.8,
+            "landmark_radiant_probability": 0.6,
+            "landmark_support": 500,
+            "landmark_target": "radiant_win",
+            "landmark_uncertainty": 0.02,
+            "model_hash": "0f18cc492556741425372c1c2489844b48c7602effbc27270d742382310f704b",
+            "model_version": "test-draft-model-v1",
+            "radiant_team_side": "team_one",
+            "source_ref": "prospective-draft:8fed164982266bcde8ac3a80eedcb115839115b29158bd8b2b0599d49d97e03c",
+            "strict_mapping_id": 1,
+            "target_snapshot_hash": "bf51d0fe4e9039bfbacb0421c5f85f883f8d372123f9424dd2c1393a955a8ab7"
+          },
+          "edge": 0.17799178909644675,
+          "eligible": 1,
+          "input_ref": "33bc4b122af524b125afe664",
+          "inputs": {
+            "conservative_contributions": {
+              "draft_curve": 0.04,
+              "late_game_style": 0.0,
+              "market_movement": 0.01,
+              "player_form": -0.02,
+              "team_style": 0.52
+            },
+            "conservative_probability": 0.5360709503058387,
+            "draft_authority": {
+              "authority_revision": 30,
+              "calibration_hash": "07150e29ddfc538f5ba8fb9433d99c6c2cf14dc69700f22b99a43616b8403525",
+              "curve_key": "8fed164982266bcde8ac3a80eedcb115839115b29158bd8b2b0599d49d97e03c",
+              "dependency_revision": 1,
+              "deployment_key": "089073ee3e072ba364421180a1a4a8531c3f25c98f35b0175ebf87a0d827ee71",
+              "feature_hash": "b9a638318a2b07adcc30102274192467f6e643027aab96e9f9a08b861e8dd323",
+              "global_gate_ref": "draft-calibration:07150e29ddfc538f5ba8fb9433d99c6c2cf14dc69700f22b99a43616b8403525",
+              "horizon_minutes": 10,
+              "input_snapshot_hash": "d2a76824ea4a282392c1255094e68cf1c3076e2b17f5a62a7043f50c3b866033",
+              "landmark_key": "98ba93ab336602d61789598598f00d50db7a50a6aa540bdc1934841091c1d28f",
+              "model_hash": "0f18cc492556741425372c1c2489844b48c7602effbc27270d742382310f704b",
+              "model_version": "test-draft-model-v1",
+              "quality": 0.8,
+              "radiant_probability": 0.6,
+              "radiant_team_side": "team_one",
+              "source_ref": "prospective-draft:8fed164982266bcde8ac3a80eedcb115839115b29158bd8b2b0599d49d97e03c",
+              "strict_mapping_id": 1,
+              "support": 500,
+              "target": "radiant_win",
+              "target_snapshot_hash": "bf51d0fe4e9039bfbacb0421c5f85f883f8d372123f9424dd2c1393a955a8ab7",
+              "uncertainty": 0.02
+            },
+            "strict_live_eligibility": {
+              "mapping_refs": {
+                "strict_automatic_approval_id": "",
+                "strict_canonical_identity_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_canonical_team_one_id": 11,
+                "strict_canonical_team_one_name": "Radiant Five",
+                "strict_canonical_team_two_id": 22,
+                "strict_canonical_team_two_name": "Dire Five",
+                "strict_crosswalk_evidence_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_event_id": "monitor-test",
+                "strict_mapping_acceptance_mode": "manual_exact",
+                "strict_mapping_accepted_at": "2026-07-13T14:00:00+00:00",
+                "strict_mapping_evidence_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_mapping_id": 1,
+                "strict_mapping_recorded_at": "2026-07-13T14:00:00+00:00",
+                "strict_mapping_source": "test",
+                "strict_mapping_version": "test-v1",
+                "strict_raybet_best_of": 3,
+                "strict_raybet_identity_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "strict_raybet_metadata_updated_at": "2026-07-13T14:00:00+00:00",
+                "strict_raybet_team_one_id": 11,
+                "strict_raybet_team_two_id": 22,
+                "strict_scheduled_at_utc": "2026-07-13T14:00:00+00:00",
+                "strict_stage_scope": "main_event"
+              }
+            },
+            "transport": {
+              "current_at": "2026-07-14T13:59:55+00:00",
+              "current_key": "monitor-transport:decision-golden-v1"
+            },
+            "vision": {
+              "captured_at": "2026-07-14T13:59:55+00:00",
+              "game_clock_seconds": 600,
+              "radiant_team_side": "team_one",
+              "source_frame_ref": "vision-frame:sha256:7f75e66f0d00cc074e26ac35e66da4aa8fcb9473947a2fb5bc334aa2bbec85a7"
+            },
+            "independent_positive": true
+          },
+          "map_number": 1,
+          "market_probability": 0.4,
+          "model_probability": 0.5779917890964468,
+          "reason": "eligible",
+          "strategy_version": "comeback-shadow-v2-strict-landmarks",
+          "underdog_side": "team_one",
+          "vision_authority": {
+            "aligned_game_clock_seconds": 600,
+            "alignment_lag_seconds": 0.0,
+            "alignment_method": "anchor",
+            "captured_at": "2026-07-14T13:59:55+00:00",
+            "clock_confidence": 0.95,
+            "confirmed": 1,
+            "dire_hero_ids_json": [6, 7, 8, 9, 10],
+            "draft_confidence": 0.95,
+            "is_paused": 0,
+            "map_number": 1,
+            "observed_game_clock_seconds": 600,
+            "radiant_hero_ids_json": [1, 2, 3, 4, 5],
+            "radiant_team_side": "team_one",
+            "raybet_match_id": "match-1",
+            "screen_state": "game",
+            "source_frame_bytes": 154,
+            "source_frame_ref": "vision-frame:sha256:7f75e66f0d00cc074e26ac35e66da4aa8fcb9473947a2fb5bc334aa2bbec85a7",
+            "source_frame_sha256": "7f75e66f0d00cc074e26ac35e66da4aa8fcb9473947a2fb5bc334aa2bbec85a7",
+            "transport_at": "2026-07-14T13:59:55+00:00",
+            "transport_key": "monitor-transport:decision-golden-v1"
+          }
+        }
+      ],
+      "displayed_count": 2,
+      "excluded": {
+        "draft_conflicted": 0,
+        "invalid_payload": 0,
+        "mapping_impacted": 0,
+        "vision_invalidated": 0
+      },
+      "excluded_decision_count": 0,
+      "has_more": false,
+      "scanned_count": 2,
+      "truncated": false
+    },
+    "reason": "strategy_available",
+    "status": "available"
+  },
+  "vision": {
+    "data": {
+      "captured_at": "2026-07-14T13:59:55+00:00",
+      "clock_confidence": 0.95,
+      "draft_confidence": 0.95,
+      "game_clock_seconds": 600,
+      "map_number": 1,
+      "source_frame_ref": "vision-frame:sha256:7f75e66f0d00cc074e26ac35e66da4aa8fcb9473947a2fb5bc334aa2bbec85a7"
+    },
+    "reason": "trusted_vision_available",
+    "status": "available"
+  }
+}

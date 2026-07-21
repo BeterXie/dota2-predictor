@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -16,15 +18,27 @@ from fastapi.testclient import TestClient
 
 from live_betting.engine import price_groups
 from live_betting.browser_contract import canonical_json, payload_sha256
+from live_betting.comeback import (
+    STRATEGY_VERSION,
+    _identity,
+    no_signal_decision,
+    score_comeback,
+)
 from live_betting.health import record_health
 from live_betting.markets import normalized_state_hash
+from live_betting.market_state import MarketSurface
 from live_betting.models import Market, OddsSnapshot
+from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
+from live_betting.profiles.draft_curve import DraftPoint
+from live_betting.shadow_monitor import _persist_decision
 from live_betting.storage import LiveBettingStore
+from live_betting.strict_eligibility import query_strict_mapping_snapshot
 from live_betting.vision import VisionObservation
 from live_betting.vision_frame_registry import (
     publish_vision_frame_bytes,
     retire_vision_frame_artifact,
 )
+from shared.sqlite import classify_sqlite_error
 from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
@@ -489,36 +503,112 @@ class MonitoringDashboardTests(unittest.TestCase):
 
     def add_decision(
         self,
-        decision_key: str,
+        label: str,
         decided_at: datetime,
-        model_probability: float,
+        team_style: float,
         *,
         map_number: int = 1,
-    ) -> None:
+    ) -> str:
         mapping_id = self.ensure_strict_mapping()
+        mapping_snapshot = query_strict_mapping_snapshot(
+            self.store.connection,
+            mapping_id=mapping_id,
+            observed_at=decided_at,
+        )
+        self.assertTrue(mapping_snapshot.eligible)
+        assert mapping_snapshot.mapping is not None
         draft_authority = seed_test_draft_authority(
             self.store.connection,
             raybet_match_id="match-1",
             map_number=map_number,
             strict_mapping_id=mapping_id,
             observed_at=decided_at,
-            label=f"monitor:{decision_key}",
+            label=f"monitor:{label}",
         )
         vision = make_test_vision_observation(
             raybet_match_id="match-1",
             map_number=map_number,
             captured_at=decided_at,
-            label=f"monitor-frame:{decision_key}",
+            label=f"monitor-frame:{label}",
         )
         self.store.insert_vision_observation(vision)
         rows = self.add_winner_response(
             decided_at,
             2.5,
             5.0 / 3.0,
-            observation_key=f"monitor-transport:{decision_key}",
+            observation_key=f"monitor-transport:{label}",
             period=f"map_{map_number}",
         )
         market_probability = price_groups(rows)[rows[0].odds_id]
+        bounded_market = min(1.0 - 1e-6, max(1e-6, market_probability))
+        market_logit = math.log(bounded_market / (1.0 - bounded_market))
+        raw_contributions = {
+            "team_style": team_style,
+            "player_form": -0.02,
+            "draft_curve": 0.08,
+            "late_game_style": 0.0,
+            "market_movement": 0.01,
+        }
+        model_probability = 1.0 / (
+            1.0
+            + math.exp(
+                -(market_logit + math.fsum(raw_contributions.values()))
+            )
+        )
+        conservative_contributions = {
+            "team_style": (
+                raw_contributions["team_style"] * 0.8
+                if raw_contributions["team_style"] > 0.0
+                else raw_contributions["team_style"]
+            ),
+            "player_form": -0.02,
+            "draft_curve": 0.04,
+            "late_game_style": 0.0,
+            "market_movement": 0.01,
+        }
+        conservative_probability = 1.0 / (
+            1.0
+            + math.exp(
+                -(
+                    market_logit
+                    + math.fsum(conservative_contributions.values())
+                )
+            )
+        )
+        independent_positive = (
+            raw_contributions["team_style"]
+            + raw_contributions["late_game_style"]
+            > 0.0
+            or raw_contributions["player_form"] > 0.0
+            or raw_contributions["draft_curve"] > 0.0
+        )
+        inputs = {
+            "draft_authority": asdict(draft_authority),
+            "strict_live_eligibility": {
+                "mapping_refs": mapping_snapshot.mapping.input_refs()
+            },
+            "transport": {
+                "current_key": f"monitor-transport:{label}",
+                "current_at": decided_at.isoformat(),
+            },
+            "vision": {
+                "captured_at": vision.captured_at.isoformat(),
+                "source_frame_ref": vision.source_frame_ref,
+                "game_clock_seconds": vision.game_clock_seconds,
+                "radiant_team_side": vision.radiant_team_side,
+            },
+            "conservative_contributions": conservative_contributions,
+            "conservative_probability": conservative_probability,
+            "independent_positive": independent_positive,
+        }
+        decision_key, input_ref = _identity(
+            observation=vision,
+            decided_at=decided_at,
+            underdog_side="team_one",
+            model_probability=model_probability,
+            reason="eligible",
+            inputs=inputs,
+        )
         decision = SimpleNamespace(
             decision_key=decision_key,
             raybet_match_id="match-1",
@@ -532,24 +622,191 @@ class MonitoringDashboardTests(unittest.TestCase):
             eligible=True,
             reason="eligible",
             contributions={
-                "__inputs__": {
-                    "draft_authority": asdict(draft_authority),
-                    "strict_live_eligibility": {
-                        "mapping_refs": {"strict_mapping_id": mapping_id}
-                    },
-                }
+                **raw_contributions,
+                "__conservative__": conservative_contributions,
+                "__inputs__": inputs,
             },
-            input_ref=f"input-{decision_key}",
-            strategy_version="strategy-v1",
+            input_ref=input_ref,
+            strategy_version=STRATEGY_VERSION,
         )
         self.assertTrue(
             self.store.insert_decision(
                 decision,
                 draft_authority=draft_authority,
                 vision_observation=vision,
-                vision_transport_key=f"monitor-transport:{decision_key}",
+                vision_transport_key=f"monitor-transport:{label}",
             )
         )
+        self.assertEqual(len(decision_key), 32)
+        self.assertEqual(len(input_ref), 24)
+        return decision_key
+
+    def add_no_signal_decision(
+        self,
+        label: str,
+        decided_at: datetime,
+        *,
+        reason: str = "strict_live_ineligible:mapping_missing",
+    ) -> str:
+        vision = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=decided_at,
+            game_clock_seconds=590,
+            label=f"monitor-no-signal:{label}",
+        )
+        self.store.insert_vision_observation(vision)
+        surface = MarketSurface(
+            underdog_side="team_one",
+            underdog_price=2.5,
+            underdog_probability=0.4,
+            probability_move=0.0,
+            kill_handicap=None,
+            total_kills=None,
+            duration_minutes=None,
+            quality=0.5,
+            missing_markets=("kill_handicap",),
+        )
+        decision = no_signal_decision(
+            observation=vision,
+            surface=surface,
+            decided_at=decided_at,
+            reason=reason,
+        )
+        self.assertTrue(_persist_decision(self.store, decision))
+        self.assertRegex(decision.decision_key, r"^[0-9a-f]{32}$")
+        self.assertRegex(decision.input_ref, r"^[0-9a-f]{24}$")
+        return decision.decision_key
+
+    def build_scored_blocked_decision(
+        self,
+        label: str,
+        decided_at: datetime,
+    ):
+        mapping_id = self.ensure_strict_mapping()
+        mapping_snapshot = query_strict_mapping_snapshot(
+            self.store.connection,
+            mapping_id=mapping_id,
+            observed_at=decided_at,
+        )
+        self.assertTrue(mapping_snapshot.eligible)
+        assert mapping_snapshot.mapping is not None
+        draft_authority = seed_test_draft_authority(
+            self.store.connection,
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=mapping_id,
+            observed_at=decided_at,
+            label=f"monitor-scored-blocked:{label}",
+        )
+        vision = make_test_vision_observation(
+            raybet_match_id="match-1",
+            map_number=1,
+            captured_at=decided_at,
+            game_clock_seconds=600,
+            label=f"monitor-scored-blocked-frame:{label}",
+        )
+        self.store.insert_vision_observation(vision)
+        transport_key = f"monitor-scored-blocked-transport:{label}"
+        self.add_winner_response(
+            decided_at,
+            2.5,
+            5.0 / 3.0,
+            observation_key=transport_key,
+        )
+        surface = MarketSurface(
+            underdog_side="team_one",
+            underdog_price=2.5,
+            underdog_probability=0.4,
+            probability_move=0.0,
+            kill_handicap=-3.5,
+            total_kills=48.5,
+            duration_minutes=36.5,
+            quality=1.0,
+        )
+        point = DraftPoint(
+            minute=draft_authority.horizon_minutes,
+            radiant_probability=draft_authority.radiant_probability,
+            scaling_edge=0.0,
+            synergy_edge=0.0,
+            quality=draft_authority.quality,
+            validated=True,
+            support=draft_authority.support,
+            calibration_ref=draft_authority.global_gate_ref,
+            input_refs=("test",),
+            uncertainty=draft_authority.uncertainty,
+            feature_hash=draft_authority.feature_hash,
+            model_hash=draft_authority.model_hash,
+            calibration_hash=draft_authority.calibration_hash,
+            global_calibration_passed=True,
+            global_gate_ref=draft_authority.global_gate_ref,
+            model_version=draft_authority.model_version,
+            model_kind="pure_draft",
+            availability_mode="prospective",
+            input_snapshot_hash=draft_authority.input_snapshot_hash,
+            landmark_key=draft_authority.landmark_key,
+            curve_key=draft_authority.curve_key,
+            deployment_key=draft_authority.deployment_key,
+            target_snapshot_hash=draft_authority.target_snapshot_hash,
+        )
+        draft_curve = DraftCurve(
+            points=(point,),
+            source_ref=draft_authority.source_ref,
+            authority_revision=draft_authority.authority_revision,
+            dependency_revision=draft_authority.dependency_revision,
+            curve_key=draft_authority.curve_key,
+            deployment_key=draft_authority.deployment_key,
+            target_snapshot_hash=draft_authority.target_snapshot_hash,
+            strict_mapping_id=draft_authority.strict_mapping_id,
+        )
+        decision = score_comeback(
+            observation=vision,
+            surface=surface,
+            underdog_style=TeamStyleProfile(
+                11, 100, 0.28, 0.16, 0.84, 0.4, 38.0, 0.8
+            ),
+            favorite_style=TeamStyleProfile(
+                22, 100, 0.18, 0.2, 0.8, 0.35, 36.0, 0.8
+            ),
+            underdog_form=PlayerForm((1, 2, 3, 4, 5), 0.2, {}, 50, 0.8),
+            favorite_form=PlayerForm((6, 7, 8, 9, 10), 0.0, {}, 50, 0.8),
+            draft_curve=draft_curve,
+            decided_at=decided_at,
+            stable=True,
+            min_edge=0.99,
+            input_refs={
+                "draft_authority": asdict(draft_authority),
+                "strict_live_eligibility": {
+                    "mapping_refs": mapping_snapshot.mapping.input_refs()
+                },
+                "transport": {
+                    "current_key": transport_key,
+                    "current_at": decided_at.isoformat(),
+                },
+            },
+        )
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.reason, "edge_below_threshold")
+        return decision, draft_authority, vision, transport_key
+
+    def add_scored_blocked_decision(
+        self,
+        label: str,
+        decided_at: datetime,
+    ) -> str:
+        decision, draft_authority, vision, transport_key = (
+            self.build_scored_blocked_decision(label, decided_at)
+        )
+        self.assertTrue(
+            _persist_decision(
+                self.store,
+                decision,
+                draft_authority=draft_authority,
+                vision_observation=vision,
+                vision_transport_key=transport_key,
+            )
+        )
+        return decision.decision_key
 
     def test_stale_healthy_heartbeat_is_derived_as_unhealthy(self) -> None:
         heartbeat = NOW - timedelta(minutes=5)
@@ -769,17 +1026,25 @@ class MonitoringDashboardTests(unittest.TestCase):
 
     def test_strict_mapping_impact_is_removed_from_summary_and_detail(self) -> None:
         self.add_match(status=2)
-        self.add_decision("older-valid", NOW - timedelta(seconds=20), 0.55)
-        self.add_decision("newer-impacted", NOW - timedelta(seconds=5), 0.75)
+        older_key = self.add_decision(
+            "older-valid", NOW - timedelta(seconds=20), 0.55
+        )
+        newer_key = self.add_decision(
+            "newer-impacted", NOW - timedelta(seconds=5), 0.75
+        )
+        older_probability = self.store.connection.execute(
+            "SELECT model_probability FROM strategy_decisions WHERE decision_key=?",
+            (older_key,),
+        ).fetchone()[0]
         before = monitor_cursor(self.store.connection)
         self.store.connection.execute("PRAGMA foreign_keys=OFF")
         self.store.connection.execute(
             """INSERT INTO strict_live_mapping_impacts
                (mapping_id, invalidation_id, dependent_type, dependent_key,
                 reason, recorded_at)
-               VALUES (1, 1, 'strategy_decision', 'newer-impacted',
+               VALUES (1, 1, 'strategy_decision', ?,
                        'mapping_invalidated', ?)""",
-            (NOW.isoformat(),),
+            (newer_key, NOW.isoformat()),
         )
         self.store.connection.commit()
         self.store.connection.execute("PRAGMA foreign_keys=ON")
@@ -790,12 +1055,12 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertNotEqual(before, monitor_cursor(self.store.connection))
         self.assertEqual(
             snapshot["matches"][0]["latest_decision"]["model_probability"],
-            0.55,
+            older_probability,
         )
         assert detail is not None
         self.assertEqual(
             [decision["decision_key"] for decision in detail["decisions"]],
-            ["older-valid"],
+            [older_key],
         )
 
     def test_decision_views_fail_closed_without_strict_impact_relation(self) -> None:
@@ -837,16 +1102,24 @@ class MonitoringDashboardTests(unittest.TestCase):
         self,
     ) -> None:
         self.add_match(status=2)
-        self.add_decision("older-valid", NOW - timedelta(seconds=30), 0.55)
-        self.add_decision("vision-invalidated", NOW - timedelta(seconds=20), 0.65)
+        older_key = self.add_decision(
+            "older-valid", NOW - timedelta(seconds=30), 0.55
+        )
+        invalidated_key = self.add_decision(
+            "vision-invalidated", NOW - timedelta(seconds=20), 0.65
+        )
         self.add_decision("draft-conflicted", NOW - timedelta(seconds=5), 0.75)
+        older_probability = self.store.connection.execute(
+            "SELECT model_probability FROM strategy_decisions WHERE decision_key=?",
+            (older_key,),
+        ).fetchone()[0]
         self.store.connection.execute(
             """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, block_reason, recorded_at)
-               VALUES ('strategy_decision', 'vision-invalidated', 'match-1', 1,
+               VALUES ('strategy_decision', ?, 'match-1', 1,
                        'bad_frame', 'vision_observation_invalidated', ?)""",
-            (NOW.isoformat(),),
+            (invalidated_key, NOW.isoformat()),
         )
         self.store.connection.execute(
             """UPDATE vision_draft_anchors
@@ -861,12 +1134,12 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertEqual(
             snapshot["matches"][0]["latest_decision"]["model_probability"],
-            0.55,
+            older_probability,
         )
         assert detail is not None
         self.assertEqual(
             [decision["decision_key"] for decision in detail["decisions"]],
-            ["older-valid"],
+            [older_key],
         )
 
     def test_vision_views_exclude_only_the_invalidated_observation(self) -> None:
@@ -2544,6 +2817,1227 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(history.json()["items"][0]["raybet_match_id"], "match-1")
         self.assertEqual(invalid_cursor.status_code, 400)
         self.assertEqual(invalid_limit.status_code, 422)
+
+    def test_match_detail_analysis_exposes_only_persisted_live_evidence(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("analysis-decision", NOW - timedelta(seconds=5), 0.65)
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            with patch(
+                "live_betting.profiles.build_draft_curve",
+                side_effect=AssertionError("monitor detail must not recompute curves"),
+            ):
+                before = self.store.connection.total_changes
+                detail = monitor_match_detail(
+                    self.store.connection, "match-1", now=NOW
+                )
+                after = self.store.connection.total_changes
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        assert detail is not None
+        self.assertEqual(before, after)
+        self.assertEqual(detail["analysis"]["odds"]["reason"], "odds_available")
+        self.assertEqual(
+            detail["analysis"]["vision"]["reason"],
+            "trusted_vision_available",
+        )
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "available")
+        self.assertEqual(strategy["reason"], "strategy_available")
+        decision = strategy["data"]["decisions"][0]
+        self.assertNotIn("contributions_json", decision)
+        self.assertIsInstance(decision["inputs"], dict)
+        self.assertEqual(decision["draft_authority"]["strict_mapping_id"], 1)
+        self.assertEqual(decision["vision_authority"]["confirmed"], 1)
+        lineup = detail["analysis"]["lineup"]
+        self.assertEqual(lineup["reason"], "lineup_available")
+        self.assertEqual(lineup["data"]["radiant"]["hero_ids"], [1, 2, 3, 4, 5])
+        self.assertEqual(lineup["data"]["dire"]["hero_ids"], [6, 7, 8, 9, 10])
+        self.assertEqual(
+            lineup["data"]["active_curve"]["reason"],
+            "active_curve_available",
+        )
+        self.assertEqual(
+            lineup["data"]["players"],
+            {
+                "status": "unavailable",
+                "reason": "live_player_identity_unavailable",
+                "data": None,
+            },
+        )
+        normalized = "\n".join(statements).casefold()
+        self.assertNotRegex(
+            normalized,
+            r"\b(insert|update|delete|replace|create|drop|alter)\b",
+        )
+        self.assertNotIn("map_results", normalized)
+        self.assertNotIn("settlement_reconciliations", normalized)
+
+    def test_available_analysis_matches_cross_layer_golden_fixture(self) -> None:
+        self.add_match(status=2)
+        blocked_key = self.add_scored_blocked_decision(
+            "blocked-golden-v1",
+            NOW - timedelta(seconds=10),
+        )
+        decision_key = self.add_decision(
+            "decision-golden-v1",
+            NOW - timedelta(seconds=5),
+            0.65,
+        )
+        expected = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "monitor-analysis-available.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertEqual(detail["analysis"], expected)
+        blocked_decision, golden_decision = expected["strategy"]["data"][
+            "decisions"
+        ]
+        self.assertEqual(blocked_decision["decision_key"], blocked_key)
+        self.assertEqual(blocked_decision["eligible"], 0)
+        self.assertEqual(blocked_decision["reason"], "edge_below_threshold")
+        self.assertEqual(
+            set(blocked_decision["contributions"]),
+            {
+                "team_style",
+                "player_form",
+                "draft_curve",
+                "late_game_style",
+                "market_movement",
+            },
+        )
+        self.assertEqual(golden_decision["decision_key"], decision_key)
+        self.assertRegex(golden_decision["decision_key"], r"^[0-9a-f]{32}$")
+        self.assertRegex(golden_decision["input_ref"], r"^[0-9a-f]{24}$")
+        self.assertAlmostEqual(
+            golden_decision["model_probability"],
+            monitoring._strategy_probability(
+                golden_decision["market_probability"],
+                golden_decision["contributions"],
+            ),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            golden_decision["inputs"]["conservative_probability"],
+            monitoring._strategy_probability(
+                golden_decision["market_probability"],
+                golden_decision["conservative_contributions"],
+            ),
+            places=12,
+        )
+
+    def test_no_signal_decision_is_available_without_strategy_authorities(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        decision_key = self.add_no_signal_decision(
+            "no-signal-golden-v1",
+            NOW - timedelta(seconds=5),
+        )
+        expected = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "monitor-analysis-no-signal.json"
+            ).read_text(encoding="utf-8")
+        )
+        persisted = self.store.connection.execute(
+            """SELECT draft_curve_key, draft_landmark_key,
+                      vision_source_frame_ref, vision_transport_key
+                 FROM strategy_decisions WHERE decision_key=?""",
+            (decision_key,),
+        ).fetchone()
+        assert persisted is not None
+        self.assertTrue(all(value is None for value in persisted))
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertEqual(detail["analysis"], expected)
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "available")
+        self.assertEqual(strategy["reason"], "strategy_available")
+        self.assertEqual(strategy["data"]["displayed_count"], 1)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 0)
+        decision = strategy["data"]["decisions"][0]
+        self.assertEqual(decision["decision_key"], decision_key)
+        self.assertEqual(decision["eligible"], 0)
+        self.assertEqual(decision["reason"], "strict_live_ineligible:mapping_missing")
+        self.assertEqual(decision["model_probability"], 0.4)
+        self.assertEqual(decision["market_probability"], 0.4)
+        self.assertEqual(decision["edge"], 0.0)
+        self.assertEqual(decision["data_quality"], 0.0)
+        self.assertEqual(decision["contributions"], {})
+        self.assertEqual(decision["conservative_contributions"], {})
+        self.assertEqual(decision["draft_authority"], {})
+        self.assertEqual(decision["vision_authority"], {})
+
+    def test_scored_blocked_decision_is_available_with_complete_authority(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        blocked_key = self.add_scored_blocked_decision(
+            "scored-blocked",
+            NOW - timedelta(seconds=5),
+        )
+        connection = self.store.connection
+        persisted = connection.execute(
+            """SELECT draft_curve_key, draft_landmark_key,
+                      vision_source_frame_ref, vision_transport_key
+                 FROM strategy_decisions WHERE decision_key=?""",
+            (blocked_key,),
+        ).fetchone()
+        assert persisted is not None
+        self.assertIsNotNone(persisted["draft_curve_key"])
+        self.assertIsNotNone(persisted["draft_landmark_key"])
+        self.assertIsNotNone(persisted["vision_source_frame_ref"])
+        self.assertIsNotNone(persisted["vision_transport_key"])
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "available")
+        self.assertEqual(strategy["reason"], "strategy_available")
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 0)
+        self.assertEqual(len(strategy["data"]["decisions"]), 1)
+        decision = strategy["data"]["decisions"][0]
+        self.assertEqual(decision["decision_key"], blocked_key)
+        self.assertEqual(decision["eligible"], 0)
+        self.assertEqual(decision["reason"], "edge_below_threshold")
+        self.assertEqual(decision["draft_authority"]["strict_mapping_id"], 1)
+        self.assertEqual(decision["vision_authority"]["confirmed"], 1)
+
+    def test_scored_blocked_decision_fails_closed_without_exact_authority(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        decision, draft_authority, vision, transport_key = (
+            self.build_scored_blocked_decision(
+                "scored-blocked-fail-closed",
+                NOW - timedelta(seconds=5),
+            )
+        )
+        self.assertFalse(_persist_decision(self.store, decision))
+        self.assertFalse(
+            _persist_decision(
+                self.store,
+                decision,
+                draft_authority=replace(
+                    draft_authority,
+                    landmark_key="0" * 64,
+                ),
+                vision_observation=vision,
+                vision_transport_key=transport_key,
+            )
+        )
+        self.assertFalse(
+            _persist_decision(
+                self.store,
+                decision,
+                draft_authority=draft_authority,
+                vision_observation=vision,
+                vision_transport_key="wrong-transport-key",
+            )
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM strategy_decisions WHERE decision_key=?",
+                (decision.decision_key,),
+            ).fetchone()
+        )
+
+    def test_malformed_no_signal_decisions_are_reviewed(self) -> None:
+        self.add_match(status=2)
+        base_key = self.add_no_signal_decision(
+            "malformed-no-signal-source",
+            NOW - timedelta(seconds=5),
+        )
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (base_key,),
+            ).fetchone()
+        )
+        missing_market = json.loads(source["contributions_json"])
+        del missing_market["__inputs__"]["market"]
+        cases = (
+            ("eligible-reason", {"reason": "eligible"}),
+            (
+                "nonzero-baseline",
+                {"model_probability": 0.41, "edge": 0.01},
+            ),
+            (
+                "missing-market",
+                {
+                    "contributions_json": json.dumps(
+                        missing_market, separators=(",", ":")
+                    )
+                },
+            ),
+        )
+        for label, overrides in cases:
+            clone = {
+                **source,
+                "decision_key": hashlib.sha256(label.encode("ascii")).hexdigest()[
+                    :32
+                ],
+                "input_ref": hashlib.sha256(
+                    f"input:{label}".encode("ascii")
+                ).hexdigest()[:24],
+                **overrides,
+            }
+            connection.execute(
+                f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(clone[column] for column in columns),
+            )
+        connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('strategy_decision', ?, 'match-1', 1,
+                       'test', 'test', ?)""",
+            (base_key, NOW.isoformat()),
+        )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
+        self.assertEqual(strategy["data"]["decisions"], [])
+        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 3)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 4)
+
+    def test_match_detail_analysis_has_stable_waiting_reasons(self) -> None:
+        self.add_match(status=1)
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertEqual(
+            {
+                name: (section["status"], section["reason"])
+                for name, section in detail["analysis"].items()
+            },
+            {
+                "odds": ("waiting", "winner_odds_pending"),
+                "vision": ("waiting", "trusted_vision_pending"),
+                "strategy": ("waiting", "strategy_decision_pending"),
+                "lineup": ("waiting", "trusted_vision_pending"),
+            },
+        )
+
+    def test_match_detail_analysis_excludes_future_live_records(self) -> None:
+        self.add_match(status=2)
+        past_key = self.add_decision(
+            "past-decision", NOW - timedelta(seconds=5), 0.6
+        )
+        self.add_decision("future-decision", NOW + timedelta(minutes=5), 0.8)
+        future_curve_key = str(
+            self.store.connection.execute(
+                """SELECT curve_key FROM prospective_draft_curves
+                    ORDER BY first_usable_at DESC LIMIT 1"""
+            ).fetchone()[0]
+        )
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertEqual(
+            [item["decision_key"] for item in detail["decisions"]],
+            [past_key],
+        )
+        self.assertTrue(
+            all(_parse <= NOW for _parse in (
+                datetime.fromisoformat(point["observed_at"])
+                for point in detail["winner_timeline"]
+            ))
+        )
+        self.assertLessEqual(
+            datetime.fromisoformat(detail["analysis"]["vision"]["data"]["captured_at"]),
+            NOW,
+        )
+        self.assertNotEqual(
+            detail["analysis"]["lineup"]["data"]["active_curve"]["data"]["curve_key"],
+            future_curve_key,
+        )
+        self.assertTrue(detail["markets"])
+        self.assertTrue(
+            all(
+                datetime.fromisoformat(market["received_at"]) <= NOW
+                for market in detail["markets"]
+            )
+        )
+
+        self.add_match(match_id="legacy-market", status=2)
+        for observed_at, price_one, price_two in (
+            (NOW - timedelta(seconds=5), 2.0, 2.0),
+            (NOW + timedelta(minutes=5), 1.5, 3.0),
+        ):
+            for odds_id, side, price in (
+                ("legacy-one", "team_one", price_one),
+                ("legacy-two", "team_two", price_two),
+            ):
+                self.store.insert_odds(
+                    OddsSnapshot(
+                        "legacy-market",
+                        odds_id,
+                        "legacy-winner",
+                        observed_at,
+                        price,
+                        1,
+                        Market("winner", "map_1", side, None, side, True),
+                    )
+                )
+        self.store.connection.commit()
+
+        legacy = monitor_match_detail(
+            self.store.connection, "legacy-market", now=NOW
+        )
+
+        assert legacy is not None
+        self.assertEqual(
+            {market["price"] for market in legacy["markets"]},
+            {2.0},
+        )
+        self.assertTrue(
+            all(
+                datetime.fromisoformat(market["received_at"]) <= NOW
+                for market in legacy["markets"]
+            )
+        )
+
+    def test_lineup_curve_rejects_stale_dependency_revision(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("stale-curve", NOW - timedelta(seconds=5), 0.65)
+        self.store.connection.execute(
+            """UPDATE draft_lineage_revisions
+                  SET dependency_revision=dependency_revision+1,
+                      updated_at=?
+                WHERE singleton=1""",
+            (NOW.isoformat(),),
+        )
+        self.store.connection.commit()
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        curve = detail["analysis"]["lineup"]["data"]["active_curve"]
+        self.assertEqual(curve["status"], "unavailable")
+        self.assertEqual(curve["reason"], "lineup_curve_dependency_revision_stale")
+        self.assertIsNone(curve["data"])
+
+    def test_lineup_curve_exposes_only_passed_landmarks(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("mixed-curve", NOW - timedelta(seconds=5), 0.65)
+        connection = self.store.connection
+        landmark_columns = [
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(prospective_draft_landmarks)"
+            )
+        ]
+        passed = dict(
+            connection.execute(
+                "SELECT * FROM prospective_draft_landmarks LIMIT 1"
+            ).fetchone()
+        )
+        model_20 = connection.execute(
+            """SELECT model_hash, model_version, feature_schema_hash
+                 FROM draft_model_artifacts WHERE horizon_minutes=20 LIMIT 1"""
+        ).fetchone()
+        calibration_20 = connection.execute(
+            """SELECT calibration_hash, support
+                 FROM draft_calibration_artifacts
+                WHERE model_hash=? AND horizon_minutes=20 LIMIT 1""",
+            (model_20["model_hash"],),
+        ).fetchone()
+        failed = {
+            **passed,
+            "landmark_key": hashlib.sha256(b"monitor-failed-landmark").hexdigest(),
+            "horizon_minutes": 20,
+            "validation_status": "failed",
+            "support": calibration_20["support"],
+            "global_calibration_passed": 0,
+            "model_hash": model_20["model_hash"],
+            "model_version": model_20["model_version"],
+            "feature_hash": model_20["feature_schema_hash"],
+            "calibration_hash": calibration_20["calibration_hash"],
+            "calibration_ref": f"draft-calibration:{calibration_20['calibration_hash']}",
+            "global_gate_ref": f"draft-calibration:{calibration_20['calibration_hash']}",
+        }
+        connection.execute(
+            f"INSERT INTO prospective_draft_landmarks "
+            f"({', '.join(landmark_columns)}) "
+            f"VALUES ({', '.join('?' for _ in landmark_columns)})",
+            tuple(failed[column] for column in landmark_columns),
+        )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        curve = detail["analysis"]["lineup"]["data"]["active_curve"]
+        self.assertEqual(curve["status"], "available")
+        self.assertEqual(
+            [point["validation_status"] for point in curve["data"]["points"]],
+            ["passed"],
+        )
+
+        curve_columns = [
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(prospective_draft_curves)"
+            )
+        ]
+        source_curve = dict(
+            connection.execute(
+                "SELECT * FROM prospective_draft_curves LIMIT 1"
+            ).fetchone()
+        )
+        failed_curve_key = "f" * 64
+        failed_curve = {**source_curve, "curve_key": failed_curve_key}
+        connection.execute(
+            f"INSERT INTO prospective_draft_curves ({', '.join(curve_columns)}) "
+            f"VALUES ({', '.join('?' for _ in curve_columns)})",
+            tuple(failed_curve[column] for column in curve_columns),
+        )
+        only_failed = {
+            **passed,
+            "landmark_key": "e" * 64,
+            "curve_key": failed_curve_key,
+            "validation_status": "failed",
+            "global_calibration_passed": 0,
+        }
+        connection.execute(
+            f"INSERT INTO prospective_draft_landmarks "
+            f"({', '.join(landmark_columns)}) "
+            f"VALUES ({', '.join('?' for _ in landmark_columns)})",
+            tuple(only_failed[column] for column in landmark_columns),
+        )
+        connection.commit()
+
+        unavailable = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert unavailable is not None
+        failed_section = unavailable["analysis"]["lineup"]["data"]["active_curve"]
+        self.assertEqual(failed_section["status"], "unavailable")
+        self.assertEqual(
+            failed_section["reason"], "validated_live_draft_landmark_missing"
+        )
+        self.assertIsNone(failed_section["data"])
+
+    def test_malformed_strategy_evidence_is_review_not_json_500(self) -> None:
+        self.add_match(status=2)
+        deep: object = "leaf"
+        for _ in range(20):
+            deep = {"nested": deep}
+        rows = (
+            (
+                "bad-ref",
+                1,
+                0.4,
+                0.5,
+                0.1,
+                0.8,
+                0,
+                "{}",
+                "../input",
+            ),
+            (
+                "bad-numeric",
+                0,
+                1.2,
+                0.5,
+                -0.7,
+                -0.1,
+                2,
+                "{}",
+                "input-safe",
+            ),
+            (
+                "bad-nan",
+                1,
+                0.4,
+                0.5,
+                0.1,
+                0.8,
+                0,
+                '{"__inputs__":{"value":NaN}}',
+                "input-safe",
+            ),
+            (
+                "bad-depth",
+                1,
+                0.4,
+                0.5,
+                0.1,
+                0.8,
+                0,
+                json.dumps({"__inputs__": deep}),
+                "input-safe",
+            ),
+        )
+        for index, row in enumerate(rows):
+            self.store.connection.execute(
+                """INSERT INTO strategy_decisions
+                   (decision_key, raybet_match_id, map_number, decided_at,
+                    underdog_side, market_probability, model_probability,
+                    edge, data_quality, eligible, reason, contributions_json,
+                    input_ref, strategy_version)
+                   VALUES (?, 'match-1', ?, ?, 'team_one', ?, ?, ?, ?, ?,
+                           'blocked', ?, ?, 'strategy-v1')""",
+                (
+                    row[0],
+                    row[1],
+                    (NOW - timedelta(seconds=10 - index)).isoformat(),
+                    *row[2:],
+                ),
+            )
+        self.store.connection.commit()
+        previous_path = queries.DB_PATH
+        queries.init_db(str(self.database))
+        try:
+            with TestClient(app) as client:
+                response = client.get("/api/monitor/matches/match-1")
+        finally:
+            queries.init_db(previous_path)
+
+        self.assertEqual(response.status_code, 200)
+        strategy = response.json()["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
+        self.assertEqual(strategy["data"]["decisions"], [])
+        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 4)
+
+    def test_trusted_vision_candidate_scan_is_bounded(self) -> None:
+        self.add_match(status=2)
+        self.add_frame_observation(
+            captured_at=NOW - timedelta(minutes=10),
+            label="bounded-vision-anchor",
+        )
+        for index in range(257):
+            captured_at = NOW - timedelta(seconds=300 - index)
+            digest = hashlib.sha256(f"wrong-vision-{index}".encode()).hexdigest()
+            self.store.connection.execute(
+                """INSERT INTO vision_observations
+                   (raybet_match_id, map_number, captured_at, game_clock_seconds,
+                    is_paused, radiant_hero_ids, dire_hero_ids,
+                    radiant_team_side, clock_confidence, draft_confidence,
+                    source_frame_ref, source_frame_sha256, source_frame_bytes,
+                    screen_state, confirmed)
+                   VALUES ('match-1', 1, ?, 120, 0, '[11,12,13,14,15]',
+                           '[16,17,18,19,20]', 'team_one', 0.99, 0.99,
+                           ?, ?, 1, 'game', 1)""",
+                (
+                    captured_at.isoformat(),
+                    f"vision-frame:sha256:{digest}",
+                    digest,
+                ),
+            )
+        self.store.connection.commit()
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertEqual(
+            detail["analysis"]["vision"],
+            {
+                "status": "review",
+                "reason": "vision_candidate_limit_exceeded",
+                "data": None,
+            },
+        )
+        self.assertEqual(
+            detail["analysis"]["lineup"]["reason"],
+            "vision_candidate_limit_exceeded",
+        )
+
+    def test_strict_mapping_candidate_scan_is_bounded(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("mapping-limit", NOW - timedelta(seconds=5), 0.65)
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(strict_live_map_mappings)"
+            )
+            if str(row["name"]) != "mapping_id"
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strict_live_map_mappings LIMIT 1"
+            ).fetchone()
+        )
+        for _ in range(64):
+            connection.execute(
+                f"INSERT INTO strict_live_map_mappings ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(source[column] for column in columns),
+            )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertEqual(
+            detail["analysis"]["lineup"],
+            {
+                "status": "review",
+                "reason": "strict_mapping_candidate_limit_exceeded",
+                "data": None,
+            },
+        )
+
+    def test_strategy_scan_finds_valid_after_two_hundred_invalid_rows(self) -> None:
+        self.add_match(status=2)
+        valid_key = self.add_decision(
+            "valid-after-invalid", NOW - timedelta(minutes=5), 0.65
+        )
+        for index in range(200):
+            self.store.connection.execute(
+                """INSERT INTO strategy_decisions
+                   (decision_key, raybet_match_id, map_number, decided_at,
+                    underdog_side, market_probability, model_probability,
+                    edge, data_quality, eligible, reason, contributions_json,
+                    input_ref, strategy_version)
+                   VALUES (?, 'match-1', 1, ?, 'team_one', 0.4, 0.5, 0.1,
+                           0.8, 0, 'blocked', '[]', ?, 'strategy-v1')""",
+                (
+                    f"invalid-scan-{index:03d}",
+                    (NOW - timedelta(seconds=index / 1000)).isoformat(),
+                    f"invalid-input-{index:03d}",
+                ),
+            )
+        self.store.connection.commit()
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "available")
+        self.assertEqual(
+            [decision["decision_key"] for decision in strategy["data"]["decisions"]],
+            [valid_key],
+        )
+        self.assertEqual(strategy["data"]["displayed_count"], 1)
+        self.assertEqual(strategy["data"]["scanned_count"], 201)
+        self.assertFalse(strategy["data"]["has_more"])
+        self.assertFalse(strategy["data"]["truncated"])
+        self.assertEqual(
+            strategy["data"]["count_scope"],
+            "recent_scanned_window",
+        )
+        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 200)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 200)
+
+    def test_strategy_scan_reports_has_more_for_201_valid_rows(self) -> None:
+        self.add_match(status=2)
+        base_key = self.add_decision(
+            "valid-scan-base", NOW - timedelta(seconds=5), 0.65
+        )
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (base_key,),
+            ).fetchone()
+        )
+        for index in range(200):
+            clone = {
+                **source,
+                "decision_key": hashlib.sha256(
+                    f"valid-scan-{index:03d}".encode("ascii")
+                ).hexdigest()[:32],
+                "input_ref": hashlib.sha256(
+                    f"valid-input-{index:03d}".encode("ascii")
+                ).hexdigest()[:24],
+            }
+            connection.execute(
+                f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(clone[column] for column in columns),
+            )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "available")
+        self.assertEqual(len(strategy["data"]["decisions"]), 200)
+        self.assertEqual(strategy["data"]["displayed_count"], 200)
+        self.assertTrue(strategy["data"]["has_more"])
+        self.assertTrue(strategy["data"]["truncated"])
+        self.assertEqual(
+            strategy["data"]["count_scope"],
+            "recent_scanned_window",
+        )
+
+    def test_strategy_scan_is_bounded_and_uses_descending_keyset(self) -> None:
+        self.add_match(status=2)
+        for index in range(1001):
+            self.store.connection.execute(
+                """INSERT INTO strategy_decisions
+                   (decision_key, raybet_match_id, map_number, decided_at,
+                    underdog_side, market_probability, model_probability,
+                    edge, data_quality, eligible, reason, contributions_json,
+                    input_ref, strategy_version)
+                   VALUES (?, 'match-1', 1, ?, 'team_one', 0.4, 0.5, 0.1,
+                           0.8, 0, 'blocked', '[]', ?, 'strategy-v1')""",
+                (
+                    f"bounded-invalid-{index:04d}",
+                    (NOW - timedelta(seconds=1)).isoformat(),
+                    f"bounded-input-{index:04d}",
+                ),
+            )
+        self.store.connection.commit()
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            detail = monitor_match_detail(
+                self.store.connection,
+                "match-1",
+                now=NOW,
+            )
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_scan_limit_exceeded")
+        self.assertEqual(strategy["data"]["scanned_count"], 1000)
+        self.assertEqual(strategy["data"]["displayed_count"], 0)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 1000)
+        self.assertTrue(strategy["data"]["has_more"])
+        self.assertTrue(strategy["data"]["truncated"])
+        self.assertEqual(
+            strategy["data"]["count_scope"],
+            "recent_scanned_window",
+        )
+        candidate_queries = [
+            statement.casefold()
+            for statement in statements
+            if "from strategy_decisions as decision" in statement.casefold()
+            and "contributions_json" in statement.casefold()
+        ]
+        self.assertGreaterEqual(len(candidate_queries), 4)
+        self.assertTrue(
+            all(" offset " not in statement for statement in candidate_queries)
+        )
+        self.assertTrue(
+            all("decision.decided_at <" in statement for statement in candidate_queries)
+        )
+
+    def test_strategy_authority_reason_counts_overlap_but_unique_rows_do_not(self) -> None:
+        self.add_match(status=2)
+        decision_key = self.add_decision(
+            "overlapping-authority", NOW - timedelta(seconds=5), 0.65
+        )
+        connection = self.store.connection
+        connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('strategy_decision', ?, 'match-1', 1,
+                       'test', 'test', ?)""",
+            (decision_key, NOW.isoformat()),
+        )
+        invalidation = connection.execute(
+            """INSERT INTO strict_live_map_mapping_invalidations
+               (mapping_id, reason, invalidated_by, invalidated_at, recorded_at)
+               VALUES (?, 'test', 'test', ?, ?)""",
+            (self.strict_mapping_id, NOW.isoformat(), NOW.isoformat()),
+        )
+        connection.execute(
+            """INSERT INTO strict_live_mapping_impacts
+               (mapping_id, invalidation_id, dependent_type, dependent_key,
+                reason, recorded_at)
+               VALUES (?, ?, 'strategy_decision', ?,
+                       'mapping_invalidated', ?)""",
+            (
+                self.strict_mapping_id,
+                int(invalidation.lastrowid),
+                decision_key,
+                NOW.isoformat(),
+            ),
+        )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 1)
+        self.assertEqual(strategy["data"]["excluded"]["vision_invalidated"], 1)
+        self.assertEqual(strategy["data"]["excluded"]["mapping_impacted"], 1)
+        self.assertEqual(strategy["data"]["count_scope"], "recent_scanned_window")
+
+    def test_eligible_strategy_requires_independent_positive_explanation(self) -> None:
+        self.add_match(status=2)
+        base_key = self.add_decision(
+            "explanation-base", NOW - timedelta(seconds=5), 0.65
+        )
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (base_key,),
+            ).fetchone()
+        )
+        market_only = {
+            **source,
+            "decision_key": hashlib.sha256(b"market-only-explanation").hexdigest()[
+                :32
+            ],
+            "input_ref": hashlib.sha256(b"market-only-input").hexdigest()[:24],
+            "contributions_json": json.dumps(
+                {
+                    "market_movement": 0.2,
+                    "__conservative__": {"market_movement": 0.1},
+                    "__inputs__": {"market": {"quality": 0.8}},
+                },
+                separators=(",", ":"),
+            ),
+        }
+        connection.execute(
+            f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(market_only[column] for column in columns),
+        )
+        partial = {
+            **source,
+            "decision_key": hashlib.sha256(
+                b"partial-independent-explanation"
+            ).hexdigest()[:32],
+            "input_ref": hashlib.sha256(b"partial-independent-input").hexdigest()[
+                :24
+            ],
+            "contributions_json": json.dumps(
+                {
+                    "team_style": 0.2,
+                    "draft_curve": 0.1,
+                    "__conservative__": {
+                        "team_style": 0.1,
+                        "draft_curve": 0.05,
+                    },
+                    "__inputs__": {
+                        "draft_authority": json.loads(
+                            source["contributions_json"]
+                        )["__inputs__"]["draft_authority"],
+                        "strict_live_eligibility": {
+                            "mapping_refs": {"strict_mapping_id": 1}
+                        },
+                    },
+                },
+                separators=(",", ":"),
+            ),
+        }
+        connection.execute(
+            f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(partial[column] for column in columns),
+        )
+        connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('strategy_decision', ?, 'match-1', 1,
+                       'test', 'test', ?)""",
+            (base_key, NOW.isoformat()),
+        )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
+        self.assertEqual(strategy["data"]["decisions"], [])
+        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 2)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 3)
+
+    def test_eligible_strategy_requires_matching_input_authority_lineage(self) -> None:
+        self.add_match(status=2)
+        base_key = self.add_decision(
+            "lineage-base", NOW - timedelta(seconds=5), 0.65
+        )
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (base_key,),
+            ).fetchone()
+        )
+        payload = json.loads(source["contributions_json"])
+        payload["__inputs__"]["draft_authority"]["quality"] = 0.7
+        mismatch = {
+            **source,
+            "decision_key": hashlib.sha256(b"lineage-mismatch").hexdigest()[:32],
+            "input_ref": hashlib.sha256(b"lineage-mismatch-input").hexdigest()[:24],
+            "contributions_json": json.dumps(payload, separators=(",", ":")),
+        }
+        connection.execute(
+            f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(mismatch[column] for column in columns),
+        )
+        connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('strategy_decision', ?, 'match-1', 1,
+                       'test', 'test', ?)""",
+            (base_key, NOW.isoformat()),
+        )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
+        self.assertEqual(strategy["data"]["decisions"], [])
+        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 1)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 2)
+
+    def test_eligible_strategy_recomputes_probabilities_and_validates_identity(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        base_key = self.add_decision(
+            "math-identity-base", NOW - timedelta(seconds=5), 0.65
+        )
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (base_key,),
+            ).fetchone()
+        )
+        base_payload = json.loads(source["contributions_json"])
+
+        raw_tamper = json.loads(json.dumps(base_payload))
+        raw_tamper["team_style"] += 0.01
+        conservative_probability_tamper = json.loads(json.dumps(base_payload))
+        conservative_probability_tamper["__inputs__"][
+            "conservative_probability"
+        ] += 0.01
+        independent_tamper = json.loads(json.dumps(base_payload))
+        independent_tamper["__inputs__"]["independent_positive"] = False
+
+        def conservative_tamper(key: str, value: float) -> dict[str, object]:
+            payload = json.loads(json.dumps(base_payload))
+            payload["__conservative__"][key] = value
+            payload["__inputs__"]["conservative_contributions"][key] = value
+            probability = monitoring._strategy_probability(
+                float(source["market_probability"]),
+                payload["__conservative__"],
+            )
+            assert probability is not None
+            payload["__inputs__"]["conservative_probability"] = probability
+            return payload
+
+        conservative_amplified = conservative_tamper(
+            "team_style", base_payload["team_style"] + 0.01
+        )
+        conservative_flipped = conservative_tamper("player_form", 0.01)
+        conservative_market_changed = conservative_tamper(
+            "market_movement", base_payload["market_movement"] + 0.01
+        )
+
+        cancellation = json.loads(json.dumps(base_payload))
+        cancellation_raw = {
+            "team_style": -0.01,
+            "player_form": 0.0,
+            "draft_curve": 0.0,
+            "late_game_style": 0.005,
+            "market_movement": 0.08,
+        }
+        cancellation_conservative = {
+            "team_style": -0.01,
+            "player_form": 0.0,
+            "draft_curve": 0.0,
+            "late_game_style": 0.0025,
+            "market_movement": 0.08,
+        }
+        cancellation.update(cancellation_raw)
+        cancellation["__conservative__"] = cancellation_conservative
+        cancellation["__inputs__"][
+            "conservative_contributions"
+        ] = cancellation_conservative
+        cancellation_model = monitoring._strategy_probability(
+            float(source["market_probability"]), cancellation_raw
+        )
+        cancellation_conservative_probability = monitoring._strategy_probability(
+            float(source["market_probability"]), cancellation_conservative
+        )
+        assert cancellation_model is not None
+        assert cancellation_conservative_probability is not None
+        cancellation["__inputs__"][
+            "conservative_probability"
+        ] = cancellation_conservative_probability
+        cancellation["__inputs__"]["independent_positive"] = True
+        cases = (
+            ("raw", raw_tamper, {}),
+            (
+                "model",
+                base_payload,
+                {
+                    "model_probability": float(source["model_probability"]) + 0.01,
+                    "edge": float(source["edge"]) + 0.01,
+                },
+            ),
+            ("conservative-probability", conservative_probability_tamper, {}),
+            ("independent", independent_tamper, {}),
+            ("conservative-amplified", conservative_amplified, {}),
+            ("conservative-flipped", conservative_flipped, {}),
+            ("conservative-market", conservative_market_changed, {}),
+            (
+                "independent-cancellation",
+                cancellation,
+                {
+                    "model_probability": cancellation_model,
+                    "edge": cancellation_model - float(source["market_probability"]),
+                },
+            ),
+            ("eligible-reason", base_payload, {"reason": "edge_below_threshold"}),
+            ("decision-format", base_payload, {"decision_key": "not-32-hex"}),
+            ("input-format", base_payload, {"input_ref": "not-24-hex"}),
+        )
+        for label, payload, overrides in cases:
+            clone = {
+                **source,
+                "decision_key": hashlib.sha256(label.encode("ascii")).hexdigest()[
+                    :32
+                ],
+                "input_ref": hashlib.sha256(
+                    f"input:{label}".encode("ascii")
+                ).hexdigest()[:24],
+                "contributions_json": json.dumps(payload, separators=(",", ":")),
+                **overrides,
+            }
+            connection.execute(
+                f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(clone[column] for column in columns),
+            )
+        connection.execute(
+            """INSERT INTO vision_derived_invalidations
+               (dependent_type, dependent_key, raybet_match_id, map_number,
+                reason, block_reason, recorded_at)
+               VALUES ('strategy_decision', ?, 'match-1', 1,
+                       'test', 'test', ?)""",
+            (base_key, NOW.isoformat()),
+        )
+        connection.commit()
+
+        detail = monitor_match_detail(connection, "match-1", now=NOW)
+
+        assert detail is not None
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
+        self.assertEqual(strategy["data"]["decisions"], [])
+        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 11)
+        self.assertEqual(strategy["data"]["excluded"]["vision_invalidated"], 1)
+        self.assertEqual(strategy["data"]["excluded_decision_count"], 12)
+
+    def test_sqlite_errors_are_classified_and_busy_detail_returns_503(self) -> None:
+        readonly = sqlite3.OperationalError("database is locked")
+        readonly.sqlite_errorcode = sqlite3.SQLITE_READONLY
+        memory = sqlite3.connect(":memory:")
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as missing_table:
+                memory.execute("SELECT * FROM missing_monitor_table").fetchall()
+            memory.execute("CREATE TABLE monitor_sample (present INTEGER)")
+            with self.assertRaises(sqlite3.OperationalError) as missing_column:
+                memory.execute("SELECT absent FROM monitor_sample").fetchall()
+        finally:
+            memory.close()
+        self.assertEqual(
+            classify_sqlite_error(sqlite3.OperationalError("database is locked")),
+            "busy",
+        )
+        self.assertEqual(classify_sqlite_error(readonly), "other")
+        self.assertEqual(
+            missing_table.exception.sqlite_errorcode,
+            sqlite3.SQLITE_ERROR,
+        )
+        self.assertEqual(
+            classify_sqlite_error(missing_table.exception),
+            "schema_missing",
+        )
+        self.assertEqual(
+            classify_sqlite_error(missing_column.exception),
+            "schema_missing",
+        )
+        self.assertEqual(
+            classify_sqlite_error(
+                sqlite3.OperationalError("database is locked during readonly write")
+            ),
+            "other",
+        )
+        self.assertEqual(
+            classify_sqlite_error(sqlite3.OperationalError("no such column: x")),
+            "schema_missing",
+        )
+        self.assertEqual(
+            classify_sqlite_error(sqlite3.DatabaseError("database disk image is malformed")),
+            "other",
+        )
+        previous_path = queries.DB_PATH
+        queries.init_db(str(self.database))
+        try:
+            with (
+                patch(
+                    "web.routers.monitor.monitoring.monitor_match_detail",
+                    side_effect=sqlite3.OperationalError("database is locked"),
+                ),
+                TestClient(app) as client,
+            ):
+                response = client.get("/api/monitor/matches/match-1")
+        finally:
+            queries.init_db(previous_path)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["retry-after"], "1")
 
 
 if __name__ == "__main__":

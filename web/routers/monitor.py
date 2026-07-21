@@ -12,6 +12,7 @@ from live_betting.vision_frame_registry import (
     read_registered_vision_frame_bytes,
     vision_frame_ref,
 )
+from shared.sqlite import classify_sqlite_error
 
 from .. import intelligence, monitoring, queries
 
@@ -82,11 +83,26 @@ def match_detail(
 ) -> dict[str, object]:
     connection = queries.get_db()
     try:
-        detail = monitoring.monitor_match_detail(
-            connection,
-            raybet_match_id,
-            max_points=max_points,
-        )
+        try:
+            detail = monitoring.monitor_match_detail(
+                connection,
+                raybet_match_id,
+                max_points=max_points,
+            )
+        except sqlite3.Error as error:
+            kind = classify_sqlite_error(error)
+            if kind == "busy":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Monitor database is busy",
+                    headers={"Retry-After": "1"},
+                ) from None
+            if kind == "schema_missing":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Monitor database schema is unavailable",
+                ) from None
+            raise
     finally:
         connection.close()
     if detail is None:

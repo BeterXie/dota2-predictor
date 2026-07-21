@@ -59,6 +59,16 @@ from .vision_frame_registry import (
 CURRENT_SCHEMA_VERSION = 9
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 
+_SCORED_DECISION_CONTRIBUTION_KEYS = frozenset(
+    {
+        "team_style",
+        "player_form",
+        "draft_curve",
+        "late_game_style",
+        "market_movement",
+    }
+)
+
 _DIRECT_RESPONSE_ENDPOINTS = {
     "live_match_list": "https://raybet.local/v2/match/live",
     "completed_match_list": "https://raybet.local/v2/match/completed",
@@ -326,6 +336,13 @@ def _draft_authority_values(
         authority.input_snapshot_hash,
         authority.authority_revision,
         authority.dependency_revision,
+    )
+
+
+def _has_scored_decision_contributions(decision: Any) -> bool:
+    contributions = getattr(decision, "contributions", None)
+    return isinstance(contributions, Mapping) and (
+        _SCORED_DECISION_CONTRIBUTION_KEYS <= set(contributions)
     )
 
 
@@ -8615,6 +8632,9 @@ class LiveBettingStore:
             decision.input_ref,
             decision.strategy_version,
         )
+        requires_bound_authority = bool(
+            decision.eligible
+        ) or _has_scored_decision_contributions(decision)
         with self.transaction():
             bound_authority: DraftLandmarkAuthority | None = None
             if isinstance(draft_authority, DraftLandmarkAuthority):
@@ -8631,11 +8651,11 @@ class LiveBettingStore:
                     verify_curve=False,
                 ):
                     bound_authority = draft_authority
-            if bool(decision.eligible) and bound_authority is None:
+            if requires_bound_authority and bound_authority is None:
                 return False
             bound_vision: VisionDecisionAuthority | None = None
             if (
-                bool(decision.eligible)
+                requires_bound_authority
                 and bound_authority is not None
                 and vision_observation is not None
                 and isinstance(vision_transport_key, str)
@@ -8646,7 +8666,7 @@ class LiveBettingStore:
                     vision_transport_key=vision_transport_key,
                     draft_authority=bound_authority,
                 )
-            if bool(decision.eligible) and bound_vision is None:
+            if requires_bound_authority and bound_vision is None:
                 return False
             values = (
                 *base_values,

@@ -15,15 +15,21 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote as url_quote
 
+from live_betting.draft_authority import (
+    DraftLandmarkAuthority,
+    draft_landmark_authority_matches,
+)
 from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
 from live_betting.sanitize import stored_public_stream_url
 from live_betting.strict_eligibility import (
     RAYBET_MATCH_HEAD_TO_HEAD,
     RAYBET_MATCH_NON_HEAD_TO_HEAD,
     classify_raybet_match_format,
+    query_strict_mapping_snapshot,
     query_strict_live_eligibility,
 )
 from live_betting.vision_frame_registry import VISION_FRAME_REF_PREFIX
+from shared.sqlite import classify_sqlite_error
 
 from .alerts import active_alerts
 
@@ -49,6 +55,86 @@ _RAYBET_PAGE_ORIGINS = frozenset(
 _RAYBET_PAGE_PREFIXES = ("/sports/esports", "/esports", "/dota2")
 _RAYBET_PAGE_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 _MAX_VISION_TIMELINE_POINTS = 5_000
+_MAX_DETAIL_DECISIONS = 200
+_MAX_DETAIL_DECISION_SCAN = 1_000
+_STRATEGY_SCAN_BATCH = 256
+_MAX_TRUSTED_VISION_CANDIDATES = 256
+_MAX_STRICT_MAPPING_CANDIDATES = 64
+_MAX_PUBLIC_EVIDENCE_DEPTH = 10
+_MAX_PUBLIC_EVIDENCE_NODES = 1_000
+_MAX_PUBLIC_EVIDENCE_STRING = 8_192
+_ANALYSIS_STATUSES = frozenset({"available", "waiting", "unavailable", "review"})
+_OPAQUE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DECISION_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
+_INPUT_REF_RE = re.compile(r"^[0-9a-f]{24}$")
+_INVALID_EVIDENCE = object()
+_CONTRIBUTION_KEYS = frozenset(
+    {
+        "team_style",
+        "player_form",
+        "draft_curve",
+        "late_game_style",
+        "market_movement",
+    }
+)
+_REQUIRED_CONTRIBUTION_KEYS = frozenset(
+    {
+        "team_style",
+        "player_form",
+        "draft_curve",
+        "late_game_style",
+        "market_movement",
+    }
+)
+_INDEPENDENT_CONTRIBUTION_KEYS = frozenset(
+    {"team_style", "player_form", "draft_curve", "late_game_style"}
+)
+_DRAFT_AUTHORITY_FIELDS = (
+    "curve_key",
+    "source_ref",
+    "landmark_key",
+    "landmark_horizon_minutes",
+    "landmark_target",
+    "landmark_radiant_probability",
+    "landmark_quality",
+    "landmark_uncertainty",
+    "landmark_support",
+    "radiant_team_side",
+    "strict_mapping_id",
+    "deployment_key",
+    "target_snapshot_hash",
+    "feature_hash",
+    "model_hash",
+    "calibration_hash",
+    "model_version",
+    "global_gate_ref",
+    "input_snapshot_hash",
+    "authority_revision",
+    "dependency_revision",
+)
+_VISION_AUTHORITY_FIELDS = (
+    "raybet_match_id",
+    "map_number",
+    "captured_at",
+    "source_frame_ref",
+    "source_frame_sha256",
+    "source_frame_bytes",
+    "observed_game_clock_seconds",
+    "aligned_game_clock_seconds",
+    "is_paused",
+    "radiant_hero_ids_json",
+    "dire_hero_ids_json",
+    "radiant_team_side",
+    "clock_confidence",
+    "draft_confidence",
+    "screen_state",
+    "confirmed",
+    "transport_key",
+    "transport_at",
+    "alignment_method",
+    "alignment_lag_seconds",
+)
 _MATCH_COLUMN_NAMES = (
     "raybet_match_id",
     "tournament",
@@ -326,19 +412,56 @@ def monitor_match_detail(
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
     summary = _monitor_match(connection, row, checked_at, health_by_component)
+    timeline = winner_timeline(
+        connection,
+        raybet_match_id,
+        max_points=max_points,
+        as_of=checked_at,
+    )
+    strategy = _strategy_analysis(
+        connection,
+        raybet_match_id,
+        summary["readiness"]["strategy"],
+        lifecycle=str(summary["lifecycle"]),
+        now=checked_at,
+    )
+    decisions = (
+        list(strategy["data"]["decisions"])
+        if isinstance(strategy.get("data"), dict)
+        and isinstance(strategy["data"].get("decisions"), list)
+        else []
+    )
+    trusted_context = _trusted_live_context(connection, raybet_match_id, checked_at)
     return {
         **summary,
-        "winner_timeline": winner_timeline(
-            connection, raybet_match_id, max_points=max_points
-        ),
-        "decisions": _strategy_decisions(connection, raybet_match_id),
+        "latest_decision": decisions[-1] if decisions else None,
+        "winner_timeline": timeline,
+        "decisions": decisions,
         "vision": _vision_timeline(
             connection,
             raybet_match_id,
             now=checked_at,
             max_points=max_points,
         ),
-        "markets": current_markets(connection, raybet_match_id),
+        "markets": current_markets(
+            connection,
+            raybet_match_id,
+            as_of=checked_at,
+        ),
+        "analysis": {
+            "odds": _odds_analysis(
+                connection,
+                raybet_match_id,
+                timeline,
+                lifecycle=str(summary["lifecycle"]),
+                now=checked_at,
+            ),
+            "vision": _vision_analysis(trusted_context),
+            "strategy": strategy,
+            "lineup": _lineup_analysis(
+                connection, raybet_match_id, trusted_context
+            ),
+        },
     }
 
 
@@ -348,7 +471,9 @@ def winner_timeline(
     *,
     max_points: int | None = 1200,
     period: str | None = None,
+    as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
+    cutoff = _aware_utc(as_of).isoformat() if as_of is not None else None
     authority_relations = {
         str(row[0])
         for row in connection.execute(
@@ -399,8 +524,9 @@ def winner_timeline(
                       AND snapshot.last_update IS outcome.last_update
                      LEFT JOIN odds_alignments AS alignment
                        ON alignment.odds_snapshot_id=snapshot.id
-                    WHERE transport.raybet_match_id=?
-                      AND transport.timing_status='on_time'
+                     WHERE transport.raybet_match_id=?
+                       AND (? IS NULL OR julianday(transport.observed_at)<=julianday(?))
+                       AND transport.timing_status='on_time'
                       AND transport.processing_status='processed'
                       AND outcome.market_type='winner'
                       AND outcome.supported=1
@@ -408,12 +534,14 @@ def winner_timeline(
                     ORDER BY transport.observed_at, transport.observation_key,
                              outcome.period, outcome.odds_group_id,
                              outcome.odds_id""",
-                (raybet_match_id, period, period),
+                    (raybet_match_id, cutoff, cutoff, period, period),
             )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as error:
             # A partial or malformed response-authority schema must not revive
             # carried-forward legacy snapshots as product data.
-            return []
+            if classify_sqlite_error(error) == "schema_missing":
+                return []
+            raise
     else:
         has_alignment_relation = connection.execute(
             """SELECT 1 FROM sqlite_master
@@ -447,11 +575,12 @@ def winner_timeline(
                  FROM odds_snapshots AS odds
                  {alignment_join}
                 WHERE odds.raybet_match_id=?
+                  AND (? IS NULL OR julianday(odds.received_at)<=julianday(?))
                   AND odds.market_type='winner' AND odds.supported=1
                   AND (? IS NULL OR odds.period=?)
                 ORDER BY odds.received_at, odds.period,
                          odds.odds_group_id, odds.id""",
-            (raybet_match_id, period, period),
+            (raybet_match_id, cutoff, cutoff, period, period),
         )
 
     grouped: dict[tuple[str, str, str, str], list[sqlite3.Row]] = defaultdict(list)
@@ -565,15 +694,19 @@ def winner_timeline(
 def current_markets(
     connection: sqlite3.Connection,
     raybet_match_id: str,
+    *,
+    as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
+    cutoff = _aware_utc(as_of).isoformat() if as_of is not None else None
     if _has_transport_observations(connection, raybet_match_id):
         rows = _rows(
             connection,
             """WITH latest AS (
                    SELECT observation_key
                      FROM odds_transport_observations
-                    WHERE raybet_match_id=?
-                      AND timing_status='on_time'
+                     WHERE raybet_match_id=?
+                       AND (? IS NULL OR julianday(observed_at)<=julianday(?))
+                       AND timing_status='on_time'
                       AND processing_status='processed'
                     ORDER BY observed_at DESC, observation_key DESC LIMIT 1
                )
@@ -584,11 +717,19 @@ def current_markets(
                  FROM latest
                  JOIN odds_response_outcomes_effective AS outcome
                    ON outcome.observation_key=latest.observation_key
-                WHERE outcome.raybet_match_id=?
+                 WHERE outcome.raybet_match_id=?
+                   AND (? IS NULL OR julianday(outcome.received_at)<=julianday(?))
                 ORDER BY CASE WHEN outcome.market_type='winner' THEN 0 ELSE 1 END,
                          outcome.period, outcome.market_type,
                          outcome.odds_group_id, outcome.outcome_key""",
-            (raybet_match_id, raybet_match_id),
+            (
+                raybet_match_id,
+                cutoff,
+                cutoff,
+                raybet_match_id,
+                cutoff,
+                cutoff,
+            ),
         )
     else:
         rows = _rows(
@@ -596,15 +737,16 @@ def current_markets(
             """WITH ranked AS (
                    SELECT *, ROW_NUMBER() OVER (
                        PARTITION BY odds_id ORDER BY received_at DESC, id DESC
-                   ) AS rank
-                   FROM odds_snapshots WHERE raybet_match_id=?
+                    ) AS rank
+                    FROM odds_snapshots WHERE raybet_match_id=?
+                      AND (? IS NULL OR julianday(received_at)<=julianday(?))
                )
                SELECT odds_id, odds_group_id, received_at, price, status,
                       market_type, period, side, line, outcome_key, supported
                  FROM ranked WHERE rank=1
                 ORDER BY CASE WHEN market_type='winner' THEN 0 ELSE 1 END,
                          period, market_type, odds_group_id, outcome_key""",
-            (raybet_match_id,),
+            (raybet_match_id, cutoff, cutoff),
         )
     return [dict(row) for row in rows]
 
@@ -1061,22 +1203,25 @@ def _monitor_match(
             connection,
             """SELECT observed_at FROM odds_transport_observations
                 WHERE raybet_match_id=?
+                  AND julianday(observed_at)<=julianday(?)
                   AND timing_status='on_time'
                   AND processing_status='processed'
                 ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
-            (match_id,),
+            (match_id, now.isoformat()),
         )
     else:
         latest_odds = _latest_row(
             connection,
             """SELECT received_at AS observed_at FROM odds_snapshots
-                WHERE raybet_match_id=? ORDER BY received_at DESC, id DESC LIMIT 1""",
-            (match_id,),
+                WHERE raybet_match_id=?
+                  AND julianday(received_at)<=julianday(?)
+                ORDER BY received_at DESC, id DESC LIMIT 1""",
+            (match_id, now.isoformat()),
         )
     latest_vision = _latest_valid_vision_row(connection, match_id, now=now)
-    latest_decision = _latest_strategy_decision(connection, match_id)
+    latest_decision = _latest_strategy_decision(connection, match_id, now=now)
     mapping_readiness = _mapping_readiness(connection, match_id, now)
-    latest_odds_activity = _latest_odds_activity(connection, match_id)
+    latest_odds_activity = _latest_odds_activity(connection, match_id, now=now)
 
     odds_readiness = _freshness(latest_odds, now, warning=15.0, stale=60.0)
     vision_readiness = _freshness(latest_vision, now, warning=20.0, stale=120.0)
@@ -1176,6 +1321,22 @@ def _captured_raybet_page_url(
     connection: sqlite3.Connection,
     raybet_match_id: str,
 ) -> str | None:
+    if not _relation_has_columns(
+        connection,
+        "browser_events",
+        {
+            "page_origin",
+            "page_path",
+            "raybet_match_id",
+            "game_id",
+            "recognized",
+            "event_type",
+            "processing_status",
+            "captured_at",
+            "event_id",
+        },
+    ):
+        return None
     try:
         rows = connection.execute(
             """SELECT page_origin, page_path
@@ -1189,8 +1350,10 @@ def _captured_raybet_page_url(
                 LIMIT 50""",
             (raybet_match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
-        return None
+    except sqlite3.OperationalError as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return None
+        raise
     for event in rows:
         url = _safe_raybet_page_url(event["page_origin"], event["page_path"])
         if url is not None:
@@ -1231,8 +1394,11 @@ def _mapping_readiness(
                 ORDER BY mapping.map_number""",
             (raybet_match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+    except sqlite3.OperationalError as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            rows = []
+        else:
+            raise
     if not rows:
         return {"status": "missing", "count": 0, "total_count": 0, "reasons": []}
     results = [
@@ -1260,26 +1426,45 @@ def _current_winner(
     *,
     provider_status: str,
 ) -> dict[str, Any] | None:
-    try:
+    transport_columns = _relation_columns(
+        connection, "odds_transport_observations"
+    )
+    required_transport_columns = {
+        "observation_key",
+        "raybet_match_id",
+        "observed_at",
+        "timing_status",
+        "processing_status",
+    }
+    if transport_columns is None:
+        has_transport = False
+    elif not required_transport_columns <= transport_columns:
+        return None
+    else:
         has_transport = connection.execute(
             """SELECT 1 FROM odds_transport_observations
                 WHERE raybet_match_id=? LIMIT 1""",
             (raybet_match_id,),
         ).fetchone() is not None
-    except sqlite3.OperationalError:
-        try:
-            transport_relation_exists = connection.execute(
-                """SELECT 1 FROM sqlite_master
-                    WHERE type IN ('table', 'view')
-                      AND name='odds_transport_observations'"""
-            ).fetchone() is not None
-        except sqlite3.OperationalError:
-            return None
-        if transport_relation_exists:
-            return None
-        has_transport = False
 
     if has_transport:
+        if not _relation_has_columns(
+            connection,
+            "odds_response_outcomes_effective",
+            {
+                "observation_key",
+                "raybet_match_id",
+                "odds_group_id",
+                "side",
+                "price",
+                "status",
+                "period",
+                "odds_id",
+                "market_type",
+                "supported",
+            },
+        ):
+            return None
         try:
             quotes = _rows(
                 connection,
@@ -1307,10 +1492,12 @@ def _current_winner(
                          outcome.odds_id DESC""",
                 (raybet_match_id, raybet_match_id),
             )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as error:
             # Once exact transport membership exists, a malformed response
             # schema cannot be replaced by carried-forward legacy snapshots.
-            return None
+            if classify_sqlite_error(error) == "schema_missing":
+                return None
+            raise
     else:
         quotes = _rows(
             connection,
@@ -1407,73 +1594,1486 @@ def _period_sort_key(period: str) -> tuple[int, int | str]:
     return (1, period)
 
 
-def _strategy_decisions(
+def _analysis_section(
+    status: str,
+    reason: str,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if status not in _ANALYSIS_STATUSES:
+        raise ValueError("invalid analysis section status")
+    return {"status": status, "reason": reason, "data": data}
+
+
+def _odds_analysis(
     connection: sqlite3.Connection,
     raybet_match_id: str,
-) -> list[dict[str, Any]]:
+    timeline: list[dict[str, Any]],
+    *,
+    lifecycle: str,
+    now: datetime,
+) -> dict[str, Any]:
+    if timeline:
+        return _analysis_section(
+            "available",
+            "odds_available",
+            {
+                "point_count": len(timeline),
+                "periods": sorted(
+                    {str(point["period"]) for point in timeline},
+                    key=_period_sort_key,
+                ),
+                "latest_observed_at": str(timeline[-1]["observed_at"]),
+            },
+        )
+    try:
+        observed = bool(
+            connection.execute(
+                """SELECT EXISTS(
+                       SELECT 1 FROM odds_snapshots
+                        WHERE raybet_match_id=?
+                          AND julianday(received_at)<=julianday(?)
+                   )""",
+                (raybet_match_id, now.isoformat()),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return _analysis_section("unavailable", "odds_schema_missing")
+        raise
+    if observed:
+        return _analysis_section("review", "winner_odds_incomplete")
+    status = "unavailable" if lifecycle == "ended" else "waiting"
+    return _analysis_section(status, "winner_odds_pending")
+
+
+def _trusted_live_context(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    try:
+        anchor = connection.execute(
+            """SELECT raybet_match_id, map_number, draft_hash,
+                      radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                      team_side_anchored_at, team_side_source_frame_ref,
+                      anchored_at, source_frame_ref, status, conflict_at
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id=?
+                ORDER BY map_number DESC, anchored_at DESC LIMIT 1""",
+            (raybet_match_id,),
+        ).fetchone()
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return {"status": "unavailable", "reason": "vision_schema_missing"}
+        raise
+    if anchor is None:
+        return {"status": "waiting", "reason": "trusted_vision_pending"}
+    anchored_at = _parse_time(anchor["anchored_at"])
+    if anchored_at is None:
+        return {"status": "review", "reason": "draft_anchor_invalid"}
+    if anchored_at > now:
+        return {"status": "waiting", "reason": "trusted_vision_pending"}
+    if str(anchor["status"]) == "conflict":
+        return {"status": "review", "reason": "draft_conflict"}
+    radiant = _five_hero_ids(anchor["radiant_hero_ids"])
+    dire = _five_hero_ids(anchor["dire_hero_ids"])
+    side = str(anchor["radiant_team_side"] or "")
+    if (
+        radiant is None
+        or dire is None
+        or len(set(radiant + dire)) != 10
+        or side not in {"team_one", "team_two"}
+        or re.fullmatch(r"[0-9a-f]{64}", str(anchor["draft_hash"])) is None
+    ):
+        return {"status": "review", "reason": "lineup_payload_invalid"}
+    try:
+        candidates = connection.execute(
+            """SELECT observation.captured_at,
+                      observation.game_clock_seconds,
+                      observation.clock_confidence,
+                      observation.draft_confidence,
+                      observation.source_frame_ref,
+                      observation.radiant_hero_ids,
+                      observation.dire_hero_ids,
+                      observation.radiant_team_side
+                 FROM vision_observations AS observation
+                WHERE observation.raybet_match_id=?
+                  AND observation.map_number=?
+                  AND observation.confirmed=1
+                  AND observation.screen_state='game'
+                  AND julianday(observation.captured_at)<=julianday(?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vision_observation_invalidations AS invalidation
+                       WHERE invalidation.raybet_match_id=observation.raybet_match_id
+                         AND invalidation.captured_at=observation.captured_at
+                         AND invalidation.source_frame_ref=observation.source_frame_ref
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vision_draft_conflicts AS conflict
+                       WHERE conflict.raybet_match_id=observation.raybet_match_id
+                         AND conflict.map_number=observation.map_number
+                         AND julianday(conflict.captured_at)<=
+                             julianday(observation.captured_at)
+                  )
+                ORDER BY observation.captured_at DESC,
+                         observation.source_frame_ref DESC
+                LIMIT ?""",
+            (
+                raybet_match_id,
+                int(anchor["map_number"]),
+                now.isoformat(),
+                _MAX_TRUSTED_VISION_CANDIDATES + 1,
+            ),
+        ).fetchall()
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return {"status": "unavailable", "reason": "vision_schema_missing"}
+        raise
+    observation = next(
+        (
+            row
+            for row in candidates[:_MAX_TRUSTED_VISION_CANDIDATES]
+            if _five_hero_ids(row["radiant_hero_ids"]) == radiant
+            and _five_hero_ids(row["dire_hero_ids"]) == dire
+            and str(row["radiant_team_side"] or "") == side
+        ),
+        None,
+    )
+    if observation is None:
+        if len(candidates) > _MAX_TRUSTED_VISION_CANDIDATES:
+            return {
+                "status": "review",
+                "reason": "vision_candidate_limit_exceeded",
+            }
+        return {"status": "waiting", "reason": "trusted_vision_pending"}
+    clock = observation["game_clock_seconds"]
+    if type(clock) is not int or clock < 0:
+        return {"status": "review", "reason": "trusted_vision_invalid"}
+    return {
+        "status": "available",
+        "reason": "trusted_vision_available",
+        "checked_at": now,
+        "anchor": dict(anchor),
+        "observation": dict(observation),
+        "radiant": radiant,
+        "dire": dire,
+    }
+
+
+def _vision_analysis(context: dict[str, Any]) -> dict[str, Any]:
+    if context.get("status") != "available":
+        return _analysis_section(
+            str(context.get("status", "unavailable")),
+            str(context.get("reason", "trusted_vision_pending")),
+        )
+    observation = context["observation"]
+    anchor = context["anchor"]
+    return _analysis_section(
+        "available",
+        "trusted_vision_available",
+        {
+            "map_number": int(anchor["map_number"]),
+            "captured_at": str(observation["captured_at"]),
+            "game_clock_seconds": int(observation["game_clock_seconds"]),
+            "clock_confidence": float(observation["clock_confidence"]),
+            "draft_confidence": float(observation["draft_confidence"]),
+            "source_frame_ref": str(observation["source_frame_ref"]),
+        },
+    )
+
+
+def _lineup_analysis(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("status") != "available":
+        return _analysis_section(
+            str(context.get("status", "unavailable")),
+            str(context.get("reason", "trusted_vision_pending")),
+        )
+    anchor = context["anchor"]
+    observation = context["observation"]
+    evidence_at = _parse_time(observation["captured_at"])
+    checked_at = context.get("checked_at")
+    if evidence_at is None or not isinstance(checked_at, datetime):
+        return _analysis_section("review", "trusted_vision_invalid")
+    mapping = _trusted_mapping(
+        connection,
+        raybet_match_id,
+        int(anchor["map_number"]),
+        checked_at,
+    )
+    if mapping["status"] != "available":
+        return _analysis_section(mapping["status"], mapping["reason"])
+    mapping_id = int(mapping["mapping_id"])
+    curve = _persisted_lineup_curve(
+        connection,
+        raybet_match_id=raybet_match_id,
+        map_number=int(anchor["map_number"]),
+        mapping_id=mapping_id,
+        radiant=context["radiant"],
+        dire=context["dire"],
+        radiant_team_side=str(anchor["radiant_team_side"]),
+        anchor=anchor,
+        game_clock_seconds=int(observation["game_clock_seconds"]),
+        now=checked_at,
+    )
+    return _analysis_section(
+        "available",
+        "lineup_available",
+        {
+            "as_of": evidence_at.isoformat(),
+            "map_number": int(anchor["map_number"]),
+            "radiant_team_side": str(anchor["radiant_team_side"]),
+            "radiant": {"hero_ids": list(context["radiant"])},
+            "dire": {"hero_ids": list(context["dire"])},
+            "evidence": {
+                "draft_hash": str(anchor["draft_hash"]),
+                "anchor_source_frame_ref": str(anchor["source_frame_ref"]),
+                "anchored_at": str(anchor["anchored_at"]),
+                "strict_mapping_id": mapping_id,
+            },
+            "active_curve": curve,
+            "players": _analysis_section(
+                "unavailable", "live_player_identity_unavailable"
+            ),
+        },
+    )
+
+
+def _trusted_mapping(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    map_number: int,
+    now: datetime,
+) -> dict[str, Any]:
     try:
         rows = connection.execute(
-            """SELECT decision.decision_key, decision.map_number,
-                      decision.decided_at, decision.underdog_side,
-                      market_probability, model_probability, edge, data_quality,
-                      eligible, decision.reason, contributions_json, input_ref,
-                      strategy_version
-                 FROM strategy_decisions AS decision
-                WHERE decision.raybet_match_id=?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM vision_derived_invalidations AS invalidation
-                       WHERE invalidation.dependent_type='strategy_decision'
-                         AND invalidation.dependent_key=decision.decision_key
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM strict_live_mapping_impacts AS impact
-                       WHERE impact.dependent_type='strategy_decision'
-                         AND impact.dependent_key=decision.decision_key
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                        FROM vision_draft_anchors AS anchor
-                       WHERE anchor.raybet_match_id=decision.raybet_match_id
-                         AND anchor.map_number=decision.map_number
-                         AND anchor.status='conflict'
-                         AND (
-                               anchor.conflict_at IS NULL
-                               OR julianday(anchor.conflict_at) IS NULL
-                               OR julianday(decision.decided_at) IS NULL
-                               OR julianday(anchor.conflict_at)<=
-                                  julianday(decision.decided_at)
-                               OR EXISTS (
-                                    SELECT 1
-                                      FROM vision_draft_conflicts AS conflict
-                                     WHERE conflict.raybet_match_id=
-                                           anchor.raybet_match_id
-                                       AND conflict.map_number=anchor.map_number
-                                       AND (
-                                             julianday(conflict.captured_at) IS NULL
-                                             OR julianday(conflict.captured_at)<=
-                                                julianday(decision.decided_at)
-                                       )
-                               )
-                         )
-                  )
-                ORDER BY decision.decided_at, decision.decision_key""",
-            (raybet_match_id,),
+            """SELECT mapping_id FROM strict_live_map_mappings
+                WHERE raybet_match_id=? AND map_number=?
+                ORDER BY mapping_id LIMIT ?""",
+            (
+                raybet_match_id,
+                map_number,
+                _MAX_STRICT_MAPPING_CANDIDATES + 1,
+            ),
         ).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    return [dict(row) for row in rows]
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return {"status": "unavailable", "reason": "strict_mapping_schema_missing"}
+        raise
+    if not rows:
+        return {"status": "waiting", "reason": "strict_mapping_pending"}
+    if len(rows) > _MAX_STRICT_MAPPING_CANDIDATES:
+        return {
+            "status": "review",
+            "reason": "strict_mapping_candidate_limit_exceeded",
+        }
+    results = [
+        query_strict_mapping_snapshot(
+            connection, mapping_id=int(row[0]), observed_at=now
+        )
+        for row in rows
+    ]
+    valid = [
+        result
+        for result in results
+        if result.eligible
+        and result.mapping is not None
+        and result.raybet_match_id == raybet_match_id
+        and result.map_number == map_number
+    ]
+    if len(valid) == 1:
+        return {
+            "status": "available",
+            "reason": "strict_mapping_available",
+            "mapping_id": valid[0].mapping.mapping_id,
+        }
+    if len(valid) > 1:
+        return {"status": "review", "reason": "strict_mapping_ambiguous"}
+    reasons = {result.reason for result in results}
+    if "strict_mapping_schema_missing" in reasons:
+        return {"status": "unavailable", "reason": "strict_mapping_schema_missing"}
+    return {"status": "review", "reason": sorted(reasons)[0]}
+
+
+def _persisted_lineup_curve(
+    connection: sqlite3.Connection,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    mapping_id: int,
+    radiant: tuple[int, ...],
+    dire: tuple[int, ...],
+    radiant_team_side: str,
+    anchor: dict[str, Any],
+    game_clock_seconds: int,
+    now: datetime,
+) -> dict[str, Any]:
+    try:
+        rows = connection.execute(
+            """SELECT curve_key, radiant_hero_ids_json, dire_hero_ids_json,
+                      prediction_cutoff, first_usable_at, availability_mode,
+                      created_at, radiant_team_side, anchor_draft_hash,
+                      anchor_source_frame_ref, anchor_anchored_at,
+                      anchor_team_side_source_frame_ref,
+                       anchor_team_side_anchored_at, deployment_key,
+                       target_snapshot_hash, feature_dependency_revision
+                 FROM prospective_draft_curves
+                WHERE raybet_match_id=? AND map_number=? AND strict_mapping_id=?
+                ORDER BY first_usable_at DESC, curve_key DESC""",
+            (raybet_match_id, map_number, mapping_id),
+        ).fetchall()
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return _analysis_section("unavailable", "lineup_curve_schema_missing")
+        raise
+    causal = []
+    future_seen = False
+    for row in rows:
+        first_usable = _parse_time(row["first_usable_at"])
+        created = _parse_time(row["created_at"])
+        if first_usable is None or created is None:
+            return _analysis_section("review", "lineup_curve_payload_invalid")
+        if first_usable > now or created > now:
+            future_seen = True
+            continue
+        causal.append(row)
+    if not causal:
+        reason = (
+            "prospective_draft_artifact_not_yet_usable"
+            if future_seen
+            else "validated_live_draft_prediction_missing"
+        )
+        return _analysis_section("waiting", reason)
+    row = causal[0]
+    if (
+        _five_hero_ids(row["radiant_hero_ids_json"]) != radiant
+        or _five_hero_ids(row["dire_hero_ids_json"]) != dire
+        or str(row["availability_mode"]) != "prospective"
+        or str(row["radiant_team_side"]) != radiant_team_side
+        or str(row["anchor_draft_hash"]) != str(anchor["draft_hash"])
+        or str(row["anchor_source_frame_ref"]) != str(anchor["source_frame_ref"])
+        or str(row["anchor_anchored_at"]) != str(anchor["anchored_at"])
+    ):
+        return _analysis_section("review", "lineup_curve_payload_invalid")
+    try:
+        revisions = connection.execute(
+            """SELECT authority.authority_revision,
+                      lineage.dependency_revision
+                 FROM draft_authority_revisions AS authority
+                 JOIN draft_lineage_revisions AS lineage
+                   ON lineage.singleton=authority.singleton
+                WHERE authority.singleton=1"""
+        ).fetchone()
+        landmarks = connection.execute(
+            """SELECT landmark_key, horizon_minutes, radiant_probability,
+                      quality, validation_status, support, uncertainty,
+                      calibration_ref, input_refs_json,
+                      feature_hash, model_hash, calibration_hash,
+                      global_calibration_passed, global_gate_ref,
+                      model_version, model_kind, availability_mode,
+                      input_snapshot_hash, deployment_key, created_at
+                 FROM prospective_draft_landmarks
+                WHERE curve_key=? ORDER BY horizon_minutes""",
+            (row["curve_key"],),
+        ).fetchall()
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return _analysis_section("unavailable", "lineup_curve_schema_missing")
+        raise
+    if revisions is None or not landmarks:
+        return _analysis_section("waiting", "validated_live_draft_prediction_missing")
+    try:
+        persisted_dependency_revision = int(row["feature_dependency_revision"])
+        current_dependency_revision = int(revisions[1])
+    except (TypeError, ValueError):
+        return _analysis_section("review", "lineup_curve_payload_invalid")
+    if persisted_dependency_revision != current_dependency_revision:
+        return _analysis_section(
+            "unavailable", "lineup_curve_dependency_revision_stale"
+        )
+    points: list[dict[str, Any]] = []
+    usable_horizons: list[int] = []
+    for landmark in landmarks:
+        try:
+            horizon = int(landmark["horizon_minutes"])
+            support = int(landmark["support"])
+            globally_passed = int(landmark["global_calibration_passed"])
+            landmark_created_at = _parse_time(landmark["created_at"])
+            input_refs = json.loads(str(landmark["input_refs_json"]))
+        except (TypeError, ValueError):
+            return _analysis_section("review", "lineup_curve_payload_invalid")
+        if (
+            str(landmark["validation_status"]) != "passed"
+            or globally_passed != 1
+            or support < 100
+            or landmark["uncertainty"] is None
+            or not str(landmark["calibration_ref"] or "").strip()
+            or not str(landmark["global_gate_ref"] or "").strip()
+            or not isinstance(input_refs, list)
+            or not input_refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in input_refs)
+        ):
+            continue
+        if landmark_created_at is None or landmark_created_at > now:
+            continue
+        try:
+            authority = DraftLandmarkAuthority(
+                curve_key=str(row["curve_key"]),
+                source_ref=f"prospective-draft:{row['curve_key']}",
+                landmark_key=str(landmark["landmark_key"]),
+                horizon_minutes=horizon,
+                target="radiant_win",
+                radiant_probability=float(landmark["radiant_probability"]),
+                quality=float(landmark["quality"]),
+                uncertainty=float(landmark["uncertainty"]),
+                support=support,
+                radiant_team_side=radiant_team_side,
+                strict_mapping_id=mapping_id,
+                deployment_key=str(row["deployment_key"]),
+                target_snapshot_hash=str(row["target_snapshot_hash"]),
+                feature_hash=str(landmark["feature_hash"]),
+                model_hash=str(landmark["model_hash"]),
+                calibration_hash=str(landmark["calibration_hash"]),
+                model_version=str(landmark["model_version"]),
+                global_gate_ref=str(landmark["global_gate_ref"]),
+                input_snapshot_hash=str(landmark["input_snapshot_hash"]),
+                authority_revision=int(revisions[0]),
+                dependency_revision=persisted_dependency_revision,
+            )
+        except (TypeError, ValueError):
+            return _analysis_section("review", "lineup_curve_payload_invalid")
+        if not draft_landmark_authority_matches(
+            connection,
+            authority,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            strict_mapping_id=mapping_id,
+            radiant_hero_ids=radiant,
+            dire_hero_ids=dire,
+            observed_at=now,
+            require_current_revisions=True,
+            verify_curve=False,
+        ):
+            return _analysis_section("review", "lineup_curve_authority_invalid")
+        if horizon * 60 <= game_clock_seconds:
+            usable_horizons.append(horizon)
+        points.append(
+            {
+                "landmark_key": str(landmark["landmark_key"]),
+                "horizon_minutes": horizon,
+                "radiant_probability": float(landmark["radiant_probability"]),
+                "quality": float(landmark["quality"]),
+                "support": support,
+                "uncertainty": (
+                    float(landmark["uncertainty"])
+                    if landmark["uncertainty"] is not None
+                    else None
+                ),
+                "model_version": str(landmark["model_version"]),
+                "validation_status": str(landmark["validation_status"]),
+                "conditional": horizon * 60 > game_clock_seconds,
+                "active": False,
+            }
+        )
+    if not points:
+        return _analysis_section(
+            "unavailable", "validated_live_draft_landmark_missing"
+        )
+    if not usable_horizons:
+        return _analysis_section("waiting", "before_first_draft_landmark")
+    active_horizon = max(usable_horizons)
+    if game_clock_seconds / 60.0 - active_horizon > 10.0:
+        return _analysis_section("waiting", "validated_draft_landmark_stale")
+    for point in points:
+        point["active"] = point["horizon_minutes"] == active_horizon
+    return _analysis_section(
+        "available",
+        "active_curve_available",
+        {
+            "curve_key": str(row["curve_key"]),
+            "first_usable_at": str(row["first_usable_at"]),
+            "active_horizon_minutes": active_horizon,
+            "points": points,
+        },
+    )
+
+
+def _five_hero_ids(value: object) -> tuple[int, ...] | None:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(parsed, list)
+        or len(parsed) != 5
+        or any(type(hero) is not int or hero <= 0 for hero in parsed)
+        or len(set(parsed)) != 5
+    ):
+        return None
+    return tuple(parsed)
+
+
+def _strategy_analysis(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    _readiness: dict[str, Any],
+    *,
+    lifecycle: str,
+    now: datetime,
+) -> dict[str, Any]:
+    required_relations = {
+        "strategy_decisions": {
+            "decision_key",
+            "raybet_match_id",
+            "map_number",
+            "decided_at",
+            "underdog_side",
+            "market_probability",
+            "model_probability",
+            "edge",
+            "data_quality",
+            "eligible",
+            "reason",
+            "contributions_json",
+            "input_ref",
+            "strategy_version",
+            *(f"draft_{field}" for field in _DRAFT_AUTHORITY_FIELDS),
+            *(f"vision_{field}" for field in _VISION_AUTHORITY_FIELDS),
+        },
+        "vision_derived_invalidations": {"dependent_type", "dependent_key"},
+        "strict_live_mapping_impacts": {"dependent_type", "dependent_key"},
+        "verified_strategy_decision_vision_authority": {"decision_key"},
+        "vision_draft_anchors": {
+            "raybet_match_id",
+            "map_number",
+            "status",
+            "conflict_at",
+        },
+        "vision_draft_conflicts": {"raybet_match_id", "map_number", "captured_at"},
+    }
+    if any(
+        not _relation_has_columns(connection, relation, columns)
+        for relation, columns in required_relations.items()
+    ):
+        return _analysis_section("unavailable", "strategy_schema_missing")
+    draft_columns = ", ".join(
+        f"decision.draft_{field}" for field in _DRAFT_AUTHORITY_FIELDS
+    )
+    vision_columns = ", ".join(
+        f"decision.vision_{field}" for field in _VISION_AUTHORITY_FIELDS
+    )
+    vision_invalidated = """EXISTS (
+        SELECT 1 FROM vision_derived_invalidations AS invalidation
+         WHERE invalidation.dependent_type='strategy_decision'
+           AND invalidation.dependent_key=decision.decision_key
+    )"""
+    mapping_impacted = """EXISTS (
+        SELECT 1 FROM strict_live_mapping_impacts AS impact
+         WHERE impact.dependent_type='strategy_decision'
+           AND impact.dependent_key=decision.decision_key
+    )"""
+    draft_conflicted = """EXISTS (
+        SELECT 1 FROM vision_draft_anchors AS anchor
+         WHERE anchor.raybet_match_id=decision.raybet_match_id
+           AND anchor.map_number=decision.map_number
+           AND anchor.status='conflict'
+           AND (
+               anchor.conflict_at IS NULL
+               OR julianday(anchor.conflict_at) IS NULL
+               OR julianday(anchor.conflict_at)<=julianday(decision.decided_at)
+               OR EXISTS (
+                   SELECT 1 FROM vision_draft_conflicts AS conflict
+                    WHERE conflict.raybet_match_id=anchor.raybet_match_id
+                      AND conflict.map_number=anchor.map_number
+                      AND (
+                          julianday(conflict.captured_at) IS NULL
+                          OR julianday(conflict.captured_at)<=
+                             julianday(decision.decided_at)
+                      )
+               )
+           )
+    )"""
+    select_candidates = f"""SELECT decision.decision_key,
+               decision.raybet_match_id, decision.map_number,
+               decision.decided_at, decision.underdog_side,
+               decision.market_probability, decision.model_probability,
+               decision.edge, decision.data_quality, decision.eligible,
+               decision.reason, decision.contributions_json,
+               decision.input_ref, decision.strategy_version,
+               {draft_columns}, {vision_columns},
+               CASE WHEN {vision_invalidated} THEN 1 ELSE 0 END
+                   AS _vision_invalidated,
+               CASE WHEN {mapping_impacted} THEN 1 ELSE 0 END
+                   AS _mapping_impacted,
+               CASE WHEN {draft_conflicted} THEN 1 ELSE 0 END
+                   AS _draft_conflicted
+          FROM strategy_decisions AS decision
+         WHERE decision.raybet_match_id=?
+           AND julianday(decision.decided_at)<=julianday(?)
+           AND (
+               ? IS NULL
+               OR decision.decided_at < ?
+               OR (
+                   decision.decided_at = ?
+                   AND decision.decision_key < ?
+               )
+           )
+         ORDER BY decision.decided_at DESC, decision.decision_key DESC
+         LIMIT ?"""
+    excluded = {
+        "vision_invalidated": 0,
+        "mapping_impacted": 0,
+        "draft_conflicted": 0,
+        "invalid_payload": 0,
+    }
+    excluded_decision_count = 0
+    decisions_desc: list[dict[str, Any]] = []
+    scanned_count = 0
+    cursor_at: str | None = None
+    cursor_key: str | None = None
+    exhausted = False
+    try:
+        while (
+            scanned_count < _MAX_DETAIL_DECISION_SCAN
+            and len(decisions_desc) <= _MAX_DETAIL_DECISIONS
+        ):
+            batch_limit = min(
+                _STRATEGY_SCAN_BATCH,
+                _MAX_DETAIL_DECISION_SCAN - scanned_count,
+            )
+            rows = connection.execute(
+                select_candidates,
+                (
+                    raybet_match_id,
+                    now.isoformat(),
+                    cursor_at,
+                    cursor_at,
+                    cursor_at,
+                    cursor_key,
+                    batch_limit,
+                ),
+            ).fetchall()
+            if not rows:
+                exhausted = True
+                break
+            for row in rows:
+                scanned_count += 1
+                cursor_at = str(row["decided_at"])
+                cursor_key = str(row["decision_key"])
+                flags = {
+                    "vision_invalidated": bool(row["_vision_invalidated"]),
+                    "mapping_impacted": bool(row["_mapping_impacted"]),
+                    "draft_conflicted": bool(row["_draft_conflicted"]),
+                }
+                if any(flags.values()):
+                    excluded_decision_count += 1
+                    for reason, present in flags.items():
+                        excluded[reason] += int(present)
+                else:
+                    decision = _public_strategy_decision(connection, row)
+                    if decision is None:
+                        excluded["invalid_payload"] += 1
+                        excluded_decision_count += 1
+                    else:
+                        decisions_desc.append(decision)
+                        if len(decisions_desc) > _MAX_DETAIL_DECISIONS:
+                            break
+            if len(decisions_desc) > _MAX_DETAIL_DECISIONS:
+                break
+            if len(rows) < batch_limit:
+                exhausted = True
+                break
+        scan_limit_exceeded = False
+        if (
+            len(decisions_desc) <= _MAX_DETAIL_DECISIONS
+            and scanned_count >= _MAX_DETAIL_DECISION_SCAN
+            and not exhausted
+        ):
+            scan_limit_exceeded = connection.execute(
+                select_candidates,
+                (
+                    raybet_match_id,
+                    now.isoformat(),
+                    cursor_at,
+                    cursor_at,
+                    cursor_at,
+                    cursor_key,
+                    1,
+                ),
+            ).fetchone() is not None
+    except sqlite3.Error as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return _analysis_section("unavailable", "strategy_schema_missing")
+        raise
+    has_more = len(decisions_desc) > _MAX_DETAIL_DECISIONS or scan_limit_exceeded
+    decisions = list(reversed(decisions_desc[:_MAX_DETAIL_DECISIONS]))
+    data = {
+        "decisions": decisions,
+        "excluded": excluded,
+        "excluded_decision_count": excluded_decision_count,
+        "displayed_count": len(decisions),
+        "scanned_count": scanned_count,
+        "has_more": has_more,
+        "truncated": has_more,
+        "count_scope": "recent_scanned_window",
+    }
+    if scan_limit_exceeded:
+        return _analysis_section("review", "strategy_scan_limit_exceeded", data)
+    if decisions:
+        return _analysis_section("available", "strategy_available", data)
+    if sum(excluded.values()):
+        return _analysis_section("review", "strategy_evidence_invalid", data)
+    if lifecycle == "ended":
+        return _analysis_section("unavailable", "strategy_decision_missing", data)
+    return _analysis_section("waiting", "strategy_decision_pending", data)
+
+
+def _public_strategy_decision(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> dict[str, Any] | None:
+    base = _strategy_base_values(row)
+    if base is None:
+        return None
+    try:
+        payload = json.loads(str(row["contributions_json"]))
+    except (RecursionError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    contributions = _finite_number_object(
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"__inputs__", "__conservative__"}
+        }
+    )
+    inputs = payload.get("__inputs__", {})
+    if contributions is None or not isinstance(inputs, dict):
+        return None
+    conservative = _finite_number_object(
+        payload.get(
+            "__conservative__",
+            inputs.get("conservative_contributions", {}),
+        )
+    )
+    if conservative is None:
+        return None
+    public_inputs = _public_evidence_value(inputs)
+    if public_inputs is _INVALID_EVIDENCE:
+        return None
+    if (
+        set(contributions) - _CONTRIBUTION_KEYS
+        or set(conservative) - _CONTRIBUTION_KEYS
+    ):
+        return None
+    expected_model_probability = _strategy_probability(
+        float(base["market_probability"]),
+        contributions,
+    )
+    expected_conservative_probability = _strategy_probability(
+        float(base["market_probability"]),
+        conservative,
+    )
+    independent_positive = _independent_positive(contributions)
+    scored_payload_valid = (
+        set(contributions) == _REQUIRED_CONTRIBUTION_KEYS
+        and set(conservative) == _REQUIRED_CONTRIBUTION_KEYS
+        and _valid_conservative_contributions(contributions, conservative)
+        and expected_model_probability is not None
+        and math.isclose(
+            float(base["model_probability"]),
+            expected_model_probability,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        and expected_conservative_probability is not None
+    )
+    eligible = int(base["eligible"]) == 1
+    if eligible and (
+        base["reason"] != "eligible"
+        or not scored_payload_valid
+        or not public_inputs
+        or not independent_positive
+    ):
+        return None
+    if not eligible and base["reason"] == "eligible":
+        return None
+    draft_authority = _authority_object(row, "draft", _DRAFT_AUTHORITY_FIELDS)
+    vision_authority = _authority_object(row, "vision", _VISION_AUTHORITY_FIELDS)
+    if draft_authority and not _valid_draft_authority(draft_authority):
+        return None
+    if vision_authority and not _valid_vision_authority(
+        vision_authority,
+        raybet_match_id=str(row["raybet_match_id"]),
+        map_number=int(base["map_number"]),
+        decided_at=str(base["decided_at"]),
+    ):
+        return None
+    if eligible and (
+        len(draft_authority) != len(_DRAFT_AUTHORITY_FIELDS)
+        or len(vision_authority) != len(_VISION_AUTHORITY_FIELDS)
+        or connection.execute(
+            """SELECT 1 FROM verified_strategy_decision_vision_authority
+                WHERE decision_key=?""",
+            (base["decision_key"],),
+        ).fetchone()
+        is None
+        or not _valid_strategy_inputs(
+            connection,
+            public_inputs,
+            raybet_match_id=str(row["raybet_match_id"]),
+            map_number=int(base["map_number"]),
+            decided_at=str(base["decided_at"]),
+            market_probability=float(base["market_probability"]),
+            draft_authority=draft_authority,
+            vision_authority=vision_authority,
+            conservative=conservative,
+            expected_conservative_probability=expected_conservative_probability,
+            independent_positive=independent_positive,
+            require_eligible_gates=True,
+        )
+    ):
+        return None
+    if not eligible:
+        no_signal = not contributions and not conservative
+        if no_signal:
+            if (
+                draft_authority
+                or vision_authority
+                or not _valid_no_signal_decision(base, public_inputs)
+            ):
+                return None
+        elif (
+            not scored_payload_valid
+            or len(draft_authority) != len(_DRAFT_AUTHORITY_FIELDS)
+            or len(vision_authority) != len(_VISION_AUTHORITY_FIELDS)
+            or not _valid_strategy_inputs(
+                connection,
+                public_inputs,
+                raybet_match_id=str(row["raybet_match_id"]),
+                map_number=int(base["map_number"]),
+                decided_at=str(base["decided_at"]),
+                market_probability=float(base["market_probability"]),
+                draft_authority=draft_authority,
+                vision_authority=vision_authority,
+                conservative=conservative,
+                expected_conservative_probability=(
+                    expected_conservative_probability
+                ),
+                independent_positive=independent_positive,
+                require_eligible_gates=False,
+            )
+        ):
+            return None
+    return {
+        **base,
+        "contributions": contributions,
+        "conservative_contributions": conservative,
+        "inputs": public_inputs,
+        "draft_authority": draft_authority,
+        "vision_authority": vision_authority,
+    }
+
+
+def _strategy_base_values(row: sqlite3.Row) -> dict[str, Any] | None:
+    map_number = row["map_number"]
+    eligible = row["eligible"]
+    if type(map_number) is not int or map_number <= 0:
+        return None
+    if type(eligible) is not int or eligible not in {0, 1}:
+        return None
+    try:
+        market_probability = float(row["market_probability"])
+        model_probability = float(row["model_probability"])
+        edge = float(row["edge"])
+        data_quality = float(row["data_quality"])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (market_probability, model_probability, edge, data_quality)
+        )
+        or not 0.0 <= market_probability <= 1.0
+        or not 0.0 <= model_probability <= 1.0
+        or not 0.0 <= data_quality <= 1.0
+        or not -1.0 <= edge <= 1.0
+        or not math.isclose(
+            edge,
+            model_probability - market_probability,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        return None
+    decided_at = str(row["decided_at"] or "")
+    if _parse_time(decided_at) is None:
+        return None
+    decision_key = str(row["decision_key"] or "")
+    input_ref = str(row["input_ref"] or "")
+    reason = str(row["reason"] or "")
+    strategy_version = str(row["strategy_version"] or "")
+    if (
+        _DECISION_KEY_RE.fullmatch(decision_key) is None
+        or _INPUT_REF_RE.fullmatch(input_ref) is None
+        or not _is_opaque_ref(reason)
+        or not _is_opaque_ref(strategy_version)
+        or not _is_opaque_ref(str(row["raybet_match_id"] or ""))
+        or str(row["underdog_side"] or "") not in {"team_one", "team_two"}
+    ):
+        return None
+    return {
+        "decision_key": decision_key,
+        "map_number": map_number,
+        "decided_at": decided_at,
+        "underdog_side": str(row["underdog_side"]),
+        "market_probability": market_probability,
+        "model_probability": model_probability,
+        "edge": edge,
+        "data_quality": data_quality,
+        "eligible": eligible,
+        "reason": reason,
+        "input_ref": input_ref,
+        "strategy_version": strategy_version,
+    }
+
+
+def _finite_number_object(value: object) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, float] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or isinstance(item, bool) or not isinstance(
+            item, (int, float)
+        ):
+            return None
+        number = float(item)
+        if not math.isfinite(number):
+            return None
+        result[key] = number
+    return result
+
+
+def _strategy_probability(
+    market_probability: float,
+    contributions: dict[str, float],
+) -> float | None:
+    bounded = min(1.0 - 1e-6, max(1e-6, market_probability))
+    try:
+        score = math.log(bounded / (1.0 - bounded)) + math.fsum(
+            contributions.values()
+        )
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(score):
+        return None
+    if score >= 0.0:
+        inverse = math.exp(-score)
+        return 1.0 / (1.0 + inverse)
+    exponent = math.exp(score)
+    return exponent / (1.0 + exponent)
+
+
+def _independent_positive(contributions: dict[str, float]) -> bool:
+    return (
+        contributions.get("team_style", 0.0)
+        + contributions.get("late_game_style", 0.0)
+        > 0.0
+        or contributions.get("player_form", 0.0) > 0.0
+        or contributions.get("draft_curve", 0.0) > 0.0
+    )
+
+
+def _valid_conservative_contributions(
+    raw: dict[str, float],
+    conservative: dict[str, float],
+) -> bool:
+    tolerance = 1e-9
+    if not math.isclose(
+        conservative["market_movement"],
+        raw["market_movement"],
+        rel_tol=tolerance,
+        abs_tol=tolerance,
+    ):
+        return False
+    for key in _INDEPENDENT_CONTRIBUTION_KEYS:
+        raw_value = raw[key]
+        conservative_value = conservative[key]
+        if raw_value <= 0.0:
+            if not math.isclose(
+                conservative_value,
+                raw_value,
+                rel_tol=tolerance,
+                abs_tol=tolerance,
+            ):
+                return False
+        elif (
+            conservative_value < -tolerance
+            or conservative_value > raw_value + tolerance
+        ):
+            return False
+    return True
+
+
+def _valid_no_signal_decision(
+    base: dict[str, Any],
+    inputs: Any,
+) -> bool:
+    if not isinstance(inputs, dict):
+        return False
+    market = inputs.get("market")
+    vision = inputs.get("vision")
+    if not isinstance(market, dict) or not isinstance(vision, dict):
+        return False
+    market_probability = market.get("underdog_probability")
+    market_price = market.get("underdog_price")
+    missing_markets = market.get("missing_markets")
+    captured_at = _parse_time(vision.get("captured_at"))
+    decided_at = _parse_time(base.get("decided_at"))
+    game_clock = vision.get("game_clock_seconds")
+    radiant_team_side = vision.get("radiant_team_side")
+    return (
+        math.isclose(
+            float(base["model_probability"]),
+            float(base["market_probability"]),
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        and math.isclose(float(base["edge"]), 0.0, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(
+            float(base["data_quality"]), 0.0, rel_tol=0.0, abs_tol=1e-9
+        )
+        and market.get("underdog_side") == base["underdog_side"]
+        and _bounded_number(market_probability, 0.0, 1.0)
+        and math.isclose(
+            float(market_probability),
+            float(base["market_probability"]),
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        and _finite_number_greater_than(market_price, 1.0)
+        and _bounded_number(market.get("quality"), 0.0, 1.0)
+        and isinstance(missing_markets, list)
+        and all(
+            isinstance(item, str) and _is_opaque_ref(item)
+            for item in missing_markets
+        )
+        and captured_at is not None
+        and decided_at is not None
+        and captured_at <= decided_at
+        and isinstance(vision.get("source_frame_ref"), str)
+        and re.fullmatch(
+            rf"{re.escape(VISION_FRAME_REF_PREFIX)}[0-9a-f]{{64}}",
+            vision["source_frame_ref"],
+        )
+        is not None
+        and (game_clock is None or _nonnegative_int(game_clock))
+        and radiant_team_side in {None, "team_one", "team_two"}
+    )
+
+
+def _valid_draft_authority(authority: dict[str, Any]) -> bool:
+    digest_fields = (
+        "curve_key",
+        "landmark_key",
+        "deployment_key",
+        "target_snapshot_hash",
+        "feature_hash",
+        "model_hash",
+        "calibration_hash",
+        "input_snapshot_hash",
+    )
+    if any(not _is_sha256(authority.get(field)) for field in digest_fields):
+        return False
+    if authority.get("source_ref") != (
+        f"prospective-draft:{authority['curve_key']}"
+    ):
+        return False
+    if (
+        authority.get("landmark_horizon_minutes") not in {10, 20, 30, 40, 50}
+        or authority.get("landmark_target") != "radiant_win"
+        or authority.get("radiant_team_side") not in {"team_one", "team_two"}
+        or not _positive_int(authority.get("landmark_support"), minimum=100)
+        or not _positive_int(authority.get("strict_mapping_id"))
+        or not _positive_int(authority.get("authority_revision"))
+        or not _positive_int(authority.get("dependency_revision"))
+        or not _is_opaque_ref(authority.get("model_version"))
+        or not _is_opaque_ref(authority.get("global_gate_ref"))
+    ):
+        return False
+    return all(
+        _bounded_number(authority.get(field), lower, upper)
+        for field, lower, upper in (
+            ("landmark_radiant_probability", 0.0, 1.0),
+            ("landmark_quality", 0.0, 1.0),
+            ("landmark_uncertainty", 0.0, 0.5),
+        )
+    )
+
+
+def _valid_strategy_inputs(
+    connection: sqlite3.Connection,
+    inputs: Any,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    decided_at: str,
+    market_probability: float,
+    draft_authority: dict[str, Any],
+    vision_authority: dict[str, Any],
+    conservative: dict[str, float],
+    expected_conservative_probability: float,
+    independent_positive: bool,
+    require_eligible_gates: bool,
+) -> bool:
+    if not isinstance(inputs, dict):
+        return False
+    input_draft = inputs.get("draft_authority")
+    input_vision = inputs.get("vision")
+    strict = inputs.get("strict_live_eligibility")
+    transport = inputs.get("transport")
+    input_conservative = inputs.get("conservative_contributions")
+    conservative_probability = inputs.get("conservative_probability")
+    if (
+        not isinstance(input_draft, dict)
+        or not isinstance(input_vision, dict)
+        or not isinstance(strict, dict)
+        or not isinstance(transport, dict)
+        or not isinstance(input_conservative, dict)
+        or _finite_number_object(input_conservative) != conservative
+        or not _bounded_number(conservative_probability, 0.0, 1.0)
+        or not math.isclose(
+            float(conservative_probability),
+            expected_conservative_probability,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        or inputs.get("independent_positive") is not independent_positive
+        or (
+            require_eligible_gates
+            and float(conservative_probability) <= market_probability
+        )
+        or (require_eligible_gates and not independent_positive)
+    ):
+        return False
+    decision_time = _parse_time(decided_at)
+    if decision_time is None:
+        return False
+    mapping_refs = strict.get("mapping_refs")
+    mapping_id = draft_authority.get("strict_mapping_id")
+    if not isinstance(mapping_refs, dict) or not _positive_int(mapping_id):
+        return False
+    mapping_snapshot = query_strict_mapping_snapshot(
+        connection,
+        mapping_id=mapping_id,
+        observed_at=decision_time,
+    )
+    if (
+        not mapping_snapshot.eligible
+        or mapping_snapshot.mapping is None
+        or mapping_snapshot.raybet_match_id != raybet_match_id
+        or mapping_snapshot.map_number != map_number
+        or mapping_refs != mapping_snapshot.mapping.input_refs()
+    ):
+        return False
+    draft_pairs = (
+        ("curve_key", "curve_key"),
+        ("source_ref", "source_ref"),
+        ("landmark_key", "landmark_key"),
+        ("horizon_minutes", "landmark_horizon_minutes"),
+        ("target", "landmark_target"),
+        ("radiant_probability", "landmark_radiant_probability"),
+        ("quality", "landmark_quality"),
+        ("uncertainty", "landmark_uncertainty"),
+        ("support", "landmark_support"),
+        ("radiant_team_side", "radiant_team_side"),
+        ("strict_mapping_id", "strict_mapping_id"),
+        ("deployment_key", "deployment_key"),
+        ("target_snapshot_hash", "target_snapshot_hash"),
+        ("feature_hash", "feature_hash"),
+        ("model_hash", "model_hash"),
+        ("calibration_hash", "calibration_hash"),
+        ("model_version", "model_version"),
+        ("global_gate_ref", "global_gate_ref"),
+        ("input_snapshot_hash", "input_snapshot_hash"),
+        ("authority_revision", "authority_revision"),
+        ("dependency_revision", "dependency_revision"),
+    )
+    if set(input_draft) != {input_key for input_key, _ in draft_pairs} or any(
+        input_draft[input_key] != draft_authority.get(authority_key)
+        for input_key, authority_key in draft_pairs
+    ):
+        return False
+    if set(input_vision) != {
+        "captured_at",
+        "source_frame_ref",
+        "game_clock_seconds",
+        "radiant_team_side",
+    }:
+        return False
+    transport_at = _parse_time(transport.get("current_at"))
+    authority_transport_at = _parse_time(vision_authority.get("transport_at"))
+    return (
+        input_vision.get("captured_at") == vision_authority.get("captured_at")
+        and input_vision.get("source_frame_ref")
+        == vision_authority.get("source_frame_ref")
+        and input_vision.get("game_clock_seconds")
+        == vision_authority.get("aligned_game_clock_seconds")
+        and input_vision.get("radiant_team_side")
+        == vision_authority.get("radiant_team_side")
+        and transport.get("current_key") == vision_authority.get("transport_key")
+        and transport_at is not None
+        and authority_transport_at is not None
+        and transport_at == authority_transport_at == decision_time
+    )
+
+
+def _valid_vision_authority(
+    authority: dict[str, Any],
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    decided_at: str,
+) -> bool:
+    frame_sha256 = authority.get("source_frame_sha256")
+    frame_ref = authority.get("source_frame_ref")
+    radiant = _five_hero_ids(authority.get("radiant_hero_ids_json"))
+    dire = _five_hero_ids(authority.get("dire_hero_ids_json"))
+    captured_at = _parse_time(authority.get("captured_at"))
+    transport_at = _parse_time(authority.get("transport_at"))
+    decision_time = _parse_time(decided_at)
+    lag_seconds = authority.get("alignment_lag_seconds")
+    observed_clock = authority.get("observed_game_clock_seconds")
+    aligned_clock = authority.get("aligned_game_clock_seconds")
+    if (
+        authority.get("raybet_match_id") != raybet_match_id
+        or authority.get("map_number") != map_number
+        or not _is_sha256(frame_sha256)
+        or frame_ref != f"{VISION_FRAME_REF_PREFIX}{frame_sha256}"
+        or not _positive_int(authority.get("source_frame_bytes"))
+        or not _nonnegative_int(authority.get("observed_game_clock_seconds"))
+        or not _nonnegative_int(authority.get("aligned_game_clock_seconds"))
+        or authority.get("is_paused") != 0
+        or radiant is None
+        or dire is None
+        or len(set(radiant + dire)) != 10
+        or authority.get("radiant_team_side") not in {"team_one", "team_two"}
+        or authority.get("screen_state") != "game"
+        or authority.get("confirmed") != 1
+        or not _is_opaque_ref(authority.get("transport_key"))
+        or authority.get("alignment_method") not in {"anchor", "forward_projection"}
+        or captured_at is None
+        or transport_at is None
+        or decision_time is None
+        or transport_at != decision_time
+        or captured_at > transport_at
+        or not _bounded_number(lag_seconds, 0.0, 15.0)
+        or not math.isclose(
+            float(lag_seconds),
+            (transport_at - captured_at).total_seconds(),
+            rel_tol=0.0,
+            abs_tol=0.001,
+        )
+        or aligned_clock != int(int(observed_clock) + float(lag_seconds))
+        or authority.get("alignment_method")
+        != ("forward_projection" if float(lag_seconds) >= 1.0 else "anchor")
+    ):
+        return False
+    return all(
+        _bounded_number(authority.get(field), lower, upper)
+        for field, lower, upper in (
+            ("clock_confidence", 0.0, 1.0),
+            ("draft_confidence", 0.0, 1.0),
+            ("alignment_lag_seconds", 0.0, 15.0),
+        )
+    )
+
+
+def _authority_object(
+    row: sqlite3.Row,
+    prefix: str,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for field in fields:
+        value = row[f"{prefix}_{field}"]
+        if value is None:
+            continue
+        if field.endswith("_json"):
+            try:
+                value = json.loads(str(value))
+            except (TypeError, ValueError):
+                return {}
+        result[field] = value
+    return result
+
+
+def _public_evidence_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> Any:
+    if budget is None:
+        budget = [_MAX_PUBLIC_EVIDENCE_NODES]
+    budget[0] -= 1
+    if budget[0] < 0 or depth > _MAX_PUBLIC_EVIDENCE_DEPTH:
+        return _INVALID_EVIDENCE
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not _safe_evidence_key(key):
+                return _INVALID_EVIDENCE
+            lowered = key.casefold()
+            if lowered.endswith("_path") or lowered in {
+                "storage_path",
+                "raw_json",
+                "raw_payload",
+            }:
+                continue
+            if not _valid_nested_reference(lowered, item):
+                return _INVALID_EVIDENCE
+            public = _public_evidence_value(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
+            if public is _INVALID_EVIDENCE:
+                return _INVALID_EVIDENCE
+            result[key] = public
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            public = _public_evidence_value(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
+            if public is _INVALID_EVIDENCE:
+                return _INVALID_EVIDENCE
+            result.append(public)
+        return result
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _INVALID_EVIDENCE
+    if isinstance(value, str):
+        return (
+            value
+            if len(value) <= _MAX_PUBLIC_EVIDENCE_STRING
+            else _INVALID_EVIDENCE
+        )
+    if value is None or isinstance(value, (int, bool)):
+        return value
+    return _INVALID_EVIDENCE
+
+
+def _valid_nested_reference(key: str, value: Any) -> bool:
+    if value is None or not isinstance(value, str):
+        return True
+    if key == "source_frame_ref":
+        return bool(
+            re.fullmatch(
+                rf"{re.escape(VISION_FRAME_REF_PREFIX)}[0-9a-f]{{64}}",
+                value,
+            )
+        )
+    if key.endswith("_hash") or key in {
+        "curve_key",
+        "landmark_key",
+        "deployment_key",
+    }:
+        return _is_sha256(value)
+    if key.endswith("_ref") or key.endswith("_key"):
+        return _is_opaque_ref(value)
+    return True
+
+
+def _safe_evidence_key(value: str) -> bool:
+    return (
+        0 < len(value) <= 128
+        and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+    )
+
+
+def _is_opaque_ref(value: object) -> bool:
+    return isinstance(value, str) and _OPAQUE_REF_RE.fullmatch(value) is not None
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
+def _positive_int(value: object, *, minimum: int = 1) -> bool:
+    return type(value) is int and value >= minimum
+
+
+def _nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _bounded_number(value: object, lower: float, upper: float) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and lower <= float(value) <= upper
+    )
+
+
+def _finite_number_greater_than(value: object, lower: float) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) > lower
+    )
 
 
 def _latest_strategy_decision(
     connection: sqlite3.Connection,
     raybet_match_id: str,
+    *,
+    now: datetime,
 ) -> sqlite3.Row | None:
+    required_relations = {
+        "strategy_decisions": {
+            "decision_key",
+            "raybet_match_id",
+            "map_number",
+            "decided_at",
+            "model_probability",
+            "market_probability",
+            "edge",
+            "eligible",
+            "reason",
+            "strategy_version",
+        },
+        "vision_derived_invalidations": {"dependent_type", "dependent_key"},
+        "strict_live_mapping_impacts": {"dependent_type", "dependent_key"},
+        "vision_draft_anchors": {
+            "raybet_match_id",
+            "map_number",
+            "status",
+            "conflict_at",
+        },
+        "vision_draft_conflicts": {"raybet_match_id", "map_number", "captured_at"},
+    }
+    if any(
+        not _relation_has_columns(connection, relation, columns)
+        for relation, columns in required_relations.items()
+    ):
+        return None
     try:
         return connection.execute(
             """SELECT decided_at AS observed_at, map_number, model_probability,
                       market_probability, edge, eligible, reason, strategy_version
                  FROM strategy_decisions AS decision
                 WHERE decision.raybet_match_id=?
+                  AND julianday(decision.decided_at)<=julianday(?)
                   AND NOT EXISTS (
                       SELECT 1 FROM vision_derived_invalidations AS invalidation
                        WHERE invalidation.dependent_type='strategy_decision'
@@ -1511,10 +3111,12 @@ def _latest_strategy_decision(
                          )
                   )
                 ORDER BY decision.decided_at DESC LIMIT 1""",
-            (raybet_match_id,),
+            (raybet_match_id, now.isoformat()),
         ).fetchone()
-    except sqlite3.OperationalError:
-        return None
+    except sqlite3.OperationalError as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return None
+        raise
 
 
 def _vision_timeline(
@@ -1663,8 +3265,7 @@ def _valid_vision_rows(
             ).fetchall()
         )
     except sqlite3.OperationalError as error:
-        message = str(error).casefold()
-        if "no such table" in message or "no such column" in message:
+        if classify_sqlite_error(error) == "schema_missing":
             return []
         raise
 
@@ -1783,6 +3384,8 @@ def _ended_schedule_is_trustworthy(
 def _latest_odds_activity(
     connection: sqlite3.Connection,
     raybet_match_id: str,
+    *,
+    now: datetime,
 ) -> datetime | None:
     """Return the newest immutable odds activity for archive gating.
 
@@ -1797,9 +3400,10 @@ def _latest_odds_activity(
         connection,
         """SELECT observed_at
              FROM odds_transport_observations
-            WHERE raybet_match_id=?
+             WHERE raybet_match_id=?
+               AND julianday(observed_at)<=julianday(?)
             ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
-        (raybet_match_id,),
+        (raybet_match_id, now.isoformat()),
     )
     if transport is not None:
         parsed = _parse_time(transport["observed_at"])
@@ -1809,9 +3413,10 @@ def _latest_odds_activity(
         connection,
         """SELECT received_at
              FROM odds_snapshots
-            WHERE raybet_match_id=?
+             WHERE raybet_match_id=?
+               AND julianday(received_at)<=julianday(?)
             ORDER BY received_at DESC, id DESC LIMIT 1""",
-        (raybet_match_id,),
+        (raybet_match_id, now.isoformat()),
     )
     if snapshot is not None:
         parsed = _parse_time(snapshot["received_at"])
@@ -1915,6 +3520,35 @@ def _has_transport_observations(
     )
 
 
+def _relation_columns(
+    connection: sqlite3.Connection,
+    relation: str,
+) -> frozenset[str] | None:
+    if re.fullmatch(r"[A-Za-z0-9_]+", relation) is None:
+        raise ValueError("invalid SQLite relation name")
+    exists = connection.execute(
+        """SELECT 1 FROM sqlite_master
+            WHERE type IN ('table', 'view') AND name=?""",
+        (relation,),
+    ).fetchone()
+    if exists is None:
+        return None
+    try:
+        rows = connection.execute(f'PRAGMA table_info("{relation}")').fetchall()
+    except sqlite3.Error:
+        return frozenset()
+    return frozenset(str(row[1]) for row in rows)
+
+
+def _relation_has_columns(
+    connection: sqlite3.Connection,
+    relation: str,
+    required: set[str] | frozenset[str],
+) -> bool:
+    columns = _relation_columns(connection, relation)
+    return columns is not None and required <= columns
+
+
 def _rows(
     connection: sqlite3.Connection,
     query: str,
@@ -1923,7 +3557,7 @@ def _rows(
     try:
         return list(connection.execute(query, params).fetchall())
     except sqlite3.OperationalError as error:
-        if "no such table" in str(error):
+        if classify_sqlite_error(error) == "schema_missing":
             return []
         raise
 
@@ -1936,7 +3570,7 @@ def _latest_row(
     try:
         return connection.execute(query, params).fetchone()
     except sqlite3.OperationalError as error:
-        if "no such table" in str(error):
+        if classify_sqlite_error(error) == "schema_missing":
             return None
         raise
 
@@ -1951,7 +3585,7 @@ def _scalar(
     try:
         row = connection.execute(query, params).fetchone()
     except sqlite3.OperationalError as error:
-        if "no such table" in str(error):
+        if classify_sqlite_error(error) == "schema_missing":
             return default
         raise
     return row[0] if row is not None else default
