@@ -51,6 +51,9 @@ const INPUT_REF = "c".repeat(24);
 const CURVE_KEY = "d".repeat(64);
 const LANDMARK_10 = "e".repeat(64);
 const LANDMARK_20 = "f".repeat(64);
+const ROSH_SCORE_KEY = "1".repeat(64);
+const ROSH_EVIDENCE_HASH = "2".repeat(64);
+const ROSH_PLAYER_IDENTITY_HASH = "3".repeat(64);
 
 const match: MonitorMatch = {
   raybet_match_id: "match-1",
@@ -183,6 +186,16 @@ function fixtureStrategyDecision(
   return decision;
 }
 
+function scoredBlockedDecision(analysis: MatchAnalysis): StrategyDecision {
+  return {
+    ...structuredClone(fixtureStrategyDecision(analysis, 1)),
+    decision_key: "4".repeat(32),
+    input_ref: "5".repeat(24),
+    eligible: 0,
+    reason: "edge_below_threshold",
+  };
+}
+
 function lineupData(overrides: Partial<LineupAnalysisData> = {}): LineupAnalysisData {
   return {
     as_of: "2026-07-16T12:02:00+00:00",
@@ -199,6 +212,7 @@ function lineupData(overrides: Partial<LineupAnalysisData> = {}): LineupAnalysis
       anchored_at: "2026-07-16T12:01:58+00:00",
       strict_mapping_id: 42,
     },
+    scores: analysisSection("waiting", "rosh_lineup_score_pending", null),
     active_curve: analysisSection("available", "active_curve_available", {
       curve_key: CURVE_KEY,
       first_usable_at: "2026-07-16T12:01:59+00:00",
@@ -558,9 +572,19 @@ describe("MatchWorkspace", () => {
   });
 
   it("renders the backend mixed golden without dropping blocked or eligible decisions", () => {
-    const goldenAnalysis = goldenAvailableAnalysis as unknown as MatchAnalysis;
+    const goldenAnalysis = structuredClone(goldenAvailableAnalysis) as unknown as MatchAnalysis;
     const goldenDecision = fixtureStrategyDecision(goldenAnalysis, 1);
-    const blockedDecision = fixtureStrategyDecision(goldenAnalysis, 0);
+    const blockedDecision = scoredBlockedDecision(goldenAnalysis);
+    goldenAnalysis.strategy.data!.decisions = [blockedDecision, goldenDecision];
+    goldenAnalysis.strategy.data!.displayed_count = 2;
+    goldenAnalysis.strategy.data!.scanned_count = 2;
+    goldenAnalysis.strategy.data!.excluded_decision_count = 0;
+    goldenAnalysis.strategy.data!.excluded = {
+      vision_invalidated: 0,
+      mapping_impacted: 0,
+      draft_conflicted: 0,
+      invalid_payload: 0,
+    };
     const decisionKey = goldenDecision.decision_key!;
     const inputRef = goldenDecision.input_ref!;
     const view = render(
@@ -613,8 +637,8 @@ describe("MatchWorkspace", () => {
     expect(within(blockedRow).getByText("未满足策略门槛")).toBeInTheDocument();
     expect(within(blockedRow).getByText(blockedDecision.reason)).toBeInTheDocument();
     expect(within(blockedRow).getByText("队伍风格")).toBeInTheDocument();
-    expect(within(blockedRow).getByText("Δlogit +0.147")).toBeInTheDocument();
-    expect(within(blockedRow).getByText("保守 +0.118")).toBeInTheDocument();
+    expect(within(blockedRow).getByText("Δlogit +0.650")).toBeInTheDocument();
+    expect(within(blockedRow).getByText("保守 +0.520")).toBeInTheDocument();
     expect(within(blockedRow).getByText("test-draft-model-v1")).toBeInTheDocument();
     expect(within(blockedRow).queryByText("没有持久化贡献项")).not.toBeInTheDocument();
     expect(within(strategy).queryByText("strategy_evidence_invalid")).not.toBeInTheDocument();
@@ -650,10 +674,17 @@ describe("MatchWorkspace", () => {
 
   it("renders a fully scored blocked decision without weakening eligible validation", () => {
     const analysis = structuredClone(goldenAvailableAnalysis) as unknown as MatchAnalysis;
-    const scoredBlocked = fixtureStrategyDecision(analysis, 0);
+    const scoredBlocked = scoredBlockedDecision(analysis);
     analysis.strategy.data!.decisions = [scoredBlocked];
     analysis.strategy.data!.displayed_count = 1;
     analysis.strategy.data!.scanned_count = 1;
+    analysis.strategy.data!.excluded_decision_count = 0;
+    analysis.strategy.data!.excluded = {
+      vision_invalidated: 0,
+      mapping_impacted: 0,
+      draft_conflicted: 0,
+      invalid_payload: 0,
+    };
     const view = render(
       <MatchWorkspace
         detail={detailWithAnalysis(analysis)}
@@ -669,7 +700,7 @@ describe("MatchWorkspace", () => {
 
     expect(within(section).getByText("未满足策略门槛")).toBeInTheDocument();
     expect(within(section).getByText("edge_below_threshold")).toBeInTheDocument();
-    expect(within(section).getByText("Δlogit +0.147")).toBeInTheDocument();
+    expect(within(section).getByText("Δlogit +0.650")).toBeInTheDocument();
     expect(within(section).queryByText("strategy_evidence_invalid")).not.toBeInTheDocument();
   });
 
@@ -1074,6 +1105,132 @@ describe("MatchWorkspace", () => {
     expect(screen.queryByText("当前胜率", { exact: true })).not.toBeInTheDocument();
     expect(screen.getByText(/实时选手身份不可用/)).toBeInTheDocument();
     expect(screen.getByText("live_player_identity_unavailable")).toBeInTheDocument();
+  });
+
+  it("shows pure and player-adjusted Rosh scores in the lineup and evidence summary", () => {
+    const scored = lineupData({
+      scores: analysisSection("available", "rosh_lineup_score_available", {
+        pure_lineup_score: 3.2,
+        player_adjusted_lineup_score: 4.1,
+        effective_lineup_score: 4.1,
+        mode: "player_adjusted",
+        player_coverage: 1,
+        player_coverage_count: 10,
+        stake_multiplier: 1,
+        formula_version: "dematus-rosh-v1",
+        source_as_of: "2026-07-16T11:58:00+00:00",
+        score_key: ROSH_SCORE_KEY,
+        player_identity_hash: ROSH_PLAYER_IDENTITY_HASH,
+        evidence_hash: ROSH_EVIDENCE_HASH,
+        stake_cap: 1,
+      }),
+      players: analysisSection("available", "rosh_player_identity_available", {
+        players: Array.from({ length: 10 }, (_, slot) => ({
+          steam_account_id: 1000 + slot,
+          side: slot < 5 ? "radiant" as const : "dire" as const,
+          position: (slot % 5) + 1,
+          hero_id: slot + 1,
+          status: "resolved" as const,
+        })),
+      }),
+    });
+    render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(matchAnalysis({
+          lineup: analysisSection("available", "lineup_available", scored),
+        }))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByText("纯阵容评分")).toBeInTheDocument();
+    expect(screen.getByText("选手修正后实际阵容评分")).toBeInTheDocument();
+    expect(screen.getByText("+3.2 pp")).toBeInTheDocument();
+    expect(screen.getAllByText("+4.1 pp").length).toBeGreaterThan(1);
+    expect(screen.getAllByText(/选手覆盖 100\.0%/).length).toBeGreaterThan(1);
+    expect(screen.getByText("选手修正评分")).toBeInTheDocument();
+    expect(screen.getByText(ROSH_SCORE_KEY)).toBeInTheDocument();
+    expect(screen.getByText(ROSH_EVIDENCE_HASH)).toBeInTheDocument();
+    expect(screen.getByText("Steam 1000")).toBeInTheDocument();
+    expect(screen.getAllByText("已用于选手修正")).toHaveLength(10);
+  });
+
+  it("marks a pure-score fallback as unavailable player correction and half stake", () => {
+    const fallback = lineupData({
+      scores: analysisSection("available", "rosh_lineup_score_available", {
+        pure_lineup_score: -2.4,
+        player_adjusted_lineup_score: null,
+        effective_lineup_score: -2.4,
+        mode: "pure",
+        player_coverage: 0.6,
+        player_coverage_count: 6,
+        stake_multiplier: 0.5,
+        formula_version: "dematus-rosh-v1",
+        source_as_of: "2026-07-16T11:58:00+00:00",
+        score_key: ROSH_SCORE_KEY,
+        player_identity_hash: ROSH_PLAYER_IDENTITY_HASH,
+        evidence_hash: ROSH_EVIDENCE_HASH,
+        stake_cap: 0.5,
+      }),
+      players: analysisSection("available", "rosh_player_identity_partial", {
+        players: Array.from({ length: 10 }, (_, slot) => ({
+          steam_account_id: slot < 8 ? 2000 + slot : null,
+          side: slot < 5 ? "radiant" as const : "dire" as const,
+          position: (slot % 5) + 1,
+          hero_id: slot + 1,
+          status: slot < 6
+            ? "resolved" as const
+            : slot < 8
+              ? "selected_unresolved" as const
+              : "unavailable" as const,
+        })),
+      }),
+    });
+    render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(matchAnalysis({
+          lineup: analysisSection("available", "lineup_available", fallback),
+        }))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getAllByText("不可用").length).toBeGreaterThan(0);
+    expect(screen.getByText(/回退采用纯阵容评分 · 仓位上限 50\.0%/)).toBeInTheDocument();
+    expect(screen.getByText("纯阵容回退")).toBeInTheDocument();
+    expect(screen.getByText(/纯阵容半仓回退/)).toBeInTheDocument();
+    expect(screen.getByText("Steam 2006")).toBeInTheDocument();
+    expect(screen.getAllByText("身份可信，修正数据不可用")).toHaveLength(2);
+  });
+
+  it("shows waiting instead of fabricating a missing Rosh score", () => {
+    const waiting = lineupData({
+      scores: analysisSection("waiting", "rosh_lineup_score_pending", null),
+    });
+    render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(matchAnalysis({
+          lineup: analysisSection("available", "lineup_available", waiting),
+        }))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getAllByText("rosh_lineup_score_pending").length).toBeGreaterThan(0);
+    expect(screen.queryByText("纯阵容评分")).not.toBeInTheDocument();
+    expect(screen.queryByText("选手修正后实际阵容评分")).not.toBeInTheDocument();
   });
 
   it("fails closed for duplicate heroes and invalid active curve points", () => {

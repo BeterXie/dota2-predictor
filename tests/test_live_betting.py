@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -24,6 +26,7 @@ from live_betting.models import (
     Market,
     ModelQuote,
     OddsSnapshot,
+    RoshLineupScore,
 )
 from live_betting.pricing import devig
 from live_betting.postmatch_monitor import _winner
@@ -180,6 +183,25 @@ class StrategyTests(unittest.TestCase):
         )
         rejected = attempt_fill(order, self.snapshot(NOW + timedelta(seconds=3), 1.80))
         self.assertEqual((rejected.status, rejected.rejection_reason), ("rejected", "slippage"))
+
+    def test_rejects_invalid_stake_multiplier_types_and_values(self) -> None:
+        snapshot = self.snapshot(NOW)
+        quote = ModelQuote(
+            "m", "game", snapshot.market, 0.60, 0.50, 0.10, NOW, "v1", "frame1"
+        )
+        for value in (True, "1.0", None, float("nan"), float("inf"), 0.0, 1.01):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "stake multiplier must be greater than 0 and at most 1"
+                ):
+                    make_order(
+                        quote,
+                        snapshot,
+                        min_edge=0.05,
+                        signal_transport_key="signal",
+                        signal_transport_at=NOW,
+                        stake_multiplier=value,
+                    )
 
     def test_settled_status_five_cannot_signal_or_fill(self) -> None:
         snapshot = self.snapshot(NOW)
@@ -695,6 +717,13 @@ class ComebackStrategyTests(unittest.TestCase):
         decided_at: datetime = NOW,
         signal_transport_key: str = "current",
     ) -> dict:
+        draft_hash = hashlib.sha256(
+            json.dumps(
+                {"radiant": [1, 2, 3, 4, 5], "dire": [6, 7, 8, 9, 10]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         return dict(
             observation=observation or self.observation(),
             underdog_style=self.style(2, 0.7, 0.2, 0.8),
@@ -720,6 +749,33 @@ class ComebackStrategyTests(unittest.TestCase):
             )),
             decided_at=decided_at,
             signal_transport_key=signal_transport_key,
+            rosh_lineup_score=RoshLineupScore(
+                score_key="a" * 64,
+                draft_hash=draft_hash,
+                player_identity_hash="c" * 64,
+                pure_lineup_score=-20.0,
+                player_adjusted_lineup_score=None,
+                effective_lineup_score=-20.0,
+                scoring_mode="pure",
+                player_coverage_count=0,
+                stake_multiplier=0.5,
+                formula_version="dematus-rosh-test",
+                source_name="stratz",
+                source_week=1_773_619_200,
+                cache_week_start=1_773_619_200,
+                source_as_of=NOW,
+                evidence_hash="b" * 64,
+                evidence={
+                    "pure_minute_table": [
+                        {
+                            "minute": 30,
+                            "win_rate_graph": -20.0,
+                            "match_percentage": 100.0,
+                        }
+                    ],
+                    "minute_table": [],
+                },
+            ),
         )
 
     def test_requires_two_stable_snapshots_and_one_attempt_per_map(self) -> None:

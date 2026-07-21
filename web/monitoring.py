@@ -21,6 +21,8 @@ from live_betting.draft_authority import (
 )
 from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
 from live_betting.sanitize import stored_public_stream_url
+from live_betting.storage import query_rosh_lineup_score_for_trusted_draft
+from live_betting.stratz_rosh_client import ROSH_FORMULA_VERSION
 from live_betting.strict_eligibility import (
     RAYBET_MATCH_HEAD_TO_HEAD,
     RAYBET_MATCH_NON_HEAD_TO_HEAD,
@@ -74,6 +76,7 @@ _CONTRIBUTION_KEYS = frozenset(
         "team_style",
         "player_form",
         "draft_curve",
+        "lineup_rosh",
         "late_game_style",
         "market_movement",
     }
@@ -83,12 +86,16 @@ _REQUIRED_CONTRIBUTION_KEYS = frozenset(
         "team_style",
         "player_form",
         "draft_curve",
+        "lineup_rosh",
         "late_game_style",
         "market_movement",
     }
 )
+_LEGACY_REQUIRED_CONTRIBUTION_KEYS = _REQUIRED_CONTRIBUTION_KEYS - {
+    "lineup_rosh"
+}
 _INDEPENDENT_CONTRIBUTION_KEYS = frozenset(
-    {"team_style", "player_form", "draft_curve", "late_game_style"}
+    {"team_style", "player_form", "lineup_rosh", "late_game_style"}
 )
 _DRAFT_AUTHORITY_FIELDS = (
     "curve_key",
@@ -1819,6 +1826,47 @@ def _lineup_analysis(
         game_clock_seconds=int(observation["game_clock_seconds"]),
         now=checked_at,
     )
+    rosh_score = query_rosh_lineup_score_for_trusted_draft(
+        connection,
+        raybet_match_id=raybet_match_id,
+        map_number=int(anchor["map_number"]),
+        strict_mapping_id=mapping_id,
+        draft_hash=str(anchor["draft_hash"]),
+        radiant_hero_ids=context["radiant"],
+        dire_hero_ids=context["dire"],
+        as_of=checked_at,
+        formula_version=ROSH_FORMULA_VERSION,
+    )
+    scores = (
+        _analysis_section("waiting", "rosh_lineup_score_pending")
+        if rosh_score is None
+        else _analysis_section(
+            "available",
+            "rosh_lineup_score_available",
+            {
+                "pure_lineup_score": rosh_score.pure_score,
+                "player_adjusted_lineup_score": (
+                    rosh_score.player_adjusted_score
+                ),
+                "effective_lineup_score": rosh_score.effective_score,
+                "mode": rosh_score.mode,
+                "player_coverage": rosh_score.player_coverage,
+                "player_coverage_count": rosh_score.player_coverage_count,
+                "stake_multiplier": rosh_score.stake_multiplier,
+                "formula_version": rosh_score.formula_version,
+                "source_as_of": rosh_score.source_as_of.isoformat(),
+                "score_key": rosh_score.score_key,
+                "player_identity_hash": rosh_score.player_identity_hash,
+                "evidence_hash": rosh_score.evidence_hash,
+                "stake_cap": rosh_score.stake_cap,
+            },
+        )
+    )
+    players = _rosh_player_identity(
+        rosh_score,
+        radiant=context["radiant"],
+        dire=context["dire"],
+    )
     return _analysis_section(
         "available",
         "lineup_available",
@@ -1834,11 +1882,85 @@ def _lineup_analysis(
                 "anchored_at": str(anchor["anchored_at"]),
                 "strict_mapping_id": mapping_id,
             },
+            "scores": scores,
             "active_curve": curve,
-            "players": _analysis_section(
-                "unavailable", "live_player_identity_unavailable"
-            ),
+            "players": players,
         },
+    )
+
+
+def _rosh_player_identity(
+    score: Any,
+    *,
+    radiant: tuple[int, ...],
+    dire: tuple[int, ...],
+) -> dict[str, Any]:
+    if score is None or score.player_coverage_count == 0:
+        return _analysis_section(
+            "unavailable", "live_player_identity_unavailable"
+        )
+    slots = score.evidence.get("player_slots")
+    if not isinstance(slots, list) or len(slots) != 10:
+        return _analysis_section("review", "rosh_player_identity_evidence_invalid")
+    expected_heroes = (*radiant, *dire)
+    players: list[dict[str, Any]] = []
+    seen_slots: set[int] = set()
+    resolved_count = 0
+    for value in slots:
+        if not isinstance(value, dict):
+            return _analysis_section(
+                "review", "rosh_player_identity_evidence_invalid"
+            )
+        slot = value.get("slot")
+        position = value.get("position")
+        hero_id = value.get("hero_id")
+        steam_id = value.get("steam_account_id")
+        selected = value.get("selected")
+        resolved = value.get("resolved")
+        if (
+            type(slot) is not int
+            or slot not in range(10)
+            or slot in seen_slots
+            or value.get("side") != ("radiant" if slot < 5 else "dire")
+            or type(position) is not int
+            or position != (slot % 5) + 1
+            or type(hero_id) is not int
+            or hero_id != expected_heroes[slot]
+            or (steam_id is not None and not _positive_int(steam_id))
+            or type(selected) is not bool
+            or type(resolved) is not bool
+            or (resolved and (not selected or not _positive_int(steam_id)))
+        ):
+            return _analysis_section(
+                "review", "rosh_player_identity_evidence_invalid"
+            )
+        seen_slots.add(slot)
+        resolved_count += int(resolved)
+        players.append(
+            {
+                "steam_account_id": steam_id,
+                "side": value["side"],
+                "position": position,
+                "hero_id": hero_id,
+                "status": (
+                    "resolved"
+                    if resolved
+                    else "selected_unresolved"
+                    if selected
+                    else "unavailable"
+                ),
+            }
+        )
+    if resolved_count != score.player_coverage_count:
+        return _analysis_section("review", "rosh_player_identity_evidence_invalid")
+    return _analysis_section(
+        "available",
+        (
+            "rosh_player_identity_available"
+            if resolved_count == 10
+            else "rosh_player_identity_partial"
+        ),
+        {"players": players},
     )
 
 
@@ -2379,9 +2501,26 @@ def _public_strategy_decision(
         conservative,
     )
     independent_positive = _independent_positive(contributions)
+    contribution_keys = set(contributions)
+    conservative_keys = set(conservative)
+    contribution_schema_valid = (
+        contribution_keys == conservative_keys
+        and frozenset(contribution_keys)
+        in (
+            _LEGACY_REQUIRED_CONTRIBUTION_KEYS,
+            _REQUIRED_CONTRIBUTION_KEYS,
+        )
+    )
+    new_rosh_schema = contribution_keys == _REQUIRED_CONTRIBUTION_KEYS
     scored_payload_valid = (
-        set(contributions) == _REQUIRED_CONTRIBUTION_KEYS
-        and set(conservative) == _REQUIRED_CONTRIBUTION_KEYS
+        contribution_schema_valid
+        and (
+            not new_rosh_schema
+            or (
+                contributions["draft_curve"] == 0.0
+                and conservative["draft_curve"] == 0.0
+            )
+        )
         and _valid_conservative_contributions(contributions, conservative)
         and expected_model_probability is not None
         and math.isclose(
@@ -2579,12 +2718,15 @@ def _strategy_probability(
 
 
 def _independent_positive(contributions: dict[str, float]) -> bool:
+    lineup_value = contributions.get(
+        "lineup_rosh", contributions.get("draft_curve", 0.0)
+    )
     return (
         contributions.get("team_style", 0.0)
         + contributions.get("late_game_style", 0.0)
         > 0.0
         or contributions.get("player_form", 0.0) > 0.0
-        or contributions.get("draft_curve", 0.0) > 0.0
+        or lineup_value > 0.0
     )
 
 
@@ -2600,7 +2742,11 @@ def _valid_conservative_contributions(
         abs_tol=tolerance,
     ):
         return False
-    for key in _INDEPENDENT_CONTRIBUTION_KEYS:
+    keys = set(_INDEPENDENT_CONTRIBUTION_KEYS)
+    if "lineup_rosh" not in raw:
+        keys.remove("lineup_rosh")
+        keys.add("draft_curve")
+    for key in keys:
         raw_value = raw[key]
         conservative_value = conservative[key]
         if raw_value <= 0.0:
@@ -2738,6 +2884,12 @@ def _valid_strategy_inputs(
     transport = inputs.get("transport")
     input_conservative = inputs.get("conservative_contributions")
     conservative_probability = inputs.get("conservative_probability")
+    if "lineup_rosh" in conservative and not _valid_rosh_strategy_input(
+        inputs.get("rosh_lineup_score"),
+        decided_at=decided_at,
+        require_eligible_gates=require_eligible_gates,
+    ):
+        return False
     if (
         not isinstance(input_draft, dict)
         or not isinstance(input_vision, dict)
@@ -2829,6 +2981,82 @@ def _valid_strategy_inputs(
         and transport_at is not None
         and authority_transport_at is not None
         and transport_at == authority_transport_at == decision_time
+    )
+
+
+def _valid_rosh_strategy_input(
+    value: object,
+    *,
+    decided_at: str,
+    require_eligible_gates: bool,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    actual_stake = value.get("actual_stake_multiplier")
+    compatibility_stake = value.get("stake_multiplier")
+    if value.get("status") == "unavailable":
+        return (
+            not require_eligible_gates
+            and value.get("draft_matches_observation") is False
+            and actual_stake == 0.0
+            and compatibility_stake == 0.0
+            and value.get("selected_score") is None
+        )
+    mode = value.get("mode")
+    stake_cap = value.get("stake_cap")
+    coverage = value.get("player_coverage")
+    coverage_count = value.get("player_coverage_count")
+    source_as_of = _parse_time(value.get("source_as_of"))
+    decision_time = _parse_time(decided_at)
+    if (
+        mode not in {"pure", "player_adjusted"}
+        or value.get("draft_matches_observation") is not True
+        or value.get("formula_version") != ROSH_FORMULA_VERSION
+        or any(
+            not _is_sha256(value.get(field))
+            for field in (
+                "score_key",
+                "draft_hash",
+                "player_identity_hash",
+                "evidence_hash",
+            )
+        )
+        or not _bounded_number(coverage, 0.0, 1.0)
+        or not _nonnegative_int(coverage_count)
+        or int(coverage_count) > 10
+        or not math.isclose(
+            float(coverage), int(coverage_count) / 10.0, abs_tol=1e-9
+        )
+        or not _bounded_number(stake_cap, 0.0, 1.0)
+        or not _bounded_number(actual_stake, 0.0, 1.0)
+        or compatibility_stake != actual_stake
+        or source_as_of is None
+        or decision_time is None
+        or source_as_of > decision_time
+        or not _is_opaque_ref(value.get("source_name"))
+        or not _positive_int(value.get("source_week"))
+        or not _positive_int(value.get("cache_week_start"))
+        or _finite_number_object({"value": value.get("pure_score")}) is None
+        or _finite_number_object({"value": value.get("effective_score")}) is None
+        or _finite_number_object({"value": value.get("selected_score")}) is None
+        or not _bounded_number(value.get("match_percentage"), 0.0, 100.0)
+    ):
+        return False
+    adjusted = value.get("player_adjusted_score")
+    if mode == "player_adjusted":
+        return (
+            int(coverage_count) == 10
+            and _finite_number_object({"value": adjusted}) is not None
+            and math.isclose(float(stake_cap), 1.0, abs_tol=1e-9)
+            and math.isclose(float(actual_stake), 1.0, abs_tol=1e-9)
+            and value.get("selected_table") == "minute_table"
+        )
+    return (
+        int(coverage_count) < 10
+        and adjusted is None
+        and math.isclose(float(stake_cap), 0.5, abs_tol=1e-9)
+        and 0.1 <= float(actual_stake) <= 0.5
+        and value.get("selected_table") == "pure_minute_table"
     )
 
 

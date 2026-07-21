@@ -10,13 +10,14 @@ from datetime import datetime
 from typing import Any, Mapping
 
 from .market_state import MarketSurface
+from .models import RoshLineupScore
 from .profiles.draft_curve import DraftCurve, DraftPoint
 from .profiles.player_form import PlayerForm
 from .profiles.team_style import TeamStyleProfile
 from .vision import VisionObservation
 
 
-STRATEGY_VERSION = "comeback-shadow-v2-strict-landmarks"
+STRATEGY_VERSION = "comeback-shadow-v3-rosh-lineup"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class ComebackDecision:
     input_ref: str
     conservative_probability: float = 0.0
     inputs: dict[str, Any] = field(default_factory=dict)
+    stake_multiplier: float = 0.0
     strategy_version: str = STRATEGY_VERSION
 
 
@@ -46,6 +48,71 @@ def _logit(probability: float) -> float:
 
 def _sigmoid(value: float) -> float:
     return 1.0 / (1.0 + math.exp(-value))
+
+
+def _observation_draft_hash(observation: VisionObservation) -> str:
+    payload = json.dumps(
+        {
+            "radiant": list(observation.radiant_hero_ids),
+            "dire": list(observation.dire_hero_ids),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _select_rosh_minute_score(
+    score: RoshLineupScore,
+    game_clock_seconds: int,
+) -> dict[str, float | int | str] | None:
+    table_key = (
+        "minute_table"
+        if score.scoring_mode == "player_adjusted"
+        else "pure_minute_table"
+    )
+    raw_table = score.evidence.get(table_key)
+    if not isinstance(raw_table, (list, tuple)) or not raw_table:
+        return None
+    rows: list[tuple[int, float, float]] = []
+    seen_minutes: set[int] = set()
+    for raw_row in raw_table:
+        if not isinstance(raw_row, Mapping):
+            return None
+        minute = raw_row.get("minute")
+        value = raw_row.get("win_rate_graph")
+        match_percentage = raw_row.get("match_percentage")
+        if (
+            isinstance(minute, bool)
+            or not isinstance(minute, int)
+            or not 20 <= minute <= 60
+            or minute in seen_minutes
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or isinstance(match_percentage, bool)
+            or not isinstance(match_percentage, (int, float))
+            or not math.isfinite(float(match_percentage))
+            or not 0.0 <= float(match_percentage) <= 100.0
+        ):
+            return None
+        seen_minutes.add(minute)
+        rows.append((minute, float(value), float(match_percentage)))
+    target_minute = min(60, max(20, game_clock_seconds // 60))
+    minute, value, match_percentage = min(
+        rows,
+        key=lambda row: (
+            abs(row[0] - target_minute),
+            row[0] > target_minute,
+            row[0],
+        ),
+    )
+    return {
+        "table": table_key,
+        "minute": minute,
+        "score": value,
+        "match_percentage": match_percentage,
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -188,6 +255,7 @@ def score_comeback(
     stable: bool,
     min_edge: float = 0.08,
     input_refs: Mapping[str, Any] | None = None,
+    rosh_lineup_score: RoshLineupScore | None = None,
 ) -> ComebackDecision:
     if observation.map_number is None or observation.game_clock_seconds is None:
         raise ValueError("confirmed map and game clock are required")
@@ -197,6 +265,18 @@ def score_comeback(
     team_quality = min(underdog_style.quality, favorite_style.quality)
     player_quality = min(underdog_form.quality, favorite_form.quality)
     draft_quality = point.quality if point is not None else 0.0
+    rosh_matches_draft = (
+        rosh_lineup_score is not None
+        and rosh_lineup_score.draft_hash == _observation_draft_hash(observation)
+    )
+    selected_rosh_score = (
+        _select_rosh_minute_score(
+            rosh_lineup_score,
+            observation.game_clock_seconds,
+        )
+        if rosh_matches_draft and rosh_lineup_score is not None
+        else None
+    )
 
     team_raw = (
         (underdog_style.comeback_rate - 0.18) * 1.2
@@ -205,31 +285,33 @@ def score_comeback(
     )
     team_adjustment = team_raw * team_quality
     player_raw = (underdog_form.score - favorite_form.score) * 0.35
-    player_adjustment = player_raw * player_quality
+    player_form_suppressed = (
+        rosh_lineup_score is not None
+        and rosh_lineup_score.scoring_mode == "player_adjusted"
+    )
+    player_adjustment = (
+        0.0 if player_form_suppressed else player_raw * player_quality
+    )
 
     underdog_draft_probability = 0.5
-    draft_adjustment = 0.0
-    conservative_draft = 0.0
-    if point is not None and observation.radiant_team_side is not None:
-        underdog_draft_probability = (
-            point.radiant_probability
-            if surface.underdog_side == observation.radiant_team_side
-            else 1.0 - point.radiant_probability
+    lineup_adjustment = 0.0
+    if selected_rosh_score is not None and observation.radiant_team_side is not None:
+        radiant_probability = min(
+            1.0 - 1e-6,
+            max(1e-6, (50.0 + float(selected_rosh_score["score"])) / 100.0),
         )
-        draft_adjustment = (
+        underdog_draft_probability = (
+            radiant_probability
+            if surface.underdog_side == observation.radiant_team_side
+            else 1.0 - radiant_probability
+        )
+        lineup_adjustment = (
             _logit(underdog_draft_probability) * 0.45 * draft_quality
         )
-        uncertainty = float(point.uncertainty or 0.0)
-        lower_probability = max(1e-6, underdog_draft_probability - uncertainty)
-        uncertainty_adjusted = _logit(lower_probability) * 0.45 * draft_quality
-        conservative_draft = (
-            min(
-                _conservative_positive(draft_adjustment, draft_quality),
-                uncertainty_adjusted,
-            )
-            if draft_adjustment > 0.0
-            else min(draft_adjustment, uncertainty_adjusted)
-        )
+    conservative_lineup = _conservative_positive(
+        lineup_adjustment,
+        draft_quality,
+    )
 
     minute = observation.game_clock_seconds / 60.0
     late_adjustment = 0.0
@@ -241,14 +323,16 @@ def score_comeback(
     contributions = {
         "team_style": team_adjustment,
         "player_form": player_adjustment,
-        "draft_curve": draft_adjustment,
+        "draft_curve": 0.0,
+        "lineup_rosh": lineup_adjustment,
         "late_game_style": late_adjustment,
         "market_movement": movement_adjustment,
     }
     conservative_contributions = {
         "team_style": _conservative_positive(team_adjustment, team_quality),
         "player_form": _conservative_positive(player_adjustment, player_quality),
-        "draft_curve": conservative_draft,
+        "draft_curve": 0.0,
+        "lineup_rosh": conservative_lineup,
         "late_game_style": _conservative_positive(late_adjustment, team_quality),
         # Market movement is kept separate and can never satisfy the required
         # independent team/player/draft reason below.
@@ -272,7 +356,7 @@ def score_comeback(
     independent_positive = (
         team_adjustment + late_adjustment > 0.0
         or player_adjustment > 0.0
-        or draft_adjustment > 0.0
+        or lineup_adjustment > 0.0
     )
 
     reason = "eligible"
@@ -288,6 +372,12 @@ def score_comeback(
         reason = "odds_outside_range"
     elif not stable:
         reason = "market_not_stable_two_snapshots"
+    elif rosh_lineup_score is None:
+        reason = "rosh_lineup_score_unavailable"
+    elif not rosh_matches_draft:
+        reason = "rosh_lineup_draft_mismatch"
+    elif selected_rosh_score is None:
+        reason = "rosh_minute_score_unavailable"
     elif point is None:
         reason = draft_wait_reason or "draft_landmark_unavailable"
     elif not point.passes_live_gate:
@@ -300,6 +390,24 @@ def score_comeback(
         reason = "edge_below_threshold"
     elif conservative_probability <= surface.underdog_probability:
         reason = "conservative_probability_not_above_market"
+
+    stake_multiplier = 0.0
+    if selected_rosh_score is not None and rosh_lineup_score is not None:
+        if rosh_lineup_score.scoring_mode == "player_adjusted":
+            stake_multiplier = 1.0
+        else:
+            stake_multiplier = max(
+                0.1,
+                min(
+                    0.5,
+                    round(
+                        0.5
+                        * float(selected_rosh_score["match_percentage"])
+                        / 100.0,
+                        2,
+                    ),
+                ),
+            )
 
     merged_inputs = {
         **dict(input_refs or {}),
@@ -321,6 +429,44 @@ def score_comeback(
             "missing_markets": list(surface.missing_markets),
         },
         "draft_landmark": _point_inputs(point, draft_wait_reason),
+        "rosh_lineup_score": {
+            **(
+                rosh_lineup_score.as_input_ref()
+                if rosh_lineup_score is not None
+                else {"status": "unavailable"}
+            ),
+            "draft_matches_observation": rosh_matches_draft,
+            "stake_multiplier": stake_multiplier,
+            "selected_table": (
+                selected_rosh_score["table"]
+                if selected_rosh_score is not None
+                else None
+            ),
+            "selected_minute": (
+                selected_rosh_score["minute"]
+                if selected_rosh_score is not None
+                else None
+            ),
+            "selected_score": (
+                selected_rosh_score["score"]
+                if selected_rosh_score is not None
+                else None
+            ),
+            "match_percentage": (
+                selected_rosh_score["match_percentage"]
+                if selected_rosh_score is not None
+                else None
+            ),
+            "actual_stake_multiplier": stake_multiplier,
+        },
+        "player_form_suppression": {
+            "suppressed": player_form_suppressed,
+            "reason": (
+                "included_in_player_adjusted_rosh"
+                if player_form_suppressed
+                else None
+            ),
+        },
         "quality": {
             "team": team_quality,
             "player": player_quality,
@@ -355,4 +501,5 @@ def score_comeback(
         input_ref=input_ref,
         conservative_probability=conservative_probability,
         inputs=merged_inputs,
+        stake_multiplier=stake_multiplier,
     )

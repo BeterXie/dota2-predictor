@@ -27,11 +27,16 @@ from live_betting.comeback import (
 from live_betting.health import record_health
 from live_betting.markets import normalized_state_hash
 from live_betting.market_state import MarketSurface
-from live_betting.models import Market, OddsSnapshot
+from live_betting.models import Market, OddsSnapshot, RoshLineupScore
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
 from live_betting.shadow_monitor import _persist_decision
 from live_betting.storage import LiveBettingStore
+from live_betting.stratz_rosh_client import (
+    ROSH_FORMULA_VERSION,
+    canonical_evidence_hash,
+    rosh_cache_week_start,
+)
 from live_betting.strict_eligibility import query_strict_mapping_snapshot
 from live_betting.vision import VisionObservation
 from live_betting.vision_frame_registry import (
@@ -759,6 +764,16 @@ class MonitoringDashboardTests(unittest.TestCase):
             target_snapshot_hash=draft_authority.target_snapshot_hash,
             strict_mapping_id=draft_authority.strict_mapping_id,
         )
+        draft_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "radiant": list(vision.radiant_hero_ids),
+                    "dire": list(vision.dire_hero_ids),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         decision = score_comeback(
             observation=vision,
             surface=surface,
@@ -774,6 +789,37 @@ class MonitoringDashboardTests(unittest.TestCase):
             decided_at=decided_at,
             stable=True,
             min_edge=0.99,
+            rosh_lineup_score=RoshLineupScore(
+                score_key="a" * 64,
+                draft_hash=draft_hash,
+                player_identity_hash="c" * 64,
+                pure_lineup_score=(draft_authority.radiant_probability * 100) - 50,
+                player_adjusted_lineup_score=None,
+                effective_lineup_score=(
+                    draft_authority.radiant_probability * 100
+                ) - 50,
+                scoring_mode="pure",
+                player_coverage_count=0,
+                stake_multiplier=0.5,
+                formula_version=ROSH_FORMULA_VERSION,
+                source_name="stratz",
+                source_week=1_773_619_200,
+                cache_week_start=1_773_619_200,
+                source_as_of=decided_at,
+                evidence_hash="b" * 64,
+                evidence={
+                    "pure_minute_table": [
+                        {
+                            "minute": 20,
+                            "win_rate_graph": (
+                                draft_authority.radiant_probability * 100
+                            ) - 50,
+                            "match_percentage": 100.0,
+                        }
+                    ],
+                    "minute_table": [],
+                },
+            ),
             input_refs={
                 "draft_authority": asdict(draft_authority),
                 "strict_live_eligibility": {
@@ -2860,6 +2906,14 @@ class MonitoringDashboardTests(unittest.TestCase):
             "active_curve_available",
         )
         self.assertEqual(
+            lineup["data"]["scores"],
+            {
+                "status": "waiting",
+                "reason": "rosh_lineup_score_pending",
+                "data": None,
+            },
+        )
+        self.assertEqual(
             lineup["data"]["players"],
             {
                 "status": "unavailable",
@@ -2875,9 +2929,175 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertNotIn("map_results", normalized)
         self.assertNotIn("settlement_reconciliations", normalized)
 
+    def test_match_detail_exposes_latest_causal_rosh_lineup_score(self) -> None:
+        self.add_match(status=2)
+        self.add_decision("rosh-score", NOW - timedelta(seconds=5), 0.65)
+        mapping_id = self.strict_mapping_id
+        self.assertIsNotNone(mapping_id)
+        anchor = self.store.connection.execute(
+            """SELECT draft_hash FROM vision_draft_anchors
+                WHERE raybet_match_id='match-1' AND map_number=1"""
+        ).fetchone()
+        self.assertIsNotNone(anchor)
+        draft_hash = str(anchor["draft_hash"])
+        player_slots = [
+            {
+                "slot": slot,
+                "side": "radiant" if slot < 5 else "dire",
+                "position": (slot % 5) + 1,
+                "hero_id": slot + 1,
+                "steam_account_id": (
+                    101 + slot if slot < 5 else 196 + slot
+                ),
+                "selected": True,
+                "resolved": True,
+                "fallback_reason": None,
+            }
+            for slot in range(10)
+        ]
+        source_as_of = NOW - timedelta(seconds=3)
+        source_week = int(source_as_of.timestamp())
+        cache_week_start = rosh_cache_week_start(source_as_of)
+
+        def make_score(
+            formula_version: str,
+            pure_score: float,
+            adjusted_score: float,
+        ) -> SimpleNamespace:
+            pure_bucket = {
+                "minute": 60,
+                "time_start": 59,
+                "time_end": 60,
+                "advantage_side": "radiant",
+                "advantage_percent": pure_score,
+                "radiant_advantage": pure_score,
+                "dire_advantage": 0.0,
+                "match_percentage": 50.0,
+                "win_rate_graph": pure_score,
+                "hero_adjustment": pure_score,
+                "hero_base_adjustment": pure_score,
+                "hero_tempo_adjustment": 0.0,
+                "synergy_adjustment": 0.0,
+                "player_adjustment": 0.0,
+            }
+            evidence = {
+                "fixture": "monitor-rosh",
+                "source": "stratz",
+                "formula_version": formula_version,
+                "source_week": source_week,
+                "cache_week_start": cache_week_start,
+                "source_as_of": source_as_of.isoformat(),
+                "player_slots": player_slots,
+                "pure_minute_table": [pure_bucket],
+                "minute_table": [
+                    {
+                        **pure_bucket,
+                        "advantage_percent": adjusted_score,
+                        "radiant_advantage": adjusted_score,
+                        "win_rate_graph": adjusted_score,
+                        "player_adjustment": adjusted_score - pure_score,
+                    }
+                ],
+                "score": {
+                    "pure_lineup_score": pure_score,
+                    "player_adjusted_lineup_score": adjusted_score,
+                    "effective_lineup_score": adjusted_score,
+                    "scoring_mode": "player_adjusted",
+                    "player_coverage_count": 10,
+                },
+            }
+            return SimpleNamespace(
+                pure_lineup_score=pure_score,
+                player_adjusted_lineup_score=adjusted_score,
+                effective_lineup_score=adjusted_score,
+                scoring_mode="player_adjusted",
+                player_coverage_count=10,
+                stake_multiplier=1.0,
+                stake_cap=1.0,
+                formula_version=formula_version,
+                source_name="stratz",
+                source_week=source_week,
+                cache_week_start=cache_week_start,
+                source_as_of=source_as_of,
+                evidence=evidence,
+                evidence_hash=canonical_evidence_hash(evidence),
+            )
+
+        score = make_score(ROSH_FORMULA_VERSION, 3.2, 4.1)
+        old_score = make_score("dematus-rosh-obsolete", 30.0, 40.0)
+        self.assertIsNotNone(
+            self.store.insert_rosh_lineup_score(
+                old_score,
+                raybet_match_id="match-1",
+                map_number=1,
+                strict_mapping_id=int(mapping_id),
+                draft_hash=draft_hash,
+                radiant_hero_ids=(1, 2, 3, 4, 5),
+                dire_hero_ids=(6, 7, 8, 9, 10),
+                radiant_player_ids=(101, 102, 103, 104, 105),
+                dire_player_ids=(201, 202, 203, 204, 205),
+                created_at=source_as_of,
+            )
+        )
+        persisted = self.store.insert_rosh_lineup_score(
+            score,
+            raybet_match_id="match-1",
+            map_number=1,
+            strict_mapping_id=int(mapping_id),
+            draft_hash=draft_hash,
+            radiant_hero_ids=(1, 2, 3, 4, 5),
+            dire_hero_ids=(6, 7, 8, 9, 10),
+            radiant_player_ids=(101, 102, 103, 104, 105),
+            dire_player_ids=(201, 202, 203, 204, 205),
+            created_at=source_as_of,
+        )
+        self.assertIsNotNone(persisted)
+        self.store.connection.commit()
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        scores = detail["analysis"]["lineup"]["data"]["scores"]
+        self.assertEqual(scores["status"], "available")
+        self.assertEqual(scores["reason"], "rosh_lineup_score_available")
+        self.assertEqual(
+            scores["data"],
+            {
+                "pure_lineup_score": 3.2,
+                "player_adjusted_lineup_score": 4.1,
+                "effective_lineup_score": 4.1,
+                "mode": "player_adjusted",
+                "player_coverage": 1.0,
+                "player_coverage_count": 10,
+                "stake_multiplier": 1.0,
+                "formula_version": ROSH_FORMULA_VERSION,
+                "source_as_of": source_as_of.isoformat(),
+                "score_key": persisted.score_key,
+                "player_identity_hash": persisted.player_identity_hash,
+                "evidence_hash": score.evidence_hash,
+                "stake_cap": 1.0,
+            },
+        )
+        self.assertNotIn("evidence", scores["data"])
+        players = detail["analysis"]["lineup"]["data"]["players"]
+        self.assertEqual(players["status"], "available")
+        self.assertEqual(players["reason"], "rosh_player_identity_available")
+        self.assertEqual(len(players["data"]["players"]), 10)
+        self.assertEqual(
+            players["data"]["players"][0],
+            {
+                "steam_account_id": 101,
+                "side": "radiant",
+                "position": 1,
+                "hero_id": 1,
+                "status": "resolved",
+            },
+        )
+        self.assertNotIn("fallback_reason", players["data"]["players"][0])
+
     def test_available_analysis_matches_cross_layer_golden_fixture(self) -> None:
         self.add_match(status=2)
-        blocked_key = self.add_scored_blocked_decision(
+        self.add_scored_blocked_decision(
             "blocked-golden-v1",
             NOW - timedelta(seconds=10),
         )
@@ -2898,22 +3118,11 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         assert detail is not None
         self.assertEqual(detail["analysis"], expected)
-        blocked_decision, golden_decision = expected["strategy"]["data"][
-            "decisions"
-        ]
-        self.assertEqual(blocked_decision["decision_key"], blocked_key)
-        self.assertEqual(blocked_decision["eligible"], 0)
-        self.assertEqual(blocked_decision["reason"], "edge_below_threshold")
-        self.assertEqual(
-            set(blocked_decision["contributions"]),
-            {
-                "team_style",
-                "player_form",
-                "draft_curve",
-                "late_game_style",
-                "market_movement",
-            },
-        )
+        strategy = expected["strategy"]["data"]
+        self.assertEqual(strategy["displayed_count"], 1)
+        self.assertEqual(strategy["excluded_decision_count"], 1)
+        self.assertEqual(strategy["excluded"]["invalid_payload"], 1)
+        [golden_decision] = strategy["decisions"]
         self.assertEqual(golden_decision["decision_key"], decision_key)
         self.assertRegex(golden_decision["decision_key"], r"^[0-9a-f]{32}$")
         self.assertRegex(golden_decision["input_ref"], r"^[0-9a-f]{24}$")

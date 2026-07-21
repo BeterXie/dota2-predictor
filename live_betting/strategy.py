@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -25,7 +26,15 @@ def make_order(
     min_edge: float,
     signal_transport_key: str,
     signal_transport_at: datetime,
+    stake_multiplier: float = 1.0,
 ) -> ShadowOrder | None:
+    if (
+        isinstance(stake_multiplier, bool)
+        or not isinstance(stake_multiplier, (int, float))
+        or not math.isfinite(float(stake_multiplier))
+        or not 0.0 < float(stake_multiplier) <= 1.0
+    ):
+        raise ValueError("stake multiplier must be greater than 0 and at most 1")
     if quote.edge < min_edge or not is_open(snapshot.status):
         return None
     if signal_transport_at != quote.quoted_at:
@@ -44,6 +53,7 @@ def make_order(
             ),
             quote.strategy_version,
             quote.input_ref,
+            str(float(stake_multiplier)),
         )
     )
     order_key = hashlib.sha256(raw_key.encode()).hexdigest()[:32]
@@ -62,6 +72,7 @@ def make_order(
         signal_odds_group_id=snapshot.odds_group_id,
         signal_outcome_key=snapshot.market.outcome_key,
         signal_identity_verified=True,
+        stake=float(stake_multiplier),
     )
 
 

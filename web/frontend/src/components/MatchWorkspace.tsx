@@ -29,6 +29,7 @@ import type {
   MatchDetail,
   MonitorMatch,
   OddsAnalysisData,
+  RoshLineupScoresData,
   StrategyAnalysisData,
   StrategyDecision,
   VisionAnalysisData,
@@ -57,16 +58,14 @@ const STRATEGY_CONTRIBUTION_KEYS = [
   "team_style",
   "player_form",
   "draft_curve",
+  "lineup_rosh",
   "late_game_style",
   "market_movement",
 ] as const;
+const LEGACY_STRATEGY_CONTRIBUTION_KEYS = STRATEGY_CONTRIBUTION_KEYS.filter(
+  (key) => key !== "lineup_rosh",
+);
 const STRATEGY_CONTRIBUTION_KEY_SET = new Set<string>(STRATEGY_CONTRIBUTION_KEYS);
-const INDEPENDENT_CONTRIBUTION_KEYS = [
-  "team_style",
-  "player_form",
-  "draft_curve",
-  "late_game_style",
-] as const;
 
 const ProbabilityChart = lazy(() =>
   import("./ProbabilityChart").then((module) => ({ default: module.ProbabilityChart })),
@@ -337,6 +336,10 @@ const reasonDescription: Record<string, string> = {
   lineup_payload_invalid: "阵容不是可信的两边各五个唯一英雄。",
   lineup_curve_payload_invalid: "阵容曲线结构无效，不能显示为可用预测。",
   lineup_curve_clock_unavailable: "缺少可信比赛时钟，无法验证阵容曲线的当前检查点。",
+  rosh_lineup_score_payload_invalid: "Rosh 阵容评分证据结构无效，不能显示或参与判断。",
+  rosh_player_identity_available: "Rosh 证据已解析全部十个选手位置。",
+  rosh_player_identity_partial: "Rosh 证据只解析出部分选手位置，实际评分回退纯阵容。",
+  rosh_player_identity_evidence_invalid: "Rosh 选手身份结构无效，已隐藏该部分证据。",
   players_payload_invalid: "选手证据结构无效，不能显示。",
 };
 
@@ -400,10 +403,22 @@ function normalizeLineupSection(
     ...normalized,
     data: {
       ...normalized.data,
+      scores: normalizeRoshScoresSection(
+        sectionOrFallback(normalized.data.scores, null),
+      ),
       active_curve: withoutUnavailableData(normalized.data.active_curve),
-      players: normalizePlayersSection(normalized.data.players),
+      players: normalizePlayersSection(normalized.data.players, normalized.data),
     },
   };
+}
+
+function normalizeRoshScoresSection(
+  section: AnalysisSection<RoshLineupScoresData>,
+): AnalysisSection<RoshLineupScoresData> {
+  const normalized = withoutUnavailableData(section);
+  return normalized.status === "available" && !validRoshScoresData(normalized.data)
+    ? reviewSection("rosh_lineup_score_payload_invalid")
+    : normalized;
 }
 
 function normalizeCurveSection(
@@ -422,9 +437,10 @@ function normalizeCurveSection(
 
 function normalizePlayersSection(
   section: AnalysisSection<LivePlayerIdentityData>,
+  lineup: LineupAnalysisData,
 ): AnalysisSection<LivePlayerIdentityData> {
   const normalized = withoutUnavailableData(section);
-  return normalized.status === "available" && !validPlayersData(normalized.data)
+  return normalized.status === "available" && !validPlayersData(normalized.data, lineup)
     ? reviewSection("players_payload_invalid")
     : normalized;
 }
@@ -551,6 +567,7 @@ const contributionLabel: Record<string, string> = {
   team_style: "队伍风格",
   player_form: "选手状态",
   draft_curve: "阵容曲线",
+  lineup_rosh: "Rosh 阵容评分",
   late_game_style: "后期能力",
   market_movement: "市场变化",
 };
@@ -594,6 +611,9 @@ function DecisionRow({ decision }: { decision: StrategyDecision }) {
       ? authorityGameClock
       : null;
   const draftVersion = safeCode(draftInput.model_version);
+  const roshInput = recordValue(evidence.inputs.rosh_lineup_score);
+  const actualStake = numberValue(roshInput.actual_stake_multiplier);
+  const stakeCap = numberValue(roshInput.stake_cap);
   const strategyVersion = safeCode(decision.strategy_version);
   const inputRef = inputReference(decision.input_ref);
   const decisionKey = decisionReference(decision.decision_key);
@@ -644,6 +664,8 @@ function DecisionRow({ decision }: { decision: StrategyDecision }) {
         <span>时钟 {gameClock == null ? "未提供" : formatClock(gameClock)}</span>
         <span>画面引用 <code>{visionRef || "未提供"}</code></span>
         <span>阵容模型 <code>{draftVersion || draftRef || "未提供"}</code></span>
+        {actualStake != null && <span>实际仓位 {formatPercent(actualStake)}</span>}
+        {stakeCap != null && <span>仓位上限 {formatPercent(stakeCap)}</span>}
       </div>
     </article>
   );
@@ -775,6 +797,7 @@ function LineupContent({
     : null;
   const curveSection = normalizeCurveSection(data.active_curve, gameClockSeconds);
   const curve = curveSection.status === "available" ? curveSection.data : null;
+  const scores = data.scores;
   const players = data.players;
 
   return (
@@ -791,6 +814,7 @@ function LineupContent({
           side={teamTwo}
         />
       </div>
+      <RoshLineupScores data={data} match={match} section={scores} />
       <dl className="lineup-evidence">
         <div><dt>局数</dt><dd>第 {data.map_number} 局</dd></div>
         <div><dt>阵容证据时间</dt><dd>{formatDateTime(data.evidence.anchored_at || data.as_of)}</dd></div>
@@ -822,8 +846,107 @@ function LineupContent({
             : reasonDescription[players.reason] || "选手证据按来源状态显示。"}
         </span>
       </div>
+      {players.status === "available" && players.data && (
+        <div className="player-identity-grid" role="list" aria-label="Rosh 选手身份">
+          {players.data.players.map((player) => (
+            <div key={`${player.side}:${player.position}`} role="listitem">
+              <strong>{player.side === "radiant" ? "Radiant" : "Dire"} P{player.position}</strong>
+              <span>英雄 {player.hero_id}</span>
+              <code>{player.steam_account_id == null ? "Steam ID 不可用" : `Steam ${player.steam_account_id}`}</code>
+              <small>{playerIdentityStatusLabel(player.status)}</small>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
+}
+
+function playerIdentityStatusLabel(
+  status: LivePlayerIdentityData["players"][number]["status"],
+): string {
+  if (status === "resolved") return "已用于选手修正";
+  if (status === "selected_unresolved") return "身份可信，修正数据不可用";
+  return "身份不可用";
+}
+
+function RoshLineupScores({
+  data,
+  match,
+  section,
+}: {
+  data: LineupAnalysisData;
+  match: MonitorMatch;
+  section: AnalysisSection<RoshLineupScoresData>;
+}) {
+  const scores = section.status === "available" ? section.data : null;
+  const fallback = scores?.mode === "pure";
+  return (
+    <div className="rosh-score-block">
+      <div className="curve-heading">
+        <div>
+          <h3>Rosh 阵容评分</h3>
+          <p>正值代表 Radiant 优势，负值代表 Dire 优势。</p>
+        </div>
+        <AnalysisState lifecycle={match.lifecycle} section={section} />
+      </div>
+      {scores ? (
+        <>
+          <dl className="rosh-score-grid">
+            <div>
+              <dt>纯阵容评分</dt>
+              <dd>{formatRoshScore(scores.pure_lineup_score)}</dd>
+              <small>{roshAdvantageLabel(scores.pure_lineup_score, data, match)}</small>
+            </div>
+            <div>
+              <dt>选手修正后实际阵容评分</dt>
+              <dd>
+                {scores.player_adjusted_lineup_score == null
+                  ? "不可用"
+                  : formatRoshScore(scores.player_adjusted_lineup_score)}
+              </dd>
+              <small>
+                {fallback
+                  ? `回退采用纯阵容评分 · 仓位上限 ${formatPercent(scores.stake_cap)}`
+                  : `${roshAdvantageLabel(scores.effective_lineup_score, data, match)} · 选手覆盖 ${formatPercent(scores.player_coverage)}`}
+              </small>
+            </div>
+          </dl>
+          <dl className="lineup-evidence rosh-score-evidence">
+            <div><dt>实际采用</dt><dd>{fallback ? "纯阵容回退" : "选手修正评分"}</dd></div>
+            <div><dt>有效评分</dt><dd>{formatRoshScore(scores.effective_lineup_score)}</dd></div>
+            <div><dt>选手覆盖</dt><dd>{formatPercent(scores.player_coverage)} ({scores.player_coverage_count}/10)</dd></div>
+            <div><dt>公式版本</dt><dd><code>{scores.formula_version}</code></dd></div>
+            <div><dt>数据时间</dt><dd>{formatDateTime(scores.source_as_of)}</dd></div>
+            <div><dt>Score key</dt><dd><code>{scores.score_key}</code></dd></div>
+            <div><dt>Player identity</dt><dd><code>{scores.player_identity_hash}</code></dd></div>
+            <div><dt>Evidence hash</dt><dd><code>{scores.evidence_hash}</code></dd></div>
+          </dl>
+        </>
+      ) : (
+        <AnalysisEmpty lifecycle={match.lifecycle} section={section} subject="Rosh 阵容评分" />
+      )}
+    </div>
+  );
+}
+
+function formatRoshScore(value: number): string {
+  return `${value > 0 ? "+" : ""}${value.toFixed(1)} pp`;
+}
+
+function roshAdvantageLabel(
+  score: number,
+  data: LineupAnalysisData,
+  match: MonitorMatch,
+): string {
+  if (Math.abs(score) < 0.05) return "阵容评分均衡";
+  const radiantName = data.radiant_team_side === "team_one"
+    ? match.team_one || "队伍一"
+    : match.team_two || "队伍二";
+  const direName = data.radiant_team_side === "team_one"
+    ? match.team_two || "队伍二"
+    : match.team_one || "队伍一";
+  return `${score > 0 ? radiantName : direName} 阵容占优`;
 }
 
 function LineupTeam({
@@ -1024,8 +1147,12 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
   if (
     !hasRequiredStrategyContributions(contributions)
     || !hasRequiredStrategyContributions(conservative)
+    || (Object.prototype.hasOwnProperty.call(contributions, "lineup_rosh")
+      && (contributions.draft_curve !== 0 || conservative.draft_curve !== 0))
     || !validConservativeContributions(contributions, conservative)
     || !validDecisionReferences(value, true)
+    || (Object.prototype.hasOwnProperty.call(contributions, "lineup_rosh")
+      && !validRoshStrategyInput(inputs.rosh_lineup_score, eligible === 1))
   ) {
     return false;
   }
@@ -1038,7 +1165,7 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
   const conservativeProbability = numberValue(inputs.conservative_probability);
   const independentPositive = contributions.team_style + contributions.late_game_style > 0
     || contributions.player_form > 0
-    || contributions.draft_curve > 0;
+    || (contributions.lineup_rosh ?? contributions.draft_curve) > 0;
   return expectedModelProbability !== null
     && expectedConservativeProbability !== null
     && conservativeProbability !== null
@@ -1053,10 +1180,47 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
     ));
 }
 
+function validRoshStrategyInput(value: unknown, eligible: boolean): boolean {
+  if (!isRecord(value)) return false;
+  const actualStake = numberValue(value.actual_stake_multiplier);
+  const compatibilityStake = numberValue(value.stake_multiplier);
+  if (value.status === "unavailable") {
+    return !eligible
+      && value.draft_matches_observation === false
+      && actualStake === 0
+      && compatibilityStake === 0
+      && value.selected_score == null;
+  }
+  const stakeCap = numberValue(value.stake_cap);
+  if (
+    actualStake === null
+    || compatibilityStake === null
+    || stakeCap === null
+    || !approximatelyEqual(actualStake, compatibilityStake)
+    || value.draft_matches_observation !== true
+    || safeCode(value.formula_version) === null
+  ) {
+    return false;
+  }
+  if (value.mode === "player_adjusted") {
+    return approximatelyEqual(actualStake, 1) && approximatelyEqual(stakeCap, 1);
+  }
+  return value.mode === "pure"
+    && approximatelyEqual(stakeCap, 0.5)
+    && actualStake >= 0.1
+    && actualStake <= 0.5;
+}
+
 function hasRequiredStrategyContributions(value: Record<string, number>): boolean {
-  return STRATEGY_CONTRIBUTION_KEYS.every(
+  return contributionKeys(value).every(
     (key) => Object.prototype.hasOwnProperty.call(value, key),
   );
+}
+
+function contributionKeys(value: Record<string, number>): readonly string[] {
+  return Object.prototype.hasOwnProperty.call(value, "lineup_rosh")
+    ? STRATEGY_CONTRIBUTION_KEYS
+    : LEGACY_STRATEGY_CONTRIBUTION_KEYS;
 }
 
 function validContributionRecord(value: unknown): value is Record<string, number> {
@@ -1068,7 +1232,8 @@ function validContributionRecord(value: unknown): value is Record<string, number
 
 function sameContributionRecord(value: unknown, expected: Record<string, number>): boolean {
   return validContributionRecord(value)
-    && STRATEGY_CONTRIBUTION_KEYS.every((key) => (
+    && Object.keys(value).length === Object.keys(expected).length
+    && contributionKeys(expected).every((key) => (
       Object.prototype.hasOwnProperty.call(value, key) && value[key] === expected[key]
     ));
 }
@@ -1080,14 +1245,16 @@ function validConservativeContributions(
   if (!approximatelyEqual(conservative.market_movement, raw.market_movement)) {
     return false;
   }
-  return INDEPENDENT_CONTRIBUTION_KEYS.every((key) => {
-    const rawValue = raw[key];
-    const conservativeValue = conservative[key];
-    return rawValue <= 0
-      ? approximatelyEqual(conservativeValue, rawValue)
-      : conservativeValue >= -STRATEGY_MATH_TOLERANCE
-        && conservativeValue <= rawValue + STRATEGY_MATH_TOLERANCE;
-  });
+  return contributionKeys(raw)
+    .filter((key) => key !== "market_movement")
+    .every((key) => {
+      const rawValue = raw[key];
+      const conservativeValue = conservative[key];
+      return rawValue <= 0
+        ? approximatelyEqual(conservativeValue, rawValue)
+        : conservativeValue >= -STRATEGY_MATH_TOLERANCE
+          && conservativeValue <= rawValue + STRATEGY_MATH_TOLERANCE;
+    });
 }
 
 function strategyProbability(
@@ -1099,7 +1266,7 @@ function strategyProbability(
     Math.max(PROBABILITY_EPSILON, marketProbability),
   );
   const score = Math.log(bounded / (1 - bounded))
-    + STRATEGY_CONTRIBUTION_KEYS.reduce((sum, key) => sum + contributions[key], 0);
+    + contributionKeys(contributions).reduce((sum, key) => sum + contributions[key], 0);
   if (!Number.isFinite(score)) return null;
   if (score >= 0) {
     const inverse = Math.exp(-score);
@@ -1187,8 +1354,54 @@ function validLineupData(data: LineupAnalysisData | null): data is LineupAnalysi
     && validTimestamp(data.evidence.anchored_at)
     && Number.isInteger(data.evidence.strict_mapping_id)
     && data.evidence.strict_mapping_id > 0
+    && (data.scores === undefined || validAnalysisSection(data.scores))
     && validAnalysisSection(data.active_curve)
     && validAnalysisSection(data.players);
+}
+
+function validRoshScoresData(
+  data: RoshLineupScoresData | null,
+): data is RoshLineupScoresData {
+  if (!data || !isRecord(data)) return false;
+  const pure = numberValue(data.pure_lineup_score);
+  const adjusted = data.player_adjusted_lineup_score == null
+    ? null
+    : numberValue(data.player_adjusted_lineup_score);
+  const effective = numberValue(data.effective_lineup_score);
+  const multiplier = numberValue(data.stake_multiplier);
+  if (
+    pure === null
+    || effective === null
+    || multiplier === null
+    || !finiteUnit(data.player_coverage)
+    || !Number.isInteger(data.player_coverage_count)
+    || Number(data.player_coverage_count) < 0
+    || Number(data.player_coverage_count) > 10
+    || !approximatelyEqual(data.player_coverage, data.player_coverage_count / 10)
+    || safeCode(data.formula_version) === null
+    || !validTimestamp(data.source_as_of)
+    || typeof data.score_key !== "string"
+    || !SHA256_RE.test(data.score_key)
+    || typeof data.player_identity_hash !== "string"
+    || !SHA256_RE.test(data.player_identity_hash)
+    || typeof data.evidence_hash !== "string"
+    || !SHA256_RE.test(data.evidence_hash)
+    || !finiteUnit(data.stake_cap)
+    || !approximatelyEqual(data.stake_multiplier, data.stake_cap)
+  ) {
+    return false;
+  }
+  if (data.mode === "pure") {
+    return adjusted === null
+      && data.player_coverage_count < 10
+      && approximatelyEqual(effective, pure)
+      && approximatelyEqual(multiplier, 0.5);
+  }
+  return data.mode === "player_adjusted"
+    && adjusted !== null
+    && data.player_coverage_count === 10
+    && approximatelyEqual(effective, adjusted)
+    && approximatelyEqual(multiplier, 1);
 }
 
 function validLineupSide(value: unknown): value is LineupSide {
@@ -1279,12 +1492,36 @@ function validCurvePoint(value: unknown): value is LineupCurvePoint {
     && !(value.conditional && value.active);
 }
 
-function validPlayersData(data: LivePlayerIdentityData | null): data is LivePlayerIdentityData {
-  return Boolean(
-    data
-    && isRecord(data)
-    && Array.isArray(data.players),
-  );
+function validPlayersData(
+  data: LivePlayerIdentityData | null,
+  lineup: LineupAnalysisData,
+): data is LivePlayerIdentityData {
+  if (!data || !isRecord(data) || !Array.isArray(data.players) || data.players.length !== 10) {
+    return false;
+  }
+  const steamIds = new Set<number>();
+  return data.players.every((player) => {
+    if (!isRecord(player)) return false;
+    const side = player.side;
+    const position = player.position;
+    const expected = side === "radiant" ? lineup.radiant.hero_ids : lineup.dire.hero_ids;
+    const steamId = player.steam_account_id;
+    if (
+      (side !== "radiant" && side !== "dire")
+      || !Number.isInteger(position)
+      || Number(position) < 1
+      || Number(position) > 5
+      || player.hero_id !== expected[Number(position) - 1]
+      || !["resolved", "selected_unresolved", "unavailable"].includes(String(player.status))
+      || (player.status === "unavailable" && steamId !== null)
+      || (player.status !== "unavailable" && !Number.isInteger(steamId))
+      || (typeof steamId === "number" && (steamId <= 0 || steamIds.has(steamId)))
+    ) {
+      return false;
+    }
+    if (typeof steamId === "number") steamIds.add(steamId);
+    return true;
+  });
 }
 
 function validDecisionEdge(
@@ -1333,6 +1570,9 @@ function EvidenceSummary({
       lineup.data.active_curve,
       vision.status === "available" ? vision.data?.game_clock_seconds ?? null : null,
     )
+    : { status: lineup.status, reason: lineup.reason, data: null };
+  const scores: AnalysisSection<RoshLineupScoresData> = lineup.status === "available" && lineup.data
+    ? lineup.data.scores
     : { status: lineup.status, reason: lineup.reason, data: null };
   const mapping = readinessSection(detail?.readiness.mapping || match.readiness.mapping, match.lifecycle, "mapping");
   const workerReadiness = detail?.readiness.strategy || match.readiness.strategy;
@@ -1387,6 +1627,14 @@ function EvidenceSummary({
           label="完整阵容"
           lifecycle={match.lifecycle}
           section={lineup}
+        />
+        <SourceStatusRow
+          detail={scores.data
+            ? `${formatRoshScore(scores.data.effective_lineup_score)} · ${scores.data.mode === "pure" ? "纯阵容半仓回退" : `选手覆盖 ${formatPercent(scores.data.player_coverage)}`}`
+            : "无持久化 Rosh 阵容评分"}
+          label="Rosh 阵容评分"
+          lifecycle={match.lifecycle}
+          section={scores}
         />
         <SourceStatusRow
           detail={curve.data ? `${curve.data.points.length} 个条件点 · active ${curve.data.active_horizon_minutes} 分钟` : "无可用曲线"}

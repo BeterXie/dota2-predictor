@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 from .comeback import ComebackDecision, score_comeback
 from .market_state import build_market_surface
-from .models import ModelQuote, OddsSnapshot, ShadowOrder
+from .models import ModelQuote, OddsSnapshot, RoshLineupScore, ShadowOrder
 from .profiles.draft_curve import DraftCurve
 from .profiles.player_form import PlayerForm
 from .profiles.team_style import TeamStyleProfile
@@ -46,6 +46,7 @@ class ComebackShadowStrategy:
         signal_transport_key: str | None = None,
         previous_transport_key: str | None = None,
         input_refs: Mapping[str, Any] | None = None,
+        rosh_lineup_score: RoshLineupScore | None = None,
     ) -> StrategyResult:
         if observation.map_number is None:
             raise ValueError("map number is required")
@@ -146,6 +147,7 @@ class ComebackShadowStrategy:
             draft_curve=draft_curve, decided_at=current_snapshot_at,
             stable=stable, min_edge=self.min_edge,
             input_refs=decision_inputs,
+            rosh_lineup_score=rosh_lineup_score,
         )
         if not identity_valid:
             decision = ComebackDecision(
@@ -181,5 +183,6 @@ class ComebackShadowStrategy:
                 min_edge=self.min_edge,
                 signal_transport_key=current_transport_key,
                 signal_transport_at=current_snapshot_at,
+                stake_multiplier=decision.stake_multiplier,
             ),
         )

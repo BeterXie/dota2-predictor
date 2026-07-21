@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from event_intelligence.incremental import SCORE_VERSION
 from event_intelligence.team_profiles import PROFILE_VERSION
-from live_betting.models import Market, OddsSnapshot
+from live_betting.models import Market, OddsSnapshot, RoshLineupScore
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint, build_draft_curve
 from live_betting.shadow_strategy import ComebackShadowStrategy
@@ -89,6 +89,44 @@ def style(
 
 def form(score: float = 0.0, quality: float = 1.0) -> PlayerForm:
     return PlayerForm((1, 2, 3, 4, 5), score, {}, 100, quality)
+
+
+def rosh_score(radiant_probability: float) -> RoshLineupScore:
+    draft_hash = hashlib.sha256(
+        json.dumps(
+            {"radiant": [1, 2, 3, 4, 5], "dire": [6, 7, 8, 9, 10]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    score = (radiant_probability * 100.0) - 50.0
+    return RoshLineupScore(
+        score_key="a" * 64,
+        draft_hash=draft_hash,
+        player_identity_hash="c" * 64,
+        pure_lineup_score=score,
+        player_adjusted_lineup_score=None,
+        effective_lineup_score=score,
+        scoring_mode="pure",
+        player_coverage_count=0,
+        stake_multiplier=0.5,
+        formula_version="dematus-rosh-test",
+        source_name="stratz",
+        source_week=1_773_619_200,
+        cache_week_start=1_773_619_200,
+        source_as_of=NOW,
+        evidence_hash="b" * 64,
+        evidence={
+            "pure_minute_table": [
+                {
+                    "minute": 30,
+                    "win_rate_graph": score,
+                    "match_percentage": 100.0,
+                }
+            ],
+            "minute_table": [],
+        },
+    )
 
 
 def insert_prospective_curve(
@@ -356,6 +394,7 @@ class StrictComebackStrategyTests(unittest.TestCase):
             previous_snapshot_observed_at=previous[0].received_at,
             signal_transport_key="current",
             previous_transport_key="previous",
+            rosh_lineup_score=rosh_score(draft_probability),
         )
 
     def test_stability_uses_devigged_probability_not_relative_odds(self) -> None:

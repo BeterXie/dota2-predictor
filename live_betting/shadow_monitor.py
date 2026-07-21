@@ -7,10 +7,11 @@ import json
 import logging
 import sqlite3
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from event_intelligence.benchmarks import BENCHMARK_VERSION
 from event_intelligence.incremental import (
@@ -26,8 +27,9 @@ from .alignment import align_snapshots
 from .comeback import no_signal_decision
 from .draft_authority import DraftLandmarkAuthority, authority_from_curve
 from .health import record_health
+from .live_player_identity import LivePlayerIdentity, LivePlayerIdentityResolver
 from .market_state import build_market_surface
-from .models import Market, OddsSnapshot, ShadowOrder
+from .models import Market, OddsSnapshot, RoshLineupScore, ShadowOrder
 from .profiles import (
     PlayerForm,
     TeamStyleProfile,
@@ -43,6 +45,12 @@ from .service_coordination import (
     database_writer_authority,
 )
 from .storage import LiveBettingStore
+from .stratz_rosh_client import (
+    FetchedRoshLineupScore,
+    ROSH_FORMULA_VERSION,
+    StratzRoshClient,
+    rosh_cache_week_start,
+)
 from .strict_eligibility import query_strict_live_eligibility
 from .vision import VisionObservation, read_jsonl
 
@@ -51,6 +59,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 MAX_VISION_AGE = timedelta(seconds=30)
 MAX_ODDS_TRANSPORT_AGE = timedelta(seconds=15)
+ROSH_BACKGROUND_TIMEOUT_SECONDS = 90.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,136 @@ class TransportRef:
     observation_key: str
     observed_at: datetime
     state_hash: str
+
+
+@dataclass(frozen=True)
+class RoshFetchKey:
+    radiant_heroes: tuple[int, ...]
+    dire_heroes: tuple[int, ...]
+    radiant_players: tuple[int | None, ...]
+    dire_players: tuple[int | None, ...]
+    player_identity_evidence_hash: str | None
+    cache_week_start: int
+
+
+@dataclass
+class _PendingRoshFetch:
+    future: Future[FetchedRoshLineupScore]
+    submitted_at: float
+    timeout_logged: bool = False
+
+
+class RoshFetchCoordinator:
+    """One-worker, non-blocking coordinator; background code never sees SQLite."""
+
+    def __init__(
+        self,
+        *,
+        executor: ThreadPoolExecutor | None = None,
+        client_factory: Callable[[], StratzRoshClient] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        timeout_seconds: float = ROSH_BACKGROUND_TIMEOUT_SECONDS,
+    ) -> None:
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="stratz-rosh",
+        )
+        self._owns_executor = executor is None
+        self._client_factory = client_factory or (
+            lambda: StratzRoshClient(timeout_seconds=5.0)
+        )
+        self._monotonic = monotonic
+        self._timeout_seconds = timeout_seconds
+        self._active: tuple[RoshFetchKey, _PendingRoshFetch] | None = None
+        self._closed = False
+
+    def poll_or_submit(
+        self,
+        key: RoshFetchKey,
+        *,
+        radiant_heroes: tuple[int, ...],
+        dire_heroes: tuple[int, ...],
+        query_started_at: datetime,
+        radiant_players: tuple[int | None, ...],
+        dire_players: tuple[int | None, ...],
+        player_identity_evidence: Mapping[str, Any] | None,
+    ) -> FetchedRoshLineupScore | None:
+        if self._closed:
+            return None
+        now = self._monotonic()
+        if self._active is not None:
+            active_key, pending = self._active
+            expired = now - pending.submitted_at > self._timeout_seconds
+            if not pending.future.done():
+                if expired and not pending.timeout_logged:
+                    pending.timeout_logged = True
+                    logger.warning("STRATZ Rosh background fetch timed out")
+                return None
+            self._active = None
+            if expired or active_key != key:
+                try:
+                    pending.future.result()
+                except Exception as error:
+                    logger.warning(
+                        "STRATZ Rosh background fetch failed (%s)",
+                        type(error).__name__,
+                    )
+                # The completed result is stale for this poll. After sweeping
+                # it, the current key may occupy the sole worker slot below.
+            else:
+                try:
+                    return pending.future.result()
+                except Exception as error:
+                    logger.warning(
+                        "STRATZ Rosh background fetch failed (%s)",
+                        type(error).__name__,
+                    )
+                    return None
+        future = self._executor.submit(
+            self._fetch,
+            radiant_heroes,
+            dire_heroes,
+            query_started_at,
+            radiant_players,
+            dire_players,
+            dict(player_identity_evidence) if player_identity_evidence else None,
+        )
+        self._active = (key, _PendingRoshFetch(future, now))
+        return None
+
+    def _fetch(
+        self,
+        radiant_heroes: tuple[int, ...],
+        dire_heroes: tuple[int, ...],
+        query_started_at: datetime,
+        radiant_players: tuple[int | None, ...],
+        dire_players: tuple[int | None, ...],
+        player_identity_evidence: Mapping[str, Any] | None,
+    ) -> FetchedRoshLineupScore:
+        return self._client_factory().fetch_lineup_score(
+            radiant_heroes,
+            dire_heroes,
+            as_of=query_started_at,
+            radiant_player_ids=radiant_players,
+            dire_player_ids=dire_players,
+            player_identity_evidence=player_identity_evidence,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._active is not None:
+            self._active[1].future.cancel()
+            self._active = None
+        if self._owns_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def __enter__(self) -> "RoshFetchCoordinator":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
@@ -744,12 +883,151 @@ def _aligned_transport_observation(
     return replace(anchor, game_clock_seconds=game_clock), "ok"
 
 
+def _rosh_score_for_trusted_draft(
+    store: LiveBettingStore,
+    observation: VisionObservation,
+    *,
+    strict_mapping_id: int,
+    as_of: datetime,
+    fetch_started_at: datetime,
+    player_identity: LivePlayerIdentity | None = None,
+    fetch_coordinator: RoshFetchCoordinator | None = None,
+) -> RoshLineupScore | None:
+    """Load or fetch Rosh with only exact live player identity."""
+    draft_hash = store.rosh_draft_hash(
+        observation.radiant_hero_ids,
+        observation.dire_hero_ids,
+    )
+    missing_players: tuple[None, ...] = (None,) * 5
+    if (
+        player_identity is not None
+        and player_identity.radiant_hero_ids == observation.radiant_hero_ids
+        and player_identity.dire_hero_ids == observation.dire_hero_ids
+    ):
+        radiant_players: tuple[int | None, ...] = (
+            player_identity.radiant_player_ids
+        )
+        dire_players: tuple[int | None, ...] = player_identity.dire_player_ids
+        player_identity_evidence: dict[str, Any] | None = {
+            "radiant_team_id": player_identity.radiant_team_id,
+            "dire_team_id": player_identity.dire_team_id,
+            "source_name": player_identity.source_name,
+            "source_match_id": player_identity.source_match_id,
+            "fetched_at": player_identity.fetched_at,
+            "evidence_hash": player_identity.evidence_hash,
+        }
+    else:
+        radiant_players = missing_players
+        dire_players = missing_players
+        player_identity_evidence = None
+    cached = store.find_rosh_lineup_score(
+        draft_hash=draft_hash,
+        formula_version=ROSH_FORMULA_VERSION,
+        cache_week_start=rosh_cache_week_start(as_of),
+        radiant_hero_ids=observation.radiant_hero_ids,
+        dire_hero_ids=observation.dire_hero_ids,
+        radiant_player_ids=radiant_players,
+        dire_player_ids=dire_players,
+        as_of=as_of,
+    )
+    if cached is not None:
+        rebound = store.insert_rosh_lineup_score(
+            cached,
+            raybet_match_id=observation.raybet_match_id,
+            map_number=int(observation.map_number or 0),
+            strict_mapping_id=strict_mapping_id,
+            draft_hash=draft_hash,
+            radiant_hero_ids=observation.radiant_hero_ids,
+            dire_hero_ids=observation.dire_hero_ids,
+            radiant_player_ids=radiant_players,
+            dire_player_ids=dire_players,
+            created_at=as_of,
+        )
+        if rebound is not None:
+            return rebound
+    already_fetched = store.find_rosh_lineup_score(
+        draft_hash=draft_hash,
+        formula_version=ROSH_FORMULA_VERSION,
+        cache_week_start=rosh_cache_week_start(fetch_started_at),
+        radiant_hero_ids=observation.radiant_hero_ids,
+        dire_hero_ids=observation.dire_hero_ids,
+        radiant_player_ids=radiant_players,
+        dire_player_ids=dire_players,
+        as_of=fetch_started_at,
+    )
+    if already_fetched is not None:
+        store.insert_rosh_lineup_score(
+            already_fetched,
+            raybet_match_id=observation.raybet_match_id,
+            map_number=int(observation.map_number or 0),
+            strict_mapping_id=strict_mapping_id,
+            draft_hash=draft_hash,
+            radiant_hero_ids=observation.radiant_hero_ids,
+            dire_hero_ids=observation.dire_hero_ids,
+            radiant_player_ids=radiant_players,
+            dire_player_ids=dire_players,
+            created_at=fetch_started_at,
+        )
+        return None
+    if fetch_coordinator is None:
+        return None
+    fetch_key = RoshFetchKey(
+        radiant_heroes=observation.radiant_hero_ids,
+        dire_heroes=observation.dire_hero_ids,
+        radiant_players=radiant_players,
+        dire_players=dire_players,
+        player_identity_evidence_hash=(
+            player_identity.evidence_hash if player_identity is not None else None
+        ),
+        cache_week_start=rosh_cache_week_start(fetch_started_at),
+    )
+    fetched = fetch_coordinator.poll_or_submit(
+        fetch_key,
+        radiant_heroes=observation.radiant_hero_ids,
+        dire_heroes=observation.dire_hero_ids,
+        query_started_at=fetch_started_at,
+        radiant_players=radiant_players,
+        dire_players=dire_players,
+        player_identity_evidence=player_identity_evidence,
+    )
+    if fetched is None:
+        return None
+    store.insert_rosh_lineup_score(
+        fetched,
+        raybet_match_id=observation.raybet_match_id,
+        map_number=int(observation.map_number or 0),
+        strict_mapping_id=strict_mapping_id,
+        draft_hash=draft_hash,
+        radiant_hero_ids=observation.radiant_hero_ids,
+        dire_hero_ids=observation.dire_hero_ids,
+        radiant_player_ids=radiant_players,
+        dire_player_ids=dire_players,
+        created_at=max(fetch_started_at, fetched.source_as_of),
+    )
+    # The response did not exist at the current transport cutoff. It becomes
+    # eligible only for a later transport after both source and creation time.
+    return None
+
+
+def _canonical_live_team_ids(
+    mapping: Any,
+    radiant_team_side: str | None,
+) -> tuple[int, int] | None:
+    if radiant_team_side == "team_one":
+        return mapping.canonical_team_one_id, mapping.canonical_team_two_id
+    if radiant_team_side == "team_two":
+        return mapping.canonical_team_two_id, mapping.canonical_team_one_id
+    return None
+
+
 def run_once(
     store: LiveBettingStore,
     strategy: ComebackShadowStrategy,
     vision_path: Path,
     *,
     now: datetime | None = None,
+    player_identity_resolver: LivePlayerIdentityResolver | None = None,
+    rosh_fetch_coordinator: RoshFetchCoordinator | None = None,
 ) -> dict[str, object]:
     run_at = now or datetime.now(timezone.utc)
     try:
@@ -1090,6 +1368,41 @@ def run_once(
             "research": research_payload,
         }
 
+    player_identity = None
+    if player_identity_resolver is not None:
+        live_team_ids = _canonical_live_team_ids(
+            strict.mapping, observation.radiant_team_side
+        )
+        if live_team_ids is not None:
+            player_identity = player_identity_resolver.resolve(
+                radiant_team_id=live_team_ids[0],
+                dire_team_id=live_team_ids[1],
+                radiant_hero_ids=observation.radiant_hero_ids,
+                dire_hero_ids=observation.dire_hero_ids,
+                as_of=current_transport_at,
+            )
+        strict_inputs["live_player_identity"] = (
+            {"status": "unavailable"}
+            if player_identity is None
+            else {
+                "status": "resolved",
+                "source": player_identity.source_name,
+                "source_match_id": player_identity.source_match_id,
+                "fetched_at": player_identity.fetched_at.isoformat(),
+                "evidence_hash": player_identity.evidence_hash,
+            }
+        )
+
+    rosh_lineup_score = _rosh_score_for_trusted_draft(
+        store,
+        observation,
+        strict_mapping_id=strict.mapping.mapping_id,
+        as_of=current_transport_at,
+        fetch_started_at=run_at,
+        player_identity=player_identity,
+        fetch_coordinator=rosh_fetch_coordinator,
+    )
+
     previous_snapshots = None
     previous_observation = None
     previous_transport_key = None
@@ -1143,6 +1456,7 @@ def run_once(
         signal_transport_key=current_transport.observation_key,
         previous_transport_key=previous_transport_key,
         input_refs=intelligence_refs,
+        rosh_lineup_score=rosh_lineup_score,
     )
     _persist_decision(
         store,
@@ -1177,7 +1491,11 @@ def run_once(
 
 def _run_cli(args: argparse.Namespace) -> int:
     strategy = ComebackShadowStrategy()
-    with LiveBettingStore(args.database) as store:
+    player_identity_resolver = LivePlayerIdentityResolver()
+    with (
+        LiveBettingStore(args.database) as store,
+        RoshFetchCoordinator() as rosh_fetch_coordinator,
+    ):
         if not getattr(args, "schema_prepared", False):
             store.init_schema()
         started_at = datetime.now(timezone.utc)
@@ -1190,7 +1508,13 @@ def _run_cli(args: argparse.Namespace) -> int:
         )
         while True:
             try:
-                result = run_once(store, strategy, args.vision_jsonl)
+                result = run_once(
+                    store,
+                    strategy,
+                    args.vision_jsonl,
+                    player_identity_resolver=player_identity_resolver,
+                    rosh_fetch_coordinator=rosh_fetch_coordinator,
+                )
                 succeeded_at = datetime.now(timezone.utc)
                 record_health(
                     store.connection,

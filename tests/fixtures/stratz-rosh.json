@@ -1,0 +1,130 @@
+{
+  "week": 1800000000,
+  "radiant_heroes": [1, 2, 3, 4, 5],
+  "dire_heroes": [6, 7, 8, 9, 10],
+  "responses": {
+    "heroes_meta_positions": {
+      "data": {
+        "heroStats": {
+          "heroesPos_1": [
+            {"heroId": 1, "matchCount": 100, "winCount": 60},
+            {"heroId": 6, "matchCount": 100, "winCount": 40}
+          ],
+          "heroesPos_2": [
+            {"heroId": 2, "matchCount": 100, "winCount": 60},
+            {"heroId": 7, "matchCount": 100, "winCount": 40}
+          ],
+          "heroesPos_3": [
+            {"heroId": 3, "matchCount": 100, "winCount": 60},
+            {"heroId": 8, "matchCount": 100, "winCount": 40}
+          ],
+          "heroesPos_4": [
+            {"heroId": 4, "matchCount": 100, "winCount": 60},
+            {"heroId": 9, "matchCount": 100, "winCount": 40}
+          ],
+          "heroesPos_5": [
+            {"heroId": 5, "matchCount": 100, "winCount": 60},
+            {"heroId": 10, "matchCount": 100, "winCount": 40}
+          ]
+        }
+      }
+    },
+    "hero_stats_by_time_bracket": {
+      "data": {
+        "heroStats": {
+          "heroStatsByTime_1": [
+            {"heroId": 1, "time": 20, "matchCount": 300, "winCount": 180},
+            {"heroId": 1, "time": 21, "matchCount": 200, "winCount": 100},
+            {"heroId": 1, "time": 22, "matchCount": 100, "winCount": 40},
+            {"heroId": 6, "time": 20, "matchCount": 300, "winCount": 120},
+            {"heroId": 6, "time": 21, "matchCount": 200, "winCount": 80},
+            {"heroId": 6, "time": 22, "matchCount": 100, "winCount": 40}
+          ],
+          "heroStatsByTime_2": [
+            {"heroId": 2, "time": 20, "matchCount": 300, "winCount": 180},
+            {"heroId": 2, "time": 21, "matchCount": 200, "winCount": 100},
+            {"heroId": 2, "time": 22, "matchCount": 100, "winCount": 40},
+            {"heroId": 7, "time": 20, "matchCount": 300, "winCount": 120},
+            {"heroId": 7, "time": 21, "matchCount": 200, "winCount": 80},
+            {"heroId": 7, "time": 22, "matchCount": 100, "winCount": 40}
+          ],
+          "heroStatsByTime_3": [
+            {"heroId": 3, "time": 20, "matchCount": 300, "winCount": 180},
+            {"heroId": 3, "time": 21, "matchCount": 200, "winCount": 100},
+            {"heroId": 3, "time": 22, "matchCount": 100, "winCount": 40},
+            {"heroId": 8, "time": 20, "matchCount": 300, "winCount": 120},
+            {"heroId": 8, "time": 21, "matchCount": 200, "winCount": 80},
+            {"heroId": 8, "time": 22, "matchCount": 100, "winCount": 40}
+          ],
+          "heroStatsByTime_4": [
+            {"heroId": 4, "time": 20, "matchCount": 300, "winCount": 180},
+            {"heroId": 4, "time": 21, "matchCount": 200, "winCount": 100},
+            {"heroId": 4, "time": 22, "matchCount": 100, "winCount": 40},
+            {"heroId": 9, "time": 20, "matchCount": 300, "winCount": 120},
+            {"heroId": 9, "time": 21, "matchCount": 200, "winCount": 80},
+            {"heroId": 9, "time": 22, "matchCount": 100, "winCount": 40}
+          ],
+          "heroStatsByTime_5": [
+            {"heroId": 5, "time": 20, "matchCount": 300, "winCount": 180},
+            {"heroId": 5, "time": 21, "matchCount": 200, "winCount": 100},
+            {"heroId": 5, "time": 22, "matchCount": 100, "winCount": 40},
+            {"heroId": 10, "time": 20, "matchCount": 300, "winCount": 120},
+            {"heroId": 10, "time": 21, "matchCount": 200, "winCount": 80},
+            {"heroId": 10, "time": 22, "matchCount": 100, "winCount": 40}
+          ]
+        }
+      }
+    },
+    "synergy": {
+      "data": {
+        "heroStats": {
+          "matchUp_Prev_Week_1": [
+            {"heroId": 1, "with": [{"heroId2": 2, "matchCount": 50, "synergy": 4}], "vs": [{"heroId2": 6, "matchCount": 100, "synergy": 3}]},
+            {"heroId": 6, "with": [{"heroId2": 7, "matchCount": 100, "synergy": 2}], "vs": [{"heroId2": 1, "matchCount": 100, "synergy": 1}]}
+          ],
+          "matchUp_Prev_Week_2": [
+            {"heroId": 1, "with": [{"heroId2": 2, "matchCount": 50, "synergy": 6}], "vs": []}
+          ],
+          "matchUp_Prev_Week_3": [],
+          "matchUp_Prev_Week_4": []
+        }
+      }
+    }
+  },
+  "radiant_player_highlights": [
+    {
+      "lastPlayed": 1799999000,
+      "matchCount": 30,
+      "winCount": 18,
+      "impAllTime": 8,
+      "matchCountLastMonth": 10,
+      "winCountLastMonth": 7,
+      "impLastMonth": 10,
+      "matchCountLastSixMonths": 20,
+      "winCountLastSixMonths": 12,
+      "impLastSixMonths": 9
+    },
+    null,
+    null,
+    null,
+    null
+  ],
+  "dire_player_highlights": [
+    {
+      "lastPlayed": 1799998000,
+      "matchCount": 30,
+      "winCount": 15,
+      "impAllTime": -8,
+      "matchCountLastMonth": 10,
+      "winCountLastMonth": 4,
+      "impLastMonth": -10,
+      "matchCountLastSixMonths": 20,
+      "winCountLastSixMonths": 9,
+      "impLastSixMonths": -9
+    },
+    null,
+    null,
+    null,
+    null
+  ]
+}

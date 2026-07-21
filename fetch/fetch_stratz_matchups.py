@@ -6,13 +6,14 @@ data with synergy scores. Sample sizes are ~13x larger than OpenDota Explorer.
 Requires curl_cffi for TLS fingerprinting to bypass Cloudflare.
 
 Usage:
-    python -m fetch.fetch_stratz_matchups [--force] [--token STRATZ_TOKEN]
+    python -m fetch.fetch_stratz_matchups [--force] [--token TOKEN]
 """
 
 import argparse
 import logging
 import os
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 
 import yaml
@@ -56,6 +57,16 @@ query HeroMatchups($heroId: Short!) {
   }
 }
 """
+
+
+def resolve_stratz_token(environment: Mapping[str, str] | None = None) -> str | None:
+    """Resolve the preferred STRATZ credential with legacy fallback."""
+    env = os.environ if environment is None else environment
+    primary = str(env.get("STRATZ_API_TOKEN", "")).strip()
+    if primary:
+        return primary
+    legacy = str(env.get("STRATZ_TOKEN", "")).strip()
+    return legacy or None
 
 
 def load_config() -> dict:
@@ -226,14 +237,18 @@ def main() -> None:
     parser.add_argument(
         "--token",
         type=str,
-        default=os.environ.get("STRATZ_TOKEN"),
-        help="Stratz API Bearer token (or set STRATZ_TOKEN env var)",
+        default=resolve_stratz_token(),
+        help=(
+            "Stratz API Bearer token (or set STRATZ_API_TOKEN; "
+            "STRATZ_TOKEN is deprecated)"
+        ),
     )
     args = parser.parse_args()
 
     if not args.token:
         parser.error(
-            "Stratz token required. Pass --token or set STRATZ_TOKEN env var."
+            "Stratz token required. Pass --token or set STRATZ_API_TOKEN "
+            "(STRATZ_TOKEN is deprecated)."
         )
 
     cfg = load_config()

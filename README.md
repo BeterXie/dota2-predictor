@@ -54,6 +54,27 @@ After building `web/frontend`, open the live console at
 `http://127.0.0.1:8000/monitor`. It includes history replay, freshness-derived
 health, allowlisted process controls, exact-mapping audit, and persistent alerts.
 
+### STRATZ API credentials
+
+`STRATZ_API_TOKEN` is the canonical STRATZ credential. `STRATZ_TOKEN` remains a
+deprecated fallback for existing installations. Keep real credentials only in
+an ignored local `.env` file or a deployment platform's secret store; never
+commit them to Git, bake them into an image, or expose them in frontend assets.
+
+STRATZ entry points read the service process environment. For local PowerShell
+sessions, inject the credential before starting the process:
+
+```powershell
+$env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
+python -m fetch.fetch_stratz_matchups
+```
+
+For production, create a secret named `STRATZ_API_TOKEN` in the host,
+container orchestrator, or CI/CD platform and configure every STRATZ worker to
+receive it as an environment variable. Restart the worker after changing the
+secret so the new process inherits it. Copying `.env.template` alone does not
+inject values into a running process.
+
 ## Live Shadow Workflow
 
 All Dota 2 live-market code runs from this repository. The workflow is

@@ -140,8 +140,32 @@ export interface LineupCurveData {
   points: LineupCurvePoint[];
 }
 
+export interface LivePlayerIdentity {
+  steam_account_id: number | null;
+  side: "radiant" | "dire";
+  position: number;
+  hero_id: number;
+  status: "resolved" | "selected_unresolved" | "unavailable";
+}
+
 export interface LivePlayerIdentityData {
-  players: unknown[];
+  players: LivePlayerIdentity[];
+}
+
+export interface RoshLineupScoresData {
+  pure_lineup_score: number;
+  player_adjusted_lineup_score: number | null;
+  effective_lineup_score: number;
+  mode: "pure" | "player_adjusted";
+  player_coverage: number;
+  player_coverage_count: number;
+  stake_multiplier: number;
+  formula_version: string;
+  source_as_of: string;
+  score_key: string;
+  player_identity_hash: string;
+  evidence_hash: string;
+  stake_cap: number;
 }
 
 export interface LineupAnalysisData {
@@ -156,6 +180,7 @@ export interface LineupAnalysisData {
     anchored_at: string;
     strict_mapping_id: number;
   };
+  scores: AnalysisSection<RoshLineupScoresData>;
   active_curve: AnalysisSection<LineupCurveData>;
   players: AnalysisSection<LivePlayerIdentityData>;
 }

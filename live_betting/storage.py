@@ -29,7 +29,15 @@ from .draft_authority import (
     authority_from_row,
     draft_landmark_authority_matches,
 )
-from .models import LiveEvent, LiveFrame, Market, OddsSnapshot, ProviderMatch, ShadowOrder
+from .models import (
+    LiveEvent,
+    LiveFrame,
+    Market,
+    OddsSnapshot,
+    ProviderMatch,
+    RoshLineupScore,
+    ShadowOrder,
+)
 from .odds_response_authority import (
     canonical_state_outcomes,
     response_artifact_identity as canonical_response_artifact_identity,
@@ -56,14 +64,17 @@ from .vision_frame_registry import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
+ROSH_LINEUP_CACHE_TTL = timedelta(minutes=15)
+ROSH_FETCH_MAX_DURATION = timedelta(minutes=10)
 
 _SCORED_DECISION_CONTRIBUTION_KEYS = frozenset(
     {
         "team_style",
         "player_form",
         "draft_curve",
+        "lineup_rosh",
         "late_game_style",
         "market_movement",
     }
@@ -341,8 +352,19 @@ def _draft_authority_values(
 
 def _has_scored_decision_contributions(decision: Any) -> bool:
     contributions = getattr(decision, "contributions", None)
-    return isinstance(contributions, Mapping) and (
-        _SCORED_DECISION_CONTRIBUTION_KEYS <= set(contributions)
+    if not isinstance(contributions, Mapping) or (
+        set(contributions) != _SCORED_DECISION_CONTRIBUTION_KEYS
+    ):
+        return False
+    values = tuple(contributions.values())
+    return (
+        all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            for value in values
+        )
+        and float(contributions["draft_curve"]) == 0.0
     )
 
 
@@ -1175,7 +1197,7 @@ CREATE TABLE IF NOT EXISTS shadow_orders (
     signal_outcome_key TEXT,
     signal_identity_verified INTEGER NOT NULL
         CHECK (signal_identity_verified IN (0, 1)),
-    stake REAL NOT NULL,
+    stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0),
     status TEXT NOT NULL,
     fill_price REAL,
     filled_at TEXT,
@@ -1919,6 +1941,83 @@ CREATE TRIGGER IF NOT EXISTS vision_draft_conflicts_immutable_delete
 BEFORE DELETE ON vision_draft_conflicts
 BEGIN
     SELECT RAISE(ABORT, 'vision draft conflict is immutable');
+END;
+CREATE TABLE IF NOT EXISTS rosh_lineup_scores (
+    score_key TEXT PRIMARY KEY CHECK (length(score_key)=64),
+    draft_hash TEXT NOT NULL CHECK (length(draft_hash)=64),
+    player_identity_hash TEXT NOT NULL CHECK (length(player_identity_hash)=64),
+    raybet_match_id TEXT NOT NULL,
+    map_number INTEGER NOT NULL CHECK (map_number>0),
+    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id>0)
+        REFERENCES strict_live_map_mappings(mapping_id),
+    radiant_hero_ids_json TEXT NOT NULL CHECK (
+        json_valid(radiant_hero_ids_json)
+        AND json_array_length(radiant_hero_ids_json)=5
+    ),
+    dire_hero_ids_json TEXT NOT NULL CHECK (
+        json_valid(dire_hero_ids_json)
+        AND json_array_length(dire_hero_ids_json)=5
+    ),
+    pure_lineup_score REAL NOT NULL CHECK (
+        typeof(pure_lineup_score) IN ('integer', 'real')
+    ),
+    player_adjusted_lineup_score REAL CHECK (
+        player_adjusted_lineup_score IS NULL OR
+        typeof(player_adjusted_lineup_score) IN ('integer', 'real')
+    ),
+    effective_lineup_score REAL NOT NULL CHECK (
+        typeof(effective_lineup_score) IN ('integer', 'real')
+    ),
+    scoring_mode TEXT NOT NULL CHECK (
+        scoring_mode IN ('pure', 'player_adjusted')
+    ),
+    player_coverage_count INTEGER NOT NULL CHECK (
+        player_coverage_count BETWEEN 0 AND 10
+    ),
+    stake_multiplier REAL NOT NULL CHECK (stake_multiplier IN (0.5, 1.0)),
+    formula_version TEXT NOT NULL CHECK (length(trim(formula_version))>0),
+    source_name TEXT NOT NULL CHECK (source_name='stratz'),
+    source_week INTEGER NOT NULL CHECK (source_week>0),
+    cache_week_start INTEGER NOT NULL CHECK (cache_week_start>0),
+    source_as_of TEXT NOT NULL,
+    evidence_json TEXT NOT NULL CHECK (
+        json_valid(evidence_json) AND json_type(evidence_json)='object'
+    ),
+    evidence_hash TEXT NOT NULL CHECK (length(evidence_hash)=64),
+    created_at TEXT NOT NULL,
+    CHECK (
+        (scoring_mode='player_adjusted'
+         AND player_coverage_count=10
+         AND player_adjusted_lineup_score IS NOT NULL
+         AND effective_lineup_score=player_adjusted_lineup_score
+         AND stake_multiplier=1.0)
+        OR
+        (scoring_mode='pure'
+         AND player_coverage_count<10
+         AND player_adjusted_lineup_score IS NULL
+         AND effective_lineup_score=pure_lineup_score
+         AND stake_multiplier=0.5)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_rosh_lineup_scores_cache
+    ON rosh_lineup_scores(
+        draft_hash, player_identity_hash, formula_version, cache_week_start,
+        created_at DESC, score_key DESC
+    );
+CREATE INDEX IF NOT EXISTS idx_rosh_lineup_scores_map
+    ON rosh_lineup_scores(
+        raybet_match_id, map_number, strict_mapping_id,
+        created_at DESC, score_key DESC
+    );
+CREATE TRIGGER IF NOT EXISTS rosh_lineup_scores_immutable_update
+BEFORE UPDATE ON rosh_lineup_scores
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh lineup score is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS rosh_lineup_scores_immutable_delete
+BEFORE DELETE ON rosh_lineup_scores
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh lineup score is immutable');
 END;
 CREATE TABLE IF NOT EXISTS vision_derived_invalidations (
     dependent_type TEXT NOT NULL CHECK (dependent_type IN
@@ -3771,6 +3870,253 @@ def strict_order_mapping_block_reason(
         map_number=map_number,
         signal_transport_at=order["signal_transport_at"],
     )
+
+
+_ROSH_MINUTE_NUMERIC_FIELDS = (
+    "advantage_percent",
+    "radiant_advantage",
+    "dire_advantage",
+    "match_percentage",
+    "win_rate_graph",
+    "hero_adjustment",
+    "hero_base_adjustment",
+    "hero_tempo_adjustment",
+    "synergy_adjustment",
+    "player_adjustment",
+)
+
+
+def _valid_rosh_minute_table(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    previous_minute = 19
+    for bucket in value:
+        if not isinstance(bucket, Mapping):
+            return False
+        minute = bucket.get("minute")
+        time_start = bucket.get("time_start")
+        time_end = bucket.get("time_end")
+        if (
+            type(minute) is not int
+            or type(time_start) is not int
+            or type(time_end) is not int
+            or not 20 <= time_start <= minute <= time_end <= 60
+            or minute <= previous_minute
+            or bucket.get("advantage_side") not in {"radiant", "dire", "even"}
+        ):
+            return False
+        previous_minute = minute
+        for field in _ROSH_MINUTE_NUMERIC_FIELDS:
+            item = bucket.get(field)
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+            ):
+                return False
+    return True
+
+
+def _valid_rosh_score_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    pure_score: float,
+    adjusted_score: float | None,
+    effective_score: float,
+    scoring_mode: str,
+    player_coverage_count: int,
+) -> bool:
+    score = evidence.get("score")
+    pure_table = evidence.get("pure_minute_table")
+    if not isinstance(score, Mapping) or not _valid_rosh_minute_table(pure_table):
+        return False
+    expected = {
+        "pure_lineup_score": pure_score,
+        "player_adjusted_lineup_score": adjusted_score,
+        "effective_lineup_score": effective_score,
+        "scoring_mode": scoring_mode,
+        "player_coverage_count": player_coverage_count,
+    }
+    if any(score.get(key) != value for key, value in expected.items()):
+        return False
+    if float(pure_table[-1]["win_rate_graph"]) != pure_score:
+        return False
+    if scoring_mode == "player_adjusted":
+        adjusted_table = evidence.get("minute_table")
+        return bool(
+            _valid_rosh_minute_table(adjusted_table)
+            and adjusted_score is not None
+            and float(adjusted_table[-1]["win_rate_graph"]) == adjusted_score
+            and [row["minute"] for row in adjusted_table]
+            == [row["minute"] for row in pure_table]
+        )
+    return "minute_table" not in evidence
+
+
+def query_rosh_lineup_score_for_trusted_draft(
+    connection: sqlite3.Connection,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    strict_mapping_id: int,
+    draft_hash: str,
+    radiant_hero_ids: Sequence[int],
+    dire_hero_ids: Sequence[int],
+    as_of: datetime,
+    formula_version: str | None = None,
+    radiant_player_ids: Sequence[int | None] | None = None,
+    dire_player_ids: Sequence[int | None] | None = None,
+) -> RoshLineupScore | None:
+    """Read a current Rosh score without mutating or configuring a connection."""
+    if (
+        not raybet_match_id
+        or type(map_number) is not int
+        or map_number <= 0
+        or type(strict_mapping_id) is not int
+        or strict_mapping_id <= 0
+        or as_of.tzinfo is None
+        or as_of.utcoffset() is None
+    ):
+        return None
+    try:
+        calculated_hash = LiveBettingStore.rosh_draft_hash(
+            radiant_hero_ids, dire_hero_ids
+        )
+        if (radiant_player_ids is None) != (dire_player_ids is None):
+            return None
+        player_identity_hash = (
+            LiveBettingStore.rosh_player_identity_hash(
+                radiant_player_ids, dire_player_ids
+            )
+            if radiant_player_ids is not None
+            else None
+        )
+    except ValueError:
+        return None
+    if calculated_hash != draft_hash:
+        return None
+    try:
+        anchor_cursor = connection.execute(
+            """SELECT draft_hash, radiant_hero_ids, dire_hero_ids,
+                      anchored_at, status, conflict_at
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id=? AND map_number=?""",
+            (raybet_match_id, map_number),
+        )
+        anchor_row = anchor_cursor.fetchone()
+        if anchor_row is None:
+            return None
+        anchor = (
+            dict(anchor_row)
+            if isinstance(anchor_row, sqlite3.Row)
+            else dict(zip((item[0] for item in anchor_cursor.description), anchor_row))
+        )
+        radiant_json = LiveBettingStore.json(list(radiant_hero_ids))
+        dire_json = LiveBettingStore.json(list(dire_hero_ids))
+        if (
+            str(anchor["draft_hash"]) != draft_hash
+            or str(anchor["radiant_hero_ids"]) != radiant_json
+            or str(anchor["dire_hero_ids"]) != dire_json
+        ):
+            return None
+        anchored_at = datetime.fromisoformat(
+            str(anchor["anchored_at"]).replace("Z", "+00:00")
+        )
+        if (
+            anchored_at.tzinfo is None
+            or anchored_at.utcoffset() is None
+            or anchored_at > as_of
+        ):
+            return None
+        status = str(anchor["status"])
+        if status != "anchored":
+            if status != "conflict" or anchor["conflict_at"] is None:
+                return None
+            conflict_time = datetime.fromisoformat(
+                str(anchor["conflict_at"]).replace("Z", "+00:00")
+            )
+            if (
+                conflict_time.tzinfo is None
+                or conflict_time.utcoffset() is None
+                or conflict_time <= as_of
+            ):
+                return None
+            effective_conflict = connection.execute(
+                """SELECT 1 FROM vision_draft_conflicts
+                    WHERE raybet_match_id=? AND map_number=?
+                      AND (
+                            julianday(captured_at) IS NULL
+                            OR julianday(captured_at)<=julianday(?)
+                      )
+                    LIMIT 1""",
+                (raybet_match_id, map_number, as_of.isoformat()),
+            ).fetchone()
+            if effective_conflict is not None:
+                return None
+        from .strict_eligibility import query_strict_mapping_snapshot
+
+        mapping_snapshot = query_strict_mapping_snapshot(
+            connection,
+            mapping_id=strict_mapping_id,
+            observed_at=as_of,
+        )
+        if (
+            not mapping_snapshot.eligible
+            or mapping_snapshot.mapping is None
+            or mapping_snapshot.mapping.raybet_match_id != raybet_match_id
+            or mapping_snapshot.mapping.map_number != map_number
+        ):
+            return None
+        formula_sql = " AND formula_version=?" if formula_version else ""
+        player_sql = (
+            " AND player_identity_hash=?"
+            if player_identity_hash is not None
+            else ""
+        )
+        parameters: list[Any] = [
+            raybet_match_id,
+            map_number,
+            strict_mapping_id,
+            draft_hash,
+        ]
+        if player_identity_hash is not None:
+            parameters.append(player_identity_hash)
+        parameters.extend(
+            (
+                radiant_json,
+                dire_json,
+                as_of.isoformat(),
+                as_of.isoformat(),
+            )
+        )
+        if formula_version:
+            parameters.append(formula_version)
+        score_cursor = connection.execute(
+            f"""SELECT * FROM rosh_lineup_scores
+                 WHERE raybet_match_id=? AND map_number=?
+                   AND strict_mapping_id=? AND draft_hash=?
+                   {player_sql}
+                   AND radiant_hero_ids_json=? AND dire_hero_ids_json=?
+                   AND julianday(source_as_of)<=julianday(?)
+                   AND julianday(created_at)<=julianday(?)
+                   {formula_sql}
+                 ORDER BY source_as_of DESC, created_at DESC, score_key DESC""",
+            tuple(parameters),
+        )
+        for raw_row in score_cursor.fetchall():
+            row = (
+                raw_row
+                if isinstance(raw_row, sqlite3.Row)
+                else dict(
+                    zip((item[0] for item in score_cursor.description), raw_row)
+                )
+            )
+            score = LiveBettingStore._rosh_score_from_row(row)
+            if score is not None and score.source_as_of <= as_of:
+                return score
+        return None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
 
 
 class LiveBettingStore:
@@ -8165,6 +8511,431 @@ class LiveBettingStore:
              event.value, self.json(event.raw)),
         )
 
+    @staticmethod
+    def _rosh_score_from_row(row: sqlite3.Row) -> RoshLineupScore | None:
+        from .stratz_rosh_client import canonical_evidence_hash
+
+        try:
+            evidence = json.loads(str(row["evidence_json"]))
+            if (
+                not isinstance(evidence, dict)
+                or canonical_evidence_hash(evidence) != str(row["evidence_hash"])
+            ):
+                return None
+            pure_score = float(row["pure_lineup_score"])
+            adjusted_score = (
+                float(row["player_adjusted_lineup_score"])
+                if row["player_adjusted_lineup_score"] is not None
+                else None
+            )
+            effective_score = float(row["effective_lineup_score"])
+            scoring_mode = str(row["scoring_mode"])
+            player_coverage_count = int(row["player_coverage_count"])
+            if not _valid_rosh_score_evidence(
+                evidence,
+                pure_score=pure_score,
+                adjusted_score=adjusted_score,
+                effective_score=effective_score,
+                scoring_mode=scoring_mode,
+                player_coverage_count=player_coverage_count,
+            ):
+                return None
+            source_as_of = datetime.fromisoformat(str(row["source_as_of"]))
+            return RoshLineupScore(
+                score_key=str(row["score_key"]),
+                draft_hash=str(row["draft_hash"]),
+                player_identity_hash=str(row["player_identity_hash"]),
+                pure_lineup_score=pure_score,
+                player_adjusted_lineup_score=adjusted_score,
+                effective_lineup_score=effective_score,
+                scoring_mode=scoring_mode,
+                player_coverage_count=player_coverage_count,
+                stake_multiplier=float(row["stake_multiplier"]),
+                formula_version=str(row["formula_version"]),
+                source_name=str(row["source_name"]),
+                source_week=int(row["source_week"]),
+                cache_week_start=int(row["cache_week_start"]),
+                source_as_of=source_as_of,
+                evidence_hash=str(row["evidence_hash"]),
+                evidence=evidence,
+            )
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            return None
+
+    @staticmethod
+    def rosh_draft_hash(
+        radiant_hero_ids: Sequence[int],
+        dire_hero_ids: Sequence[int],
+    ) -> str:
+        radiant = tuple(radiant_hero_ids)
+        dire = tuple(dire_hero_ids)
+        heroes = (*radiant, *dire)
+        if (
+            len(radiant) != 5
+            or len(dire) != 5
+            or any(type(hero_id) is not int or hero_id <= 0 for hero_id in heroes)
+            or len(set(heroes)) != 10
+        ):
+            raise ValueError("Rosh score requires ten unique positive hero IDs")
+        payload = LiveBettingStore.json(
+            {"radiant": list(radiant), "dire": list(dire)}
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def rosh_player_identity_hash(
+        radiant_player_ids: Sequence[int | None] | None = None,
+        dire_player_ids: Sequence[int | None] | None = None,
+    ) -> str:
+        def slots(
+            values: Sequence[int | None] | None,
+            side: str,
+        ) -> list[int | None]:
+            result = list(values) if values is not None else [None] * 5
+            if len(result) != 5 or any(
+                value is not None
+                and (type(value) is not int or value <= 0)
+                for value in result
+            ):
+                raise ValueError(
+                    f"{side} player IDs must contain five positive IDs or nulls"
+                )
+            return result
+
+        payload = LiveBettingStore.json(
+            {
+                "radiant": slots(radiant_player_ids, "radiant"),
+                "dire": slots(dire_player_ids, "dire"),
+            }
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _trusted_rosh_draft(
+        self,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        strict_mapping_id: int,
+        draft_hash: str,
+        radiant_hero_ids: Sequence[int],
+        dire_hero_ids: Sequence[int],
+        as_of: datetime,
+    ) -> bool:
+        if (
+            not raybet_match_id
+            or type(map_number) is not int
+            or map_number <= 0
+            or type(strict_mapping_id) is not int
+            or strict_mapping_id <= 0
+            or as_of.tzinfo is None
+            or as_of.utcoffset() is None
+        ):
+            return False
+        try:
+            calculated_hash = self.rosh_draft_hash(
+                radiant_hero_ids, dire_hero_ids
+            )
+        except ValueError:
+            return False
+        if calculated_hash != draft_hash:
+            return False
+        anchor = self.connection.execute(
+            """SELECT draft_hash, radiant_hero_ids, dire_hero_ids,
+                      anchored_at, status, conflict_at
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id=? AND map_number=?""",
+            (raybet_match_id, map_number),
+        ).fetchone()
+        if anchor is None:
+            return False
+        if (
+            str(anchor["draft_hash"]) != draft_hash
+            or str(anchor["radiant_hero_ids"])
+            != self.json(list(radiant_hero_ids))
+            or str(anchor["dire_hero_ids"])
+            != self.json(list(dire_hero_ids))
+        ):
+            return False
+        try:
+            anchored_at = datetime.fromisoformat(str(anchor["anchored_at"]))
+        except ValueError:
+            return False
+        if anchored_at > as_of:
+            return False
+        if self._draft_conflict_at_or_before(
+            raybet_match_id, map_number, as_of
+        ):
+            return False
+        from .strict_eligibility import query_strict_mapping_snapshot
+
+        mapping_snapshot = query_strict_mapping_snapshot(
+            self.connection,
+            mapping_id=strict_mapping_id,
+            observed_at=as_of,
+        )
+        return bool(
+            mapping_snapshot.eligible
+            and mapping_snapshot.mapping is not None
+            and mapping_snapshot.mapping.raybet_match_id == raybet_match_id
+            and mapping_snapshot.mapping.map_number == map_number
+        )
+
+    def find_rosh_lineup_score(
+        self,
+        *,
+        draft_hash: str,
+        formula_version: str,
+        cache_week_start: int,
+        radiant_hero_ids: Sequence[int],
+        dire_hero_ids: Sequence[int],
+        as_of: datetime,
+        radiant_player_ids: Sequence[int | None] | None = None,
+        dire_player_ids: Sequence[int | None] | None = None,
+    ) -> RoshLineupScore | None:
+        """Return a non-future same-week score reusable for an identical draft."""
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", draft_hash)
+            or not formula_version.strip()
+            or type(cache_week_start) is not int
+            or cache_week_start <= 0
+            or as_of.tzinfo is None
+            or as_of.utcoffset() is None
+        ):
+            return None
+        if self.rosh_draft_hash(radiant_hero_ids, dire_hero_ids) != draft_hash:
+            return None
+        try:
+            player_identity_hash = self.rosh_player_identity_hash(
+                radiant_player_ids, dire_player_ids
+            )
+        except ValueError:
+            return None
+        rows = self.connection.execute(
+            """SELECT * FROM rosh_lineup_scores
+                WHERE draft_hash=? AND player_identity_hash=?
+                  AND formula_version=?
+                  AND cache_week_start=?
+                  AND julianday(source_as_of)>=julianday(?)
+                  AND julianday(source_as_of)<=julianday(?)
+                  AND julianday(created_at)<=julianday(?)
+                ORDER BY source_as_of DESC, created_at DESC, score_key DESC""",
+            (
+                draft_hash,
+                player_identity_hash,
+                formula_version,
+                cache_week_start,
+                self._iso(as_of - ROSH_LINEUP_CACHE_TTL),
+                self._iso(as_of),
+                self._iso(as_of),
+            ),
+        ).fetchall()
+        radiant_json = self.json(list(radiant_hero_ids))
+        dire_json = self.json(list(dire_hero_ids))
+        for row in rows:
+            if (
+                str(row["radiant_hero_ids_json"]) != radiant_json
+                or str(row["dire_hero_ids_json"]) != dire_json
+            ):
+                continue
+            score = self._rosh_score_from_row(row)
+            if score is not None and score.source_as_of <= as_of:
+                return score
+        return None
+
+    def get_rosh_lineup_score_for_trusted_draft(
+        self,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        strict_mapping_id: int,
+        draft_hash: str,
+        radiant_hero_ids: Sequence[int],
+        dire_hero_ids: Sequence[int],
+        as_of: datetime,
+        formula_version: str | None = None,
+        radiant_player_ids: Sequence[int | None] | None = None,
+        dire_player_ids: Sequence[int | None] | None = None,
+    ) -> RoshLineupScore | None:
+        """Read only a score bound to the exact currently trusted draft."""
+        return query_rosh_lineup_score_for_trusted_draft(
+            self.connection,
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            strict_mapping_id=strict_mapping_id,
+            draft_hash=draft_hash,
+            radiant_hero_ids=radiant_hero_ids,
+            dire_hero_ids=dire_hero_ids,
+            as_of=as_of,
+            formula_version=formula_version,
+            radiant_player_ids=radiant_player_ids,
+            dire_player_ids=dire_player_ids,
+        )
+
+    def insert_rosh_lineup_score(
+        self,
+        score: Any,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        strict_mapping_id: int,
+        draft_hash: str,
+        radiant_hero_ids: Sequence[int],
+        dire_hero_ids: Sequence[int],
+        created_at: datetime,
+        radiant_player_ids: Sequence[int | None] | None = None,
+        dire_player_ids: Sequence[int | None] | None = None,
+    ) -> RoshLineupScore | None:
+        """Append a finite score only when its draft lineage is still trusted."""
+        from .stratz_rosh_client import (
+            canonical_evidence_hash,
+            rosh_cache_week_start,
+        )
+
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        try:
+            pure = float(score.pure_lineup_score)
+            adjusted = (
+                float(score.player_adjusted_lineup_score)
+                if score.player_adjusted_lineup_score is not None
+                else None
+            )
+            effective = float(score.effective_lineup_score)
+            coverage = int(score.player_coverage_count)
+            stake_multiplier = float(score.stake_cap)
+            mode = str(score.scoring_mode)
+            formula_version = str(score.formula_version)
+            source_name = str(score.source_name)
+            source_week = int(score.source_week)
+            cache_week_start = int(score.cache_week_start)
+            source_as_of = score.source_as_of
+            evidence = dict(score.evidence)
+            evidence_hash = str(score.evidence_hash)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if (
+            any(not math.isfinite(value) for value in (pure, effective))
+            or (adjusted is not None and not math.isfinite(adjusted))
+            or source_as_of.tzinfo is None
+            or source_as_of.utcoffset() is None
+            or source_as_of > created_at
+            or source_name != "stratz"
+            or not formula_version.strip()
+            or canonical_evidence_hash(evidence) != evidence_hash
+            or not _valid_rosh_score_evidence(
+                evidence,
+                pure_score=pure,
+                adjusted_score=adjusted,
+                effective_score=effective,
+                scoring_mode=mode,
+                player_coverage_count=coverage,
+            )
+        ):
+            return None
+        query_started_at = datetime.fromtimestamp(source_week, tz=timezone.utc)
+        if (
+            query_started_at > source_as_of
+            or source_as_of - query_started_at > ROSH_FETCH_MAX_DURATION
+            or cache_week_start != rosh_cache_week_start(query_started_at)
+            or evidence.get("source") != source_name
+            or evidence.get("source_week") != source_week
+            or evidence.get("cache_week_start") != cache_week_start
+            or evidence.get("formula_version") != formula_version
+            or evidence.get("source_as_of") != self._iso(source_as_of)
+        ):
+            return None
+        try:
+            player_identity_hash = self.rosh_player_identity_hash(
+                radiant_player_ids, dire_player_ids
+            )
+        except ValueError:
+            return None
+        if mode == "player_adjusted":
+            invariant = (
+                coverage == 10
+                and adjusted is not None
+                and effective == adjusted
+                and stake_multiplier == 1.0
+            )
+        else:
+            invariant = (
+                mode == "pure"
+                and 0 <= coverage < 10
+                and adjusted is None
+                and effective == pure
+                and stake_multiplier == 0.5
+            )
+        if not invariant or not self._trusted_rosh_draft(
+            raybet_match_id=raybet_match_id,
+            map_number=map_number,
+            strict_mapping_id=strict_mapping_id,
+            draft_hash=draft_hash,
+            radiant_hero_ids=radiant_hero_ids,
+            dire_hero_ids=dire_hero_ids,
+            as_of=created_at,
+        ):
+            return None
+        identity = self.json(
+            {
+                "draft_hash": draft_hash,
+                "evidence_hash": evidence_hash,
+                "formula_version": formula_version,
+                "map_number": map_number,
+                "raybet_match_id": raybet_match_id,
+                "strict_mapping_id": strict_mapping_id,
+                "player_identity_hash": player_identity_hash,
+            }
+        )
+        score_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        self.execute(
+            """INSERT OR IGNORE INTO rosh_lineup_scores
+               (score_key, draft_hash, player_identity_hash,
+                raybet_match_id, map_number,
+                strict_mapping_id, radiant_hero_ids_json,
+                dire_hero_ids_json, pure_lineup_score,
+                player_adjusted_lineup_score, effective_lineup_score,
+                scoring_mode, player_coverage_count, stake_multiplier,
+                formula_version, source_name, source_week, cache_week_start,
+                source_as_of, evidence_json, evidence_hash, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?)""",
+            (
+                score_key,
+                draft_hash,
+                player_identity_hash,
+                raybet_match_id,
+                map_number,
+                strict_mapping_id,
+                self.json(list(radiant_hero_ids)),
+                self.json(list(dire_hero_ids)),
+                pure,
+                adjusted,
+                effective,
+                mode,
+                coverage,
+                stake_multiplier,
+                formula_version,
+                source_name,
+                source_week,
+                cache_week_start,
+                self._iso(source_as_of),
+                self.json(evidence),
+                evidence_hash,
+                self._iso(created_at),
+            ),
+        )
+        row = self.connection.execute(
+            "SELECT * FROM rosh_lineup_scores WHERE score_key=?",
+            (score_key,),
+        ).fetchone()
+        return None if row is None else self._rosh_score_from_row(row)
+
     def insert_order(self, order: ShadowOrder) -> bool:
         """Reject the legacy writer that cannot bind an order to a map mapping."""
         del order
@@ -9002,6 +9773,7 @@ class LiveBettingStore:
                     ),
                     str(row["strategy_version"]),
                     str(row["input_ref"]),
+                    str(float(order.stake)),
                 )
             )
             if hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32] != order.order_key:
@@ -9097,7 +9869,7 @@ class LiveBettingStore:
             not 0.0 <= float(order.model_probability) <= 1.0
             or not 0.0 <= float(order.market_probability) <= 1.0
             or float(order.signal_price) <= 1.0
-            or float(order.stake) != 1.0
+            or not 0.0 < float(order.stake) <= 1.0
         ):
             return False
         if (
