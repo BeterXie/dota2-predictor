@@ -15,6 +15,8 @@ export interface FreshnessState {
   observed_at?: string | null;
   age_seconds?: number | null;
   count?: number;
+  total_count?: number;
+  reasons?: string[];
   component?: string;
 }
 
@@ -54,6 +56,115 @@ export interface StrategyDecision {
   eligible: number;
   reason: string;
   strategy_version: string;
+  input_ref?: string;
+  contributions_json?: string;
+  contributions?: Record<string, number>;
+  conservative_contributions?: Record<string, number>;
+  inputs?: Record<string, unknown>;
+  draft_authority?: Record<string, unknown>;
+  vision_authority?: Record<string, unknown>;
+}
+
+export type AnalysisSectionStatus =
+  | "available"
+  | "waiting"
+  | "unavailable"
+  | "review";
+
+export interface AnalysisSection<T> {
+  status: AnalysisSectionStatus;
+  reason: string;
+  data: T | null;
+}
+
+export interface OddsAnalysisData {
+  point_count: number;
+  periods: string[];
+  latest_observed_at: string | null;
+}
+
+export interface VisionAnalysisData {
+  map_number: number;
+  captured_at: string;
+  game_clock_seconds: number;
+  clock_confidence: number;
+  draft_confidence: number;
+  source_frame_ref: string;
+}
+
+export interface StrategyAnalysisData {
+  decisions: StrategyDecision[];
+  displayed_count: number;
+  scanned_count: number;
+  count_scope: "recent_scanned_window";
+  has_more: boolean;
+  truncated: boolean;
+  excluded_decision_count: number;
+  /** Per-reason counts overlap; never sum them as a unique decision count. */
+  excluded: {
+    vision_invalidated: number;
+    mapping_impacted: number;
+    draft_conflicted: number;
+    invalid_payload: number;
+  };
+}
+
+export interface LineupHero {
+  hero_id: number;
+  hero_name?: string | null;
+}
+
+export interface LineupSide {
+  hero_ids: number[];
+  /** Optional future enrichment. Hero IDs remain the display authority. */
+  heroes?: LineupHero[];
+}
+
+export interface LineupCurvePoint {
+  landmark_key: string;
+  horizon_minutes: number;
+  radiant_probability: number;
+  quality: number;
+  support: number;
+  uncertainty: number | null;
+  model_version: string;
+  validation_status: string;
+  conditional: boolean;
+  active: boolean;
+}
+
+export interface LineupCurveData {
+  curve_key: string;
+  first_usable_at: string;
+  active_horizon_minutes: number;
+  points: LineupCurvePoint[];
+}
+
+export interface LivePlayerIdentityData {
+  players: unknown[];
+}
+
+export interface LineupAnalysisData {
+  as_of: string;
+  map_number: number;
+  radiant_team_side: "team_one" | "team_two";
+  radiant: LineupSide;
+  dire: LineupSide;
+  evidence: {
+    draft_hash: string;
+    anchor_source_frame_ref: string;
+    anchored_at: string;
+    strict_mapping_id: number;
+  };
+  active_curve: AnalysisSection<LineupCurveData>;
+  players: AnalysisSection<LivePlayerIdentityData>;
+}
+
+export interface MatchAnalysis {
+  odds: AnalysisSection<OddsAnalysisData>;
+  vision: AnalysisSection<VisionAnalysisData>;
+  strategy: AnalysisSection<StrategyAnalysisData>;
+  lineup: AnalysisSection<LineupAnalysisData>;
 }
 
 export interface WatchLink {
@@ -118,6 +229,8 @@ export interface MatchDetail extends MonitorMatch {
   decisions: StrategyDecision[];
   vision: VisionPoint[];
   markets: MarketQuote[];
+  /** Optional for fail-closed compatibility with older monitor backends. */
+  analysis?: MatchAnalysis;
 }
 
 export interface HealthItem {

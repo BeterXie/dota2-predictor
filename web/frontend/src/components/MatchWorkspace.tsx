@@ -18,7 +18,21 @@ import {
   formatPercent,
 } from "../format";
 import { comparePeriods, mapNumberForPeriod, resolvePeriod } from "../probability-period";
-import type { MatchDetail, MonitorMatch } from "../types";
+import type {
+  AnalysisSection,
+  AnalysisSectionStatus,
+  LineupAnalysisData,
+  LineupCurveData,
+  LineupCurvePoint,
+  LineupSide,
+  LivePlayerIdentityData,
+  MatchDetail,
+  MonitorMatch,
+  OddsAnalysisData,
+  StrategyAnalysisData,
+  StrategyDecision,
+  VisionAnalysisData,
+} from "../types";
 import { LifecycleBadge } from "./StatusBadge";
 import { PostmatchIntelligencePanel } from "./PostmatchIntelligencePanel";
 
@@ -29,6 +43,30 @@ const PUBLIC_STREAM_HOSTS = new Set([
   "qplay.ehome.gg",
   "qplay.shyxswl.com",
 ]);
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const VISION_FRAME_REF_RE = /^vision-frame:sha256:[0-9a-f]{64}$/;
+const PROSPECTIVE_DRAFT_REF_RE = /^prospective-draft:[0-9a-f]{64}$/;
+const OPAQUE_REF_RE = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/;
+const UNSAFE_OPAQUE_REF_RE = /:\/\/|[?#]|[\u0000-\u001f\u007f]/;
+const DECISION_KEY_RE = /^[0-9a-f]{32}$/;
+const INPUT_REF_RE = /^[0-9a-f]{24}$/;
+const STRATEGY_MATH_TOLERANCE = 1e-9;
+const PROBABILITY_EPSILON = 1e-6;
+const MAX_LEGACY_CONTRIBUTIONS_JSON_BYTES = 64 * 1024;
+const STRATEGY_CONTRIBUTION_KEYS = [
+  "team_style",
+  "player_form",
+  "draft_curve",
+  "late_game_style",
+  "market_movement",
+] as const;
+const STRATEGY_CONTRIBUTION_KEY_SET = new Set<string>(STRATEGY_CONTRIBUTION_KEYS);
+const INDEPENDENT_CONTRIBUTION_KEYS = [
+  "team_style",
+  "player_form",
+  "draft_curve",
+  "late_game_style",
+] as const;
 
 const ProbabilityChart = lazy(() =>
   import("./ProbabilityChart").then((module) => ({ default: module.ProbabilityChart })),
@@ -203,9 +241,15 @@ export function MatchWorkspace({
             />
           )}
 
+          <LineupAnalysis
+            detail={detail}
+            error={error}
+            match={match}
+          />
+
           <section className="workspace-lower-grid">
-            <DecisionTimeline decisions={detail?.decisions || []} />
-            <EvidenceSummary detail={detail} />
+            <DecisionTimeline detail={detail} error={error} match={match} />
+            <EvidenceSummary detail={detail} error={error} match={match} />
           </section>
 
           <MarketDrawer detail={detail} />
@@ -275,93 +319,1206 @@ function QuoteCell({
   );
 }
 
-function DecisionTimeline({ decisions }: { decisions: MatchDetail["decisions"] }) {
-  const latest = decisions.slice(-12).reverse();
+const analysisStatusLabel: Record<AnalysisSectionStatus, string> = {
+  available: "有证据",
+  waiting: "等待",
+  unavailable: "不可用",
+  review: "需复核",
+};
+
+const reasonDescription: Record<string, string> = {
+  analysis_contract_unavailable: "当前后端未提供分析契约，不能推断策略或阵容已经就绪。",
+  analysis_section_invalid: "分析区块契约无效，不能把该结果显示为可用。",
+  detail_request_failed: "赛事详情请求失败，无法确认分析证据。",
+  live_player_identity_unavailable: "实时来源没有可信选手身份，因此不展示或猜测选手。",
+  strategy_evidence_invalid: "策略证据结构无效，需要复核持久化记录。",
+  odds_payload_invalid: "赔率分析摘要结构无效，已忽略该区块数据。",
+  vision_payload_invalid: "视觉分析证据结构无效，已忽略该区块数据。",
+  lineup_payload_invalid: "阵容不是可信的两边各五个唯一英雄。",
+  lineup_curve_payload_invalid: "阵容曲线结构无效，不能显示为可用预测。",
+  lineup_curve_clock_unavailable: "缺少可信比赛时钟，无法验证阵容曲线的当前检查点。",
+  players_payload_invalid: "选手证据结构无效，不能显示。",
+};
+
+function unavailableSection<T>(reason = "analysis_contract_unavailable"): AnalysisSection<T> {
+  return { status: "unavailable", reason, data: null };
+}
+
+function reviewSection<T>(reason: string): AnalysisSection<T> {
+  return { status: "review", reason, data: null };
+}
+
+function sectionOrFallback<T>(
+  section: AnalysisSection<T> | undefined,
+  error: string | null,
+): AnalysisSection<T> {
+  if (section && validAnalysisSection(section)) return section;
+  if (section) return reviewSection("analysis_section_invalid");
+  return unavailableSection(error ? "detail_request_failed" : "analysis_contract_unavailable");
+}
+
+function withoutUnavailableData<T>(section: AnalysisSection<T>): AnalysisSection<T> {
+  return section.status === "available"
+    ? section
+    : { status: section.status, reason: section.reason, data: null };
+}
+
+function normalizeOddsSection(
+  section: AnalysisSection<OddsAnalysisData>,
+): AnalysisSection<OddsAnalysisData> {
+  const normalized = withoutUnavailableData(section);
+  return normalized.status === "available" && !validOddsData(normalized.data)
+    ? reviewSection("odds_payload_invalid")
+    : normalized;
+}
+
+function normalizeVisionSection(
+  section: AnalysisSection<VisionAnalysisData>,
+): AnalysisSection<VisionAnalysisData> {
+  const normalized = withoutUnavailableData(section);
+  return normalized.status === "available" && !validVisionData(normalized.data)
+    ? reviewSection("vision_payload_invalid")
+    : normalized;
+}
+
+function normalizeStrategySection(
+  section: AnalysisSection<StrategyAnalysisData>,
+): AnalysisSection<StrategyAnalysisData> {
+  const normalized = withoutUnavailableData(section);
+  return normalized.status === "available" && !validStrategyData(normalized.data)
+    ? reviewSection("strategy_evidence_invalid")
+    : normalized;
+}
+
+function normalizeLineupSection(
+  section: AnalysisSection<LineupAnalysisData>,
+): AnalysisSection<LineupAnalysisData> {
+  const normalized = withoutUnavailableData(section);
+  if (normalized.status !== "available") return normalized;
+  if (!validLineupData(normalized.data)) return reviewSection("lineup_payload_invalid");
+  return {
+    ...normalized,
+    data: {
+      ...normalized.data,
+      active_curve: withoutUnavailableData(normalized.data.active_curve),
+      players: normalizePlayersSection(normalized.data.players),
+    },
+  };
+}
+
+function normalizeCurveSection(
+  section: AnalysisSection<LineupCurveData>,
+  gameClockSeconds: number | null,
+): AnalysisSection<LineupCurveData> {
+  const normalized = withoutUnavailableData(section);
+  if (normalized.status !== "available") return normalized;
+  if (!validGameClock(gameClockSeconds)) {
+    return reviewSection("lineup_curve_clock_unavailable");
+  }
+  return !validCurveData(normalized.data, gameClockSeconds)
+    ? reviewSection("lineup_curve_payload_invalid")
+    : normalized;
+}
+
+function normalizePlayersSection(
+  section: AnalysisSection<LivePlayerIdentityData>,
+): AnalysisSection<LivePlayerIdentityData> {
+  const normalized = withoutUnavailableData(section);
+  return normalized.status === "available" && !validPlayersData(normalized.data)
+    ? reviewSection("players_payload_invalid")
+    : normalized;
+}
+
+function AnalysisState({
+  section,
+  lifecycle,
+  label,
+}: {
+  section: AnalysisSection<unknown>;
+  lifecycle: MonitorMatch["lifecycle"];
+  label?: string;
+}) {
+  const waitingForStart = section.status === "waiting" && lifecycle === "upcoming";
+  return (
+    <span className={`analysis-state ${section.status}`}>
+      {label || (waitingForStart ? "等待开赛" : analysisStatusLabel[section.status])}
+    </span>
+  );
+}
+
+function AnalysisEmpty({
+  section,
+  lifecycle,
+  subject,
+}: {
+  section: AnalysisSection<unknown>;
+  lifecycle: MonitorMatch["lifecycle"];
+  subject: string;
+}) {
+  const waitingForStart = section.status === "waiting" && lifecycle === "upcoming";
+  const title = waitingForStart
+    ? "比赛尚未开始，等待开赛"
+    : section.status === "waiting"
+      ? `${subject}正在等待必要证据`
+      : section.status === "review"
+        ? `${subject}需要人工复核`
+        : `${subject}不可用`;
+  return (
+    <div className="analysis-empty" role="status">
+      <div>
+        <AnalysisState lifecycle={lifecycle} section={section} />
+        <strong>{title}</strong>
+      </div>
+      <span>{reasonDescription[section.reason] || "系统保留了明确的阻塞原因，没有用缺失数据补算。"}</span>
+      <code>{section.reason || "reason_not_provided"}</code>
+    </div>
+  );
+}
+
+function DecisionTimeline({
+  detail,
+  error,
+  match,
+}: {
+  detail: MatchDetail | null;
+  error: string | null;
+  match: MonitorMatch;
+}) {
+  const section = normalizeStrategySection(
+    sectionOrFallback(detail?.analysis?.strategy, error),
+  );
+  const structuredDecisions = section.status === "available"
+    ? section.data?.decisions
+    : null;
+  const strategyData = section.status === "available" ? section.data : null;
+  const legacy = !detail?.analysis && (detail?.decisions.length || 0) > 0;
+  const decisions = structuredDecisions || (legacy ? detail?.decisions : []) || [];
+  const displayed = legacy ? decisions.slice(-12) : decisions;
+  const latest = [...displayed].reverse();
+
   return (
     <section className="workspace-section decision-section">
       <div className="section-heading compact">
         <div>
           <h2>策略判断</h2>
-          <p>{decisions.length} 条已记录</p>
+          <p>
+            <span>显示最近 {latest.length} 条</span>
+            {strategyData && (
+              <>
+                <span aria-hidden="true"> · </span>
+                <span>{strategyScanScopeLabel(strategyData)}</span>
+              </>
+            )}
+          </p>
         </div>
-        <ClockCounterClockwise size={19} aria-hidden="true" />
+        <div className="section-status">
+          <AnalysisState lifecycle={match.lifecycle} section={section} />
+          <ClockCounterClockwise size={19} aria-hidden="true" />
+        </div>
       </div>
+      {legacy && (
+        <div className="analysis-contract-note" role="status">
+          仅显示旧契约记录；分析状态仍为不可用，不能据此宣称策略就绪。
+        </div>
+      )}
+      {(strategyData?.has_more || strategyData?.truncated) && (
+        <div className="analysis-contract-note" role="status">
+          {strategyData.has_more && <span>还有更早的策略记录未显示。</span>}
+          {strategyData.truncated && <span>后端结果已截断。</span>}
+        </div>
+      )}
       {latest.length ? (
         <div className="decision-list">
           {latest.map((decision) => (
-            <div className="decision-row" key={decision.decision_key || `${decision.decided_at}-${decision.reason}`}>
-              <div>
-                <span>{formatDateTime(decision.decided_at)}</span>
-                <code>{decision.reason}</code>
-              </div>
-              <div className="decision-values">
-                <span>模型 {formatPercent(decision.model_probability)}</span>
-                <span>市场 {formatPercent(decision.market_probability)}</span>
-                <strong className={decision.edge > 0 ? "positive" : ""}>
-                  {decision.edge > 0 ? "+" : ""}{formatPercent(decision.edge)}
-                </strong>
-              </div>
-            </div>
+            <DecisionRow
+              decision={decision}
+              key={decision.decision_key || `${decision.decided_at}-${decision.reason}`}
+            />
           ))}
         </div>
       ) : (
-        <div className="subtle-empty">这场比赛尚无策略判断</div>
+        <AnalysisEmpty lifecycle={match.lifecycle} section={section} subject="策略分析" />
       )}
     </section>
   );
 }
 
-function EvidenceSummary({ detail }: { detail: MatchDetail | null }) {
+function strategyScanScopeLabel(data: StrategyAnalysisData): string {
+  return `扫描范围：最近 ${data.scanned_count} 条候选记录`;
+}
+
+const contributionLabel: Record<string, string> = {
+  team_style: "队伍风格",
+  player_form: "选手状态",
+  draft_curve: "阵容曲线",
+  late_game_style: "后期能力",
+  market_movement: "市场变化",
+};
+
+interface ParsedDecisionEvidence {
+  contributions: Array<[string, number]>;
+  conservative: Array<[string, number]>;
+  inputs: Record<string, unknown>;
+  invalidReason: string | null;
+}
+
+function DecisionRow({ decision }: { decision: StrategyDecision }) {
+  const evidence = parseDecisionEvidence(decision);
+  const visionInput = recordValue(evidence.inputs.vision);
+  const visionAuthority = recordValue(decision.vision_authority);
+  const draftLandmarkInput = recordValue(evidence.inputs.draft_landmark);
+  const draftInput = Object.keys(draftLandmarkInput).length
+    ? draftLandmarkInput
+    : recordValue(evidence.inputs.draft_authority);
+  const draftRef = firstDraftReference(
+    decision.draft_authority,
+    ["source_ref", "landmark_key", "curve_key", "draft_hash"],
+  );
+  const visionRef = visionFrameReference(visionInput.source_frame_ref)
+    || firstVisionFrameReference(
+    decision.vision_authority,
+    ["source_frame_ref", "frame_ref", "observation_key"],
+  );
+  const inputCapturedAt = stringValue(visionInput.captured_at);
+  const authorityCapturedAt = stringValue(visionAuthority.captured_at);
+  const capturedAt = inputCapturedAt && validTimestamp(inputCapturedAt)
+    ? inputCapturedAt
+    : authorityCapturedAt && validTimestamp(authorityCapturedAt)
+      ? authorityCapturedAt
+      : null;
+  const inputGameClock = numberValue(visionInput.game_clock_seconds);
+  const authorityGameClock = numberValue(visionAuthority.aligned_game_clock_seconds);
+  const gameClock = validGameClock(inputGameClock)
+    ? inputGameClock
+    : validGameClock(authorityGameClock)
+      ? authorityGameClock
+      : null;
+  const draftVersion = safeCode(draftInput.model_version);
+  const strategyVersion = safeCode(decision.strategy_version);
+  const inputRef = inputReference(decision.input_ref);
+  const decisionKey = decisionReference(decision.decision_key);
+
+  return (
+    <article className="decision-row">
+      <div className="decision-summary">
+        <div className="decision-primary">
+          <span>{formatDateTime(decision.decided_at)} · 第 {decision.map_number} 局</span>
+          {decision.eligible === 0 && (
+            <strong className="decision-blocked-label">未满足策略门槛</strong>
+          )}
+          <code>{decision.reason}</code>
+        </div>
+        <div className="decision-values">
+          <span>模型 {formatPercent(decision.model_probability)}</span>
+          <span>市场 {formatPercent(decision.market_probability)}</span>
+          <strong className={decision.edge > 0 ? "positive" : ""}>
+            Edge {decision.edge > 0 ? "+" : ""}{formatPercent(decision.edge)}
+          </strong>
+          <span>质量 {formatPercent(decision.data_quality)}</span>
+        </div>
+      </div>
+      <dl className="decision-identity">
+        <div><dt>策略版本</dt><dd><code>{strategyVersion || "未提供"}</code></dd></div>
+        <div><dt>Input ref</dt><dd><code>{inputRef || "未提供"}</code></dd></div>
+        <div><dt>Decision key</dt><dd><code>{decisionKey || "未提供"}</code></dd></div>
+      </dl>
+      {evidence.invalidReason ? (
+        <div className="decision-evidence-error" role="alert">
+          贡献证据无效 <code>{evidence.invalidReason}</code>
+        </div>
+      ) : (
+        <div className="contribution-list" aria-label="策略贡献">
+          {evidence.contributions.length ? evidence.contributions.map(([name, value]) => (
+            <div className="contribution-row" key={name}>
+              <span>{contributionLabel[name] || name}</span>
+              <code>Δlogit {formatSigned(value)}</code>
+              {conservativeValue(evidence.conservative, name) != null && (
+                <small>保守 {formatSigned(conservativeValue(evidence.conservative, name)!)}</small>
+              )}
+            </div>
+          )) : <span className="evidence-missing">没有持久化贡献项</span>}
+        </div>
+      )}
+      <div className="decision-evidence" aria-label="持久化决策证据">
+        <span>视觉 {capturedAt ? formatDateTime(capturedAt) : "未提供"}</span>
+        <span>时钟 {gameClock == null ? "未提供" : formatClock(gameClock)}</span>
+        <span>画面引用 <code>{visionRef || "未提供"}</code></span>
+        <span>阵容模型 <code>{draftVersion || draftRef || "未提供"}</code></span>
+      </div>
+    </article>
+  );
+}
+
+function parseDecisionEvidence(decision: StrategyDecision): ParsedDecisionEvidence {
+  let rawContributions: unknown = decision.contributions;
+  let rawConservative: unknown = decision.conservative_contributions;
+  let rawInputs: unknown = decision.inputs;
+
+  if (rawContributions == null && decision.contributions_json != null) {
+    if (utf8ByteLength(decision.contributions_json) > MAX_LEGACY_CONTRIBUTIONS_JSON_BYTES) {
+      return {
+        contributions: [],
+        conservative: [],
+        inputs: {},
+        invalidReason: "contributions_json_too_large",
+      };
+    }
+    try {
+      const parsed: unknown = JSON.parse(decision.contributions_json);
+      if (!isRecord(parsed)) throw new Error("not_object");
+      rawContributions = parsed;
+      rawInputs = rawInputs ?? parsed.__inputs__;
+      const parsedInputs = recordValue(parsed.__inputs__);
+      rawConservative = rawConservative ?? parsedInputs.conservative_contributions;
+    } catch {
+      return {
+        contributions: [],
+        conservative: [],
+        inputs: {},
+        invalidReason: "invalid_contributions_json",
+      };
+    }
+  }
+
+  const contributionResult = finiteNumberEntries(rawContributions, new Set(["__inputs__"]));
+  const conservativeResult = finiteNumberEntries(rawConservative);
+  if (contributionResult.invalid || conservativeResult.invalid) {
+    return {
+      contributions: [],
+      conservative: [],
+      inputs: {},
+      invalidReason: "invalid_contribution_value",
+    };
+  }
+  return {
+    contributions: contributionResult.entries,
+    conservative: conservativeResult.entries,
+    inputs: recordValue(rawInputs),
+    invalidReason: null,
+  };
+}
+
+function finiteNumberEntries(
+  value: unknown,
+  ignored = new Set<string>(),
+): { entries: Array<[string, number]>; invalid: boolean } {
+  if (value == null) return { entries: [], invalid: false };
+  if (!isRecord(value)) return { entries: [], invalid: true };
+  const entries: Array<[string, number]> = [];
+  for (const [key, item] of Object.entries(value)) {
+    if (ignored.has(key)) continue;
+    if (typeof item !== "number" || !Number.isFinite(item)) {
+      return { entries: [], invalid: true };
+    }
+    entries.push([key, item]);
+  }
+  return { entries, invalid: false };
+}
+
+function formatSigned(value: number): string {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(3)}`;
+}
+
+function conservativeValue(values: Array<[string, number]>, key: string): number | null {
+  return values.find(([name]) => name === key)?.[1] ?? null;
+}
+
+function LineupAnalysis({
+  detail,
+  error,
+  match,
+}: {
+  detail: MatchDetail | null;
+  error: string | null;
+  match: MonitorMatch;
+}) {
+  const section = normalizeLineupSection(
+    sectionOrFallback(detail?.analysis?.lineup, error),
+  );
+  const vision = normalizeVisionSection(
+    sectionOrFallback(detail?.analysis?.vision, error),
+  );
+  const data = section.status === "available" ? section.data : null;
+
+  return (
+    <section className="workspace-section lineup-section">
+      <div className="section-heading compact">
+        <div>
+          <h2>阵容分析</h2>
+          <p>只显示可信完整阵容与因果时点可用的条件胜率</p>
+        </div>
+        <AnalysisState lifecycle={match.lifecycle} section={section} />
+      </div>
+      {data ? (
+        <LineupContent data={data} match={match} vision={vision} />
+      ) : (
+        <AnalysisEmpty lifecycle={match.lifecycle} section={section} subject="阵容分析" />
+      )}
+    </section>
+  );
+}
+
+function LineupContent({
+  data,
+  match,
+  vision,
+}: {
+  data: LineupAnalysisData;
+  match: MonitorMatch;
+  vision: AnalysisSection<VisionAnalysisData>;
+}) {
+  const teamOneIsRadiant = data.radiant_team_side === "team_one";
+  const teamOne = teamOneIsRadiant ? data.radiant : data.dire;
+  const teamTwo = teamOneIsRadiant ? data.dire : data.radiant;
+  const gameClockSeconds = vision.status === "available"
+    ? vision.data?.game_clock_seconds ?? null
+    : null;
+  const curveSection = normalizeCurveSection(data.active_curve, gameClockSeconds);
+  const curve = curveSection.status === "available" ? curveSection.data : null;
+  const players = data.players;
+
+  return (
+    <div className="lineup-content">
+      <div className="lineup-sides">
+        <LineupTeam
+          dotaSide={teamOneIsRadiant ? "Radiant" : "Dire"}
+          name={match.team_one || "队伍一"}
+          side={teamOne}
+        />
+        <LineupTeam
+          dotaSide={teamOneIsRadiant ? "Dire" : "Radiant"}
+          name={match.team_two || "队伍二"}
+          side={teamTwo}
+        />
+      </div>
+      <dl className="lineup-evidence">
+        <div><dt>局数</dt><dd>第 {data.map_number} 局</dd></div>
+        <div><dt>阵容证据时间</dt><dd>{formatDateTime(data.evidence.anchored_at || data.as_of)}</dd></div>
+        <div><dt>阵容置信度</dt><dd>{formatPercent(vision.data?.draft_confidence)}</dd></div>
+        <div><dt>Strict mapping</dt><dd><code>{data.evidence.strict_mapping_id}</code></dd></div>
+        <div><dt>画面引用</dt><dd><code>{visionFrameReference(data.evidence.anchor_source_frame_ref) || "未提供"}</code></dd></div>
+      </dl>
+      <div className="curve-heading">
+        <div>
+          <h3>阵容条件胜率曲线</h3>
+          <p>每个点都以比赛达到该分钟为条件；未来点不是当前胜率。</p>
+        </div>
+        <AnalysisState lifecycle={match.lifecycle} section={curveSection} />
+      </div>
+      {curve ? (
+        <CurvePoints curve={curve} data={data} match={match} />
+      ) : (
+        <AnalysisEmpty lifecycle={match.lifecycle} section={curveSection} subject="阵容曲线" />
+      )}
+      <div className="player-identity-row">
+        <div>
+          <strong>实时选手身份</strong>
+          <code>{players.reason}</code>
+        </div>
+        <AnalysisState lifecycle={match.lifecycle} section={players} />
+        <span>
+          {players.status === "unavailable"
+            ? "实时选手身份不可用；系统不会根据队名或历史阵容猜测选手。"
+            : reasonDescription[players.reason] || "选手证据按来源状态显示。"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function LineupTeam({
+  dotaSide,
+  name,
+  side,
+}: {
+  dotaSide: "Radiant" | "Dire";
+  name: string;
+  side: LineupSide;
+}) {
+  return (
+    <section className="lineup-team" aria-label={`${name} 阵容`}>
+      <div className="lineup-team-heading">
+        <strong>{name}</strong>
+        <span>{dotaSide}</span>
+      </div>
+      <div className="hero-grid">
+        {side.hero_ids.map((heroId) => (
+          <div className="hero-slot" key={heroId}>
+            <span>{heroLabel(side, heroId)}</span>
+            <code>ID {heroId}</code>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function heroLabel(side: LineupSide, heroId: number): string {
+  const authoritative = Array.isArray(side.heroes) ? side.heroes.find((hero) => (
+    hero.hero_id === heroId && typeof hero.hero_name === "string" && hero.hero_name.trim()
+  )) : undefined;
+  return authoritative?.hero_name?.trim() || `英雄 ${heroId}`;
+}
+
+function CurvePoints({
+  curve,
+  data,
+  match,
+}: {
+  curve: LineupCurveData;
+  data: LineupAnalysisData;
+  match: MonitorMatch;
+}) {
+  const teamOneIsRadiant = data.radiant_team_side === "team_one";
+  const points = [...curve.points].sort((left, right) => left.horizon_minutes - right.horizon_minutes);
+  return (
+    <div className="curve-points" role="list" aria-label="阵容条件胜率点">
+      {points.map((point) => {
+        const teamOneProbability = teamOneIsRadiant
+          ? point.radiant_probability
+          : 1 - point.radiant_probability;
+        return (
+          <div className={point.active ? "curve-point active" : "curve-point"} key={point.landmark_key} role="listitem">
+            <div className="curve-point-heading">
+              <strong>达到 {point.horizon_minutes} 分钟</strong>
+              <span>{point.active ? "当前可用检查点" : point.conditional ? "未来条件点" : "已过检查点"}</span>
+            </div>
+            <div className="curve-probability">
+              <span>{match.team_one || "队伍一"} {formatPercent(teamOneProbability)}</span>
+              <span>{match.team_two || "队伍二"} {formatPercent(1 - teamOneProbability)}</span>
+            </div>
+            <small>条件胜率 · 质量 {formatPercent(point.quality)} · 样本 {point.support}</small>
+            <small>不确定度 {formatPercent(point.uncertainty)} · {point.model_version}</small>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function validOddsData(data: OddsAnalysisData | null): data is OddsAnalysisData {
+  if (!data || !isRecord(data) || !Array.isArray(data.periods)) return false;
+  return Number.isInteger(data.point_count)
+    && data.point_count > 0
+    && data.periods.length > 0
+    && data.periods.every((period) => safeCode(period) !== null)
+    && new Set(data.periods).size === data.periods.length
+    && validTimestamp(data.latest_observed_at);
+}
+
+function validVisionData(data: VisionAnalysisData | null): data is VisionAnalysisData {
+  if (!data || !isRecord(data)) return false;
+  return Number.isInteger(data.map_number)
+    && data.map_number > 0
+    && validTimestamp(data.captured_at)
+    && validGameClock(data.game_clock_seconds)
+    && finiteUnit(data.clock_confidence)
+    && finiteUnit(data.draft_confidence)
+    && visionFrameReference(data.source_frame_ref) !== null;
+}
+
+function validStrategyData(data: StrategyAnalysisData | null): data is StrategyAnalysisData {
+  if (!data || !isRecord(data) || !Array.isArray(data.decisions) || !data.decisions.length) {
+    return false;
+  }
+  if (!data.decisions.every(validStrategyDecision) || !isRecord(data.excluded)) {
+    return false;
+  }
+  const rawExcludedCounts = [
+    data.excluded.vision_invalidated,
+    data.excluded.mapping_impacted,
+    data.excluded.draft_conflicted,
+    data.excluded.invalid_payload,
+  ];
+  if (
+    !nonnegativeInteger(data.displayed_count)
+    || !nonnegativeInteger(data.scanned_count)
+    || !nonnegativeInteger(data.excluded_decision_count)
+    || !rawExcludedCounts.every(nonnegativeInteger)
+    || data.count_scope !== "recent_scanned_window"
+    || typeof data.has_more !== "boolean"
+    || typeof data.truncated !== "boolean"
+  ) {
+    return false;
+  }
+  const excludedCounts = rawExcludedCounts as number[];
+  const excludedReasonCountSum = excludedCounts.reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+  return data.displayed_count === data.decisions.length
+    && data.scanned_count >= data.displayed_count + data.excluded_decision_count
+    && data.has_more === data.truncated
+    && excludedCounts.every((value) => value <= data.excluded_decision_count)
+    && excludedReasonCountSum >= data.excluded_decision_count;
+}
+
+function nonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function validStrategyDecision(value: unknown): value is StrategyDecision {
+  if (!isRecord(value)) return false;
+  const decidedAt = value.decided_at;
+  const underdogSide = value.underdog_side;
+  const marketProbability = value.market_probability;
+  const modelProbability = value.model_probability;
+  const edge = value.edge;
+  const dataQuality = value.data_quality;
+  const eligible = value.eligible;
+  const reason = safeCode(value.reason);
+  const contributions = value.contributions;
+  const conservative = value.conservative_contributions;
+  const inputs = value.inputs;
+  const draftAuthority = value.draft_authority;
+  const visionAuthority = value.vision_authority;
+  if (!(decisionReference(value.decision_key) !== null
+    && validTimestamp(decidedAt)
+    && Number.isInteger(value.map_number)
+    && Number(value.map_number) > 0
+    && (underdogSide === "team_one" || underdogSide === "team_two")
+    && typeof marketProbability === "number"
+    && Number.isFinite(marketProbability)
+    && marketProbability >= 0
+    && marketProbability <= 1
+    && typeof modelProbability === "number"
+    && Number.isFinite(modelProbability)
+    && modelProbability >= 0
+    && modelProbability <= 1
+    && typeof edge === "number"
+    && Number.isFinite(edge)
+    && typeof dataQuality === "number"
+    && Number.isFinite(dataQuality)
+    && dataQuality >= 0
+    && dataQuality <= 1
+    && (eligible === 0 || eligible === 1)
+    && reason !== null
+    && safeCode(value.strategy_version) !== null
+    && inputReference(value.input_ref) !== null
+    && validContributionRecord(contributions)
+    && validContributionRecord(conservative)
+    && isRecord(inputs)
+    && isRecord(draftAuthority)
+    && isRecord(visionAuthority)
+    && validDecisionReferences(value))) {
+    return false;
+  }
+  if (!validDecisionEdge(edge, marketProbability, modelProbability)) return false;
+  if ((eligible === 1) !== (reason === "eligible")) return false;
+
+  const hasContributions = Object.keys(contributions).length > 0;
+  if (eligible === 0 && !hasContributions) {
+    return validNoSignalStrategyDecision({
+      conservative,
+      dataQuality,
+      decidedAt,
+      draftAuthority,
+      edge,
+      inputs,
+      marketProbability,
+      modelProbability,
+      underdogSide,
+      visionAuthority,
+    });
+  }
+  if (
+    !hasRequiredStrategyContributions(contributions)
+    || !hasRequiredStrategyContributions(conservative)
+    || !validConservativeContributions(contributions, conservative)
+    || !validDecisionReferences(value, true)
+  ) {
+    return false;
+  }
+  const inputConservative = inputs.conservative_contributions;
+  const expectedModelProbability = strategyProbability(marketProbability, contributions);
+  const expectedConservativeProbability = strategyProbability(
+    marketProbability,
+    conservative,
+  );
+  const conservativeProbability = numberValue(inputs.conservative_probability);
+  const independentPositive = contributions.team_style + contributions.late_game_style > 0
+    || contributions.player_form > 0
+    || contributions.draft_curve > 0;
+  return expectedModelProbability !== null
+    && expectedConservativeProbability !== null
+    && conservativeProbability !== null
+    && finiteUnit(conservativeProbability)
+    && sameContributionRecord(inputConservative, conservative)
+    && approximatelyEqual(modelProbability, expectedModelProbability)
+    && approximatelyEqual(conservativeProbability, expectedConservativeProbability)
+    && inputs.independent_positive === independentPositive
+    && (eligible === 0 || (
+      conservativeProbability > marketProbability
+      && independentPositive
+    ));
+}
+
+function hasRequiredStrategyContributions(value: Record<string, number>): boolean {
+  return STRATEGY_CONTRIBUTION_KEYS.every(
+    (key) => Object.prototype.hasOwnProperty.call(value, key),
+  );
+}
+
+function validContributionRecord(value: unknown): value is Record<string, number> {
+  return isRecord(value)
+    && Object.entries(value).every(([key, item]) => (
+      STRATEGY_CONTRIBUTION_KEY_SET.has(key) && finiteNumber(item)
+    ));
+}
+
+function sameContributionRecord(value: unknown, expected: Record<string, number>): boolean {
+  return validContributionRecord(value)
+    && STRATEGY_CONTRIBUTION_KEYS.every((key) => (
+      Object.prototype.hasOwnProperty.call(value, key) && value[key] === expected[key]
+    ));
+}
+
+function validConservativeContributions(
+  raw: Record<string, number>,
+  conservative: Record<string, number>,
+): boolean {
+  if (!approximatelyEqual(conservative.market_movement, raw.market_movement)) {
+    return false;
+  }
+  return INDEPENDENT_CONTRIBUTION_KEYS.every((key) => {
+    const rawValue = raw[key];
+    const conservativeValue = conservative[key];
+    return rawValue <= 0
+      ? approximatelyEqual(conservativeValue, rawValue)
+      : conservativeValue >= -STRATEGY_MATH_TOLERANCE
+        && conservativeValue <= rawValue + STRATEGY_MATH_TOLERANCE;
+  });
+}
+
+function strategyProbability(
+  marketProbability: number,
+  contributions: Record<string, number>,
+): number | null {
+  const bounded = Math.min(
+    1 - PROBABILITY_EPSILON,
+    Math.max(PROBABILITY_EPSILON, marketProbability),
+  );
+  const score = Math.log(bounded / (1 - bounded))
+    + STRATEGY_CONTRIBUTION_KEYS.reduce((sum, key) => sum + contributions[key], 0);
+  if (!Number.isFinite(score)) return null;
+  if (score >= 0) {
+    const inverse = Math.exp(-score);
+    return 1 / (1 + inverse);
+  }
+  const exponent = Math.exp(score);
+  return exponent / (1 + exponent);
+}
+
+function approximatelyEqual(left: number, right: number): boolean {
+  return Math.abs(left - right) <= Math.max(
+    STRATEGY_MATH_TOLERANCE,
+    STRATEGY_MATH_TOLERANCE * Math.max(Math.abs(left), Math.abs(right)),
+  );
+}
+
+function validNoSignalStrategyDecision({
+  conservative,
+  dataQuality,
+  decidedAt,
+  draftAuthority,
+  edge,
+  inputs,
+  marketProbability,
+  modelProbability,
+  underdogSide,
+  visionAuthority,
+}: {
+  conservative: Record<string, number>;
+  dataQuality: number;
+  decidedAt: string;
+  draftAuthority: Record<string, unknown>;
+  edge: number;
+  inputs: Record<string, unknown>;
+  marketProbability: number;
+  modelProbability: number;
+  underdogSide: "team_one" | "team_two";
+  visionAuthority: Record<string, unknown>;
+}): boolean {
+  const market = inputs.market;
+  const vision = inputs.vision;
+  if (!isRecord(market) || !isRecord(vision)) return false;
+  const inputMarketProbability = numberValue(market.underdog_probability);
+  const marketPrice = numberValue(market.underdog_price);
+  const marketQuality = market.quality;
+  const missingMarkets = market.missing_markets;
+  const capturedAt = vision.captured_at;
+  return Object.keys(conservative).length === 0
+    && Object.keys(draftAuthority).length === 0
+    && Object.keys(visionAuthority).length === 0
+    && approximatelyEqual(modelProbability, marketProbability)
+    && approximatelyEqual(edge, 0)
+    && approximatelyEqual(dataQuality, 0)
+    && market.underdog_side === underdogSide
+    && inputMarketProbability !== null
+    && finiteUnit(inputMarketProbability)
+    && approximatelyEqual(inputMarketProbability, marketProbability)
+    && marketPrice !== null
+    && marketPrice > 1
+    && finiteUnit(marketQuality)
+    && Array.isArray(missingMarkets)
+    && missingMarkets.every((item) => safeCode(item) !== null)
+    && validTimestamp(capturedAt)
+    && Date.parse(capturedAt) <= Date.parse(decidedAt)
+    && visionFrameReference(vision.source_frame_ref) !== null
+    && (vision.game_clock_seconds == null || validGameClock(vision.game_clock_seconds))
+    && (vision.radiant_team_side == null
+      || vision.radiant_team_side === "team_one"
+      || vision.radiant_team_side === "team_two");
+}
+
+function validLineupData(data: LineupAnalysisData | null): data is LineupAnalysisData {
+  if (!data || !isRecord(data)) return false;
+  if (!validLineupSide(data.radiant) || !validLineupSide(data.dire)) return false;
+  const combined = [...data.radiant.hero_ids, ...data.dire.hero_ids];
+  return new Set(combined).size === 10
+    && (data.radiant_team_side === "team_one" || data.radiant_team_side === "team_two")
+    && Number.isInteger(data.map_number)
+    && data.map_number > 0
+    && validTimestamp(data.as_of)
+    && isRecord(data.evidence)
+    && typeof data.evidence.draft_hash === "string"
+    && SHA256_RE.test(data.evidence.draft_hash)
+    && visionFrameReference(data.evidence.anchor_source_frame_ref) !== null
+    && validTimestamp(data.evidence.anchored_at)
+    && Number.isInteger(data.evidence.strict_mapping_id)
+    && data.evidence.strict_mapping_id > 0
+    && validAnalysisSection(data.active_curve)
+    && validAnalysisSection(data.players);
+}
+
+function validLineupSide(value: unknown): value is LineupSide {
+  if (!isRecord(value) || !validHeroIds(value.hero_ids)) return false;
+  if (!Object.prototype.hasOwnProperty.call(value, "heroes")) return true;
+  if (!Array.isArray(value.heroes)) return false;
+  const ids = new Set(value.hero_ids);
+  const metadataIds = new Set<number>();
+  for (const hero of value.heroes) {
+    if (
+      !isRecord(hero)
+      || !Number.isInteger(hero.hero_id)
+      || !ids.has(Number(hero.hero_id))
+      || metadataIds.has(Number(hero.hero_id))
+      || !validOptionalHeroName(hero.hero_name)
+    ) {
+      return false;
+    }
+    metadataIds.add(Number(hero.hero_id));
+  }
+  return true;
+}
+
+function validOptionalHeroName(value: unknown): boolean {
+  return value == null || (typeof value === "string" && Boolean(value.trim()));
+}
+
+function validHeroIds(value: unknown): value is number[] {
+  return Array.isArray(value)
+    && value.length === 5
+    && value.every((hero) => Number.isInteger(hero) && hero > 0)
+    && new Set(value).size === 5;
+}
+
+function validCurveData(
+  data: LineupCurveData | null,
+  gameClockSeconds: number,
+): data is LineupCurveData {
+  if (!data || !isRecord(data) || !Array.isArray(data.points) || !data.points.length) {
+    return false;
+  }
+  if (
+    typeof data.curve_key !== "string"
+    || !SHA256_RE.test(data.curve_key)
+    || !validTimestamp(data.first_usable_at)
+    || !Number.isInteger(data.active_horizon_minutes)
+    || data.active_horizon_minutes <= 0
+  ) {
+    return false;
+  }
+  const points = data.points as unknown[];
+  if (!points.every(validCurvePoint)) return false;
+  const typedPoints = points as LineupCurvePoint[];
+  if (!typedPoints.every((point) => (
+    point.conditional === (point.horizon_minutes * 60 > gameClockSeconds)
+  ))) {
+    return false;
+  }
+  const active = typedPoints.filter((point) => point.active);
+  const currentHorizons = typedPoints
+    .filter((point) => !point.conditional)
+    .map((point) => point.horizon_minutes);
+  const maximumCurrentHorizon = currentHorizons.length ? Math.max(...currentHorizons) : null;
+  return active.length === 1
+    && !active[0].conditional
+    && active[0].horizon_minutes === data.active_horizon_minutes
+    && active[0].horizon_minutes === maximumCurrentHorizon
+    && gameClockSeconds / 60 - active[0].horizon_minutes <= 10
+    && new Set(typedPoints.map((point) => point.horizon_minutes)).size === points.length
+    && new Set(typedPoints.map((point) => point.landmark_key)).size === points.length;
+}
+
+function validCurvePoint(value: unknown): value is LineupCurvePoint {
+  if (!isRecord(value)) return false;
+  return typeof value.landmark_key === "string"
+    && SHA256_RE.test(value.landmark_key)
+    && Number.isInteger(value.horizon_minutes)
+    && Number(value.horizon_minutes) > 0
+    && finiteUnit(value.radiant_probability)
+    && finiteUnit(value.quality)
+    && Number.isInteger(value.support)
+    && Number(value.support) >= 0
+    && (value.uncertainty == null || finiteUnit(value.uncertainty))
+    && safeCode(value.model_version) !== null
+    && safeCode(value.validation_status) !== null
+    && typeof value.conditional === "boolean"
+    && typeof value.active === "boolean"
+    && !(value.conditional && value.active);
+}
+
+function validPlayersData(data: LivePlayerIdentityData | null): data is LivePlayerIdentityData {
+  return Boolean(
+    data
+    && isRecord(data)
+    && Array.isArray(data.players),
+  );
+}
+
+function validDecisionEdge(
+  edge: unknown,
+  marketProbability: unknown,
+  modelProbability: unknown,
+): boolean {
+  if (!finiteNumber(edge) || edge < -1 || edge > 1) return false;
+  if (!finiteNumber(marketProbability) || !finiteNumber(modelProbability)) return true;
+  return approximatelyEqual(edge, modelProbability - marketProbability);
+}
+
+function finiteUnit(value: unknown): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function EvidenceSummary({
+  detail,
+  error,
+  match,
+}: {
+  detail: MatchDetail | null;
+  error: string | null;
+  match: MonitorMatch;
+}) {
   const latestVision = detail?.latest_vision || null;
   const frameUrl = safeVisionFrameUrl(detail, latestVision);
+  const odds = normalizeOddsSection(
+    sectionOrFallback(detail?.analysis?.odds, error),
+  );
+  const vision = normalizeVisionSection(
+    sectionOrFallback(detail?.analysis?.vision, error),
+  );
+  const lineup = normalizeLineupSection(
+    sectionOrFallback(detail?.analysis?.lineup, error),
+  );
+  const strategy = normalizeStrategySection(
+    sectionOrFallback(detail?.analysis?.strategy, error),
+  );
+  const curve = lineup.status === "available" && lineup.data
+    ? normalizeCurveSection(
+      lineup.data.active_curve,
+      vision.status === "available" ? vision.data?.game_clock_seconds ?? null : null,
+    )
+    : { status: lineup.status, reason: lineup.reason, data: null };
+  const mapping = readinessSection(detail?.readiness.mapping || match.readiness.mapping, match.lifecycle, "mapping");
+  const workerReadiness = detail?.readiness.strategy || match.readiness.strategy;
+  const worker = readinessSection(workerReadiness, match.lifecycle, "shadow_worker");
+  const workerPresentation = shadowWorkerPresentation(workerReadiness.status);
+  const inputCount = strategy.data?.decisions.filter((decision) => (
+    isRecord(decision.inputs) && Object.keys(decision.inputs).length > 0
+  )).length || 0;
+  const modelInputs: AnalysisSection<null> = strategy.status === "available"
+    ? inputCount > 0
+      ? { status: "available", reason: "persisted_strategy_inputs", data: null }
+      : { status: "review", reason: "strategy_inputs_missing", data: null }
+    : { status: strategy.status, reason: strategy.reason, data: null };
+  const excluded = strategy.data?.excluded;
+  const excludedCount = strategy.data?.excluded_decision_count || 0;
+  const excludedDetail = excluded
+    ? `；原因明细（可重叠）：视觉失效 ${excluded.vision_invalidated}、映射影响 ${excluded.mapping_impacted}、阵容冲突 ${excluded.draft_conflicted}、无效载荷 ${excluded.invalid_payload}`
+    : "";
+
   return (
     <section className="workspace-section evidence-section">
       <div className="section-heading compact">
         <div>
           <h2>证据摘要</h2>
-          <p>只显示已持久化来源</p>
+          <p>来源状态、持久化数量与阻塞原因</p>
         </div>
         <Database size={19} aria-hidden="true" />
       </div>
-      <VisionFramePreview frameUrl={frameUrl} vision={latestVision} />
-      <dl className="evidence-list">
-        <div>
-          <dt>赔率快照</dt>
-          <dd>{detail?.winner_timeline.length || 0} 个完整点</dd>
+      <div className="source-status-list">
+        <SourceStatusRow
+          detail={`${odds.data?.point_count ?? detail?.winner_timeline.length ?? 0} 点 · ${formatDateTime(odds.data?.latest_observed_at)}`}
+          label="赔率"
+          lifecycle={match.lifecycle}
+          section={odds}
+        />
+        <SourceStatusRow
+          detail={`${detail?.readiness.mapping.count ?? 0}/${detail?.readiness.mapping.total_count ?? 0} 个有效映射`}
+          label="Strict mapping"
+          lifecycle={match.lifecycle}
+          section={mapping}
+        />
+        <SourceStatusRow
+          detail={vision.data
+            ? `${formatDateTime(vision.data.captured_at)} · 阵容置信 ${formatPercent(vision.data.draft_confidence)}`
+            : `${detail?.vision.length || 0} 条观测`}
+          label="视觉时钟"
+          lifecycle={match.lifecycle}
+          section={vision}
+        />
+        <SourceStatusRow
+          detail={lineup.data ? `第 ${lineup.data.map_number} 局 · 10 个英雄` : "无可信完整阵容"}
+          label="完整阵容"
+          lifecycle={match.lifecycle}
+          section={lineup}
+        />
+        <SourceStatusRow
+          detail={curve.data ? `${curve.data.points.length} 个条件点 · active ${curve.data.active_horizon_minutes} 分钟` : "无可用曲线"}
+          label="阵容曲线"
+          lifecycle={match.lifecycle}
+          section={curve}
+        />
+        <SourceStatusRow
+          detail={`当前显示决策中 ${inputCount} 条有持久化输入`}
+          label="模型输入"
+          lifecycle={match.lifecycle}
+          section={modelInputs}
+        />
+        <SourceStatusRow
+          detail={workerPresentation.detail}
+          label="策略进程"
+          lifecycle={match.lifecycle}
+          section={worker}
+          statusLabel={workerPresentation.label}
+        />
+        <SourceStatusRow
+          detail={`${strategy.data?.displayed_count ?? detail?.decisions.length ?? 0} 条已显示输出 · ${excludedCount} 条唯一排除${excludedDetail}`}
+          label="策略输出"
+          lifecycle={match.lifecycle}
+          section={strategy}
+        />
+      </div>
+      {frameUrl ? (
+        <VisionFramePreview frameUrl={frameUrl} vision={latestVision} />
+      ) : (
+        <div className="vision-frame-unavailable" role="status">
+          <Eye size={16} aria-hidden="true" />
+          <span>暂无可用的已捕获画面</span>
         </div>
-        <div>
-          <dt>视觉观测</dt>
-          <dd>{detail?.vision.length || 0} 条</dd>
-        </div>
-      </dl>
+      )}
     </section>
   );
+}
+
+function SourceStatusRow({
+  detail,
+  label,
+  lifecycle,
+  section,
+  statusLabel,
+}: {
+  detail: string;
+  label: string;
+  lifecycle: MonitorMatch["lifecycle"];
+  section: AnalysisSection<unknown>;
+  statusLabel?: string;
+}) {
+  return (
+    <div className="source-status-row">
+      <strong>{label}</strong>
+      <AnalysisState label={statusLabel} lifecycle={lifecycle} section={section} />
+      <span>{detail}</span>
+      <code title={section.reason}>{section.reason || "reason_not_provided"}</code>
+    </div>
+  );
+}
+
+function readinessSection(
+  readiness: MonitorMatch["readiness"]["odds"],
+  lifecycle: MonitorMatch["lifecycle"],
+  prefix: string,
+): AnalysisSection<null> {
+  const reason = readiness.reasons?.join(",") || `${prefix}_${readiness.status}`;
+  if (readiness.status === "ready") return { status: "available", reason, data: null };
+  if (readiness.status === "invalid") return { status: "review", reason, data: null };
+  if (["unhealthy", "stopped", "degraded"].includes(readiness.status)) {
+    return { status: "unavailable", reason, data: null };
+  }
+  return {
+    status: lifecycle === "ended" ? "unavailable" : "waiting",
+    reason,
+    data: null,
+  };
+}
+
+type StrategyReadinessStatus = MonitorMatch["readiness"]["strategy"]["status"];
+
+const shadowWorkerPresentations: Record<
+  StrategyReadinessStatus,
+  { label: string; detail: string }
+> = {
+  ready: { label: "进程运行", detail: "shadow_worker 运行中" },
+  delayed: { label: "延迟", detail: "shadow_worker 心跳延迟" },
+  stale: { label: "陈旧", detail: "shadow_worker 心跳陈旧" },
+  missing: { label: "缺失", detail: "shadow_worker 心跳缺失" },
+  invalid: { label: "数据无效", detail: "shadow_worker 数据无效" },
+  unconfirmed: { label: "等待确认", detail: "shadow_worker 等待确认" },
+  degraded: { label: "降级", detail: "shadow_worker 降级" },
+  unhealthy: { label: "故障", detail: "shadow_worker 故障" },
+  stopped: { label: "未运行", detail: "shadow_worker 未运行" },
+};
+
+function shadowWorkerPresentation(status: unknown): { label: string; detail: string } {
+  if (
+    typeof status === "string"
+    && Object.prototype.hasOwnProperty.call(shadowWorkerPresentations, status)
+  ) {
+    return shadowWorkerPresentations[status as StrategyReadinessStatus];
+  }
+  return { label: "状态未知", detail: "shadow_worker 状态未知" };
 }
 
 function VisionFramePreview({
   frameUrl,
   vision,
 }: {
-  frameUrl: string | null;
+  frameUrl: string;
   vision: MatchDetail["latest_vision"];
 }) {
   const [failedFrameUrl, setFailedFrameUrl] = useState<string | null>(null);
-  const failed = frameUrl !== null && failedFrameUrl === frameUrl;
+  const failed = failedFrameUrl === frameUrl;
+  if (failed) {
+    return (
+      <div className="vision-frame-unavailable" role="status">
+        <WarningCircle size={16} aria-hidden="true" />
+        <span>已捕获画面加载失败</span>
+      </div>
+    );
+  }
   return (
     <div className="vision-frame-preview" aria-label="最近有效视觉观测">
       <div className="vision-frame-stage">
-        {frameUrl && !failed ? (
-          <img
-            alt="最近有效视觉观测画面"
-            onError={() => setFailedFrameUrl(frameUrl)}
-            src={frameUrl}
-          />
-        ) : (
-          <div className="vision-frame-empty" role="status">
-            <Eye size={22} aria-hidden="true" />
-            <span>{failed ? "已捕获画面加载失败" : "暂无可用的已捕获画面"}</span>
-          </div>
-        )}
+        <img
+          alt="最近有效视觉观测画面"
+          onError={() => setFailedFrameUrl(frameUrl)}
+          src={frameUrl}
+        />
       </div>
       <dl className="vision-frame-meta">
         <div><dt>捕获时间</dt><dd>{vision ? formatDateTime(vision.captured_at) : "无"}</dd></div>
@@ -370,6 +1527,126 @@ function VisionFramePreview({
       </dl>
     </div>
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validAnalysisSection(value: unknown): value is AnalysisSection<unknown> {
+  return isRecord(value)
+    && ["available", "waiting", "unavailable", "review"].includes(String(value.status))
+    && typeof value.reason === "string"
+    && Object.prototype.hasOwnProperty.call(value, "data");
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function validTimestamp(value: unknown): value is string {
+  return typeof value === "string"
+    && Boolean(value.trim())
+    && Number.isFinite(Date.parse(value));
+}
+
+function validGameClock(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0;
+}
+
+function safeCode(value: unknown): string | null {
+  return opaqueReference(value);
+}
+
+function visionFrameReference(value: unknown): string | null {
+  return typeof value === "string" && VISION_FRAME_REF_RE.test(value) ? value : null;
+}
+
+function draftReference(value: unknown): string | null {
+  return typeof value === "string"
+    && (SHA256_RE.test(value) || PROSPECTIVE_DRAFT_REF_RE.test(value))
+    ? value
+    : null;
+}
+
+function inputReference(value: unknown): string | null {
+  return typeof value === "string" && INPUT_REF_RE.test(value) ? value : null;
+}
+
+function decisionReference(value: unknown): string | null {
+  return typeof value === "string" && DECISION_KEY_RE.test(value) ? value : null;
+}
+
+function opaqueReference(value: unknown): string | null {
+  return typeof value === "string"
+    && OPAQUE_REF_RE.test(value)
+    && !UNSAFE_OPAQUE_REF_RE.test(value)
+    ? value
+    : null;
+}
+
+function firstAllowedReference(
+  value: unknown,
+  keys: string[],
+  allow: (candidate: unknown) => string | null,
+): string | null {
+  const record = recordValue(value);
+  for (const key of keys) {
+    const result = allow(record[key]);
+    if (result) return result;
+  }
+  return null;
+}
+
+function firstDraftReference(value: unknown, keys: string[]): string | null {
+  return firstAllowedReference(value, keys, draftReference);
+}
+
+function firstVisionFrameReference(value: unknown, keys: string[]): string | null {
+  return firstAllowedReference(value, keys, visionFrameReference);
+}
+
+function validDecisionReferences(
+  value: Record<string, unknown>,
+  requireAuthority = value.eligible === 1,
+): boolean {
+  const draftAuthority = recordValue(value.draft_authority);
+  const visionAuthority = recordValue(value.vision_authority);
+  const draftKeys = ["source_ref", "landmark_key", "curve_key", "draft_hash"];
+  const visionKeys = ["source_frame_ref", "frame_ref", "observation_key"];
+  const presentDraftReferences = draftKeys
+    .filter((key) => Object.prototype.hasOwnProperty.call(draftAuthority, key))
+    .map((key) => draftAuthority[key]);
+  const presentVisionReferences = visionKeys
+    .filter((key) => Object.prototype.hasOwnProperty.call(visionAuthority, key))
+    .map((key) => visionAuthority[key]);
+  const inputs = recordValue(value.inputs);
+  const visionInput = recordValue(inputs.vision);
+  const inputFrameReference = Object.prototype.hasOwnProperty.call(visionInput, "source_frame_ref")
+    ? visionInput.source_frame_ref
+    : null;
+  const referencesAreValid = presentDraftReferences.every(
+    (reference) => draftReference(reference) !== null,
+  ) && presentVisionReferences.every(
+    (reference) => visionFrameReference(reference) !== null,
+  ) && (inputFrameReference === null || visionFrameReference(inputFrameReference) !== null);
+  if (!referencesAreValid) return false;
+  return !requireAuthority || (
+    presentDraftReferences.length > 0
+    && presentVisionReferences.length > 0
+  );
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function safeVisionFrameUrl(
