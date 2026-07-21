@@ -257,6 +257,51 @@ test("bridge diagnostics distinguish a failed config load", async () => {
   assert.equal(ready.config_loaded, false);
 });
 
+test("bridge probe reports only current-document lifecycle counters", async () => {
+  const harness = loadBridge("https://ray086.com/esports");
+  await flush();
+
+  let probe = harness.stateListeners[0]({action: "raybet.capture.probe"});
+  assert.equal(probe.configLoaded, true);
+  assert.equal(probe.hookSeen, false);
+  assert.equal(JSON.stringify(probe.transports), JSON.stringify({fetch: 0, xhr: 0, websocket: 0}));
+  assert.equal(probe.acceptedCount, 0);
+  assert.ok(Number.isFinite(Date.parse(probe.bridgeInitializedAt)));
+
+  harness.window.postMessage(JSON.stringify({
+    channel: "dota2-raybet-diagnostic-v1",
+    kind: "hook_initialized",
+    observed_at_utc: "2026-07-14T12:00:00.000Z",
+    frame_context: "top",
+  }));
+  harness.window.postMessage(JSON.stringify({
+    channel: "dota2-raybet-diagnostic-v1",
+    kind: "transport_observed",
+    observed_at_utc: "2026-07-14T12:00:01.000Z",
+    frame_context: "top",
+    transport: "fetch",
+    source_host: "iminfo.esportsworldlink.com",
+    source_path: "/v2/odds",
+    amount: 2,
+  }));
+  harness.window.postMessage(rawCandidate({
+    sequence: 1,
+    path: "/v2/odds?match_id=410001",
+    matchId: "410001",
+    payload: fixture("odds.json"),
+    origin: "https://iminfo.esportsworldlink.com",
+  }));
+  await flush();
+
+  probe = harness.stateListeners[0]({action: "raybet.capture.probe"});
+  assert.equal(probe.hookSeen, true);
+  assert.equal(probe.hookSeenAt, "2026-07-14T12:00:00.000Z");
+  assert.equal(JSON.stringify(probe.transports), JSON.stringify({fetch: 2, xhr: 0, websocket: 0}));
+  assert.equal(probe.lastObservedAt, "2026-07-14T12:00:01.000Z");
+  assert.equal(probe.acceptedCount, 1);
+  assert.ok(Number.isFinite(Date.parse(probe.lastAcceptedAt)));
+});
+
 test("bridge fails closed when the extension runtime is unavailable", async () => {
   for (const [options, listenerCount] of [
     [{runtimeUndefined: true}, 0],

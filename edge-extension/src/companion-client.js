@@ -1,6 +1,8 @@
 const BASE_URL = "http://127.0.0.1:8765";
 const EXTENSION_VERSION = "0.1.0";
 const PROTOCOL_VERSION = 1;
+const STATUS_TIMEOUT_MS = 3000;
+const EVENT_TIMEOUT_MS = 10_000;
 
 export class CompanionError extends Error {
   constructor(message, status = 0, code = "companion_error") {
@@ -67,29 +69,52 @@ function requireEventAcknowledgements(payload, response, events) {
   return payload;
 }
 
-export async function sendEventBatch(events, fetchImpl = fetch) {
+async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new CompanionError("Companion request timed out", 0, "companion_timeout"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      fetchImpl(url, {...init, signal: controller.signal}),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function sendEventBatch(
+  events,
+  fetchImpl = fetch,
+  timeoutMs = EVENT_TIMEOUT_MS,
+) {
   const body = JSON.stringify(events);
-  const response = await fetchImpl(`${BASE_URL}/v1/events`, {
+  const response = await fetchWithTimeout(fetchImpl, `${BASE_URL}/v1/events`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Dota-Extension-Version": EXTENSION_VERSION,
     },
     body,
-  });
+  }, timeoutMs);
   const payload = requireProtocolVersion(await parseResponse(response), response);
   return requireEventAcknowledgements(payload, response, events);
 }
 
-export async function fetchCompanionStatus(fetchImpl = fetch) {
-  const response = await fetchImpl(`${BASE_URL}/v1/status`, {
+export async function fetchCompanionStatus(fetchImpl = fetch, timeoutMs = STATUS_TIMEOUT_MS) {
+  const response = await fetchWithTimeout(fetchImpl, `${BASE_URL}/v1/status`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Dota-Extension-Version": EXTENSION_VERSION,
     },
     body: "{}",
-  });
+  }, timeoutMs);
   return requireProtocolVersion(await parseResponse(response), response);
 }
 
@@ -97,4 +122,6 @@ export const companionConstants = Object.freeze({
   BASE_URL,
   EXTENSION_VERSION,
   PROTOCOL_VERSION,
+  STATUS_TIMEOUT_MS,
+  EVENT_TIMEOUT_MS,
 });

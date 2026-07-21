@@ -14,6 +14,17 @@
     enabledDomains: {ray086: false, raylinks: false},
     captureSessionId: null,
   };
+  const pageLifecycle = {
+    bridgeInitializedAt: new Date().toISOString(),
+    configLoaded: false,
+    configResolved: false,
+    hookSeen: false,
+    hookSeenAt: null,
+    transports: {fetch: 0, xhr: 0, websocket: 0},
+    lastObservedAt: null,
+    acceptedCount: 0,
+    lastAcceptedAt: null,
+  };
   let tokens = 60;
   let lastRefill = performance.now();
   let diagnosticTokens = 20;
@@ -85,7 +96,16 @@
   }
 
   function accepted(reason) {
+    pageLifecycle.acceptedCount += 1;
+    pageLifecycle.lastAcceptedAt = new Date().toISOString();
     diagnostic("classification", {outcome: "accepted", reason});
+  }
+
+  function lifecycleSnapshot() {
+    return {
+      ...pageLifecycle,
+      transports: {...pageLifecycle.transports},
+    };
   }
 
   async function forwardEvent(origin, event) {
@@ -286,6 +306,10 @@
 
   function forwardHookDiagnostic(raw) {
     if (raw.kind === "hook_initialized") {
+      pageLifecycle.hookSeen = true;
+      pageLifecycle.hookSeenAt = typeof raw.observed_at_utc === "string"
+        && Number.isFinite(Date.parse(raw.observed_at_utc))
+        ? raw.observed_at_utc : new Date().toISOString();
       diagnostic("hook_initialized", {
         observed_at_utc: raw.observed_at_utc,
         frame_context: raw.frame_context,
@@ -300,14 +324,19 @@
         || !raw.source_path.startsWith("/")
         || raw.source_path.includes("?")
         || raw.source_path.includes("#")) return;
+    const amount = Number.isInteger(raw.amount) && raw.amount >= 1 && raw.amount <= 1000
+      ? raw.amount : 1;
+    pageLifecycle.transports[raw.transport] += amount;
+    pageLifecycle.lastObservedAt = typeof raw.observed_at_utc === "string"
+      && Number.isFinite(Date.parse(raw.observed_at_utc))
+      ? raw.observed_at_utc : new Date().toISOString();
     diagnostic("transport_observed", {
       observed_at_utc: raw.observed_at_utc,
       frame_context: raw.frame_context,
       transport: raw.transport,
       source_host: raw.source_host,
       source_path: raw.source_path,
-      amount: Number.isInteger(raw.amount) && raw.amount >= 1 && raw.amount <= 1000
-        ? raw.amount : 1,
+      amount,
     });
   }
 
@@ -338,6 +367,9 @@
   });
 
   addRuntimeMessageListener((message) => {
+    if (message?.action === api.ACTIONS.PROBE) {
+      return lifecycleSnapshot();
+    }
     if (message?.action === api.ACTIONS.STATE) {
       config = {
         ...config,
@@ -350,8 +382,12 @@
 
   diagnostic("bridge_initialized");
   safeRuntimeSendMessage({action: api.ACTIONS.GET_CONFIG}).then((value) => {
-    if (value && typeof value.captureSessionId === "string") config = value;
-    diagnostic("bridge_ready", {config_loaded: Boolean(config.captureSessionId)});
+    if (value && typeof value.captureSessionId === "string") {
+      config = value;
+      pageLifecycle.configLoaded = true;
+    }
+    pageLifecycle.configResolved = true;
+    diagnostic("bridge_ready", {config_loaded: pageLifecycle.configLoaded});
     window.postMessage(api.BRIDGE_READY_CHANNEL, "*");
   });
 

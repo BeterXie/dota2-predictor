@@ -1,14 +1,23 @@
 function stateTone(state) {
   if (state === "capturing") return "ok";
-  if (state === "buffering" || state === "paused") return "warn";
+  if ([
+    "backpressure",
+    "buffering",
+    "companion_offline",
+    "paused",
+    "reconnecting",
+    "waiting_for_traffic",
+  ].includes(state)) return "warn";
   return "error";
 }
 
 function render(status) {
-  const state = status.state || "error";
+  const state = status.captureStatus || status.state || "error";
   const dot = document.querySelector("#stateDot");
+  const stateText = document.querySelector("#stateText");
   dot.className = stateTone(state);
-  document.querySelector("#stateText").textContent = state.replaceAll("_", " ");
+  stateText.textContent = state.replaceAll("_", " ");
+  stateText.title = (status.statusReason || "").replaceAll("_", " ");
   document.querySelector("#captureToggle").checked = !status.paused;
   document.querySelector("#companionValue").textContent =
     status.companion?.reachable && status.companion?.connected
@@ -53,12 +62,39 @@ function render(status) {
   }
 }
 
+function unavailableStatus() {
+  return {
+    state: "error",
+    captureStatus: "degraded",
+    statusReason: "extension_status_unavailable",
+    paused: false,
+    companion: {reachable: false, connected: false},
+    recognizedMatches: [],
+    queue: [],
+    counters: {dropped: 0},
+    diagnostics: {},
+    remote: null,
+  };
+}
+
+async function getStatus() {
+  try {
+    return await chrome.runtime.sendMessage({action: "raybet.popup.getStatus"});
+  } catch {
+    return unavailableStatus();
+  }
+}
+
 document.querySelector("#captureToggle").addEventListener("change", async (event) => {
-  await chrome.runtime.sendMessage({
-    action: "raybet.popup.setPaused",
-    paused: !event.target.checked,
-  });
-  render(await chrome.runtime.sendMessage({action: "raybet.popup.getStatus"}));
+  try {
+    await chrome.runtime.sendMessage({
+      action: "raybet.popup.setPaused",
+      paused: !event.target.checked,
+    });
+  } catch {
+    // The status refresh below renders the invalidated extension context.
+  }
+  render(await getStatus());
 });
 document.querySelector("#openOptions").addEventListener("click", () => chrome.runtime.openOptionsPage());
-chrome.runtime.sendMessage({action: "raybet.popup.getStatus"}).then(render);
+void getStatus().then(render);

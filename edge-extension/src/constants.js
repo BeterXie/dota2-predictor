@@ -6,6 +6,7 @@
   COUNTER: "raybet.capture.counter",
   DIAGNOSTIC: "raybet.capture.diagnostic",
   GET_CONFIG: "raybet.capture.getConfig",
+  PROBE: "raybet.capture.probe",
   STATE: "raybet.capture.state",
   });
 

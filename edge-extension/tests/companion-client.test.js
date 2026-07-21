@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const {fetchCompanionStatus, sendEventBatch} = await import("../src/companion-client.js");
+const {
+  companionConstants,
+  fetchCompanionStatus,
+  sendEventBatch,
+} = await import("../src/companion-client.js");
 
 test("event request sends the exact JSON body with direct-mode headers", async () => {
   const calls = [];
@@ -88,5 +92,30 @@ test("event acknowledgement fails closed for missing, foreign, or duplicate IDs"
       (error) => error.name === "CompanionError"
         && error.code === "invalid_protocol_response",
     );
+  }
+});
+
+test("companion requests abort within their fixed timeout budgets", async () => {
+  assert.equal(companionConstants.STATUS_TIMEOUT_MS, 3000);
+  assert.equal(companionConstants.EVENT_TIMEOUT_MS, 10_000);
+
+  for (const operation of [
+    (fetchImpl) => fetchCompanionStatus(fetchImpl, 5),
+    (fetchImpl) => sendEventBatch([{event_id: "a"}], fetchImpl, 5),
+  ]) {
+    let signal;
+    const fetchImpl = async (_url, init) => {
+      signal = init.signal;
+      await new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), {once: true});
+      });
+    };
+    await assert.rejects(
+      operation(fetchImpl),
+      (error) => error.name === "CompanionError"
+        && error.status === 0
+        && error.code === "companion_timeout",
+    );
+    assert.equal(signal.aborted, true);
   }
 });

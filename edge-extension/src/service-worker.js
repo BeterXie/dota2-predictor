@@ -1,10 +1,30 @@
 import {CompanionError, fetchCompanionStatus, sendEventBatch} from "./companion-client.js";
-import {acknowledge, enqueueBounded, makeBatch, retryDelayMs} from "./queue.js";
+import {
+  QUEUE_LIMITS,
+  acknowledge,
+  enqueueBounded,
+  makeBatch,
+  queueBytes,
+  retryDelayMs,
+} from "./queue.js";
 
 const SESSION_KEY = "raybetMonitorSession";
 const CONFIG_KEY = "raybetMonitorConfig";
 const RETRY_ALARM = "raybet-monitor-delivery";
 const SHORT_TIMER_LIMIT_MS = 25_000;
+const HOOK_GRACE_MS = 2000;
+const QUEUE_HIGH_WATER = 0.8;
+const ALLOWED_PAGE_HOSTS = new Set(["ray086.com", "www.ray086.com"]);
+const DEGRADED_COMPANION_ERRORS = new Set([
+  "database_unavailable",
+  "forbidden_origin",
+  "invalid_origin",
+  "invalid_protocol_response",
+  "invalid_status_body",
+  "origin_required",
+  "unsupported_extension_version",
+  "unsupported_protocol_version",
+]);
 
 let stateMutex = Promise.resolve();
 let deliveryPromise = null;
@@ -173,10 +193,12 @@ async function deliverQueued() {
     try {
       const response = await sendEventBatch(snapshot);
       const ids = acknowledgedIds(response);
+      const rejected = response.results.filter((item) => item.status === "rejected").length;
       await serialized(async () => {
         const state = await readState();
         state.queue = acknowledge(state.queue, ids);
         state.counters.acknowledged += ids.length;
+        state.counters.rejected = Number(state.counters.rejected || 0) + rejected;
         state.retryAttempt = 0;
         state.nextRetryAt = null;
         state.state = state.paused ? "paused" : "capturing";
@@ -246,6 +268,237 @@ function sourceOriginEnabled(sourceOrigin, config) {
     return false;
   }
   return false;
+}
+
+function allowedPageUrl(value) {
+  try {
+    const url = new URL(value || "");
+    return url.protocol === "https:" && ALLOWED_PAGE_HOSTS.has(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function validTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+function normalizePageProbe(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const count = (item) => Number.isInteger(item) && item >= 0 ? item : 0;
+  return {
+    bridgeInitializedAt: validTimestamp(value.bridgeInitializedAt),
+    configLoaded: value.configLoaded === true,
+    configResolved: value.configResolved !== false,
+    hookSeen: value.hookSeen === true,
+    hookSeenAt: validTimestamp(value.hookSeenAt),
+    transports: {
+      fetch: count(value.transports?.fetch),
+      xhr: count(value.transports?.xhr),
+      websocket: count(value.transports?.websocket),
+    },
+    lastObservedAt: validTimestamp(value.lastObservedAt),
+    acceptedCount: count(value.acceptedCount),
+    lastAcceptedAt: validTimestamp(value.lastAcceptedAt),
+  };
+}
+
+async function inspectActivePage() {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({active: true, currentWindow: true});
+  } catch {
+    return {
+      supported: null,
+      tabStatus: null,
+      bridgeReachable: false,
+      probe: null,
+      error: "active_tab_unavailable",
+    };
+  }
+  const tab = tabs[0];
+  if (!tab || !allowedPageUrl(tab.url)) {
+    return {
+      supported: false,
+      tabStatus: tab?.status || null,
+      bridgeReachable: false,
+      probe: null,
+      error: null,
+    };
+  }
+  try {
+    const probe = normalizePageProbe(await chrome.tabs.sendMessage(tab.id, {
+      action: "raybet.capture.probe",
+    }));
+    return {
+      supported: true,
+      tabStatus: tab.status || null,
+      bridgeReachable: probe !== null,
+      probe,
+      error: probe === null ? "invalid_bridge_probe" : null,
+    };
+  } catch {
+    return {
+      supported: true,
+      tabStatus: tab.status || null,
+      bridgeReachable: false,
+      probe: null,
+      error: "bridge_unreachable",
+    };
+  }
+}
+
+function queueMetrics(state) {
+  const events = Array.isArray(state.queue) ? state.queue : [];
+  let bytes = null;
+  try {
+    bytes = queueBytes(events);
+  } catch {
+    bytes = null;
+  }
+  return {
+    count: events.length,
+    bytes,
+    eventUtilization: events.length / QUEUE_LIMITS.maxEvents,
+    byteUtilization: bytes === null ? null : bytes / QUEUE_LIMITS.maxBytes,
+    oldestQueuedAt: validTimestamp(events[0]?.captured_at_utc),
+  };
+}
+
+function degradedCompanionReason(companion, statusError) {
+  if (companion.connected || !companion.reachable) return null;
+  if (DEGRADED_COMPANION_ERRORS.has(companion.lastError)) return companion.lastError;
+  if (statusError?.status >= 400 && statusError.status !== 429) {
+    return companion.lastError === "http_error"
+      ? "companion_http_error" : companion.lastError;
+  }
+  return null;
+}
+
+function derivePopupStatus(state, companion, remote, statusError, page) {
+  const metrics = queueMetrics(state);
+  const dropped = Number(state.counters?.dropped || 0);
+  const rejected = Number(state.counters?.rejected || 0);
+  const retryAttempt = Number(state.retryAttempt || 0);
+  const issues = [];
+  const addIssue = (reason) => {
+    if (reason && !issues.includes(reason)) issues.push(reason);
+  };
+  const finish = (captureStatus, statusReason) => {
+    addIssue(statusReason);
+    return {
+      captureStatus,
+      statusReason,
+      statusSignals: {
+        activePageSupported: page.supported,
+        tabStatus: page.tabStatus,
+        bridgeReachable: page.bridgeReachable,
+        bridgeConfigLoaded: page.probe?.configLoaded ?? null,
+        hookSeen: page.probe?.hookSeen ?? false,
+        transportCount: page.probe
+          ? Object.values(page.probe.transports).reduce((total, value) => total + value, 0)
+          : 0,
+        acceptedCount: page.probe?.acceptedCount || 0,
+        companionReachable: companion.reachable,
+        companionConnected: companion.connected,
+        companionError: companion.lastError,
+        queueCount: metrics.count,
+        queueBytes: metrics.bytes,
+        queueEventUtilization: metrics.eventUtilization,
+        queueByteUtilization: metrics.byteUtilization,
+        oldestQueuedAt: metrics.oldestQueuedAt,
+        retryAttempt,
+        nextRetryAt: state.nextRetryAt || null,
+        dropped,
+        rejected,
+        deliveryInFlight: deliveryPromise !== null,
+        issues,
+      },
+    };
+  };
+
+  if (state.paused) return finish("paused", "capture_paused");
+  if (page.supported === false) return finish("unsupported_page", "unsupported_page");
+  if (page.error === "active_tab_unavailable") {
+    return finish("degraded", "active_tab_unavailable");
+  }
+
+  if (dropped > 0) addIssue("events_dropped");
+  if (rejected > 0) addIssue("events_rejected");
+  if (metrics.bytes === null) addIssue("queue_state_invalid");
+  if (page.probe?.configResolved && !page.probe.configLoaded) {
+    addIssue("bridge_config_failed");
+  }
+  const companionDegraded = degradedCompanionReason(companion, statusError);
+  addIssue(companionDegraded);
+  const databaseUnavailable = remote?.database_health !== undefined
+    && remote.database_health !== "ok";
+  if (databaseUnavailable) addIssue("database_unavailable");
+
+  const eventHighWater = metrics.eventUtilization >= QUEUE_HIGH_WATER;
+  const byteHighWater = metrics.byteUtilization !== null
+    && metrics.byteUtilization >= QUEUE_HIGH_WATER;
+  if (eventHighWater) addIssue("queue_event_high_water");
+  if (byteHighWater) addIssue("queue_byte_high_water");
+
+  let hookMissingReason = null;
+  if (page.supported && page.tabStatus === "complete" && !page.bridgeReachable) {
+    hookMissingReason = page.error === "invalid_bridge_probe"
+      ? "bridge_unreachable" : page.error || "bridge_unreachable";
+  } else if (page.probe && !page.probe.hookSeen) {
+    const initializedAt = Date.parse(page.probe.bridgeInitializedAt || "");
+    if (!Number.isFinite(initializedAt) || Date.now() - initializedAt >= HOOK_GRACE_MS) {
+      hookMissingReason = "main_hook_not_seen";
+    }
+  }
+  addIssue(hookMissingReason);
+
+  const offlineReason = !companion.connected && !companion.reachable
+    ? companion.lastError === "companion_timeout"
+      ? "status_probe_timeout" : "status_probe_network_error"
+    : null;
+  addIssue(offlineReason);
+
+  let reconnectingReason = null;
+  if (!offlineReason
+      && (!companion.connected || metrics.count > 0 || retryAttempt > 0 || state.nextRetryAt)) {
+    reconnectingReason = "draining_queue";
+    if (statusError?.status === 429) reconnectingReason = "companion_rate_limited";
+    else if (retryAttempt > 0 || state.nextRetryAt) reconnectingReason = "retry_scheduled";
+    else if (!companion.connected) reconnectingReason = "companion_retry_pending";
+  }
+  addIssue(reconnectingReason);
+
+  const transportCount = page.probe
+    ? Object.values(page.probe.transports).reduce((total, value) => total + value, 0)
+    : 0;
+  let waitingReason = null;
+  if (!hookMissingReason && page.tabStatus === "loading" && !page.bridgeReachable) {
+    waitingReason = "page_loading";
+  } else if (!hookMissingReason && page.probe && !page.probe.hookSeen) {
+    waitingReason = "hook_initializing";
+  } else if (!hookMissingReason && transportCount === 0) {
+    waitingReason = "no_transport_observed";
+  } else if (!hookMissingReason && !page.probe?.acceptedCount) {
+    waitingReason = "no_dota_event_accepted";
+  }
+  addIssue(waitingReason);
+
+  if (dropped > 0) return finish("degraded", "events_dropped");
+  if (rejected > 0) return finish("degraded", "events_rejected");
+  if (metrics.bytes === null) return finish("degraded", "queue_state_invalid");
+  if (page.probe?.configResolved && !page.probe.configLoaded) {
+    return finish("degraded", "bridge_config_failed");
+  }
+  if (companionDegraded) return finish("degraded", companionDegraded);
+  if (databaseUnavailable) return finish("degraded", "database_unavailable");
+  if (eventHighWater) return finish("backpressure", "queue_event_high_water");
+  if (byteHighWater) return finish("backpressure", "queue_byte_high_water");
+  if (hookMissingReason) return finish("page_hook_missing", hookMissingReason);
+  if (offlineReason) return finish("companion_offline", offlineReason);
+  if (reconnectingReason) return finish("reconnecting", reconnectingReason);
+  if (waitingReason) return finish("waiting_for_traffic", waitingReason);
+  return finish("capturing", "acknowledgements_current");
 }
 
 function diagnosticTime(value) {
@@ -369,12 +622,15 @@ async function handleMessage(message, sender) {
     }
     case "raybet.popup.getStatus": {
       const state = await readState();
+      const pagePromise = inspectActivePage();
       let remote = null;
       let companion = {...state.companion};
+      let statusError = null;
       try {
         remote = await fetchCompanionStatus();
         companion = {reachable: true, connected: true, lastError: null};
       } catch (error) {
+        statusError = error;
         remote = null;
         companion = {
           reachable: error instanceof CompanionError ? error.status > 0 : false,
@@ -382,7 +638,13 @@ async function handleMessage(message, sender) {
           lastError: error.code || error.name || "status_error",
         };
       }
-      return {...state, companion, remote};
+      const page = await pagePromise;
+      return {
+        ...state,
+        companion,
+        remote,
+        ...derivePopupStatus(state, companion, remote, statusError, page),
+      };
     }
     case "raybet.popup.setPaused": {
       const state = await serialized(async () => {

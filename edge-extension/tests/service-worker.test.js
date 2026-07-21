@@ -39,12 +39,13 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
   });
 
   const previousFetch = globalThis.fetch;
+  let eventOutcome = "accepted";
   globalThis.fetch = async (url, init) => {
     if (url.endsWith("/v1/status")) return jsonResponse({protocol_version: 1});
     const events = JSON.parse(init.body);
     return jsonResponse({
       protocol_version: 1,
-      results: events.map((event) => ({event_id: event.event_id, status: "accepted"})),
+      results: events.map((item) => ({event_id: item.event_id, status: eventOutcome})),
     });
   };
   globalThis.chrome = {
@@ -60,8 +61,25 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
       async clear() { return true; },
     },
     tabs: {
-      async query() { return [{id: 7}]; },
-      async sendMessage(tabId, message) { tabMessages.push({tabId, message}); },
+      async query() {
+        return [{id: 7, url: "https://ray086.com/esports", status: "complete"}];
+      },
+      async sendMessage(tabId, message) {
+        tabMessages.push({tabId, message});
+        if (message.action === "raybet.capture.probe") {
+          return {
+            bridgeInitializedAt: new Date(Date.now() - 5000).toISOString(),
+            configLoaded: true,
+            hookSeen: true,
+            hookSeenAt: new Date(Date.now() - 4900).toISOString(),
+            transports: {fetch: 1, xhr: 0, websocket: 0},
+            lastObservedAt: new Date(Date.now() - 100).toISOString(),
+            acceptedCount: 1,
+            lastAcceptedAt: new Date(Date.now() - 100).toISOString(),
+          };
+        }
+        return undefined;
+      },
     },
   };
 
@@ -137,6 +155,10 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
   assert.equal(status.companion.reachable, true);
   assert.equal(status.companion.connected, true);
   assert.equal(status.companion.lastError, null);
+  assert.equal(status.captureStatus, "capturing");
+  assert.equal(status.statusReason, "acknowledgements_current");
+  assert.equal(status.statusSignals.queueCount, 0);
+  assert.equal(status.statusSignals.activePageSupported, true);
   assert.equal(status.diagnostics.initialization.hook.top, 1);
   assert.equal(status.diagnostics.bridgeConfigLoaded, true);
   assert.equal(status.diagnostics.transports.fetch, 7);
@@ -148,6 +170,19 @@ test("service worker connects directly, cleans legacy secrets, and honors pause"
     frameContext: "top",
   });
   assert.equal(status.diagnostics.classification.ignoredReasons.non_dota, 1);
+
+  eventOutcome = "rejected";
+  await send({
+    action: "raybet.capture.event",
+    source_origin: "https://www.ray086.com",
+    event: {...event, event_id: "6".repeat(64)},
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  status = await send({action: "raybet.popup.getStatus"});
+  assert.equal(status.counters.rejected, 1);
+  assert.equal(status.captureStatus, "degraded");
+  assert.equal(status.statusReason, "events_rejected");
+  eventOutcome = "accepted";
 
   const invalidDiagnostic = await send({
     action: "raybet.capture.diagnostic",
@@ -270,6 +305,200 @@ test("service worker keeps an incompatible companion disconnected", async () => 
   });
 
   await send({action: "raybet.popup.setPaused", paused: true}, {});
+
+  globalThis.fetch = previousFetch;
+  delete globalThis.chrome;
+});
+
+test("popup status derives current-page readiness with deterministic priority", async () => {
+  const local = storageArea();
+  const session = storageArea();
+  const messageListeners = [];
+  let companionMode = "ready";
+  let activeTab = {id: 9, url: "https://ray086.com/esports", status: "complete"};
+  let probe;
+  const healthyProbe = (overrides = {}) => ({
+    bridgeInitializedAt: new Date(Date.now() - 5000).toISOString(),
+    configLoaded: true,
+    hookSeen: true,
+    hookSeenAt: new Date(Date.now() - 4900).toISOString(),
+    transports: {fetch: 0, xhr: 0, websocket: 0},
+    lastObservedAt: null,
+    acceptedCount: 0,
+    lastAcceptedAt: null,
+    ...overrides,
+  });
+  probe = healthyProbe();
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (!url.endsWith("/v1/status")) throw new Error("unexpected event delivery");
+    if (companionMode === "offline") throw new TypeError("network unavailable");
+    if (companionMode === "protocol") return jsonResponse({protocol_version: 2});
+    if (companionMode === "database") {
+      return jsonResponse({protocol_version: 1, database_health: "unavailable"});
+    }
+    return jsonResponse({protocol_version: 1, database_health: "ok"});
+  };
+  globalThis.chrome = {
+    storage: {local, session},
+    runtime: {
+      onMessage: {addListener: (listener) => messageListeners.push(listener)},
+      onInstalled: {addListener: () => undefined},
+      onStartup: {addListener: () => undefined},
+    },
+    alarms: {
+      onAlarm: {addListener: () => undefined},
+      async create() { return undefined; },
+      async clear() { return true; },
+    },
+    tabs: {
+      async query() { return activeTab ? [activeTab] : []; },
+      async sendMessage(_tabId, message) {
+        if (message.action !== "raybet.capture.probe") return undefined;
+        if (probe instanceof Error) throw probe;
+        return structuredClone(probe);
+      },
+    },
+  };
+
+  await import(`../src/service-worker.js?readiness-test=${Date.now()}`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const send = (message, sender = {}) => new Promise((resolve) => {
+    messageListeners[0](message, sender, resolve);
+  });
+  const original = structuredClone(session.values.get("raybetMonitorSession"));
+  const queuedEvent = (index, payload = undefined) => ({
+    event_id: String(index).padStart(64, "0"),
+    event_type: "odds",
+    captured_at_utc: "2026-07-21T00:00:00.000Z",
+    ...(payload === undefined ? {} : {payload}),
+  });
+  const eventHighWater = Array.from({length: 800}, (_, index) => queuedEvent(index));
+  const byteHighWater = [queuedEvent(1, "x".repeat(Math.ceil(5 * 1024 * 1024 * 0.8)))];
+
+  const cases = [
+    {
+      name: "loss outranks a full queue",
+      state: {queue: eventHighWater, counters: {dropped: 1}},
+      mode: "offline",
+      expected: ["degraded", "events_dropped"],
+      issues: ["events_dropped", "queue_event_high_water", "status_probe_network_error"],
+    },
+    {
+      name: "event high-water outranks an outage",
+      state: {queue: eventHighWater},
+      mode: "offline",
+      expected: ["backpressure", "queue_event_high_water"],
+      issues: ["queue_event_high_water", "status_probe_network_error"],
+    },
+    {
+      name: "byte high-water is backpressure",
+      state: {queue: byteHighWater},
+      expected: ["backpressure", "queue_byte_high_water"],
+    },
+    {
+      name: "missing hook outranks an outage",
+      mode: "offline",
+      pageProbe: healthyProbe({
+        bridgeInitializedAt: new Date(Date.now() - 3000).toISOString(),
+        hookSeen: false,
+        hookSeenAt: null,
+      }),
+      expected: ["page_hook_missing", "main_hook_not_seen"],
+      issues: ["main_hook_not_seen", "status_probe_network_error"],
+    },
+    {
+      name: "hook grace remains waiting",
+      pageProbe: healthyProbe({
+        bridgeInitializedAt: new Date(Date.now() - 1000).toISOString(),
+        hookSeen: false,
+        hookSeenAt: null,
+      }),
+      expected: ["waiting_for_traffic", "hook_initializing"],
+    },
+    {
+      name: "companion network failure is offline",
+      mode: "offline",
+      expected: ["companion_offline", "status_probe_network_error"],
+    },
+    {
+      name: "reachable protocol mismatch is degraded",
+      mode: "protocol",
+      expected: ["degraded", "unsupported_protocol_version"],
+    },
+    {
+      name: "database status failure is degraded",
+      mode: "database",
+      expected: ["degraded", "database_unavailable"],
+    },
+    {
+      name: "small queued retry is reconnecting",
+      state: {queue: [queuedEvent(1)], retryAttempt: 1, nextRetryAt: Date.now() + 1000},
+      pageProbe: healthyProbe({acceptedCount: 1, lastAcceptedAt: new Date().toISOString()}),
+      expected: ["reconnecting", "retry_scheduled"],
+    },
+    {
+      name: "healthy hook without transport waits",
+      expected: ["waiting_for_traffic", "no_transport_observed"],
+    },
+    {
+      name: "non-Dota transport still waits",
+      pageProbe: healthyProbe({
+        transports: {fetch: 2, xhr: 0, websocket: 0},
+        lastObservedAt: new Date().toISOString(),
+      }),
+      expected: ["waiting_for_traffic", "no_dota_event_accepted"],
+    },
+    {
+      name: "accepted current-page traffic captures",
+      pageProbe: healthyProbe({
+        transports: {fetch: 1, xhr: 0, websocket: 0},
+        lastObservedAt: new Date().toISOString(),
+        acceptedCount: 1,
+        lastAcceptedAt: new Date().toISOString(),
+      }),
+      expected: ["capturing", "acknowledgements_current"],
+    },
+  ];
+
+  for (const item of cases) {
+    companionMode = item.mode || "ready";
+    activeTab = {id: 9, url: "https://ray086.com/esports", status: "complete"};
+    probe = item.pageProbe || healthyProbe();
+    const next = structuredClone(original);
+    Object.assign(next, item.state || {});
+    next.counters = {...original.counters, ...(item.state?.counters || {})};
+    session.values.set("raybetMonitorSession", next);
+    const status = await send({action: "raybet.popup.getStatus"});
+    assert.equal(status.captureStatus, item.expected[0], item.name);
+    assert.equal(status.statusReason, item.expected[1], item.name);
+    assert.ok(status.statusSignals.issues.includes(item.expected[1]), item.name);
+    for (const issue of item.issues || []) {
+      assert.ok(status.statusSignals.issues.includes(issue), `${item.name}: ${issue}`);
+    }
+  }
+
+  companionMode = "ready";
+  probe = new Error("Receiving end does not exist");
+  activeTab = {id: 9, url: "https://ray086.com/esports", status: "loading"};
+  session.values.set("raybetMonitorSession", structuredClone(original));
+  let status = await send({action: "raybet.popup.getStatus"});
+  assert.equal(status.captureStatus, "waiting_for_traffic");
+  assert.equal(status.statusReason, "page_loading");
+
+  activeTab = {id: 9, url: "edge://extensions", status: "complete"};
+  status = await send({action: "raybet.popup.getStatus"});
+  assert.equal(status.captureStatus, "unsupported_page");
+  assert.equal(status.state, original.state);
+
+  const paused = structuredClone(original);
+  paused.paused = true;
+  paused.state = "paused";
+  session.values.set("raybetMonitorSession", paused);
+  status = await send({action: "raybet.popup.getStatus"});
+  assert.equal(status.captureStatus, "paused");
+  assert.equal(status.state, "paused");
 
   globalThis.fetch = previousFetch;
   delete globalThis.chrome;

@@ -7,6 +7,7 @@ function fakeElement() {
     listeners,
     className: "",
     textContent: "",
+    title: "",
     checked: false,
     hidden: true,
     href: "",
@@ -95,6 +96,75 @@ test("popup refreshes connection and capture state after a toggle", async () => 
     "raybet.popup.setPaused",
     "raybet.popup.getStatus",
   ]);
+
+  delete globalThis.chrome;
+  delete globalThis.document;
+});
+
+test("popup prefers additive capture status and exposes its reason", async () => {
+  const selectors = [
+    "#stateDot", "#stateText", "#captureToggle", "#companionValue",
+    "#matchCount", "#queueCount", "#dropCount", "#lastEvent",
+    "#hookStatus", "#bridgeStatus", "#observedCount", "#classifiedCount",
+    "#lastObserved", "#lastDecision", "#reportLink", "#openOptions",
+  ];
+  const elements = new Map(selectors.map((selector) => [selector, fakeElement()]));
+  globalThis.document = {
+    querySelector(selector) { return elements.get(selector); },
+  };
+  globalThis.chrome = {
+    runtime: {
+      async sendMessage() {
+        return {
+          state: "buffering",
+          captureStatus: "page_hook_missing",
+          statusReason: "main_hook_not_seen",
+          paused: false,
+          companion: {reachable: true, connected: true},
+          recognizedMatches: [],
+          queue: [],
+          counters: {dropped: 0},
+          diagnostics: {},
+        };
+      },
+      openOptionsPage() {},
+    },
+  };
+
+  await import(`../src/popup.js?capture-status-test=${Date.now()}`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(elements.get("#stateText").textContent, "page hook missing");
+  assert.equal(elements.get("#stateText").title, "main hook not seen");
+  assert.equal(elements.get("#stateDot").className, "error");
+
+  delete globalThis.chrome;
+  delete globalThis.document;
+});
+
+test("popup renders a failed status request as degraded", async () => {
+  const selectors = [
+    "#stateDot", "#stateText", "#captureToggle", "#companionValue",
+    "#matchCount", "#queueCount", "#dropCount", "#lastEvent",
+    "#hookStatus", "#bridgeStatus", "#observedCount", "#classifiedCount",
+    "#lastObserved", "#lastDecision", "#reportLink", "#openOptions",
+  ];
+  const elements = new Map(selectors.map((selector) => [selector, fakeElement()]));
+  globalThis.document = {
+    querySelector(selector) { return elements.get(selector); },
+  };
+  globalThis.chrome = {
+    runtime: {
+      async sendMessage() { throw new Error("extension context unavailable"); },
+      openOptionsPage() {},
+    },
+  };
+
+  await import(`../src/popup.js?status-error-test=${Date.now()}`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(elements.get("#stateText").textContent, "degraded");
+  assert.equal(elements.get("#stateText").title, "extension status unavailable");
+  assert.equal(elements.get("#stateDot").className, "error");
+  assert.equal(elements.get("#companionValue").textContent, "Unavailable");
 
   delete globalThis.chrome;
   delete globalThis.document;

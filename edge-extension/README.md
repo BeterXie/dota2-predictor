@@ -32,6 +32,26 @@ RayBet page is actually being observed. Diagnostics retain only counters and
 allowlisted host/path metadata; URL queries and response bodies are excluded.
 No pairing code or local secret is required.
 
+The capture state distinguishes the current failure boundary:
+
+- `waiting for traffic`: the current RayBet page hook is ready but has not yet
+  accepted a Dota event.
+- `capturing`: current-page Dota traffic is reaching the companion normally.
+- `page hook missing`: the current RayBet page needs a refresh after its
+  extension context was replaced or failed to initialize.
+- `companion offline`: the loopback companion did not answer the bounded
+  status probe.
+- `reconnecting`: the companion is reachable while a queued retry drains.
+- `backpressure`: the browser-session queue reached 80 percent of an event or
+  byte limit.
+- `degraded`: an event was lost or a bridge, protocol, validation, or database
+  readiness check failed.
+
+`paused` remains an explicit user state, and `unsupported page` means the
+active tab is outside the fixed RayBet host allowlist. The popup reason tooltip
+and existing counters identify the specific condition without exposing event
+payloads.
+
 The companion remains bound to `127.0.0.1` and accepts only the configured
 extension Origin. This workspace defaults to the currently loaded extension:
 
