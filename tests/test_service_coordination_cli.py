@@ -1309,7 +1309,8 @@ class WriterLifetimeAuthorityTests(unittest.TestCase):
                 "from live_betting.service_coordination import "
                 "database_writer_authority; "
                 "db=Path(sys.argv[sys.argv.index('--database')+1]); "
-                "authority=database_writer_authority(db); "
+                "authority=database_writer_authority("
+                "db, require_manager_child=True); "
                 "authority.__enter__(); print('authorized', flush=True); "
                 "authority.__exit__(None,None,None)"
             )
@@ -2057,6 +2058,22 @@ class WriterLifetimeAuthorityTests(unittest.TestCase):
 
             with SingleInstanceLock(database_service_lock_path(database)):
                 pass
+
+    def test_prepared_writer_authority_rejects_standalone_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "candidate.db"
+            database.touch()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "managed child authority is required",
+            ):
+                with database_writer_authority(
+                    database,
+                    require_manager_child=True,
+                    environ={},
+                ):
+                    self.fail("standalone process bypassed prepared-schema gate")
 
     def test_direct_writer_can_coexist_with_web_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

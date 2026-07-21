@@ -10,9 +10,11 @@ from typing import Iterable
 
 from .backtest import (
     BACKTEST_VERSION,
+    DraftDependencyLimitError,
     HORIZONS,
     _draft_snapshot_rows,
     draft_dependency_fingerprint,
+    load_bounded_draft_snapshot,
     load_draft_corpus,
 )
 from .draft_artifacts import (
@@ -428,6 +430,39 @@ def load_prospective_history(
     return tuple(row.evidence for row in corpus.maps)
 
 
+def load_bounded_prospective_history(
+    connection: sqlite3.Connection,
+    *,
+    max_rows: int,
+    max_bytes: int,
+    max_value_bytes: int,
+) -> tuple[str, tuple[DraftMapEvidence, ...]]:
+    """Load runtime history only after bounded dependency SQL preflight."""
+
+    available = connection.execute(
+        """SELECT 1
+             FROM player_role_assignments AS roles
+             JOIN formal_map_eligibility AS eligible
+               ON eligible.match_id=roles.match_id
+            WHERE eligible.draft_readiness='ready'
+              AND roles.purpose='expected_position'
+              AND roles.assignment_version=?
+            LIMIT 1""",
+        (PROSPECTIVE_ASSIGNMENT_VERSION,),
+    ).fetchone()
+    fingerprint, corpus = load_bounded_draft_snapshot(
+        connection,
+        availability_mode=AvailabilityMode.PROSPECTIVE,
+        assignment_version=PROSPECTIVE_ASSIGNMENT_VERSION,
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+        max_value_bytes=max_value_bytes,
+    )
+    if available is None:
+        return fingerprint, ()
+    return fingerprint, tuple(row.evidence for row in corpus.maps)
+
+
 def deployment_summary(deployment: FrozenDraftDeployment) -> str:
     return json.dumps(deployment.to_identity_payload(), sort_keys=True)
 
@@ -438,6 +473,8 @@ __all__ = [
     "assert_draft_models_match_database",
     "build_frozen_draft_deployment",
     "deployment_summary",
+    "DraftDependencyLimitError",
+    "load_bounded_prospective_history",
     "load_prospective_history",
     "split_calibration_samples",
 ]

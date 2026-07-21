@@ -35,6 +35,7 @@ from live_betting.service_coordination import (
     WriterScanResult,
     database_service_authority_lock_paths,
     database_writer_authority,
+    managed_child_target,
     require_unique_database_file,
     scan_managed_writers,
 )
@@ -62,6 +63,7 @@ from scripts.run_dota_shadow_service import (
 
 
 NOW = datetime(2026, 7, 14, 2, 0, tzinfo=timezone.utc)
+DRAFT_DEPLOYMENT_KEY = "a" * 64
 
 
 def _terminate_fake_tree(process: object) -> TerminationResult:
@@ -1671,6 +1673,7 @@ class ServiceHealthTests(unittest.TestCase):
                 start_strict_ingest=True,
                 start_postmatch=True,
                 start_draft_publisher=True,
+                draft_deployment_key=DRAFT_DEPLOYMENT_KEY,
                 vision_jsonl=live_root / "live_observations",
             ))
             identity = require_unique_database_file(database)
@@ -2423,6 +2426,7 @@ class ServiceHealthTests(unittest.TestCase):
             start_mail=True,
             start_strict_ingest=True,
             start_postmatch=True,
+            draft_deployment_key=DRAFT_DEPLOYMENT_KEY,
             vision_jsonl=live_root / "live_observations",
         ))
 
@@ -2462,6 +2466,41 @@ class ServiceHealthTests(unittest.TestCase):
         self.assertIn(
             str(database.resolve().parent / "raw-sources"),
             commands["postmatch"],
+        )
+        publisher_target = managed_child_target(commands["draft_publisher"])
+        self.assertIsNotNone(publisher_target)
+        assert publisher_target is not None
+        self.assertEqual(publisher_target.count("--deployment-key"), 1)
+        key_index = publisher_target.index("--deployment-key")
+        self.assertEqual(publisher_target[key_index + 1], DRAFT_DEPLOYMENT_KEY)
+
+    def test_supervisor_requires_valid_external_draft_deployment_pin(self) -> None:
+        base = dict(
+            database=Path("service.db"),
+            start_collector=False,
+            start_companion=False,
+            start_shadow=False,
+            start_vision=False,
+            start_mail=False,
+            start_strict_ingest=False,
+            start_postmatch=False,
+            start_draft_publisher=True,
+            vision_jsonl=None,
+        )
+        for value in (None, "a" * 63, "A" * 64):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "draft-deployment-key"):
+                    _commands(Namespace(**base, draft_deployment_key=value))
+
+        commands = _commands(
+            Namespace(**base, draft_deployment_key=DRAFT_DEPLOYMENT_KEY)
+        )
+        target = managed_child_target(commands["draft_publisher"])
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(
+            target[target.index("--deployment-key") + 1],
+            DRAFT_DEPLOYMENT_KEY,
         )
 
     def test_supervisor_rejects_cross_database_vision_path(self) -> None:

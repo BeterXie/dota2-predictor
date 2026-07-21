@@ -970,6 +970,7 @@ class DraftBacktestTests(unittest.TestCase):
 
             self.assertEqual(corpus.formal_draft_maps, 6)
             self.assertEqual(len(corpus.maps), 6)
+            self.assertEqual(len(prospective.maps), 6)
             self.assertEqual(len(corpus.targets), 6)
             self.assertEqual(len(prospective.targets), 0)
             self.assertIsNone(
@@ -991,6 +992,50 @@ class DraftBacktestTests(unittest.TestCase):
             )
             self.assertGreater(snapshot.feature("role_fit_win_rate_diff").support, 0)
             self.assertGreater(snapshot.feature("context_player_form_diff").support, 0)
+
+    def test_prospective_loader_excludes_incomplete_expected_roles_per_map(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self._database(directory)
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                before = draft_dependency_fingerprint(connection)
+                connection.execute(
+                    """UPDATE player_role_assignments SET position=NULL
+                         WHERE match_id=9001 AND purpose='expected_position'
+                           AND assignment_version=?""",
+                    (PROSPECTIVE_ASSIGNMENT_VERSION,),
+                )
+                connection.execute(
+                    """DELETE FROM player_role_assignments
+                         WHERE match_id=9002 AND player_slot=0
+                           AND purpose='expected_position'
+                           AND assignment_version=?""",
+                    (PROSPECTIVE_ASSIGNMENT_VERSION,),
+                )
+                connection.commit()
+                after = draft_dependency_fingerprint(connection)
+
+                prospective = load_draft_corpus(
+                    connection,
+                    availability_mode=AvailabilityMode.PROSPECTIVE,
+                    assignment_version=PROSPECTIVE_ASSIGNMENT_VERSION,
+                )
+                reconstructed = load_draft_corpus(
+                    connection,
+                    availability_mode=AvailabilityMode.RECONSTRUCTED,
+                    assignment_version=ASSIGNMENT_VERSION,
+                )
+            finally:
+                connection.close()
+
+            self.assertNotEqual(after, before)
+            self.assertEqual(prospective.formal_draft_maps, 6)
+            self.assertEqual(
+                [row.match_id for row in prospective.maps],
+                [9_003, 9_004, 9_005, 9_006],
+            )
+            self.assertEqual(len(reconstructed.maps), 6)
 
     def test_each_eligible_target_horizon_is_oos_and_modes_are_separate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -12,22 +12,26 @@ import sqlite3
 import sys
 import tempfile
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import psutil
 
-from event_intelligence.backtest import HORIZONS, draft_dependency_fingerprint
+from event_intelligence.backtest import (
+    HORIZONS,
+    DraftDependencyLimitError,
+    draft_dependency_fingerprint,
+)
 from event_intelligence.deployment import (
     DEPLOYMENT_VERSION,
     FrozenDraftDeployment,
     assert_draft_models_match_database,
     build_frozen_draft_deployment,
-    load_prospective_history,
+    load_bounded_prospective_history,
     split_calibration_samples,
 )
 from event_intelligence.draft_artifacts import (
@@ -85,6 +89,12 @@ PURE_MODEL_FEATURE_SCHEMA_HASH = FeatureSchema.from_names(
     PURE_FEATURE_SCHEMA
 ).schema_hash
 HISTORY_LOAD_TIMEOUT_SECONDS = 120.0
+MAX_RUNTIME_ARTIFACT_BYTES = 8 * 1024 * 1024
+MAX_RUNTIME_ARTIFACT_ROWS = 10_000
+MAX_RUNTIME_LINEAGE_CHANGES = 10_000
+MAX_RUNTIME_HISTORY_ROWS = 100_000
+MAX_RUNTIME_HISTORY_BYTES = 128 * 1024 * 1024
+MAX_RUNTIME_HISTORY_VALUE_BYTES = 8 * 1024 * 1024
 SAFE_FAILURE_MESSAGE_MAX_LENGTH = 240
 _SQL_DIAGNOSTIC_RE = re.compile(
     r"(?:\bselect\b.+?\bfrom\b|\binsert\s+into\b|\bupdate\s+\S+\s+set\b|"
@@ -190,6 +200,10 @@ class _FrozenDeploymentLineageError(ValueError):
 
 
 class _HistoryLoadTimeoutError(TimeoutError):
+    pass
+
+
+class _HistoryLoadLimitError(RuntimeError):
     pass
 
 
@@ -347,23 +361,20 @@ class ProspectiveHistorySnapshot:
             raise ValueError("history dependency fingerprint must be SHA-256")
 
 
-@lru_cache(maxsize=1)
-def _cached_prospective_history(
-    connection: sqlite3.Connection,
-    dependency_revision: int,
-) -> tuple[DraftMapEvidence, ...]:
-    if dependency_revision < 1:
-        raise ValueError("history dependency revision must be positive")
-    return load_prospective_history(connection)
+_BOUND_RUNTIME_HISTORIES: weakref.WeakValueDictionary[
+    int, ProspectiveHistorySnapshot
+] = weakref.WeakValueDictionary()
 
 
-def _authoritative_prospective_history(
-    connection: sqlite3.Connection,
-    dependency_revision: int,
-) -> tuple[DraftMapEvidence, ...]:
-    if connection.in_transaction:
-        return load_prospective_history(connection)
-    return _cached_prospective_history(connection, dependency_revision)
+def _bind_runtime_history(
+    history: ProspectiveHistorySnapshot,
+) -> ProspectiveHistorySnapshot:
+    _BOUND_RUNTIME_HISTORIES[id(history)] = history
+    return history
+
+
+def _runtime_history_is_bound(history: ProspectiveHistorySnapshot) -> bool:
+    return _BOUND_RUNTIME_HISTORIES.get(id(history)) is history
 
 
 def _parse_utc(value: object, field: str) -> datetime:
@@ -656,22 +667,41 @@ def _hash_map(value: object, field: str) -> dict[int, str]:
 def _load_frozen_deployment_snapshot(
     connection: sqlite3.Connection,
     deployment_key: str | None,
+    *,
+    verify_authoritative_corpus: bool = True,
+    verify_dependency_lineage: bool = True,
+    enforce_runtime_limits: bool = False,
 ) -> FrozenDraftDeployment | None:
-    row = connection.execute(
-        """SELECT deployment_key, model_hashes_json,
-                  calibration_hashes_json, training_cutoff,
-                  dependency_fingerprint, dependency_revision,
-                  evidence_mode, created_at
-             FROM draft_deployment_bundles
-            WHERE (? IS NULL OR deployment_key=?)
-            ORDER BY julianday(created_at) DESC, deployment_key DESC
-            LIMIT 1""",
-        (deployment_key, deployment_key),
-    ).fetchone()
+    if deployment_key is None:
+        row = connection.execute(
+            """SELECT deployment_key, model_hashes_json,
+                      calibration_hashes_json, training_cutoff,
+                      dependency_fingerprint, dependency_revision,
+                      evidence_mode, created_at
+                 FROM draft_deployment_bundles
+                ORDER BY julianday(created_at) DESC, deployment_key DESC
+                LIMIT 1"""
+        ).fetchone()
+    else:
+        row = connection.execute(
+            """SELECT deployment_key, model_hashes_json,
+                      calibration_hashes_json, training_cutoff,
+                      dependency_fingerprint, dependency_revision,
+                      evidence_mode, created_at
+                 FROM draft_deployment_bundles
+                WHERE deployment_key=?""",
+            (deployment_key,),
+        ).fetchone()
     if row is None:
         return None
     model_hashes = _hash_map(row[1], "model_hashes_json")
     calibration_hashes = _hash_map(row[2], "calibration_hashes_json")
+    if enforce_runtime_limits:
+        _assert_runtime_artifact_limits(
+            connection,
+            model_hashes=model_hashes,
+            calibration_hashes=calibration_hashes,
+        )
     models: list[DraftModelArtifact] = []
     calibrations: list[DraftCalibrationArtifact] = []
     model_created_at: dict[int, datetime] = {}
@@ -758,17 +788,141 @@ def _load_frozen_deployment_snapshot(
             sample.observed_at < model_created_at[horizon] for sample in samples
         ):
             raise ValueError("prospective calibration predates its frozen model")
-    dependency_reason = _deployment_training_reason(connection, deployment)
-    if dependency_reason is not None:
-        raise _FrozenDeploymentLineageError(
-            f"draft deployment lineage is stale: {dependency_reason}"
+    if verify_dependency_lineage:
+        dependency_reason = _deployment_training_reason(connection, deployment)
+        if dependency_reason is not None:
+            raise _FrozenDeploymentLineageError(
+                f"draft deployment lineage is stale: {dependency_reason}"
+            )
+    if verify_authoritative_corpus:
+        assert_draft_models_match_database(
+            connection,
+            deployment.models,
+            training_cutoff=deployment.training_cutoff,
         )
-    assert_draft_models_match_database(
-        connection,
-        deployment.models,
-        training_cutoff=deployment.training_cutoff,
-    )
     return deployment
+
+
+def _validate_deployment_key(deployment_key: str) -> str:
+    if (
+        not isinstance(deployment_key, str)
+        or len(deployment_key) != 64
+        or any(character not in "0123456789abcdef" for character in deployment_key)
+    ):
+        raise ValueError("deployment_key must be a lowercase SHA-256 digest")
+    return deployment_key
+
+
+def _assert_runtime_artifact_limits(
+    connection: sqlite3.Connection,
+    *,
+    model_hashes: Mapping[int, str],
+    calibration_hashes: Mapping[int, str],
+) -> None:
+    for horizon in HORIZONS:
+        model = connection.execute(
+            """SELECT length(CAST(artifact_json AS BLOB))
+                 FROM draft_model_artifacts
+                WHERE model_hash=? AND horizon_minutes=?""",
+            (model_hashes[horizon], horizon),
+        ).fetchone()
+        calibration = connection.execute(
+            """SELECT length(CAST(artifact_json AS BLOB)), support
+                 FROM draft_calibration_artifacts
+                WHERE calibration_hash=? AND model_hash=?
+                  AND horizon_minutes=?""",
+            (calibration_hashes[horizon], model_hashes[horizon], horizon),
+        ).fetchone()
+        if model is None or calibration is None:
+            raise ValueError("deployment references a missing artifact")
+        if (
+            model[0] is None
+            or int(model[0]) > MAX_RUNTIME_ARTIFACT_BYTES
+            or calibration[0] is None
+            or int(calibration[0]) > MAX_RUNTIME_ARTIFACT_BYTES
+        ):
+            raise ValueError("deployment artifact exceeds runtime size limit")
+        if int(calibration[1]) > MAX_RUNTIME_ARTIFACT_ROWS:
+            raise ValueError("deployment calibration exceeds runtime row limit")
+
+
+def _bounded_runtime_lineage_reason(
+    connection: sqlite3.Connection,
+    deployment: FrozenDraftDeployment,
+) -> tuple[int, str | None]:
+    row = connection.execute(
+        """SELECT dependency_revision FROM draft_lineage_revisions
+            WHERE singleton=1"""
+    ).fetchone()
+    if row is None:
+        return 0, "draft_dependency_revision_unavailable"
+    current_revision = int(row[0])
+    if current_revision < deployment.dependency_revision:
+        return current_revision, "draft_dependency_revision_moved_backwards"
+    delta = current_revision - deployment.dependency_revision
+    if delta == 0:
+        return current_revision, None
+    if delta > MAX_RUNTIME_LINEAGE_CHANGES:
+        return current_revision, "draft_dependency_change_limit_exceeded"
+    changes = connection.execute(
+        """SELECT COUNT(*), MIN(dependency_revision), MAX(dependency_revision),
+                  MAX(CASE
+                        WHEN affected_from_unix IS NULL
+                          OR affected_from_unix<=? THEN 1 ELSE 0 END)
+             FROM draft_lineage_changes
+            WHERE dependency_revision>? AND dependency_revision<=?""",
+        (
+            int(deployment.training_cutoff.timestamp()),
+            deployment.dependency_revision,
+            current_revision,
+        ),
+    ).fetchone()
+    if (
+        changes is None
+        or int(changes[0]) != delta
+        or int(changes[1]) != deployment.dependency_revision + 1
+        or int(changes[2]) != current_revision
+    ):
+        return current_revision, "draft_dependency_change_log_incomplete"
+    if int(changes[3] or 0) == 1:
+        return current_revision, "draft_dependencies_changed_before_cutoff"
+    return current_revision, None
+
+
+def _runtime_input_reasons(
+    connection: sqlite3.Connection,
+    deployment: FrozenDraftDeployment,
+    history: ProspectiveHistorySnapshot,
+) -> tuple[str | None, str | None]:
+    current_revision, deployment_reason = _bounded_runtime_lineage_reason(
+        connection,
+        deployment,
+    )
+    history_reason = (
+        None
+        if history.dependency_revision == current_revision
+        else "draft_dependency_revision_changed"
+    )
+    return deployment_reason, history_reason
+
+
+def _runtime_deployment_generation(
+    connection: sqlite3.Connection,
+) -> tuple[int, int, int]:
+    data_version = connection.execute("PRAGMA data_version").fetchone()
+    artifact = connection.execute(
+        """SELECT artifact_revision FROM draft_deployment_revisions
+            WHERE singleton=1"""
+    ).fetchone()
+    dependency = connection.execute(
+        """SELECT dependency_revision FROM draft_lineage_revisions
+            WHERE singleton=1"""
+    ).fetchone()
+    if data_version is None or artifact is None or dependency is None:
+        raise _FrozenDeploymentLineageError(
+            "draft deployment runtime generation is unavailable"
+        )
+    return int(data_version[0]), int(artifact[0]), int(dependency[0])
 
 
 def load_frozen_deployment(
@@ -778,12 +932,7 @@ def load_frozen_deployment(
 ) -> FrozenDraftDeployment | None:
     """Load and replay one deployment from a consistent database snapshot."""
 
-    if (
-        not isinstance(deployment_key, str)
-        or len(deployment_key) != 64
-        or any(character not in "0123456789abcdef" for character in deployment_key)
-    ):
-        raise ValueError("deployment_key must be a lowercase SHA-256 digest")
+    deployment_key = _validate_deployment_key(deployment_key)
     owns_snapshot = not connection.in_transaction
     if owns_snapshot:
         connection.execute("BEGIN")
@@ -811,6 +960,56 @@ def load_latest_frozen_deployment(
         return deployment
     except BaseException:
         if owns_snapshot and connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def load_pinned_frozen_deployment(
+    connection: sqlite3.Connection,
+    *,
+    deployment_key: str,
+) -> FrozenDraftDeployment | None:
+    """Load one externally pinned runtime deployment with bounded DB work."""
+
+    deployment_key = _validate_deployment_key(deployment_key)
+    if connection.in_transaction:
+        raise RuntimeError("pinned deployment load requires a fresh connection")
+    connection.execute("BEGIN")
+    try:
+        loaded_generation = _runtime_deployment_generation(connection)
+        deployment = _load_frozen_deployment_snapshot(
+            connection,
+            deployment_key,
+            verify_authoritative_corpus=False,
+            verify_dependency_lineage=False,
+            enforce_runtime_limits=True,
+        )
+        if deployment is None:
+            connection.commit()
+            return None
+        for model in deployment.models:
+            if len(model.training_corpus) > MAX_RUNTIME_ARTIFACT_ROWS:
+                raise ValueError("deployment model exceeds runtime row limit")
+        loaded_revision, reason = _bounded_runtime_lineage_reason(
+            connection,
+            deployment,
+        )
+        if reason is not None:
+            raise _FrozenDeploymentLineageError(
+                f"draft deployment lineage is stale: {reason}"
+            )
+        if loaded_revision != loaded_generation[2]:
+            raise _FrozenDeploymentLineageError(
+                "draft deployment lineage changed during runtime load"
+            )
+        connection.commit()
+        if _runtime_deployment_generation(connection) != loaded_generation:
+            raise _FrozenDeploymentLineageError(
+                "draft deployment generation changed during runtime load"
+            )
+        return deployment
+    except BaseException:
+        if connection.in_transaction:
             connection.rollback()
         raise
 
@@ -1207,6 +1406,13 @@ def publish_anchor_curve(
     history: ProspectiveHistorySnapshot,
     published_at: datetime,
 ) -> PublicationResult:
+    if not _runtime_history_is_bound(history):
+        return PublicationResult(
+            "skipped",
+            anchor.raybet_match_id,
+            anchor.map_number,
+            reason="draft_history:runtime_snapshot_untrusted",
+        )
     now = _parse_utc(published_at, "published_at")
     prediction_cutoff = max(
         _parse_utc(anchor.anchored_at, "anchor anchored_at"),
@@ -1222,7 +1428,11 @@ def publish_anchor_curve(
             anchor.map_number,
             reason="vision_anchor_from_future",
         )
-    deployment_reason = _deployment_training_reason(connection, deployment)
+    deployment_reason, history_reason = _runtime_input_reasons(
+        connection,
+        deployment,
+        history,
+    )
     deployment_row = connection.execute(
         """SELECT created_at FROM draft_deployment_bundles
             WHERE deployment_key=?""",
@@ -1249,37 +1459,12 @@ def publish_anchor_curve(
             anchor.map_number,
             reason=f"draft_deployment:{deployment_reason}",
         )
-    history_reason = draft_dependency_snapshot_reason(
-        connection,
-        expected_revision=history.dependency_revision,
-        expected_fingerprint=history.dependency_fingerprint,
-        cutoff=prediction_cutoff,
-    )
     if history_reason is not None:
         return PublicationResult(
             "skipped",
             anchor.raybet_match_id,
             anchor.map_number,
             reason=f"draft_history:{history_reason}",
-        )
-    try:
-        authoritative_history = _authoritative_prospective_history(
-            connection,
-            history.dependency_revision,
-        )
-    except (sqlite3.Error, TypeError, ValueError):
-        return PublicationResult(
-            "skipped",
-            anchor.raybet_match_id,
-            anchor.map_number,
-            reason="draft_history:authoritative_history_unavailable",
-        )
-    if history.maps != authoritative_history:
-        return PublicationResult(
-            "skipped",
-            anchor.raybet_match_id,
-            anchor.map_number,
-            reason="draft_history:history_snapshot_mismatch",
         )
     eligibility = query_strict_live_eligibility(
         connection,
@@ -1389,12 +1574,10 @@ def publish_anchor_curve(
 
     connection.execute("BEGIN IMMEDIATE")
     try:
-        deployment_reason = _deployment_training_reason(connection, deployment)
-        history_reason = draft_dependency_snapshot_reason(
+        deployment_reason, history_reason = _runtime_input_reasons(
             connection,
-            expected_revision=history.dependency_revision,
-            expected_fingerprint=history.dependency_fingerprint,
-            cutoff=prediction_cutoff,
+            deployment,
+            history,
         )
         if deployment_reason is not None or history_reason is not None:
             raise RuntimeError("draft dependencies changed before publication")
@@ -1971,18 +2154,62 @@ def _build_and_persist(database: Path, now: datetime) -> FrozenDraftDeployment:
     return deployment
 
 
-def _current_dependency_revision(database: Path) -> int:
-    reader = connect(database, read_only=True)
+def audited_rebase_frozen_deployment(
+    connection: sqlite3.Connection,
+    *,
+    old_deployment_key: str,
+    created_at: datetime,
+) -> tuple[FrozenDraftDeployment, bool]:
+    """Rebind an authoritatively replayed deployment to current lineage."""
+
+    old_deployment_key = _validate_deployment_key(old_deployment_key)
+    if connection.in_transaction:
+        raise RuntimeError("audited deployment rebase requires a fresh connection")
+    connection.execute("BEGIN")
     try:
-        row = reader.execute(
+        old = _load_frozen_deployment_snapshot(
+            connection,
+            old_deployment_key,
+            verify_authoritative_corpus=True,
+            verify_dependency_lineage=False,
+        )
+        if old is None:
+            raise ValueError("old deployment key is not persisted")
+        revision_row = connection.execute(
             """SELECT dependency_revision FROM draft_lineage_revisions
                 WHERE singleton=1"""
         ).fetchone()
-        if row is None:
+        if revision_row is None:
             raise RuntimeError("draft dependency revision is unavailable")
-        return int(row[0])
-    finally:
-        reader.close()
+        current_fingerprint = draft_dependency_fingerprint(connection)
+        current_revision = int(revision_row[0])
+        identity = _deployment_identity(
+            training_cutoff=old.training_cutoff,
+            dependency_fingerprint=current_fingerprint,
+            dependency_revision=current_revision,
+            models=old.models,
+            calibrations=old.calibrations,
+            evidence_mode=old.evidence_mode,
+        )
+        rebased = FrozenDraftDeployment(
+            deployment_key=canonical_hash(identity),
+            training_cutoff=old.training_cutoff,
+            dependency_fingerprint=current_fingerprint,
+            dependency_revision=current_revision,
+            models=old.models,
+            calibrations=old.calibrations,
+        )
+        connection.rollback()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    inserted = persist_frozen_deployment(
+        connection,
+        rebased,
+        created_at=created_at,
+    )
+    return rebased, inserted
 
 
 def _load_history(
@@ -2017,6 +2244,7 @@ def _load_history(
 
     try:
         reader.execute("BEGIN")
+        loaded_generation = _runtime_deployment_generation(reader)
         revision_row = reader.execute(
             """SELECT dependency_revision FROM draft_lineage_revisions
                 WHERE singleton=1"""
@@ -2024,16 +2252,32 @@ def _load_history(
         if revision_row is None:
             raise RuntimeError("draft dependency revision is unavailable")
         require_time_remaining()
-        fingerprint = draft_dependency_fingerprint(reader)
-        require_time_remaining()
-        history = load_prospective_history(reader)
-        require_time_remaining()
-        reader.rollback()
-        return ProspectiveHistorySnapshot(
-            dependency_revision=int(revision_row[0]),
-            dependency_fingerprint=fingerprint,
-            maps=history,
+        fingerprint, history = load_bounded_prospective_history(
+            reader,
+            max_rows=MAX_RUNTIME_HISTORY_ROWS,
+            max_bytes=MAX_RUNTIME_HISTORY_BYTES,
+            max_value_bytes=MAX_RUNTIME_HISTORY_VALUE_BYTES,
         )
+        require_time_remaining()
+        history_snapshot = _bind_runtime_history(
+            ProspectiveHistorySnapshot(
+                dependency_revision=int(revision_row[0]),
+                dependency_fingerprint=fingerprint,
+                maps=history,
+            )
+        )
+        if history_snapshot.dependency_revision != loaded_generation[2]:
+            raise _FrozenDeploymentLineageError(
+                "draft history revision changed during runtime load"
+            )
+        reader.rollback()
+        if _runtime_deployment_generation(reader) != loaded_generation:
+            raise _FrozenDeploymentLineageError(
+                "draft history generation changed during runtime load"
+            )
+        return history_snapshot
+    except DraftDependencyLimitError as error:
+        raise _HistoryLoadLimitError("history_load_limit_exceeded") from error
     except sqlite3.OperationalError as error:
         if timed_out:
             raise _HistoryLoadTimeoutError("history_load_timeout") from error
@@ -2066,16 +2310,54 @@ def _refresh_dependency_inputs(
     now: datetime,
 ) -> tuple[FrozenDraftDeployment, ProspectiveHistorySnapshot]:
     del now
-    current_revision = _current_dependency_revision(database)
-    if deployment.dependency_revision != current_revision:
-        raise _FrozenDeploymentLineageError(
-            "draft deployment dependency revision changed"
+    reader = connect(database, read_only=True, row_factory=sqlite3.Row)
+    try:
+        reader.execute("BEGIN")
+        loaded_generation = _runtime_deployment_generation(reader)
+        deployment_reason, history_reason = _runtime_input_reasons(
+            reader,
+            deployment,
+            history,
         )
-    if history.dependency_revision != current_revision:
-        raise _FrozenDeploymentLineageError(
-            "draft history dependency revision changed"
+        reader.rollback()
+        if deployment_reason is not None:
+            raise _FrozenDeploymentLineageError(
+                f"draft deployment lineage is stale: {deployment_reason}"
+            )
+        if history_reason is None:
+            return deployment, history
+        if history_reason != "draft_dependency_revision_changed":
+            raise _FrozenDeploymentLineageError(
+                f"draft history lineage is stale: {history_reason}"
+            )
+        refreshed = _load_history_with_timeout(
+            database,
+            timeout_seconds=HISTORY_LOAD_TIMEOUT_SECONDS,
         )
-    return deployment, history
+        if _runtime_deployment_generation(reader) != loaded_generation:
+            raise _FrozenDeploymentLineageError(
+                "draft history generation changed during runtime refresh"
+            )
+        reader.execute("BEGIN")
+        deployment_reason, history_reason = _runtime_input_reasons(
+            reader,
+            deployment,
+            refreshed,
+        )
+        reader.rollback()
+    finally:
+        if reader.in_transaction:
+            reader.rollback()
+        reader.close()
+    if deployment_reason is not None:
+        raise _FrozenDeploymentLineageError(
+            f"draft deployment lineage is stale: {deployment_reason}"
+        )
+    if history_reason is not None:
+        raise _FrozenDeploymentLineageError(
+            f"draft history lineage is stale: {history_reason}"
+        )
+    return deployment, refreshed
 
 
 def _record_cycle_health(
@@ -2087,6 +2369,8 @@ def _record_cycle_health(
     error: str | None = None,
     phase: str | None = None,
     failure: Mapping[str, object] | None = None,
+    history_dependency_revision: int | None = None,
+    history_refreshed: bool | None = None,
 ) -> None:
     details: dict[str, Any] = {
         "publisher_version": PUBLISHER_VERSION,
@@ -2107,6 +2391,10 @@ def _record_cycle_health(
         details["phase"] = phase
     if failure is not None:
         details["failure"] = dict(failure)
+    if history_dependency_revision is not None:
+        details["history_dependency_revision"] = history_dependency_revision
+    if history_refreshed is not None:
+        details["history_refreshed"] = history_refreshed
     record_health(
         connection,
         PUBLISHER_COMPONENT,
@@ -2144,8 +2432,53 @@ def _run_publisher_locked(
     once: bool,
     interval_seconds: float,
     rebuild_artifacts: bool,
+    deployment_key: str | None = None,
+    rebase_deployment_key: str | None = None,
     history_timeout_seconds: float = HISTORY_LOAD_TIMEOUT_SECONDS,
 ) -> int:
+    if rebase_deployment_key is not None:
+        if not once:
+            return 2
+        try:
+            old_key = _validate_deployment_key(rebase_deployment_key)
+            with LiveBettingStore(database) as store:
+                deployment, inserted = audited_rebase_frozen_deployment(
+                    store.connection,
+                    old_deployment_key=old_key,
+                    created_at=datetime.now(timezone.utc),
+                )
+        except Exception as error:
+            failure = _safe_offline_rebuild_failure(error)
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "audited_rebase_failed",
+                        "failure": failure,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "phase": "audited_rebase_complete",
+                    "old_deployment_key": old_key,
+                    "new_deployment_key": deployment.deployment_key,
+                    "inserted": inserted,
+                    "supervisor_argument": (
+                        "--draft-deployment-key " + deployment.deployment_key
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 0
     if rebuild_artifacts:
         if not once:
             _record_database_health(
@@ -2161,7 +2494,7 @@ def _run_publisher_locked(
             phase="offline_rebuild",
         )
         try:
-            _build_and_persist(database, datetime.now(timezone.utc))
+            deployment = _build_and_persist(database, datetime.now(timezone.utc))
         except Exception as error:
             failure = _safe_offline_rebuild_failure(error)
             _record_database_health(
@@ -2189,7 +2522,39 @@ def _run_publisher_locked(
             status="healthy",
             phase="offline_rebuild_complete",
         )
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "phase": "offline_rebuild_complete",
+                    "deployment_key": deployment.deployment_key,
+                    "supervisor_argument": (
+                        "--draft-deployment-key " + deployment.deployment_key
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return 0
+    if deployment_key is None:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_deployment",
+            error="deployment_pin_missing",
+        )
+        return 2
+    try:
+        deployment_key = _validate_deployment_key(deployment_key)
+    except ValueError:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_deployment",
+            error="deployment_pin_invalid",
+        )
+        return 2
     _record_database_health(
         database,
         status="starting",
@@ -2197,7 +2562,10 @@ def _run_publisher_locked(
     )
     try:
         with LiveBettingStore(database) as store:
-            deployment = load_latest_frozen_deployment(store.connection)
+            deployment = load_pinned_frozen_deployment(
+                store.connection,
+                deployment_key=deployment_key,
+            )
     except _FrozenDeploymentLineageError:
         _record_database_health(
             database,
@@ -2240,6 +2608,14 @@ def _run_publisher_locked(
             database,
             timeout_seconds=history_timeout_seconds,
         )
+    except _HistoryLoadLimitError:
+        _record_database_health(
+            database,
+            status="unhealthy",
+            phase="loading_history",
+            error="history_load_limit_exceeded",
+        )
+        return 2
     except _HistoryLoadTimeoutError:
         _record_database_health(
             database,
@@ -2259,12 +2635,14 @@ def _run_publisher_locked(
     while True:
         cycle_at = datetime.now(timezone.utc)
         try:
+            previous_history = history
             deployment, history = _refresh_dependency_inputs(
                 database,
                 deployment,
                 history,
                 now=cycle_at,
             )
+            history_refreshed = history is not previous_history
             with LiveBettingStore(database) as store:
                 report = publish_cycle(
                     store.connection,
@@ -2278,6 +2656,8 @@ def _run_publisher_locked(
                     now=cycle_at,
                     report=report,
                     phase="healthy",
+                    history_dependency_revision=history.dependency_revision,
+                    history_refreshed=history_refreshed,
                 )
             print(
                 json.dumps(
@@ -2289,6 +2669,8 @@ def _run_publisher_locked(
                         "unchanged": report.unchanged,
                         "skipped": report.skipped,
                         "outcomes_inserted": report.outcomes_inserted,
+                        "history_dependency_revision": history.dependency_revision,
+                        "history_refreshed": history_refreshed,
                     },
                     sort_keys=True,
                 ),
@@ -2324,6 +2706,8 @@ def run_publisher(
     once: bool,
     interval_seconds: float,
     rebuild_artifacts: bool,
+    deployment_key: str | None = None,
+    rebase_deployment_key: str | None = None,
 ) -> int:
     with publisher_singleton_lock(database):
         return _run_publisher_locked(
@@ -2331,6 +2715,8 @@ def run_publisher(
             once=once,
             interval_seconds=interval_seconds,
             rebuild_artifacts=rebuild_artifacts,
+            deployment_key=deployment_key,
+            rebase_deployment_key=rebase_deployment_key,
         )
 
 
@@ -2340,17 +2726,48 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--rebuild-artifacts", action="store_true")
+    parser.add_argument("--rebase-deployment-key")
     parser.add_argument("--schema-prepared", action="store_true")
+    parser.add_argument("--deployment-key")
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval <= 0.0:
         parser.error("--interval must be positive")
     if args.rebuild_artifacts and not args.once:
         parser.error("--rebuild-artifacts requires --once")
+    if args.rebase_deployment_key is not None and not args.once:
+        parser.error("--rebase-deployment-key requires --once")
+    if args.rebuild_artifacts and args.rebase_deployment_key is not None:
+        parser.error(
+            "--rebuild-artifacts cannot be used with --rebase-deployment-key"
+        )
+    if (args.rebuild_artifacts or args.rebase_deployment_key is not None) and (
+        args.deployment_key is not None
+    ):
+        parser.error("--deployment-key cannot be used with an offline mode")
+    if args.rebase_deployment_key is not None:
+        try:
+            args.rebase_deployment_key = _validate_deployment_key(
+                args.rebase_deployment_key
+            )
+        except ValueError:
+            parser.error(
+                "--rebase-deployment-key must be a lowercase SHA-256 digest"
+            )
+    if not args.rebuild_artifacts and args.rebase_deployment_key is None:
+        try:
+            args.deployment_key = _validate_deployment_key(args.deployment_key)
+        except ValueError:
+            parser.error(
+                "--deployment-key is required and must be a lowercase SHA-256 digest"
+            )
     database = args.database.resolve()
-    with database_writer_authority(database):
-        if args.schema_prepared:
+    with database_writer_authority(
+        database,
+        require_manager_child=bool(args.schema_prepared),
+    ):
+        if args.rebase_deployment_key is not None:
             verify_prepared_database(database)
-        else:
+        elif not args.schema_prepared:
             with LiveBettingStore(database) as store:
                 store.init_schema()
         return run_publisher(
@@ -2358,6 +2775,8 @@ def main() -> int:
             once=args.once,
             interval_seconds=float(args.interval),
             rebuild_artifacts=bool(args.rebuild_artifacts),
+            deployment_key=args.deployment_key,
+            rebase_deployment_key=args.rebase_deployment_key,
         )
 
 
@@ -2370,9 +2789,11 @@ __all__ = [
     "PublicationResult",
     "PublisherCycleReport",
     "append_prospective_outcomes",
+    "audited_rebase_frozen_deployment",
     "build_prospective_calibration_deployment",
     "load_frozen_deployment",
     "load_latest_frozen_deployment",
+    "load_pinned_frozen_deployment",
     "persist_frozen_deployment",
     "publish_anchor_curve",
     "publish_cycle",

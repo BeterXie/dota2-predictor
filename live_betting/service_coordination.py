@@ -2470,6 +2470,7 @@ def web_fetch_process_environment(
 def database_writer_authority(
     database: Path,
     *,
+    require_manager_child: bool = False,
     environ: Mapping[str, str] | None = None,
     process_factory: Callable[[int], Any] = psutil.Process,
     parent_pid: int | None = None,
@@ -2491,6 +2492,8 @@ def database_writer_authority(
         raise RuntimeError("legacy supervisor child authority is unsupported")
 
     manager_marker = source_environment.get(_MANAGER_CHILD_AUTHORITY_ENV)
+    if require_manager_child and manager_marker is None:
+        raise RuntimeError("managed child authority is required")
     if manager_marker is not None:
         _validate_manager_child_authority(
             resolved,

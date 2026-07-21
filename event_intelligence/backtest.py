@@ -71,6 +71,93 @@ BOOTSTRAP_SAMPLES = 1_000
 CALIBRATION_BINS = 5
 DRAFT_VALIDATION_VERSION = "draft-input-lineage-v4"
 
+
+class DraftDependencyLimitError(RuntimeError):
+    """Raised before runtime materializes an oversized draft dependency set."""
+
+
+def _qualified_columns(alias: str, columns: Sequence[str]) -> str:
+    return ", ".join(f"{alias}.{column}" for column in columns)
+
+
+_CORPUS_FACT_COLUMNS = (
+    "fact_id", "match_id", "player_slot", "account_id", "team_id",
+    "hero_id", "is_radiant", "facts_json", "missing_fields_json", "coverage",
+    "source_artifact_id", "source_content_hash", "fact_version",
+    "first_usable_at", "created_at",
+)
+_CORPUS_ROLE_COLUMNS = (
+    "assignment_id", "match_id", "player_slot", "account_id", "team_id",
+    "purpose", "position", "assignment_source", "confidence", "input_cutoff",
+    "input_hash", "assignment_version", "created_at",
+)
+_CORPUS_SCORE_COLUMNS = (
+    "score_id", "match_id", "player_slot", "account_id", "position",
+    "execution_score", "result_adjusted_score", "component_facts_json",
+    "component_scores_json", "weights_json", "coverage", "role_confidence",
+    "benchmark_cutoff", "benchmark_hash", "input_hash", "score_version",
+    "explanation_json", "created_at",
+)
+_CORPUS_PLAYER_COLUMNS = (
+    "id", "match_id", "account_id", "player_slot", "hero_id", "is_radiant",
+    "team_id", "kills", "deaths", "assists", "gold_per_min", "xp_per_min",
+    "net_worth", "last_hits", "denies", "hero_damage", "hero_healing",
+    "tower_damage", "level", "item_0", "item_1", "item_2", "item_3", "item_4",
+    "item_5", "backpack_0", "backpack_1", "backpack_2", "item_neutral",
+    "firstblood_claimed", "gold_10min", "lh_10min", "xp_10min", "kills_10min",
+    "deaths_10min", "assists_10min", "obs_placed_10min", "sen_placed_10min",
+    "lane_efficiency", "lane_role", "is_roaming", "kda",
+    "observer_kills_10min", "sentry_kills_10min",
+)
+_CORPUS_PICK_COLUMNS = (
+    "id", "match_id", "hero_id", "is_pick", "team", "ord",
+)
+_CORPUS_STATE_COLUMNS = (
+    "state_id", "match_id", "team_id", "side", "label", "duration_seconds",
+    "max_lead", "max_deficit", "ahead_fraction", "behind_fraction",
+    "even_fraction", "signed_auc", "absolute_auc", "crossings_json",
+    "first_significant_lead_at", "first_significant_deficit_at",
+    "closeout_seconds", "objective_conversion_json", "curve_coverage",
+    "source_versions_json", "input_hash", "label_version", "created_at",
+)
+_CORPUS_FACT_QUERY = f"""SELECT {_qualified_columns('facts', _CORPUS_FACT_COLUMNS)}
+   FROM formal_map_eligibility AS eligible
+   JOIN match_ingest_status AS status ON status.match_id=eligible.match_id
+   JOIN player_map_facts AS facts
+     ON facts.match_id=eligible.match_id
+    AND facts.source_content_hash=status.latest_raw_content_hash
+    AND facts.fact_version=status.normalizer_version || ':' ||
+                           status.latest_raw_content_hash
+   WHERE eligible.draft_readiness='ready'
+   ORDER BY facts.match_id, facts.player_slot"""
+_CORPUS_ROLE_QUERY = f"""SELECT {_qualified_columns('roles', _CORPUS_ROLE_COLUMNS)}
+   FROM player_role_assignments AS roles
+   JOIN formal_map_eligibility AS eligible
+     ON eligible.match_id=roles.match_id
+   WHERE eligible.draft_readiness='ready'
+     AND roles.assignment_version=?
+     AND roles.purpose IN ('expected_position', 'observed_position')"""
+_CORPUS_SCORE_QUERY = f"""SELECT {_qualified_columns('score', _CORPUS_SCORE_COLUMNS)}
+   FROM player_map_scores AS score
+   JOIN formal_map_eligibility AS eligible
+     ON eligible.match_id=score.match_id
+   WHERE eligible.draft_readiness='ready' AND score.score_version=?"""
+_CORPUS_PLAYER_QUERY = f"""SELECT {_qualified_columns('player', _CORPUS_PLAYER_COLUMNS)}
+   FROM formal_map_eligibility AS eligible
+   JOIN match_players AS player ON player.match_id=eligible.match_id
+   WHERE eligible.draft_readiness='ready'
+   ORDER BY player.match_id, player.player_slot"""
+_CORPUS_PICK_QUERY = f"""SELECT {_qualified_columns('pick', _CORPUS_PICK_COLUMNS)}
+   FROM formal_map_eligibility AS eligible
+   JOIN picks_bans AS pick ON pick.match_id=eligible.match_id
+   WHERE eligible.draft_readiness='ready' AND pick.is_pick=1
+   ORDER BY pick.match_id, pick.ord, pick.id"""
+_CORPUS_STATE_QUERY = f"""SELECT {_qualified_columns('state', _CORPUS_STATE_COLUMNS)}
+   FROM team_map_states AS state
+   JOIN formal_map_eligibility AS eligible
+     ON eligible.match_id=state.match_id
+   WHERE eligible.draft_readiness='ready' AND state.label_version=?"""
+
 _DRAFT_DEPENDENCY_QUERIES = (
     (
         "formal_events",
@@ -1012,6 +1099,60 @@ def draft_dependency_fingerprint(connection: sqlite3.Connection) -> str:
     return _dependency_fingerprint(connection, _DRAFT_DEPENDENCY_QUERIES)
 
 
+def _bounded_draft_dependency_usage(
+    connection: sqlite3.Connection,
+    *,
+    max_rows: int,
+    max_bytes: int,
+    additional_queries: Sequence[
+        tuple[str, str, tuple[object, ...]]
+    ] = (),
+) -> None:
+    if max_rows < 1 or max_bytes < 1:
+        raise ValueError("draft dependency limits must be positive")
+    total_rows = 0
+    projections: list[
+        tuple[str, str, tuple[object, ...], tuple[str, ...]]
+    ] = []
+    queries = (
+        *((relation, query, ()) for relation, query in _DRAFT_DEPENDENCY_QUERIES),
+        *additional_queries,
+    )
+    for relation, query, params in queries:
+        probe = connection.execute(f"{query} LIMIT 0", params)
+        columns = tuple(str(item[0]) for item in probe.description or ())
+        if not columns:
+            raise RuntimeError(f"draft dependency query has no columns: {relation}")
+        count_row = connection.execute(
+            f"SELECT COUNT(*) FROM ({query})",
+            params,
+        ).fetchone()
+        if count_row is None:
+            raise RuntimeError(f"draft dependency count failed: {relation}")
+        total_rows += int(count_row[0])
+        if total_rows > max_rows:
+            raise DraftDependencyLimitError("draft dependency row limit exceeded")
+        projections.append((relation, query, params, columns))
+
+    total_bytes = 0
+    for relation, query, params, columns in projections:
+        byte_terms = "+".join(
+            "COALESCE(length(CAST(\""
+            + column.replace('"', '""')
+            + "\" AS BLOB)),0)"
+            for column in columns
+        )
+        bytes_row = connection.execute(
+            f"SELECT COALESCE(SUM({byte_terms}),0) FROM ({query})",
+            params,
+        ).fetchone()
+        if bytes_row is None:
+            raise RuntimeError(f"draft dependency byte count failed: {relation}")
+        total_bytes += int(bytes_row[0])
+        if total_bytes > max_bytes:
+            raise DraftDependencyLimitError("draft dependency byte limit exceeded")
+
+
 def persist_draft_prediction_validations(
     connection: sqlite3.Connection,
     runs: Sequence[PersistedRun],
@@ -1385,13 +1526,7 @@ def _role_rows(
     connection: sqlite3.Connection, assignment_version: str
 ) -> dict[tuple[int, int, str], sqlite3.Row]:
     rows = connection.execute(
-        """SELECT roles.*
-           FROM player_role_assignments AS roles
-           JOIN formal_map_eligibility AS eligible
-             ON eligible.match_id=roles.match_id
-           WHERE eligible.draft_readiness='ready'
-             AND roles.assignment_version=?
-             AND roles.purpose IN ('expected_position', 'observed_position')""",
+        _CORPUS_ROLE_QUERY,
         (assignment_version,),
     ).fetchall()
     return {
@@ -1595,7 +1730,7 @@ def _hero_evidence(
     )
 
 
-def load_draft_corpus(
+def _load_draft_corpus(
     connection: sqlite3.Connection,
     *,
     availability_mode: AvailabilityMode,
@@ -1652,56 +1787,31 @@ def load_draft_corpus(
 
     facts_by_match = _rows_by_match(
         connection.execute(
-            """SELECT facts.*
-               FROM formal_map_eligibility AS eligible
-               JOIN match_ingest_status AS status ON status.match_id=eligible.match_id
-               JOIN player_map_facts AS facts
-                 ON facts.match_id=eligible.match_id
-                AND facts.source_content_hash=status.latest_raw_content_hash
-                AND facts.fact_version=status.normalizer_version || ':' ||
-                                       status.latest_raw_content_hash
-               WHERE eligible.draft_readiness='ready'
-               ORDER BY facts.match_id, facts.player_slot"""
+            _CORPUS_FACT_QUERY
         ).fetchall()
     )
     players_by_match = _rows_by_match(
         connection.execute(
-            """SELECT player.*
-               FROM formal_map_eligibility AS eligible
-               JOIN match_players AS player ON player.match_id=eligible.match_id
-               WHERE eligible.draft_readiness='ready'
-               ORDER BY player.match_id, player.player_slot"""
+            _CORPUS_PLAYER_QUERY
         ).fetchall()
     )
     picks_by_match = _rows_by_match(
         connection.execute(
-            """SELECT pick.*
-               FROM formal_map_eligibility AS eligible
-               JOIN picks_bans AS pick ON pick.match_id=eligible.match_id
-               WHERE eligible.draft_readiness='ready' AND pick.is_pick=1
-               ORDER BY pick.match_id, pick.ord, pick.id"""
+            _CORPUS_PICK_QUERY
         ).fetchall()
     )
     roles = _role_rows(connection, resolved_version)
     scores = {
         (int(row["match_id"]), int(row["player_slot"])): row
         for row in connection.execute(
-            """SELECT score.*
-               FROM player_map_scores AS score
-               JOIN formal_map_eligibility AS eligible
-                 ON eligible.match_id=score.match_id
-               WHERE eligible.draft_readiness='ready' AND score.score_version=?""",
+            _CORPUS_SCORE_QUERY,
             (score_version,),
         ).fetchall()
     }
     states = {
         (int(row["match_id"]), str(row["side"])): row
         for row in connection.execute(
-            """SELECT state.*
-               FROM team_map_states AS state
-               JOIN formal_map_eligibility AS eligible
-                 ON eligible.match_id=state.match_id
-               WHERE eligible.draft_readiness='ready' AND state.label_version=?""",
+            _CORPUS_STATE_QUERY,
             (LABEL_VERSION,),
         ).fetchall()
     }
@@ -1738,6 +1848,26 @@ def load_draft_corpus(
         players_by_slot = {int(row["player_slot"]): row for row in player_rows}
         if len(facts_by_slot) != 10 or set(facts_by_slot) != set(players_by_slot):
             raise ValueError(f"formal draft map {match_id} has inconsistent player slots")
+
+        if availability_mode is AvailabilityMode.PROSPECTIVE:
+            expected_positions: dict[bool, list[int]] = {True: [], False: []}
+            expected_complete = True
+            for slot, player in players_by_slot.items():
+                if player["is_radiant"] not in (0, 1):
+                    raise ValueError(
+                        f"formal draft map {match_id} has an invalid player side"
+                    )
+                role = roles.get((match_id, slot, "expected_position"))
+                position = None if role is None else _integer(role["position"])
+                if position not in range(1, 6):
+                    expected_complete = False
+                    continue
+                expected_positions[bool(player["is_radiant"])].append(position)
+            if not expected_complete or any(
+                sorted(positions) != [1, 2, 3, 4, 5]
+                for positions in expected_positions.values()
+            ):
+                continue
 
         side_players: dict[bool, list[sqlite3.Row]] = {True: [], False: []}
         fact_objects: dict[int, dict[str, Any]] = {}
@@ -2084,6 +2214,82 @@ def load_draft_corpus(
         maps=tuple(loaded),
         profile_maps=tuple(profile_maps),
     )
+
+
+def load_draft_corpus(
+    connection: sqlite3.Connection,
+    *,
+    availability_mode: AvailabilityMode,
+    assignment_version: str | None = None,
+) -> DraftCorpus:
+    return _load_draft_corpus(
+        connection,
+        availability_mode=availability_mode,
+        assignment_version=assignment_version,
+    )
+
+
+def load_bounded_draft_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    availability_mode: AvailabilityMode,
+    assignment_version: str | None = None,
+    max_rows: int,
+    max_bytes: int,
+    max_value_bytes: int,
+) -> tuple[str, DraftCorpus]:
+    """Return a fingerprint and corpus only after SQL-level size gates pass."""
+
+    if max_value_bytes < 1:
+        raise ValueError("draft dependency value limit must be positive")
+    previous_limit = connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
+    connection.setlimit(
+        sqlite3.SQLITE_LIMIT_LENGTH,
+        min(previous_limit, max_value_bytes),
+    )
+    try:
+        resolved_version = resolve_assignment_version(
+            connection,
+            assignment_version,
+        )
+        _validate_assignment_mode(resolved_version, availability_mode)
+        _bounded_draft_dependency_usage(
+            connection,
+            max_rows=max_rows,
+            max_bytes=max_bytes,
+            additional_queries=(
+                ("corpus_player_map_facts", _CORPUS_FACT_QUERY, ()),
+                (
+                    "corpus_player_role_assignments",
+                    _CORPUS_ROLE_QUERY,
+                    (resolved_version,),
+                ),
+                (
+                    "corpus_player_map_scores",
+                    _CORPUS_SCORE_QUERY,
+                    (score_version_for_role(resolved_version),),
+                ),
+                ("corpus_match_players", _CORPUS_PLAYER_QUERY, ()),
+                ("corpus_picks_bans", _CORPUS_PICK_QUERY, ()),
+                (
+                    "corpus_team_map_states",
+                    _CORPUS_STATE_QUERY,
+                    (LABEL_VERSION,),
+                ),
+            ),
+        )
+        fingerprint = _dependency_fingerprint(
+            connection,
+            _DRAFT_DEPENDENCY_QUERIES,
+        )
+        corpus = _load_draft_corpus(
+            connection,
+            availability_mode=availability_mode,
+            assignment_version=resolved_version,
+        )
+        return fingerprint, corpus
+    finally:
+        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, previous_limit)
 
 
 def _model_features(

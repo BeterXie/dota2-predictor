@@ -165,11 +165,17 @@ does write operational state; it is not a read-only verification command.
 To run the complete passive shadow pipeline:
 
 ```powershell
+$deploymentKey = "<deployment_key from the offline rebuild JSON output>"
 python scripts/run_dota_shadow_service.py --database data/dota2.db `
   --start-collector --start-companion --start-shadow --start-vision `
   --start-strict-ingest --start-postmatch --start-draft-publisher `
+  --draft-deployment-key $deploymentKey `
   --vision-jsonl data/live_betting/live_observations
 ```
+
+The supervisor never trusts the latest database bundle implicitly. Copy the
+exact `deployment_key` printed by a successful offline rebuild and pin it with
+`--draft-deployment-key`; startup fails closed when the pin is absent or differs.
 
 `--start-shadow` also starts the independent draft publisher. The publisher
 builds or loads frozen model/calibration artifacts outside the 3-second shadow

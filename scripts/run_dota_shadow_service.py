@@ -759,6 +759,10 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
     python = sys.executable
     paths = service_data_paths(args.database)
     database = str(paths.database)
+    publisher_requested = bool(
+        getattr(args, "start_draft_publisher", False) or args.start_shadow
+    )
+    deployment_key = getattr(args, "draft_deployment_key", None)
     if args.start_collector:
         commands["collector"] = [
             python,
@@ -843,7 +847,19 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             str(paths.source_archive_root),
             "--schema-prepared",
         ]
-    if getattr(args, "start_draft_publisher", False) or args.start_shadow:
+    if publisher_requested:
+        if (
+            not isinstance(deployment_key, str)
+            or len(deployment_key) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in deployment_key
+            )
+        ):
+            raise ValueError(
+                "--draft-deployment-key is required when the draft publisher is "
+                "enabled and must be a lowercase SHA-256 digest"
+            )
         commands["draft_publisher"] = [
             python,
             "-m",
@@ -851,6 +867,8 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "--database",
             database,
             "--schema-prepared",
+            "--deployment-key",
+            deployment_key,
         ]
     return {
         name: managed_child_command(command)
@@ -1387,6 +1405,13 @@ def main() -> int:
     parser.add_argument("--start-strict-ingest", action="store_true")
     parser.add_argument("--start-postmatch", action="store_true")
     parser.add_argument("--start-draft-publisher", action="store_true")
+    parser.add_argument(
+        "--draft-deployment-key",
+        help=(
+            "externally pinned frozen draft deployment SHA-256; required "
+            "when the draft publisher is enabled"
+        ),
+    )
     parser.add_argument(
         "--backup-dir",
         type=Path,

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import os
 import sqlite3
+import sys
+import weakref
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import event_intelligence.backtest as backtest_module
 import live_betting.draft_publisher as draft_publisher_module
 import live_betting.profiles.draft_curve as draft_curve_profile
 from event_intelligence.backtest import HORIZONS, draft_dependency_fingerprint
@@ -62,6 +67,7 @@ from live_betting.draft_publisher import (
     draft_anchor_frames_are_authoritative,
     load_frozen_deployment,
     load_latest_frozen_deployment,
+    load_pinned_frozen_deployment,
     persist_frozen_deployment,
     publisher_singleton_lock,
     publish_anchor_curve,
@@ -98,6 +104,35 @@ def _deployment(
         )
     finally:
         connection.close()
+
+
+def _runtime_history(
+    dependency_revision: int,
+    dependency_fingerprint: str,
+    maps: tuple[DraftMapEvidence, ...],
+) -> ProspectiveHistorySnapshot:
+    return draft_publisher_module._bind_runtime_history(
+        ProspectiveHistorySnapshot(
+            dependency_revision,
+            dependency_fingerprint,
+            maps,
+        )
+    )
+
+
+def test_runtime_history_capability_is_identity_bound_and_weak() -> None:
+    history = _runtime_history(1, "a" * 64, ())
+    equal_but_unbound = ProspectiveHistorySnapshot(1, "a" * 64, ())
+    history_id = id(history)
+    reference = weakref.ref(history)
+
+    assert draft_publisher_module._runtime_history_is_bound(history)
+    assert not draft_publisher_module._runtime_history_is_bound(equal_but_unbound)
+
+    del history
+    gc.collect()
+    assert reference() is None
+    assert history_id not in draft_publisher_module._BOUND_RUNTIME_HISTORIES
 
 
 def _forged_corpus_deployment(
@@ -340,6 +375,83 @@ def test_publisher_singleton_lock_fences_competing_processes(
         pass
 
 
+def test_schema_prepared_direct_start_requires_manager_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "publisher.db"
+    database.touch()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "draft_publisher.py",
+            "--database",
+            str(database),
+            "--schema-prepared",
+            "--deployment-key",
+            "a" * 64,
+            "--once",
+        ],
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "run_publisher",
+        lambda *_args, **_kwargs: pytest.fail(
+            "direct prepared publisher reached runtime"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="managed child authority is required"):
+        draft_publisher_module.main()
+
+
+def test_schema_prepared_managed_start_skips_full_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "publisher.db"
+    database.touch()
+    authority_calls: list[tuple[Path, bool]] = []
+
+    @contextmanager
+    def authority(path: Path, *, require_manager_child: bool = False):
+        authority_calls.append((path, require_manager_child))
+        yield
+
+    class UnexpectedStore:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pytest.fail("prepared publisher repeated schema preparation")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "draft_publisher.py",
+            "--database",
+            str(database),
+            "--schema-prepared",
+            "--deployment-key",
+            "a" * 64,
+            "--once",
+        ],
+    )
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "database_writer_authority",
+        authority,
+    )
+    monkeypatch.setattr(draft_publisher_module, "LiveBettingStore", UnexpectedStore)
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "run_publisher",
+        lambda *_args, **_kwargs: 0,
+    )
+
+    assert draft_publisher_module.main() == 0
+    assert authority_calls == [(database.resolve(), True)]
+
+
 def test_publisher_singleton_lock_fences_hard_link_alias(tmp_path: Path) -> None:
     database = tmp_path / "publisher.db"
     alias = tmp_path / "publisher-alias.db"
@@ -371,6 +483,7 @@ def test_runtime_publisher_fails_closed_without_frozen_deployment(
         once=True,
         interval_seconds=0.01,
         rebuild_artifacts=False,
+        deployment_key="0" * 64,
         history_timeout_seconds=0.1,
     )
 
@@ -393,8 +506,8 @@ def test_runtime_publisher_history_timeout_is_bounded_and_recorded(
     deployment = SimpleNamespace(dependency_revision=1)
     monkeypatch.setattr(
         draft_publisher_module,
-        "load_latest_frozen_deployment",
-        lambda _connection: deployment,
+        "load_pinned_frozen_deployment",
+        lambda _connection, *, deployment_key: deployment,
     )
     monkeypatch.setattr(
         draft_publisher_module,
@@ -418,6 +531,7 @@ def test_runtime_publisher_history_timeout_is_bounded_and_recorded(
         once=True,
         interval_seconds=0.01,
         rebuild_artifacts=False,
+        deployment_key="0" * 64,
         history_timeout_seconds=0.05,
     )
 
@@ -454,23 +568,21 @@ def test_history_timeout_interrupts_sqlite_and_closes_connection(
     def tracked_connect(*args: object, **kwargs: object) -> TrackingConnection:
         return TrackingConnection(original_connect(*args, **kwargs))
 
-    def slow_history(connection: sqlite3.Connection) -> tuple[()]:
+    def slow_history(
+        connection: sqlite3.Connection,
+        **_limits: object,
+    ) -> tuple[str, tuple[()]]:
         connection.execute(
             "WITH RECURSIVE counter(value) AS ("
             "SELECT 1 UNION ALL SELECT value + 1 FROM counter "
             "WHERE value < 1000000000) SELECT sum(value) FROM counter"
         ).fetchone()
-        return ()
+        return "fingerprint", ()
 
     monkeypatch.setattr(draft_publisher_module, "connect", tracked_connect)
     monkeypatch.setattr(
         draft_publisher_module,
-        "draft_dependency_fingerprint",
-        lambda _connection: "fingerprint",
-    )
-    monkeypatch.setattr(
-        draft_publisher_module,
-        "load_prospective_history",
+        "load_bounded_prospective_history",
         slow_history,
     )
 
@@ -486,9 +598,212 @@ def test_history_timeout_interrupts_sqlite_and_closes_connection(
     assert closed == [True]
 
 
+@pytest.mark.parametrize(
+    ("limit_name", "expected"),
+    [
+        ("MAX_RUNTIME_HISTORY_ROWS", "row limit"),
+        ("MAX_RUNTIME_HISTORY_BYTES", "byte limit"),
+    ],
+)
+def test_runtime_history_limits_reject_before_full_materialization(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    expected: str,
+) -> None:
+    _deployment(prepared_database)
+    monkeypatch.setattr(draft_publisher_module, "MAX_RUNTIME_HISTORY_ROWS", 10**9)
+    monkeypatch.setattr(draft_publisher_module, "MAX_RUNTIME_HISTORY_BYTES", 10**9)
+    monkeypatch.setattr(draft_publisher_module, limit_name, 1)
+    monkeypatch.setattr(
+        backtest_module,
+        "_dependency_fingerprint",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized runtime history reached fingerprint materialization"
+        ),
+    )
+    monkeypatch.setattr(
+        backtest_module,
+        "_load_draft_corpus",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized runtime history reached corpus materialization"
+        ),
+    )
+
+    with pytest.raises(
+        draft_publisher_module._HistoryLoadLimitError,
+        match="history_load_limit_exceeded",
+    ):
+        draft_publisher_module._load_history_with_timeout(
+            prepared_database,
+            timeout_seconds=10,
+        )
+
+
+def test_bounded_runtime_history_matches_full_small_fixture(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _deployment(prepared_database)
+    connection = connect(prepared_database, row_factory=sqlite3.Row)
+    try:
+        expected_revision = int(
+            connection.execute(
+                """SELECT dependency_revision FROM draft_lineage_revisions
+                    WHERE singleton=1"""
+            ).fetchone()[0]
+        )
+        expected_fingerprint = draft_dependency_fingerprint(connection)
+        expected_maps = load_prospective_history(connection)
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(
+        backtest_module,
+        "draft_dependency_fingerprint",
+        lambda *_args, **_kwargs: pytest.fail(
+            "runtime startup called the public full fingerprint API"
+        ),
+    )
+    monkeypatch.setattr(
+        backtest_module,
+        "load_draft_corpus",
+        lambda *_args, **_kwargs: pytest.fail(
+            "runtime startup called the public full corpus API"
+        ),
+    )
+
+    actual = draft_publisher_module._load_history_with_timeout(
+        prepared_database,
+        timeout_seconds=10,
+    )
+
+    assert actual.dependency_revision == expected_revision
+    assert actual.dependency_fingerprint == expected_fingerprint
+    assert actual.maps == expected_maps
+
+
+def test_runtime_history_row_limit_finishes_count_phase_before_byte_phase(
+    prepared_database: Path,
+) -> None:
+    _deployment(prepared_database)
+    statements: list[str] = []
+    connection = connect(prepared_database, row_factory=sqlite3.Row)
+    connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(backtest_module.DraftDependencyLimitError):
+            backtest_module.load_bounded_draft_snapshot(
+                connection,
+                availability_mode=backtest_module.AvailabilityMode.PROSPECTIVE,
+                assignment_version=PROSPECTIVE_ASSIGNMENT_VERSION,
+                max_rows=1,
+                max_bytes=10**9,
+                max_value_bytes=10**6,
+            )
+    finally:
+        connection.close()
+
+    assert any("COUNT(*)" in statement for statement in statements)
+    assert not any("SUM(" in statement for statement in statements)
+
+
+def test_runtime_history_counts_corpus_only_json_before_materialization(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _deployment(prepared_database)
+    payload = json.dumps(["x" * 4096])
+    connection = connect(prepared_database, row_factory=sqlite3.Row)
+    try:
+        fact_count = int(
+            connection.execute("SELECT COUNT(*) FROM player_map_facts").fetchone()[0]
+        )
+        assert fact_count > 1
+        connection.execute(
+            "UPDATE player_map_facts SET missing_fields_json=?",
+            (payload,),
+        )
+        connection.commit()
+        monkeypatch.setattr(
+            backtest_module,
+            "_dependency_fingerprint",
+            lambda *_args, **_kwargs: pytest.fail(
+                "oversized corpus-only JSON reached fingerprint materialization"
+            ),
+        )
+        monkeypatch.setattr(
+            backtest_module,
+            "_load_draft_corpus",
+            lambda *_args, **_kwargs: pytest.fail(
+                "oversized corpus-only JSON reached corpus materialization"
+            ),
+        )
+
+        with pytest.raises(
+            backtest_module.DraftDependencyLimitError,
+            match="byte limit",
+        ):
+            backtest_module.load_bounded_draft_snapshot(
+                connection,
+                availability_mode=backtest_module.AvailabilityMode.PROSPECTIVE,
+                assignment_version=PROSPECTIVE_ASSIGNMENT_VERSION,
+                max_rows=10**9,
+                max_bytes=len(payload.encode("utf-8")) * fact_count - 1,
+                max_value_bytes=1024 * 1024,
+            )
+    finally:
+        connection.close()
+
+
+def test_runtime_history_counts_unused_match_player_columns(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _deployment(prepared_database)
+    payload = "x" * 4096
+    connection = connect(prepared_database, row_factory=sqlite3.Row)
+    try:
+        player_count = int(
+            connection.execute("SELECT COUNT(*) FROM match_players").fetchone()[0]
+        )
+        assert player_count > 1
+        connection.execute("UPDATE match_players SET kills=?", (payload,))
+        connection.commit()
+        monkeypatch.setattr(
+            backtest_module,
+            "_dependency_fingerprint",
+            lambda *_args, **_kwargs: pytest.fail(
+                "oversized unused player columns reached fingerprint materialization"
+            ),
+        )
+        monkeypatch.setattr(
+            backtest_module,
+            "_load_draft_corpus",
+            lambda *_args, **_kwargs: pytest.fail(
+                "oversized unused player columns reached corpus materialization"
+            ),
+        )
+
+        with pytest.raises(
+            backtest_module.DraftDependencyLimitError,
+            match="byte limit",
+        ):
+            backtest_module.load_bounded_draft_snapshot(
+                connection,
+                availability_mode=backtest_module.AvailabilityMode.PROSPECTIVE,
+                assignment_version=PROSPECTIVE_ASSIGNMENT_VERSION,
+                max_rows=10**9,
+                max_bytes=len(payload.encode("utf-8")) * player_count - 1,
+                max_value_bytes=1024 * 1024,
+            )
+    finally:
+        connection.close()
+
+
 def test_explicit_offline_rebuild_is_the_only_runtime_build_path(
     prepared_database: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     built: list[Path] = []
     deployment = SimpleNamespace(deployment_key="offline-deployment")
@@ -524,6 +839,14 @@ def test_explicit_offline_rebuild_is_the_only_runtime_build_path(
 
     assert result == 0
     assert built == [prepared_database]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok",
+        "phase": "offline_rebuild_complete",
+        "deployment_key": "offline-deployment",
+        "supervisor_argument": (
+            "--draft-deployment-key offline-deployment"
+        ),
+    }
     with LiveBettingStore(prepared_database) as store:
         health = store.connection.execute(
             "SELECT status, last_error, details_json FROM service_health "
@@ -801,8 +1124,8 @@ def test_runtime_publisher_records_stable_deployment_failures(
 ) -> None:
     monkeypatch.setattr(
         draft_publisher_module,
-        "load_latest_frozen_deployment",
-        lambda _connection: (_ for _ in ()).throw(load_error),
+        "load_pinned_frozen_deployment",
+        lambda _connection, *, deployment_key: (_ for _ in ()).throw(load_error),
     )
     monkeypatch.setattr(
         draft_publisher_module,
@@ -817,6 +1140,7 @@ def test_runtime_publisher_records_stable_deployment_failures(
         once=True,
         interval_seconds=0.01,
         rebuild_artifacts=False,
+        deployment_key="0" * 64,
         history_timeout_seconds=0.1,
     )
 
@@ -846,8 +1170,8 @@ def test_runtime_publisher_success_never_recalibrates(
     )
     monkeypatch.setattr(
         draft_publisher_module,
-        "load_latest_frozen_deployment",
-        lambda _connection: deployment,
+        "load_pinned_frozen_deployment",
+        lambda _connection, *, deployment_key: deployment,
     )
     monkeypatch.setattr(
         draft_publisher_module,
@@ -880,6 +1204,7 @@ def test_runtime_publisher_success_never_recalibrates(
         once=True,
         interval_seconds=0.01,
         rebuild_artifacts=False,
+        deployment_key="0" * 64,
         history_timeout_seconds=0.1,
     )
 
@@ -902,6 +1227,97 @@ def test_runtime_publisher_success_never_recalibrates(
             details["process_created_at"],
         )
     )
+    assert details["history_dependency_revision"] == 1
+    assert details["history_refreshed"] is False
+
+
+def test_runtime_refresh_reloads_post_cutoff_history_and_keeps_pin(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    history = draft_publisher_module._load_history_with_timeout(
+        prepared_database,
+        timeout_seconds=10,
+    )
+    with LiveBettingStore(prepared_database) as store:
+        next_revision = _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF + timedelta(seconds=1),
+        )
+
+    loaded, refreshed = draft_publisher_module._refresh_dependency_inputs(
+        prepared_database,
+        deployment,
+        history,
+        now=CUTOFF + timedelta(seconds=2),
+    )
+
+    assert loaded is deployment
+    assert loaded.deployment_key == deployment.deployment_key
+    assert refreshed is not history
+    assert refreshed.dependency_revision == next_revision
+
+
+def test_runtime_refresh_rejects_pre_cutoff_revision(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    history = draft_publisher_module._load_history_with_timeout(
+        prepared_database,
+        timeout_seconds=10,
+    )
+    with LiveBettingStore(prepared_database) as store:
+        _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF - timedelta(seconds=1),
+        )
+
+    with pytest.raises(ValueError, match="changed_before_cutoff"):
+        draft_publisher_module._refresh_dependency_inputs(
+            prepared_database,
+            deployment,
+            history,
+            now=CUTOFF + timedelta(seconds=2),
+        )
+
+
+def test_runtime_refresh_rejects_revision_race(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    history = draft_publisher_module._load_history_with_timeout(
+        prepared_database,
+        timeout_seconds=10,
+    )
+    with LiveBettingStore(prepared_database) as store:
+        _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF + timedelta(seconds=1),
+        )
+    real_load = draft_publisher_module._load_history_with_timeout
+
+    def race(database: Path, *, timeout_seconds: float):
+        snapshot = real_load(database, timeout_seconds=timeout_seconds)
+        with LiveBettingStore(database) as store:
+            _record_dependency_change(
+                store.connection,
+                affected_from=CUTOFF + timedelta(seconds=2),
+            )
+        return snapshot
+
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_load_history_with_timeout",
+        race,
+    )
+    with pytest.raises(ValueError, match="changed during runtime refresh"):
+        draft_publisher_module._refresh_dependency_inputs(
+            prepared_database,
+            deployment,
+            history,
+            now=CUTOFF + timedelta(seconds=3),
+        )
 
 
 def _insert_anchor(store: LiveBettingStore, *, captured_at: datetime = CUTOFF) -> None:
@@ -951,6 +1367,35 @@ def _insert_event(connection: sqlite3.Connection) -> None:
             (CUTOFF - timedelta(days=2)).isoformat(),
         ),
     )
+
+
+def _insert_future_event(connection: sqlite3.Connection) -> None:
+    source = connection.execute(
+        "SELECT * FROM event_registry WHERE event_id='event-1'"
+    ).fetchone()
+    assert source is not None
+    payload = dict(source)
+    payload.update(
+        {
+            "event_id": "event-2",
+            "canonical_name": "Future Event",
+            "main_event_start_at": (CUTOFF + timedelta(days=10)).isoformat(),
+            "main_event_end_at": (CUTOFF + timedelta(days=11)).isoformat(),
+            "opendota_league_id": 1000,
+            "created_at": (CUTOFF + timedelta(days=2)).isoformat(),
+            "updated_at": (CUTOFF + timedelta(days=2)).isoformat(),
+        }
+    )
+    columns = tuple(payload)
+    connection.execute(
+        "INSERT INTO event_registry ("
+        + ",".join(columns)
+        + ") VALUES ("
+        + ",".join("?" for _ in columns)
+        + ")",
+        tuple(payload[column] for column in columns),
+    )
+    connection.commit()
 
 
 def _insert_prospective_history(connection: sqlite3.Connection) -> None:
@@ -1570,6 +2015,274 @@ def test_frozen_deployment_round_trip_is_complete_and_immutable(
             load_latest_frozen_deployment(store.connection)
 
 
+@pytest.mark.parametrize("old_key", ("", "A" * 64, "a" * 63))
+def test_audited_rebase_requires_exact_lowercase_old_key_without_writes(
+    prepared_database: Path,
+    old_key: str,
+) -> None:
+    with LiveBettingStore(prepared_database) as store:
+        before = store.connection.execute(
+            "SELECT COUNT(*) FROM draft_deployment_bundles"
+        ).fetchone()[0]
+
+        with pytest.raises(ValueError, match="lowercase SHA-256"):
+            draft_publisher_module.audited_rebase_frozen_deployment(
+                store.connection,
+                old_deployment_key=old_key,
+                created_at=CUTOFF + timedelta(seconds=1),
+            )
+
+        assert not store.connection.in_transaction
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM draft_deployment_bundles"
+        ).fetchone()[0] == before
+
+
+def test_audited_rebase_rejects_model_replay_mismatch_without_writes(
+    prepared_database: Path,
+) -> None:
+    original = _deployment(prepared_database)
+    forged = _forged_corpus_deployment(original, horizon_minutes=10)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            original,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_deployment_without_replay(
+            store.connection,
+            forged,
+            created_at=CUTOFF + timedelta(seconds=2),
+        )
+        before = (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_deployment_bundles"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_model_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_calibration_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT artifact_revision FROM draft_deployment_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0],
+        )
+
+        with pytest.raises(ValueError, match="authoritative database corpus"):
+            draft_publisher_module.audited_rebase_frozen_deployment(
+                store.connection,
+                old_deployment_key=forged.deployment_key,
+                created_at=CUTOFF + timedelta(seconds=3),
+            )
+
+        after = (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_deployment_bundles"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_model_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_calibration_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT artifact_revision FROM draft_deployment_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0],
+        )
+        assert after == before
+        assert not store.connection.in_transaction
+
+
+def test_audited_rebase_reuses_exact_artifacts_for_stale_old_lineage(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = _deployment(prepared_database)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("audited rebase entered a deployment build path")
+
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "build_frozen_draft_deployment",
+        forbidden,
+    )
+    monkeypatch.setattr(draft_publisher_module, "_build_and_persist", forbidden)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            original,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        old_fingerprint = original.dependency_fingerprint
+        old_revision = original.dependency_revision
+        _insert_future_event(store.connection)
+        _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF - timedelta(seconds=1),
+        )
+        current_fingerprint = draft_dependency_fingerprint(store.connection)
+        current_revision = int(
+            store.connection.execute(
+                "SELECT dependency_revision FROM draft_lineage_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0]
+        )
+        assert current_fingerprint != old_fingerprint
+        assert current_revision > old_revision
+        with pytest.raises(
+            ValueError,
+            match="draft_dependencies_changed_before_cutoff",
+        ):
+            load_frozen_deployment(
+                store.connection,
+                deployment_key=original.deployment_key,
+            )
+
+        rebased, inserted = (
+            draft_publisher_module.audited_rebase_frozen_deployment(
+                store.connection,
+                old_deployment_key=original.deployment_key,
+                created_at=CUTOFF + timedelta(days=20),
+            )
+        )
+
+        assert inserted
+        assert rebased.deployment_key != original.deployment_key
+        assert rebased.training_cutoff == original.training_cutoff
+        assert rebased.dependency_fingerprint == current_fingerprint
+        assert rebased.dependency_revision == current_revision
+        assert {
+            row.horizon_minutes: row.model_hash for row in rebased.models
+        } == {
+            row.horizon_minutes: row.model_hash for row in original.models
+        }
+        assert {
+            row.horizon_minutes: row.calibration_hash
+            for row in rebased.calibrations
+        } == {
+            row.horizon_minutes: row.calibration_hash
+            for row in original.calibrations
+        }
+        assert load_pinned_frozen_deployment(
+            store.connection,
+            deployment_key=rebased.deployment_key,
+        ) == rebased
+
+        before = (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_deployment_bundles"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_model_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_calibration_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT artifact_revision FROM draft_deployment_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0],
+        )
+        repeated, repeated_inserted = (
+            draft_publisher_module.audited_rebase_frozen_deployment(
+                store.connection,
+                old_deployment_key=original.deployment_key,
+                created_at=CUTOFF + timedelta(days=20, seconds=1),
+            )
+        )
+        after = (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_deployment_bundles"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_model_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT COUNT(*) FROM draft_calibration_artifacts"
+            ).fetchone()[0],
+            store.connection.execute(
+                "SELECT artifact_revision FROM draft_deployment_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0],
+        )
+        assert repeated == rebased
+        assert not repeated_inserted
+        assert after == before
+
+
+def test_audited_rebase_cli_prints_exact_keys_and_supervisor_pin(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old_key = "a" * 64
+    new_key = "b" * 64
+    calls: list[tuple[str, datetime]] = []
+
+    def rebase(
+        _connection: sqlite3.Connection,
+        *,
+        old_deployment_key: str,
+        created_at: datetime,
+    ) -> tuple[SimpleNamespace, bool]:
+        calls.append((old_deployment_key, created_at))
+        return SimpleNamespace(deployment_key=new_key), True
+
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "audited_rebase_frozen_deployment",
+        rebase,
+    )
+
+    result = draft_publisher_module._run_publisher_locked(
+        prepared_database,
+        once=True,
+        interval_seconds=0.01,
+        rebuild_artifacts=False,
+        rebase_deployment_key=old_key,
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0][0] == old_key
+    assert calls[0][1].tzinfo is not None
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok",
+        "phase": "audited_rebase_complete",
+        "old_deployment_key": old_key,
+        "new_deployment_key": new_key,
+        "inserted": True,
+        "supervisor_argument": "--draft-deployment-key " + new_key,
+    }
+
+
+@pytest.mark.parametrize("old_key", ("invalid", "A" * 64))
+def test_audited_rebase_cli_rejects_invalid_old_key_before_database_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old_key: str,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "draft_publisher.py",
+            "--database",
+            str(tmp_path / "missing.db"),
+            "--once",
+            "--rebase-deployment-key",
+            old_key,
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        draft_publisher_module.main()
+
+
 @pytest.mark.parametrize("horizon_minutes", (40, 50))
 def test_persist_rejects_resigned_forged_training_corpus_for_long_horizon(
     prepared_database: Path,
@@ -1619,6 +2332,158 @@ def test_specific_loader_rejects_self_consistent_forged_corpus_bundle(
             )
 
 
+def test_runtime_pinned_loader_ignores_forged_latest_without_database_replay(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    forged = _forged_corpus_deployment(deployment, horizon_minutes=10)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _insert_deployment_without_replay(
+            store.connection,
+            forged,
+            created_at=CUTOFF + timedelta(seconds=2),
+        )
+        monkeypatch.setattr(
+            draft_publisher_module,
+            "assert_draft_models_match_database",
+            lambda *_args, **_kwargs: pytest.fail(
+                "runtime pinned loader replayed the database corpus"
+            ),
+        )
+
+        loaded = load_pinned_frozen_deployment(
+            store.connection,
+            deployment_key=deployment.deployment_key,
+        )
+
+    assert loaded == deployment
+
+
+def test_runtime_pinned_loader_rejects_missing_or_invalid_pin(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        assert load_pinned_frozen_deployment(
+            store.connection,
+            deployment_key="0" * 64,
+        ) is None
+        with pytest.raises(ValueError, match="lowercase SHA-256"):
+            load_pinned_frozen_deployment(
+                store.connection,
+                deployment_key=deployment.deployment_key.upper(),
+            )
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "expected"),
+    [
+        ("MAX_RUNTIME_ARTIFACT_BYTES", "runtime size limit"),
+        ("MAX_RUNTIME_ARTIFACT_ROWS", "runtime row limit"),
+    ],
+)
+def test_runtime_pinned_loader_enforces_artifact_limits(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    expected: str,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        monkeypatch.setattr(draft_publisher_module, limit_name, 1)
+        with pytest.raises(ValueError, match=expected):
+            load_pinned_frozen_deployment(
+                store.connection,
+                deployment_key=deployment.deployment_key,
+            )
+
+
+def test_runtime_pinned_loader_rejects_pre_cutoff_lineage_change(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF - timedelta(seconds=1),
+        )
+        with pytest.raises(
+            ValueError,
+            match="draft_dependencies_changed_before_cutoff",
+        ):
+            load_pinned_frozen_deployment(
+                store.connection,
+                deployment_key=deployment.deployment_key,
+            )
+
+
+@pytest.mark.parametrize(
+    "changed_query",
+    (
+        "PRAGMA data_version",
+        "SELECT artifact_revision FROM draft_deployment_revisions",
+        "SELECT dependency_revision FROM draft_lineage_revisions",
+    ),
+)
+def test_runtime_pinned_loader_rejects_generation_race(
+    prepared_database: Path,
+    changed_query: str,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+
+        class RacingConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self.connection = connection
+
+            def __getattr__(self, name: str):
+                return getattr(self.connection, name)
+
+            @property
+            def in_transaction(self) -> bool:
+                return self.connection.in_transaction
+
+            def execute(self, sql: str, params: tuple[object, ...] = ()):
+                if (
+                    changed_query in sql
+                    and not self.connection.in_transaction
+                ):
+                    return SimpleNamespace(fetchone=lambda: (999,))
+                return self.connection.execute(sql, params)
+
+        with pytest.raises(ValueError, match="changed during runtime load"):
+            load_pinned_frozen_deployment(
+                RacingConnection(store.connection),  # type: ignore[arg-type]
+                deployment_key=deployment.deployment_key,
+            )
+
+
 def test_live_curve_rejects_self_consistent_forged_corpus_bundle(
     prepared_database: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1650,7 +2515,7 @@ def test_live_curve_rejects_self_consistent_forged_corpus_bundle(
         report = publish_cycle(
             store.connection,
             deployment=forged,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 forged.dependency_revision,
                 forged.dependency_fingerprint,
                 history,
@@ -1723,7 +2588,7 @@ def test_legacy_model_is_rejected_by_persist_sql_load_and_live_curve(
         report = publish_cycle(
             store.connection,
             deployment=legacy,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 legacy.dependency_revision,
                 legacy.dependency_fingerprint,
                 history,
@@ -1968,7 +2833,7 @@ def test_publisher_rejects_caller_supplied_history_subset(
             now=CUTOFF + timedelta(seconds=3),
         )
         assert result.inserted == 0
-        assert result.results[0].reason == "draft_history:history_snapshot_mismatch"
+        assert result.results[0].reason == "draft_history:runtime_snapshot_untrusted"
         assert store.connection.execute(
             "SELECT COUNT(*) FROM prospective_draft_curves"
         ).fetchone()[0] == 0
@@ -1994,26 +2859,38 @@ def test_failed_reconstructed_gate_publishes_research_curve_but_no_order(
             created_at=CUTOFF + timedelta(seconds=1),
         )
         _insert_anchor(store, captured_at=CUTOFF + timedelta(seconds=2))
-        first = publish_cycle(
-            store.connection,
-            deployment=deployment,
-            history=ProspectiveHistorySnapshot(
-                dependency_revision=deployment.dependency_revision,
-                dependency_fingerprint=deployment.dependency_fingerprint,
-                maps=load_prospective_history(store.connection),
-            ),
-            now=CUTOFF + timedelta(seconds=3),
+        history = _runtime_history(
+            dependency_revision=deployment.dependency_revision,
+            dependency_fingerprint=deployment.dependency_fingerprint,
+            maps=load_prospective_history(store.connection),
         )
-        second = publish_cycle(
-            store.connection,
-            deployment=deployment,
-            history=ProspectiveHistorySnapshot(
-                dependency_revision=deployment.dependency_revision,
-                dependency_fingerprint=deployment.dependency_fingerprint,
-                maps=load_prospective_history(store.connection),
-            ),
-            now=CUTOFF + timedelta(seconds=4),
-        )
+        with monkeypatch.context() as cycle_guard:
+            cycle_guard.setattr(
+                backtest_module,
+                "draft_dependency_fingerprint",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "runtime cycle recalculated the full dependency fingerprint"
+                ),
+            )
+            cycle_guard.setattr(
+                backtest_module,
+                "load_draft_corpus",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "runtime cycle reloaded the full draft corpus"
+                ),
+            )
+            first = publish_cycle(
+                store.connection,
+                deployment=deployment,
+                history=history,
+                now=CUTOFF + timedelta(seconds=3),
+            )
+            second = publish_cycle(
+                store.connection,
+                deployment=deployment,
+                history=history,
+                now=CUTOFF + timedelta(seconds=4),
+            )
 
         assert (first.inserted, first.unchanged, first.skipped) == (1, 0, 0)
         assert (second.inserted, second.unchanged, second.skipped) == (0, 1, 0)
@@ -2250,7 +3127,7 @@ def test_delayed_publication_keeps_anchor_event_cutoff(
         report = publish_cycle(
             store.connection,
             deployment=deployment,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 deployment.dependency_revision,
                 deployment.dependency_fingerprint,
                 history,
@@ -2292,7 +3169,7 @@ def test_deployment_created_after_anchor_cutoff_is_rejected(
             store.connection,
             anchor=anchor,
             deployment=deployment,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 deployment.dependency_revision,
                 deployment.dependency_fingerprint,
                 load_prospective_history(store.connection),
@@ -2344,7 +3221,7 @@ def test_mapping_accepted_after_anchor_cutoff_is_not_backfilled(
             store.connection,
             anchor=anchor,
             deployment=deployment,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 deployment.dependency_revision,
                 deployment.dependency_fingerprint,
                 load_prospective_history(store.connection),
@@ -2573,7 +3450,7 @@ def test_forged_confirmed_low_confidence_anchor_is_rejected(
         report = publish_cycle(
             store.connection,
             deployment=deployment,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 dependency_revision=deployment.dependency_revision,
                 dependency_fingerprint=deployment.dependency_fingerprint,
                 maps=load_prospective_history(store.connection),
@@ -2824,7 +3701,7 @@ def test_authoritative_prospective_artifact_can_enter_decision_gate(
             store.connection,
             anchor=anchor,
             deployment=prospective,
-            history=ProspectiveHistorySnapshot(
+            history=_runtime_history(
                 dependency_revision=prospective.dependency_revision,
                 dependency_fingerprint=prospective.dependency_fingerprint,
                 maps=history,
