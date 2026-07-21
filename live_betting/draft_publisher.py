@@ -925,6 +925,24 @@ def _runtime_deployment_generation(
     return int(data_version[0]), int(artifact[0]), int(dependency[0])
 
 
+def _runtime_pinned_deployment_generation(
+    connection: sqlite3.Connection,
+) -> tuple[int, int]:
+    artifact = connection.execute(
+        """SELECT artifact_revision FROM draft_deployment_revisions
+            WHERE singleton=1"""
+    ).fetchone()
+    dependency = connection.execute(
+        """SELECT dependency_revision FROM draft_lineage_revisions
+            WHERE singleton=1"""
+    ).fetchone()
+    if artifact is None or dependency is None:
+        raise _FrozenDeploymentLineageError(
+            "draft deployment runtime generation is unavailable"
+        )
+    return int(artifact[0]), int(dependency[0])
+
+
 def load_frozen_deployment(
     connection: sqlite3.Connection,
     *,
@@ -976,7 +994,7 @@ def load_pinned_frozen_deployment(
         raise RuntimeError("pinned deployment load requires a fresh connection")
     connection.execute("BEGIN")
     try:
-        loaded_generation = _runtime_deployment_generation(connection)
+        loaded_generation = _runtime_pinned_deployment_generation(connection)
         deployment = _load_frozen_deployment_snapshot(
             connection,
             deployment_key,
@@ -998,12 +1016,12 @@ def load_pinned_frozen_deployment(
             raise _FrozenDeploymentLineageError(
                 f"draft deployment lineage is stale: {reason}"
             )
-        if loaded_revision != loaded_generation[2]:
+        if loaded_revision != loaded_generation[1]:
             raise _FrozenDeploymentLineageError(
                 "draft deployment lineage changed during runtime load"
             )
         connection.commit()
-        if _runtime_deployment_generation(connection) != loaded_generation:
+        if _runtime_pinned_deployment_generation(connection) != loaded_generation:
             raise _FrozenDeploymentLineageError(
                 "draft deployment generation changed during runtime load"
             )

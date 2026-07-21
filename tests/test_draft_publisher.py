@@ -2441,7 +2441,6 @@ def test_runtime_pinned_loader_rejects_pre_cutoff_lineage_change(
 @pytest.mark.parametrize(
     "changed_query",
     (
-        "PRAGMA data_version",
         "SELECT artifact_revision FROM draft_deployment_revisions",
         "SELECT dependency_revision FROM draft_lineage_revisions",
     ),
@@ -2482,6 +2481,59 @@ def test_runtime_pinned_loader_rejects_generation_race(
                 RacingConnection(store.connection),  # type: ignore[arg-type]
                 deployment_key=deployment.deployment_key,
             )
+
+
+def test_runtime_pinned_loader_accepts_unrelated_database_commit(
+    prepared_database: Path,
+) -> None:
+    deployment = _deployment(prepared_database)
+    with LiveBettingStore(prepared_database) as store:
+        persist_frozen_deployment(
+            store.connection,
+            deployment,
+            created_at=CUTOFF + timedelta(seconds=1),
+        )
+        store.connection.execute(
+            "CREATE TABLE runtime_loader_unrelated_write (marker INTEGER)"
+        )
+        store.connection.commit()
+
+        class RacingConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self.connection = connection
+                self.committed_unrelated_write = False
+
+            def __getattr__(self, name: str):
+                return getattr(self.connection, name)
+
+            @property
+            def in_transaction(self) -> bool:
+                return self.connection.in_transaction
+
+            def commit(self) -> None:
+                self.connection.commit()
+                if self.committed_unrelated_write:
+                    return
+                self.committed_unrelated_write = True
+                writer = sqlite3.connect(prepared_database)
+                try:
+                    writer.execute(
+                        "INSERT INTO runtime_loader_unrelated_write VALUES (1)"
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+
+        assert (
+            load_pinned_frozen_deployment(
+                RacingConnection(store.connection),  # type: ignore[arg-type]
+                deployment_key=deployment.deployment_key,
+            )
+            == deployment
+        )
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM runtime_loader_unrelated_write"
+        ).fetchone()[0] == 1
 
 
 def test_live_curve_rejects_self_consistent_forged_corpus_bundle(
