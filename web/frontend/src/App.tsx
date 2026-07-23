@@ -751,21 +751,35 @@ export default function App() {
         </section>
       ) : view !== "intelligence" && snapshot && (
         <section className="summary-bar" aria-label="赛事与系统摘要">
-          <SummaryItem
-            label="滚球确认"
-            value={viewSummary?.live || 0}
-            tone="live"
-          />
-          <SummaryItem
-            label="数据降级"
-            value={viewSummary?.degraded || 0}
-            tone="warning"
-          />
-          <SummaryItem
-            label="即将开始"
-            value={viewSummary?.upcoming || 0}
-          />
-          <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
+          {view === "operations" ? (
+            <>
+              <SummaryItem label="数据降级赛事" value={snapshot.summary.degraded} tone="warning" />
+              <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
+              <SummaryItem
+                label="活动告警"
+                value={alertCount}
+                tone={alertCount > 0 ? "critical" : undefined}
+              />
+            </>
+          ) : (
+            <>
+              <SummaryItem
+                label="滚球确认"
+                value={viewSummary?.live || 0}
+                tone="live"
+              />
+              <SummaryItem
+                label="数据降级"
+                value={viewSummary?.degraded || 0}
+                tone="warning"
+              />
+              <SummaryItem
+                label="即将开始"
+                value={viewSummary?.upcoming || 0}
+              />
+              <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
+            </>
+          )}
           <span className="snapshot-time">快照 {new Date(snapshot.generated_at).toLocaleTimeString("zh-CN", { hour12: false })}</span>
         </section>
       )}

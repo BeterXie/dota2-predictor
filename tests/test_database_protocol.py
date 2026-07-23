@@ -1370,6 +1370,213 @@ def test_verify_prepared_database_rejects_check_constraint_drift(
         verify_prepared_database(database)
 
 
+def test_prepare_database_repairs_v9_shadow_order_stake_constraint(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live-v9-shadow-order-stake.db"
+    prepare_database(database, tmp_path / "initial-backups")
+    connection = connect(database, read_only=True)
+    try:
+        expected_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_xinfo(shadow_orders)")
+        }
+    finally:
+        connection.close()
+    assert len(expected_columns) == 61
+    _rewrite_table_definition(
+        database,
+        "shadow_orders",
+        "stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0)",
+        "stake REAL NOT NULL",
+    )
+    connection = connect(database)
+    try:
+        trigger_names = [
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master
+                     WHERE type='trigger' AND tbl_name='shadow_orders'"""
+            )
+        ]
+        for name in trigger_names:
+            connection.execute(f'DROP TRIGGER "{name}"')
+        connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, odds_id, market_key, signaled_at,
+                model_probability, market_probability, signal_price,
+                signal_transport_key, signal_transport_at, expires_at,
+                signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES ('preserved-order', 'match-1', 'odds-1',
+                       'winner|map_1|team_one|', '2026-07-22T00:00:00+00:00',
+                       0.6, 0.5, 2.0, 'transport-1',
+                       '2026-07-22T00:00:00+00:00',
+                       '2026-07-22T00:00:15+00:00', 'group-1', 'team_one',
+                       1, 0.5, 'pending')"""
+        )
+        connection.execute(
+            """CREATE TABLE application_order_refs (
+                   ref_key TEXT PRIMARY KEY,
+                   order_key TEXT NOT NULL REFERENCES shadow_orders(order_key)
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO application_order_refs VALUES ('ref-1', 'preserved-order')"
+        )
+        connection.execute("DELETE FROM live_schema_version")
+        connection.execute("INSERT INTO live_schema_version VALUES (9, 'v9')")
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = prepare_database(database, tmp_path / "migration-backups")
+
+    assert result.live_schema_version == LIVE_VERSION
+    verify_prepared_database(database)
+    connection = connect(database, read_only=True)
+    try:
+        checks = database_protocol._schema_contract(connection).checks["shadow_orders"]
+        assert "stake > 0.0 and stake <= 1.0" in checks
+        actual_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_xinfo(shadow_orders)")
+        }
+        assert actual_columns == expected_columns
+        assert connection.execute(
+            """SELECT 1 FROM sqlite_master
+                 WHERE type='trigger'
+                   AND name='strict_live_shadow_impact_after_insert'"""
+        ).fetchone() is not None
+        assert tuple(
+            connection.execute(
+                "SELECT order_key, stake FROM shadow_orders WHERE order_key=?",
+                ("preserved-order",),
+            ).fetchone()
+        ) == ("preserved-order", 0.5)
+        assert tuple(
+            connection.execute(
+                "SELECT ref_key, order_key FROM application_order_refs"
+            ).fetchone()
+        ) == ("ref-1", "preserved-order")
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_live_store_direct_init_rejects_shadow_order_stake_rebuild_before_ddl(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "direct-init-shadow-order-stake.db"
+    prepare_database(database, tmp_path / "initial-backups")
+    _rewrite_table_definition(
+        database,
+        "shadow_orders",
+        "stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0)",
+        "stake REAL NOT NULL",
+    )
+    connection = connect(database)
+    try:
+        trigger_names = [
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master
+                     WHERE type='trigger' AND tbl_name='shadow_orders'"""
+            )
+        ]
+        for name in trigger_names:
+            connection.execute(f'DROP TRIGGER "{name}"')
+        connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, odds_id, market_key, signaled_at,
+                model_probability, market_probability, signal_price,
+                signal_transport_key, signal_transport_at, expires_at,
+                signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES ('preserved-order', 'match-1', 'odds-1',
+                       'winner|map_1|team_one|', '2026-07-22T00:00:00+00:00',
+                       0.6, 0.5, 2.0, 'transport-1',
+                       '2026-07-22T00:00:00+00:00',
+                       '2026-07-22T00:00:15+00:00', 'group-1', 'team_one',
+                       1, 0.5, 'pending')"""
+        )
+        connection.execute(
+            """CREATE TABLE application_order_refs (
+                   ref_key TEXT PRIMARY KEY,
+                   order_key TEXT NOT NULL REFERENCES shadow_orders(order_key)
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO application_order_refs VALUES ('ref-1', 'preserved-order')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    before = _database_dump(database)
+
+    with LiveBettingStore(database) as store:
+        with pytest.raises(RuntimeError, match="migrated through prepare_database"):
+            store.init_schema()
+
+    assert _database_dump(database) == before
+    connection = connect(database, read_only=True)
+    try:
+        assert tuple(
+            connection.execute(
+                "SELECT ref_key, order_key FROM application_order_refs"
+            ).fetchone()
+        ) == ("ref-1", "preserved-order")
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_prepare_database_rejects_v9_shadow_order_invalid_stake(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live-v9-shadow-order-invalid-stake.db"
+    prepare_database(database, tmp_path / "initial-backups")
+    _rewrite_table_definition(
+        database,
+        "shadow_orders",
+        "stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0)",
+        "stake REAL NOT NULL",
+    )
+    connection = connect(database)
+    try:
+        trigger_names = [
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master
+                     WHERE type='trigger' AND tbl_name='shadow_orders'"""
+            )
+        ]
+        for name in trigger_names:
+            connection.execute(f'DROP TRIGGER "{name}"')
+        connection.execute(
+            """INSERT INTO shadow_orders
+               (order_key, raybet_match_id, odds_id, market_key, signaled_at,
+                model_probability, market_probability, signal_price,
+                signal_transport_key, signal_transport_at, expires_at,
+                signal_odds_group_id, signal_outcome_key,
+                signal_identity_verified, stake, status)
+               VALUES ('invalid-stake', 'match-1', 'odds-1',
+                       'winner|map_1|team_one|', '2026-07-22T00:00:00+00:00',
+                       0.6, 0.5, 2.0, 'transport-1',
+                       '2026-07-22T00:00:00+00:00',
+                       '2026-07-22T00:00:15+00:00', 'group-1', 'team_one',
+                       1, 1.5, 'pending')"""
+        )
+        connection.execute("DELETE FROM live_schema_version")
+        connection.execute("INSERT INTO live_schema_version VALUES (9, 'v9')")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="stake values violate"):
+        prepare_database(database, tmp_path / "migration-backups")
+
+
 @pytest.mark.parametrize(
     ("table", "old", "new"),
     (
@@ -1801,7 +2008,7 @@ def test_live_v8_migration_installs_bounded_monitor_candidate_state(
             for row in migrated.connection.execute(
                 "SELECT version FROM live_schema_version ORDER BY version"
             )
-        ] == [8, 9]
+        ] == [8, LIVE_VERSION]
         installed = {
             str(row[0])
             for row in migrated.connection.execute(

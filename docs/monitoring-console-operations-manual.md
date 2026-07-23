@@ -53,12 +53,35 @@ Set-Location ..\..
 
 ## 4. 启动与访问
 
-前台启动，适合查看日志：
+日常项目启动包含两个独立的常驻进程：Web 提供页面和只读 API，统一 supervisor
+托管后台 worker。两者必须指向同一个现有数据库，不能让任一进程回退到另一个默认库。
+
+在第一个 PowerShell 窗口启动 supervisor：
 
 ```powershell
 Set-Location C:\Users\59908\dota2-predictor
 $python = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
-& $python -m web.main
+$database = "<现有 dota2.db 的绝对路径>"
+$env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
+& $python scripts\run_dota_shadow_service.py --database $database
+```
+
+历史 Rosh worker 默认由这个 recurring supervisor 自动托管，不需要额外
+`--start-*` 参数。上面的无 flag 命令不会启动赔率采集、视觉、邮件或纸面策略，
+也不会触发真实下注。需要紧急停用历史 Rosh 时才增加
+`--disable-historical-rosh`。`--once`（包括 `--migrate --once`）不会启动该 worker，
+也不会发起历史 Rosh 网络请求。
+
+`STRATZ_API_TOKEN` 从 supervisor 环境继承到 worker；修改 Token 后必须重启
+supervisor。不要把 Token 写入命令参数、仓库或前端。
+
+在第二个 PowerShell 窗口启动 Web，适合查看日志：
+
+```powershell
+Set-Location C:\Users\59908\dota2-predictor
+$python = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
+$database = "<与 supervisor 完全相同的现有 dota2.db 绝对路径>"
+& $python -m web.main --database $database
 ```
 
 看到以下内容表示启动成功：
@@ -82,17 +105,18 @@ Invoke-RestMethod http://127.0.0.1:8000/api/monitor/bootstrap
 
 两项均应返回 HTTP `200`。
 
-## 5. 后台启动 Web 服务
+## 5. 后台启动 Web 与 supervisor
 
 ```powershell
 Set-Location C:\Users\59908\dota2-predictor
 $python = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
+$database = "<现有 dota2.db 的绝对路径>"
 $stdout = (Resolve-Path data).Path + "\web-monitor.stdout.log"
 $stderr = (Resolve-Path data).Path + "\web-monitor.stderr.log"
 
 $process = Start-Process `
   -FilePath $python `
-  -ArgumentList "-m", "web.main" `
+  -ArgumentList "-m", "web.main", "--database", $database `
   -WorkingDirectory (Get-Location).Path `
   -WindowStyle Hidden `
   -RedirectStandardOutput $stdout `
@@ -100,6 +124,26 @@ $process = Start-Process `
   -PassThru
 
 $process.Id
+```
+
+再以同一个 `$database` 启动 supervisor。先在当前 PowerShell 设置
+`STRATZ_API_TOKEN`，子进程会继承该环境变量：
+
+```powershell
+$env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
+$serviceStdout = (Resolve-Path data).Path + "\dota-shadow-service.stdout.log"
+$serviceStderr = (Resolve-Path data).Path + "\dota-shadow-service.stderr.log"
+
+$service = Start-Process `
+  -FilePath $python `
+  -ArgumentList "scripts\run_dota_shadow_service.py", "--database", $database `
+  -WorkingDirectory (Get-Location).Path `
+  -WindowStyle Hidden `
+  -RedirectStandardOutput $serviceStdout `
+  -RedirectStandardError $serviceStderr `
+  -PassThru
+
+$service.Id
 ```
 
 当前配置位于 `web/config.yaml`：
@@ -193,14 +237,18 @@ server:
 
 ## 9. 安全进程控制
 
-页面打开时会从本机控制 API 获取短期会话和 CSRF 令牌。右侧只显示四个固定进程：
+页面打开时会从本机控制 API 获取短期会话和 CSRF 令牌。右侧只显示五个固定进程：
 
 | 页面名称 | 固定命令 |
 |---|---|
 | 赔率采集 | `python -u -m live_betting.monitor --database data/dota2.db --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30` |
 | 纸面策略 | `python -u -m live_betting.shadow_monitor --database data/dota2.db --vision-jsonl data/live_betting/live_observations` |
 | 视觉监控 | `python -u scripts/supervise_raybet_streams.py --database data/dota2.db` |
+| 阵容预测发布器 | `python -u -m live_betting.draft_publisher --database data/dota2.db` |
 | 邮件投递 | `python -u scripts/run_notification_worker.py --database data/dota2.db` |
+
+历史 Rosh worker 不在 Web 控制 allowlist 中。它由统一 supervisor 自动托管，
+不能通过页面按钮启动、停止或替换命令。
 
 按钮说明：
 
@@ -434,12 +482,13 @@ python scripts\restore_database.py `
 
 推荐顺序：
 
-1. 页面停止邮件、纸面策略、视觉监控、赔率采集。
-2. 查找 Web PID。
-3. 停止 Web 服务。
-4. 更新代码或重新构建。
-5. 启动 Web 服务。
-6. 按需要逐项启动 worker。
+1. 页面停止邮件、阵容预测发布器、纸面策略、视觉监控、赔率采集。
+2. 停止统一 supervisor；这会同时停止默认历史 Rosh worker。
+3. 查找 Web PID。
+4. 停止 Web 服务。
+5. 更新代码或重新构建。
+6. 使用同一个现有数据库路径启动 supervisor 和 Web。
+7. 按需要逐项启动页面 allowlist 中的其他 worker。
 
 查找端口和 PID：
 

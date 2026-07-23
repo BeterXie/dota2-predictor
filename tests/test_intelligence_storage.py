@@ -30,6 +30,7 @@ EXPECTED_TABLES = {
     "player_role_assignments",
     "player_map_facts",
     "player_map_scores",
+    "historical_rosh_lineup_scores",
     "team_map_states",
     "team_style_profiles",
     "draft_model_runs",

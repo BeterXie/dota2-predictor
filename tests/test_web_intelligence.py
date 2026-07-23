@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -22,6 +23,7 @@ from event_intelligence.incremental import (
 from event_intelligence.player_scoring import score_version_for_role
 from event_intelligence.team_profiles import PROFILE_VERSION
 from event_intelligence.team_states import LABEL_VERSION
+from live_betting.stratz_rosh_client import ROSH_FORMULA_VERSION
 from web import queries
 from web.intelligence import MATCH_RATING_ROUNDING, MATCH_RATING_VERSION
 from web.routers.intelligence import router
@@ -208,6 +210,31 @@ CREATE TABLE draft_predictions (
 );
 """
 
+HISTORICAL_ROSH_SCHEMA = """
+CREATE TABLE historical_rosh_lineup_scores (
+    score_key TEXT PRIMARY KEY,
+    match_id INTEGER NOT NULL,
+    radiant_hero_ids_json TEXT NOT NULL,
+    dire_hero_ids_json TEXT NOT NULL,
+    radiant_player_ids_json TEXT NOT NULL,
+    dire_player_ids_json TEXT NOT NULL,
+    pure_lineup_score REAL NOT NULL,
+    current_player_adjusted_lineup_score REAL,
+    effective_lineup_score REAL NOT NULL,
+    scoring_mode TEXT NOT NULL,
+    player_coverage_count INTEGER NOT NULL,
+    source_name TEXT NOT NULL,
+    source_week INTEGER NOT NULL,
+    source_as_of TEXT NOT NULL,
+    player_stats_as_of TEXT,
+    formula_version TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    backtest_eligible INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
 
 def state_row(
     state_id: int,
@@ -284,6 +311,100 @@ class IntelligenceApiTests(unittest.TestCase):
         self.draft_lineage_patch.stop()
         self.db_patch.stop()
         self.directory.cleanup()
+
+    def _seed_historical_rosh_score(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.executescript(HISTORICAL_ROSH_SCHEMA)
+        connection.executemany(
+            """INSERT INTO match_players
+               (match_id, account_id, player_slot, hero_id, is_radiant, team_id)
+               VALUES (1, ?, ?, ?, ?, ?)""",
+            (
+                (103, 1, 3, 1, 10),
+                (104, 2, 4, 1, 10),
+                (105, 3, 5, 1, 10),
+                (106, 4, 6, 1, 10),
+                (107, 129, 7, 0, 20),
+                (108, 130, 8, 0, 20),
+                (109, 131, 9, 0, 20),
+                (110, 132, 10, 0, 20),
+            ),
+        )
+        pure_bucket = {
+            "minute": 60,
+            "time_start": 59,
+            "time_end": 60,
+            "advantage_side": "radiant",
+            "advantage_percent": 4.2,
+            "radiant_advantage": 4.2,
+            "dire_advantage": 0.0,
+            "match_percentage": 50.0,
+            "win_rate_graph": 4.2,
+            "hero_adjustment": 4.2,
+            "hero_base_adjustment": 4.2,
+            "hero_tempo_adjustment": 0.0,
+            "synergy_adjustment": 0.0,
+            "player_adjustment": 0.0,
+        }
+        adjusted_bucket = {
+            **pure_bucket,
+            "advantage_percent": 5.1,
+            "radiant_advantage": 5.1,
+            "win_rate_graph": 5.1,
+            "player_adjustment": 0.9,
+        }
+        evidence = {
+            "historical_match_id": 1,
+            "source": "stratz",
+            "formula_version": ROSH_FORMULA_VERSION,
+            "source_week": 1_774_099_200,
+            "source_as_of": "2026-03-20T12:00:00+00:00",
+            "player_stats_as_of": "2026-07-22T08:00:00+00:00",
+            "retrospective": True,
+            "current_player_adjustment_only": True,
+            "backtest_eligible": False,
+            "pure_minute_table": [pure_bucket],
+            "minute_table": [adjusted_bucket],
+            "score": {
+                "pure_lineup_score": 4.2,
+                "current_player_adjusted_lineup_score": 5.1,
+                "effective_lineup_score": 5.1,
+                "scoring_mode": "current_player_adjusted",
+                "player_coverage_count": 10,
+            },
+        }
+        evidence_json = json.dumps(
+            evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        self.historical_rosh_evidence_json = evidence_json
+        self.historical_rosh_evidence_hash = hashlib.sha256(
+            evidence_json.encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            """INSERT INTO historical_rosh_lineup_scores VALUES
+               (?, 1, ?, ?, ?, ?, 4.2, 5.1, 5.1,
+                'current_player_adjusted', 10, 'stratz', ?, ?, ?, ?,
+                ?, ?, 0, ?)""",
+            (
+                "a" * 64,
+                json.dumps([1, 3, 4, 5, 6], separators=(",", ":")),
+                json.dumps([2, 7, 8, 9, 10], separators=(",", ":")),
+                json.dumps([101, 103, 104, 105, 106], separators=(",", ":")),
+                json.dumps([102, 107, 108, 109, 110], separators=(",", ":")),
+                1_774_099_200,
+                "2026-03-20T12:00:00+00:00",
+                "2026-07-22T08:00:00+00:00",
+                ROSH_FORMULA_VERSION,
+                evidence_json,
+                self.historical_rosh_evidence_hash,
+                "2026-07-22T08:00:01+00:00",
+            ),
+        )
+        connection.commit()
+        connection.close()
 
     def _seed(self, connection: sqlite3.Connection) -> None:
         connection.execute(
@@ -745,8 +866,120 @@ class IntelligenceApiTests(unittest.TestCase):
         )
         self.assertNotIn("configuration_json", payload["draft_predictions"][0])
         self.assertEqual(
+            payload["rosh_lineup_score"],
+            {
+                "status": "missing",
+                "reason": "historical_rosh_lineup_score_missing",
+                "data": None,
+            },
+        )
+        self.assertEqual(
             self.client.get("/api/intelligence/matches/999").status_code, 404
         )
+
+    def test_match_detail_returns_only_identity_bound_current_rosh_score(self) -> None:
+        self._seed_historical_rosh_score()
+
+        payload = self.client.get("/api/intelligence/matches/1").json()
+
+        self.assertEqual(payload["versions"]["rosh_lineup"], ROSH_FORMULA_VERSION)
+        self.assertEqual(
+            payload["rosh_lineup_score"],
+            {
+                "status": "available",
+                "reason": "historical_rosh_lineup_score_available",
+                "data": {
+                    "pure_lineup_score": 4.2,
+                    "current_player_adjusted_lineup_score": 5.1,
+                    "effective_lineup_score": 5.1,
+                    "scoring_mode": "current_player_adjusted",
+                    "player_coverage_count": 10,
+                    "formula_version": ROSH_FORMULA_VERSION,
+                    "source_name": "stratz",
+                    "source_week": 1_774_099_200,
+                    "source_as_of": "2026-03-20T12:00:00+00:00",
+                    "player_stats_as_of": "2026-07-22T08:00:00+00:00",
+                    "backtest_eligible": False,
+                    "pure_minute_table": [
+                        {
+                            "minute": 60,
+                            "time_start": 59,
+                            "time_end": 60,
+                            "advantage_side": "radiant",
+                            "advantage_percent": 4.2,
+                            "radiant_advantage": 4.2,
+                            "dire_advantage": 0.0,
+                            "match_percentage": 50.0,
+                            "win_rate_graph": 4.2,
+                            "hero_adjustment": 4.2,
+                            "hero_base_adjustment": 4.2,
+                            "hero_tempo_adjustment": 0.0,
+                            "synergy_adjustment": 0.0,
+                            "player_adjustment": 0.0,
+                        }
+                    ],
+                    "current_player_adjusted_minute_table": [
+                        {
+                            "minute": 60,
+                            "time_start": 59,
+                            "time_end": 60,
+                            "advantage_side": "radiant",
+                            "advantage_percent": 5.1,
+                            "radiant_advantage": 5.1,
+                            "dire_advantage": 0.0,
+                            "match_percentage": 50.0,
+                            "win_rate_graph": 5.1,
+                            "hero_adjustment": 4.2,
+                            "hero_base_adjustment": 4.2,
+                            "hero_tempo_adjustment": 0.0,
+                            "synergy_adjustment": 0.0,
+                            "player_adjustment": 0.9,
+                        }
+                    ],
+                },
+            },
+        )
+
+        connection = sqlite3.connect(self.path)
+        tampered = json.loads(self.historical_rosh_evidence_json)
+        tampered["score"]["pure_lineup_score"] = 99.0
+        tampered_json = json.dumps(
+            tampered,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        connection.execute(
+            """UPDATE historical_rosh_lineup_scores
+                  SET evidence_json=?, evidence_hash=? WHERE score_key=?""",
+            (
+                tampered_json,
+                hashlib.sha256(tampered_json.encode("utf-8")).hexdigest(),
+                "a" * 64,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        tampered_payload = self.client.get("/api/intelligence/matches/1").json()
+        self.assertEqual(tampered_payload["rosh_lineup_score"]["status"], "missing")
+
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """UPDATE historical_rosh_lineup_scores
+                  SET evidence_json=?, evidence_hash=? WHERE score_key=?""",
+            (
+                self.historical_rosh_evidence_json,
+                self.historical_rosh_evidence_hash,
+                "a" * 64,
+            ),
+        )
+        connection.execute(
+            "UPDATE match_players SET account_id=999 WHERE match_id=1 AND player_slot=4"
+        )
+        connection.commit()
+        connection.close()
+        mismatched = self.client.get("/api/intelligence/matches/1").json()
+        self.assertEqual(mismatched["rosh_lineup_score"]["status"], "missing")
 
     def test_match_detail_exposes_delivery_versions_and_cutoff_contract(self) -> None:
         payload = self.client.get("/api/intelligence/matches/1").json()

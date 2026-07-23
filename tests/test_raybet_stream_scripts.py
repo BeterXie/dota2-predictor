@@ -42,15 +42,29 @@ from scripts.watch_raybet_stream import (
     _validate_stream_url,
     _write_evidence_frame,
     completion_check_due,
+    current_frame_comeback_state,
     current_frame_clock_fields,
+    allow_live_hud_tracking,
     match_is_complete,
     match_source,
     resolve_source,
     resolve_data_paths as resolve_watcher_data_paths,
 )
-from contracts.live_observation import LiveObservation
+from contracts.live_observation import ComebackState, LiveObservation
 from vision.map_state import ConfirmedClock
+from vision.scoreboard_reader import (
+    NetWorthAdvantageReading,
+    NetWorthAdvantageTracker,
+    ReplayGateReading,
+    ScoreboardReading,
+    ScoreboardTracker,
+)
+from vision.map_state import MapStateTracker
 from live_betting.storage import LiveBettingStore
+from live_betting.shadow_monitor import (
+    _bind_source_comeback_state,
+    _source_comeback_state_index,
+)
 from live_betting.service_coordination import (
     TerminationResult,
     WriterScanResult,
@@ -828,6 +842,114 @@ def test_unconfirmed_frame_never_refreshes_previous_clock_value() -> None:
     assert current_frame_clock_fields(None) == (None, None, 0.0)
 
 
+def test_comeback_state_requires_current_confirmed_hud_inputs() -> None:
+    clock = ConfirmedClock(1, 1_800, False, 0.96)
+    scoreboard = ScoreboardReading(18, 25, 0.95)
+    advantage = NetWorthAdvantageReading("dire", 5_000, 5_999, 0.94)
+
+    unavailable = current_frame_comeback_state(None, scoreboard, advantage)
+    assert unavailable.status == "unavailable"
+    assert unavailable.unavailable_reason == "hud_clock_unconfirmed"
+
+    unavailable = current_frame_comeback_state(clock, None, advantage)
+    assert unavailable.status == "unavailable"
+    assert unavailable.unavailable_reason == "hud_kill_score_unconfirmed"
+
+    unavailable = current_frame_comeback_state(clock, scoreboard, None)
+    assert unavailable.status == "unavailable"
+    assert unavailable.unavailable_reason == (
+        "hud_net_worth_advantage_unconfirmed"
+    )
+
+    available = current_frame_comeback_state(clock, scoreboard, advantage)
+    assert available.status == "available"
+    assert available.source == "vision_hud"
+    assert available.confidence == 0.94
+    assert available.radiant_kills == 18
+    assert available.dire_kills == 25
+    assert available.radiant_net_worth is None
+    assert available.dire_net_worth is None
+    assert available.net_worth_advantage_side == "dire"
+    assert available.net_worth_advantage_min == 5_000
+    assert available.net_worth_advantage_max == 5_999
+
+
+@pytest.mark.parametrize("status", ["replay", "untrusted"])
+def test_replay_gate_resets_all_live_hud_trackers(status: str) -> None:
+    clock_tracker = MapStateTracker()
+    clock_tracker.reset_map(2)
+    clock_tracker.last_seconds = 1_800
+    scoreboard_tracker = ScoreboardTracker()
+    scoreboard_tracker.update(ScoreboardReading(18, 25, 0.95))
+    advantage_tracker = NetWorthAdvantageTracker()
+    advantage_tracker.update(NetWorthAdvantageReading("dire", 5_000, 5_999, 0.95))
+
+    assert not allow_live_hud_tracking(
+        ReplayGateReading(status, 0.95),
+        map_number=2,
+        clock_tracker=clock_tracker,
+        scoreboard_tracker=scoreboard_tracker,
+        advantage_tracker=advantage_tracker,
+    )
+    assert clock_tracker.last_seconds is None
+    assert scoreboard_tracker.update(ScoreboardReading(18, 25, 0.95)) is None
+    assert (
+        advantage_tracker.update(
+            NetWorthAdvantageReading("dire", 5_000, 5_999, 0.95)
+        )
+        is None
+    )
+
+
+def test_jsonl_comeback_state_rebind_requires_exact_frame_identity(
+    tmp_path: Path,
+) -> None:
+    captured_at = datetime.now(timezone.utc)
+    state = visual_watcher.current_frame_comeback_state(
+        ConfirmedClock(1, 1_800, False, 0.96),
+        ScoreboardReading(18, 25, 0.95),
+        NetWorthAdvantageReading("dire", 5_000, 5_999, 0.94),
+    )
+    contract = LiveObservation(
+        raybet_match_id="42",
+        map_number=1,
+        captured_at_utc=captured_at,
+        source_frame_ref="vision-frame:source",
+        comeback_state=state,
+    )
+    path = tmp_path / "42.jsonl"
+    path.write_text(contract.model_dump_json() + "\n", encoding="utf-8")
+    stored = VisionObservation(
+        "42",
+        1,
+        captured_at,
+        None,
+        None,
+        (),
+        (),
+        0.0,
+        0.0,
+        "vision-frame:source",
+        "game",
+    )
+
+    states = _source_comeback_state_index(path)
+    rebound = _bind_source_comeback_state(stored, states)
+    mismatched = _bind_source_comeback_state(
+        VisionObservation(
+            **{
+                **stored.__dict__,
+                "source_frame_ref": "vision-frame:different",
+            }
+        ),
+        states,
+    )
+
+    assert rebound.comeback_state.is_available
+    assert rebound.comeback_state.radiant_kills == 18
+    assert not mismatched.comeback_state.is_available
+
+
 def test_confirmation_and_pause_changes_are_persisted_as_barriers() -> None:
     def row(clock: int | None, paused: bool | None) -> LiveObservation:
         return LiveObservation(
@@ -847,6 +969,19 @@ def test_confirmation_and_pause_changes_are_persisted_as_barriers() -> None:
     confirmed = row(600, False)
     assert _meaningful(confirmed, row(None, None))
     assert _meaningful(confirmed, row(600, True))
+
+    state_available = row(600, False)
+    state_available.comeback_state = ComebackState(
+        status="available",
+        source="vision_hud",
+        confidence=0.95,
+        radiant_kills=18,
+        dire_kills=25,
+        radiant_net_worth=42_000,
+        dire_net_worth=49_500,
+        unavailable_reason=None,
+    )
+    assert _meaningful(confirmed, state_available)
 
 
 def test_every_confirmed_observation_requires_persisted_frame_evidence() -> None:

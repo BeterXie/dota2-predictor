@@ -38,7 +38,11 @@ from live_betting.settlement import MapResult, settle
 from live_betting.storage import LiveBettingStore
 from live_betting.strategy import attempt_fill, make_order
 from live_betting.shadow_strategy import ComebackShadowStrategy
-from live_betting.vision import VisionObservation, parse_observation
+from live_betting.vision import (
+    VisionComebackState,
+    VisionObservation,
+    parse_observation,
+)
 from live_betting.vision_frame_registry import publish_vision_frame_bytes
 from tests.draft_authority_fixture import seed_test_draft_authority
 
@@ -581,7 +585,7 @@ class VisionContractTests(unittest.TestCase):
 
     def test_rejects_future_schema(self) -> None:
         with self.assertRaises(ValueError):
-            parse_observation({"schema_version": 3})
+            parse_observation({"schema_version": 5})
 
 
 class AlignmentTests(unittest.TestCase):
@@ -681,6 +685,19 @@ class ComebackStrategyTests(unittest.TestCase):
             "m", 1, at, 1800, paused,
             (1, 2, 3, 4, 5), (6, 7, 8, 9, 10),
             0.95, 0.95, "frame", "game", "team_one",
+            comeback_state=VisionComebackState(
+                "available",
+                "vision_hud",
+                0.95,
+                18,
+                14,
+                None,
+                None,
+                None,
+                net_worth_advantage_side="radiant",
+                net_worth_advantage_min=5_000,
+                net_worth_advantage_max=5_999,
+            ),
         )
 
     @staticmethod

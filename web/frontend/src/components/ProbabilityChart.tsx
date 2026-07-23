@@ -97,13 +97,13 @@ export function ProbabilityChart({
         left: 0,
         itemHeight: 3,
         itemWidth: 18,
-        textStyle: { color: "#aab3bd", fontFamily: "Segoe UI Variable" },
+        textStyle: { color: "#b8c2c9", fontFamily: "Segoe UI Variable", fontSize: 12 },
       },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "#171c22",
-        borderColor: "#39414a",
-        textStyle: { color: "#edf1f5", fontFamily: "Segoe UI Variable" },
+        backgroundColor: "#11171c",
+        borderColor: "#465560",
+        textStyle: { color: "#f1f5f7", fontFamily: "Segoe UI Variable", fontSize: 12 },
         formatter: (rawParams: unknown) => {
           const params = Array.isArray(rawParams) ? rawParams : [rawParams];
           const first = params[0] as { value?: [number, number] } | undefined;
@@ -123,9 +123,9 @@ export function ProbabilityChart({
       },
       xAxis: {
         type: "time",
-        axisLine: { lineStyle: { color: "#3b434d" } },
+        axisLine: { lineStyle: { color: "#465560" } },
         axisTick: { show: false },
-        axisLabel: { color: "#838e9a", hideOverlap: true },
+        axisLabel: { color: "#9ba8b1", fontSize: 11, hideOverlap: true },
         splitLine: { show: false },
       },
       yAxis: {
@@ -134,10 +134,11 @@ export function ProbabilityChart({
         max: 1,
         interval: 0.25,
         axisLabel: {
-          color: "#838e9a",
+          color: "#9ba8b1",
+          fontSize: 11,
           formatter: (value: number) => `${Math.round(value * 100)}%`,
         },
-        splitLine: { lineStyle: { color: "#2a3038", type: "dashed" } },
+        splitLine: { lineStyle: { color: "#2b363e", type: "dashed" } },
       },
       dataZoom: [
         { type: "inside", filterMode: "none" },
@@ -146,10 +147,10 @@ export function ProbabilityChart({
           height: 16,
           bottom: 10,
           borderColor: "transparent",
-          backgroundColor: "#20262d",
-          fillerColor: "rgba(91, 158, 203, 0.24)",
-          handleStyle: { color: "#5b9ecb", borderColor: "#5b9ecb" },
-          textStyle: { color: "#77828e" },
+          backgroundColor: "#172027",
+          fillerColor: "rgba(85, 199, 187, 0.2)",
+          handleStyle: { color: "#55c7bb", borderColor: "#55c7bb" },
+          textStyle: { color: "#87959f" },
         },
       ],
       series: [
@@ -160,8 +161,8 @@ export function ProbabilityChart({
           showSymbol: false,
           connectNulls: false,
           data: teamOneData,
-          lineStyle: { width: 2, color: "#69a7d0" },
-          itemStyle: { color: "#69a7d0" },
+          lineStyle: { width: 2, color: "#55c7bb" },
+          itemStyle: { color: "#55c7bb" },
         },
         {
           name: teamTwo || "队伍二",
@@ -170,8 +171,8 @@ export function ProbabilityChart({
           showSymbol: false,
           connectNulls: false,
           data: teamTwoData,
-          lineStyle: { width: 2, color: "#d77b69" },
-          itemStyle: { color: "#d77b69" },
+          lineStyle: { width: 2, color: "#ef8b79" },
+          itemStyle: { color: "#ef8b79" },
         },
         {
           name: "模型概率",

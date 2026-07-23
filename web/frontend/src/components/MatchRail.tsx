@@ -30,6 +30,7 @@ export function MatchRail({
   onLoadMore,
 }: MatchRailProps) {
   const [query, setQuery] = useState("");
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
     if (!normalized) return matches;
@@ -44,24 +45,36 @@ export function MatchRail({
   }, [matches, query]);
 
   return (
-    <aside className="match-rail" aria-label="赛事列表">
-      <div className="rail-header">
-        <div>
-          <h2>{mode === "history" ? "历史赛事" : "滚球赛事"}</h2>
-          <span>{matches.length} 场</span>
-        </div>
-        <Input
-          aria-label="搜索赛事"
-          className="match-search"
-          contentBefore={<MagnifyingGlass size={16} aria-hidden="true" />}
-          placeholder="队伍或赛事"
-          size="small"
-          value={query}
-          onChange={(_, data) => setQuery(data.value)}
-        />
-      </div>
+    <aside className={`match-rail${mobileExpanded ? " expanded" : ""}`} aria-label="赛事列表">
+        <button
+          aria-expanded={mobileExpanded}
+          className="mobile-rail-summary"
+          onClick={() => setMobileExpanded((current) => !current)}
+          type="button"
+        >
+          <span>{mode === "history" ? "选择历史赛事" : "切换滚球赛事"}</span>
+          <strong>{matches.find((item) => item.raybet_match_id === selectedId)?.team_one || "未选择"}</strong>
+          <span>VS</span>
+          <strong>{matches.find((item) => item.raybet_match_id === selectedId)?.team_two || "未选择"}</strong>
+        </button>
+        <div className="rail-body">
+          <div className="rail-header">
+            <div>
+              <h2>{mode === "history" ? "历史赛事" : "滚球赛事"}</h2>
+              <span>{matches.length} 场</span>
+            </div>
+            <Input
+              aria-label="搜索赛事"
+              className="match-search"
+              contentBefore={<MagnifyingGlass size={16} aria-hidden="true" />}
+              placeholder="队伍或赛事"
+              size="small"
+              value={query}
+              onChange={(_, data) => setQuery(data.value)}
+            />
+          </div>
 
-      <nav className="match-groups" aria-label="按状态分组的赛事">
+          <nav className="match-groups" aria-label="按状态分组的赛事">
         {lifecycleOrder.map((lifecycle) => {
           const group = filtered.filter((match) => match.lifecycle === lifecycle);
           if (!group.length) return null;
@@ -80,7 +93,10 @@ export function MatchRail({
                     <button
                       className={`match-row${selected ? " selected" : ""}`}
                       key={match.raybet_match_id}
-                      onClick={() => onSelect(match.raybet_match_id)}
+                      onClick={() => {
+                        onSelect(match.raybet_match_id);
+                        setMobileExpanded(false);
+                      }}
                       type="button"
                     >
                       <div className="match-row-meta">
@@ -129,7 +145,8 @@ export function MatchRail({
             {historyLoading ? "正在加载" : "加载更多"}
           </button>
         )}
-      </nav>
+          </nav>
+        </div>
     </aside>
   );
 }

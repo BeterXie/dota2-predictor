@@ -120,6 +120,28 @@ def _runtime_history(
     )
 
 
+def test_runtime_deployment_generation_tracks_only_draft_revisions(
+    prepared_database: Path,
+) -> None:
+    with LiveBettingStore(prepared_database) as store:
+        artifact_revision = int(
+            store.connection.execute(
+                "SELECT artifact_revision FROM draft_deployment_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0]
+        )
+        dependency_revision = int(
+            store.connection.execute(
+                "SELECT dependency_revision FROM draft_lineage_revisions "
+                "WHERE singleton=1"
+            ).fetchone()[0]
+        )
+
+        assert draft_publisher_module._runtime_deployment_generation(
+            store.connection
+        ) == (artifact_revision, dependency_revision)
+
+
 def test_runtime_history_capability_is_identity_bound_and_weak() -> None:
     history = _runtime_history(1, "a" * 64, ())
     equal_but_unbound = ProspectiveHistorySnapshot(1, "a" * 64, ())
@@ -681,6 +703,81 @@ def test_bounded_runtime_history_matches_full_small_fixture(
     assert actual.dependency_revision == expected_revision
     assert actual.dependency_fingerprint == expected_fingerprint
     assert actual.maps == expected_maps
+
+
+def test_runtime_history_load_accepts_unrelated_commit(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _deployment(prepared_database)
+    with sqlite3.connect(prepared_database) as writer:
+        writer.execute("CREATE TABLE history_load_unrelated (marker INTEGER)")
+    real_load = draft_publisher_module.load_bounded_prospective_history
+
+    def load_with_unrelated_commit(
+        connection: sqlite3.Connection,
+        **kwargs: object,
+    ):
+        loaded = real_load(connection, **kwargs)
+        with sqlite3.connect(prepared_database) as writer:
+            writer.execute("INSERT INTO history_load_unrelated VALUES (1)")
+        return loaded
+
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_bounded_prospective_history",
+        load_with_unrelated_commit,
+    )
+
+    history = draft_publisher_module._load_history_with_timeout(
+        prepared_database,
+        timeout_seconds=10,
+    )
+
+    assert history.dependency_revision >= 1
+    with sqlite3.connect(prepared_database) as reader:
+        assert reader.execute(
+            "SELECT COUNT(*) FROM history_load_unrelated"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "revision_update",
+    (
+        "UPDATE draft_deployment_revisions "
+        "SET artifact_revision=artifact_revision+1 WHERE singleton=1",
+        "UPDATE draft_lineage_revisions "
+        "SET dependency_revision=dependency_revision+1 WHERE singleton=1",
+    ),
+)
+def test_runtime_history_load_rejects_tracked_generation_race(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    revision_update: str,
+) -> None:
+    _deployment(prepared_database)
+    real_load = draft_publisher_module.load_bounded_prospective_history
+
+    def load_with_revision_race(
+        connection: sqlite3.Connection,
+        **kwargs: object,
+    ):
+        loaded = real_load(connection, **kwargs)
+        with sqlite3.connect(prepared_database) as writer:
+            writer.execute(revision_update)
+        return loaded
+
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "load_bounded_prospective_history",
+        load_with_revision_race,
+    )
+
+    with pytest.raises(ValueError, match="changed during runtime load"):
+        draft_publisher_module._load_history_with_timeout(
+            prepared_database,
+            timeout_seconds=10,
+        )
 
 
 def test_runtime_history_row_limit_finishes_count_phase_before_byte_phase(
@@ -1258,6 +1355,53 @@ def test_runtime_refresh_reloads_post_cutoff_history_and_keeps_pin(
     assert refreshed.dependency_revision == next_revision
 
 
+def test_runtime_refresh_accepts_unrelated_commit(
+    prepared_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(prepared_database)
+    history = draft_publisher_module._load_history_with_timeout(
+        prepared_database,
+        timeout_seconds=10,
+    )
+    with LiveBettingStore(prepared_database) as store:
+        next_revision = _record_dependency_change(
+            store.connection,
+            affected_from=CUTOFF + timedelta(seconds=1),
+        )
+        store.connection.execute(
+            "CREATE TABLE history_refresh_unrelated (marker INTEGER)"
+        )
+        store.connection.commit()
+    real_load = draft_publisher_module._load_history_with_timeout
+
+    def load_with_unrelated_commit(
+        database: Path,
+        *,
+        timeout_seconds: float,
+    ) -> ProspectiveHistorySnapshot:
+        loaded = real_load(database, timeout_seconds=timeout_seconds)
+        with sqlite3.connect(database) as writer:
+            writer.execute("INSERT INTO history_refresh_unrelated VALUES (1)")
+        return loaded
+
+    monkeypatch.setattr(
+        draft_publisher_module,
+        "_load_history_with_timeout",
+        load_with_unrelated_commit,
+    )
+
+    loaded, refreshed = draft_publisher_module._refresh_dependency_inputs(
+        prepared_database,
+        deployment,
+        history,
+        now=CUTOFF + timedelta(seconds=2),
+    )
+
+    assert loaded is deployment
+    assert refreshed.dependency_revision == next_revision
+
+
 def test_runtime_refresh_rejects_pre_cutoff_revision(
     prepared_database: Path,
 ) -> None:
@@ -1281,9 +1425,11 @@ def test_runtime_refresh_rejects_pre_cutoff_revision(
         )
 
 
+@pytest.mark.parametrize("revision_kind", ("artifact", "dependency"))
 def test_runtime_refresh_rejects_revision_race(
     prepared_database: Path,
     monkeypatch: pytest.MonkeyPatch,
+    revision_kind: str,
 ) -> None:
     deployment = _deployment(prepared_database)
     history = draft_publisher_module._load_history_with_timeout(
@@ -1300,10 +1446,17 @@ def test_runtime_refresh_rejects_revision_race(
     def race(database: Path, *, timeout_seconds: float):
         snapshot = real_load(database, timeout_seconds=timeout_seconds)
         with LiveBettingStore(database) as store:
-            _record_dependency_change(
-                store.connection,
-                affected_from=CUTOFF + timedelta(seconds=2),
-            )
+            if revision_kind == "dependency":
+                _record_dependency_change(
+                    store.connection,
+                    affected_from=CUTOFF + timedelta(seconds=2),
+                )
+            else:
+                store.connection.execute(
+                    "UPDATE draft_deployment_revisions "
+                    "SET artifact_revision=artifact_revision+1 WHERE singleton=1"
+                )
+                store.connection.commit()
         return snapshot
 
     monkeypatch.setattr(

@@ -15,6 +15,8 @@ from event_intelligence.ingest_adapters import SQLiteIngestAdapter
 from event_intelligence.raw_archive import RawArchive, canonical_json_bytes
 from event_intelligence.registry import EventRegistry
 from event_intelligence.storage import IntelligenceStorage
+from live_betting.comeback import STRATEGY_VERSION
+from live_betting.comeback_entry import decide_comeback_entry
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
 from live_betting.models import Market, OddsSnapshot
 from live_betting.postmatch_monitor import StoredMapResult
@@ -37,6 +39,83 @@ from tests.draft_authority_fixture import (
 
 
 NOW = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
+
+
+def v4_entry_inputs(
+    *,
+    game_clock_seconds: int,
+    underdog_price: float,
+    hud_confirmed: bool,
+    kill_deficit: int | None,
+    rosh_probability: float | None,
+    rosh_score: float | None,
+    underdog_side: str = "team_two",
+    radiant_team_side: str = "team_one",
+    exact_net_worth: bool = False,
+    net_worth_bucket: int = 5,
+    underdog_ahead: bool = False,
+) -> dict[str, object]:
+    state = None
+    if hud_confirmed:
+        assert kill_deficit is not None
+        underdog_kills = 10
+        opponent_kills = underdog_kills + kill_deficit
+        underdog_is_radiant = underdog_side == radiant_team_side
+        radiant_kills, dire_kills = (
+            (underdog_kills, opponent_kills)
+            if underdog_is_radiant
+            else (opponent_kills, underdog_kills)
+        )
+        radiant_net_worth = dire_net_worth = None
+        underdog_radiant_side = "radiant" if underdog_is_radiant else "dire"
+        opponent_radiant_side = "dire" if underdog_is_radiant else "radiant"
+        net_worth_advantage_side = (
+            underdog_radiant_side if underdog_ahead else opponent_radiant_side
+        )
+        net_worth_advantage_min = net_worth_bucket * 1_000
+        net_worth_advantage_max = net_worth_advantage_min + 999
+        if exact_net_worth:
+            radiant_net_worth, dire_net_worth = (
+                (40_000, 45_000) if underdog_is_radiant else (45_000, 40_000)
+            )
+            net_worth_advantage_side = None
+            net_worth_advantage_min = None
+            net_worth_advantage_max = None
+        state = {
+            "status": "available",
+            "source": "vision_hud",
+            "confidence": 0.96,
+            "radiant_kills": radiant_kills,
+            "dire_kills": dire_kills,
+            "radiant_net_worth": radiant_net_worth,
+            "dire_net_worth": dire_net_worth,
+            "net_worth_advantage_side": net_worth_advantage_side,
+            "net_worth_advantage_min": net_worth_advantage_min,
+            "net_worth_advantage_max": net_worth_advantage_max,
+            "unavailable_reason": None,
+        }
+    entry = decide_comeback_entry(
+        SimpleNamespace(
+            comeback_state=state,
+            screen_state="game",
+            game_clock_seconds=game_clock_seconds,
+            radiant_team_side=radiant_team_side,
+        ),
+        underdog_side=underdog_side,
+        rosh_underdog_probability=rosh_probability,
+    )
+    return {
+        **entry.as_inputs(),
+        "market": {
+            "underdog_side": underdog_side,
+            "underdog_price": underdog_price,
+        },
+        "vision": {
+            "game_clock_seconds": game_clock_seconds,
+            "radiant_team_side": radiant_team_side,
+        },
+        "rosh_lineup_score": {"selected_score": rosh_score},
+    }
 
 
 def live_odds_payload(
@@ -483,6 +562,10 @@ class LiveReportCohortTests(unittest.TestCase):
         settlement_review_required: bool = False,
         settlement_mapping_matches_order: bool = True,
         include_map_result: bool = True,
+        decision_eligible: bool = True,
+        decision_reason: str = "eligible",
+        extra_inputs: dict[str, object] | None = None,
+        underdog_side: str = "team_two",
     ) -> None:
         match_id = series_id or str(1_000_000 + index)
         order_key = f"order-{index}"
@@ -517,11 +600,12 @@ class LiveReportCohortTests(unittest.TestCase):
             horizon_minutes=30,
             label=f"live-report:{model_hash}",
         )
+        opposite_side = "team_one" if underdog_side == "team_two" else "team_two"
         signal_market = Market(
-            "winner", f"map_{map_number}", "team_two", None, "team_two", True
+            "winner", f"map_{map_number}", underdog_side, None, underdog_side, True
         )
         opposite_market = Market(
-            "winner", f"map_{map_number}", "team_one", None, "team_one", True
+            "winner", f"map_{map_number}", opposite_side, None, opposite_side, True
         )
         signal = OddsSnapshot(
             match_id,
@@ -564,7 +648,7 @@ class LiveReportCohortTests(unittest.TestCase):
             result = settlement_result
             if result == "review":
                 return_units = 0.0
-        winner_side = "team_two" if outcome else "team_one"
+        winner_side = underdog_side if outcome else opposite_side
         reconciliation_status = (
             "manual_review"
             if result == "review" or settlement_review_required
@@ -617,6 +701,17 @@ class LiveReportCohortTests(unittest.TestCase):
                 },
             },
         })
+        if extra_inputs is not None:
+            contribution_payload = json.loads(contributions)
+            persisted_inputs = contribution_payload["__inputs__"]
+            for name, value in extra_inputs.items():
+                if isinstance(value, dict) and isinstance(
+                    persisted_inputs.get(name), dict
+                ):
+                    persisted_inputs[name].update(value)
+                else:
+                    persisted_inputs[name] = value
+            contributions = json.dumps(contribution_payload)
         self.assertTrue(
             self.store.insert_decision(
                 SimpleNamespace(
@@ -624,13 +719,13 @@ class LiveReportCohortTests(unittest.TestCase):
                     raybet_match_id=match_id,
                     map_number=map_number,
                     decided_at=decided_at,
-                    underdog_side="team_two",
+                    underdog_side=underdog_side,
                     market_probability=market_probability,
                     model_probability=probability,
                     edge=probability - market_probability,
                     data_quality=coverage,
-                    eligible=True,
-                    reason="eligible",
+                    eligible=decision_eligible,
+                    reason=decision_reason,
                     contributions=json.loads(contributions),
                     input_ref=f"input-{index}",
                     strategy_version=strategy_version,
@@ -645,6 +740,8 @@ class LiveReportCohortTests(unittest.TestCase):
                 vision_transport_key=transport_key,
             )
         )
+        if not decision_eligible:
+            return
         authority_columns = (*_DRAFT_AUTHORITY_COLUMNS, *_VISION_AUTHORITY_COLUMNS)
         decision_authority = self.store.connection.execute(
             f"SELECT {', '.join(authority_columns)} FROM strategy_decisions "
@@ -673,7 +770,7 @@ class LiveReportCohortTests(unittest.TestCase):
                 signal_identity_verified, stake, status, fill_price, filled_at,
                 rejection_reason, {', '.join(authority_columns)})
                VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, 'team_two', 1, 1.0,
+                       ?, ?, ?, ?, ?, ?, 1, 1.0,
                        ?, ?, ?, ?,
                        {', '.join('?' for _ in authority_columns)})""",
             (
@@ -681,7 +778,7 @@ class LiveReportCohortTests(unittest.TestCase):
                 match_id,
                 strict_mapping_id,
                 f"odds-{index}",
-                f"winner|map_{map_number}|team_two|",
+                f"winner|map_{map_number}|{underdog_side}|",
                 decided_at.isoformat(),
                 probability,
                 market_probability,
@@ -690,6 +787,7 @@ class LiveReportCohortTests(unittest.TestCase):
                 decided_at.isoformat(),
                 (decided_at + timedelta(seconds=15)).isoformat(),
                 f"winner-group-{index}",
+                underdog_side,
                 order_status,
                 fill_price,
                 (
@@ -935,6 +1033,393 @@ class LiveReportCohortTests(unittest.TestCase):
             buckets["slippage_bucket"],
             {"adverse_1-3pct", "rejected_slippage"},
         )
+
+    def test_v4_forward_entry_metrics_are_complete_and_version_isolated(self) -> None:
+        samples = (
+            (101, True, "eligible", 30, 3.0, True, 4, 0.62, -12.0),
+            (102, False, "rosh_direction_opposes_underdog", 35, 5.0, True, 8, 0.45, 5.0),
+            (103, False, "vision_live_situation_missing", 25, 10.0, False, None, None, None),
+        )
+        for index, eligible, reason, minute, odds, hud, kills, rosh, score in samples:
+            self.insert_settled_order(
+                index,
+                strategy_version=STRATEGY_VERSION,
+                game_clock_seconds=minute * 60,
+                signal_price=odds,
+                decision_eligible=eligible,
+                decision_reason=reason,
+                extra_inputs=v4_entry_inputs(
+                    game_clock_seconds=minute * 60,
+                    underdog_price=odds,
+                    hud_confirmed=hud,
+                    kill_deficit=kills,
+                    rosh_probability=rosh,
+                    rosh_score=score,
+                ),
+            )
+        self.insert_settled_order(
+            104,
+            strategy_version="legacy-with-v4-shaped-inputs",
+            extra_inputs=v4_entry_inputs(
+                game_clock_seconds=30 * 60,
+                underdog_price=4.5,
+                hud_confirmed=True,
+                kill_deficit=5,
+                rosh_probability=0.7,
+                rosh_score=-20.0,
+            ),
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        metrics = report["forward_entry_by_strategy_version"][STRATEGY_VERSION]
+
+        self.assertEqual(report["eligible_decisions"], 2)
+        self.assertEqual(
+            {name: metrics[name] for name in (
+                "candidate_count", "hud_confirmed_count",
+                "controlled_deficit_count", "rosh_direction_pass_count",
+                "eligible_count",
+            )},
+            {
+                "candidate_count": 3,
+                "hud_confirmed_count": 2,
+                "controlled_deficit_count": 2,
+                "rosh_direction_pass_count": 1,
+                "eligible_count": 1,
+            },
+        )
+        self.assertEqual(metrics["rejection_reasons"], {
+            "rosh_direction_opposes_underdog": 1,
+            "vision_live_situation_missing": 1,
+        })
+        self.assertEqual(metrics["candidate_buckets"]["game_minute"], {
+            "20-29": 1, "30-39": 2,
+        })
+        self.assertEqual(metrics["candidate_buckets"]["kill_deficit"], {
+            "2-4": 1, "8-10": 1, "unknown": 1,
+        })
+        self.assertEqual(metrics["candidate_buckets"]["net_worth_deficit"], {
+            "underdog_deficit:5k": 2, "unknown": 1,
+        })
+        self.assertEqual(
+            metrics["candidate_buckets"]["rosh_underdog_probability"], {
+                "0.30-0.50": 1, "0.50-0.70": 1, "unknown": 1,
+            },
+        )
+        self.assertEqual(metrics["entry_evidence_invalid_count"], 0)
+        self.assertEqual(metrics["entry_evidence_invalid_reasons"], {})
+        self.assertEqual(
+            metrics["settled_performance"]["invalid_entry_order_count"], 0
+        )
+        self.assertEqual(
+            metrics["settled_performance"][
+                "invalid_entry_settled_order_count"
+            ],
+            0,
+        )
+        self.assertEqual(metrics["candidate_buckets"]["odds"], {
+            "2.50-3.99": 1, "4.00-5.99": 1, "9.00-12.00": 1,
+        })
+        settled = metrics["settled_performance"]
+        self.assertEqual(settled["cohort_count"], 1)
+        self.assertEqual(settled["settled_order_count"], 1)
+        self.assertEqual(
+            settled["cohorts"][0]["buckets"]["kill_deficit_bucket"][0]["bucket"],
+            "2-4",
+        )
+        self.assertEqual(
+            settled["cohorts"][0]["buckets"][
+                "net_worth_deficit_bucket"
+            ][0]["bucket"],
+            "underdog_deficit:5k",
+        )
+        self.assertEqual(
+            settled["cohorts"][0]["buckets"][
+                "rosh_underdog_probability_bucket"
+            ][0]["bucket"],
+            "0.50-0.70",
+        )
+        self.assertNotIn(
+            "legacy-with-v4-shaped-inputs",
+            report["forward_entry_by_strategy_version"],
+        )
+
+    def test_v4_rosh_buckets_are_normalized_to_underdog_direction(self) -> None:
+        for index, underdog_side, score in (
+            (105, "team_two", -12.0),
+            (106, "team_one", 12.0),
+        ):
+            self.insert_settled_order(
+                index,
+                strategy_version=STRATEGY_VERSION,
+                decision_eligible=True,
+                decision_reason="eligible",
+                underdog_side=underdog_side,
+                extra_inputs=v4_entry_inputs(
+                    game_clock_seconds=30 * 60,
+                    underdog_price=3.0,
+                    hud_confirmed=True,
+                    kill_deficit=4,
+                    rosh_probability=0.62,
+                    rosh_score=score,
+                    underdog_side=underdog_side,
+                    radiant_team_side="team_one",
+                ),
+            )
+        self.store.connection.commit()
+
+        metrics = build_report(self.store.connection)[
+            "forward_entry_by_strategy_version"
+        ][STRATEGY_VERSION]
+
+        self.assertEqual(
+            metrics["candidate_buckets"]["rosh_underdog_probability"],
+            {"0.50-0.70": 2},
+        )
+        settled = metrics["settled_performance"]
+        self.assertEqual(settled["settled_order_count"], 2)
+        bucket = settled["cohorts"][0]["buckets"][
+            "rosh_underdog_probability_bucket"
+        ][0]
+        self.assertEqual(
+            (bucket["bucket"], bucket["orders"], bucket["settled_orders"]),
+            ("0.50-0.70", 2, 2),
+        )
+
+    def test_v4_economy_buckets_are_normalized_to_underdog_direction(self) -> None:
+        for index, underdog_side, rosh_score in (
+            (110, "team_two", -12.0),
+            (111, "team_one", 12.0),
+        ):
+            self.insert_settled_order(
+                index,
+                strategy_version=STRATEGY_VERSION,
+                decision_eligible=True,
+                decision_reason="eligible",
+                underdog_side=underdog_side,
+                extra_inputs=v4_entry_inputs(
+                    game_clock_seconds=30 * 60,
+                    underdog_price=3.0,
+                    hud_confirmed=True,
+                    kill_deficit=4,
+                    rosh_probability=0.62,
+                    rosh_score=rosh_score,
+                    underdog_side=underdog_side,
+                    radiant_team_side="team_one",
+                    net_worth_bucket=5,
+                ),
+            )
+        self.insert_settled_order(
+            112,
+            strategy_version=STRATEGY_VERSION,
+            decision_eligible=False,
+            decision_reason="underdog_deficit_not_material",
+            underdog_side="team_one",
+            extra_inputs=v4_entry_inputs(
+                game_clock_seconds=30 * 60,
+                underdog_price=3.0,
+                hud_confirmed=True,
+                kill_deficit=4,
+                rosh_probability=0.62,
+                rosh_score=12.0,
+                underdog_side="team_one",
+                radiant_team_side="team_one",
+                net_worth_bucket=3,
+                underdog_ahead=True,
+            ),
+        )
+        self.store.connection.commit()
+
+        metrics = build_report(self.store.connection)[
+            "forward_entry_by_strategy_version"
+        ][STRATEGY_VERSION]
+
+        self.assertEqual(metrics["entry_evidence_invalid_count"], 0)
+        self.assertEqual(metrics["candidate_buckets"]["net_worth_deficit"], {
+            "underdog_ahead:3k": 1,
+            "underdog_deficit:5k": 2,
+        })
+        settled = metrics["settled_performance"]
+        self.assertEqual(settled["settled_order_count"], 2)
+        bucket = settled["cohorts"][0]["buckets"][
+            "net_worth_deficit_bucket"
+        ][0]
+        self.assertEqual(
+            (bucket["bucket"], bucket["orders"], bucket["settled_orders"]),
+            ("underdog_deficit:5k", 2, 2),
+        )
+
+    def test_v4_economy_bucket_policy_boundaries_are_fail_closed(self) -> None:
+        cases = (
+            (113, 0, False, "underdog_deficit_not_material", "underdog_deficit:<1k"),
+            (114, 1, True, "eligible", "underdog_deficit:1k"),
+            (115, 9, True, "eligible", "underdog_deficit:9k"),
+            (116, 10, False, "vision_situation_collapsed", "underdog_deficit:10k"),
+        )
+        for index, economy_bucket, eligible, reason, _label in cases:
+            with self.subTest(economy_bucket=economy_bucket):
+                self.insert_settled_order(
+                    index,
+                    strategy_version=STRATEGY_VERSION,
+                    decision_eligible=eligible,
+                    decision_reason=reason,
+                    extra_inputs=v4_entry_inputs(
+                        game_clock_seconds=30 * 60,
+                        underdog_price=3.0,
+                        hud_confirmed=True,
+                        kill_deficit=4,
+                        rosh_probability=0.62,
+                        rosh_score=-12.0,
+                        net_worth_bucket=economy_bucket,
+                    ),
+                )
+        self.store.connection.commit()
+
+        metrics = build_report(self.store.connection)[
+            "forward_entry_by_strategy_version"
+        ][STRATEGY_VERSION]
+
+        self.assertEqual(metrics["entry_evidence_count"], len(cases))
+        self.assertEqual(metrics["entry_evidence_invalid_count"], 0)
+        self.assertEqual(metrics["eligible_count"], 2)
+        self.assertEqual(metrics["rejection_reasons"], {
+            "underdog_deficit_not_material": 1,
+            "vision_situation_collapsed": 1,
+        })
+        self.assertEqual(metrics["candidate_buckets"]["net_worth_deficit"], {
+            label: 1 for *_values, label in cases
+        })
+        settled = metrics["settled_performance"]
+        self.assertEqual(settled["settled_order_count"], 2)
+        settled_buckets = {
+            row["bucket"]: row["settled_orders"]
+            for row in settled["cohorts"][0]["buckets"][
+                "net_worth_deficit_bucket"
+            ]
+        }
+        self.assertEqual(settled_buckets, {
+            "underdog_deficit:1k": 1,
+            "underdog_deficit:9k": 1,
+        })
+        self.assertNotIn("underdog_deficit:10k", settled_buckets)
+
+    def test_invalid_v4_entry_is_quarantined_from_funnel_and_settlement(self) -> None:
+        inputs = v4_entry_inputs(
+            game_clock_seconds=30 * 60,
+            underdog_price=3.0,
+            hud_confirmed=True,
+            kill_deficit=4,
+            rosh_probability=0.45,
+            rosh_score=5.0,
+        )
+        self.insert_settled_order(
+            107,
+            strategy_version=STRATEGY_VERSION,
+            decision_eligible=True,
+            decision_reason="eligible",
+            extra_inputs=inputs,
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        metrics = report[
+            "forward_entry_by_strategy_version"
+        ][STRATEGY_VERSION]
+
+        self.assertEqual(metrics["candidate_count"], 1)
+        self.assertEqual(metrics["entry_evidence_count"], 0)
+        self.assertEqual(metrics["entry_evidence_invalid_count"], 1)
+        self.assertEqual(metrics["entry_evidence_invalid_reasons"], {
+            "inconsistent_row_entry_decision": 1,
+        })
+        self.assertEqual(metrics["eligible_count"], 0)
+        self.assertEqual(report["eligible_decisions"], 0)
+        self.assertEqual(metrics["candidate_buckets"]["game_minute"], {
+            "unknown": 1,
+        })
+        self.assertEqual(metrics["candidate_buckets"]["net_worth_deficit"], {
+            "unknown": 1,
+        })
+        settled = metrics["settled_performance"]
+        self.assertEqual(settled["cohort_count"], 0)
+        self.assertEqual(settled["settled_order_count"], 0)
+        self.assertEqual(settled["invalid_entry_order_count"], 1)
+        self.assertEqual(settled["invalid_entry_settled_order_count"], 1)
+
+        cohort = report["evaluation_cohorts"][0]
+        self.assertFalse(cohort["identity_complete"])
+        self.assertIsNone(cohort["brier_score"])
+        for field in ("stake_units", "return_units", "pnl_units", "roi"):
+            self.assertIsNone(cohort["orders"][field])
+        self.assertEqual(report["orders"]["signals"], 0)
+        self.assertEqual(report["orders"]["settled"], 0)
+        self.assertEqual(report["settled_orders"], 0)
+        self.assertEqual(report["order_audit"]["scored_orders"], 0)
+        self.assertEqual(report["stability_status"], "descriptive_only")
+
+    def test_v4_final_strategy_rejection_can_follow_eligible_entry(self) -> None:
+        self.insert_settled_order(
+            108,
+            strategy_version=STRATEGY_VERSION,
+            decision_eligible=False,
+            decision_reason="edge_below_threshold",
+            extra_inputs=v4_entry_inputs(
+                game_clock_seconds=30 * 60,
+                underdog_price=3.0,
+                hud_confirmed=True,
+                kill_deficit=4,
+                rosh_probability=0.62,
+                rosh_score=-12.0,
+            ),
+        )
+        self.store.connection.commit()
+
+        metrics = build_report(self.store.connection)[
+            "forward_entry_by_strategy_version"
+        ][STRATEGY_VERSION]
+
+        self.assertEqual(metrics["entry_evidence_count"], 1)
+        self.assertEqual(metrics["entry_evidence_invalid_count"], 0)
+        self.assertEqual(metrics["entry_evidence_invalid_reasons"], {})
+        self.assertEqual(metrics["eligible_count"], 0)
+        self.assertEqual(metrics["rejection_reasons"], {
+            "edge_below_threshold": 1,
+        })
+        self.assertEqual(
+            metrics["settled_performance"]["invalid_entry_order_count"], 0
+        )
+
+    def test_v4_exact_net_worth_evidence_is_quarantined(self) -> None:
+        self.insert_settled_order(
+            109,
+            strategy_version=STRATEGY_VERSION,
+            decision_eligible=True,
+            decision_reason="eligible",
+            extra_inputs=v4_entry_inputs(
+                game_clock_seconds=30 * 60,
+                underdog_price=3.0,
+                hud_confirmed=True,
+                kill_deficit=4,
+                rosh_probability=0.62,
+                rosh_score=-12.0,
+                exact_net_worth=True,
+            ),
+        )
+        self.store.connection.commit()
+
+        report = build_report(self.store.connection)
+        metrics = report["forward_entry_by_strategy_version"][STRATEGY_VERSION]
+
+        self.assertEqual(metrics["entry_evidence_count"], 0)
+        self.assertEqual(metrics["entry_evidence_invalid_reasons"], {
+            "unsupported_exact_net_worth_evidence": 1,
+        })
+        self.assertEqual(metrics["eligible_count"], 0)
+        self.assertEqual(metrics["settled_performance"]["settled_order_count"], 0)
+        self.assertEqual(report["orders"]["signals"], 0)
+        self.assertEqual(report["settled_orders"], 0)
+        self.assertEqual(report["order_audit"]["scored_orders"], 0)
 
     def test_five_hundred_orders_from_one_event_cannot_claim_stability(self) -> None:
         for index in range(500):

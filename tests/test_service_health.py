@@ -66,6 +66,32 @@ NOW = datetime(2026, 7, 14, 2, 0, tzinfo=timezone.utc)
 DRAFT_DEPLOYMENT_KEY = "a" * 64
 
 
+class _MutableProcess:
+    def __init__(
+        self,
+        pid: int,
+        created_at: float,
+        descendants: list["_MutableProcess"] | None = None,
+    ) -> None:
+        self.pid = pid
+        self.created_at = created_at
+        self.descendants = descendants or []
+        self.running = True
+        self.status_value = "running"
+
+    def create_time(self) -> float:
+        return self.created_at
+
+    def children(self, recursive: bool = False) -> list["_MutableProcess"]:
+        return list(self.descendants)
+
+    def is_running(self) -> bool:
+        return self.running
+
+    def status(self) -> str:
+        return self.status_value
+
+
 def _terminate_fake_tree(process: object) -> TerminationResult:
     process.terminate()  # type: ignore[attr-defined]
     return TerminationResult(True)
@@ -96,6 +122,86 @@ class ServiceHealthTests(unittest.TestCase):
                 handle,
                 process_factory=lambda _pid: process,
             )
+
+    def test_subtree_capture_retries_a_descendant_that_exits_mid_read(self) -> None:
+        class Descendant:
+            pid = 991_201
+
+            @staticmethod
+            def is_running() -> bool:
+                raise psutil.NoSuchProcess(991_201)
+
+        class Process:
+            pid = 991_200
+
+            def __init__(self) -> None:
+                self.child_reads = 0
+
+            @staticmethod
+            def create_time() -> float:
+                return 20.0
+
+            def children(self, recursive: bool = False) -> list[object]:
+                self.child_reads += 1
+                return [Descendant()] if self.child_reads == 1 else []
+
+        process = Process()
+        handle = Mock(pid=process.pid)
+        handle.poll.return_value = None
+
+        self.assertEqual(
+            _capture_subprocess_tree_identities(
+                handle,
+                process_factory=lambda _pid: process,
+            ),
+            (ProcessIdentity(process.pid, 20.0),),
+        )
+
+    def test_subtree_capture_retries_nonrunning_and_zombie_descendants(
+        self,
+    ) -> None:
+        for mode in ("nonrunning", "zombie"):
+            with self.subTest(mode=mode):
+                class Descendant:
+                    pid = 991_301
+
+                    @staticmethod
+                    def is_running() -> bool:
+                        return mode != "nonrunning"
+
+                    @staticmethod
+                    def status() -> str:
+                        return psutil.STATUS_ZOMBIE if mode == "zombie" else "running"
+
+                    @staticmethod
+                    def create_time() -> float:
+                        return 31.0
+
+                class Process:
+                    pid = 991_300
+
+                    def __init__(self) -> None:
+                        self.child_reads = 0
+
+                    @staticmethod
+                    def create_time() -> float:
+                        return 30.0
+
+                    def children(self, recursive: bool = False) -> list[object]:
+                        self.child_reads += 1
+                        return [Descendant()] if self.child_reads == 1 else []
+
+                process = Process()
+                handle = Mock(pid=process.pid)
+                handle.poll.return_value = None
+
+                self.assertEqual(
+                    _capture_subprocess_tree_identities(
+                        handle,
+                        process_factory=lambda _pid: process,
+                    ),
+                    (ProcessIdentity(process.pid, 30.0),),
+                )
 
     def test_database_file_identity_rejects_hardlinks_and_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1106,6 +1212,123 @@ class ServiceHealthTests(unittest.TestCase):
             authority.__exit__.assert_not_called()
             self.assertEqual(restart_states["collector"], _ChildRestartState())
             spawn.assert_not_called()
+
+    def test_reconcile_allows_watcher_churn_before_publisher_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "publisher-watcher-churn.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            old_watcher = _MutableProcess(9012, 12.0)
+            new_watcher = _MutableProcess(9013, 13.0)
+            vision_root = _MutableProcess(9011, 11.0, [old_watcher])
+            vision = Mock(pid=vision_root.pid)
+            vision.poll.return_value = None
+            publisher = Mock(pid=9021)
+            publisher.poll.return_value = 1
+            publisher_authority = Mock()
+            publisher_authority.__exit__ = Mock(return_value=None)
+            publisher._dota2_manager_authority_context = publisher_authority
+            publisher._dota2_manager_authority_cleanup_error = None
+            replacement = Mock(pid=9022)
+            replacement.poll.return_value = None
+            replacement_authority = Mock()
+            replacement_authority.__enter__ = Mock(
+                return_value={"DOTA2_MANAGER_CHILD_AUTHORITY_V1": "marker"}
+            )
+            replacement_authority.__exit__ = Mock(return_value=None)
+            children = {"vision": vision, "draft_publisher": publisher}
+            commands = {
+                "vision": ["python", "vision.py"],
+                "draft_publisher": ["python", "publisher.py"],
+            }
+            states = {
+                "vision": _ChildRestartState(started_at=0.0),
+                "draft_publisher": _ChildRestartState(started_at=0.0),
+            }
+            clock = [10.0]
+            scan_count = 0
+            events: list[str] = []
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                nonlocal scan_count
+                scan_count += 1
+                events.append(f"scan:{scan_count}")
+                if scan_count == 1:
+                    vision_root.descendants.clear()
+                elif scan_count == 2:
+                    vision_root.descendants.append(new_watcher)
+                    return WriterScanResult(
+                        (ProcessIdentity(new_watcher.pid, new_watcher.created_at),),
+                        (),
+                    )
+                return WriterScanResult((), ())
+
+            def process_factory(pid: int) -> object:
+                if pid == vision_root.pid:
+                    return vision_root
+                if pid == new_watcher.pid:
+                    return new_watcher
+                raise psutil.NoSuchProcess(pid)
+
+            def gate(*args: object) -> TerminationResult:
+                return _replacement_authority_gate(
+                    *args,  # type: ignore[arg-type]
+                    process_factory=process_factory,
+                    writer_scanner=scan,
+                )
+
+            def spawn(*_: object, **__: object) -> object:
+                events.append("spawn")
+                return replacement
+
+            first = _reconcile_managed_children(
+                children,
+                commands,
+                database,
+                identity,
+                restart_states=states,
+                monotonic=lambda: clock[0],
+                authority_gate=gate,
+                popen_factory=spawn,
+            )
+
+            self.assertTrue(first.ok, first.detail)
+            self.assertEqual(states["draft_publisher"].next_restart_at, 11.0)
+            self.assertNotIn("spawn", events)
+
+            clock[0] = 11.0
+            with (
+                patch(
+                    "scripts.run_dota_shadow_service.manager_child_authority",
+                    return_value=replacement_authority,
+                ),
+                patch(
+                    "scripts.run_dota_shadow_service.bind_manager_child_authority",
+                    return_value=ProcessIdentity(replacement.pid, 14.0),
+                ),
+            ):
+                restarted = _reconcile_managed_children(
+                    children,
+                    commands,
+                    database,
+                    identity,
+                    restart_states=states,
+                    monotonic=lambda: clock[0],
+                    authority_gate=gate,
+                    popen_factory=spawn,
+                )
+
+            self.assertTrue(restarted.ok, restarted.detail)
+            self.assertIs(
+                children["draft_publisher"]._process_handle,  # type: ignore[attr-defined]
+                replacement,
+            )
+            self.assertEqual(events, ["scan:1", "scan:2", "scan:3", "scan:4", "spawn"])
 
     def test_exited_child_restarts_after_backoff_without_touching_peer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2268,6 +2491,10 @@ class ServiceHealthTests(unittest.TestCase):
                 observed_allowed.append(tuple(allowed_identities))
                 if not root.descendants:
                     root.descendants.append(worker)
+                    return WriterScanResult(
+                        (ProcessIdentity(worker.pid, worker.created_at),),
+                        (),
+                    )
                 return WriterScanResult((), ())
 
             result = _replacement_authority_gate(
@@ -2283,7 +2510,10 @@ class ServiceHealthTests(unittest.TestCase):
                 observed_allowed,
                 [
                     (ProcessIdentity(9201, 21.0),),
-                    (ProcessIdentity(9201, 21.0),),
+                    (
+                        ProcessIdentity(9201, 21.0),
+                        ProcessIdentity(9202, 22.0),
+                    ),
                 ],
             )
 
@@ -2333,7 +2563,7 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
 
-    def test_replacement_gate_rejects_direct_child_exit_during_scan(self) -> None:
+    def test_replacement_gate_rescans_a_direct_child_that_exits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "child-exit.db"
             database.write_bytes(b"sqlite")
@@ -2345,21 +2575,130 @@ class ServiceHealthTests(unittest.TestCase):
             process.children.return_value = []
             handle = Mock(pid=9401)
             handle.poll.return_value = None
+            exited = False
+            allowed_scans: list[tuple[ProcessIdentity, ...]] = []
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                nonlocal exited
+                allowed_scans.append(tuple(allowed_identities))
+                if not exited:
+                    exited = True
+                    handle.poll.return_value = 9
+                return WriterScanResult((), ())
+
+            def process_factory(_: int) -> object:
+                if exited:
+                    raise psutil.NoSuchProcess(handle.pid)
+                return process
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=process_factory,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok, result.detail)
+            self.assertEqual(
+                allowed_scans,
+                [(ProcessIdentity(9401, 41.0),), ()],
+            )
+
+    def test_replacement_gate_rejects_root_shrink_while_identity_is_alive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "live-root-shrink.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9411, 42.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
 
             def scan(_: Path, **__: object) -> WriterScanResult:
-                handle.poll.return_value = 9
+                handle.poll.return_value = 1
                 return WriterScanResult((), ())
 
             result = _replacement_authority_gate(
                 {"collector": handle},
                 database,
                 identity,
-                process_factory=lambda _: process,
+                process_factory=lambda _: root,
                 writer_scanner=scan,
             )
 
             self.assertFalse(result.ok)
             self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
+
+    def test_replacement_gate_rejects_live_root_demoted_to_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "demoted-root.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            first_root = _MutableProcess(9412, 42.1)
+            second_root = _MutableProcess(9413, 42.2)
+            first = Mock(pid=first_root.pid)
+            first.poll.return_value = None
+            second = Mock(pid=second_root.pid)
+            second.poll.return_value = None
+            children = {"collector": first, "vision": second}
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                children.pop("collector")
+                second_root.descendants.append(first_root)
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                children,
+                database,
+                identity,
+                process_factory=lambda pid: (
+                    first_root if pid == first_root.pid else second_root
+                ),
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
+
+    def test_replacement_gate_allows_root_shrink_after_pid_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "reused-root-shrink.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9421, 43.0)
+            reused = _MutableProcess(root.pid, 44.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            exited = False
+            scans = 0
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                nonlocal exited, scans
+                scans += 1
+                if scans == 1:
+                    exited = True
+                    handle.poll.return_value = 1
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: reused if exited else root,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok, result.detail)
+            self.assertEqual(scans, 2)
 
     def test_replacement_gate_rejects_root_identity_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2389,7 +2728,7 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.detail, "healthy_roots_changed_during_writer_gate")
 
-    def test_replacement_gate_rejects_descendant_disappearance_after_rescan(self) -> None:
+    def test_replacement_gate_rescans_a_descendant_that_exits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "descendant-toctou.db"
             database.write_bytes(b"sqlite")
@@ -2419,10 +2758,126 @@ class ServiceHealthTests(unittest.TestCase):
             root.descendants.append(worker)
             handle = Mock(pid=root.pid)
             handle.poll.return_value = None
+            exited = False
+            allowed_scans: list[tuple[ProcessIdentity, ...]] = []
+
+            def scan(
+                _: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                nonlocal exited
+                allowed_scans.append(tuple(allowed_identities))
+                if not exited:
+                    exited = True
+                    root.descendants.clear()
+                return WriterScanResult((), ())
+
+            def process_factory(pid: int) -> object:
+                if pid == root.pid:
+                    return root
+                raise psutil.NoSuchProcess(pid)
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=process_factory,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok, result.detail)
+            self.assertEqual(
+                allowed_scans,
+                [
+                    (
+                        ProcessIdentity(9601, 61.0),
+                        ProcessIdentity(9602, 62.0),
+                    ),
+                    (ProcessIdentity(9601, 61.0),),
+                ],
+            )
+
+    def test_replacement_gate_reconciles_birth_conflict_from_real_scanner(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "real-scanner-birth.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9701, 71.0)
+            worker = _MutableProcess(9702, 72.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            scanned = 0
+            allowed_scans: list[tuple[ProcessIdentity, ...]] = []
+            writer = Mock(info={
+                "pid": worker.pid,
+                "name": "python.exe",
+                "create_time": worker.created_at,
+                "cmdline": [
+                    "python",
+                    "scripts/run_postmatch_labeler.py",
+                    "--database",
+                    str(database.resolve()),
+                ],
+            })
+
+            def scan(
+                path: Path,
+                *,
+                allowed_identities: tuple[ProcessIdentity, ...],
+            ) -> WriterScanResult:
+                nonlocal scanned
+                scanned += 1
+                allowed_scans.append(tuple(allowed_identities))
+                if scanned == 1:
+                    root.descendants.append(worker)
+                return scan_managed_writers(
+                    path,
+                    allowed_identities=allowed_identities,
+                    process_iter=lambda _: [writer],
+                )
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda _: root,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok, result.detail)
+            self.assertEqual(scanned, 2)
+            self.assertEqual(
+                allowed_scans[1],
+                (
+                    ProcessIdentity(root.pid, root.created_at),
+                    ProcessIdentity(worker.pid, worker.created_at),
+                ),
+            )
+
+    def test_replacement_gate_rejects_external_conflict_during_descendant_birth(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "birth-external.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9711, 81.0)
+            worker = _MutableProcess(9712, 82.0)
+            external = ProcessIdentity(9713, 83.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
 
             def scan(_: Path, **__: object) -> WriterScanResult:
-                root.descendants.clear()
-                return WriterScanResult((), ())
+                root.descendants.append(worker)
+                return WriterScanResult(
+                    (ProcessIdentity(worker.pid, worker.created_at), external),
+                    (),
+                )
 
             result = _replacement_authority_gate(
                 {"collector": handle},
@@ -2433,7 +2888,223 @@ class ServiceHealthTests(unittest.TestCase):
             )
 
             self.assertFalse(result.ok)
+            self.assertEqual(result.detail, f"orphan_writer_conflict:{external.pid}")
+
+    def test_replacement_gate_rejects_added_descendant_that_detaches_alive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "descendant-detach.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9721, 91.0)
+            worker = _MutableProcess(9722, 92.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            scans = 0
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                nonlocal scans
+                scans += 1
+                if scans == 1:
+                    root.descendants.append(worker)
+                    return WriterScanResult(
+                        (ProcessIdentity(worker.pid, worker.created_at),),
+                        (),
+                    )
+                root.descendants.clear()
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=lambda pid: root if pid == root.pid else worker,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
             self.assertEqual(result.detail, "healthy_subtree_changed_during_writer_gate")
+
+    def test_replacement_gate_rejects_exited_root_with_live_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "orphan-descendant.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            descendant = _MutableProcess(9732, 102.0)
+            root = _MutableProcess(9731, 101.0, [descendant])
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            exited = False
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                nonlocal exited
+                exited = True
+                handle.poll.return_value = 1
+                return WriterScanResult((), ())
+
+            def process_factory(pid: int) -> object:
+                if pid == root.pid:
+                    if exited:
+                        raise psutil.NoSuchProcess(pid)
+                    return root
+                return descendant
+
+            result = _replacement_authority_gate(
+                {"vision": handle},
+                database,
+                identity,
+                process_factory=process_factory,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.detail, "healthy_subtree_changed_during_writer_gate")
+
+    def test_replacement_gate_allows_descendant_pid_reuse_after_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "descendant-reuse.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            worker = _MutableProcess(9742, 112.0)
+            reused = _MutableProcess(worker.pid, 113.0)
+            root = _MutableProcess(9741, 111.0, [worker])
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            scans = 0
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                nonlocal scans
+                scans += 1
+                if scans == 1:
+                    root.descendants.clear()
+                return WriterScanResult((), ())
+
+            result = _replacement_authority_gate(
+                {"vision": handle},
+                database,
+                identity,
+                process_factory=lambda pid: root if pid == root.pid else reused,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok, result.detail)
+            self.assertEqual(scans, 2)
+
+    def test_replacement_gate_rejects_unverifiable_descendant_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "descendant-unverifiable.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            worker = _MutableProcess(9752, 122.0)
+            root = _MutableProcess(9751, 121.0, [worker])
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                root.descendants.clear()
+                return WriterScanResult((), ())
+
+            def process_factory(pid: int) -> object:
+                if pid == root.pid:
+                    return root
+                raise psutil.AccessDenied(pid)
+
+            result = _replacement_authority_gate(
+                {"vision": handle},
+                database,
+                identity,
+                process_factory=process_factory,
+                writer_scanner=scan,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("replacement_authority_unverifiable", str(result.detail))
+            self.assertIn(str(worker.pid), str(result.detail))
+
+    def test_replacement_gate_allows_root_exit_during_current_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capture-root-exit.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9761, 131.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            exit_during_capture = False
+            scans = 0
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                nonlocal exit_during_capture, scans
+                scans += 1
+                if scans == 1:
+                    exit_during_capture = True
+                return WriterScanResult((), ())
+
+            def process_factory(pid: int) -> object:
+                if exit_during_capture:
+                    handle.poll.return_value = 1
+                    raise psutil.NoSuchProcess(pid)
+                return root
+
+            result = _replacement_authority_gate(
+                {"collector": handle},
+                database,
+                identity,
+                process_factory=process_factory,
+                writer_scanner=scan,
+            )
+
+            self.assertTrue(result.ok, result.detail)
+            self.assertEqual(scans, 2)
+
+    def test_replacement_gate_bounds_continuous_legal_churn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "continuous-churn.db"
+            database.write_bytes(b"sqlite")
+            identity = require_unique_database_file(database)
+            assert isinstance(identity, DatabaseFileIdentity)
+            root = _MutableProcess(9771, 141.0)
+            handle = Mock(pid=root.pid)
+            handle.poll.return_value = None
+            next_pid = 9771
+
+            def scan(_: Path, **__: object) -> WriterScanResult:
+                nonlocal next_pid
+                next_pid += 1
+                worker = _MutableProcess(next_pid, float(next_pid))
+                root.descendants[:] = [worker]
+                return WriterScanResult(
+                    (ProcessIdentity(worker.pid, worker.created_at),),
+                    (),
+                )
+
+            def process_factory(pid: int) -> object:
+                if pid == root.pid:
+                    return root
+                current = root.descendants[0]
+                if pid == current.pid:
+                    return current
+                raise psutil.NoSuchProcess(pid)
+
+            result = _replacement_authority_gate(
+                {"vision": handle},
+                database,
+                identity,
+                process_factory=process_factory,
+                writer_scanner=scan,
+                max_passes=3,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(
+                result.detail,
+                "healthy_subtree_did_not_stabilize_during_writer_gate",
+            )
 
     def test_replacement_gate_allows_read_only_web_peer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2599,7 +3270,14 @@ class ServiceHealthTests(unittest.TestCase):
             vision_jsonl=None,
         ))
         self.assertEqual(
-            set(commands), {"companion", "vision", "strict_ingest", "postmatch"}
+            set(commands),
+            {
+                "companion",
+                "vision",
+                "strict_ingest",
+                "postmatch",
+                "historical_rosh",
+            },
         )
         self.assertIn(
             str(
@@ -2647,6 +3325,7 @@ class ServiceHealthTests(unittest.TestCase):
                 "strict_ingest",
                 "postmatch",
                 "draft_publisher",
+                "historical_rosh",
             },
         )
         for command in commands.values():
@@ -2672,6 +3351,14 @@ class ServiceHealthTests(unittest.TestCase):
         self.assertIn(
             str(database.resolve().parent / "raw-sources"),
             commands["postmatch"],
+        )
+        self.assertIn(
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "run_historical_rosh_worker.py"
+            ),
+            commands["historical_rosh"],
         )
         publisher_target = managed_child_target(commands["draft_publisher"])
         self.assertIsNotNone(publisher_target)
@@ -2709,6 +3396,27 @@ class ServiceHealthTests(unittest.TestCase):
             DRAFT_DEPLOYMENT_KEY,
         )
 
+    def test_supervisor_once_and_explicit_disable_skip_historical_rosh(self) -> None:
+        base = dict(
+            database=Path("service.db"),
+            start_collector=False,
+            start_companion=False,
+            start_shadow=False,
+            start_vision=False,
+            start_mail=False,
+            start_strict_ingest=False,
+            start_postmatch=False,
+            start_draft_publisher=False,
+            vision_jsonl=None,
+        )
+        once = _commands(Namespace(**base, once=True))
+        disabled = _commands(
+            Namespace(**base, once=False, disable_historical_rosh=True)
+        )
+
+        self.assertNotIn("historical_rosh", once)
+        self.assertNotIn("historical_rosh", disabled)
+
     def test_supervisor_rejects_cross_database_vision_path(self) -> None:
         with self.assertRaisesRegex(ValueError, "must equal <database-dir>"):
             _commands(Namespace(
@@ -2735,6 +3443,7 @@ class ServiceHealthTests(unittest.TestCase):
                     "vision_worker",
                     "strict_ingest_worker",
                     "postmatch_worker",
+                    "historical_rosh_worker",
                 ):
                     record_health(
                         store.connection,
@@ -2750,6 +3459,7 @@ class ServiceHealthTests(unittest.TestCase):
                     "vision",
                     "strict_ingest",
                     "postmatch",
+                    "historical_rosh",
                     "companion",
                 },
                 companion_probe=lambda: {"protocol_version": 1, "state": "ok"},
@@ -2762,6 +3472,7 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertEqual(statuses["vision"], "healthy")
             self.assertEqual(statuses["strict_ingest"], "healthy")
             self.assertEqual(statuses["postmatch"], "healthy")
+            self.assertEqual(statuses["historical_rosh"], "healthy")
             self.assertEqual(statuses["companion"], "healthy")
 
     def test_companion_probe_has_one_startup_grace_cycle(self) -> None:

@@ -69,7 +69,7 @@ query GetMatchPicksBans($matchId: Long!) {
     radiantTeam { id name }
     direTeam { id name }
     league { id displayName }
-    players { heroId position }
+    players { heroId position steamAccountId }
     pickBans {
       heroId
       order
@@ -202,6 +202,8 @@ def build_rosh_match_context(
     match = data.get("match", {}) if isinstance(data, Mapping) else {}
     if not isinstance(match, Mapping):
         raise ValueError("STRATZ Rosh match response does not contain match data")
+    if match.get("id") != match_id:
+        raise ValueError("STRATZ Rosh match response ID does not match the request")
     bracket_value = match.get("bracket")
     week = match.get("endDateTime")
     if not _is_int(bracket_value) or bracket_value not in ROSH_BRACKETS:

@@ -14,12 +14,19 @@ from live_betting.stratz_rosh_client import (
     StratzRoshClient,
     StratzRoshError,
 )
+from prematch.stratz_rosh import MATCH_PICKS_BANS_QUERY
 
 
 class Response:
-    def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def json(self) -> dict[str, Any]:
         return self.payload
@@ -54,6 +61,152 @@ def identity_evidence(data: dict[str, Any], fetched_at: datetime) -> dict[str, A
             fetched_at=fetched_at,
         ),
     }
+
+
+def historical_match_payload(
+    data: dict[str, Any], *, missing_player_index: int | None = None
+) -> dict[str, Any]:
+    heroes = [*data["radiant_heroes"], *data["dire_heroes"]]
+    players = []
+    picks = []
+    for index, hero_id in enumerate(heroes):
+        player_id = 100 + index
+        players.append(
+            {
+                "heroId": hero_id,
+                "position": f"POSITION_{(index % 5) + 1}",
+                "steamAccountId": (
+                    None if index == missing_player_index else player_id
+                ),
+            }
+        )
+        picks.append(
+            {
+                "heroId": hero_id,
+                "order": index,
+                "isPick": True,
+                "isRadiant": index < 5,
+            }
+        )
+    return {
+        "data": {
+            "match": {
+                "id": 123,
+                "bracket": 8,
+                "endDateTime": data["week"],
+                "players": players,
+                "pickBans": picks,
+            }
+        }
+    }
+
+
+def historical_post(
+    data: dict[str, Any],
+    *,
+    missing_player_index: int | None = None,
+    player_calls: list[dict[str, Any]] | None = None,
+) -> Any:
+    highlight = next(
+        row for row in data["radiant_player_highlights"] if row is not None
+    )
+
+    def post(_url: str, **kwargs: Any) -> Response:
+        operation = kwargs["json"]["operationName"]
+        if operation == "GetMatchPicksBans":
+            return Response(
+                historical_match_payload(
+                    data, missing_player_index=missing_player_index
+                )
+            )
+        if operation == "PlayerHeroHighlights":
+            if player_calls is not None:
+                player_calls.append(kwargs["json"])
+            return Response(
+                {
+                    "data": {
+                        "plus": {
+                            f"player_{index}": highlight for index in range(10)
+                        }
+                    }
+                }
+            )
+        key = {
+            "HeroesMetaPositionsByWeek": "heroes_meta_positions",
+            "GetHeroStatsByTime": "hero_stats_by_time_bracket",
+            "Synergy": "synergy",
+        }[operation]
+        return Response(data["responses"][key])
+
+    return post
+
+
+def test_historical_match_query_requests_player_identity_fields() -> None:
+    assert "steamAccountId" in MATCH_PICKS_BANS_QUERY
+    assert "isAnonymous" not in MATCH_PICKS_BANS_QUERY
+
+
+def test_historical_score_defaults_to_pure_and_marks_retrospective() -> None:
+    data = fixture()
+    player_calls: list[dict[str, Any]] = []
+    fetched_at = datetime(2026, 7, 22, 1, 2, 3, tzinfo=timezone.utc)
+
+    result = StratzRoshClient(
+        "private-token",
+        post=historical_post(data, player_calls=player_calls),
+        clock=lambda: fetched_at,
+    ).fetch_historical_match_score(123)
+
+    assert player_calls == []
+    assert result.score is not None
+    assert result.score.scoring_mode == "pure"
+    assert result.score.current_player_adjusted_lineup_score is None
+    assert result.score.player_coverage_count == 0
+    assert result.score.evidence["player_stats_as_of"] is None
+    assert result.score.evidence["retrospective"] is True
+    assert result.score.evidence["current_player_adjustment_only"] is True
+    assert result.score.evidence["backtest_eligible"] is False
+
+
+def test_historical_score_uses_current_adjustment_only_at_ten_of_ten() -> None:
+    data = fixture()
+    fetched_at = datetime(2026, 7, 22, 1, 2, 3, tzinfo=timezone.utc)
+
+    result = StratzRoshClient(
+        "private-token",
+        post=historical_post(data),
+        clock=lambda: fetched_at,
+    ).fetch_historical_match_score(123, include_current_player_adjustment=True)
+
+    assert result.score is not None
+    assert result.score.scoring_mode == "current_player_adjusted"
+    assert result.score.current_player_adjusted_lineup_score is not None
+    assert result.score.effective_lineup_score == (
+        result.score.current_player_adjusted_lineup_score
+    )
+    assert result.score.player_coverage_count == 10
+    assert result.score.player_stats_as_of == fetched_at
+    assert result.score.evidence["player_stats_as_of"] == fetched_at.isoformat()
+
+
+def test_historical_score_falls_back_to_pure_at_nine_of_ten() -> None:
+    data = fixture()
+    fetched_at = datetime(2026, 7, 22, 1, 2, 3, tzinfo=timezone.utc)
+
+    result = StratzRoshClient(
+        "private-token",
+        post=historical_post(data, missing_player_index=4),
+        clock=lambda: fetched_at,
+    ).fetch_historical_match_score(123, include_current_player_adjustment=True)
+
+    assert result.score is not None
+    assert result.score.scoring_mode == "pure"
+    assert result.score.current_player_adjusted_lineup_score is None
+    assert result.score.effective_lineup_score == result.score.pure_lineup_score
+    assert result.score.player_coverage_count == 9
+    assert result.score.evidence["player_slots"][4]["fallback_reason"] == (
+        "player_identity_unavailable"
+    )
 
 
 def test_live_queries_use_request_timestamp_and_completion_source_time() -> None:
@@ -215,6 +368,152 @@ def test_transport_failure_never_exposes_token() -> None:
         )
 
     assert secret not in str(caught.value)
+    assert caught.value.retryable is True
+    assert caught.value.category == "network_failure"
+
+
+def test_http_429_exposes_structured_retry_after_without_response_body() -> None:
+    def post(_url: str, **_kwargs: Any) -> Response:
+        return Response(
+            {"secret": "must-not-escape"},
+            status_code=429,
+            headers={"Retry-After": "7"},
+        )
+
+    with pytest.raises(StratzRoshError) as caught:
+        StratzRoshClient("private-token", post=post).fetch_lineup_score(
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            as_of=datetime.now(timezone.utc),
+        )
+
+    assert caught.value.retryable is True
+    assert caught.value.retry_after_seconds == 7.0
+    assert caught.value.category == "http_429"
+    assert "must-not-escape" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "category"),
+    [
+        (400, "http_failure"),
+        (401, "http_auth_failure"),
+        (403, "http_auth_failure"),
+    ],
+)
+def test_http_auth_failures_are_distinct_from_single_request_failures(
+    status_code: int,
+    category: str,
+) -> None:
+    def post(_url: str, **_kwargs: Any) -> Response:
+        return Response({}, status_code=status_code)
+
+    with pytest.raises(StratzRoshError) as caught:
+        StratzRoshClient("private-token", post=post).fetch_lineup_score(
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            as_of=datetime.now(timezone.utc),
+        )
+
+    assert caught.value.retryable is False
+    assert caught.value.category == category
+
+
+def test_stop_callback_prevents_a_second_graphql_request() -> None:
+    data = fixture()
+    stopped = False
+    calls: list[str] = []
+
+    def post(_url: str, **kwargs: Any) -> Response:
+        nonlocal stopped
+        operation = kwargs["json"]["operationName"]
+        calls.append(operation)
+        stopped = True
+        key = {
+            "HeroesMetaPositionsByWeek": "heroes_meta_positions",
+            "GetHeroStatsByTime": "hero_stats_by_time_bracket",
+            "Synergy": "synergy",
+        }[operation]
+        return Response(data["responses"][key])
+
+    with pytest.raises(StratzRoshError) as caught:
+        StratzRoshClient(
+            "private-token",
+            post=post,
+            stop_requested=lambda: stopped,
+        ).fetch_lineup_score(
+            data["radiant_heroes"],
+            data["dire_heroes"],
+            as_of=datetime.now(timezone.utc),
+        )
+
+    assert calls == ["HeroesMetaPositionsByWeek"]
+    assert caught.value.retryable is False
+    assert caught.value.category == "request_cancelled"
+
+
+def test_graphql_auth_failure_is_not_suppressed_for_partial_requests() -> None:
+    def post(_url: str, **_kwargs: Any) -> Response:
+        return Response(
+            {
+                "errors": [
+                    {
+                        "message": "sensitive auth detail",
+                        "extensions": {"code": "UNAUTHENTICATED"},
+                    }
+                ]
+            }
+        )
+
+    client = StratzRoshClient("private-token", post=post)
+    with pytest.raises(StratzRoshError) as caught:
+        client._request(
+            {"query": "query Test { test }", "operation_name": "Test"},
+            allow_partial=True,
+        )
+
+    assert caught.value.category == "graphql_auth_failure"
+    assert "sensitive auth detail" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("code", "retryable", "category"),
+    [
+        ("RATE_LIMITED", True, "graphql_rate_limited"),
+        ("INTERNAL_SERVER_ERROR", True, "graphql_internal_server_error"),
+        ("UNAUTHENTICATED", False, "graphql_auth_failure"),
+        ("FORBIDDEN", False, "graphql_auth_failure"),
+        ("PERMISSION_DENIED", False, "graphql_auth_failure"),
+        ("BAD_USER_INPUT", False, "graphql_failure"),
+    ],
+)
+def test_graphql_retry_policy_uses_only_safe_extension_codes(
+    code: str,
+    retryable: bool,
+    category: str,
+) -> None:
+    def post(_url: str, **_kwargs: Any) -> Response:
+        return Response(
+            {
+                "errors": [
+                    {
+                        "message": "sensitive upstream detail",
+                        "extensions": {"code": code},
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(StratzRoshError) as caught:
+        StratzRoshClient("private-token", post=post).fetch_lineup_score(
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            as_of=datetime.now(timezone.utc),
+        )
+
+    assert caught.value.retryable is retryable
+    assert caught.value.category == category
+    assert "sensitive upstream detail" not in str(caught.value)
 
 
 def test_full_player_coverage_persists_both_curves_and_identity_evidence() -> None:

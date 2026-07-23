@@ -28,7 +28,11 @@ from shared.sqlite import BUSY_TIMEOUT_MS, configure_connection, connect
 
 from .service_coordination import require_current_process_lock
 from .storage import CURRENT_SCHEMA_VERSION as LIVE_SCHEMA_VERSION
-from .storage import LiveBettingStore, init_draft_authority_revision_schema
+from .storage import (
+    LiveBettingStore,
+    init_draft_authority_revision_schema,
+    shadow_order_stake_schema_requires_rebuild,
+)
 from .odds_response_verifier import verify_odds_response_authority
 from .runtime_schema import (
     prepare_runtime_schema,
@@ -1037,7 +1041,10 @@ def prepare_database(
                 now or datetime.now(timezone.utc),
             )
             _backup_connection(migration, backup)
-        if strict_live_mapping_schema_requires_rebuild(migration):
+        if (
+            strict_live_mapping_schema_requires_rebuild(migration)
+            or shadow_order_stake_schema_requires_rebuild(migration)
+        ):
             migration.execute("PRAGMA foreign_keys=OFF")
             if migration.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
                 raise RuntimeError(

@@ -45,6 +45,7 @@ from live_betting.service_coordination import (  # noqa: E402
     manager_child_process_environment,
     managed_child_command,
     require_unique_database_file,
+    resolve_process_identity,
     scan_managed_writers,
     service_data_paths,
     terminate_subprocess_tree,
@@ -65,6 +66,7 @@ WORKER_COMPONENTS = {
     "strict_ingest": "strict_ingest_worker",
     "postmatch": "postmatch_worker",
     "draft_publisher": "draft_publisher_worker",
+    "historical_rosh": "historical_rosh_worker",
 }
 ACTIVE_COMMANDS = {
     "raybet": "collector",
@@ -74,6 +76,7 @@ ACTIVE_COMMANDS = {
     "strict_ingest": "strict_ingest",
     "postmatch": "postmatch",
     "draft_publisher": "draft_publisher",
+    "historical_rosh": "historical_rosh",
 }
 WORKER_MAX_AGE = {
     "raybet": timedelta(seconds=45),
@@ -83,6 +86,7 @@ WORKER_MAX_AGE = {
     "strict_ingest": timedelta(seconds=90),
     "postmatch": timedelta(seconds=150),
     "draft_publisher": timedelta(minutes=15),
+    "historical_rosh": timedelta(minutes=15),
 }
 COLLECTOR_MAX_AGE = timedelta(seconds=60)
 DATABASE_AUDIT_MAX_AGE = timedelta(minutes=15)
@@ -711,7 +715,13 @@ def service_once(
             details=mail_details,
         )
 
-        for component in ("vision", "strict_ingest", "postmatch", "draft_publisher"):
+        for component in (
+            "vision",
+            "strict_ingest",
+            "postmatch",
+            "draft_publisher",
+            "historical_rosh",
+        ):
             status, details = _worker_health(
                 connection, component, now, active_components
             )
@@ -761,6 +771,10 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
     database = str(paths.database)
     publisher_requested = bool(
         getattr(args, "start_draft_publisher", False) or args.start_shadow
+    )
+    historical_rosh_requested = not bool(
+        getattr(args, "once", False)
+        or getattr(args, "disable_historical_rosh", False)
     )
     deployment_key = getattr(args, "draft_deployment_key", None)
     if args.start_collector:
@@ -870,6 +884,14 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             "--deployment-key",
             deployment_key,
         ]
+    if historical_rosh_requested:
+        commands["historical_rosh"] = [
+            python,
+            "scripts/run_historical_rosh_worker.py",
+            "--database",
+            database,
+            "--schema-prepared",
+        ]
     return {
         name: managed_child_command(command)
         for name, command in commands.items()
@@ -893,12 +915,29 @@ def _capture_subprocess_tree_identities(
         if float(root.create_time()) != root_identity.created_at:
             raise RuntimeError("direct child identity changed during subtree capture")
         identities = {root_identity}
-        for child in root.children(recursive=True):
-            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
-                raise RuntimeError("descendant exited during subtree capture")
-            identities.add(
-                ProcessIdentity(int(child.pid), float(child.create_time()))
-            )
+        unstable = False
+        try:
+            descendants = root.children(recursive=True)
+        except psutil.NoSuchProcess:
+            previous = None
+            continue
+        for child in descendants:
+            try:
+                if (
+                    not child.is_running()
+                    or child.status() == psutil.STATUS_ZOMBIE
+                ):
+                    unstable = True
+                    break
+                identities.add(
+                    ProcessIdentity(int(child.pid), float(child.create_time()))
+                )
+            except psutil.NoSuchProcess:
+                unstable = True
+                break
+        if unstable:
+            previous = None
+            continue
         current = tuple(sorted(identities))
         if current == previous:
             if process_handle.poll() is not None:
@@ -930,10 +969,15 @@ def _healthy_subtree_snapshot(
     for process_handle in children.values():
         if process_handle.poll() is not None:
             continue
-        subtree = _capture_subprocess_tree_identities(
-            process_handle,
-            process_factory=process_factory,
-        )
+        try:
+            subtree = _capture_subprocess_tree_identities(
+                process_handle,
+                process_factory=process_factory,
+            )
+        except Exception:
+            if process_handle.poll() is not None:
+                continue
+            raise
         root_pid = int(process_handle.pid)
         root_identity = next(
             (identity for identity in subtree if identity.pid == root_pid),
@@ -963,24 +1007,18 @@ def _replacement_authority_gate(
             database,
             expected_identity=database_identity,
         )
-        expected_roots, allowed = _healthy_subtree_snapshot(
+        baseline_roots, baseline = _healthy_subtree_snapshot(
             children,
             process_factory=process_factory,
         )
-        observed = allowed
+        initial_roots = set(baseline_roots)
         for _ in range(max_passes):
-            scan = writer_scanner(database, allowed_identities=allowed)
+            scan = writer_scanner(database, allowed_identities=baseline)
             if scan.unverifiable_pids:
                 return TerminationResult(
                     False,
                     "writer_scan_unverifiable:"
                     + ",".join(str(pid) for pid in scan.unverifiable_pids),
-                )
-            if scan.conflicts:
-                return TerminationResult(
-                    False,
-                    "orphan_writer_conflict:"
-                    + ",".join(str(item.pid) for item in scan.conflicts),
                 )
             current_roots, current = _healthy_subtree_snapshot(
                 children,
@@ -990,19 +1028,53 @@ def _replacement_authority_gate(
                 database,
                 expected_identity=database_identity,
             )
-            if current_roots != expected_roots:
+            baseline_root_set = set(baseline_roots)
+            current_root_set = set(current_roots)
+            if (
+                current_root_set - initial_roots
+                or current_root_set - baseline_root_set
+            ):
                 return TerminationResult(
                     False,
                     "healthy_roots_changed_during_writer_gate",
                 )
-            if not set(observed).issubset(current):
+            baseline_set = set(baseline)
+            current_set = set(current)
+            added_descendants = (
+                current_set - baseline_set - current_root_set
+            )
+            conflicts = tuple(
+                item for item in scan.conflicts if item not in added_descendants
+            )
+            if conflicts:
                 return TerminationResult(
                     False,
-                    "healthy_subtree_changed_during_writer_gate",
+                    "orphan_writer_conflict:"
+                    + ",".join(str(item.pid) for item in conflicts),
                 )
-            if current == observed:
+            removed = baseline_set - current_set
+            removed_roots = baseline_root_set - current_root_set
+            for removed_identity in sorted(removed | removed_roots):
+                alive, _, resolve_error = resolve_process_identity(
+                    removed_identity,
+                    process_factory,
+                )
+                if resolve_error is not None:
+                    raise RuntimeError(
+                        "removed process identity is unverifiable:"
+                        f"{removed_identity.pid}:{resolve_error}"
+                    )
+                if alive:
+                    detail = (
+                        "healthy_roots_changed_during_writer_gate"
+                        if removed_identity in removed_roots
+                        else "healthy_subtree_changed_during_writer_gate"
+                    )
+                    return TerminationResult(False, detail)
+            if current_roots == baseline_roots and current == baseline:
                 return TerminationResult(True)
-            observed = current
+            baseline_roots = current_roots
+            baseline = current
     except Exception as error:
         return TerminationResult(
             False,
@@ -1444,6 +1516,11 @@ def main() -> int:
     parser.add_argument("--start-strict-ingest", action="store_true")
     parser.add_argument("--start-postmatch", action="store_true")
     parser.add_argument("--start-draft-publisher", action="store_true")
+    parser.add_argument(
+        "--disable-historical-rosh",
+        action="store_true",
+        help="disable the historical Rosh backfill worker",
+    )
     parser.add_argument(
         "--draft-deployment-key",
         help=(

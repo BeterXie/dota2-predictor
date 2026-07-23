@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
 
+from .comeback_entry import decide_comeback_entry
 from .market_state import MarketSurface
 from .models import RoshLineupScore
 from .profiles.draft_curve import DraftCurve, DraftPoint
@@ -17,7 +18,7 @@ from .profiles.team_style import TeamStyleProfile
 from .vision import VisionObservation
 
 
-STRATEGY_VERSION = "comeback-shadow-v3-rosh-lineup"
+STRATEGY_VERSION = "comeback-shadow-v4-controlled-entry"
 
 
 @dataclass(frozen=True)
@@ -98,15 +99,11 @@ def _select_rosh_minute_score(
             return None
         seen_minutes.add(minute)
         rows.append((minute, float(value), float(match_percentage)))
-    target_minute = min(60, max(20, game_clock_seconds // 60))
-    minute, value, match_percentage = min(
-        rows,
-        key=lambda row: (
-            abs(row[0] - target_minute),
-            row[0] > target_minute,
-            row[0],
-        ),
-    )
+    target_minute = min(60, game_clock_seconds // 60)
+    available = tuple(row for row in rows if row[0] <= target_minute)
+    if not available:
+        return None
+    minute, value, match_percentage = max(available, key=lambda row: row[0])
     return {
         "table": table_key,
         "minute": minute,
@@ -319,7 +316,9 @@ def score_comeback(
         late_adjustment = (
             underdog_style.late_game_rate - favorite_style.late_game_rate
         ) * 0.3 * team_quality
-    movement_adjustment = max(-0.08, min(0.08, surface.probability_move * 1.5))
+    # The market identifies the candidate underdog and price. It is not
+    # independent evidence that the live situation can reverse.
+    movement_adjustment = 0.0
     contributions = {
         "team_style": team_adjustment,
         "player_form": player_adjustment,
@@ -358,6 +357,13 @@ def score_comeback(
         or player_adjustment > 0.0
         or lineup_adjustment > 0.0
     )
+    entry = decide_comeback_entry(
+        observation,
+        underdog_side=surface.underdog_side,
+        rosh_underdog_probability=(
+            underdog_draft_probability if selected_rosh_score is not None else None
+        ),
+    )
 
     reason = "eligible"
     if not observation.is_confirmed:
@@ -372,12 +378,16 @@ def score_comeback(
         reason = "odds_outside_range"
     elif not stable:
         reason = "market_not_stable_two_snapshots"
+    elif not entry.situation.controllable:
+        reason = entry.situation.reason
     elif rosh_lineup_score is None:
         reason = "rosh_lineup_score_unavailable"
     elif not rosh_matches_draft:
         reason = "rosh_lineup_draft_mismatch"
     elif selected_rosh_score is None:
         reason = "rosh_minute_score_unavailable"
+    elif not entry.eligible:
+        reason = entry.reason
     elif point is None:
         reason = draft_wait_reason or "draft_landmark_unavailable"
     elif not point.passes_live_gate:
@@ -422,6 +432,7 @@ def score_comeback(
             "underdog_price": surface.underdog_price,
             "underdog_probability": surface.underdog_probability,
             "probability_move": surface.probability_move,
+            "probability_move_used_as_evidence": False,
             "kill_handicap": surface.kill_handicap,
             "total_kills": surface.total_kills,
             "duration_minutes": surface.duration_minutes,
@@ -429,6 +440,10 @@ def score_comeback(
             "missing_markets": list(surface.missing_markets),
         },
         "draft_landmark": _point_inputs(point, draft_wait_reason),
+        "draft_landmark_role": {
+            "calibration_gate_only": True,
+            "direction_authority": False,
+        },
         "rosh_lineup_score": {
             **(
                 rosh_lineup_score.as_input_ref()
@@ -459,6 +474,7 @@ def score_comeback(
             ),
             "actual_stake_multiplier": stake_multiplier,
         },
+        **entry.as_inputs(),
         "player_form_suppression": {
             "suppressed": player_form_suppressed,
             "reason": (

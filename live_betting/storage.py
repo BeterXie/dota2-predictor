@@ -69,6 +69,75 @@ VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 ROSH_LINEUP_CACHE_TTL = timedelta(minutes=15)
 ROSH_FETCH_MAX_DURATION = timedelta(minutes=10)
 
+_SHADOW_ORDER_STAKE_CHECK = re.compile(
+    r"\bstake\s+REAL\s+NOT\s+NULL\s+CHECK\s*\(\s*"
+    r"stake\s*>\s*0\.0\s+AND\s+stake\s*<=\s*1\.0\s*\)",
+    re.IGNORECASE,
+)
+_SHADOW_ORDER_COLUMNS = (
+    "order_key",
+    "raybet_match_id",
+    "strict_mapping_id",
+    "odds_id",
+    "market_key",
+    "signaled_at",
+    "model_probability",
+    "market_probability",
+    "signal_price",
+    "signal_transport_key",
+    "signal_transport_at",
+    "expires_at",
+    "signal_odds_group_id",
+    "signal_outcome_key",
+    "signal_identity_verified",
+    "stake",
+    "status",
+    "fill_price",
+    "filled_at",
+    "rejection_reason",
+    "draft_curve_key",
+    "draft_source_ref",
+    "draft_landmark_key",
+    "draft_landmark_horizon_minutes",
+    "draft_landmark_target",
+    "draft_landmark_radiant_probability",
+    "draft_landmark_quality",
+    "draft_landmark_uncertainty",
+    "draft_landmark_support",
+    "draft_radiant_team_side",
+    "draft_strict_mapping_id",
+    "draft_deployment_key",
+    "draft_target_snapshot_hash",
+    "draft_feature_hash",
+    "draft_model_hash",
+    "draft_calibration_hash",
+    "draft_model_version",
+    "draft_global_gate_ref",
+    "draft_input_snapshot_hash",
+    "draft_authority_revision",
+    "draft_dependency_revision",
+    "vision_raybet_match_id",
+    "vision_map_number",
+    "vision_captured_at",
+    "vision_source_frame_ref",
+    "vision_source_frame_sha256",
+    "vision_source_frame_bytes",
+    "vision_observed_game_clock_seconds",
+    "vision_aligned_game_clock_seconds",
+    "vision_is_paused",
+    "vision_radiant_hero_ids_json",
+    "vision_dire_hero_ids_json",
+    "vision_radiant_team_side",
+    "vision_clock_confidence",
+    "vision_draft_confidence",
+    "vision_screen_state",
+    "vision_confirmed",
+    "vision_transport_key",
+    "vision_transport_at",
+    "vision_alignment_method",
+    "vision_alignment_lag_seconds",
+)
+
 _SCORED_DECISION_CONTRIBUTION_KEYS = frozenset(
     {
         "team_style",
@@ -87,6 +156,17 @@ _DIRECT_RESPONSE_ENDPOINTS = {
     "completed_odds": "https://raybet.local/v2/odds",
     "final_odds": "https://raybet.local/v2/odds",
 }
+
+
+def shadow_order_stake_schema_requires_rebuild(
+    connection: sqlite3.Connection,
+) -> bool:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='shadow_orders'"
+    ).fetchone()
+    if row is None:
+        return False
+    return _SHADOW_ORDER_STAKE_CHECK.search(str(row[0] or "")) is None
 
 _DRAFT_AUTHORITY_COLUMNS = (
     "draft_curve_key",
@@ -4172,6 +4252,15 @@ class LiveBettingStore:
     def init_schema(self, *, external_transaction: bool = False) -> None:
         if external_transaction and not self.connection.in_transaction:
             raise RuntimeError("external transaction is not active")
+        if shadow_order_stake_schema_requires_rebuild(self.connection):
+            foreign_keys_enabled = bool(
+                self.connection.execute("PRAGMA foreign_keys").fetchone()[0]
+            )
+            if not external_transaction or foreign_keys_enabled:
+                raise RuntimeError(
+                    "legacy shadow_orders stake schema must be migrated through "
+                    "prepare_database"
+                )
         self._reject_future_schema()
         self._migrate_odds_response_storage_fields()
         self._migrate_prospective_draft_authority_fields()
@@ -4192,6 +4281,7 @@ class LiveBettingStore:
                DROP TRIGGER IF EXISTS settlements_authority_insert_guard;"""
         )
         execute_script(self.connection, SCHEMA_SQL)
+        self._migrate_shadow_order_stake_constraint()
         self._migrate_monitor_match_activity()
         self._migrate_settlement_authority_audit()
         from .strict_eligibility import init_strict_live_eligibility_schema
@@ -5221,6 +5311,73 @@ class LiveBettingStore:
             """
         )
 
+    def _migrate_shadow_order_stake_constraint(self) -> None:
+        if not shadow_order_stake_schema_requires_rebuild(self.connection):
+            return
+        invalid_stake = self.connection.execute(
+            """SELECT 1 FROM shadow_orders
+                WHERE stake IS NULL
+                   OR typeof(stake) NOT IN ('integer', 'real')
+                   OR stake<=0.0 OR stake>1.0
+                LIMIT 1"""
+        ).fetchone()
+        if invalid_stake is not None:
+            raise RuntimeError(
+                "legacy shadow_orders stake values violate the current contract"
+            )
+        column_rows = tuple(
+            self.connection.execute("PRAGMA table_xinfo(shadow_orders)")
+        )
+        actual_columns = {str(row[1]) for row in column_rows}
+        expected_columns = set(_SHADOW_ORDER_COLUMNS)
+        if (
+            any(int(row[6]) != 0 for row in column_rows)
+            or actual_columns != expected_columns
+            or len(actual_columns) != len(_SHADOW_ORDER_COLUMNS)
+        ):
+            raise RuntimeError(
+                "legacy shadow_orders columns do not match the stake migration contract"
+            )
+        table_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='shadow_orders'"
+        ).fetchone()
+        table_sql = "" if table_row is None else str(table_row[0] or "")
+        migration_sql, table_replacements = re.subn(
+            r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+            r"(?:\"shadow_orders\"|shadow_orders)(?=\s*\()",
+            "CREATE TABLE shadow_orders_stake_migration",
+            table_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        migration_sql, stake_replacements = re.subn(
+            r"\bstake\s+REAL\s+NOT\s+NULL(?=\s*,)",
+            "stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0)",
+            migration_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if table_replacements != 1 or stake_replacements != 1:
+            raise RuntimeError(
+                "legacy shadow_orders stake schema cannot be repaired safely"
+            )
+
+        self.connection.execute("DROP TABLE IF EXISTS shadow_orders_stake_migration")
+        self.connection.execute(migration_sql)
+        columns_sql = ", ".join(f'"{name}"' for name in _SHADOW_ORDER_COLUMNS)
+        self.connection.execute(
+            f"""INSERT INTO shadow_orders_stake_migration ({columns_sql})
+                SELECT {columns_sql} FROM shadow_orders"""
+        )
+        self.connection.execute(
+            "DROP TRIGGER IF EXISTS settlement_result_evidence_authority_insert"
+        )
+        self.connection.execute("DROP TABLE shadow_orders")
+        self.connection.execute(
+            "ALTER TABLE shadow_orders_stake_migration RENAME TO shadow_orders"
+        )
+        execute_script(self.connection, SCHEMA_SQL)
+
     def _migrate_shadow_order_signal_fields(self) -> None:
         """Add strict signal identity to databases created by earlier versions."""
         self.connection.execute(
@@ -5363,7 +5520,7 @@ class LiveBettingStore:
                     signal_outcome_key TEXT,
                     signal_identity_verified INTEGER NOT NULL
                         CHECK (signal_identity_verified IN (0, 1)),
-                    stake REAL NOT NULL,
+                    stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0),
                     status TEXT NOT NULL,
                     fill_price REAL,
                     filled_at TEXT,

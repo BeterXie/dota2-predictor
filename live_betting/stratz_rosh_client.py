@@ -19,6 +19,7 @@ from prematch.stratz_rosh import (
     build_rosh_query_requests,
     normalize_player_highlights_response,
     normalize_rosh_analysis,
+    position_ordered_rosh_heroes,
     score_rosh_picks,
     score_rosh_lineups,
 )
@@ -30,7 +31,39 @@ ROSH_SOURCE_NAME = "stratz"
 
 
 class StratzRoshError(RuntimeError):
-    """A sanitized transport or GraphQL failure."""
+    """A sanitized transport failure with structured retry guidance."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_after_seconds: float | None = None,
+        category: str = "request_failure",
+    ) -> None:
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.retry_after_seconds = retry_after_seconds
+        self.category = (
+            category
+            if category
+            in {
+                "network_failure",
+                "http_auth_failure",
+                "http_429",
+                "http_5xx",
+                "http_failure",
+                "graphql_rate_limited",
+                "graphql_internal_server_error",
+                "graphql_auth_failure",
+                "graphql_failure",
+                "request_cancelled",
+                "invalid_json",
+                "invalid_response",
+                "request_failure",
+            }
+            else "request_failure"
+        )
 
 
 @dataclass(frozen=True)
@@ -58,8 +91,27 @@ class FetchedRoshLineupScore:
 @dataclass(frozen=True)
 class FetchedHistoricalRoshScore:
     context: Mapping[str, Any]
-    score: FetchedRoshLineupScore | None
+    score: FetchedHistoricalRoshLineupScore | None
     minute_table: Sequence[Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class FetchedHistoricalRoshLineupScore:
+    """Retrospective score with explicitly current-only player correction."""
+
+    pure_lineup_score: float
+    current_player_adjusted_lineup_score: float | None
+    effective_lineup_score: float
+    scoring_mode: str
+    player_coverage_count: int
+    formula_version: str
+    source_name: str
+    source_week: int
+    cache_week_start: int
+    source_as_of: datetime
+    player_stats_as_of: datetime | None
+    evidence: Mapping[str, Any]
+    evidence_hash: str
 
 
 def resolve_stratz_api_token(
@@ -106,6 +158,7 @@ class StratzRoshClient:
         timeout_seconds: float = 30.0,
         post: Callable[..., Any] | None = None,
         clock: Callable[[], datetime] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         resolved = token.strip() if isinstance(token, str) else None
         self._token = resolved or resolve_stratz_api_token()
@@ -115,6 +168,7 @@ class StratzRoshClient:
         self.timeout_seconds = timeout_seconds
         self._post = post or cffi_requests.post
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._stop_requested = stop_requested or (lambda: False)
 
     def fetch_lineup_score(
         self,
@@ -180,49 +234,10 @@ class StratzRoshClient:
             identity_valid = True
         player_response_hashes: dict[str, str] = {}
         if selected_indices and identity_valid:
-            batch = build_player_highlights_query(players)
-            batch_response = self._request(batch, allow_partial=True)
-            player_response_hashes["batch"] = _payload_hash(batch_response)
-            highlights.update(normalize_player_highlights_response(batch, batch_response))
-            error_policy = _player_error_policy(batch, batch_response)
-
-            # STRATZ may return HTTP 200 with per-alias GraphQL errors. Preserve
-            # successful aliases and retry every selected unresolved slot alone.
-            for index in selected_indices:
-                if highlights.get(index) is not None:
-                    continue
-                policy = error_policy.get(index, "missing")
-                if policy == "missing_or_anonymous":
-                    slots[index]["fallback_reason"] = (
-                        "player_missing_or_anonymous_in_stratz"
-                    )
-                    continue
-                if policy == "unsupported":
-                    slots[index]["fallback_reason"] = "player_stats_request_failed"
-                    continue
-                if policy == "missing":
-                    slots[index]["fallback_reason"] = "player_hero_stats_missing"
-                    continue
-                single = build_player_highlights_query([players[index]])
-                try:
-                    response = self._request(single, allow_partial=True)
-                except StratzRoshError:
-                    slots[index]["fallback_reason"] = "player_stats_request_failed"
-                    continue
-                player_response_hashes[f"slot_{index}"] = _payload_hash(response)
-                normalized = normalize_player_highlights_response(single, response)
-                highlights[index] = normalized.get(0)
-                if highlights[index] is None:
-                    retry_policy = _player_error_policy(single, response).get(
-                        0, "missing"
-                    )
-                    slots[index]["fallback_reason"] = {
-                        "missing_or_anonymous": (
-                            "player_missing_or_anonymous_in_stratz"
-                        ),
-                        "unsupported": "player_stats_request_failed",
-                        "missing": "player_hero_stats_missing",
-                    }.get(retry_policy, "player_stats_request_failed")
+            highlights, player_response_hashes, _ = self._fetch_player_highlights(
+                players,
+                slots,
+            )
 
         for index, slot in enumerate(slots):
             resolved = highlights.get(index) is not None
@@ -298,16 +313,77 @@ class StratzRoshClient:
             evidence_hash=canonical_evidence_hash(evidence),
         )
 
+    def _fetch_player_highlights(
+        self,
+        players: Sequence[Mapping[str, Any]],
+        slots: list[dict[str, Any]],
+    ) -> tuple[
+        dict[int, Mapping[str, Any] | None],
+        dict[str, str],
+        datetime | None,
+    ]:
+        selected_indices = [
+            index for index, slot in enumerate(slots) if slot["selected"]
+        ]
+        if not selected_indices:
+            return {}, {}, None
+
+        batch = build_player_highlights_query(players)
+        batch_response = self._request(batch, allow_partial=True)
+        response_hashes = {"batch": _payload_hash(batch_response)}
+        highlights = normalize_player_highlights_response(batch, batch_response)
+        error_policy = _player_error_policy(batch, batch_response)
+
+        # STRATZ may return HTTP 200 with per-alias GraphQL errors. Preserve
+        # successful aliases and retry every selected unresolved slot alone.
+        for index in selected_indices:
+            if highlights.get(index) is not None:
+                continue
+            policy = error_policy.get(index, "missing")
+            if policy == "missing_or_anonymous":
+                slots[index]["fallback_reason"] = (
+                    "player_missing_or_anonymous_in_stratz"
+                )
+                continue
+            if policy == "unsupported":
+                slots[index]["fallback_reason"] = "player_stats_request_failed"
+                continue
+            if policy == "missing":
+                slots[index]["fallback_reason"] = "player_hero_stats_missing"
+                continue
+            single = build_player_highlights_query([players[index]])
+            try:
+                response = self._request(single, allow_partial=True)
+            except StratzRoshError as error:
+                if error.category == "request_cancelled":
+                    raise
+                slots[index]["fallback_reason"] = "player_stats_request_failed"
+                continue
+            response_hashes[f"slot_{index}"] = _payload_hash(response)
+            normalized = normalize_player_highlights_response(single, response)
+            highlights[index] = normalized.get(0)
+            if highlights[index] is None:
+                retry_policy = _player_error_policy(single, response).get(0, "missing")
+                slots[index]["fallback_reason"] = {
+                    "missing_or_anonymous": "player_missing_or_anonymous_in_stratz",
+                    "unsupported": "player_stats_request_failed",
+                    "missing": "player_hero_stats_missing",
+                }.get(retry_policy, "player_stats_request_failed")
+        return highlights, response_hashes, _utc(self._clock())
+
     def fetch_historical_match_score(
         self,
         match_id: int,
+        *,
+        include_current_player_adjustment: bool = False,
     ) -> FetchedHistoricalRoshScore:
-        """Run the upstream GetMatchPicksBans historical Rosh entry point."""
+        """Score a past match without presenting current player data as historical."""
         match_request = build_rosh_match_query_request(match_id)
         match_response = self._request(match_request)
         context = build_rosh_match_context(match_id, match_response)
         radiant_picks = context["radiant_picks"]
         dire_picks = context["dire_picks"]
+        identity = historical_rosh_lineup_identity(context)
         week = int(context["week"])
         source_as_of = datetime.fromtimestamp(week, tz=timezone.utc)
         response_hashes = {"match": _payload_hash(match_response)}
@@ -320,50 +396,118 @@ class StratzRoshClient:
             response = self._request(request)
             responses[key] = response
             response_hashes[key] = _payload_hash(response)
+
+        slots: list[dict[str, Any]] = []
+        highlights: dict[int, Mapping[str, Any] | None] = {}
+        player_response_hashes: dict[str, str] = {}
+        player_stats_as_of: datetime | None = None
+        if include_current_player_adjustment:
+            players, slots = _player_slots(
+                identity["radiant_hero_ids"],
+                identity["dire_hero_ids"],
+                identity["radiant_player_ids"],
+                identity["dire_player_ids"],
+            )
+            highlights, player_response_hashes, player_stats_as_of = (
+                self._fetch_player_highlights(players, slots)
+            )
+            for index, slot in enumerate(slots):
+                resolved = highlights.get(index) is not None
+                slot["resolved"] = resolved
+                if resolved:
+                    slot["fallback_reason"] = None
+
+        coverage_count = sum(bool(slot["resolved"]) for slot in slots)
+        use_current_player_adjustment = coverage_count == 10
         scored = score_rosh_picks(
             radiant_picks,
             dire_picks,
             normalize_rosh_analysis(responses),
+            radiant_player_highlights=(
+                [highlights[index] for index in range(5)]
+                if use_current_player_adjustment
+                else None
+            ),
+            dire_player_highlights=(
+                [highlights[index] for index in range(5, 10)]
+                if use_current_player_adjustment
+                else None
+            ),
+            player_slot_statuses=slots or None,
         )
         raw_pure_score = scored.get("pure_lineup_score")
-        minute_table = tuple(scored.get("pure_minute_table") or ())
+        pure_minute_table = tuple(scored.get("pure_minute_table") or ())
         if raw_pure_score is None:
             return FetchedHistoricalRoshScore(
                 context=context,
                 score=None,
-                minute_table=minute_table,
+                minute_table=pure_minute_table,
             )
         pure_score = _required_score(raw_pure_score, "pure")
+        current_adjusted_score = (
+            _required_score(
+                scored.get("player_adjusted_lineup_score"),
+                "current player-adjusted",
+            )
+            if use_current_player_adjustment
+            else None
+        )
+        mode = (
+            "current_player_adjusted"
+            if current_adjusted_score is not None
+            else "pure"
+        )
+        effective_score = (
+            current_adjusted_score
+            if current_adjusted_score is not None
+            else pure_score
+        )
+        minute_table = tuple(
+            scored.get("minute_table")
+            if use_current_player_adjustment
+            else pure_minute_table
+        )
         evidence: dict[str, Any] = {
             "source": ROSH_SOURCE_NAME,
             "source_week": week,
+            "source_as_of": source_as_of.isoformat(),
             "cache_week_start": rosh_cache_week_start(source_as_of),
             "formula_version": ROSH_FORMULA_VERSION,
             "historical_match_id": match_id,
             "response_hashes": response_hashes,
-            "player_response_hashes": {},
-            "player_slots": [],
-            "pure_minute_table": list(minute_table),
+            "player_response_hashes": player_response_hashes,
+            "player_slots": slots,
+            "player_stats_as_of": (
+                player_stats_as_of.isoformat()
+                if player_stats_as_of is not None
+                else None
+            ),
+            "retrospective": True,
+            "current_player_adjustment_only": True,
+            "backtest_eligible": False,
+            "pure_minute_table": list(pure_minute_table),
             "score": {
                 "pure_lineup_score": pure_score,
-                "player_adjusted_lineup_score": None,
-                "effective_lineup_score": pure_score,
-                "scoring_mode": "pure",
-                "player_coverage_count": 0,
+                "current_player_adjusted_lineup_score": current_adjusted_score,
+                "effective_lineup_score": effective_score,
+                "scoring_mode": mode,
+                "player_coverage_count": coverage_count,
             },
         }
-        result = FetchedRoshLineupScore(
+        if use_current_player_adjustment:
+            evidence["minute_table"] = list(minute_table)
+        result = FetchedHistoricalRoshLineupScore(
             pure_lineup_score=pure_score,
-            player_adjusted_lineup_score=None,
-            effective_lineup_score=pure_score,
-            scoring_mode="pure",
-            player_coverage_count=0,
-            stake_multiplier=0.5,
+            current_player_adjusted_lineup_score=current_adjusted_score,
+            effective_lineup_score=effective_score,
+            scoring_mode=mode,
+            player_coverage_count=coverage_count,
             formula_version=ROSH_FORMULA_VERSION,
             source_name=ROSH_SOURCE_NAME,
             source_week=week,
             cache_week_start=rosh_cache_week_start(source_as_of),
             source_as_of=source_as_of,
+            player_stats_as_of=player_stats_as_of,
             evidence=evidence,
             evidence_hash=canonical_evidence_hash(evidence),
         )
@@ -382,6 +526,11 @@ class StratzRoshClient:
         query = request.get("query")
         if not isinstance(query, str) or not query.strip():
             raise StratzRoshError("STRATZ GraphQL query is empty")
+        if self._stop_requested():
+            raise StratzRoshError(
+                "STRATZ request cancelled",
+                category="request_cancelled",
+            )
         try:
             response = self._post(
                 self.endpoint,
@@ -399,26 +548,126 @@ class StratzRoshClient:
             )
         except Exception as error:
             raise StratzRoshError(
-                f"STRATZ request failed ({type(error).__name__})"
+                f"STRATZ request failed ({type(error).__name__})",
+                retryable=True,
+                category="network_failure",
             ) from None
         status = getattr(response, "status_code", None)
         if status != 200:
-            raise StratzRoshError(f"STRATZ request returned HTTP {status}")
+            retry_after = _retry_after_seconds(response)
+            retryable = status == 429 or (
+                type(status) is int and 500 <= status <= 599
+            )
+            category = (
+                "http_auth_failure"
+                if status in {401, 403}
+                else "http_429"
+                if status == 429
+                else "http_5xx"
+                if type(status) is int and 500 <= status <= 599
+                else "http_failure"
+            )
+            raise StratzRoshError(
+                f"STRATZ request returned HTTP {status}",
+                retryable=retryable,
+                retry_after_seconds=retry_after,
+                category=category,
+            )
         try:
             payload = response.json()
         except Exception as error:
             raise StratzRoshError(
-                f"STRATZ returned invalid JSON ({type(error).__name__})"
+                f"STRATZ returned invalid JSON ({type(error).__name__})",
+                category="invalid_json",
             ) from None
         if not isinstance(payload, Mapping):
-            raise StratzRoshError("STRATZ returned a non-object response")
-        if payload.get("errors") and not allow_partial:
-            raise StratzRoshError("STRATZ GraphQL request failed")
+            raise StratzRoshError(
+                "STRATZ returned a non-object response",
+                category="invalid_response",
+            )
+        if payload.get("errors"):
+            retryable, category = _graphql_retry_policy(payload.get("errors"))
+            if category == "graphql_auth_failure" or not allow_partial:
+                raise StratzRoshError(
+                    "STRATZ GraphQL request failed",
+                    retryable=retryable,
+                    retry_after_seconds=_retry_after_seconds(response),
+                    category=category,
+                )
         if not isinstance(payload.get("data"), Mapping) and not (
             allow_partial and payload.get("errors")
         ):
-            raise StratzRoshError("STRATZ GraphQL response has no data")
+            raise StratzRoshError(
+                "STRATZ GraphQL response has no data",
+                category="invalid_response",
+            )
         return payload
+
+
+def historical_rosh_lineup_identity(
+    context: Mapping[str, Any],
+) -> dict[str, tuple[int | None, ...] | tuple[int, ...]]:
+    """Return position-ordered STRATZ heroes and available player identities."""
+    radiant_picks = context.get("radiant_picks")
+    dire_picks = context.get("dire_picks")
+    if not isinstance(radiant_picks, Sequence) or isinstance(radiant_picks, (str, bytes)):
+        raise ValueError("historical radiant picks are unavailable")
+    if not isinstance(dire_picks, Sequence) or isinstance(dire_picks, (str, bytes)):
+        raise ValueError("historical dire picks are unavailable")
+    radiant_heroes = position_ordered_rosh_heroes(radiant_picks)
+    dire_heroes = position_ordered_rosh_heroes(dire_picks)
+
+    match = context.get("match")
+    raw_players = match.get("players") if isinstance(match, Mapping) else None
+    players = raw_players if isinstance(raw_players, list) else []
+    by_hero: dict[int, list[Mapping[str, Any]]] = {}
+    for player in players:
+        if not isinstance(player, Mapping):
+            continue
+        hero_id = player.get("heroId")
+        if type(hero_id) is int and hero_id > 0:
+            by_hero.setdefault(hero_id, []).append(player)
+
+    def player_ids(hero_ids: Sequence[int]) -> tuple[int | None, ...]:
+        result: list[int | None] = []
+        for hero_id in hero_ids:
+            candidates = by_hero.get(hero_id, [])
+            candidate = candidates[0] if len(candidates) == 1 else None
+            account_id = (
+                candidate.get("steamAccountId")
+                if isinstance(candidate, Mapping)
+                else None
+            )
+            result.append(
+                account_id
+                if type(account_id) is int and account_id > 0
+                else None
+            )
+        return tuple(result)
+
+    radiant_players = player_ids(radiant_heroes)
+    dire_players = player_ids(dire_heroes)
+    all_players = (*radiant_players, *dire_players)
+    duplicate_ids = {
+        player_id
+        for player_id in all_players
+        if player_id is not None and all_players.count(player_id) > 1
+    }
+    if duplicate_ids:
+        radiant_players = tuple(
+            None if player_id in duplicate_ids else player_id
+            for player_id in radiant_players
+        )
+        dire_players = tuple(
+            None if player_id in duplicate_ids else player_id
+            for player_id in dire_players
+        )
+    return {
+        "radiant_hero_ids": radiant_heroes,
+        "dire_hero_ids": dire_heroes,
+        "radiant_player_ids": radiant_players,
+        "dire_player_ids": dire_players,
+    }
 
 
 def _player_slots(
@@ -501,6 +750,45 @@ def _payload_hash(payload: Mapping[str, Any]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", None)
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    raw = getter("Retry-After")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value != value or value < 0 or value == float("inf"):
+        return None
+    return min(value, 60.0)
+
+
+def _graphql_retry_policy(errors: Any) -> tuple[bool, str]:
+    if not isinstance(errors, list) or not errors:
+        return False, "graphql_failure"
+    codes: list[str] = []
+    for error in errors:
+        extensions = error.get("extensions") if isinstance(error, Mapping) else None
+        code = extensions.get("code") if isinstance(extensions, Mapping) else None
+        if not isinstance(code, str) or not code.strip():
+            return False, "graphql_failure"
+        codes.append(code.strip().upper())
+    auth_codes = {"UNAUTHENTICATED", "FORBIDDEN", "PERMISSION_DENIED"}
+    if any(code in auth_codes for code in codes):
+        return False, "graphql_auth_failure"
+    retryable_codes = {"RATE_LIMITED", "INTERNAL_SERVER_ERROR"}
+    if any(code not in retryable_codes for code in codes):
+        return False, "graphql_failure"
+    category = (
+        "graphql_rate_limited"
+        if "RATE_LIMITED" in codes
+        else "graphql_internal_server_error"
+    )
+    return True, category
 
 
 def _player_error_policy(

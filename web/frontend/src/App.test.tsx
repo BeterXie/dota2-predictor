@@ -289,6 +289,8 @@ describe("App data recovery and ownership", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
     expect(await screen.findByTestId("selected-match")).toHaveTextContent("a");
+    expect(screen.getByText("数据降级赛事")).toBeInTheDocument();
+    expect(screen.getByText("活动告警")).toBeInTheDocument();
     expect(screen.queryByText("opendota-postmatch")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-a" })).not.toBeInTheDocument();
   });

@@ -13,10 +13,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from shared.sqlite import connect
 
+from .comeback import STRATEGY_VERSION as COMEBACK_ENTRY_STRATEGY_VERSION
+from .comeback_entry import ComebackEntryPolicy, decide_comeback_entry
 from .evaluation import brier_score, log_loss, shadow_summary
 from .draft_authority import (
     authority_from_row,
@@ -48,6 +51,13 @@ _STRATIFICATION_DEFINITIONS = {
     "team": "selected canonical team from strict mapping refs",
     "odds_bucket": "signal decimal price",
     "game_minute_bucket": "trusted vision game clock at signal",
+    "kill_deficit_bucket": "persisted underdog kill deficit at signal",
+    "net_worth_deficit_bucket": (
+        "persisted canonical HUD economy bucket directed relative to the underdog"
+    ),
+    "rosh_underdog_probability_bucket": (
+        "persisted Rosh probability for the selected underdog at signal"
+    ),
     "vision_quality_bucket": "minimum clock/draft confidence for the signal frame",
     "signal_reason": "persisted strategy decision reason",
     "latency_bucket": "vision capture to signal transport seconds",
@@ -65,6 +75,10 @@ class _DecisionContext:
     selected_side: str | None
     selected_team: str
     game_minute: float | None
+    kill_deficit: float | None
+    net_worth_deficit_min: int | None
+    net_worth_deficit_max: int | None
+    rosh_underdog_probability: float | None
     vision_key: tuple[str, str, str] | None
     signal_reason: str
     coverage: float | None
@@ -77,12 +91,33 @@ class _OrderRecord:
     event_id: str | None
     selected_team: str
     game_minute: float | None
+    kill_deficit: float | None
+    net_worth_deficit_min: int | None
+    net_worth_deficit_max: int | None
+    rosh_underdog_probability: float | None
     vision_quality: float | None
     signal_reason: str
     latency_seconds: float | None
     coverage: float | None
     slippage: float | None
     outcome: int | None
+
+
+@dataclass(frozen=True)
+class _EntryValidation:
+    valid: bool
+    invalid_reason: str | None = None
+    inputs: Mapping[str, Any] | None = None
+    hud_confirmed: bool = False
+    controlled_deficit: bool = False
+    rosh_direction_pass: bool = False
+    row_eligible: bool = False
+    game_minute: float | None = None
+    kill_deficit: float | None = None
+    net_worth_deficit_min: int | None = None
+    net_worth_deficit_max: int | None = None
+    rosh_underdog_probability: float | None = None
+    underdog_price: float | None = None
 
 
 def _decision_draft_authority_valid(
@@ -270,6 +305,20 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         row for row in decisions
         if _decision_draft_authority_valid(connection, row)
     ]
+    entry_validations = {
+        str(row["decision_key"]): _validate_v4_entry(row)
+        for row in decisions
+        if str(row["strategy_version"]) == COMEBACK_ENTRY_STRATEGY_VERSION
+    }
+    eligible_decisions = 0
+    for row in decisions:
+        if int(row["eligible"]) != 1:
+            continue
+        if str(row["strategy_version"]) == COMEBACK_ENTRY_STRATEGY_VERSION:
+            validation = entry_validations.get(str(row["decision_key"]))
+            if validation is None or not validation.valid:
+                continue
+        eligible_decisions += 1
     reasons = Counter(str(row["reason"]) for row in decisions)
     reconciliation_available = table_has_columns(
         connection,
@@ -437,10 +486,14 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         orders,
         decision_index,
         _vision_quality_index(connection, decisions),
+        entry_validations,
+    )
+    scorable_orders = _scorable_orders(
+        orders, decision_index, entry_validations
     )
     summary_rows = []
     settled = 0
-    for row in orders:
+    for row in scorable_orders:
         summary = dict(row)
         outcome = _binary_outcome(row)
         if outcome is None:
@@ -459,7 +512,10 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         included_decision_count=len(decisions),
         strict_gate=decision_strict_gate,
     )
-    headline = cohorts[0] if len(cohorts) == 1 and cohorts[0]["identity_complete"] else None
+    scorable_cohorts = [
+        cohort for cohort in cohorts if cohort["identity_complete"]
+    ]
+    headline = scorable_cohorts[0] if len(scorable_cohorts) == 1 else None
     outbox = _group_counts(connection, "notification_outbox", "status")
     reconciliation = _settlement_reconciliation_counts(connection)
     settlement_authority_audit_log = _group_counts(
@@ -469,6 +525,9 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
     strategy_versions = dict(sorted(Counter(
         str(row["strategy_version"]) for row in decisions
     ).items()))
+    forward_entry_by_strategy_version = _forward_entry_evaluation(
+        decisions, cohorts, entry_validations
+    )
     try:
         strict_counts = {
             "accepted_mappings": int(connection.execute(
@@ -519,9 +578,9 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         "settlement_authority_audit": dict(
             sorted(settlement_authority_failures.items())
         ),
-        "eligible_decisions": sum(int(row["eligible"]) for row in decisions),
+        "eligible_decisions": eligible_decisions,
         "decision_reasons": dict(sorted(reasons.items())),
-        "orders": shadow_summary(summary_rows),
+        "orders": _order_summary(summary_rows, score=True),
         "settled_orders": settled,
         "brier_score": None if headline is None else headline["brier_score"],
         "log_loss": None if headline is None else headline["log_loss"],
@@ -543,9 +602,12 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         ),
         "service_health": health,
         "strategy_versions": strategy_versions,
+        "forward_entry_by_strategy_version": forward_entry_by_strategy_version,
         "strict_scope": strict_counts,
         "research": research_summary(connection),
-        "stability_status": _headline_stability_status(cohorts, settled),
+        "stability_status": _headline_stability_status(
+            scorable_cohorts, settled
+        ),
         "minimum_stability_sample": 500,
         "minimum_stability_events": 2,
     }
@@ -567,24 +629,72 @@ def _decision_index(
     return index
 
 
+def _linked_decision(
+    order: Mapping[str, object],
+    decision_index: Mapping[tuple[object, ...], list[sqlite3.Row]],
+) -> sqlite3.Row | None:
+    key = (
+        str(order["raybet_match_id"]),
+        int(order["attempt_map_number"]),
+        str(order["signaled_at"]),
+        float(order["model_probability"]),
+        float(order["market_probability"]),
+    )
+    candidates = decision_index.get(key, [])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _scorable_orders(
+    orders: Sequence[Mapping[str, object]],
+    decision_index: Mapping[tuple[object, ...], list[sqlite3.Row]],
+    entry_validations: Mapping[str, _EntryValidation],
+) -> list[Mapping[str, object]]:
+    output = []
+    for order in orders:
+        decision = _linked_decision(order, decision_index)
+        if decision is None:
+            continue
+        context = _decision_context(decision)
+        if (
+            order["strict_mapping_id"] is None
+            or context.mapping_id is None
+            or int(order["strict_mapping_id"]) != context.mapping_id
+            or any(
+                context.identity.get(field) in (None, "")
+                for field in _COHORT_IDENTITY_FIELDS
+            )
+        ):
+            continue
+        if str(decision["strategy_version"]) == COMEBACK_ENTRY_STRATEGY_VERSION:
+            validation = entry_validations.get(str(decision["decision_key"]))
+            if validation is None or not validation.valid:
+                continue
+        output.append(order)
+    return output
+
+
 def _evaluation_cohorts(
     orders: Sequence[sqlite3.Row],
     decision_index: Mapping[tuple[object, ...], list[sqlite3.Row]],
     vision_quality: Mapping[tuple[str, str, str], float],
+    entry_validations: Mapping[str, _EntryValidation],
 ) -> list[dict[str, object]]:
     grouped: dict[tuple[str | None, ...], dict[str, Any]] = {}
     for order in orders:
-        key = (
-            str(order["raybet_match_id"]),
-            int(order["attempt_map_number"]),
-            str(order["signaled_at"]),
-            float(order["model_probability"]),
-            float(order["market_probability"]),
-        )
-        candidates = decision_index.get(key, [])
-        decision = candidates[0] if len(candidates) == 1 else None
+        decision = _linked_decision(order, decision_index)
         context = _decision_context(decision)
         identity = context.identity
+        entry_status: str | None = None
+        if (
+            decision is not None
+            and str(decision["strategy_version"])
+            == COMEBACK_ENTRY_STRATEGY_VERSION
+        ):
+            validation = entry_validations.get(str(decision["decision_key"]))
+            entry_status = (
+                "valid" if validation is not None and validation.valid else "invalid"
+            )
+            identity["entry_evidence_status"] = entry_status
         order_mapping_id = order["strict_mapping_id"]
         if (
             decision is None
@@ -601,7 +711,11 @@ def _evaluation_cohorts(
             identity["linkage_status"] = "verified"
         identity_key = tuple(
             None if identity.get(field) in (None, "") else str(identity[field])
-            for field in (*_COHORT_IDENTITY_FIELDS, "linkage_status")
+            for field in (
+                *_COHORT_IDENTITY_FIELDS,
+                "entry_evidence_status",
+                "linkage_status",
+            )
         )
         cohort = grouped.setdefault(
             identity_key,
@@ -628,6 +742,10 @@ def _evaluation_cohorts(
             event_id=None if not strict_event else str(strict_event),
             selected_team=team,
             game_minute=context.game_minute,
+            kill_deficit=context.kill_deficit,
+            net_worth_deficit_min=context.net_worth_deficit_min,
+            net_worth_deficit_max=context.net_worth_deficit_max,
+            rosh_underdog_probability=context.rosh_underdog_probability,
             vision_quality=quality,
             signal_reason=context.signal_reason,
             latency_seconds=latency,
@@ -648,7 +766,11 @@ def _evaluation_cohorts(
         })
         identity_complete = all(identity_key[index] for index in range(
             len(_COHORT_IDENTITY_FIELDS)
-        )) and identity_key[-1] == "verified"
+        )) and identity_key[-1] == "verified" and (
+            cohort["identity"].get("strategy_version")
+            != COMEBACK_ENTRY_STRATEGY_VERSION
+            or cohort["identity"].get("entry_evidence_status") == "valid"
+        )
         summary_rows = [_summary_row(record) for record in records]
         metrics = _record_metrics(records, score=identity_complete)
         bootstrap = _series_cluster_bootstrap(
@@ -670,7 +792,9 @@ def _evaluation_cohorts(
         output.append({
             "identity": cohort["identity"],
             "identity_complete": identity_complete,
-            "orders": shadow_summary(summary_rows),
+            "orders": _order_summary(
+                summary_rows, score=identity_complete
+            ),
             "settled_orders": metrics["settled_orders"],
             "event_count": len(events),
             "events": events,
@@ -711,7 +835,8 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
     }
     if decision is None:
         return _DecisionContext(
-            identity, None, None, None, "unknown", None, None, "unknown", None
+            identity, None, None, None, "unknown", None, None, None, None,
+            None, None, "unknown", None
         )
     identity["strategy_version"] = str(decision["strategy_version"])
     authority = authority_from_row(decision)
@@ -738,6 +863,10 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
             "unknown",
             None,
             None,
+            None,
+            None,
+            None,
+            None,
             str(decision["reason"]),
             _finite_or_none(decision["data_quality"]),
         )
@@ -754,6 +883,28 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
         vision = {}
     clock = _finite_or_none(vision.get("game_clock_seconds"))
     game_minute = None if clock is None or clock < 0.0 else clock / 60.0
+    comeback_state = inputs.get("comeback_state")
+    if not isinstance(comeback_state, Mapping):
+        comeback_state = {}
+    kill_deficit = _finite_or_none(comeback_state.get("kill_deficit"))
+    raw_net_worth_deficit_min = comeback_state.get("net_worth_deficit_min")
+    raw_net_worth_deficit_max = comeback_state.get("net_worth_deficit_max")
+    net_worth_deficit_min = (
+        raw_net_worth_deficit_min
+        if type(raw_net_worth_deficit_min) is int
+        else None
+    )
+    net_worth_deficit_max = (
+        raw_net_worth_deficit_max
+        if type(raw_net_worth_deficit_max) is int
+        else None
+    )
+    comeback_entry = inputs.get("comeback_entry")
+    if not isinstance(comeback_entry, Mapping):
+        comeback_entry = {}
+    rosh_underdog_probability = _finite_or_none(
+        comeback_entry.get("rosh_underdog_probability")
+    )
     captured_at = vision.get("captured_at")
     frame_ref = vision.get("source_frame_ref")
     vision_key = (
@@ -772,6 +923,10 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
         selected_side=selected_side,
         selected_team=team,
         game_minute=game_minute,
+        kill_deficit=kill_deficit,
+        net_worth_deficit_min=net_worth_deficit_min,
+        net_worth_deficit_max=net_worth_deficit_max,
+        rosh_underdog_probability=rosh_underdog_probability,
         vision_key=vision_key,
         signal_reason=str(decision["reason"]),
         coverage=_finite_or_none(decision["data_quality"]),
@@ -783,6 +938,398 @@ def _finite_or_none(value: object) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _forward_entry_evaluation(
+    decisions: Sequence[sqlite3.Row],
+    cohorts: Sequence[Mapping[str, object]],
+    entry_validations: Mapping[str, _EntryValidation],
+) -> dict[str, dict[str, object]]:
+    """Expose the current v4 entry funnel without pooling strategy versions."""
+
+    version = COMEBACK_ENTRY_STRATEGY_VERSION
+    rows = [row for row in decisions if str(row["strategy_version"]) == version]
+    counts: Counter[str] = Counter()
+    buckets: dict[str, Counter[str]] = {
+        "game_minute": Counter(),
+        "kill_deficit": Counter(),
+        "net_worth_deficit": Counter(),
+        "rosh_underdog_probability": Counter(),
+        "odds": Counter(),
+    }
+    rejections: Counter[str] = Counter()
+    invalid_reasons: Counter[str] = Counter()
+    for row in rows:
+        validation = entry_validations.get(str(row["decision_key"]))
+        valid = validation is not None and validation.valid
+        counts["entry_evidence" if valid else "entry_evidence_invalid"] += 1
+        if not valid:
+            reason = (
+                validation.invalid_reason
+                if validation is not None and validation.invalid_reason
+                else "entry_validation_missing"
+            )
+            invalid_reasons[reason] += 1
+        assert validation is not None
+        buckets["game_minute"][_minute_bucket(validation.game_minute)] += 1
+        buckets["kill_deficit"][_kill_deficit_bucket(
+            validation.kill_deficit
+        )] += 1
+        buckets["net_worth_deficit"][_net_worth_deficit_bucket(
+            validation.net_worth_deficit_min,
+            validation.net_worth_deficit_max,
+        )] += 1
+        buckets["rosh_underdog_probability"][_rosh_probability_bucket(
+            validation.rosh_underdog_probability
+        )] += 1
+        buckets["odds"][_odds_bucket(
+            validation.underdog_price
+        )] += 1
+        if valid and validation.hud_confirmed:
+            counts["hud_confirmed"] += 1
+        if valid and validation.controlled_deficit:
+            counts["controlled_deficit"] += 1
+        if valid and validation.rosh_direction_pass:
+            counts["rosh_direction_pass"] += 1
+        if valid and validation.row_eligible:
+            counts["eligible"] += 1
+        elif valid:
+            rejections[str(row["reason"])] += 1
+
+    version_cohorts = [
+        cohort for cohort in cohorts
+        if isinstance(cohort.get("identity"), Mapping)
+        and cohort["identity"].get("strategy_version") == version
+    ]
+    return {version: {
+        "candidate_count": len(rows),
+        "entry_evidence_count": counts["entry_evidence"],
+        "entry_evidence_invalid_count": counts["entry_evidence_invalid"],
+        "entry_evidence_invalid_reasons": dict(sorted(invalid_reasons.items())),
+        "hud_confirmed_count": counts["hud_confirmed"],
+        "controlled_deficit_count": counts["controlled_deficit"],
+        "rosh_direction_pass_count": counts["rosh_direction_pass"],
+        "eligible_count": counts["eligible"],
+        "rejection_reasons": dict(sorted(rejections.items())),
+        "candidate_buckets": {
+            name: dict(sorted(values.items())) for name, values in buckets.items()
+        },
+        "settled_performance": _version_settled_performance(version_cohorts),
+    }}
+
+
+def _invalid_entry(reason: str) -> _EntryValidation:
+    return _EntryValidation(False, invalid_reason=reason)
+
+
+def _validate_v4_entry(row: sqlite3.Row) -> _EntryValidation:
+    """Rebuild the persisted v4 entry decision from its own frozen policy."""
+
+    try:
+        payload = json.loads(str(row["contributions_json"]))
+        inputs = payload["__inputs__"]
+        state = inputs["comeback_state"]
+        window = inputs["entry_window"]
+        entry = inputs["comeback_entry"]
+        market = inputs["market"]
+        rosh = inputs["rosh_lineup_score"]
+        vision = inputs["vision"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return _invalid_entry("invalid_entry_json")
+    if not isinstance(inputs, Mapping) or not all(
+        isinstance(group, Mapping)
+        for group in (state, window, entry, market, rosh, vision)
+    ):
+        return _invalid_entry("invalid_entry_structure")
+
+    raw_policy = entry.get("policy")
+    if not isinstance(raw_policy, Mapping):
+        return _invalid_entry("invalid_entry_policy")
+    integer_policy_fields = (
+        "minimum_clock_seconds",
+        "maximum_clock_seconds",
+        "minimum_kill_deficit",
+        "maximum_kill_deficit",
+        "minimum_net_worth_deficit",
+        "maximum_net_worth_deficit",
+    )
+    confidence = raw_policy.get("minimum_vision_confidence")
+    if (
+        set(raw_policy) != set(ComebackEntryPolicy.__dataclass_fields__)
+        or any(
+            type(raw_policy.get(name)) is not int or int(raw_policy[name]) < 0
+            for name in integer_policy_fields
+        )
+        or _finite_or_none(confidence) is None
+        or not 0.0 <= float(confidence) <= 1.0
+        or int(raw_policy["minimum_clock_seconds"])
+        > int(raw_policy["maximum_clock_seconds"])
+        or int(raw_policy["minimum_kill_deficit"])
+        > int(raw_policy["maximum_kill_deficit"])
+        or int(raw_policy["minimum_net_worth_deficit"])
+        > int(raw_policy["maximum_net_worth_deficit"])
+    ):
+        return _invalid_entry("invalid_entry_policy")
+    policy = ComebackEntryPolicy(**dict(raw_policy))
+
+    underdog_side = str(row["underdog_side"])
+    radiant_team_side = vision.get("radiant_team_side")
+    game_clock = window.get("game_clock_seconds")
+    underdog_price = _finite_or_none(market.get("underdog_price"))
+    if (
+        underdog_side not in {"team_one", "team_two"}
+        or state.get("underdog_side") != underdog_side
+        or market.get("underdog_side") != underdog_side
+        or radiant_team_side not in {"team_one", "team_two"}
+        or type(game_clock) is not int
+        or game_clock < 0
+        or vision.get("game_clock_seconds") != game_clock
+        or underdog_price is None
+        or underdog_price <= 0.0
+    ):
+        return _invalid_entry("invalid_entry_identity")
+    if (
+        state.get("reason")
+        == "vision_net_worth_exact_totals_not_production_evidence"
+        or any(
+            state.get(name) is not None
+            for name in (
+                "underdog_net_worth",
+                "opponent_net_worth",
+                "net_worth_deficit",
+            )
+        )
+    ):
+        return _invalid_entry("unsupported_exact_net_worth_evidence")
+
+    persisted_probability = entry.get("rosh_underdog_probability")
+    selected_score = rosh.get("selected_score")
+    if selected_score is None:
+        if persisted_probability is not None:
+            return _invalid_entry("inconsistent_rosh_direction")
+        rosh_probability = None
+    else:
+        score = _finite_or_none(selected_score)
+        rosh_probability = _finite_or_none(persisted_probability)
+        if score is None or rosh_probability is None or not 0.0 <= rosh_probability <= 1.0:
+            return _invalid_entry("inconsistent_rosh_direction")
+        radiant_probability = min(
+            1.0 - 1e-6,
+            max(1e-6, (50.0 + score) / 100.0),
+        )
+        expected_probability = (
+            radiant_probability
+            if underdog_side == radiant_team_side
+            else 1.0 - radiant_probability
+        )
+        if not math.isclose(
+            rosh_probability, expected_probability, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            return _invalid_entry("inconsistent_rosh_direction")
+
+    raw_state, state_valid = _raw_comeback_state(
+        state,
+        underdog_side=underdog_side,
+        radiant_team_side=str(radiant_team_side),
+    )
+    if not state_valid:
+        return _invalid_entry("invalid_comeback_state")
+    canonical = decide_comeback_entry(
+        SimpleNamespace(
+            comeback_state=raw_state,
+            screen_state="game",
+            game_clock_seconds=game_clock,
+            radiant_team_side=radiant_team_side,
+        ),
+        underdog_side=underdog_side,
+        rosh_underdog_probability=rosh_probability,
+        policy=policy,
+    )
+    canonical_inputs = canonical.as_inputs()
+    if (
+        dict(state) != canonical_inputs["comeback_state"]
+        or dict(window) != canonical_inputs["entry_window"]
+        or dict(entry) != canonical_inputs["comeback_entry"]
+    ):
+        return _invalid_entry("inconsistent_entry_contract")
+
+    row_eligible_value = row["eligible"]
+    row_reason = row["reason"]
+    if (
+        row_eligible_value not in (0, 1)
+        or not isinstance(row_reason, str)
+        or not row_reason
+        or (bool(row_eligible_value) and (
+            not canonical.eligible or row_reason != "eligible"
+        ))
+        or (not bool(row_eligible_value) and row_reason == "eligible")
+    ):
+        return _invalid_entry("inconsistent_row_entry_decision")
+
+    return _EntryValidation(
+        True,
+        inputs=inputs,
+        hud_confirmed=(
+            canonical.situation.source_status == "available"
+            and canonical.situation.source == "vision_hud"
+            and canonical.situation.confidence >= policy.minimum_vision_confidence
+        ),
+        controlled_deficit=canonical.situation.controllable,
+        rosh_direction_pass=(
+            canonical.situation.controllable
+            and rosh_probability is not None
+            and rosh_probability > 0.5
+        ),
+        row_eligible=bool(row_eligible_value),
+        game_minute=game_clock / 60.0,
+        kill_deficit=(
+            None
+            if canonical.situation.kill_deficit is None
+            else float(canonical.situation.kill_deficit)
+        ),
+        net_worth_deficit_min=canonical.situation.net_worth_deficit_min,
+        net_worth_deficit_max=canonical.situation.net_worth_deficit_max,
+        rosh_underdog_probability=rosh_probability,
+        underdog_price=underdog_price,
+    )
+
+
+def _raw_comeback_state(
+    state: Mapping[str, Any],
+    *,
+    underdog_side: str,
+    radiant_team_side: str,
+) -> tuple[object | None, bool]:
+    expected_keys = {
+        "controllable", "reason", "source_status", "source", "confidence",
+        "underdog_side", "underdog_kills", "opponent_kills", "kill_deficit",
+        "underdog_net_worth", "opponent_net_worth", "net_worth_deficit",
+        "net_worth_advantage_side", "net_worth_deficit_min",
+        "net_worth_deficit_max", "unavailable_reason",
+    }
+    if set(state) != expected_keys:
+        return None, False
+    if state.get("source_status") == "missing":
+        return None, True
+    if state.get("source_status") == "unavailable":
+        return {
+            "status": "unavailable",
+            "source": None,
+            "confidence": 0.0,
+            "unavailable_reason": state.get("unavailable_reason"),
+        }, True
+    if state.get("source_status") != "available" or state.get("source") != "vision_hud":
+        return None, False
+
+    underdog_kills = state.get("underdog_kills")
+    opponent_kills = state.get("opponent_kills")
+    if any(
+        type(value) is not int or value < 0
+        for value in (underdog_kills, opponent_kills)
+    ):
+        return None, False
+    underdog_is_radiant = underdog_side == radiant_team_side
+    radiant_kills, dire_kills = (
+        (underdog_kills, opponent_kills)
+        if underdog_is_radiant
+        else (opponent_kills, underdog_kills)
+    )
+
+    underdog_net_worth = state.get("underdog_net_worth")
+    opponent_net_worth = state.get("opponent_net_worth")
+    deficit_min = state.get("net_worth_deficit_min")
+    deficit_max = state.get("net_worth_deficit_max")
+    advantage_side = state.get("net_worth_advantage_side")
+    raw = {
+        "status": "available",
+        "source": "vision_hud",
+        "confidence": state.get("confidence"),
+        "radiant_kills": radiant_kills,
+        "dire_kills": dire_kills,
+        "radiant_net_worth": None,
+        "dire_net_worth": None,
+        "net_worth_advantage_side": None,
+        "net_worth_advantage_min": None,
+        "net_worth_advantage_max": None,
+        "unavailable_reason": None,
+    }
+    exact_values = (underdog_net_worth, opponent_net_worth)
+    if all(type(value) is int and value >= 0 for value in exact_values):
+        raw["radiant_net_worth"], raw["dire_net_worth"] = (
+            exact_values if underdog_is_radiant else tuple(reversed(exact_values))
+        )
+    elif all(value is None for value in exact_values) and (
+        advantage_side in {"radiant", "dire"}
+        and type(deficit_min) is int
+        and type(deficit_max) is int
+        and deficit_min <= deficit_max
+    ):
+        underdog_radiant_side = "radiant" if underdog_is_radiant else "dire"
+        if advantage_side == underdog_radiant_side:
+            advantage_min, advantage_max = -deficit_max, -deficit_min
+        else:
+            advantage_min, advantage_max = deficit_min, deficit_max
+        if advantage_min < 0 or advantage_max < advantage_min:
+            return None, False
+        raw["net_worth_advantage_side"] = advantage_side
+        raw["net_worth_advantage_min"] = advantage_min
+        raw["net_worth_advantage_max"] = advantage_max
+    else:
+        return None, False
+    return raw, True
+
+
+def _version_settled_performance(
+    cohorts: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    dimensions = (
+        "odds_bucket",
+        "game_minute_bucket",
+        "kill_deficit_bucket",
+        "net_worth_deficit_bucket",
+        "rosh_underdog_probability_bucket",
+    )
+    isolated = [
+        cohort for cohort in cohorts
+        if isinstance(cohort.get("identity"), Mapping)
+        and cohort["identity"].get("entry_evidence_status") != "valid"
+    ]
+    summaries = []
+    for cohort in cohorts:
+        if (
+            not isinstance(cohort.get("identity"), Mapping)
+            or cohort["identity"].get("entry_evidence_status") != "valid"
+        ):
+            continue
+        stratified = cohort["stratified"]
+        summaries.append({
+            "identity": cohort["identity"],
+            "identity_complete": cohort["identity_complete"],
+            "orders": cohort["orders"],
+            "settled_orders": cohort["settled_orders"],
+            "event_count": cohort["event_count"],
+            "brier_score": cohort["brier_score"],
+            "log_loss": cohort["log_loss"],
+            "market_brier_score": cohort["market_brier_score"],
+            "roi": cohort["roi"],
+            "stability_status": cohort["stability_status"],
+            "buckets": {
+                dimension: stratified[dimension] for dimension in dimensions
+            },
+        })
+    return {
+        "cohort_count": len(summaries),
+        "settled_order_count": sum(
+            int(summary["settled_orders"]) for summary in summaries
+        ),
+        "invalid_entry_order_count": sum(
+            int(cohort["orders"]["signals"]) for cohort in isolated
+        ),
+        "invalid_entry_settled_order_count": sum(
+            int(cohort["settled_orders"]) for cohort in isolated
+        ),
+        "cohorts": summaries,
+    }
 
 
 def _strict_team_label(strict: Mapping[str, object], side: str) -> str:
@@ -933,6 +1480,17 @@ def _summary_row(record: _OrderRecord) -> dict[str, object]:
     if record.outcome is None:
         row["return_units"] = None
     return row
+
+
+def _order_summary(
+    rows: Sequence[Mapping[str, object]], *, score: bool
+) -> dict[str, object]:
+    summary = dict(shadow_summary(rows))
+    if score:
+        return summary
+    for field in ("stake_units", "return_units", "pnl_units", "roi"):
+        summary[field] = None
+    return summary
 
 
 def _binary_outcome(row: Mapping[str, object]) -> int | None:
@@ -1199,6 +1757,16 @@ def _stratified(
         "team": lambda record: record.selected_team,
         "odds_bucket": lambda record: _odds_bucket(record.row["signal_price"]),
         "game_minute_bucket": lambda record: _minute_bucket(record.game_minute),
+        "kill_deficit_bucket": lambda record: _kill_deficit_bucket(
+            record.kill_deficit
+        ),
+        "net_worth_deficit_bucket": lambda record: _net_worth_deficit_bucket(
+            record.net_worth_deficit_min,
+            record.net_worth_deficit_max,
+        ),
+        "rosh_underdog_probability_bucket": lambda record: (
+            _rosh_probability_bucket(record.rosh_underdog_probability)
+        ),
         "vision_quality_bucket": lambda record: _quality_bucket(
             record.vision_quality, vision=True
         ),
@@ -1284,6 +1852,55 @@ def _minute_bucket(value: float | None) -> str:
     if value < 50.0:
         return "40-49"
     return "50+"
+
+
+def _kill_deficit_bucket(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value <= 0.0:
+        return "<=0"
+    if value < 2.0:
+        return "1"
+    if value < 5.0:
+        return "2-4"
+    if value < 8.0:
+        return "5-7"
+    if value <= 10.0:
+        return "8-10"
+    return "11+"
+
+
+def _net_worth_deficit_bucket(minimum: object, maximum: object) -> str:
+    if type(minimum) is not int or type(maximum) is not int:
+        return "unknown"
+    if minimum >= 0:
+        direction = "underdog_deficit"
+        bucket_minimum, bucket_maximum = minimum, maximum
+    elif maximum <= 0:
+        direction = "underdog_ahead"
+        bucket_minimum, bucket_maximum = -maximum, -minimum
+    else:
+        return "unknown"
+    if (
+        bucket_minimum < 0
+        or bucket_minimum % 1_000 != 0
+        or bucket_maximum != bucket_minimum + 999
+    ):
+        return "unknown"
+    label = "<1k" if bucket_minimum == 0 else f"{bucket_minimum // 1_000}k"
+    return f"{direction}:{label}"
+
+
+def _rosh_probability_bucket(value: float | None) -> str:
+    if value is None or not 0.0 <= value <= 1.0:
+        return "unknown"
+    if value < 0.3:
+        return "<0.30"
+    if value <= 0.5:
+        return "0.30-0.50"
+    if value < 0.7:
+        return "0.50-0.70"
+    return "0.70+"
 
 
 def _quality_bucket(value: float | None, *, vision: bool) -> str:

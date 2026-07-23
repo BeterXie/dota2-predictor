@@ -14,7 +14,7 @@ from live_betting.profiles.draft_curve import DraftPoint, build_draft_curve
 from live_betting.shadow_strategy import ComebackShadowStrategy
 from live_betting.shadow_monitor import _profile_refs, _profiles
 from live_betting.storage import LiveBettingStore
-from live_betting.vision import VisionObservation
+from live_betting.vision import VisionComebackState, VisionObservation
 
 
 NOW = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
@@ -40,6 +40,19 @@ def observation() -> VisionObservation:
         "frame",
         "game",
         "team_one",
+        comeback_state=VisionComebackState(
+            "available",
+            "vision_hud",
+            0.95,
+            18,
+            14,
+            None,
+            None,
+            None,
+            net_worth_advantage_side="radiant",
+            net_worth_advantage_min=5_000,
+            net_worth_advantage_max=5_999,
+        ),
     )
 
 
@@ -424,7 +437,7 @@ class StrictComebackStrategyTests(unittest.TestCase):
             0.0,
         )
 
-    def test_market_movement_alone_cannot_create_signal(self) -> None:
+    def test_market_only_discovers_candidate_and_rosh_must_supply_direction(self) -> None:
         result = self.evaluate(
             previous=snapshots(NOW),
             current=snapshots(
@@ -440,10 +453,14 @@ class StrictComebackStrategyTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            result.decision.reason, "no_independent_positive_contribution"
+            result.decision.reason, "rosh_direction_opposes_underdog"
         )
         self.assertIsNone(result.order)
-        self.assertGreater(result.decision.contributions["market_movement"], 0.0)
+        self.assertEqual(result.decision.contributions["market_movement"], 0.0)
+        self.assertGreater(result.decision.inputs["market"]["probability_move"], 0.0)
+        self.assertFalse(
+            result.decision.inputs["market"]["probability_move_used_as_evidence"]
+        )
 
     def test_large_devigged_move_fails_even_when_dog_odds_move_under_two_percent(self) -> None:
         result = self.evaluate(
@@ -471,7 +488,7 @@ class StrictComebackStrategyTests(unittest.TestCase):
         )
         self.assertIsNone(result.order)
 
-    def test_conservative_shrink_can_veto_positive_point_edge(self) -> None:
+    def test_rosh_direction_vetoes_other_positive_edge(self) -> None:
         result = self.evaluate(
             previous=snapshots(NOW),
             current=snapshots(NOW + timedelta(seconds=3)),
@@ -488,11 +505,7 @@ class StrictComebackStrategyTests(unittest.TestCase):
 
         self.assertGreater(result.decision.edge, 0.005)
         self.assertEqual(
-            result.decision.reason, "conservative_probability_not_above_market"
-        )
-        self.assertLessEqual(
-            result.decision.conservative_probability,
-            result.decision.market_probability,
+            result.decision.reason, "rosh_direction_opposes_underdog"
         )
         self.assertIsNone(result.order)
 

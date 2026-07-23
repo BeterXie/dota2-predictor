@@ -52,7 +52,7 @@ from .stratz_rosh_client import (
     rosh_cache_week_start,
 )
 from .strict_eligibility import query_strict_live_eligibility
-from .vision import VisionObservation, read_jsonl
+from .vision import VisionComebackState, VisionObservation, read_jsonl
 
 
 logger = logging.getLogger(__name__)
@@ -321,15 +321,62 @@ def _persist_decision(
     )
 
 
-def ingest_vision(store: LiveBettingStore, path: Path) -> int:
+def _source_vision_observations(path: Path) -> list[VisionObservation]:
     if not path.exists():
-        return 0
+        return []
     paths = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
-    return sum(
-        store.insert_vision_observation(row)
+    return [
+        row
         for item in paths
         for row in read_jsonl(item)
+    ]
+
+
+def ingest_vision(store: LiveBettingStore, path: Path) -> int:
+    return sum(
+        store.insert_vision_observation(row)
+        for row in _source_vision_observations(path)
     )
+
+
+def _vision_observation_identity(
+    observation: VisionObservation,
+) -> tuple[str, int | None, datetime, str]:
+    return (
+        observation.raybet_match_id,
+        observation.map_number,
+        observation.captured_at.astimezone(timezone.utc),
+        observation.source_frame_ref,
+    )
+
+
+def _source_comeback_state_index(
+    path: Path,
+) -> dict[tuple[str, int | None, datetime, str], VisionComebackState]:
+    result: dict[
+        tuple[str, int | None, datetime, str], VisionComebackState
+    ] = {}
+    conflicts: set[tuple[str, int | None, datetime, str]] = set()
+    for observation in _source_vision_observations(path):
+        identity = _vision_observation_identity(observation)
+        previous = result.get(identity)
+        if previous is not None and previous != observation.comeback_state:
+            conflicts.add(identity)
+            continue
+        result[identity] = observation.comeback_state
+    for identity in conflicts:
+        result.pop(identity, None)
+    return result
+
+
+def _bind_source_comeback_state(
+    observation: VisionObservation,
+    states: Mapping[
+        tuple[str, int | None, datetime, str], VisionComebackState
+    ],
+) -> VisionObservation:
+    state = states.get(_vision_observation_identity(observation))
+    return observation if state is None else replace(observation, comeback_state=state)
 
 
 def _as_of_iso(as_of: datetime | None) -> str:
@@ -1030,8 +1077,12 @@ def run_once(
     rosh_fetch_coordinator: RoshFetchCoordinator | None = None,
 ) -> dict[str, object]:
     run_at = now or datetime.now(timezone.utc)
+    comeback_states: dict[
+        tuple[str, int | None, datetime, str], VisionComebackState
+    ] = {}
     try:
         ingested = ingest_vision(store, vision_path)
+        comeback_states = _source_comeback_state_index(vision_path)
     except (OSError, TypeError, ValueError, KeyError) as error:
         # A malformed vision line must not prevent a previously pending shadow
         # order from resolving from its persisted odds successor.
@@ -1196,8 +1247,10 @@ def run_once(
         created_at=run_at,
     )
 
-    observations = [_observation(item) for item in store.connection.execute(
-        """SELECT observation.*
+    observations = [
+        _bind_source_comeback_state(_observation(item), comeback_states)
+        for item in store.connection.execute(
+            """SELECT observation.*
              FROM vision_observations AS observation
              LEFT JOIN vision_draft_anchors AS anchor
                ON anchor.raybet_match_id=observation.raybet_match_id
@@ -1224,13 +1277,14 @@ def run_once(
                     )
               )
            ORDER BY observation.captured_at""",
-        (
-            match_id,
-            current_transport_at.isoformat(),
-            current_transport_at.isoformat(),
-            current_transport_at.isoformat(),
-        ),
-    )]
+            (
+                match_id,
+                current_transport_at.isoformat(),
+                current_transport_at.isoformat(),
+                current_transport_at.isoformat(),
+            ),
+        )
+    ]
     observation, alignment_reason = _aligned_transport_observation(
         snapshots, current_transport_at, observations
     )

@@ -11,10 +11,14 @@ import re
 import secrets
 import sqlite3
 from collections import defaultdict
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote as url_quote
 
+from contracts.live_observation import is_canonical_net_worth_bucket
+from live_betting.comeback import STRATEGY_VERSION
+from live_betting.comeback_entry import ComebackEntryPolicy
 from live_betting.draft_authority import (
     DraftLandmarkAuthority,
     draft_landmark_authority_matches,
@@ -71,6 +75,16 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DECISION_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
 _INPUT_REF_RE = re.compile(r"^[0-9a-f]{24}$")
 _INVALID_EVIDENCE = object()
+_DEFAULT_COMEBACK_ENTRY_POLICY = asdict(ComebackEntryPolicy())
+_LEGACY_COMEBACK_STRATEGY_VERSIONS = frozenset(
+    {
+        "comeback-shadow-v1",
+        "comeback-shadow-v2",
+        "comeback-shadow-v2-strict-landmarks",
+        "comeback-shadow-v3",
+        "comeback-shadow-v3-rosh-lineup",
+    }
+)
 _CONTRIBUTION_KEYS = frozenset(
     {
         "team_style",
@@ -2564,6 +2578,7 @@ def _public_strategy_decision(
         or not _valid_strategy_inputs(
             connection,
             public_inputs,
+            strategy_version=base["strategy_version"],
             raybet_match_id=str(row["raybet_match_id"]),
             map_number=int(base["map_number"]),
             decided_at=str(base["decided_at"]),
@@ -2593,6 +2608,7 @@ def _public_strategy_decision(
             or not _valid_strategy_inputs(
                 connection,
                 public_inputs,
+                strategy_version=base["strategy_version"],
                 raybet_match_id=str(row["raybet_match_id"]),
                 map_number=int(base["map_number"]),
                 decided_at=str(base["decided_at"]),
@@ -2865,6 +2881,7 @@ def _valid_strategy_inputs(
     connection: sqlite3.Connection,
     inputs: Any,
     *,
+    strategy_version: str,
     raybet_match_id: str,
     map_number: int,
     decided_at: str,
@@ -2884,9 +2901,20 @@ def _valid_strategy_inputs(
     transport = inputs.get("transport")
     input_conservative = inputs.get("conservative_contributions")
     conservative_probability = inputs.get("conservative_probability")
+    if not _valid_comeback_entry_inputs(
+        inputs,
+        strategy_version=strategy_version,
+        require_eligible_gates=require_eligible_gates,
+    ):
+        return False
     if "lineup_rosh" in conservative and not _valid_rosh_strategy_input(
         inputs.get("rosh_lineup_score"),
         decided_at=decided_at,
+        game_clock_seconds=(
+            input_vision.get("game_clock_seconds")
+            if isinstance(input_vision, dict)
+            else None
+        ),
         require_eligible_gates=require_eligible_gates,
     ):
         return False
@@ -2984,10 +3012,313 @@ def _valid_strategy_inputs(
     )
 
 
+def _valid_comeback_entry_inputs(
+    inputs: dict[str, Any],
+    *,
+    strategy_version: str,
+    require_eligible_gates: bool,
+) -> bool:
+    names = {"comeback_state", "entry_window", "comeback_entry"}
+    present = names.intersection(inputs)
+    if not present:
+        return strategy_version in _LEGACY_COMEBACK_STRATEGY_VERSIONS
+    if present != names:
+        return False
+    state = inputs.get("comeback_state")
+    window = inputs.get("entry_window")
+    entry = inputs.get("comeback_entry")
+    vision = inputs.get("vision")
+    rosh = inputs.get("rosh_lineup_score")
+    market = inputs.get("market")
+    if not all(
+        isinstance(value, dict)
+        for value in (state, window, entry, vision, rosh, market)
+    ):
+        return False
+    assert isinstance(state, dict)
+    assert isinstance(window, dict)
+    assert isinstance(entry, dict)
+    assert isinstance(vision, dict)
+    assert isinstance(rosh, dict)
+    assert isinstance(market, dict)
+    state_keys = {
+        "controllable",
+        "reason",
+        "source_status",
+        "source",
+        "confidence",
+        "underdog_side",
+        "underdog_kills",
+        "opponent_kills",
+        "kill_deficit",
+        "underdog_net_worth",
+        "opponent_net_worth",
+        "net_worth_deficit",
+        "net_worth_advantage_side",
+        "net_worth_deficit_min",
+        "net_worth_deficit_max",
+        "unavailable_reason",
+    }
+    window_keys = {
+        "minimum_clock_seconds",
+        "maximum_clock_seconds",
+        "game_clock_seconds",
+        "inside",
+    }
+    entry_keys = {"eligible", "reason", "rosh_underdog_probability", "policy"}
+    policy_keys = {
+        "minimum_clock_seconds",
+        "maximum_clock_seconds",
+        "minimum_kill_deficit",
+        "maximum_kill_deficit",
+        "minimum_net_worth_deficit",
+        "maximum_net_worth_deficit",
+        "minimum_vision_confidence",
+    }
+    policy = entry.get("policy")
+    if (
+        set(state) != state_keys
+        or set(window) != window_keys
+        or set(entry) != entry_keys
+        or not isinstance(policy, dict)
+        or set(policy) != policy_keys
+        or (
+            strategy_version == STRATEGY_VERSION
+            and policy != _DEFAULT_COMEBACK_ENTRY_POLICY
+        )
+    ):
+        return False
+    assert isinstance(policy, dict)
+    minimum_clock = policy.get("minimum_clock_seconds")
+    maximum_clock = policy.get("maximum_clock_seconds")
+    minimum_kills = policy.get("minimum_kill_deficit")
+    maximum_kills = policy.get("maximum_kill_deficit")
+    minimum_net_worth = policy.get("minimum_net_worth_deficit")
+    maximum_net_worth = policy.get("maximum_net_worth_deficit")
+    minimum_confidence = policy.get("minimum_vision_confidence")
+    if (
+        any(
+            not _nonnegative_int(value)
+            for value in (
+                minimum_clock,
+                maximum_clock,
+                minimum_kills,
+                maximum_kills,
+                minimum_net_worth,
+                maximum_net_worth,
+            )
+        )
+        or int(minimum_clock) > int(maximum_clock)
+        or int(minimum_kills) > int(maximum_kills)
+        or int(minimum_net_worth) > int(maximum_net_worth)
+        or not _bounded_number(minimum_confidence, 0.0, 1.0)
+    ):
+        return False
+    game_clock = window.get("game_clock_seconds")
+    expected_inside = (
+        _nonnegative_int(game_clock)
+        and int(minimum_clock) <= int(game_clock) <= int(maximum_clock)
+    )
+    if (
+        window.get("minimum_clock_seconds") != minimum_clock
+        or window.get("maximum_clock_seconds") != maximum_clock
+        or type(window.get("inside")) is not bool
+        or window.get("inside") is not expected_inside
+        or vision.get("game_clock_seconds") != game_clock
+    ):
+        return False
+
+    controllable = state.get("controllable")
+    confidence = state.get("confidence")
+    underdog_side = state.get("underdog_side")
+    if (
+        type(controllable) is not bool
+        or not _is_opaque_ref(state.get("reason"))
+        or not _is_opaque_ref(state.get("source_status"))
+        or (
+            state.get("source") is not None
+            and not _is_opaque_ref(state.get("source"))
+        )
+        or not _bounded_number(confidence, 0.0, 1.0)
+        or underdog_side not in {"team_one", "team_two"}
+        or market.get("underdog_side") != underdog_side
+        or (
+            state.get("unavailable_reason") is not None
+            and not _is_opaque_ref(state.get("unavailable_reason"))
+        )
+    ):
+        return False
+    underdog_kills = state.get("underdog_kills")
+    opponent_kills = state.get("opponent_kills")
+    kill_deficit = state.get("kill_deficit")
+    kills_available = all(
+        _nonnegative_int(value) for value in (underdog_kills, opponent_kills)
+    ) and type(kill_deficit) is int
+    if kills_available:
+        if int(kill_deficit) != int(opponent_kills) - int(underdog_kills):
+            return False
+    elif any(value is not None for value in (underdog_kills, opponent_kills, kill_deficit)):
+        return False
+    underdog_net_worth = state.get("underdog_net_worth")
+    opponent_net_worth = state.get("opponent_net_worth")
+    net_worth_deficit = state.get("net_worth_deficit")
+    net_worth_available = all(
+        _nonnegative_int(value)
+        for value in (underdog_net_worth, opponent_net_worth)
+    ) and type(net_worth_deficit) is int
+    if net_worth_available:
+        return False
+    elif any(
+        value is not None
+        for value in (underdog_net_worth, opponent_net_worth, net_worth_deficit)
+    ):
+        return False
+    advantage_side = state.get("net_worth_advantage_side")
+    net_worth_deficit_min = state.get("net_worth_deficit_min")
+    net_worth_deficit_max = state.get("net_worth_deficit_max")
+    range_available = (
+        type(net_worth_deficit_min) is int
+        and type(net_worth_deficit_max) is int
+        and int(net_worth_deficit_min) <= int(net_worth_deficit_max)
+    )
+    if net_worth_available:
+        if (
+            advantage_side is not None
+            or not range_available
+            or net_worth_deficit_min != net_worth_deficit
+            or net_worth_deficit_max != net_worth_deficit
+        ):
+            return False
+    elif advantage_side is not None:
+        radiant_team_side = vision.get("radiant_team_side")
+        if (
+            advantage_side not in {"radiant", "dire"}
+            or not range_available
+            or radiant_team_side not in {"team_one", "team_two"}
+        ):
+            return False
+        leader_is_underdog = (
+            advantage_side == "radiant"
+        ) is (underdog_side == radiant_team_side)
+        raw_advantage_min, raw_advantage_max = (
+            (-int(net_worth_deficit_max), -int(net_worth_deficit_min))
+            if leader_is_underdog
+            else (int(net_worth_deficit_min), int(net_worth_deficit_max))
+        )
+        if not is_canonical_net_worth_bucket(
+            raw_advantage_min,
+            raw_advantage_max,
+        ):
+            return False
+        if leader_is_underdog:
+            if int(net_worth_deficit_max) > 0:
+                return False
+        elif int(net_worth_deficit_min) < 0:
+            return False
+    elif range_available or any(
+        value is not None
+        for value in (net_worth_deficit_min, net_worth_deficit_max)
+    ):
+        return False
+    economy_available = net_worth_available or advantage_side is not None
+    if kills_available:
+        if (
+            state.get("source_status") != "available"
+            or state.get("source") != "vision_hud"
+            or state.get("unavailable_reason") is not None
+            or float(confidence) < float(minimum_confidence)
+        ):
+            return False
+        collapsed = int(kill_deficit) > int(maximum_kills) or (
+            economy_available
+            and int(net_worth_deficit_max) > int(maximum_net_worth)
+        )
+        not_material = int(kill_deficit) < int(minimum_kills) or (
+            economy_available
+            and int(net_worth_deficit_min) < int(minimum_net_worth)
+        )
+        if not economy_available:
+            expected_state_reason = "vision_net_worth_evidence_missing"
+        elif collapsed:
+            expected_state_reason = "vision_situation_collapsed"
+        elif not_material:
+            expected_state_reason = "underdog_deficit_not_material"
+        else:
+            expected_state_reason = "controlled_deficit"
+        expected_controllable = expected_state_reason == "controlled_deficit"
+        if (
+            state.get("reason") != expected_state_reason
+            or controllable is not expected_controllable
+        ):
+            return False
+    elif (
+        economy_available
+        or controllable
+        or state.get("reason")
+        in {
+            "controlled_deficit",
+            "vision_situation_collapsed",
+            "underdog_deficit_not_material",
+        }
+    ):
+        return False
+
+    selected_score = rosh.get("selected_score")
+    expected_rosh_probability: float | None = None
+    radiant_team_side = vision.get("radiant_team_side")
+    if selected_score is not None:
+        if (
+            _finite_number_object({"score": selected_score}) is None
+            or radiant_team_side not in {"team_one", "team_two"}
+        ):
+            return False
+        radiant_probability = min(
+            1.0 - 1e-6,
+            max(1e-6, (50.0 + float(selected_score)) / 100.0),
+        )
+        expected_rosh_probability = (
+            radiant_probability
+            if underdog_side == radiant_team_side
+            else 1.0 - radiant_probability
+        )
+    persisted_rosh_probability = entry.get("rosh_underdog_probability")
+    if expected_rosh_probability is None:
+        if persisted_rosh_probability is not None:
+            return False
+    elif (
+        not _bounded_number(persisted_rosh_probability, 0.0, 1.0)
+        or not math.isclose(
+            float(persisted_rosh_probability),
+            expected_rosh_probability,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        return False
+    expected_reason = str(state["reason"])
+    if controllable:
+        if not expected_inside:
+            expected_reason = "comeback_entry_outside_time_window"
+        elif expected_rosh_probability is None:
+            expected_reason = "rosh_direction_unavailable"
+        elif expected_rosh_probability <= 0.5:
+            expected_reason = "rosh_direction_opposes_underdog"
+        else:
+            expected_reason = "eligible"
+    expected_eligible = expected_reason == "eligible"
+    return (
+        type(entry.get("eligible")) is bool
+        and entry.get("eligible") is expected_eligible
+        and entry.get("reason") == expected_reason
+        and (not require_eligible_gates or expected_eligible)
+    )
+
+
 def _valid_rosh_strategy_input(
     value: object,
     *,
     decided_at: str,
+    game_clock_seconds: object,
     require_eligible_gates: bool,
 ) -> bool:
     if not isinstance(value, dict):
@@ -3006,11 +3337,16 @@ def _valid_rosh_strategy_input(
     stake_cap = value.get("stake_cap")
     coverage = value.get("player_coverage")
     coverage_count = value.get("player_coverage_count")
+    draft_matches = value.get("draft_matches_observation")
+    selected_table = value.get("selected_table")
+    selected_minute = value.get("selected_minute")
+    selected_score = value.get("selected_score")
+    match_percentage = value.get("match_percentage")
     source_as_of = _parse_time(value.get("source_as_of"))
     decision_time = _parse_time(decided_at)
     if (
         mode not in {"pure", "player_adjusted"}
-        or value.get("draft_matches_observation") is not True
+        or type(draft_matches) is not bool
         or value.get("formula_version") != ROSH_FORMULA_VERSION
         or any(
             not _is_sha256(value.get(field))
@@ -3038,25 +3374,53 @@ def _valid_rosh_strategy_input(
         or not _positive_int(value.get("cache_week_start"))
         or _finite_number_object({"value": value.get("pure_score")}) is None
         or _finite_number_object({"value": value.get("effective_score")}) is None
-        or _finite_number_object({"value": value.get("selected_score")}) is None
-        or not _bounded_number(value.get("match_percentage"), 0.0, 100.0)
     ):
         return False
     adjusted = value.get("player_adjusted_score")
     if mode == "player_adjusted":
-        return (
+        mode_valid = (
             int(coverage_count) == 10
             and _finite_number_object({"value": adjusted}) is not None
             and math.isclose(float(stake_cap), 1.0, abs_tol=1e-9)
-            and math.isclose(float(actual_stake), 1.0, abs_tol=1e-9)
-            and value.get("selected_table") == "minute_table"
+        )
+        expected_table = "minute_table"
+    else:
+        mode_valid = (
+            int(coverage_count) < 10
+            and adjusted is None
+            and math.isclose(float(stake_cap), 0.5, abs_tol=1e-9)
+        )
+        expected_table = "pure_minute_table"
+    if not mode_valid:
+        return False
+
+    if selected_score is None:
+        return (
+            not require_eligible_gates
+            and actual_stake == 0.0
+            and compatibility_stake == 0.0
+            and selected_table is None
+            and selected_minute is None
+            and match_percentage is None
+        )
+
+    if (
+        draft_matches is not True
+        or _finite_number_object({"value": selected_score}) is None
+        or not _positive_int(selected_minute)
+        or not 20 <= int(selected_minute) <= 60
+        or not _nonnegative_int(game_clock_seconds)
+        or int(selected_minute) > int(game_clock_seconds) // 60
+        or selected_table != expected_table
+        or not _bounded_number(match_percentage, 0.0, 100.0)
+    ):
+        return False
+    if mode == "player_adjusted":
+        return (
+            math.isclose(float(actual_stake), 1.0, abs_tol=1e-9)
         )
     return (
-        int(coverage_count) < 10
-        and adjusted is None
-        and math.isclose(float(stake_cap), 0.5, abs_tol=1e-9)
-        and 0.1 <= float(actual_stake) <= 0.5
-        and value.get("selected_table") == "pure_minute_table"
+        0.1 <= float(actual_stake) <= 0.5
     )
 
 

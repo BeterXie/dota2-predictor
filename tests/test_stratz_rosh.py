@@ -324,6 +324,7 @@ def test_total_score_is_not_capped_at_100() -> None:
 
 def test_historical_picks_sort_by_order_and_partial_picks_do_not_fallback() -> None:
     match = {
+        "id": 123,
         "bracket": 8,
         "endDateTime": 1_800_000_000,
         "players": [

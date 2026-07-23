@@ -35,9 +35,11 @@ from event_intelligence.incremental import (
 )
 from event_intelligence.player_scoring import score_version_for_role
 from event_intelligence.roles import PROSPECTIVE_ASSIGNMENT_VERSION
+from event_intelligence.storage import query_historical_rosh_lineup_score
 from event_intelligence.team_profiles import PROFILE_VERSION
 from event_intelligence.team_states import LABEL_VERSION
 from live_betting.postmatch_monitor import has_trusted_confirmed_draft
+from live_betting.stratz_rosh_client import ROSH_FORMULA_VERSION
 from live_betting.strict_eligibility import (
     StrictLiveMapMapping,
     query_strict_live_eligibility,
@@ -1380,6 +1382,85 @@ def _match_players(
     return result
 
 
+def _match_rosh_lineup_score(
+    connection: sqlite3.Connection,
+    match_id: int,
+) -> dict[str, Any]:
+    missing = {
+        "status": "missing",
+        "reason": "historical_rosh_lineup_score_missing",
+        "data": None,
+    }
+    player_columns = _relation_columns(connection, "match_players")
+    required = {"match_id", "player_slot", "hero_id", "account_id", "is_radiant"}
+    if not required.issubset(player_columns):
+        return missing
+    try:
+        rows = connection.execute(
+            """SELECT player_slot, hero_id, account_id, is_radiant
+                 FROM match_players
+                WHERE match_id=?
+                ORDER BY player_slot""",
+            (match_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return missing
+    expected_slots = (*range(5), *range(128, 133))
+    if len(rows) != 10 or tuple(row["player_slot"] for row in rows) != expected_slots:
+        return missing
+    if any(
+        type(row["hero_id"]) is not int
+        or int(row["hero_id"]) <= 0
+        or type(row["account_id"]) is not int
+        or int(row["account_id"]) <= 0
+        or row["is_radiant"] != (1 if index < 5 else 0)
+        for index, row in enumerate(rows)
+    ):
+        return missing
+    hero_ids = tuple(int(row["hero_id"]) for row in rows)
+    player_ids = tuple(int(row["account_id"]) for row in rows)
+    if len(set(hero_ids)) != 10 or len(set(player_ids)) != 10:
+        return missing
+    score = query_historical_rosh_lineup_score(
+        connection,
+        match_id=match_id,
+        formula_version=ROSH_FORMULA_VERSION,
+        radiant_hero_ids=hero_ids[:5],
+        dire_hero_ids=hero_ids[5:],
+        radiant_player_ids=player_ids[:5],
+        dire_player_ids=player_ids[5:],
+    )
+    if score is None:
+        return missing
+    return {
+        "status": "available",
+        "reason": "historical_rosh_lineup_score_available",
+        "data": {
+            "pure_lineup_score": score.pure_lineup_score,
+            "current_player_adjusted_lineup_score": (
+                score.current_player_adjusted_lineup_score
+            ),
+            "effective_lineup_score": score.effective_lineup_score,
+            "scoring_mode": score.scoring_mode,
+            "player_coverage_count": score.player_coverage_count,
+            "formula_version": score.formula_version,
+            "source_name": score.source_name,
+            "source_week": score.source_week,
+            "source_as_of": score.source_as_of.isoformat(),
+            "player_stats_as_of": (
+                None
+                if score.player_stats_as_of is None
+                else score.player_stats_as_of.isoformat()
+            ),
+            "backtest_eligible": score.backtest_eligible,
+            "pure_minute_table": score.evidence["pure_minute_table"],
+            "current_player_adjusted_minute_table": score.evidence.get(
+                "minute_table"
+            ),
+        },
+    }
+
+
 def _match_rating(
     player_scores: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
@@ -1513,6 +1594,7 @@ def _match_detail_payload(
         "player_performance": player_performance,
         "player_scores": player_scores,
         "match_rating": _match_rating(player_scores),
+        "rosh_lineup_score": _match_rosh_lineup_score(connection, match_id),
         "draft_predictions": draft_predictions,
         "versions": {
             "match_rating": MATCH_RATING_VERSION,
@@ -1523,6 +1605,7 @@ def _match_detail_payload(
             "draft_model": DRAFT_MODEL_VERSION,
             "draft_backtest": BACKTEST_VERSION,
             "draft_features": DRAFT_FEATURE_VERSION,
+            "rosh_lineup": ROSH_FORMULA_VERSION,
         },
         "cutoffs": {
             "player_score": sorted(

@@ -9,13 +9,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from live_betting.comeback import score_comeback
+from live_betting.comeback_entry import ComebackEntryPolicy
 from live_betting.market_state import build_market_surface
 from live_betting.models import Market, OddsSnapshot, RoshLineupScore
 from live_betting.profiles.draft_curve import DraftCurve, DraftPoint
 from live_betting.profiles.player_form import PlayerForm
 from live_betting.profiles.team_style import TeamStyleProfile
 from live_betting.shadow_strategy import ComebackShadowStrategy
-from live_betting.vision import VisionObservation
+from live_betting.vision import VisionComebackState, VisionObservation
 
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
@@ -85,6 +86,7 @@ def _observation(
     radiant_team_side: str = "team_one",
     game_clock_seconds: int = 30 * 60,
 ) -> VisionObservation:
+    underdog_is_radiant = radiant_team_side == "team_two"
     return VisionObservation(
         "match-1",
         1,
@@ -98,6 +100,21 @@ def _observation(
         "frame",
         "game",
         radiant_team_side,
+        comeback_state=VisionComebackState(
+            "available",
+            "vision_hud",
+            0.95,
+            14 if underdog_is_radiant else 18,
+            18 if underdog_is_radiant else 14,
+            None,
+            None,
+            None,
+            net_worth_advantage_side=(
+                "dire" if underdog_is_radiant else "radiant"
+            ),
+            net_worth_advantage_min=5_000,
+            net_worth_advantage_max=5_999,
+        ),
     )
 
 
@@ -170,12 +187,16 @@ def _decision(
     game_clock_seconds: int = 30 * 60,
     underdog_form_score: float = 0.0,
     favorite_form_score: float = 0.0,
+    comeback_state: VisionComebackState | None = None,
 ):
+    observation = _observation(
+        radiant_team_side=radiant_team_side,
+        game_clock_seconds=game_clock_seconds,
+    )
+    if comeback_state is not None:
+        observation = replace(observation, comeback_state=comeback_state)
     return score_comeback(
-        observation=_observation(
-            radiant_team_side=radiant_team_side,
-            game_clock_seconds=game_clock_seconds,
-        ),
+        observation=observation,
         surface=build_market_surface(_snapshots(NOW)),
         underdog_style=_style(2),
         favorite_style=_style(1),
@@ -218,6 +239,25 @@ def test_missing_rosh_score_fails_closed() -> None:
     assert decision.stake_multiplier == 0.0
     assert decision.inputs["rosh_lineup_score"]["status"] == "unavailable"
     assert decision.inputs["rosh_lineup_score"]["selected_score"] is None
+
+
+def test_missing_live_situation_fails_closed_with_persistable_reason() -> None:
+    decision = _decision(
+        _score(pure=-20.0),
+        radiant_team_side="team_one",
+        comeback_state=VisionComebackState.unavailable(
+            "hud_live_state_ocr_unavailable"
+        ),
+    )
+
+    assert decision.eligible is False
+    assert decision.reason == (
+        "vision_live_situation_unavailable:hud_live_state_ocr_unavailable"
+    )
+    assert decision.inputs["comeback_state"]["unavailable_reason"] == (
+        "hud_live_state_ocr_unavailable"
+    )
+    assert decision.inputs["comeback_entry"]["eligible"] is False
 
 
 def test_mismatched_rosh_draft_fails_closed_without_lineup_contribution() -> None:
@@ -275,7 +315,7 @@ def test_rosh_uses_current_minute_instead_of_permanent_late_endpoint() -> None:
     early = _decision(
         score,
         radiant_team_side="team_two",
-        game_clock_seconds=15 * 60,
+        game_clock_seconds=20 * 60,
     )
     late = _decision(
         score,
@@ -312,7 +352,7 @@ def test_player_adjusted_mode_uses_adjusted_minute_curve() -> None:
     assert decision.stake_multiplier == 1.0
 
 
-def test_rosh_minute_selection_clamps_boundaries_and_uses_nearest_bucket() -> None:
+def test_rosh_minute_selection_never_uses_a_future_bucket() -> None:
     score = _score(
         pure=0.0,
         pure_table=[
@@ -323,13 +363,37 @@ def test_rosh_minute_selection_clamps_boundaries_and_uses_nearest_bucket() -> No
     )
 
     before = _decision(score, game_clock_seconds=15 * 60)
-    nearest = _decision(score, game_clock_seconds=23 * 60)
+    current = _decision(score, game_clock_seconds=23 * 60)
     after = _decision(score, game_clock_seconds=61 * 60)
 
-    assert before.inputs["rosh_lineup_score"]["selected_minute"] == 20
-    assert nearest.inputs["rosh_lineup_score"]["selected_minute"] == 25
+    assert before.inputs["rosh_lineup_score"]["selected_minute"] is None
+    assert before.reason == "rosh_minute_score_unavailable"
+    assert current.inputs["rosh_lineup_score"]["selected_minute"] == 20
     assert after.inputs["rosh_lineup_score"]["selected_minute"] == 60
     assert "pure_minute_table" not in before.inputs["rosh_lineup_score"]["evidence"]
+
+
+def test_future_rosh_bucket_cannot_reverse_the_current_direction() -> None:
+    score = _score(
+        pure=-30.0,
+        pure_table=[
+            {"minute": 20, "win_rate_graph": 30.0, "match_percentage": 80.0},
+            {"minute": 25, "win_rate_graph": -30.0, "match_percentage": 80.0},
+        ],
+    )
+
+    decision = _decision(score, game_clock_seconds=23 * 60)
+
+    assert decision.inputs["rosh_lineup_score"]["selected_minute"] == 20
+    assert decision.inputs["rosh_lineup_score"]["selected_score"] == 30.0
+    assert decision.reason == "rosh_direction_opposes_underdog"
+
+
+def test_strategy_version_does_not_allow_a_non_default_entry_policy() -> None:
+    with pytest.raises(TypeError):
+        ComebackShadowStrategy(  # type: ignore[call-arg]
+            entry_policy=ComebackEntryPolicy(minimum_kill_deficit=0)
+        )
 
 
 @pytest.mark.parametrize(

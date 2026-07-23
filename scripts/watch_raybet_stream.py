@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from contracts.live_observation import LiveObservation  # noqa: E402
+from contracts.live_observation import ComebackState, LiveObservation  # noqa: E402
 from live_betting.direct_response_audit import (  # noqa: E402
     DirectResponseContext,
     DirectResponseDecision,
@@ -47,6 +47,14 @@ from vision.hero_recognizer import (  # noqa: E402
 from vision.map_state import ConfirmedClock, MapStateTracker  # noqa: E402
 from vision.observation_writer import ObservationWriter  # noqa: E402
 from vision.screen_state import classify_screen_state  # noqa: E402
+from vision.scoreboard_reader import (  # noqa: E402
+    NetWorthAdvantageReading,
+    NetWorthAdvantageTracker,
+    ScoreboardReader,
+    ScoreboardReading,
+    ScoreboardTracker,
+    ReplayGateReading,
+)
 from vision.stream_capture import HLSStreamCapture  # noqa: E402
 from vision.team_side import TeamSideRecognizer, TeamSideTracker  # noqa: E402
 
@@ -267,6 +275,8 @@ def _meaningful(previous: LiveObservation | None, current: LiveObservation) -> b
         return True
     if current.map_number != previous.map_number:
         return True
+    if current.comeback_state != previous.comeback_state:
+        return True
     if (
         current.game_clock_seconds is not None
         and previous.game_clock_seconds is not None
@@ -288,6 +298,52 @@ def current_frame_clock_fields(
     )
 
 
+def current_frame_comeback_state(
+    confirmed_clock: ConfirmedClock | None,
+    confirmed_scoreboard: ScoreboardReading | None,
+    confirmed_advantage: NetWorthAdvantageReading | None,
+) -> ComebackState:
+    if confirmed_clock is None:
+        return ComebackState.unavailable("hud_clock_unconfirmed")
+    if confirmed_scoreboard is None:
+        return ComebackState.unavailable("hud_kill_score_unconfirmed")
+    if confirmed_advantage is None:
+        return ComebackState.unavailable("hud_net_worth_advantage_unconfirmed")
+    return ComebackState(
+        status="available",
+        source="vision_hud",
+        confidence=min(
+            confirmed_clock.confidence,
+            confirmed_scoreboard.confidence,
+            confirmed_advantage.confidence,
+        ),
+        radiant_kills=confirmed_scoreboard.radiant_kills,
+        dire_kills=confirmed_scoreboard.dire_kills,
+        radiant_net_worth=None,
+        dire_net_worth=None,
+        net_worth_advantage_side=confirmed_advantage.side,
+        net_worth_advantage_min=confirmed_advantage.minimum,
+        net_worth_advantage_max=confirmed_advantage.maximum,
+        unavailable_reason=None,
+    )
+
+
+def allow_live_hud_tracking(
+    replay_gate: ReplayGateReading,
+    *,
+    map_number: int,
+    clock_tracker: MapStateTracker,
+    scoreboard_tracker: ScoreboardTracker,
+    advantage_tracker: NetWorthAdvantageTracker,
+) -> bool:
+    if replay_gate.status == "live":
+        return True
+    clock_tracker.reset_map(map_number)
+    scoreboard_tracker.reset()
+    advantage_tracker.reset()
+    return False
+
+
 def _should_persist_frame(
     previous: LiveObservation | None,
     current: LiveObservation,
@@ -302,6 +358,7 @@ def _should_persist_frame(
         or previous.screen_state != current.screen_state
         or (current.is_confirmed and not previous.is_confirmed)
         or current.map_number != previous.map_number
+        or current.comeback_state != previous.comeback_state
     )
     return (
         current.is_confirmed
@@ -384,6 +441,9 @@ def _run_cli(args: argparse.Namespace) -> int:
     clock_reader = ClockReader()
     clock_tracker = MapStateTracker()
     clock_tracker.reset_map(map_number)
+    scoreboard_reader = ScoreboardReader()
+    scoreboard_tracker = ScoreboardTracker()
+    advantage_tracker = NetWorthAdvantageTracker()
     hero_reader = HeroRecognizer(args.features)
     draft_tracker = DraftTracker()
     side_reader = None
@@ -412,6 +472,60 @@ def _run_cli(args: argparse.Namespace) -> int:
             state, _ = classify_screen_state(frame.image)
             confirmed_clock: ConfirmedClock | None = None
             if state == "game":
+                replay_gate = scoreboard_reader.read_replay_gate(frame.image)
+                if not allow_live_hud_tracking(
+                    replay_gate,
+                    map_number=map_number,
+                    clock_tracker=clock_tracker,
+                    scoreboard_tracker=scoreboard_tracker,
+                    advantage_tracker=advantage_tracker,
+                ):
+                    outside_game_frames += 1
+                    confirmed_scoreboard = None
+                    confirmed_advantage = None
+                    confirmed_draft = None
+                    captured = datetime.fromtimestamp(frame.captured_at, timezone.utc)
+                    observation = LiveObservation(
+                        raybet_match_id=args.match_id,
+                        map_number=None,
+                        captured_at_utc=captured,
+                        game_clock_seconds=None,
+                        is_paused=None,
+                        radiant_hero_ids=(
+                            list(last_draft.radiant_hero_ids) if last_draft else []
+                        ),
+                        dire_hero_ids=(
+                            list(last_draft.dire_hero_ids) if last_draft else []
+                        ),
+                        radiant_team_side=radiant_team_side,
+                        clock_confidence=0.0,
+                        draft_confidence=last_draft.confidence if last_draft else 0.0,
+                        source_frame_ref=f"stream:{frame.source_hash}:{frame.sequence}",
+                        screen_state="replay" if replay_gate.status == "replay" else "unknown",
+                        comeback_state=ComebackState.unavailable(
+                            "hud_replay_frame"
+                            if replay_gate.status == "replay"
+                            else "hud_replay_gate_untrusted"
+                        ),
+                    )
+                    if _meaningful(previous, observation):
+                        if _should_persist_frame(
+                            previous,
+                            observation,
+                            captured_at=frame.captured_at,
+                            last_evidence_at=last_evidence_at,
+                            evidence_interval=args.evidence_interval,
+                        ):
+                            receipt = _write_evidence_frame(evidence_dir, frame.image)
+                            observation.source_frame_ref = receipt.frame_ref
+                            observation.source_frame_sha256 = receipt.content_sha256
+                            observation.source_frame_bytes = receipt.byte_length
+                            observation.source_frame_path = str(receipt.storage_path)
+                            last_evidence_at = frame.captured_at
+                        writer.append(observation)
+                        print(observation.model_dump_json())
+                        previous = observation
+                    continue
                 raw_clock = clock_reader.read(frame.image)
                 if (
                     outside_game_frames >= 5
@@ -423,6 +537,8 @@ def _run_cli(args: argparse.Namespace) -> int:
                 ):
                     map_number += 1
                     clock_tracker.reset_map(map_number)
+                    scoreboard_tracker.reset()
+                    advantage_tracker.reset()
                     draft_tracker.reset()
                     last_clock = None
                     last_draft = None
@@ -430,6 +546,16 @@ def _run_cli(args: argparse.Namespace) -> int:
                     side_tracker.reset()
                 outside_game_frames = 0
                 confirmed_clock = clock_tracker.update(raw_clock)
+                confirmed_scoreboard = scoreboard_tracker.update(
+                    scoreboard_reader.read(frame.image)
+                )
+                if confirmed_clock is not None and confirmed_scoreboard is not None:
+                    confirmed_advantage = advantage_tracker.update(
+                        scoreboard_reader.read_net_worth_advantage(frame.image)
+                    )
+                else:
+                    advantage_tracker.reset()
+                    confirmed_advantage = None
                 confirmed_draft = draft_tracker.update(hero_reader.read(frame.image))
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
@@ -440,6 +566,10 @@ def _run_cli(args: argparse.Namespace) -> int:
                         radiant_team_side = side.radiant_team_side
             else:
                 outside_game_frames += 1
+                scoreboard_tracker.reset()
+                advantage_tracker.reset()
+                confirmed_scoreboard = None
+                confirmed_advantage = None
             captured = datetime.fromtimestamp(frame.captured_at, timezone.utc)
             clock_seconds, is_paused, clock_confidence = current_frame_clock_fields(
                 confirmed_clock if state == "game" else None
@@ -459,6 +589,11 @@ def _run_cli(args: argparse.Namespace) -> int:
                 draft_confidence=last_draft.confidence if last_draft else 0.0,
                 source_frame_ref=f"stream:{frame.source_hash}:{frame.sequence}",
                 screen_state=state,
+                comeback_state=current_frame_comeback_state(
+                    confirmed_clock if state == "game" else None,
+                    confirmed_scoreboard if state == "game" else None,
+                    confirmed_advantage if state == "game" else None,
+                ),
             )
             if _meaningful(previous, observation):
                 if _should_persist_frame(

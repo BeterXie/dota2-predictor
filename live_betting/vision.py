@@ -3,13 +3,52 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from contracts.live_observation import SCHEMA_VERSION
+from contracts.live_observation import ComebackState, LiveObservation, SCHEMA_VERSION
 
-from .vision_frame_registry import vision_frame_ref
+
+@dataclass(frozen=True)
+class VisionComebackState:
+    status: str
+    source: str | None
+    confidence: float
+    radiant_kills: int | None
+    dire_kills: int | None
+    radiant_net_worth: int | None
+    dire_net_worth: int | None
+    unavailable_reason: str | None
+    net_worth_advantage_side: str | None = None
+    net_worth_advantage_min: int | None = None
+    net_worth_advantage_max: int | None = None
+
+    @classmethod
+    def unavailable(
+        cls, reason: str = "live_state_not_provided"
+    ) -> "VisionComebackState":
+        return cls("unavailable", None, 0.0, None, None, None, None, reason)
+
+    @classmethod
+    def from_contract(cls, state: ComebackState) -> "VisionComebackState":
+        return cls(
+            status=state.status,
+            source=state.source,
+            confidence=state.confidence,
+            radiant_kills=state.radiant_kills,
+            dire_kills=state.dire_kills,
+            radiant_net_worth=state.radiant_net_worth,
+            dire_net_worth=state.dire_net_worth,
+            unavailable_reason=state.unavailable_reason,
+            net_worth_advantage_side=state.net_worth_advantage_side,
+            net_worth_advantage_min=state.net_worth_advantage_min,
+            net_worth_advantage_max=state.net_worth_advantage_max,
+        )
+
+    @property
+    def is_available(self) -> bool:
+        return self.status == "available"
 
 
 @dataclass(frozen=True)
@@ -29,6 +68,9 @@ class VisionObservation:
     source_frame_sha256: str | None = None
     source_frame_bytes: int | None = None
     source_frame_path: str | None = None
+    comeback_state: VisionComebackState = field(
+        default_factory=VisionComebackState.unavailable
+    )
 
     @property
     def is_confirmed(self) -> bool:
@@ -49,60 +91,49 @@ class VisionObservation:
 
 def parse_observation(payload: dict) -> VisionObservation:
     schema_version = payload.get("schema_version")
-    if schema_version not in {1, SCHEMA_VERSION}:
+    if schema_version not in {1, 2, 3, SCHEMA_VERSION}:
         raise ValueError(f"unsupported vision schema: {payload.get('schema_version')}")
-    captured = datetime.fromisoformat(str(payload["captured_at_utc"]).replace("Z", "+00:00"))
-    if captured.tzinfo is None:
-        raise ValueError("captured_at_utc must be timezone-aware")
-    radiant = tuple(int(value) for value in payload.get("radiant_hero_ids") or [])
-    dire = tuple(int(value) for value in payload.get("dire_hero_ids") or [])
-    if any(hero_id <= 0 for hero_id in radiant + dire):
-        raise ValueError("hero IDs must be positive")
-    if len(set(radiant + dire)) != len(radiant + dire):
-        raise ValueError("hero IDs must be unique")
-    radiant_team_side = payload.get("radiant_team_side")
-    if radiant_team_side not in {None, "team_one", "team_two"}:
-        raise ValueError("radiant_team_side must be team_one, team_two, or null")
-    source_frame_ref = str(payload.get("source_frame_ref") or "")
-    if not source_frame_ref.strip():
-        raise ValueError("source_frame_ref must be non-empty")
-    source_frame_sha256 = payload.get("source_frame_sha256")
-    source_frame_bytes = payload.get("source_frame_bytes")
-    source_frame_path = payload.get("source_frame_path")
-    integrity = (source_frame_sha256, source_frame_bytes, source_frame_path)
-    if any(value is not None for value in integrity) and any(
-        value is None for value in integrity
-    ):
-        raise ValueError("vision frame integrity metadata must be complete")
-    if all(value is not None for value in integrity):
-        source_frame_sha256 = str(source_frame_sha256)
-        if source_frame_ref != vision_frame_ref(source_frame_sha256):
-            raise ValueError("source_frame_ref must match source_frame_sha256")
-        if (
-            isinstance(source_frame_bytes, bool)
-            or not isinstance(source_frame_bytes, int)
-            or source_frame_bytes <= 0
-        ):
-            raise ValueError("source_frame_bytes must be a positive integer")
-        source_frame_path = str(source_frame_path)
-        if not source_frame_path.strip():
-            raise ValueError("source_frame_path must be non-empty")
+    normalized = dict(payload)
+    if schema_version in {1, 2}:
+        normalized["comeback_state"] = ComebackState.unavailable(
+            "legacy_schema_live_state_unavailable"
+        ).model_dump()
+    elif schema_version == 3 and isinstance(normalized.get("comeback_state"), dict):
+        normalized["comeback_state"] = {
+            **normalized["comeback_state"],
+            "radiant_net_worth": None,
+            "dire_net_worth": None,
+            "net_worth_advantage_side": None,
+            "net_worth_advantage_min": None,
+            "net_worth_advantage_max": None,
+        }
+    elif "comeback_state" not in normalized:
+        normalized["comeback_state"] = ComebackState.unavailable(
+            "live_state_not_provided"
+        ).model_dump()
+    observation = LiveObservation.model_validate(normalized)
+    captured = observation.captured_at_utc
+    radiant = tuple(observation.radiant_hero_ids)
+    dire = tuple(observation.dire_hero_ids)
     return VisionObservation(
-        raybet_match_id=str(payload["raybet_match_id"]),
-        map_number=payload.get("map_number"),
+        raybet_match_id=observation.raybet_match_id,
+        map_number=observation.map_number,
         captured_at=captured.astimezone(timezone.utc),
-        game_clock_seconds=payload.get("game_clock_seconds"),
-        is_paused=payload.get("is_paused"),
+        game_clock_seconds=observation.game_clock_seconds,
+        is_paused=observation.is_paused,
         radiant_hero_ids=radiant,
         dire_hero_ids=dire,
-        clock_confidence=float(payload.get("clock_confidence") or 0),
-        draft_confidence=float(payload.get("draft_confidence") or 0),
-        source_frame_ref=source_frame_ref,
-        screen_state=str(payload.get("screen_state") or "unknown"),
-        radiant_team_side=radiant_team_side,
-        source_frame_sha256=source_frame_sha256,
-        source_frame_bytes=source_frame_bytes,
-        source_frame_path=source_frame_path,
+        clock_confidence=observation.clock_confidence,
+        draft_confidence=observation.draft_confidence,
+        source_frame_ref=observation.source_frame_ref,
+        screen_state=observation.screen_state,
+        radiant_team_side=observation.radiant_team_side,
+        source_frame_sha256=observation.source_frame_sha256,
+        source_frame_bytes=observation.source_frame_bytes,
+        source_frame_path=observation.source_frame_path,
+        comeback_state=VisionComebackState.from_contract(
+            observation.comeback_state
+        ),
     )
 
 

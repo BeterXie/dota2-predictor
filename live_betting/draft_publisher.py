@@ -908,8 +908,7 @@ def _runtime_input_reasons(
 
 def _runtime_deployment_generation(
     connection: sqlite3.Connection,
-) -> tuple[int, int, int]:
-    data_version = connection.execute("PRAGMA data_version").fetchone()
+) -> tuple[int, int]:
     artifact = connection.execute(
         """SELECT artifact_revision FROM draft_deployment_revisions
             WHERE singleton=1"""
@@ -918,11 +917,11 @@ def _runtime_deployment_generation(
         """SELECT dependency_revision FROM draft_lineage_revisions
             WHERE singleton=1"""
     ).fetchone()
-    if data_version is None or artifact is None or dependency is None:
+    if artifact is None or dependency is None:
         raise _FrozenDeploymentLineageError(
             "draft deployment runtime generation is unavailable"
         )
-    return int(data_version[0]), int(artifact[0]), int(dependency[0])
+    return int(artifact[0]), int(dependency[0])
 
 
 def _runtime_pinned_deployment_generation(
@@ -2284,7 +2283,7 @@ def _load_history(
                 maps=history,
             )
         )
-        if history_snapshot.dependency_revision != loaded_generation[2]:
+        if history_snapshot.dependency_revision != loaded_generation[1]:
             raise _FrozenDeploymentLineageError(
                 "draft history revision changed during runtime load"
             )

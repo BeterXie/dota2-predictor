@@ -12,6 +12,7 @@ import type {
   MatchAnalysis,
   MatchDetail,
   MonitorMatch,
+  RoshLineupScoresData,
   StrategyAnalysisData,
   StrategyDecision,
   VisionAnalysisData,
@@ -175,6 +176,126 @@ function strategyDecision(overrides: Partial<StrategyDecision> = {}): StrategyDe
   };
 }
 
+function roshStrategyDecision(
+  selected = true,
+  selectedMinute = 30,
+  gameClockSeconds = 30 * 60,
+): StrategyDecision {
+  const marketProbability = 0.35;
+  const contributions = {
+    team_style: 0.12,
+    player_form: -0.03,
+    draft_curve: 0,
+    lineup_rosh: selected ? 0.08 : 0,
+    late_game_style: 0,
+    market_movement: 0.01,
+  };
+  const conservative = {
+    team_style: 0.08,
+    player_form: -0.03,
+    draft_curve: 0,
+    lineup_rosh: selected ? 0.04 : 0,
+    late_game_style: 0,
+    market_movement: 0.01,
+  };
+  const probability = (values: Record<string, number>) => {
+    const logit = Math.log(marketProbability / (1 - marketProbability));
+    const score = logit + Object.values(values).reduce((sum, value) => sum + value, 0);
+    return 1 / (1 + Math.exp(-score));
+  };
+  const modelProbability = probability(contributions);
+  return strategyDecision({
+    decision_key: selected ? "6".repeat(32) : "7".repeat(32),
+    input_ref: selected ? "8".repeat(24) : "9".repeat(24),
+    market_probability: marketProbability,
+    model_probability: modelProbability,
+    edge: modelProbability - marketProbability,
+    eligible: selected ? 1 : 0,
+    reason: selected ? "eligible" : "rosh_lineup_draft_mismatch",
+    strategy_version: "comeback-shadow-v4-controlled-entry",
+    contributions,
+    conservative_contributions: conservative,
+    inputs: {
+      conservative_contributions: conservative,
+      conservative_probability: probability(conservative),
+      independent_positive: true,
+      vision: {
+        captured_at: "2026-07-16T12:01:58+00:00",
+        game_clock_seconds: gameClockSeconds,
+        source_frame_ref: FRAME_REF,
+        radiant_team_side: "team_one",
+      },
+      market: {
+        underdog_side: "team_two",
+      },
+      draft_landmark: { model_version: "draft-model-v3" },
+      rosh_lineup_score: {
+        score_key: ROSH_SCORE_KEY,
+        draft_hash: "d".repeat(64),
+        player_identity_hash: ROSH_PLAYER_IDENTITY_HASH,
+        pure_score: -2.2,
+        player_adjusted_score: -2.75,
+        effective_score: -2.75,
+        mode: "player_adjusted",
+        player_coverage: 1,
+        player_coverage_count: 10,
+        stake_cap: 1,
+        stake_multiplier: selected ? 1 : 0,
+        formula_version: "dematus-rosh-v1",
+        source_name: "stratz",
+        source_week: 1_752_643_200,
+        cache_week_start: 1_752_643_200,
+        source_as_of: "2026-07-16T11:58:00+00:00",
+        evidence_hash: ROSH_EVIDENCE_HASH,
+        draft_matches_observation: selected,
+        selected_table: selected ? "minute_table" : null,
+        selected_minute: selected ? selectedMinute : null,
+        selected_score: selected ? -2.75 : null,
+        match_percentage: selected ? 76 : null,
+        actual_stake_multiplier: selected ? 1 : 0,
+      },
+      comeback_state: {
+        controllable: true,
+        reason: "controlled_deficit",
+        source_status: "available",
+        source: "vision_hud",
+        confidence: 0.96,
+        underdog_side: "team_two",
+        underdog_kills: 18,
+        opponent_kills: 22,
+        kill_deficit: 4,
+        underdog_net_worth: null,
+        opponent_net_worth: null,
+        net_worth_deficit: null,
+        net_worth_advantage_side: "radiant",
+        net_worth_deficit_min: 5_000,
+        net_worth_deficit_max: 5_999,
+        unavailable_reason: null,
+      },
+      entry_window: {
+        minimum_clock_seconds: 1200,
+        maximum_clock_seconds: 2700,
+        game_clock_seconds: gameClockSeconds,
+        inside: true,
+      },
+      comeback_entry: {
+        eligible: selected,
+        reason: selected ? "eligible" : "rosh_direction_unavailable",
+        rosh_underdog_probability: selected ? 0.5275 : null,
+        policy: {
+          minimum_clock_seconds: 1200,
+          maximum_clock_seconds: 2700,
+          minimum_kill_deficit: 2,
+          maximum_kill_deficit: 10,
+          minimum_net_worth_deficit: 1000,
+          maximum_net_worth_deficit: 10_000,
+          minimum_vision_confidence: 0.9,
+        },
+      },
+    },
+  });
+}
+
 function fixtureStrategyDecision(
   analysis: MatchAnalysis,
   eligible: 0 | 1,
@@ -212,7 +333,7 @@ function lineupData(overrides: Partial<LineupAnalysisData> = {}): LineupAnalysis
       anchored_at: "2026-07-16T12:01:58+00:00",
       strict_mapping_id: 42,
     },
-    scores: analysisSection("waiting", "rosh_lineup_score_pending", null),
+    scores: analysisSection<RoshLineupScoresData>("waiting", "rosh_lineup_score_pending", null),
     active_curve: analysisSection("available", "active_curve_available", {
       curve_key: CURVE_KEY,
       first_usable_at: "2026-07-16T12:01:59+00:00",
@@ -302,6 +423,14 @@ function detailWithAnalysis(analysis = matchAnalysis()): MatchDetail {
     status: { team_one: "open", team_two: "open" },
   }];
   return value;
+}
+
+function analysisWithSingleDecision(decision: StrategyDecision): MatchAnalysis {
+  const analysis = matchAnalysis();
+  analysis.strategy.data!.decisions = [decision];
+  analysis.strategy.data!.displayed_count = 1;
+  analysis.strategy.data!.scanned_count = 1;
+  return analysis;
 }
 
 function sourceRow(label: string): HTMLElement {
@@ -569,6 +698,293 @@ describe("MatchWorkspace", () => {
     expect(screen.getByText("draft-model-v3")).toBeInTheDocument();
     expect(screen.queryByText("策略就绪")).not.toBeInTheDocument();
     expect(screen.getByText("进程运行")).toBeInTheDocument();
+  });
+
+  it("shows decision-time Rosh and live situation evidence without using the latest score card", () => {
+    const analysis = matchAnalysis();
+    const decision = roshStrategyDecision(true);
+    analysis.strategy.data!.decisions = [decision];
+    analysis.strategy.data!.displayed_count = 1;
+    analysis.lineup.data!.scores = analysisSection("available", "rosh_lineup_score_available", {
+      pure_lineup_score: 9.1,
+      player_adjusted_lineup_score: 9.9,
+      effective_lineup_score: 9.9,
+      mode: "player_adjusted",
+      player_coverage: 1,
+      player_coverage_count: 10,
+      stake_multiplier: 1,
+      formula_version: "dematus-rosh-v1",
+      source_as_of: "2026-07-16T12:01:59+00:00",
+      score_key: "4".repeat(64),
+      player_identity_hash: "5".repeat(64),
+      evidence_hash: "6".repeat(64),
+      stake_cap: 1,
+    });
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+    const row = view.container.querySelector(".decision-row");
+    if (!(row instanceof HTMLElement)) throw new Error("decision row not found");
+
+    const rosh = within(row).getByLabelText("决策时 Rosh 证据");
+    expect(within(rosh).getByText("当前分钟分 -2.8 pp · 30 分钟桶")).toBeInTheDocument();
+    expect(within(rosh).getByText("决策时阵容局势 Dire 阵容占优 -2.8 pp")).toBeInTheDocument();
+    expect(within(rosh).getByText("评分模式 选手修正")).toBeInTheDocument();
+    expect(within(rosh).getByText("选手覆盖 100.0% (10/10)")).toBeInTheDocument();
+    expect(within(rosh).getByText("dematus-rosh-v1")).toBeInTheDocument();
+    expect(within(row).queryByText("+9.9 pp")).not.toBeInTheDocument();
+
+    const situation = within(row).getByLabelText("决策时实时局势证据");
+    expect(within(situation).getByText("实时局势 可控劣势")).toBeInTheDocument();
+    expect(within(situation).getByText("弱势方击杀落后 4")).toBeInTheDocument();
+    expect(within(situation).getByText("弱势方经济落后 5,000–5,999")).toBeInTheDocument();
+    expect(within(situation).getByText(/HUD vision_hud · 置信 96\.0%/)).toBeInTheDocument();
+    expect(within(situation).getByText(FRAME_REF)).toBeInTheDocument();
+    expect(within(situation).getByText(/入场时间窗 命中 · 20:00-45:00/)).toBeInTheDocument();
+    expect(within(situation).getByText("eligible")).toBeInTheDocument();
+    expect(within(situation).getByText(/可控区间：击杀落后 2-10 · 经济落后 1,000-10,000 · 20:00-45:00 · HUD 置信至少 90\.0%/)).toBeInTheDocument();
+
+    const overview = view.getByLabelText("当前策略结论与入场链路");
+    expect(within(overview).getByText("最终策略合格")).toBeInTheDocument();
+    expect(within(overview).getByText("证据有效")).toBeInTheDocument();
+    expect(within(overview).getByText(/HUD 已验证 · 置信 96\.0%/)).toBeInTheDocument();
+    expect(within(overview).getByText("入场门槛通过 · 击杀落后 4 · 经济落后 5,000–5,999")).toBeInTheDocument();
+    expect(within(overview).getByText("52.8% 支持弱势方")).toBeInTheDocument();
+    expect(within(overview).getByText("最终合格")).toBeInTheDocument();
+    expect(within(overview).getByText("v4 仅为纸面影子信号，不代表策略表现已验证。")).toBeInTheDocument();
+  });
+
+  it("fails closed when a v4 decision restores forbidden exact economy totals", () => {
+    const decision = roshStrategyDecision(true);
+    const state = decision.inputs!.comeback_state as Record<string, unknown>;
+    Object.assign(state, {
+      underdog_net_worth: 38_000,
+      opponent_net_worth: 43_000,
+      net_worth_deficit: 5_000,
+      net_worth_advantage_side: null,
+      net_worth_deficit_min: null,
+      net_worth_deficit_max: null,
+    });
+
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysisWithSingleDecision(decision))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(view.container.querySelector(".decision-row")).not.toBeInTheDocument();
+    const overview = view.getByLabelText("当前策略结论与入场链路");
+    expect(within(overview).getByText("策略证据无效")).toBeInTheDocument();
+    expect(within(overview).getByText("证据无效")).toBeInTheDocument();
+    expect(within(overview).queryByText(/入场判定 允许/)).not.toBeInTheDocument();
+  });
+
+  it("rejects a v4 economy bucket whose signed range contradicts the HUD leader", () => {
+    const decision = roshStrategyDecision(true);
+    const state = decision.inputs!.comeback_state as Record<string, unknown>;
+    state.net_worth_advantage_side = "dire";
+
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysisWithSingleDecision(decision))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(view.container.querySelector(".decision-row")).not.toBeInTheDocument();
+    expect(within(view.getByLabelText("当前策略结论与入场链路")).getByText("证据无效")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["unavailable state with a permissive entry", (decision: StrategyDecision) => {
+      const state = decision.inputs!.comeback_state as Record<string, unknown>;
+      Object.assign(state, {
+        controllable: false,
+        reason: "live_state_not_provided",
+        source_status: "unavailable",
+        source: null,
+        confidence: 0,
+        underdog_kills: null,
+        opponent_kills: null,
+        kill_deficit: null,
+        net_worth_advantage_side: null,
+        net_worth_deficit_min: null,
+        net_worth_deficit_max: null,
+        unavailable_reason: "live_state_not_provided",
+      });
+    }],
+    ["eligible entry with a non-eligible reason", (decision: StrategyDecision) => {
+      const entry = decision.inputs!.comeback_entry as Record<string, unknown>;
+      entry.reason = "rosh_direction_unavailable";
+    }],
+    ["tampered frozen entry policy", (decision: StrategyDecision) => {
+      const entry = decision.inputs!.comeback_entry as Record<string, unknown>;
+      const policy = entry.policy as Record<string, unknown>;
+      policy.minimum_kill_deficit = 3;
+    }],
+    ["entry window flag inconsistent with its game clock", (decision: StrategyDecision) => {
+      const window = decision.inputs!.entry_window as Record<string, unknown>;
+      window.inside = false;
+    }],
+  ] as const)("fails closed on %s", (_, mutate) => {
+    const decision = roshStrategyDecision(true);
+    mutate(decision);
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysisWithSingleDecision(decision))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(view.container.querySelector(".decision-row")).not.toBeInTheDocument();
+    const overview = view.getByLabelText("当前策略结论与入场链路");
+    expect(within(overview).getByText("策略证据无效")).toBeInTheDocument();
+    expect(within(overview).getByText("证据无效")).toBeInTheDocument();
+  });
+
+  it("keeps a canonical negative deficit range as valid underdog-ahead evidence", () => {
+    const decision = roshStrategyDecision(true);
+    decision.eligible = 0;
+    decision.reason = "underdog_deficit_not_material";
+    const state = decision.inputs!.comeback_state as Record<string, unknown>;
+    Object.assign(state, {
+      controllable: false,
+      reason: "underdog_deficit_not_material",
+      net_worth_advantage_side: "dire",
+      net_worth_deficit_min: -5_999,
+      net_worth_deficit_max: -5_000,
+    });
+    const entry = decision.inputs!.comeback_entry as Record<string, unknown>;
+    entry.eligible = false;
+    entry.reason = "underdog_deficit_not_material";
+
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysisWithSingleDecision(decision))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const row = view.container.querySelector(".decision-row");
+    if (!(row instanceof HTMLElement)) throw new Error("decision row not found");
+    expect(within(row).getByText("弱势方经济领先 5,000–5,999")).toBeInTheDocument();
+    const overview = view.getByLabelText("当前策略结论与入场链路");
+    expect(within(overview).getByText("当前策略拒绝")).toBeInTheDocument();
+    expect(within(overview).getByText("证据有效")).toBeInTheDocument();
+    expect(within(overview).getByText("最终拒绝")).toBeInTheDocument();
+  });
+
+  it("distinguishes an entry candidate from a final edge rejection", () => {
+    const decision = roshStrategyDecision(true);
+    decision.eligible = 0;
+    decision.reason = "edge_below_threshold";
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysisWithSingleDecision(decision))}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const overview = view.getByLabelText("当前策略结论与入场链路");
+    expect(within(overview).getByText("候选通过，最终策略拒绝")).toBeInTheDocument();
+    expect(within(overview).getByText("入场候选通过")).toBeInTheDocument();
+    expect(within(overview).getByText(/入场门槛通过/)).toBeInTheDocument();
+    expect(within(overview).getByText("最终拒绝")).toBeInTheDocument();
+    expect(within(overview).queryByText("证据无效")).not.toBeInTheDocument();
+  });
+
+  it("keeps a valid 25-minute Rosh bucket visible", () => {
+    const analysis = matchAnalysis();
+    const decision = roshStrategyDecision(true, 25);
+    analysis.strategy.data!.decisions = [decision];
+    analysis.strategy.data!.displayed_count = 1;
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+    const row = view.container.querySelector(".decision-row");
+    if (!(row instanceof HTMLElement)) throw new Error("decision row not found");
+
+    const rosh = within(row).getByLabelText("决策时 Rosh 证据");
+    expect(within(rosh).getByText("当前分钟分 -2.8 pp · 25 分钟桶")).toBeInTheDocument();
+  });
+
+  it("rejects a Rosh bucket later than the decision game clock", () => {
+    const analysis = matchAnalysis();
+    analysis.strategy.data!.decisions = [roshStrategyDecision(true, 25, 24 * 60)];
+    analysis.strategy.data!.displayed_count = 1;
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getAllByText("strategy_evidence_invalid").length).toBeGreaterThan(0);
+    expect(view.container.querySelector(".decision-row")).not.toBeInTheDocument();
+  });
+
+  it("shows the persisted Rosh blocker when a decision has no current-minute score", () => {
+    const analysis = matchAnalysis();
+    const decision = roshStrategyDecision(false);
+    analysis.strategy.data!.decisions = [decision];
+    analysis.strategy.data!.displayed_count = 1;
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+    const row = view.container.querySelector(".decision-row");
+    if (!(row instanceof HTMLElement)) throw new Error("decision row not found");
+    const rosh = within(row).getByLabelText("决策时 Rosh 证据");
+
+    expect(within(rosh).getByText("当前分钟分 不可用")).toBeInTheDocument();
+    expect(within(rosh).getByText("决策时阵容局势 不可判定")).toBeInTheDocument();
+    expect(within(rosh).getByText(/Rosh 评分阵容与决策时可信阵容不一致/)).toBeInTheDocument();
+    expect(within(rosh).getByText(/rosh_lineup_draft_mismatch/)).toBeInTheDocument();
   });
 
   it("renders the backend mixed golden without dropping blocked or eligible decisions", () => {
@@ -988,6 +1404,30 @@ describe("MatchWorkspace", () => {
     },
   );
 
+  it("treats an upcoming match as waiting for start instead of evidence unavailable", () => {
+    const analysis = matchAnalysis({
+      strategy: analysisSection<StrategyAnalysisData>("waiting", "waiting_for_match_start", null),
+    });
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={{ ...match, lifecycle: "upcoming" }}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const overview = view.getByLabelText("当前策略结论与入场链路");
+    expect(within(overview).getByText("等待开赛")).toBeInTheDocument();
+    expect(within(overview).getByText("尚未开赛")).toBeInTheDocument();
+    expect(within(overview).getByText("等待比赛开始并采集可信 HUD。")).toBeInTheDocument();
+    expect(within(overview).getByText(/下一步 等待比赛开始并采集可信 HUD/)).toBeInTheDocument();
+    expect(within(overview).getByText(/最近数据/)).toBeInTheDocument();
+    expect(within(overview).queryByText("证据不可用")).not.toBeInTheDocument();
+  });
+
   it("shows exact mapping, vision, lineup and strategy blockers in the source summary", () => {
     const analysis = matchAnalysis({
       vision: analysisSection<VisionAnalysisData>("waiting", "waiting_for_confirmed_vision", null),
@@ -1213,7 +1653,7 @@ describe("MatchWorkspace", () => {
 
   it("shows waiting instead of fabricating a missing Rosh score", () => {
     const waiting = lineupData({
-      scores: analysisSection("waiting", "rosh_lineup_score_pending", null),
+      scores: analysisSection<RoshLineupScoresData>("waiting", "rosh_lineup_score_pending", null),
     });
     render(
       <MatchWorkspace

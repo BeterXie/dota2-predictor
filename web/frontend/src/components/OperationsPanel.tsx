@@ -78,6 +78,10 @@ export function OperationsPanel({
   onInvalidateMapping,
 }: OperationsPanelProps) {
   const activeMappings = mappings.filter((mapping) => !mapping.invalidation);
+  const activeAlertCount = alerts.filter((alert) => !alert.acknowledged_at).length;
+  const readinessStates = match ? Object.values(match.readiness) : [];
+  const readyCount = readinessStates.filter((item) => item.status === "ready").length;
+  const chainReady = Boolean(match) && readyCount === readinessRows.length;
   const visibleAlerts = [...alerts]
     .sort((left, right) => Number(Boolean(left.acknowledged_at))
       - Number(Boolean(right.acknowledged_at)))
@@ -92,6 +96,27 @@ export function OperationsPanel({
 
   return (
     <aside className="operations-panel" aria-label="就绪状态与操作">
+      <section className={`operations-overview ${chainReady ? "ready" : "degraded"}`} aria-label="数据链路与活动告警结论">
+        <div>
+          {chainReady
+            ? <CheckCircle size={21} weight="fill" aria-hidden="true" />
+            : <WarningCircle size={21} weight="fill" aria-hidden="true" />}
+          <div>
+            <strong>{chainReady ? "数据链路可用于决策" : "数据链路尚不可用于决策"}</strong>
+            <span>{match
+              ? chainReady ? "当前赛事的关键数据链路均已就绪。" : "进程运行不代表数据可用于决策。"
+              : "未选择赛事，无法判断数据链路可用性。"}</span>
+          </div>
+        </div>
+        <dl>
+          <div><dt>链路就绪</dt><dd>{readyCount}/{readinessRows.length}</dd></div>
+          <div>
+            <dt>活动告警</dt>
+            <dd>{activeAlertCount}<small>仅表示当前已触发且未确认的告警</small></dd>
+          </div>
+        </dl>
+      </section>
+
       <section className="operations-section">
         <div className="operations-heading">
           <div>
@@ -245,8 +270,8 @@ export function OperationsPanel({
       <section className="operations-section alert-section">
         <div className="operations-heading">
           <div>
-            <h2>当前告警</h2>
-            <span>{alerts.length} 项需要关注</span>
+            <h2>活动告警</h2>
+            <span>{activeAlertCount} 项未确认</span>
           </div>
           <Bell size={20} aria-hidden="true" />
         </div>
@@ -272,10 +297,11 @@ export function OperationsPanel({
               />
             </div>
           ))}
-          {!alerts.length && (
+          {activeAlertCount === 0 && (
             <div className="all-clear">
               <CheckCircle size={18} aria-hidden="true" />
-              当前没有活动告警
+              <span>当前没有活动告警</span>
+              <small>0 仅表示未触发活动告警，请同时检查数据链路。</small>
             </div>
           )}
         </div>

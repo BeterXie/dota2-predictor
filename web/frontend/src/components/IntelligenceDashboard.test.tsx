@@ -300,6 +300,33 @@ describe("IntelligenceDashboard", () => {
           coverage: 0.82,
         },
       },
+      rosh_lineup_score: {
+        status: "available",
+        reason: "historical_rosh_lineup_score_available",
+        data: {
+          pure_lineup_score: 4.2,
+          current_player_adjusted_lineup_score: 5.1,
+          effective_lineup_score: 5.1,
+          scoring_mode: "current_player_adjusted",
+          player_coverage_count: 10,
+          formula_version: "dematus-rosh-test",
+          source_name: "stratz",
+          source_week: 1_752_500_000,
+          source_as_of: "2026-07-13T12:00:00+00:00",
+          player_stats_as_of: "2026-07-22T01:00:00+00:00",
+          backtest_eligible: false,
+          pure_minute_table: [
+            roshMinute(20, 4.2, 33.3, 3.1, 1.1, 0),
+            roshMinute(40, -2.5, 44.4, -1.8, -0.7, 0),
+            roshMinute(60, 0, 55.5, 0, 0, 0),
+          ],
+          current_player_adjusted_minute_table: [
+            roshMinute(20, 5.1, 33.3, 3.1, 1.1, 1.0),
+            roshMinute(40, -3.1, 44.4, -1.8, -0.7, -0.6),
+            roshMinute(60, 0, 55.5, 0, 0, 0),
+          ],
+        },
+      },
       draft_predictions: [{
         model_version: "draft-v1",
         model_kind: "context_adjusted",
@@ -343,7 +370,19 @@ describe("IntelligenceDashboard", () => {
     expect(within(matchRating).getByText("57.00")).toBeInTheDocument();
     expect(within(matchRating).getByText("57.30")).toBeInTheDocument();
     expect(within(matchRating).getAllByText("82.0%")).toHaveLength(3);
-    expect(screen.getByText("阵容评分（胜率）")).toBeInTheDocument();
+    const rosh = screen.getByRole("region", { name: "Rosh 阵容评分" });
+    expect(within(rosh).getAllByText("Aurora 占优 4.20")).toHaveLength(2);
+    expect(within(rosh).getAllByText("Aurora 占优 5.10")).toHaveLength(3);
+    expect(within(rosh).getByText("100.0% (10/10)")).toBeInTheDocument();
+    expect(within(rosh).getByText("dematus-rosh-test")).toBeInTheDocument();
+    expect(within(rosh).getByText("2026-07-22T01:00:00+00:00")).toBeInTheDocument();
+    expect(within(rosh).getByText(/当前选手修正来自当前 STRATZ 数据/)).toBeInTheDocument();
+    expect(within(rosh).getByText("20-60 分钟优势曲线")).toBeInTheDocument();
+    expect(within(rosh).getAllByText("Aurora 占优 4.20")).toHaveLength(2);
+    expect(within(rosh).getByText("Beacon 占优 2.50")).toBeInTheDocument();
+    expect(within(rosh).getAllByText("均势 0.00")).toHaveLength(2);
+    expect(within(rosh).getByText("33.3%")).toBeInTheDocument();
+    expect(screen.getByText("阵容胜率预测")).toBeInTheDocument();
     expect(screen.queryByText("不合成未定义的比赛总分，保留各项可审计结果")).not.toBeInTheDocument();
     expect(screen.getByText("评分待处理")).toBeInTheDocument();
     expect(screen.getAllByText("历史重建").length).toBeGreaterThan(0);
@@ -379,6 +418,62 @@ describe("IntelligenceDashboard", () => {
         expect(matchesMock.mock.calls.some(([options]) => options?.label === label)).toBe(true);
       });
     }
+  });
+
+  it("shows a truthful empty state when historical Rosh scoring is missing", async () => {
+    matchesMock.mockResolvedValue({
+      data: [{
+        match_id: 9002,
+        radiant_team_id: 101,
+        dire_team_id: 202,
+        radiant_team_name: "Aurora",
+        dire_team_name: "Beacon",
+        radiant_win: false,
+        duration: 1800,
+        start_time: 1_752_500_100,
+        leagueid: 77,
+        league_name: "Strict Invitational",
+        radiant_score: 12,
+        dire_score: 24,
+        radiant_state: null,
+        dire_state: null,
+      }],
+      pagination: { ...pagination, total: 1 },
+    });
+    detailMock.mockResolvedValue({
+      match: {
+        match_id: 9002,
+        radiant_team_id: 101,
+        dire_team_id: 202,
+        radiant_team_name: "Aurora",
+        dire_team_name: "Beacon",
+        radiant_win: false,
+        duration: 1800,
+        start_time: 1_752_500_100,
+        leagueid: 77,
+        league_name: "Strict Invitational",
+        radiant_score: 12,
+        dire_score: 24,
+      },
+      radiant_state: null,
+      dire_state: null,
+      player_performance: [],
+      player_scores: [],
+      match_rating: null,
+      rosh_lineup_score: {
+        status: "missing",
+        reason: "historical_rosh_lineup_score_missing",
+        data: null,
+      },
+      draft_predictions: [],
+    });
+
+    renderDashboard();
+
+    const rosh = await screen.findByRole("region", { name: "Rosh 阵容评分" });
+    expect(within(rosh).getByText("当前没有可展示的 Rosh 阵容评分")).toBeInTheDocument();
+    expect(within(rosh).getByText("historical_rosh_lineup_score_missing")).toBeInTheDocument();
+    expect(within(rosh).queryByText("0.00")).not.toBeInTheDocument();
   });
 
   it("prefers a completed intelligence match over a newer pending row", async () => {
@@ -589,6 +684,26 @@ function renderDashboard() {
       <IntelligenceDashboard />
     </FluentProvider>,
   );
+}
+
+function roshMinute(
+  minute: number,
+  winRateGraph: number,
+  matchPercentage: number,
+  heroAdjustment: number,
+  synergyAdjustment: number,
+  playerAdjustment: number,
+) {
+  return {
+    minute,
+    time_start: minute,
+    time_end: minute + 1,
+    win_rate_graph: winRateGraph,
+    match_percentage: matchPercentage,
+    hero_adjustment: heroAdjustment,
+    synergy_adjustment: synergyAdjustment,
+    player_adjustment: playerAdjustment,
+  };
 }
 
 function overview(): IntelligenceOverview {

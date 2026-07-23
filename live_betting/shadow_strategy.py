@@ -23,7 +23,12 @@ class StrategyResult:
 
 
 class ComebackShadowStrategy:
-    def __init__(self, *, min_edge: float = 0.08, stability_tolerance: float = 0.02) -> None:
+    def __init__(
+        self,
+        *,
+        min_edge: float = 0.08,
+        stability_tolerance: float = 0.02,
+    ) -> None:
         self.min_edge = min_edge
         self.stability_tolerance = stability_tolerance
 

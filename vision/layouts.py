@@ -32,6 +32,14 @@ class BroadcastLayout:
     dire_heroes: tuple[NormalizedRegion, ...] = field(default_factory=tuple)
     radiant_team_logo: NormalizedRegion | None = None
     dire_team_logo: NormalizedRegion | None = None
+    radiant_kills: NormalizedRegion | None = None
+    dire_kills: NormalizedRegion | None = None
+    radiant_net_worth_advantage: NormalizedRegion | None = None
+    dire_net_worth_advantage: NormalizedRegion | None = None
+    broadcast_status: NormalizedRegion | None = None
+    live_broadcast_marker_sets: tuple[tuple[str, ...], ...] = field(
+        default_factory=tuple
+    )
 
 
 STANDARD_DOTA_HUD = BroadcastLayout(
@@ -48,6 +56,12 @@ STANDARD_DOTA_HUD = BroadcastLayout(
     ),
     radiant_team_logo=NormalizedRegion(0.250, 0.0, 0.286, 0.060),
     dire_team_logo=NormalizedRegion(0.714, 0.0, 0.750, 0.060),
+    radiant_kills=NormalizedRegion(0.446, 0.008, 0.468, 0.052),
+    dire_kills=NormalizedRegion(0.532, 0.008, 0.554, 0.052),
+    radiant_net_worth_advantage=NormalizedRegion(0.452, 0.038, 0.478, 0.055),
+    dire_net_worth_advantage=NormalizedRegion(0.527, 0.038, 0.555, 0.055),
+    broadcast_status=NormalizedRegion(0.830, 0.000, 0.990, 0.280),
+    live_broadcast_marker_sets=(("playoffs", "quarterfinal"),),
 )
 
 

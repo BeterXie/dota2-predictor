@@ -5,7 +5,7 @@ is stored in SQLite for model training, strict event intelligence, live shadow
 analysis, and the web interface.
 
 `DESIGN.md` is the legacy module baseline, not the current acceptance source.
-Use the [current specifications](docs/superpowers/specs/) together with the
+Use the 
 [historical intelligence delivery design](docs/historical-intelligence-delivery-design.md)
 for current behavior, and [live_betting/README.md](live_betting/README.md) for
 live operations.
@@ -46,13 +46,30 @@ python -m train.main
 # Generate a prematch prediction
 python -m predict.main --radiant 9247354 --dire 10150538
 
-# Start the match browser and monitoring console
-python -m web.main
+# Use the same existing database path for both long-running processes.
+$database = "<absolute path to the existing dota2.db>"
+
+# Terminal 1: start the service supervisor. Historical Rosh is managed by
+# default; no --start-* flag is required for it.
+python scripts/run_dota_shadow_service.py --database $database
+
+# Terminal 2: start the match browser and monitoring console.
+python -m web.main --database $database
 ```
 
 After building `web/frontend`, open the live console at
 `http://127.0.0.1:8000/monitor`. It includes history replay, freshness-derived
 health, allowlisted process controls, exact-mapping audit, and persistent alerts.
+The Web server and service supervisor are separate processes and both are part
+of the normal project start. Running `web.main` alone serves the page but does
+not run historical Rosh analysis.
+
+The recurring supervisor starts the historical Rosh worker by default. It does
+not start odds collection, vision, notifications, or the paper strategy unless
+their existing `--start-*` flags are supplied. Use
+`--disable-historical-rosh` only as an emergency operational override. The
+supervisor's `--once` mode, including `--migrate --once`, does not start the
+historical worker or make historical Rosh network requests.
 
 ### STRATZ API credentials
 
@@ -62,11 +79,12 @@ an ignored local `.env` file or a deployment platform's secret store; never
 commit them to Git, bake them into an image, or expose them in frontend assets.
 
 STRATZ entry points read the service process environment. For local PowerShell
-sessions, inject the credential before starting the process:
+sessions, inject the credential before starting the supervisor so its historical
+Rosh child inherits it:
 
 ```powershell
 $env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
-python -m fetch.fetch_stratz_matchups
+python scripts/run_dota_shadow_service.py --database $database
 ```
 
 For production, create a secret named `STRATZ_API_TOKEN` in the host,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,17 +11,25 @@ import httpx
 import numpy as np
 import pytest
 
-from contracts.live_observation import LiveObservation
+from contracts.live_observation import ComebackState, LiveObservation
 from live_betting.vision import read_jsonl
 from scripts.build_hero_features import build_hero_features
 from scripts.fetch_hero_portraits import valid_portrait_bytes
 from vision.clock_reader import ClockReader, ClockReading
 from vision.hero_recognizer import DraftReading, DraftTracker, HeroRecognizer
 from vision.image_features import color_histogram, compute_phash
-from vision.layouts import BroadcastLayout, NormalizedRegion
+from vision.layouts import BroadcastLayout, NormalizedRegion, STANDARD_DOTA_HUD
 from vision.map_state import MapStateTracker
 from vision.observation_writer import ObservationWriter
 from vision.screen_state import classify_screen_state
+from vision.scoreboard_reader import (
+    NetWorthAdvantageReading,
+    NetWorthAdvantageTracker,
+    ScoreboardReader,
+    ScoreboardReading,
+    ScoreboardTracker,
+    ReplayGateReading,
+)
 from vision.stream_capture import HLSStreamCapture, nonblack_ratio
 from vision.team_side import TeamSideRecognizer, TeamSideTracker
 
@@ -31,6 +40,13 @@ HERO_LAYOUT = BroadcastLayout("hero-test", FULL, FULL, (FULL,) * 5, (FULL,) * 5)
 LEFT = NormalizedRegion(0, 0, 0.5, 1)
 RIGHT = NormalizedRegion(0.5, 0, 1, 1)
 LOGO_LAYOUT = BroadcastLayout("logo-test", LEFT, LEFT, (), (), LEFT, RIGHT)
+SCORE_LAYOUT = BroadcastLayout(
+    "score-test",
+    FULL,
+    FULL,
+    radiant_kills=LEFT,
+    dire_kills=RIGHT,
+)
 
 
 def _portrait(color: tuple[int, int, int], marker: str) -> np.ndarray:
@@ -200,6 +216,133 @@ def test_black_frame_is_transition() -> None:
     assert confidence >= 0.5
 
 
+def test_scoreboard_reader_extracts_both_kill_scores_from_a_synthetic_hud() -> None:
+    image = np.zeros((80, 240, 3), dtype=np.uint8)
+    reader = ScoreboardReader(SCORE_LAYOUT, use_ocr=False)
+    for digit, left in (("1", 24), ("8", 52), ("2", 144), ("5", 172)):
+        glyph = cv2.cvtColor(reader.templates[digit], cv2.COLOR_GRAY2BGR)
+        image[22:58, left : left + 24] = glyph
+
+    reading = reader.read(image)
+
+    assert reading.radiant_kills == 18
+    assert reading.dire_kills == 25
+    assert reading.confidence >= 0.9
+
+
+def test_standard_score_regions_do_not_overlap_clock_or_hero_portraits() -> None:
+    layout = STANDARD_DOTA_HUD
+    assert layout.radiant_kills is not None
+    assert layout.dire_kills is not None
+    assert layout.radiant_heroes[-1].right < layout.radiant_kills.left
+    assert layout.radiant_kills.right < layout.clock.left
+    assert layout.clock.right < layout.dire_kills.left
+    assert layout.dire_kills.right < layout.dire_heroes[0].left
+    assert layout.radiant_net_worth_advantage is not None
+    assert layout.dire_net_worth_advantage is not None
+    assert (
+        layout.radiant_net_worth_advantage.right
+        < layout.dire_net_worth_advantage.left
+    )
+
+
+def test_scoreboard_tracker_requires_two_monotonic_high_confidence_frames() -> None:
+    tracker = ScoreboardTracker(confirmations=2)
+    assert tracker.update(ScoreboardReading(18, 25, 0.96)) is None
+    assert tracker.update(ScoreboardReading(18, 26, 0.94)) is None
+    confirmed = tracker.update(ScoreboardReading(18, 26, 0.93))
+    assert confirmed == ScoreboardReading(18, 26, 0.93)
+
+    assert tracker.update(ScoreboardReading(17, 26, 0.99)) is None
+    assert tracker.update(ScoreboardReading(18, 26, 0.89)) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("<1k", (0, 999, 0.95)),
+        ("1k", (1_000, 1_999, 0.95)),
+        ("9K", (9_000, 9_999, 0.95)),
+        ("10kv", (10_000, 10_999, 0.95)),
+        ("0k", None),
+        ("<2k", None),
+        ("channeling", None),
+    ],
+)
+def test_net_worth_advantage_parser_preserves_bucket_bounds(
+    text: str,
+    expected: tuple[int, int, float] | None,
+) -> None:
+    assert ScoreboardReader._parse_advantage_text(text, 0.95) == expected
+
+
+def test_net_worth_advantage_requires_two_matching_high_confidence_frames() -> None:
+    tracker = NetWorthAdvantageTracker(confirmations=2)
+    one = NetWorthAdvantageReading("radiant", 1_000, 1_999, 0.96)
+    assert tracker.update(one) is None
+    assert (
+        tracker.update(NetWorthAdvantageReading("dire", 1_000, 1_999, 0.96))
+        is None
+    )
+    confirmed = tracker.update(
+        NetWorthAdvantageReading("dire", 1_000, 1_999, 0.94)
+    )
+    assert confirmed == NetWorthAdvantageReading("dire", 1_000, 1_999, 0.94)
+    assert (
+        tracker.update(NetWorthAdvantageReading("dire", 2_000, 2_999, 0.89))
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("readings", "expected"),
+    [
+        ([('HIGHLIGHTS', 0.99)], ReplayGateReading("replay", 0.99, "HIGHLIGHTS")),
+        ([('REPLAY', 0.95)], ReplayGateReading("replay", 0.95, "REPLAY")),
+        ([('PLAYOFFS', 0.98)], ReplayGateReading("untrusted", 0.98, None)),
+        (
+            [('PLAYOFFS', 0.98), ('QUARTERFINAL', 0.99)],
+            ReplayGateReading("live", 0.99, "QUARTERFINAL"),
+        ),
+        (
+            [
+                ('HIGHLIGHTS', 0.75),
+                ('PLAYOFFS', 0.98),
+                ('QUARTERFINAL', 0.99),
+            ],
+            ReplayGateReading("untrusted", 0.75, "HIGHLIGHTS"),
+        ),
+        ([('HIGHLIGHTS', 0.75)], ReplayGateReading("untrusted", 0.75, "HIGHLIGHTS")),
+        ([], ReplayGateReading("untrusted", 0.0, None)),
+    ],
+)
+def test_replay_gate_is_explicit_and_fails_closed(
+    readings: list[tuple[str, float]],
+    expected: ReplayGateReading,
+) -> None:
+    assert ScoreboardReader._classify_broadcast_text(
+        readings,
+        live_marker_sets=STANDARD_DOTA_HUD.live_broadcast_marker_sets,
+    ) == expected
+
+
+def test_replay_gate_matches_fixed_real_broadcast_status_crops() -> None:
+    fixture_root = Path(__file__).parent / "fixtures" / "vision" / "replay_gate"
+    highlight = fixture_root / "highlights.jpg"
+    live = fixture_root / "live_playoffs_quarterfinal.jpg"
+    assert highlight.is_file()
+    assert live.is_file()
+    fixture_layout = replace(STANDARD_DOTA_HUD, broadcast_status=FULL)
+    reader = ScoreboardReader(fixture_layout)
+    highlight_image = cv2.imread(str(highlight))
+    live_image = cv2.imread(str(live))
+    assert highlight_image is not None and highlight_image.shape[:2] == (302, 307)
+    assert live_image is not None and live_image.shape[:2] == (302, 307)
+
+    assert reader.read_replay_gate(highlight_image).status == "replay"
+    assert reader.read_replay_gate(live_image).status == "live"
+
+
 def test_exact_portrait_is_recognized(tmp_path: Path) -> None:
     one = _portrait((20, 90, 180), "1")
     two = _portrait((170, 60, 20), "2")
@@ -299,6 +442,182 @@ def test_observation_contract_and_writer_are_consumer_compatible(
     assert len(parsed) == 1
     assert parsed[0].is_confirmed
     assert parsed[0].radiant_team_side == "team_one"
+    assert parsed[0].comeback_state.status == "unavailable"
+    assert parsed[0].comeback_state.unavailable_reason == "live_state_not_provided"
+
+
+def test_available_comeback_state_round_trips_from_the_same_evidence_frame(
+    tmp_path: Path,
+) -> None:
+    observation = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        source_frame_ref="frame.jpg",
+        comeback_state=ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.95,
+            radiant_kills=18,
+            dire_kills=25,
+            radiant_net_worth=42_000,
+            dire_net_worth=49_500,
+            unavailable_reason=None,
+        ),
+    )
+    path = tmp_path / "observations" / "42.jsonl"
+
+    ObservationWriter(path).append(observation)
+    state = read_jsonl(path)[0].comeback_state
+
+    assert state.is_available
+    assert state.source == "vision_hud"
+    assert state.confidence == 0.95
+    assert state.radiant_kills == 18
+    assert state.dire_kills == 25
+    assert state.radiant_net_worth == 42_000
+    assert state.dire_net_worth == 49_500
+
+
+def test_bucketed_net_worth_advantage_round_trips_without_exact_totals(
+    tmp_path: Path,
+) -> None:
+    observation = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        source_frame_ref="frame.jpg",
+        comeback_state=ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.95,
+            radiant_kills=18,
+            dire_kills=25,
+            net_worth_advantage_side="dire",
+            net_worth_advantage_min=5_000,
+            net_worth_advantage_max=5_999,
+            unavailable_reason=None,
+        ),
+    )
+    path = tmp_path / "observations" / "42.jsonl"
+
+    ObservationWriter(path).append(observation)
+    state = read_jsonl(path)[0].comeback_state
+
+    assert state.radiant_net_worth is None
+    assert state.dire_net_worth is None
+    assert state.net_worth_advantage_side == "dire"
+    assert state.net_worth_advantage_min == 5_000
+    assert state.net_worth_advantage_max == 5_999
+
+
+def test_comeback_state_fails_closed_instead_of_accepting_partial_values() -> None:
+    with pytest.raises(ValueError, match="complete trusted HUD evidence"):
+        ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.95,
+            radiant_kills=18,
+            unavailable_reason=None,
+        )
+    with pytest.raises(ValueError, match="cannot contain inferred HUD values"):
+        ComebackState(
+            status="unavailable",
+            confidence=0.0,
+            radiant_kills=18,
+            unavailable_reason="partial_ocr",
+        )
+    with pytest.raises(ValueError, match="complete trusted HUD evidence"):
+        ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.95,
+            radiant_kills=18,
+            dire_kills=25,
+            net_worth_advantage_side="dire",
+            net_worth_advantage_min=1_000,
+            unavailable_reason=None,
+        )
+
+
+def test_legacy_observation_explicitly_degrades_comeback_state() -> None:
+    payload = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        source_frame_ref="frame.jpg",
+    ).model_dump(mode="json")
+    payload["schema_version"] = 2
+    payload.pop("comeback_state")
+
+    from live_betting.vision import parse_observation
+
+    state = parse_observation(payload).comeback_state
+    assert state.status == "unavailable"
+    assert state.unavailable_reason == "legacy_schema_live_state_unavailable"
+
+
+@pytest.mark.parametrize("economy_kind", ["bucket", "exact"])
+def test_schema_v3_cannot_disguise_v4_economy_evidence(economy_kind: str) -> None:
+    economy = (
+        {
+            "net_worth_advantage_side": "dire",
+            "net_worth_advantage_min": 5_000,
+            "net_worth_advantage_max": 5_999,
+        }
+        if economy_kind == "bucket"
+        else {"radiant_net_worth": 42_000, "dire_net_worth": 47_000}
+    )
+    payload = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        source_frame_ref="frame.jpg",
+        comeback_state=ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.95,
+            radiant_kills=18,
+            dire_kills=25,
+            **economy,
+            unavailable_reason=None,
+        ),
+    ).model_dump(mode="json")
+    payload["schema_version"] = 3
+
+    from live_betting.vision import parse_observation
+
+    state = parse_observation(payload).comeback_state
+    assert state.status == "available"
+    assert state.radiant_kills == 18
+    assert state.dire_kills == 25
+    assert state.radiant_net_worth is None
+    assert state.dire_net_worth is None
+    assert state.net_worth_advantage_side is None
+    assert state.net_worth_advantage_min is None
+    assert state.net_worth_advantage_max is None
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_legacy_observation_cannot_claim_available_comeback_state(
+    schema_version: int,
+) -> None:
+    payload = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        source_frame_ref="frame.jpg",
+        comeback_state=ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.95,
+            radiant_kills=18,
+            dire_kills=25,
+            unavailable_reason=None,
+        ),
+    ).model_dump(mode="json")
+    payload["schema_version"] = schema_version
+
+    from live_betting.vision import parse_observation
+
+    state = parse_observation(payload).comeback_state
+    assert state.status == "unavailable"
+    assert state.unavailable_reason == "legacy_schema_live_state_unavailable"
 
 
 def test_observation_rejects_duplicate_heroes() -> None:

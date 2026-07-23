@@ -2,11 +2,13 @@ import { Button, Skeleton, SkeletonItem } from "@fluentui/react-components";
 import {
   ArrowSquareOut,
   ChartLineUp,
+  CheckCircle,
   Clock,
   ClockCounterClockwise,
   Database,
   Eye,
   WarningCircle,
+  XCircle,
 } from "@phosphor-icons/react";
 import { lazy, Suspense, useMemo, useState } from "react";
 
@@ -31,7 +33,11 @@ import type {
   OddsAnalysisData,
   RoshLineupScoresData,
   StrategyAnalysisData,
+  StrategyComebackEntryInput,
+  StrategyComebackStateInput,
   StrategyDecision,
+  StrategyEntryWindowInput,
+  StrategyRoshInput,
   VisionAnalysisData,
 } from "../types";
 import { LifecycleBadge } from "./StatusBadge";
@@ -54,6 +60,7 @@ const INPUT_REF_RE = /^[0-9a-f]{24}$/;
 const STRATEGY_MATH_TOLERANCE = 1e-9;
 const PROBABILITY_EPSILON = 1e-6;
 const MAX_LEGACY_CONTRIBUTIONS_JSON_BYTES = 64 * 1024;
+const COMEBACK_STRATEGY_V4 = "comeback-shadow-v4-controlled-entry";
 const STRATEGY_CONTRIBUTION_KEYS = [
   "team_style",
   "player_form",
@@ -128,6 +135,10 @@ export function MatchWorkspace({
     ? vision
     : null;
   const watchLink = safeWatchLink(match.watch_link);
+  const chartTimeline = detail?.winner_timeline || [];
+  const chartDecisions = detail?.decisions || [];
+  const hasChartTimeline = chartTimeline.length > 0;
+  const hasModelDecisions = chartDecisions.length > 0;
 
   return (
     <main className="workspace" aria-live="polite">
@@ -199,15 +210,21 @@ export function MatchWorkspace({
         </div>
       )}
 
+      <CurrentStrategyOverview detail={detail} error={error} match={match} />
+
       {loading && !detail ? (
         <WorkspaceSkeleton />
       ) : (
         <>
-          <section className="workspace-section chart-section">
+          <section className={`workspace-section chart-section${hasChartTimeline ? "" : " is-empty"}`}>
             <div className="section-heading">
               <div>
-                <h2>市场概率与模型判断</h2>
-                <p>横轴为真实采集时间。超过 60 秒的数据空档会断开曲线。</p>
+                <h2>{hasModelDecisions
+                  ? "市场概率与模型判断"
+                  : hasChartTimeline ? "市场概率走势" : "市场概率记录"}</h2>
+                <p>{hasChartTimeline
+                  ? "横轴为真实采集时间。超过 60 秒的数据空档会断开曲线。"
+                  : "等待同一采集时刻的完整双方报价。"}</p>
               </div>
               <span className="method-note" title="双方概率已按完整胜负盘去除水位">
                 去水概率
@@ -216,8 +233,8 @@ export function MatchWorkspace({
             <Suspense fallback={<div className="chart-empty"><span>正在加载概率图</span></div>}>
               <ProbabilityChart
                 key={match.raybet_match_id}
-                timeline={detail?.winner_timeline || []}
-                decisions={detail?.decisions || []}
+                timeline={chartTimeline}
+                decisions={chartDecisions}
                 teamOne={match.team_one}
                 teamTwo={match.team_two}
                 preferLatestPeriod={replay}
@@ -256,6 +273,235 @@ export function MatchWorkspace({
       )}
     </main>
   );
+}
+
+type FunnelTone = "pass" | "blocked" | "waiting" | "invalid";
+
+function CurrentStrategyOverview({
+  detail,
+  error,
+  match,
+}: {
+  detail: MatchDetail | null;
+  error: string | null;
+  match: MonitorMatch;
+}) {
+  const strategy = normalizeStrategySection(
+    sectionOrFallback(detail?.analysis?.strategy, error),
+  );
+  const decisions = strategy.status === "available" ? strategy.data?.decisions || [] : [];
+  const latest = decisions[decisions.length - 1] || null;
+  const evidence = latest ? parseDecisionEvidence(latest) : null;
+  const inputs = evidence && !evidence.invalidReason ? evidence.inputs : {};
+  const visionInput = recordValue(inputs.vision);
+  const comeback = parseComebackState(
+    inputs.comeback_state,
+    visionInput.radiant_team_side,
+  );
+  const entryWindow = parseEntryWindow(inputs.entry_window);
+  const entry = parseComebackEntry(inputs.comeback_entry, entryWindow);
+  const v4 = latest?.strategy_version === COMEBACK_STRATEGY_V4;
+  const malformedV4 = Boolean(v4 && (!comeback || !entryWindow || !entry));
+  const invalid = strategy.status === "review" || malformedV4 || Boolean(evidence?.invalidReason);
+  const entryCandidate = entry?.eligible === true;
+  const waitingForStart = !invalid && !latest && match.lifecycle === "upcoming";
+
+  const verdictTone: FunnelTone = invalid
+    ? "invalid"
+    : latest?.eligible === 1
+      ? "pass"
+      : latest ? "blocked" : "waiting";
+  const verdictTitle = invalid
+    ? "策略证据无效"
+    : latest?.eligible === 1
+      ? "最终策略合格"
+      : latest && entryCandidate
+        ? "候选通过，最终策略拒绝"
+        : latest ? "当前策略拒绝" : waitingForStart ? "等待开赛" : "当前策略不可判定";
+  const primaryReason = latest?.reason || strategy.reason;
+  const reasonText = waitingForStart
+    ? "等待比赛开始并采集可信 HUD。"
+    : strategyReasonText(primaryReason, strategy.status);
+  const readiness = detail?.readiness || match.readiness;
+  const dataTone = combineReadinessTone(
+    readinessTone(readiness.odds.status),
+    readinessTone(readiness.mapping.status),
+  );
+  const hudTone: FunnelTone = malformedV4
+    ? "invalid"
+    : comeback?.source_status === "available" ? "pass" : "waiting";
+  const entryTone: FunnelTone = malformedV4
+    ? "invalid"
+    : entry ? (entry.eligible ? "pass" : "blocked") : "waiting";
+  const roshProbability = entry?.rosh_underdog_probability ?? null;
+  const roshTone: FunnelTone = malformedV4
+    ? "invalid"
+    : roshProbability == null ? "waiting" : roshProbability > 0.5 ? "pass" : "blocked";
+  const scanText = strategy.data
+    ? `扫描 ${strategy.data.scanned_count} 条 · 显示 ${strategy.data.displayed_count} 条 · 唯一排除 ${strategy.data.excluded_decision_count} 条`
+    : "尚无可信策略输出";
+  const latestDataAt = detail?.winner?.observed_at || match.winner?.observed_at || match.updated_at;
+  const nextStep = waitingForStart
+    ? "等待比赛开始并采集可信 HUD"
+    : invalid ? "复核并修复无效策略证据"
+      : latest?.eligible === 1 ? "保持纸面监控并等待后续结算"
+        : latest && entryCandidate ? "检查最终拒绝原因并保留候选证据"
+          : latest ? "等待下一次可信输入" : "等待可信 HUD 与策略判断";
+
+  return (
+    <section className={`strategy-overview tone-${verdictTone}`} aria-label="当前策略结论与入场链路">
+      <div className="strategy-verdict">
+        <div className="strategy-verdict-status">
+          <VerdictIcon tone={verdictTone} />
+          <span>{invalid ? "证据无效" : latest ? "证据有效" : waitingForStart ? "尚未开赛" : "证据不可用"}</span>
+          {entryCandidate && latest?.eligible === 0 && <span>入场候选通过</span>}
+        </div>
+        <h2>{verdictTitle}</h2>
+        <p>{reasonText}</p>
+        <div className="strategy-verdict-meta">
+          <span>{latest
+            ? `结论更新 ${formatDateTime(latest.decided_at)}`
+            : `最近数据 ${formatDateTime(latestDataAt)}`}</span>
+          <span>下一步 {nextStep}</span>
+          {latest && <span>{scanText}</span>}
+        </div>
+        {primaryReason && (
+          <details className="strategy-reason-code">
+            <summary>Reason code</summary>
+            <code>{primaryReason}</code>
+          </details>
+        )}
+        {v4 && (
+          <p className="strategy-provisional">v4 仅为纸面影子信号，不代表策略表现已验证。</p>
+        )}
+      </div>
+
+      <div className="strategy-funnel" aria-label="当前比赛关键链路">
+        <FunnelStep
+          detail={`赔率 ${readinessStatusText(readiness.odds.status)} · 映射 ${readinessStatusText(readiness.mapping.status)}`}
+          label="数据可信"
+          tone={dataTone}
+        />
+        <FunnelStep
+          detail={comeback
+            ? `${comeback.source_status === "available" ? "HUD 已验证" : "HUD 不可用"} · 置信 ${formatPercent(comeback.confidence)}`
+            : "等待 v4 HUD 证据"}
+          label="实时 HUD"
+          tone={hudTone}
+        />
+        <FunnelStep
+          detail={entry
+            ? `${entry.eligible ? "入场门槛通过" : "入场门槛阻止"} · ${comebackStateSummary(comeback)}`
+            : "入场门槛不可判"}
+          label="受控劣势"
+          tone={entryTone}
+        />
+        <FunnelStep
+          detail={roshProbability == null
+            ? "方向不可判"
+            : `${formatPercent(roshProbability)} ${roshProbability > 0.5 ? "支持弱势方" : "不支持弱势方"}`}
+          label="Rosh 方向"
+          tone={roshTone}
+        />
+        <FunnelStep
+          detail={invalid
+            ? "最终证据无效"
+            : latest ? (latest.eligible === 1 ? "最终合格" : "最终拒绝") : "最终不可判"}
+          label="最终资格"
+          tone={verdictTone}
+        />
+      </div>
+    </section>
+  );
+}
+
+function FunnelStep({
+  detail,
+  label,
+  tone,
+}: {
+  detail: string;
+  label: string;
+  tone: FunnelTone;
+}) {
+  const stateText = tone === "pass"
+    ? "通过"
+    : tone === "blocked" ? "阻止" : tone === "invalid" ? "无效" : "等待";
+  return (
+    <div className={`funnel-step ${tone}`}>
+      <div>
+        <VerdictIcon tone={tone} />
+        <strong>{label}</strong>
+        <span>{stateText}</span>
+      </div>
+      <p>{detail}</p>
+    </div>
+  );
+}
+
+function VerdictIcon({ tone }: { tone: FunnelTone }) {
+  if (tone === "pass") return <CheckCircle size={17} weight="fill" aria-hidden="true" />;
+  if (tone === "blocked") return <XCircle size={17} weight="fill" aria-hidden="true" />;
+  if (tone === "invalid") return <WarningCircle size={17} weight="fill" aria-hidden="true" />;
+  return <Clock size={17} aria-hidden="true" />;
+}
+
+function readinessTone(status: MonitorMatch["readiness"]["odds"]["status"]): FunnelTone {
+  if (status === "ready" || status === "delayed") return "pass";
+  if (status === "invalid") return "invalid";
+  if (["unhealthy", "stopped", "degraded"].includes(status)) return "blocked";
+  return "waiting";
+}
+
+function combineReadinessTone(left: FunnelTone, right: FunnelTone): FunnelTone {
+  if (left === "invalid" || right === "invalid") return "invalid";
+  if (left === "blocked" || right === "blocked") return "blocked";
+  return left === "pass" && right === "pass" ? "pass" : "waiting";
+}
+
+function readinessStatusText(status: MonitorMatch["readiness"]["odds"]["status"]): string {
+  return {
+    ready: "就绪",
+    delayed: "延迟",
+    stale: "过期",
+    missing: "缺失",
+    invalid: "无效",
+    unconfirmed: "未确认",
+    degraded: "降级",
+    unhealthy: "异常",
+    stopped: "停止",
+  }[status];
+}
+
+function strategyReasonText(reason: string, status: AnalysisSectionStatus): string {
+  const descriptions: Record<string, string> = {
+    eligible: "全部策略门槛已通过。",
+    controlled_deficit: "弱势方处于策略允许的受控劣势区间。",
+    vision_net_worth_evidence_missing: "HUD 缺少可用经济区间，Entry 已阻止。",
+    vision_situation_collapsed: "弱势方劣势超出策略上限，Entry 已阻止。",
+    underdog_deficit_not_material: "当前劣势未达到入场下限，Entry 已阻止。",
+    comeback_entry_outside_time_window: "比赛时钟不在受控入场窗口内。",
+    rosh_direction_unavailable: "Rosh 对弱势方的方向证据不可用。",
+    rosh_direction_opposes_underdog: "Rosh 方向不支持当前弱势方。",
+    edge_below_threshold: "模型 Edge 未达到最终策略阈值。",
+    conservative_probability_not_above_market: "保守模型概率未高于市场概率。",
+    insufficient_data_quality: "数据质量未达到最终策略门槛。",
+    no_independent_positive_contribution: "没有独立的正向模型贡献。",
+    strategy_evidence_invalid: "策略证据未通过前端契约校验。",
+    waiting_for_strategy_inputs: "等待可信策略输入。",
+  };
+  if (descriptions[reason]) return descriptions[reason];
+  if (status === "waiting") return "等待形成可信的策略判断。";
+  if (status === "review") return "策略证据需要人工复核，不能用于入场。";
+  if (status === "unavailable") return "当前没有可用于判断的策略证据。";
+  return "当前判断已保留原因码，详细证据见下方策略记录。";
+}
+
+function comebackStateSummary(state: StrategyComebackStateInput | null): string {
+  if (!state) return "局势不可判";
+  const kill = deficitDescription(state.kill_deficit, "击杀");
+  const economy = economyDeficitDescription(state);
+  return `${kill.replace("弱势方", "")} · ${economy.replace("弱势方", "")}`;
 }
 
 function safeWatchLink(link: MonitorMatch["watch_link"]): {
@@ -549,6 +795,7 @@ function DecisionTimeline({
             <DecisionRow
               decision={decision}
               key={decision.decision_key || `${decision.decided_at}-${decision.reason}`}
+              match={match}
             />
           ))}
         </div>
@@ -579,7 +826,13 @@ interface ParsedDecisionEvidence {
   invalidReason: string | null;
 }
 
-function DecisionRow({ decision }: { decision: StrategyDecision }) {
+function DecisionRow({
+  decision,
+  match,
+}: {
+  decision: StrategyDecision;
+  match: MonitorMatch;
+}) {
   const evidence = parseDecisionEvidence(decision);
   const visionInput = recordValue(evidence.inputs.vision);
   const visionAuthority = recordValue(decision.vision_authority);
@@ -612,6 +865,11 @@ function DecisionRow({ decision }: { decision: StrategyDecision }) {
       : null;
   const draftVersion = safeCode(draftInput.model_version);
   const roshInput = recordValue(evidence.inputs.rosh_lineup_score);
+  const usesRosh = evidence.contributions.some(([name]) => name === "lineup_rosh");
+  const persistedRosh = usesRosh
+    && validRoshStrategyInput(roshInput, decision.eligible === 1, inputGameClock)
+    ? roshInput as unknown as StrategyRoshInput
+    : null;
   const actualStake = numberValue(roshInput.actual_stake_multiplier);
   const stakeCap = numberValue(roshInput.stake_cap);
   const strategyVersion = safeCode(decision.strategy_version);
@@ -659,6 +917,15 @@ function DecisionRow({ decision }: { decision: StrategyDecision }) {
           )) : <span className="evidence-missing">没有持久化贡献项</span>}
         </div>
       )}
+      {persistedRosh && (
+        <DecisionRoshEvidence
+          decision={decision}
+          input={persistedRosh}
+          match={match}
+          radiantTeamSide={stringValue(visionInput.radiant_team_side)}
+        />
+      )}
+      <DecisionComebackEvidence inputs={evidence.inputs} />
       <div className="decision-evidence" aria-label="持久化决策证据">
         <span>视觉 {capturedAt ? formatDateTime(capturedAt) : "未提供"}</span>
         <span>时钟 {gameClock == null ? "未提供" : formatClock(gameClock)}</span>
@@ -669,6 +936,282 @@ function DecisionRow({ decision }: { decision: StrategyDecision }) {
       </div>
     </article>
   );
+}
+
+function DecisionRoshEvidence({
+  decision,
+  input,
+  match,
+  radiantTeamSide,
+}: {
+  decision: StrategyDecision;
+  input: StrategyRoshInput;
+  match: MonitorMatch;
+  radiantTeamSide: string | null;
+}) {
+  const selectedScore = numberValue(input.selected_score);
+  const selectedMinute = numberValue(input.selected_minute);
+  const coverage = numberValue(input.player_coverage);
+  const coverageCount = numberValue(input.player_coverage_count);
+  const formulaVersion = safeCode(input.formula_version);
+  const mode = input.mode === "player_adjusted"
+    ? "选手修正"
+    : input.mode === "pure"
+      ? "纯阵容回退"
+      : "评分不可用";
+  const situation = selectedScore == null
+    ? null
+    : decisionRoshSituation(selectedScore, radiantTeamSide, match);
+  return (
+    <div className="decision-evidence" aria-label="决策时 Rosh 证据">
+      <span>
+        当前分钟分 {selectedScore == null
+          ? "不可用"
+          : `${formatRoshScore(selectedScore)} · ${selectedMinute} 分钟桶`}
+      </span>
+      <span>决策时阵容局势 {situation || "不可判定"}</span>
+      <span>评分模式 {mode}</span>
+      <span>
+        选手覆盖 {coverage == null
+          ? "未提供"
+          : `${formatPercent(coverage)}${coverageCount == null ? "" : ` (${coverageCount}/10)`}`}
+      </span>
+      <span>公式 <code>{formulaVersion || "未提供"}</code></span>
+      <span>Rosh 数据时间 {validTimestamp(input.source_as_of) ? formatDateTime(input.source_as_of) : "未提供"}</span>
+      {selectedScore == null && (
+        <span>
+          缺失原因 <code>{decisionRoshMissingReason(decision.reason, input)}</code>
+        </span>
+      )}
+    </div>
+  );
+}
+
+function decisionRoshSituation(
+  score: number,
+  radiantTeamSide: string | null,
+  match: MonitorMatch,
+): string {
+  if (Math.abs(score) < 0.05) return `阵容均衡 ${formatRoshScore(score)}`;
+  const radiantSide = radiantTeamSide === "team_one" || radiantTeamSide === "team_two"
+    ? radiantTeamSide
+    : null;
+  const advantagedSide = score > 0
+    ? radiantSide
+    : radiantSide === "team_one"
+      ? "team_two"
+      : radiantSide === "team_two"
+        ? "team_one"
+        : null;
+  const team = advantagedSide === "team_one"
+    ? match.team_one || "队伍一"
+    : advantagedSide === "team_two"
+      ? match.team_two || "队伍二"
+      : score > 0
+        ? "Radiant"
+        : "Dire";
+  return `${team} 阵容占优 ${formatRoshScore(score)}`;
+}
+
+function decisionRoshMissingReason(
+  reason: string,
+  input: StrategyRoshInput,
+): string {
+  const descriptions: Record<string, string> = {
+    rosh_lineup_score_unavailable: "没有持久化 Rosh 阵容评分",
+    rosh_lineup_draft_mismatch: "Rosh 评分阵容与决策时可信阵容不一致",
+    rosh_minute_score_unavailable: "决策时刻没有可用的 Rosh 分钟桶",
+    rosh_direction_unavailable: "无法从当前分钟 Rosh 分确定劣势方方向",
+  };
+  if (descriptions[reason]) return `${descriptions[reason]} (${reason})`;
+  if (input.status === "unavailable") {
+    return `没有持久化 Rosh 阵容评分 (${reason})`;
+  }
+  if (input.draft_matches_observation === false) {
+    return `Rosh 评分阵容与决策时可信阵容不一致 (${reason})`;
+  }
+  return `当前分钟 Rosh 分不可用 (${reason})`;
+}
+
+function DecisionComebackEvidence({ inputs }: { inputs: Record<string, unknown> }) {
+  const vision = recordValue(inputs.vision);
+  const state = parseComebackState(
+    inputs.comeback_state,
+    vision.radiant_team_side,
+  );
+  const window = parseEntryWindow(inputs.entry_window);
+  const entry = parseComebackEntry(inputs.comeback_entry, window);
+  const frameRef = visionFrameReference(vision.source_frame_ref);
+  if (!state && !window && !entry) return null;
+  return (
+    <div className="decision-evidence" aria-label="决策时实时局势证据">
+      {state && (
+        <>
+          <span>实时局势 {state.controllable ? "可控劣势" : "不可用于入场"}</span>
+          <span>局势原因 <code>{state.reason}</code></span>
+          <span>{deficitDescription(state.kill_deficit, "击杀")}</span>
+          <span>{economyDeficitDescription(state)}</span>
+          <span>
+            HUD {state.source || "来源不可用"} · 置信 {formatPercent(state.confidence)} · <code>{frameRef || "画面引用不可用"}</code>
+          </span>
+          {state.unavailable_reason && (
+            <span>局势缺失原因 <code>{state.unavailable_reason}</code></span>
+          )}
+        </>
+      )}
+      {window && (
+        <span>
+          入场时间窗 {window.inside ? "命中" : "不在窗口"} · {formatClock(window.minimum_clock_seconds)}-{formatClock(window.maximum_clock_seconds)}
+        </span>
+      )}
+      {entry && (
+        <>
+          <span>
+            入场判定 {entry.eligible ? "允许" : "阻止"} · <code>{entry.reason}</code>
+          </span>
+          <span>
+            可控区间：击杀落后 {entry.policy.minimum_kill_deficit}-{entry.policy.maximum_kill_deficit} · 经济落后 {entry.policy.minimum_net_worth_deficit.toLocaleString("zh-CN")}-{entry.policy.maximum_net_worth_deficit.toLocaleString("zh-CN")} · {formatClock(entry.policy.minimum_clock_seconds)}-{formatClock(entry.policy.maximum_clock_seconds)} · HUD 置信至少 {formatPercent(entry.policy.minimum_vision_confidence)}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+function parseComebackState(
+  value: unknown,
+  radiantTeamSide: unknown,
+): StrategyComebackStateInput | null {
+  const data = recordValue(value);
+  const economyFields = [
+    "underdog_net_worth",
+    "opponent_net_worth",
+    "net_worth_deficit",
+    "net_worth_advantage_side",
+    "net_worth_deficit_min",
+    "net_worth_deficit_max",
+  ];
+  if (
+    typeof data.controllable !== "boolean"
+    || safeCode(data.reason) === null
+    || safeCode(data.source_status) === null
+    || !finiteUnit(data.confidence)
+    || (data.underdog_side !== "team_one" && data.underdog_side !== "team_two")
+    || economyFields.some((key) => !Object.prototype.hasOwnProperty.call(data, key))
+  ) return null;
+  const integerFields = [
+    "underdog_kills",
+    "opponent_kills",
+    "kill_deficit",
+  ] as const;
+  if (integerFields.some((key) => data[key] != null && !Number.isInteger(data[key]))) {
+    return null;
+  }
+  if (
+    data.underdog_net_worth != null
+    || data.opponent_net_worth != null
+    || data.net_worth_deficit != null
+  ) return null;
+  const economyMinimum = data.net_worth_deficit_min;
+  const economyMaximum = data.net_worth_deficit_max;
+  const hasEconomyRange = Number.isInteger(economyMinimum) && Number.isInteger(economyMaximum);
+  if (
+    (economyMinimum == null) !== (economyMaximum == null)
+    || (hasEconomyRange && data.net_worth_advantage_side !== "radiant" && data.net_worth_advantage_side !== "dire")
+    || (!hasEconomyRange && data.net_worth_advantage_side != null)
+  ) return null;
+  if (hasEconomyRange) {
+    if (radiantTeamSide !== "team_one" && radiantTeamSide !== "team_two") return null;
+    const minimum = Number(economyMinimum);
+    const maximum = Number(economyMaximum);
+    const leaderIsUnderdog = (data.net_worth_advantage_side === "radiant")
+      === (data.underdog_side === radiantTeamSide);
+    const rawMinimum = leaderIsUnderdog ? -maximum : minimum;
+    const rawMaximum = leaderIsUnderdog ? -minimum : maximum;
+    if (
+      !canonicalEconomyBucket(rawMinimum, rawMaximum)
+      || (leaderIsUnderdog ? maximum > 0 : minimum < 0)
+    ) return null;
+  }
+  if (data.source != null && safeCode(data.source) === null) return null;
+  if (data.unavailable_reason != null && safeCode(data.unavailable_reason) === null) {
+    return null;
+  }
+  return data as unknown as StrategyComebackStateInput;
+}
+
+function parseEntryWindow(value: unknown): StrategyEntryWindowInput | null {
+  const data = recordValue(value);
+  return Number.isInteger(data.minimum_clock_seconds)
+    && Number(data.minimum_clock_seconds) >= 0
+    && Number.isInteger(data.maximum_clock_seconds)
+    && Number(data.maximum_clock_seconds) >= Number(data.minimum_clock_seconds)
+    && Number.isInteger(data.game_clock_seconds)
+    && Number(data.game_clock_seconds) >= 0
+    && typeof data.inside === "boolean"
+    ? data as unknown as StrategyEntryWindowInput
+    : null;
+}
+
+function parseComebackEntry(
+  value: unknown,
+  window: StrategyEntryWindowInput | null,
+): StrategyComebackEntryInput | null {
+  const data = recordValue(value);
+  const policy = recordValue(data.policy);
+  const numeric = (key: string): number | null => numberValue(policy[key]);
+  const minimumClock = numeric("minimum_clock_seconds");
+  const maximumClock = numeric("maximum_clock_seconds");
+  const minimumKills = numeric("minimum_kill_deficit");
+  const maximumKills = numeric("maximum_kill_deficit");
+  const minimumNetWorth = numeric("minimum_net_worth_deficit");
+  const maximumNetWorth = numeric("maximum_net_worth_deficit");
+  const minimumConfidence = numeric("minimum_vision_confidence");
+  const policyValid = [
+    minimumClock,
+    maximumClock,
+    minimumKills,
+    maximumKills,
+    minimumNetWorth,
+    maximumNetWorth,
+  ].every((item) => item !== null && Number.isInteger(item) && item >= 0)
+    && minimumClock! <= maximumClock!
+    && minimumKills! <= maximumKills!
+    && minimumNetWorth! <= maximumNetWorth!
+    && minimumConfidence !== null
+    && finiteUnit(minimumConfidence)
+    && (window === null || (
+      window.minimum_clock_seconds === minimumClock
+      && window.maximum_clock_seconds === maximumClock
+    ));
+  return typeof data.eligible === "boolean"
+    && safeCode(data.reason) !== null
+    && (data.rosh_underdog_probability == null || finiteUnit(data.rosh_underdog_probability))
+    && policyValid
+    ? data as unknown as StrategyComebackEntryInput
+    : null;
+}
+
+function deficitDescription(value: number | null, metric: string): string {
+  if (value == null) return `弱势方${metric}差不可用`;
+  const amount = Math.abs(Math.round(value)).toLocaleString("zh-CN");
+  return `弱势方${metric}${value >= 0 ? "落后" : "领先"} ${amount}`;
+}
+
+function economyDeficitDescription(state: StrategyComebackStateInput): string {
+  const minimum = state.net_worth_deficit_min;
+  const maximum = state.net_worth_deficit_max;
+  if (minimum == null || maximum == null) return "弱势方经济差不可用";
+  const trailing = maximum <= 0 ? "领先" : "落后";
+  const displayMinimum = maximum <= 0 ? Math.abs(maximum) : minimum;
+  const displayMaximum = maximum <= 0 ? Math.abs(minimum) : maximum;
+  return `弱势方经济${trailing} ${displayMinimum.toLocaleString("zh-CN")}–${displayMaximum.toLocaleString("zh-CN")}`;
+}
+
+function canonicalEconomyBucket(minimum: number, maximum: number): boolean {
+  return minimum >= 0
+    && minimum % 1_000 === 0
+    && maximum === minimum + 999;
 }
 
 function parseDecisionEvidence(decision: StrategyDecision): ParsedDecisionEvidence {
@@ -1128,6 +1671,10 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
   }
   if (!validDecisionEdge(edge, marketProbability, modelProbability)) return false;
   if ((eligible === 1) !== (reason === "eligible")) return false;
+  if (
+    value.strategy_version === COMEBACK_STRATEGY_V4
+    && !validV4ComebackInputs(inputs, eligible === 1)
+  ) return false;
 
   const hasContributions = Object.keys(contributions).length > 0;
   if (eligible === 0 && !hasContributions) {
@@ -1152,7 +1699,11 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
     || !validConservativeContributions(contributions, conservative)
     || !validDecisionReferences(value, true)
     || (Object.prototype.hasOwnProperty.call(contributions, "lineup_rosh")
-      && !validRoshStrategyInput(inputs.rosh_lineup_score, eligible === 1))
+      && !validRoshStrategyInput(
+        inputs.rosh_lineup_score,
+        eligible === 1,
+        recordValue(inputs.vision).game_clock_seconds,
+      ))
   ) {
     return false;
   }
@@ -1180,7 +1731,164 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
     ));
 }
 
-function validRoshStrategyInput(value: unknown, eligible: boolean): boolean {
+function validV4ComebackInputs(
+  inputs: Record<string, unknown>,
+  finalEligible: boolean,
+): boolean {
+  const stateValue = inputs.comeback_state;
+  const windowValue = inputs.entry_window;
+  const entryValue = inputs.comeback_entry;
+  const visionValue = inputs.vision;
+  const marketValue = inputs.market;
+  const roshValue = inputs.rosh_lineup_score;
+  if (
+    !isRecord(stateValue)
+    || !isRecord(windowValue)
+    || !isRecord(entryValue)
+    || !isRecord(visionValue)
+    || !isRecord(marketValue)
+    || !isRecord(roshValue)
+    || !isRecord(entryValue.policy)
+    || !hasExactKeys(stateValue, [
+      "controllable", "reason", "source_status", "source", "confidence",
+      "underdog_side", "underdog_kills", "opponent_kills", "kill_deficit",
+      "underdog_net_worth", "opponent_net_worth", "net_worth_deficit",
+      "net_worth_advantage_side", "net_worth_deficit_min",
+      "net_worth_deficit_max", "unavailable_reason",
+    ])
+    || !hasExactKeys(windowValue, [
+      "minimum_clock_seconds", "maximum_clock_seconds", "game_clock_seconds", "inside",
+    ])
+    || !hasExactKeys(entryValue, ["eligible", "reason", "rosh_underdog_probability", "policy"])
+    || !hasExactKeys(entryValue.policy, [
+      "minimum_clock_seconds", "maximum_clock_seconds", "minimum_kill_deficit",
+      "maximum_kill_deficit", "minimum_net_worth_deficit",
+      "maximum_net_worth_deficit", "minimum_vision_confidence",
+    ])
+  ) return false;
+
+  const vision = visionValue;
+  const state = parseComebackState(
+    stateValue,
+    vision.radiant_team_side,
+  );
+  const window = parseEntryWindow(windowValue);
+  const entry = parseComebackEntry(entryValue, window);
+  if (!state || !window || !entry) return false;
+
+  const policy = entry.policy;
+  if (
+    policy.minimum_clock_seconds !== 1_200
+    || policy.maximum_clock_seconds !== 2_700
+    || policy.minimum_kill_deficit !== 2
+    || policy.maximum_kill_deficit !== 10
+    || policy.minimum_net_worth_deficit !== 1_000
+    || policy.maximum_net_worth_deficit !== 10_000
+    || !approximatelyEqual(policy.minimum_vision_confidence, 0.9)
+  ) return false;
+
+  const expectedInside = window.game_clock_seconds >= policy.minimum_clock_seconds
+    && window.game_clock_seconds <= policy.maximum_clock_seconds;
+  if (
+    window.minimum_clock_seconds !== policy.minimum_clock_seconds
+    || window.maximum_clock_seconds !== policy.maximum_clock_seconds
+    || window.inside !== expectedInside
+    || vision.game_clock_seconds !== window.game_clock_seconds
+    || marketValue.underdog_side !== state.underdog_side
+  ) return false;
+
+  const killsAvailable = Number.isInteger(state.underdog_kills)
+    && Number(state.underdog_kills) >= 0
+    && Number.isInteger(state.opponent_kills)
+    && Number(state.opponent_kills) >= 0
+    && Number.isInteger(state.kill_deficit);
+  if (killsAvailable) {
+    if (state.kill_deficit !== Number(state.opponent_kills) - Number(state.underdog_kills)) {
+      return false;
+    }
+  } else if (
+    state.underdog_kills != null
+    || state.opponent_kills != null
+    || state.kill_deficit != null
+  ) return false;
+
+  const economyAvailable = state.net_worth_advantage_side !== null;
+  if (killsAvailable) {
+    if (
+      state.source_status !== "available"
+      || state.source !== "vision_hud"
+      || state.unavailable_reason !== null
+      || state.confidence < policy.minimum_vision_confidence
+    ) return false;
+    const collapsed = Number(state.kill_deficit) > policy.maximum_kill_deficit
+      || (economyAvailable
+        && Number(state.net_worth_deficit_max) > policy.maximum_net_worth_deficit);
+    const notMaterial = Number(state.kill_deficit) < policy.minimum_kill_deficit
+      || (economyAvailable
+        && Number(state.net_worth_deficit_min) < policy.minimum_net_worth_deficit);
+    const expectedStateReason = !economyAvailable
+      ? "vision_net_worth_evidence_missing"
+      : collapsed ? "vision_situation_collapsed"
+        : notMaterial ? "underdog_deficit_not_material" : "controlled_deficit";
+    if (
+      state.reason !== expectedStateReason
+      || state.controllable !== (expectedStateReason === "controlled_deficit")
+    ) return false;
+  } else if (
+    economyAvailable
+    || state.controllable
+    || [
+      "controlled_deficit",
+      "vision_situation_collapsed",
+      "underdog_deficit_not_material",
+    ].includes(state.reason)
+  ) return false;
+
+  const selectedScore = numberValue(roshValue.selected_score);
+  let expectedRoshProbability: number | null = null;
+  if (roshValue.selected_score != null) {
+    if (
+      selectedScore === null
+      || (vision.radiant_team_side !== "team_one" && vision.radiant_team_side !== "team_two")
+    ) return false;
+    const radiantProbability = Math.min(
+      1 - PROBABILITY_EPSILON,
+      Math.max(PROBABILITY_EPSILON, (50 + selectedScore) / 100),
+    );
+    expectedRoshProbability = state.underdog_side === vision.radiant_team_side
+      ? radiantProbability
+      : 1 - radiantProbability;
+  }
+  if (
+    expectedRoshProbability === null
+      ? entry.rosh_underdog_probability !== null
+      : entry.rosh_underdog_probability === null
+        || !approximatelyEqual(entry.rosh_underdog_probability, expectedRoshProbability)
+  ) return false;
+
+  let expectedEntryReason = state.reason;
+  if (state.controllable) {
+    expectedEntryReason = !expectedInside
+      ? "comeback_entry_outside_time_window"
+      : expectedRoshProbability === null ? "rosh_direction_unavailable"
+        : expectedRoshProbability <= 0.5 ? "rosh_direction_opposes_underdog" : "eligible";
+  }
+  const expectedEntryEligible = expectedEntryReason === "eligible";
+  return entry.eligible === expectedEntryEligible
+    && entry.reason === expectedEntryReason
+    && (!finalEligible || expectedEntryEligible);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function validRoshStrategyInput(
+  value: unknown,
+  eligible: boolean,
+  gameClockSeconds: unknown,
+): boolean {
   if (!isRecord(value)) return false;
   const actualStake = numberValue(value.actual_stake_multiplier);
   const compatibilityStake = numberValue(value.stake_multiplier);
@@ -1189,24 +1897,78 @@ function validRoshStrategyInput(value: unknown, eligible: boolean): boolean {
       && value.draft_matches_observation === false
       && actualStake === 0
       && compatibilityStake === 0
-      && value.selected_score == null;
+      && value.selected_score == null
+      && value.selected_minute == null
+      && value.selected_table == null
+      && value.match_percentage == null;
   }
   const stakeCap = numberValue(value.stake_cap);
+  const coverage = numberValue(value.player_coverage);
+  const coverageCount = numberValue(value.player_coverage_count);
+  const pureScore = numberValue(value.pure_score);
+  const effectiveScore = numberValue(value.effective_score);
+  const adjustedScore = value.player_adjusted_score == null
+    ? null
+    : numberValue(value.player_adjusted_score);
   if (
     actualStake === null
     || compatibilityStake === null
     || stakeCap === null
+    || coverage === null
+    || coverageCount === null
+    || !Number.isInteger(coverageCount)
+    || coverageCount < 0
+    || coverageCount > 10
+    || !finiteUnit(coverage)
+    || !approximatelyEqual(coverage, coverageCount / 10)
+    || pureScore === null
+    || effectiveScore === null
     || !approximatelyEqual(actualStake, compatibilityStake)
-    || value.draft_matches_observation !== true
+    || typeof value.draft_matches_observation !== "boolean"
     || safeCode(value.formula_version) === null
+    || !validTimestamp(value.source_as_of)
   ) {
     return false;
   }
-  if (value.mode === "player_adjusted") {
-    return approximatelyEqual(actualStake, 1) && approximatelyEqual(stakeCap, 1);
+  const playerAdjusted = value.mode === "player_adjusted"
+    && coverageCount === 10
+    && adjustedScore !== null
+    && approximatelyEqual(stakeCap, 1);
+  const pure = value.mode === "pure"
+    && coverageCount < 10
+    && value.player_adjusted_score == null
+    && approximatelyEqual(stakeCap, 0.5);
+  if (!playerAdjusted && !pure) return false;
+
+  const selectedScore = numberValue(value.selected_score);
+  if (value.selected_score == null) {
+    return !eligible
+      && actualStake === 0
+      && compatibilityStake === 0
+      && value.selected_minute == null
+      && value.selected_table == null
+      && value.match_percentage == null;
   }
-  return value.mode === "pure"
-    && approximatelyEqual(stakeCap, 0.5)
+  const selectedMinute = numberValue(value.selected_minute);
+  const matchPercentage = numberValue(value.match_percentage);
+  if (
+    value.draft_matches_observation !== true
+    || selectedScore === null
+    || selectedMinute === null
+    || !Number.isInteger(selectedMinute)
+    || selectedMinute < 20
+    || selectedMinute > 60
+    || !validGameClock(gameClockSeconds)
+    || selectedMinute > Math.floor(gameClockSeconds / 60)
+    || matchPercentage === null
+    || matchPercentage < 0
+    || matchPercentage > 100
+  ) return false;
+  if (playerAdjusted) {
+    return value.selected_table === "minute_table"
+      && approximatelyEqual(actualStake, 1);
+  }
+  return value.selected_table === "pure_minute_table"
     && actualStake >= 0.1
     && actualStake <= 0.5;
 }

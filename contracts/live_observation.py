@@ -8,7 +8,92 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
+COMEBACK_STATE_MIN_CONFIDENCE = 0.9
+
+
+def is_canonical_net_worth_bucket(minimum: object, maximum: object) -> bool:
+    """Return whether bounds represent a production HUD thousand bucket."""
+    return (
+        type(minimum) is int
+        and type(maximum) is int
+        and minimum >= 0
+        and minimum % 1_000 == 0
+        and maximum == minimum + 999
+    )
+
+
+class ComebackState(BaseModel):
+    """Current-frame HUD facts required to prove an in-game disadvantage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["available", "unavailable"] = "unavailable"
+    source: Literal["vision_hud"] | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    radiant_kills: int | None = Field(default=None, ge=0)
+    dire_kills: int | None = Field(default=None, ge=0)
+    radiant_net_worth: int | None = Field(default=None, ge=0)
+    dire_net_worth: int | None = Field(default=None, ge=0)
+    net_worth_advantage_side: Literal["radiant", "dire"] | None = None
+    net_worth_advantage_min: int | None = Field(default=None, ge=0)
+    net_worth_advantage_max: int | None = Field(default=None, ge=0)
+    unavailable_reason: str | None = Field(default="live_state_not_provided")
+
+    @classmethod
+    def unavailable(cls, reason: str = "live_state_not_provided") -> "ComebackState":
+        return cls(unavailable_reason=reason)
+
+    @model_validator(mode="after")
+    def status_matches_evidence(self) -> "ComebackState":
+        exact_values = (
+            self.radiant_net_worth,
+            self.dire_net_worth,
+        )
+        advantage_values = (
+            self.net_worth_advantage_min,
+            self.net_worth_advantage_max,
+        )
+        exact_present = any(value is not None for value in exact_values)
+        advantage_present = self.net_worth_advantage_side is not None or any(
+            value is not None for value in advantage_values
+        )
+        exact_valid = not exact_present or all(
+            value is not None for value in exact_values
+        )
+        advantage_valid = not advantage_present or (
+            self.net_worth_advantage_side is not None
+            and is_canonical_net_worth_bucket(*advantage_values)
+        )
+        if self.status == "available":
+            if (
+                self.source != "vision_hud"
+                or self.confidence < COMEBACK_STATE_MIN_CONFIDENCE
+                or self.radiant_kills is None
+                or self.dire_kills is None
+                or not exact_valid
+                or not advantage_valid
+                or (exact_present and advantage_present)
+                or self.unavailable_reason is not None
+            ):
+                raise ValueError(
+                    "available comeback state requires complete trusted HUD evidence"
+                )
+            return self
+        if (
+            self.source is not None
+            or self.confidence != 0.0
+            or self.radiant_kills is not None
+            or self.dire_kills is not None
+            or exact_present
+            or advantage_present
+            or not isinstance(self.unavailable_reason, str)
+            or not self.unavailable_reason.strip()
+        ):
+            raise ValueError(
+                "unavailable comeback state cannot contain inferred HUD values"
+            )
+        return self
 
 
 class LiveObservation(BaseModel):
@@ -34,6 +119,7 @@ class LiveObservation(BaseModel):
     source_frame_bytes: int | None = Field(default=None, gt=0)
     source_frame_path: str | None = None
     screen_state: str = "unknown"
+    comeback_state: ComebackState = Field(default_factory=ComebackState.unavailable)
 
     @field_validator("captured_at_utc")
     @classmethod

@@ -65,6 +65,74 @@ export interface StrategyDecision {
   vision_authority?: Record<string, unknown>;
 }
 
+export interface StrategyRoshInput {
+  status?: "unavailable";
+  score_key?: string;
+  draft_hash?: string;
+  player_identity_hash?: string;
+  pure_score?: number;
+  player_adjusted_score?: number | null;
+  effective_score?: number;
+  mode?: "pure" | "player_adjusted";
+  player_coverage?: number;
+  player_coverage_count?: number;
+  stake_cap?: number;
+  stake_multiplier: number;
+  formula_version?: string;
+  source_name?: string;
+  source_week?: number;
+  cache_week_start?: number;
+  source_as_of?: string;
+  evidence_hash?: string;
+  draft_matches_observation: boolean;
+  selected_table: "pure_minute_table" | "minute_table" | null;
+  selected_minute: number | null;
+  selected_score: number | null;
+  match_percentage: number | null;
+  actual_stake_multiplier: number;
+}
+
+export interface StrategyComebackStateInput {
+  controllable: boolean;
+  reason: string;
+  source_status: string;
+  source: string | null;
+  confidence: number;
+  underdog_side: "team_one" | "team_two";
+  underdog_kills: number | null;
+  opponent_kills: number | null;
+  kill_deficit: number | null;
+  underdog_net_worth: number | null;
+  opponent_net_worth: number | null;
+  net_worth_deficit: number | null;
+  net_worth_advantage_side: "radiant" | "dire" | null;
+  net_worth_deficit_min: number | null;
+  net_worth_deficit_max: number | null;
+  unavailable_reason: string | null;
+}
+
+export interface StrategyEntryWindowInput {
+  minimum_clock_seconds: number;
+  maximum_clock_seconds: number;
+  game_clock_seconds: number;
+  inside: boolean;
+}
+
+export interface StrategyComebackEntryInput {
+  eligible: boolean;
+  reason: string;
+  rosh_underdog_probability: number | null;
+  policy: {
+    minimum_clock_seconds: number;
+    maximum_clock_seconds: number;
+    minimum_kill_deficit: number;
+    maximum_kill_deficit: number;
+    minimum_net_worth_deficit: number;
+    maximum_net_worth_deficit: number;
+    minimum_vision_confidence: number;
+  };
+}
+
 export type AnalysisSectionStatus =
   | "available"
   | "waiting"
@@ -494,6 +562,39 @@ export interface IntelligenceMatchRating {
   dire: IntelligenceMatchRatingValues;
 }
 
+export interface IntelligenceRoshLineupScoreData {
+  pure_lineup_score: number;
+  current_player_adjusted_lineup_score: number | null;
+  effective_lineup_score: number;
+  scoring_mode: "pure" | "current_player_adjusted";
+  player_coverage_count: number;
+  formula_version: string;
+  source_name: string;
+  source_week: number;
+  source_as_of: string;
+  player_stats_as_of: string | null;
+  backtest_eligible: false;
+  pure_minute_table: IntelligenceRoshMinutePoint[];
+  current_player_adjusted_minute_table: IntelligenceRoshMinutePoint[] | null;
+}
+
+export interface IntelligenceRoshMinutePoint {
+  minute: number;
+  time_start: number;
+  time_end: number;
+  win_rate_graph: number;
+  match_percentage: number;
+  hero_adjustment: number;
+  synergy_adjustment: number;
+  player_adjustment: number;
+}
+
+export interface IntelligenceRoshLineupScoreSection {
+  status: "available" | "missing";
+  reason: string;
+  data: IntelligenceRoshLineupScoreData | null;
+}
+
 export interface IntelligenceDraftPrediction {
   model_version: string;
   model_kind: "pure_draft" | "context_adjusted";
@@ -520,6 +621,7 @@ export interface IntelligenceFlatMatchDetail extends IntelligenceMatchSummary {
   player_performance?: IntelligencePlayerPerformance[];
   player_scores: IntelligencePlayerMapScore[];
   match_rating: IntelligenceMatchRating | null;
+  rosh_lineup_score?: IntelligenceRoshLineupScoreSection | null;
   draft_predictions: IntelligenceDraftPrediction[];
 }
 
@@ -530,6 +632,7 @@ export interface IntelligenceNestedMatchDetail {
   player_performance?: IntelligencePlayerPerformance[];
   player_scores: IntelligencePlayerMapScore[];
   match_rating: IntelligenceMatchRating | null;
+  rosh_lineup_score?: IntelligenceRoshLineupScoreSection | null;
   draft_predictions: IntelligenceDraftPrediction[];
 }
 

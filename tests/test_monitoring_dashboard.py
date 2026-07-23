@@ -3225,6 +3225,370 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(decision["draft_authority"]["strict_mapping_id"], 1)
         self.assertEqual(decision["vision_authority"]["confirmed"], 1)
 
+    def test_rosh_input_keeps_explained_missing_minute_decisions_visible(
+        self,
+    ) -> None:
+        source_as_of = NOW - timedelta(seconds=10)
+        value = {
+            "score_key": "a" * 64,
+            "draft_hash": "b" * 64,
+            "player_identity_hash": "c" * 64,
+            "pure_score": 2.5,
+            "player_adjusted_score": None,
+            "effective_score": 2.5,
+            "mode": "pure",
+            "player_coverage": 0.0,
+            "player_coverage_count": 0,
+            "stake_cap": 0.5,
+            "stake_multiplier": 0.0,
+            "formula_version": ROSH_FORMULA_VERSION,
+            "source_name": "stratz",
+            "source_week": int(source_as_of.timestamp()),
+            "cache_week_start": int(source_as_of.timestamp()),
+            "source_as_of": source_as_of.isoformat(),
+            "evidence_hash": "d" * 64,
+            "draft_matches_observation": False,
+            "selected_table": None,
+            "selected_minute": None,
+            "selected_score": None,
+            "match_percentage": None,
+            "actual_stake_multiplier": 0.0,
+        }
+
+        self.assertTrue(
+            monitoring._valid_rosh_strategy_input(
+                value,
+                decided_at=NOW.isoformat(),
+                game_clock_seconds=30 * 60,
+                require_eligible_gates=False,
+            )
+        )
+        self.assertFalse(
+            monitoring._valid_rosh_strategy_input(
+                value,
+                decided_at=NOW.isoformat(),
+                game_clock_seconds=30 * 60,
+                require_eligible_gates=True,
+            )
+        )
+        self.assertFalse(
+            monitoring._valid_rosh_strategy_input(
+                {
+                    **value,
+                    "selected_table": "pure_minute_table",
+                    "selected_minute": 20,
+                    "selected_score": 2.5,
+                    "match_percentage": 50.0,
+                },
+                decided_at=NOW.isoformat(),
+                game_clock_seconds=30 * 60,
+                require_eligible_gates=False,
+            )
+        )
+        self.assertTrue(
+            monitoring._valid_rosh_strategy_input(
+                {
+                    **value,
+                    "draft_matches_observation": True,
+                    "selected_table": "pure_minute_table",
+                    "selected_minute": 25,
+                    "selected_score": 2.5,
+                    "match_percentage": 50.0,
+                    "stake_multiplier": 0.5,
+                    "actual_stake_multiplier": 0.5,
+                },
+                decided_at=NOW.isoformat(),
+                game_clock_seconds=30 * 60,
+                require_eligible_gates=True,
+            )
+        )
+        self.assertFalse(
+            monitoring._valid_rosh_strategy_input(
+                {
+                    **value,
+                    "draft_matches_observation": True,
+                    "selected_table": "pure_minute_table",
+                    "selected_minute": 25,
+                    "selected_score": 2.5,
+                    "match_percentage": 50.0,
+                    "stake_multiplier": 0.5,
+                    "actual_stake_multiplier": 0.5,
+                },
+                decided_at=NOW.isoformat(),
+                game_clock_seconds=24 * 60,
+                require_eligible_gates=True,
+            )
+        )
+
+    def test_comeback_entry_inputs_reject_tampered_durable_evidence(
+        self,
+    ) -> None:
+        inputs = {
+            "vision": {
+                "game_clock_seconds": 30 * 60,
+                "radiant_team_side": "team_one",
+            },
+            "market": {"underdog_side": "team_one"},
+            "rosh_lineup_score": {"selected_score": 12.0},
+            "comeback_state": {
+                "controllable": True,
+                "reason": "controlled_deficit",
+                "source_status": "available",
+                "source": "vision_hud",
+                "confidence": 0.95,
+                "underdog_side": "team_one",
+                "underdog_kills": 14,
+                "opponent_kills": 18,
+                "kill_deficit": 4,
+                "underdog_net_worth": 42_000,
+                "opponent_net_worth": 47_000,
+                "net_worth_deficit": 5_000,
+                "net_worth_advantage_side": None,
+                "net_worth_deficit_min": 5_000,
+                "net_worth_deficit_max": 5_000,
+                "unavailable_reason": None,
+            },
+            "entry_window": {
+                "minimum_clock_seconds": 20 * 60,
+                "maximum_clock_seconds": 45 * 60,
+                "game_clock_seconds": 30 * 60,
+                "inside": True,
+            },
+            "comeback_entry": {
+                "eligible": True,
+                "reason": "eligible",
+                "rosh_underdog_probability": 0.62,
+                "policy": {
+                    "minimum_clock_seconds": 20 * 60,
+                    "maximum_clock_seconds": 45 * 60,
+                    "minimum_kill_deficit": 2,
+                    "maximum_kill_deficit": 10,
+                    "minimum_net_worth_deficit": 1_000,
+                    "maximum_net_worth_deficit": 10_000,
+                    "minimum_vision_confidence": 0.9,
+                },
+            },
+        }
+
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                inputs,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
+        bucketed = json.loads(json.dumps(inputs))
+        bucketed["comeback_state"].update(
+            {
+                "underdog_net_worth": None,
+                "opponent_net_worth": None,
+                "net_worth_deficit": None,
+                "net_worth_advantage_side": "dire",
+                "net_worth_deficit_min": 1_000,
+                "net_worth_deficit_max": 1_999,
+            }
+        )
+        self.assertTrue(
+            monitoring._valid_comeback_entry_inputs(
+                bucketed,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
+        for minimum, maximum in ((5_000, 5_000), (500, 1_499), (5_000, 6_000)):
+            with self.subTest(noncanonical_bucket=(minimum, maximum)):
+                noncanonical = json.loads(json.dumps(bucketed))
+                noncanonical["comeback_state"].update(
+                    {
+                        "net_worth_deficit_min": minimum,
+                        "net_worth_deficit_max": maximum,
+                    }
+                )
+                self.assertFalse(
+                    monitoring._valid_comeback_entry_inputs(
+                        noncanonical,
+                        strategy_version=STRATEGY_VERSION,
+                        require_eligible_gates=True,
+                    )
+                )
+
+        ambiguous_ten_k = json.loads(json.dumps(bucketed))
+        ambiguous_ten_k["comeback_state"].update(
+            {
+                "controllable": False,
+                "reason": "vision_situation_collapsed",
+                "net_worth_deficit_min": 10_000,
+                "net_worth_deficit_max": 10_999,
+            }
+        )
+        ambiguous_ten_k["comeback_entry"].update(
+            {
+                "eligible": False,
+                "reason": "vision_situation_collapsed",
+            }
+        )
+        self.assertTrue(
+            monitoring._valid_comeback_entry_inputs(
+                ambiguous_ten_k,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=False,
+            )
+        )
+
+        wrong_leader = json.loads(json.dumps(bucketed))
+        wrong_leader["comeback_state"]["net_worth_advantage_side"] = "radiant"
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                wrong_leader,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=False,
+            )
+        )
+
+        without_entry_evidence = {
+            key: value
+            for key, value in inputs.items()
+            if key not in {"comeback_state", "entry_window", "comeback_entry"}
+        }
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                without_entry_evidence,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+        for legacy_version in (
+            "comeback-shadow-v1",
+            "comeback-shadow-v2",
+            "comeback-shadow-v2-strict-landmarks",
+            "comeback-shadow-v3",
+            "comeback-shadow-v3-rosh-lineup",
+        ):
+            with self.subTest(legacy_version=legacy_version):
+                self.assertTrue(
+                    monitoring._valid_comeback_entry_inputs(
+                        without_entry_evidence,
+                        strategy_version=legacy_version,
+                        require_eligible_gates=True,
+                    )
+                )
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                without_entry_evidence,
+                strategy_version="comeback-shadow-v999-unknown",
+                require_eligible_gates=False,
+            )
+        )
+
+        tampered_cases = {
+            "state-controllable": ("comeback_state", "controllable", False),
+            "state-reason": (
+                "comeback_state",
+                "reason",
+                "vision_situation_collapsed",
+            ),
+            "window-inside": ("entry_window", "inside", False),
+            "policy-maximum-kills": (
+                "comeback_entry.policy",
+                "maximum_kill_deficit",
+                3,
+            ),
+            "entry-reason": (
+                "comeback_entry",
+                "reason",
+                "rosh_direction_opposes_underdog",
+            ),
+        }
+        for label, (section, field, value) in tampered_cases.items():
+            with self.subTest(label=label):
+                tampered = json.loads(json.dumps(inputs))
+                if section == "comeback_entry.policy":
+                    tampered["comeback_entry"]["policy"][field] = value
+                else:
+                    tampered[section][field] = value
+                self.assertFalse(
+                    monitoring._valid_comeback_entry_inputs(
+                        tampered,
+                        strategy_version=STRATEGY_VERSION,
+                        require_eligible_gates=False,
+                    )
+                )
+
+        rewritten_policy = json.loads(json.dumps(inputs))
+        rewritten_policy["entry_window"].update(
+            {
+                "minimum_clock_seconds": 15 * 60,
+                "maximum_clock_seconds": 50 * 60,
+            }
+        )
+        rewritten_policy["comeback_entry"]["policy"].update(
+            {
+                "minimum_clock_seconds": 15 * 60,
+                "maximum_clock_seconds": 50 * 60,
+                "minimum_kill_deficit": 1,
+                "maximum_kill_deficit": 20,
+                "minimum_net_worth_deficit": 100,
+                "maximum_net_worth_deficit": 20_000,
+                "minimum_vision_confidence": 0.8,
+            }
+        )
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                rewritten_policy,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
+        switched_underdog = json.loads(json.dumps(inputs))
+        switched_underdog["comeback_state"]["underdog_side"] = "team_two"
+        switched_underdog["comeback_entry"].update(
+            {
+                "eligible": False,
+                "reason": "rosh_direction_opposes_underdog",
+                "rosh_underdog_probability": 0.38,
+            }
+        )
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                switched_underdog,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=False,
+            )
+        )
+
+        collapsed = json.loads(json.dumps(bucketed))
+        collapsed["comeback_state"].update(
+            {
+                "controllable": False,
+                "reason": "vision_situation_collapsed",
+                "opponent_kills": 25,
+                "kill_deficit": 11,
+            }
+        )
+        collapsed["comeback_entry"].update(
+            {
+                "eligible": False,
+                "reason": "vision_situation_collapsed",
+            }
+        )
+        self.assertTrue(
+            monitoring._valid_comeback_entry_inputs(
+                collapsed,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=False,
+            )
+        )
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                collapsed,
+                strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
     def test_scored_blocked_decision_fails_closed_without_exact_authority(
         self,
     ) -> None:

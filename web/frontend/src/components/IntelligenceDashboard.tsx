@@ -43,6 +43,8 @@ import type {
   IntelligencePlayerPerformance,
   IntelligencePlayerPage,
   IntelligencePlayerRanking,
+  IntelligenceRoshMinutePoint,
+  IntelligenceRoshLineupScoreSection,
   IntelligenceStateLabel,
   IntelligenceTeamPage,
   IntelligenceTeamProfile,
@@ -720,6 +722,12 @@ function MatchDetailPanel({
         dire={dire}
       />
 
+      <RoshHistoricalScorePanel
+        dire={dire}
+        radiant={radiant}
+        score={value.roshLineupScore}
+      />
+
       <section className="intel-detail-section">
         <div className="intel-section-heading compact">
           <div>
@@ -751,8 +759,8 @@ function MatchDetailPanel({
       <section className="intel-detail-section">
         <div className="intel-section-heading compact">
           <div>
-            <h3>阵容评分（胜率）</h3>
-            <p>历史重建与真实前瞻数据严格分开显示</p>
+            <h3>阵容胜率预测</h3>
+            <p>模型概率独立于 Rosh 纯阵容分与选手修正分</p>
           </div>
           <Sword size={19} aria-hidden="true" />
         </div>
@@ -816,6 +824,158 @@ function MatchRatingGroup({
         <div><dt>赛果修正</dt><dd>{decimal(values.result_adjusted_score, 2)}</dd></div>
         <div><dt>覆盖率</dt><dd>{percent(values.coverage)}</dd></div>
       </dl>
+    </div>
+  );
+}
+
+function RoshHistoricalScorePanel({
+  dire,
+  radiant,
+  score,
+}: {
+  dire: string;
+  radiant: string;
+  score: IntelligenceRoshLineupScoreSection | null;
+}) {
+  const data = score?.status === "available" ? score.data : null;
+  if (!data) {
+    return (
+      <section className="intel-rosh-score unavailable" aria-label="Rosh 阵容评分">
+        <header>
+          <div>
+            <h3>Rosh 阵容评分</h3>
+            <p>历史 OpenDota 比赛的 dematus 阵容评分</p>
+          </div>
+          <Sword size={19} aria-hidden="true" />
+        </header>
+        <div className="intel-rosh-empty">
+          <strong>当前没有可展示的 Rosh 阵容评分</strong>
+          <span>{score?.reason || "历史阵容评分尚未生成"}</span>
+        </div>
+      </section>
+    );
+  }
+
+  const coverage = Math.max(0, Math.min(10, data.player_coverage_count)) / 10;
+  const hasCurrentCorrection = data.current_player_adjusted_lineup_score != null;
+  const displayStatus = score?.status === "available" ? "可展示" : score?.status || "未知";
+  return (
+    <section className="intel-rosh-score" aria-label="Rosh 阵容评分">
+      <header>
+        <div>
+          <h3>Rosh 阵容评分</h3>
+          <p>纯阵容分与当前 STRATZ 选手修正分分开显示</p>
+        </div>
+        <Sword size={19} aria-hidden="true" />
+      </header>
+      <div className="intel-rosh-score-grid">
+        <div>
+          <dt>纯阵容分</dt>
+          <dd>{roshAdvantageLabel(data.pure_lineup_score, radiant, dire)}</dd>
+        </div>
+        <div>
+          <dt>当前选手修正分</dt>
+          <dd>
+            {hasCurrentCorrection
+              ? roshAdvantageLabel(data.current_player_adjusted_lineup_score, radiant, dire)
+              : "不可用"}
+          </dd>
+        </div>
+        <div>
+          <dt>最终展示分</dt>
+          <dd className="score-primary">
+            {roshAdvantageLabel(data.effective_lineup_score, radiant, dire)}
+          </dd>
+        </div>
+        <div>
+          <dt>选手覆盖</dt>
+          <dd>{percent(coverage)} ({data.player_coverage_count}/10)</dd>
+        </div>
+        <div>
+          <dt>评分模式</dt>
+          <dd>{data.scoring_mode === "current_player_adjusted" ? "当前选手修正" : "纯阵容"}</dd>
+        </div>
+        <div>
+          <dt>状态</dt>
+          <dd>{displayStatus}</dd>
+        </div>
+      </div>
+      <dl className="intel-rosh-score-meta">
+        <div><dt>公式版本</dt><dd><code>{data.formula_version}</code></dd></div>
+        <div><dt>数据源</dt><dd><code>{data.source_name}</code></dd></div>
+        <div><dt>阵容数据时间</dt><dd><code>{data.source_as_of}</code></dd></div>
+        <div><dt>选手数据时间</dt><dd><code>{data.player_stats_as_of || "未提供"}</code></dd></div>
+      </dl>
+      <p className="intel-rosh-score-warning">
+        当前选手修正来自当前 STRATZ 数据，不是比赛当时快照；该修正不可用于历史回测或下注证据。
+      </p>
+      <RoshMinuteTable
+        adjusted={data.current_player_adjusted_minute_table}
+        dire={dire}
+        pure={data.pure_minute_table}
+        radiant={radiant}
+      />
+    </section>
+  );
+}
+
+function RoshMinuteTable({
+  adjusted,
+  dire,
+  pure,
+  radiant,
+}: {
+  adjusted: IntelligenceRoshMinutePoint[] | null;
+  dire: string;
+  pure: IntelligenceRoshMinutePoint[];
+  radiant: string;
+}) {
+  const adjustedByMinute = new Map((adjusted || []).map((point) => [point.minute, point]));
+  return (
+    <div className="intel-rosh-curve">
+      <div className="intel-rosh-curve-heading">
+        <strong>20-60 分钟优势曲线</strong>
+        <span>每一行是该时间桶的 Rosh 有符号优势，不将 60 分钟值冒充整场评分</span>
+      </div>
+      {!pure.length ? (
+        <div className="intel-rosh-curve-empty">暂无可展示的 20-60 分钟纯阵容曲线</div>
+      ) : (
+        <div className="intel-table-scroll">
+          <table className="intel-table intel-rosh-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>样本时间窗</th>
+                <th>纯阵容优势</th>
+                <th>当前选手修正优势</th>
+                <th>样本覆盖</th>
+                <th>纯调整</th>
+                <th>选手调整</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pure.map((point) => {
+                const current = adjustedByMinute.get(point.minute);
+                return (
+                  <tr key={point.minute}>
+                    <td className="intel-number">{point.minute} 分钟</td>
+                    <td className="intel-number">{point.time_start}-{point.time_end} 分钟</td>
+                    <td>{roshAdvantageLabel(point.win_rate_graph, radiant, dire)}</td>
+                    <td>
+                      {current
+                        ? roshAdvantageLabel(current.win_rate_graph, radiant, dire)
+                        : "不可用"}
+                    </td>
+                    <td className="intel-number">{percentagePoints(point.match_percentage)}</td>
+                    <td className="intel-number">{signedDecimal(point.hero_adjustment + point.synergy_adjustment)}</td>
+                    <td className="intel-number">{current ? signedDecimal(current.player_adjustment) : "-"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -1333,6 +1493,7 @@ function normalizedDetail(detail: IntelligenceMatchDetail) {
       playerPerformance: detail.player_performance || [],
       playerScores: detail.player_scores,
       matchRating: detail.match_rating,
+      roshLineupScore: detail.rosh_lineup_score ?? null,
       draftPredictions: detail.draft_predictions,
     };
   }
@@ -1343,6 +1504,7 @@ function normalizedDetail(detail: IntelligenceMatchDetail) {
     playerPerformance: detail.player_performance || [],
     playerScores: detail.player_scores,
     matchRating: detail.match_rating,
+    roshLineupScore: detail.rosh_lineup_score ?? null,
     draftPredictions: detail.draft_predictions,
   };
 }
@@ -1520,6 +1682,23 @@ function formatDuration(seconds: number | null | undefined): string {
 
 function decimal(value: number | null | undefined, digits: number): string {
   return value == null || !Number.isFinite(value) ? "-" : value.toFixed(digits);
+}
+
+function signedDecimal(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "-";
+  return `${value > 0 ? "+" : ""}${value.toFixed(2)}`;
+}
+
+function percentagePoints(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "-" : `${value.toFixed(1)}%`;
+}
+
+function roshAdvantageLabel(value: number | null | undefined, radiant: string, dire: string): string {
+  if (value == null || !Number.isFinite(value)) return "不可用";
+  const magnitude = Math.abs(value).toFixed(2);
+  if (value > 0) return `${radiant} 占优 ${magnitude}`;
+  if (value < 0) return `${dire} 占优 ${magnitude}`;
+  return `均势 ${magnitude}`;
 }
 
 function percent(value: number | null | undefined): string {
