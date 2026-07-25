@@ -11,6 +11,7 @@ import re
 import secrets
 import sqlite3
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -24,8 +25,18 @@ from live_betting.draft_authority import (
     draft_landmark_authority_matches,
 )
 from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
+from live_betting.milestone_revocation import (
+    MilestoneRevocationConfig,
+    load_milestone_revocation_projection,
+)
 from live_betting.sanitize import stored_public_stream_url
+from live_betting.service_coordination import MARKET_SOURCE_POLICY
 from live_betting.storage import query_rosh_lineup_score_for_trusted_draft
+from live_betting.strategy_contract import (
+    parse_decision_payload,
+    persisted_decision_projection_failure,
+    validate_strategy_contract,
+)
 from live_betting.stratz_rosh_client import ROSH_FORMULA_VERSION
 from live_betting.strict_eligibility import (
     RAYBET_MATCH_HEAD_TO_HEAD,
@@ -54,7 +65,7 @@ _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
     "shadow_worker": 45.0,
 }
-_OPTIONAL_UNCONFIGURED_COMPONENTS = {"mail", "mail_worker"}
+_OPTIONAL_UNCONFIGURED_COMPONENTS = {"mail", "mail_worker", "companion"}
 _RAYBET_PAGE_ORIGINS = frozenset(
     {"https://ray086.com", "https://www.ray086.com"}
 )
@@ -246,6 +257,7 @@ def derive_health(
             continue
 
         reported = str(row["status"])
+        details = _json_object(row["details_json"])
         heartbeat = _parse_time(row["last_heartbeat_at"])
         age = max(0.0, (checked_at - heartbeat).total_seconds()) if heartbeat else None
         limit = _EXPECTED_HEALTH_COMPONENTS.get(component, 120.0)
@@ -258,7 +270,12 @@ def derive_health(
         else:
             status = reported
             freshness = "fresh"
-        if reported == "stopped" and freshness == "fresh":
+        companion_informational = (
+            component == "companion" and details.get("configured") is False
+        )
+        if companion_informational:
+            status, freshness = "stopped", "informational"
+        elif reported == "stopped" and freshness == "fresh":
             status = "stopped"
 
         output.append(
@@ -272,7 +289,7 @@ def derive_health(
                 "last_success_at": row["last_success_at"],
                 "last_error_at": row["last_error_at"],
                 "last_error": row["last_error"],
-                "details": _json_object(row["details_json"]),
+                "details": details,
             }
         )
     return output
@@ -282,17 +299,29 @@ def build_monitor_snapshot(
     connection: sqlite3.Connection,
     *,
     now: datetime | None = None,
+    revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, Any]:
     checked_at = _aware_utc(now or utc_now())
+    governance = load_milestone_revocation_projection(
+        config=revocation_config,
+        connection=connection if revocation_config is not None else None,
+    )
     health = derive_health(connection, now=checked_at)
-    matches = monitor_matches(connection, now=checked_at)
+    matches = monitor_matches(
+        connection,
+        now=checked_at,
+        _governance=governance,
+    )
     alerts = active_alerts(connection)
     all_counts = _lifecycle_counts(matches)
     live_view = [item for item in matches if not _is_historical_match(item)]
     history_view = [item for item in matches if _is_historical_match(item)]
     snapshot = {
         "generated_at": checked_at.isoformat(),
+        "market_source_policy": MARKET_SOURCE_POLICY,
+        "capabilities": _monitor_capabilities(health),
         "mapping_revision": mapping_revision(connection),
+        "milestone_governance": governance,
         "health": health,
         "matches": matches,
         "alerts": alerts,
@@ -308,7 +337,10 @@ def build_monitor_snapshot(
                 for item in health
                 if not (
                     item["component"] in _OPTIONAL_UNCONFIGURED_COMPONENTS
-                    and item["last_error"] == "configuration_missing"
+                    and (
+                        item["last_error"] == "configuration_missing"
+                        or item["details"].get("configured") is False
+                    )
                 )
             ),
             "active_alerts": len(alerts),
@@ -318,18 +350,52 @@ def build_monitor_snapshot(
     return snapshot
 
 
+def _monitor_capabilities(
+    health: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    statuses = {item["component"]: item["status"] for item in health}
+    return {
+        "direct_market_collection": {
+            "required": True,
+            "status": statuses.get("raybet", "stopped"),
+        },
+        "vision": {
+            "required": True,
+            "status": statuses.get("vision", "stopped"),
+        },
+        "paper_decision": {
+            "required": True,
+            "status": statuses.get("shadow", "stopped"),
+        },
+        "browser_compare": {
+            "required": False,
+            "status": statuses.get("companion", "stopped"),
+        },
+    }
+
+
 def monitor_matches(
     connection: sqlite3.Connection,
     *,
     now: datetime | None = None,
+    revocation_config: MilestoneRevocationConfig | None = None,
+    _governance: Mapping[str, object] | None = None,
 ) -> list[dict[str, Any]]:
     checked_at = _aware_utc(now or utc_now())
+    governance = (
+        _governance
+        if _governance is not None
+        else load_milestone_revocation_projection(
+            config=revocation_config,
+            connection=connection if revocation_config is not None else None,
+        )
+    )
     rows = _realtime_match_candidates(connection, checked_at)
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
     output = [
-        _monitor_match(connection, row, checked_at, health_by_component)
+        _monitor_match(connection, row, checked_at, health_by_component, governance)
         for row in rows
     ]
     lifecycle_order = {"live": 0, "degraded": 1, "upcoming": 2, "ended": 3}
@@ -349,6 +415,7 @@ def monitor_history_page(
     cursor: str | None = None,
     limit: int = _HISTORY_DEFAULT_LIMIT,
     now: datetime | None = None,
+    revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, Any]:
     """Return a bounded immutable-odds replay page.
 
@@ -359,6 +426,10 @@ def monitor_history_page(
 
     if type(limit) is not int or not 1 <= limit <= _HISTORY_MAX_LIMIT:
         raise ValueError("history limit is out of range")
+    governance = load_milestone_revocation_projection(
+        config=revocation_config,
+        connection=connection if revocation_config is not None else None,
+    )
     if cursor is None:
         checked_at = _aware_utc(now or utc_now())
         before = None
@@ -384,7 +455,9 @@ def monitor_history_page(
     found_extra = False
     for row in candidates:
         last_scanned = row
-        item = _monitor_match(connection, row, checked_at, health_by_component)
+        item = _monitor_match(
+            connection, row, checked_at, health_by_component, governance
+        )
         if item.get("history_eligible") is not True:
             continue
         if len(items) == limit:
@@ -419,8 +492,13 @@ def monitor_match_detail(
     *,
     now: datetime | None = None,
     max_points: int = 1200,
+    revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, Any] | None:
     checked_at = _aware_utc(now or utc_now())
+    governance = load_milestone_revocation_projection(
+        config=revocation_config,
+        connection=connection if revocation_config is not None else None,
+    )
     row = connection.execute(
         """SELECT raybet_match_id, tournament, team_one, team_two,
                   scheduled_at, best_of, status, live_url, raw_json, updated_at
@@ -432,7 +510,9 @@ def monitor_match_detail(
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
-    summary = _monitor_match(connection, row, checked_at, health_by_component)
+    summary = _monitor_match(
+        connection, row, checked_at, health_by_component, governance
+    )
     timeline = winner_timeline(
         connection,
         raybet_match_id,
@@ -445,6 +525,7 @@ def monitor_match_detail(
         summary["readiness"]["strategy"],
         lifecycle=str(summary["lifecycle"]),
         now=checked_at,
+        governance=governance,
     )
     decisions = (
         list(strategy["data"]["decisions"])
@@ -455,6 +536,7 @@ def monitor_match_detail(
     trusted_context = _trusted_live_context(connection, raybet_match_id, checked_at)
     return {
         **summary,
+        "milestone_governance": governance,
         "latest_decision": decisions[-1] if decisions else None,
         "winner_timeline": timeline,
         "decisions": decisions,
@@ -506,12 +588,16 @@ def winner_timeline(
                    )"""
         ).fetchall()
     }
+    required_authority_relations = {
+        "odds_transport_observations",
+        "odds_response_outcomes_effective",
+    }
+    if (
+        authority_relations
+        and authority_relations != required_authority_relations
+    ):
+        return []
     if authority_relations:
-        if authority_relations != {
-            "odds_transport_observations",
-            "odds_response_outcomes_effective",
-        }:
-            return []
         try:
             rows = _rows(
                 connection,
@@ -546,6 +632,7 @@ def winner_timeline(
                      LEFT JOIN odds_alignments AS alignment
                        ON alignment.odds_snapshot_id=snapshot.id
                      WHERE transport.raybet_match_id=?
+                       AND transport.source='direct'
                        AND (? IS NULL OR julianday(transport.observed_at)<=julianday(?))
                        AND transport.timing_status='on_time'
                       AND transport.processing_status='processed'
@@ -726,6 +813,7 @@ def current_markets(
                    SELECT observation_key
                      FROM odds_transport_observations
                      WHERE raybet_match_id=?
+                       AND source='direct'
                        AND (? IS NULL OR julianday(observed_at)<=julianday(?))
                        AND timing_status='on_time'
                       AND processing_status='processed'
@@ -881,15 +969,28 @@ def _realtime_match_candidates(
 
     activity_rows = _rows(
         connection,
-        f"""SELECT match_row.rowid AS _candidate_rowid, {qualified}
-               FROM raybet_match_odds_activity AS activity
-               JOIN raybet_matches AS match_row
-                 ON match_row.raybet_match_id=activity.raybet_match_id
-              WHERE activity.latest_odds_activity_at>=?
-                AND activity.latest_odds_activity_at<=?
-              ORDER BY activity.latest_odds_activity_at DESC,
-                       activity.raybet_match_id DESC
-              LIMIT ?""",
+        f"""WITH production_activity AS (
+               SELECT raybet_match_id, MAX(observed_at) AS latest_odds_activity_at
+                 FROM odds_transport_observations
+                WHERE source='direct'
+                GROUP BY raybet_match_id
+               UNION ALL
+               SELECT activity.raybet_match_id, activity.latest_odds_activity_at
+                 FROM raybet_match_odds_activity AS activity
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM odds_transport_observations AS transport
+                       WHERE transport.raybet_match_id=activity.raybet_match_id
+                )
+           )
+           SELECT match_row.rowid AS _candidate_rowid, {qualified}
+             FROM production_activity AS activity
+             JOIN raybet_matches AS match_row
+               ON match_row.raybet_match_id=activity.raybet_match_id
+            WHERE activity.latest_odds_activity_at>=?
+              AND activity.latest_odds_activity_at<=?
+            ORDER BY activity.latest_odds_activity_at DESC,
+                     activity.raybet_match_id DESC
+            LIMIT ?""",
         (
             (checked_at - _HISTORY_ACTIVITY_GRACE).isoformat(),
             checked_at.isoformat(),
@@ -1217,6 +1318,7 @@ def _monitor_match(
     row: sqlite3.Row,
     now: datetime,
     health: dict[str, dict[str, Any]],
+    governance: Mapping[str, object],
 ) -> dict[str, Any]:
     match_id = str(row["raybet_match_id"])
     if _has_transport_observations(connection, match_id):
@@ -1224,6 +1326,7 @@ def _monitor_match(
             connection,
             """SELECT observed_at FROM odds_transport_observations
                 WHERE raybet_match_id=?
+                  AND source='direct'
                   AND julianday(observed_at)<=julianday(?)
                   AND timing_status='on_time'
                   AND processing_status='processed'
@@ -1240,7 +1343,9 @@ def _monitor_match(
             (match_id, now.isoformat()),
         )
     latest_vision = _latest_valid_vision_row(connection, match_id, now=now)
-    latest_decision = _latest_strategy_decision(connection, match_id, now=now)
+    latest_decision = _latest_strategy_decision(
+        connection, match_id, now=now, governance=governance
+    )
     mapping_readiness = _mapping_readiness(connection, match_id, now)
     latest_odds_activity = _latest_odds_activity(connection, match_id, now=now)
 
@@ -1456,6 +1561,7 @@ def _current_winner(
         "observed_at",
         "timing_status",
         "processing_status",
+        "source",
     }
     if transport_columns is None:
         has_transport = False
@@ -1493,6 +1599,7 @@ def _current_winner(
                    SELECT observation_key, observed_at
                      FROM odds_transport_observations
                     WHERE raybet_match_id=?
+                      AND source='direct'
                       AND timing_status='on_time'
                       AND processing_status='processed'
                     ORDER BY observed_at DESC, observation_key DESC
@@ -1625,6 +1732,47 @@ def _analysis_section(
     return {"status": status, "reason": reason, "data": data}
 
 
+def _milestone_revocation_keys(
+    projection: Mapping[str, object], field: str
+) -> set[str]:
+    isolated = projection.get("isolated_keys")
+    if not isinstance(isolated, Mapping):
+        return set()
+    values = isolated.get(field)
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values}
+
+
+def _milestone_revocation_decision_keys(
+    connection: sqlite3.Connection,
+    projection: Mapping[str, object],
+) -> set[str]:
+    decisions = _milestone_revocation_keys(projection, "decision_keys")
+    orders = _milestone_revocation_keys(projection, "order_keys")
+    orders.update(_milestone_revocation_keys(projection, "settlement_keys"))
+    if not orders:
+        return decisions
+    try:
+        rows = connection.execute(
+            """SELECT decision_key FROM shadow_order_decision_lineage
+                 WHERE order_key IN (SELECT value FROM json_each(?))""",
+            (json.dumps(sorted(orders)),),
+        ).fetchall()
+    except sqlite3.Error:
+        # An unreadable lineage relation cannot authorize a possibly affected
+        # strategy decision on a configured governance surface.
+        try:
+            return {
+                str(row[0])
+                for row in connection.execute("SELECT decision_key FROM strategy_decisions")
+            }
+        except sqlite3.Error:
+            return decisions
+    decisions.update(str(row[0]) for row in rows)
+    return decisions
+
+
 def _odds_analysis(
     connection: sqlite3.Connection,
     raybet_match_id: str,
@@ -1647,16 +1795,28 @@ def _odds_analysis(
             },
         )
     try:
-        observed = bool(
-            connection.execute(
-                """SELECT EXISTS(
-                       SELECT 1 FROM odds_snapshots
-                        WHERE raybet_match_id=?
-                          AND julianday(received_at)<=julianday(?)
-                   )""",
-                (raybet_match_id, now.isoformat()),
-            ).fetchone()[0]
-        )
+        if _has_transport_observations(connection, raybet_match_id):
+            observed = bool(
+                connection.execute(
+                    """SELECT EXISTS(
+                           SELECT 1 FROM odds_transport_observations
+                            WHERE raybet_match_id=? AND source='direct'
+                              AND julianday(observed_at)<=julianday(?)
+                       )""",
+                    (raybet_match_id, now.isoformat()),
+                ).fetchone()[0]
+            )
+        else:
+            observed = bool(
+                connection.execute(
+                    """SELECT EXISTS(
+                           SELECT 1 FROM odds_snapshots
+                            WHERE raybet_match_id=?
+                              AND julianday(received_at)<=julianday(?)
+                       )""",
+                    (raybet_match_id, now.isoformat()),
+                ).fetchone()[0]
+            )
     except sqlite3.Error as error:
         if classify_sqlite_error(error) == "schema_missing":
             return _analysis_section("unavailable", "odds_schema_missing")
@@ -2259,6 +2419,7 @@ def _strategy_analysis(
     *,
     lifecycle: str,
     now: datetime,
+    governance: Mapping[str, object],
 ) -> dict[str, Any]:
     required_relations = {
         "strategy_decisions": {
@@ -2365,6 +2526,14 @@ def _strategy_analysis(
         "draft_conflicted": 0,
         "invalid_payload": 0,
     }
+    ledger_integrity = governance.get("ledger_integrity")
+    ledger_configured = (
+        isinstance(ledger_integrity, Mapping)
+        and ledger_integrity.get("status") == "verified"
+    )
+    if ledger_configured:
+        excluded["milestone_revocation"] = 0
+    isolated_decisions = _milestone_revocation_decision_keys(connection, governance)
     excluded_decision_count = 0
     decisions_desc: list[dict[str, Any]] = []
     scanned_count = 0
@@ -2404,16 +2573,29 @@ def _strategy_analysis(
                     "mapping_impacted": bool(row["_mapping_impacted"]),
                     "draft_conflicted": bool(row["_draft_conflicted"]),
                 }
+                if ledger_configured:
+                    flags["milestone_revocation"] = (
+                        str(row["decision_key"]) in isolated_decisions
+                    )
                 if any(flags.values()):
                     excluded_decision_count += 1
                     for reason, present in flags.items():
                         excluded[reason] += int(present)
                 else:
-                    decision = _public_strategy_decision(connection, row)
-                    if decision is None:
-                        excluded["invalid_payload"] += 1
+                    payload_failure = persisted_decision_projection_failure(
+                        dict(row)
+                    )
+                    if payload_failure is not None:
+                        excluded[payload_failure] = (
+                            excluded.get(payload_failure, 0) + 1
+                        )
                         excluded_decision_count += 1
                     else:
+                        decision = _public_strategy_decision(connection, row)
+                    if payload_failure is None and decision is None:
+                        excluded["invalid_payload"] += 1
+                        excluded_decision_count += 1
+                    elif payload_failure is None:
                         decisions_desc.append(decision)
                         if len(decisions_desc) > _MAX_DETAIL_DECISIONS:
                             break
@@ -2475,7 +2657,10 @@ def _public_strategy_decision(
     if base is None:
         return None
     try:
-        payload = json.loads(str(row["contributions_json"]))
+        payload = parse_decision_payload(
+            str(row["contributions_json"]),
+            strategy_version=str(row["strategy_version"]),
+        )
     except (RecursionError, TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -3076,16 +3261,25 @@ def _valid_comeback_entry_inputs(
         "minimum_vision_confidence",
     }
     policy = entry.get("policy")
+    contract = validate_strategy_contract(
+        strategy_version,
+        inputs.get("strategy_contract"),
+    )
+    if contract is not None:
+        expected_policy = asdict(contract.policy.entry)
+    elif strategy_version == STRATEGY_VERSION:
+        expected_policy = _DEFAULT_COMEBACK_ENTRY_POLICY
+    elif strategy_version in _LEGACY_COMEBACK_STRATEGY_VERSIONS:
+        expected_policy = None
+    else:
+        return False
     if (
         set(state) != state_keys
         or set(window) != window_keys
         or set(entry) != entry_keys
         or not isinstance(policy, dict)
         or set(policy) != policy_keys
-        or (
-            strategy_version == STRATEGY_VERSION
-            and policy != _DEFAULT_COMEBACK_ENTRY_POLICY
-        )
+        or (expected_policy is not None and policy != expected_policy)
     ):
         return False
     assert isinstance(policy, dict)
@@ -3630,6 +3824,7 @@ def _latest_strategy_decision(
     raybet_match_id: str,
     *,
     now: datetime,
+    governance: Mapping[str, object],
 ) -> sqlite3.Row | None:
     required_relations = {
         "strategy_decisions": {
@@ -3660,12 +3855,19 @@ def _latest_strategy_decision(
     ):
         return None
     try:
+        isolated = sorted(
+            _milestone_revocation_decision_keys(connection, governance)
+        )
         return connection.execute(
             """SELECT decided_at AS observed_at, map_number, model_probability,
                       market_probability, edge, eligible, reason, strategy_version
                  FROM strategy_decisions AS decision
                 WHERE decision.raybet_match_id=?
                   AND julianday(decision.decided_at)<=julianday(?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM json_each(?) AS revoked
+                       WHERE revoked.value=decision.decision_key
+                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM vision_derived_invalidations AS invalidation
                        WHERE invalidation.dependent_type='strategy_decision'
@@ -3703,7 +3905,7 @@ def _latest_strategy_decision(
                          )
                   )
                 ORDER BY decision.decided_at DESC LIMIT 1""",
-            (raybet_match_id, now.isoformat()),
+            (raybet_match_id, now.isoformat(), json.dumps(isolated)),
         ).fetchone()
     except sqlite3.OperationalError as error:
         if classify_sqlite_error(error) == "schema_missing":
@@ -3982,39 +4184,32 @@ def _latest_odds_activity(
     """Return the newest immutable odds activity for archive gating.
 
     ``updated_at`` belongs to the match-list metadata and can remain stale
-    while the odds page continues emitting responses.  Both transport rows
-    and legacy normalized snapshots are considered; processing failures still
-    count as activity so a broken feed cannot be silently archived.
+    while the odds page continues emitting responses. Direct transport rows
+    are authoritative once any transport exists for the match; legacy
+    snapshots are considered only when the match has no transport records.
     """
 
-    candidates: list[datetime] = []
-    transport = _latest_row(
-        connection,
-        """SELECT observed_at
-             FROM odds_transport_observations
-             WHERE raybet_match_id=?
-               AND julianday(observed_at)<=julianday(?)
-            ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
-        (raybet_match_id, now.isoformat()),
-    )
-    if transport is not None:
-        parsed = _parse_time(transport["observed_at"])
-        if parsed is not None:
-            candidates.append(parsed)
-    snapshot = _latest_row(
+    if _has_transport_observations(connection, raybet_match_id):
+        row = _latest_row(
+            connection,
+            """SELECT observed_at
+                 FROM odds_transport_observations
+                WHERE raybet_match_id=? AND source='direct'
+                  AND julianday(observed_at)<=julianday(?)
+                ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
+            (raybet_match_id, now.isoformat()),
+        )
+        return _parse_time(row["observed_at"]) if row is not None else None
+    row = _latest_row(
         connection,
         """SELECT received_at
              FROM odds_snapshots
-             WHERE raybet_match_id=?
-               AND julianday(received_at)<=julianday(?)
+            WHERE raybet_match_id=?
+              AND julianday(received_at)<=julianday(?)
             ORDER BY received_at DESC, id DESC LIMIT 1""",
         (raybet_match_id, now.isoformat()),
     )
-    if snapshot is not None:
-        parsed = _parse_time(snapshot["received_at"])
-        if parsed is not None:
-            candidates.append(parsed)
-    return max(candidates) if candidates else None
+    return _parse_time(row["received_at"]) if row is not None else None
 
 
 def _is_historical_match(match: dict[str, Any]) -> bool:
@@ -4099,6 +4294,7 @@ def _has_transport_observations(
     connection: sqlite3.Connection,
     raybet_match_id: str,
 ) -> bool:
+    """Return any-source membership, which blocks unsafe legacy fallback."""
     return bool(
         _scalar(
             connection,

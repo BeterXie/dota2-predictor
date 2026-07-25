@@ -72,6 +72,25 @@ def _metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
     return sanitized
 
 
+def _transport_metadata(source: object) -> dict[str, Any]:
+    started_at = getattr(source, "request_started_at", None)
+    if started_at is None:
+        started_at = getattr(source, "raybet_request_started_at", None)
+    duration_ms = getattr(source, "transport_duration_ms", None)
+    if duration_ms is None:
+        duration_ms = getattr(source, "raybet_transport_duration_ms", None)
+    metadata: dict[str, Any] = {}
+    if isinstance(started_at, datetime):
+        metadata["request_started_at"] = _aware_utc(started_at).isoformat()
+    if (
+        isinstance(duration_ms, (int, float))
+        and not isinstance(duration_ms, bool)
+        and duration_ms >= 0
+    ):
+        metadata["transport_duration_ms"] = float(duration_ms)
+    return metadata
+
+
 def _provider_code(payload: Mapping[str, Any]) -> int | None:
     value = payload.get("code")
     if isinstance(value, bool) or not isinstance(value, int):
@@ -261,6 +280,7 @@ def audited_direct_request(
     except Exception as error:
         failed_response = getattr(error, "raybet_response", None)
         if isinstance(failed_response, RayBetHTTPResponse):
+            metadata.update(_transport_metadata(failed_response))
             observed_at = _aware_utc(failed_response.received_at)
             try:
                 failed_payload = sanitize_raybet_payload(failed_response.payload)
@@ -331,6 +351,7 @@ def audited_direct_request(
             except Exception as audit_error:
                 raise audit_error from error
             raise
+        metadata.update(_transport_metadata(error))
         received_at = getattr(error, "raybet_received_at", None)
         observed_at = _aware_utc(
             received_at if isinstance(received_at, datetime) else now()
@@ -371,6 +392,7 @@ def audited_direct_request(
         raise
 
     if isinstance(fetched, RayBetHTTPResponse):
+        metadata.update(_transport_metadata(fetched))
         raw_payload = fetched.payload
         observed_at = _aware_utc(fetched.received_at)
         actual_endpoint = fetched.endpoint

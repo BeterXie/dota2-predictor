@@ -729,7 +729,8 @@ def _run_cli(args: argparse.Namespace) -> int:
                         args.database,
                         "unhealthy",
                         active_matches=len(children),
-                        error=f"{type(error).__name__}: {error}",
+                        error=type(error).__name__,
+                        details={"error_type": type(error).__name__},
                     )
                 except Exception:
                     pass

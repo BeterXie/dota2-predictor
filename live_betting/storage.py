@@ -51,6 +51,12 @@ from .sanitize import (
     sanitize_raybet_payload,
 )
 from .strategy import attempt_fill, is_open
+from .strategy_contract import (
+    REGISTERED_STRATEGY_CONTRACTS,
+    parse_decision_payload,
+    serialize_decision_payload,
+    validate_strategy_contract,
+)
 from .strict_eligibility import (
     RAYBET_MATCH_NON_HEAD_TO_HEAD,
     classify_raybet_match_format,
@@ -432,11 +438,16 @@ def _draft_authority_values(
 
 def _has_scored_decision_contributions(decision: Any) -> bool:
     contributions = getattr(decision, "contributions", None)
-    if not isinstance(contributions, Mapping) or (
-        set(contributions) != _SCORED_DECISION_CONTRIBUTION_KEYS
-    ):
+    if not isinstance(contributions, Mapping):
         return False
-    values = tuple(contributions.values())
+    scored = {
+        key: value
+        for key, value in contributions.items()
+        if not str(key).startswith("__")
+    }
+    if set(scored) != _SCORED_DECISION_CONTRIBUTION_KEYS:
+        return False
+    values = tuple(scored.values())
     return (
         all(
             not isinstance(value, bool)
@@ -444,8 +455,29 @@ def _has_scored_decision_contributions(decision: Any) -> bool:
             and math.isfinite(float(value))
             for value in values
         )
-        and float(contributions["draft_curve"]) == 0.0
+        and float(scored["draft_curve"]) == 0.0
     )
+
+
+def _decision_contract(decision: Any) -> Any | None:
+    inputs = getattr(decision, "inputs", None)
+    if not isinstance(inputs, Mapping):
+        contributions = getattr(decision, "contributions", None)
+        inputs = (
+            contributions.get("__inputs__")
+            if isinstance(contributions, Mapping)
+            else None
+        )
+    return inputs.get("strategy_contract") if isinstance(inputs, Mapping) else None
+
+
+def _contract_identity(value: Any) -> tuple[str, str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    fields = ("evaluator_hash", "policy_hash", "serialization_version")
+    if any(not isinstance(value.get(field), str) for field in fields):
+        return None
+    return tuple(str(value[field]) for field in fields)  # type: ignore[return-value]
 
 
 def _load_odds_raw_artifact(
@@ -4281,9 +4313,6 @@ class LiveBettingStore:
                DROP TRIGGER IF EXISTS settlements_authority_insert_guard;"""
         )
         execute_script(self.connection, SCHEMA_SQL)
-        self._migrate_shadow_order_stake_constraint()
-        self._migrate_monitor_match_activity()
-        self._migrate_settlement_authority_audit()
         from .strict_eligibility import init_strict_live_eligibility_schema
 
         init_strict_live_eligibility_schema(
@@ -4291,6 +4320,14 @@ class LiveBettingStore:
             external_transaction=external_transaction,
         )
         self._migrate_shadow_order_signal_fields()
+        self._migrate_shadow_order_stake_constraint()
+        self._migrate_shadow_order_signal_fields()
+        self._migrate_monitor_match_activity()
+        self._migrate_settlement_authority_audit()
+        init_strict_live_eligibility_schema(
+            self.connection,
+            external_transaction=external_transaction,
+        )
         self._migrate_vision_map_identity_fields()
         self._migrate_vision_derived_invalidation_fields()
         if not external_transaction:
@@ -5447,6 +5484,7 @@ class LiveBettingStore:
                     WHERE outcome.observation_key=?
                       AND outcome.raybet_match_id=? AND outcome.odds_id=?
                       AND transport.observed_at=?
+                      AND transport.source='direct'
                       AND transport.timing_status='on_time'
                       AND transport.processing_status='processed'""",
                 (
@@ -6663,6 +6701,7 @@ class LiveBettingStore:
         transport = self.connection.execute(
             """SELECT observed_at FROM odds_transport_observations
                 WHERE observation_key=? AND raybet_match_id=?
+                  AND source='direct'
                   AND timing_status='on_time'
                   AND processing_status='processed'""",
             (vision_transport_key, decision_match_id),
@@ -6856,6 +6895,11 @@ class LiveBettingStore:
                  FROM strategy_decisions AS decision
                  JOIN verified_strategy_decision_vision_authority AS verified
                    ON verified.decision_key=decision.decision_key
+                 JOIN odds_transport_observations AS transport
+                   ON transport.observation_key=decision.vision_transport_key
+                  AND transport.raybet_match_id=decision.raybet_match_id
+                  AND transport.observed_at=decision.vision_transport_at
+                  AND transport.source='direct'
                 WHERE decision.decision_key=?""",
             (decision_key,),
         ).fetchone()
@@ -7469,11 +7513,13 @@ class LiveBettingStore:
         return cursor.rowcount == 1
 
     def observation_timing_status(
-        self, raybet_match_id: str, observed_at: datetime
+        self, raybet_match_id: str, observed_at: datetime, *, source: str
     ) -> str:
+        source_filter = " AND source='direct'" if source == "direct" else ""
         newest = self.connection.execute(
-            """SELECT observed_at FROM odds_transport_observations
+            f"""SELECT observed_at FROM odds_transport_observations
                WHERE raybet_match_id=? AND timing_status!='late'
+               {source_filter}
                ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
             (raybet_match_id,),
         ).fetchone()
@@ -7702,7 +7748,9 @@ class LiveBettingStore:
                 normalized_state_hash,
                 state_values,
             )
-            timing_status = self.observation_timing_status(raybet_match_id, observed_at)
+            timing_status = self.observation_timing_status(
+                raybet_match_id, observed_at, source=source
+            )
             processing_status = "audit_only" if timing_status == "late" else "processing"
             inserted = self.insert_transport_observation(
                 observation_key=observation_key,
@@ -8324,7 +8372,7 @@ class LiveBettingStore:
             """WITH successor AS (
                    SELECT observation_key, raybet_match_id, observed_at
                      FROM odds_transport_observations
-                    WHERE raybet_match_id=? AND observed_at>?
+                     WHERE raybet_match_id=? AND source='direct' AND observed_at>?
                       AND timing_status='on_time'
                       AND processing_status='processed'
                     ORDER BY observed_at, observation_key LIMIT 1
@@ -8349,7 +8397,7 @@ class LiveBettingStore:
         """Return persisted event-time progress, never the worker wall clock."""
         row = self.connection.execute(
             """SELECT observed_at FROM odds_transport_observations
-                 WHERE raybet_match_id=? AND observed_at<=?
+                 WHERE raybet_match_id=? AND source='direct' AND observed_at<=?
                    AND timing_status='on_time'
                    AND processing_status='processed'
                  ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
@@ -8374,7 +8422,7 @@ class LiveBettingStore:
                  FROM odds_transport_observations AS transport
                  JOIN odds_response_outcomes_effective AS outcome
                    ON outcome.observation_key=transport.observation_key
-                WHERE transport.observation_key=?
+                WHERE transport.observation_key=? AND transport.source='direct'
                   AND outcome.raybet_match_id=? AND outcome.odds_id=?""",
             (
                 order.signal_transport_key,
@@ -8414,10 +8462,16 @@ class LiveBettingStore:
         map_number: int,
     ) -> bool:
         row = self.connection.execute(
-            """SELECT underdog_side, underdog_odds_id, underdog_price,
-                      underdog_probability, odds_group_id, period
-                 FROM trusted_odds_winner_market_authority
-                WHERE observation_key=? AND raybet_match_id=? AND period=?""",
+            """SELECT market.underdog_side, market.underdog_odds_id,
+                      market.underdog_price, market.underdog_probability,
+                      market.odds_group_id, market.period
+                 FROM trusted_odds_winner_market_authority AS market
+                 JOIN odds_transport_observations AS transport
+                   ON transport.observation_key=market.observation_key
+                  AND transport.raybet_match_id=market.raybet_match_id
+                  AND transport.source='direct'
+                WHERE market.observation_key=? AND market.raybet_match_id=?
+                  AND market.period=?""",
             (
                 order.signal_transport_key,
                 order.raybet_match_id,
@@ -8506,7 +8560,7 @@ class LiveBettingStore:
             successor = self.connection.execute(
                 """SELECT observation_key, raybet_match_id, observed_at
                      FROM odds_transport_observations
-                    WHERE raybet_match_id=? AND observed_at>?
+                     WHERE raybet_match_id=? AND source='direct' AND observed_at>?
                       AND observed_at<=?
                       AND timing_status='on_time'
                       AND processing_status='processed'
@@ -9526,6 +9580,33 @@ class LiveBettingStore:
         vision_observation: Any | None = None,
         vision_transport_key: str | None = None,
     ) -> bool:
+        strategy_version = str(getattr(decision, "strategy_version", ""))
+        contract_value = _decision_contract(decision)
+        contract = None
+        if strategy_version in REGISTERED_STRATEGY_CONTRACTS:
+            contract = validate_strategy_contract(strategy_version, contract_value)
+            if contract is None:
+                return False
+        stored_contributions = dict(decision.contributions)
+        decision_inputs = getattr(decision, "inputs", None)
+        if isinstance(decision_inputs, Mapping):
+            stored_contributions.setdefault("__inputs__", dict(decision_inputs))
+            conservative = decision_inputs.get("conservative_contributions")
+            if isinstance(conservative, Mapping):
+                stored_contributions.setdefault(
+                    "__conservative__", dict(conservative)
+                )
+        try:
+            contributions_json = (
+                serialize_decision_payload(
+                    stored_contributions,
+                    strategy_version=strategy_version,
+                )
+                if strategy_version in REGISTERED_STRATEGY_CONTRACTS
+                else self.json(stored_contributions)
+            )
+        except (TypeError, ValueError):
+            return False
         columns = (
             "decision_key",
             "raybet_match_id",
@@ -9556,7 +9637,7 @@ class LiveBettingStore:
             decision.data_quality,
             int(decision.eligible),
             decision.reason,
-            self.json(decision.contributions),
+            contributions_json,
             decision.input_ref,
             decision.strategy_version,
         )
@@ -9564,6 +9645,29 @@ class LiveBettingStore:
             decision.eligible
         ) or _has_scored_decision_contributions(decision)
         with self.transaction():
+            if contract is not None:
+                expected_identity = (
+                    contract.evaluator_hash,
+                    contract.policy_hash,
+                    contract.serialization_version,
+                )
+                existing_rows = self.connection.execute(
+                    """SELECT contributions_json FROM strategy_decisions
+                         WHERE strategy_version=?""",
+                    (strategy_version,),
+                ).fetchall()
+                for existing in existing_rows:
+                    try:
+                        payload = parse_decision_payload(
+                            str(existing["contributions_json"]),
+                            strategy_version=strategy_version,
+                        )
+                        existing_value = payload["__inputs__"]["strategy_contract"]
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                    identity = _contract_identity(existing_value)
+                    if identity is None or identity != expected_identity:
+                        return False
             bound_authority: DraftLandmarkAuthority | None = None
             if isinstance(draft_authority, DraftLandmarkAuthority):
                 if draft_landmark_authority_matches(
@@ -9717,6 +9821,22 @@ class LiveBettingStore:
             return cursor.rowcount == 1
 
     def insert_research_price_label(self, label: Any) -> bool:
+        if self.connection.execute(
+            """SELECT 1
+                 FROM research_live_predictions AS prediction
+                 JOIN odds_transport_observations AS transport
+                   ON transport.observation_key=?
+                  AND transport.raybet_match_id=prediction.raybet_match_id
+                  AND transport.observed_at=?
+                  AND transport.source='direct'
+                WHERE prediction.prediction_key=?""",
+            (
+                label.transport_key,
+                self._iso(label.observed_at),
+                label.prediction_key,
+            ),
+        ).fetchone() is None:
+            return False
         cursor = self.execute(
             """INSERT INTO research_price_labels
                (label_key, prediction_key, transport_key, transport_hash,
@@ -9898,6 +10018,11 @@ class LiveBettingStore:
                      FROM strategy_decisions AS decision
                      JOIN verified_strategy_decision_vision_authority AS vision
                        ON vision.decision_key=decision.decision_key
+                     JOIN odds_transport_observations AS transport
+                       ON transport.observation_key=decision.vision_transport_key
+                      AND transport.raybet_match_id=decision.raybet_match_id
+                      AND transport.observed_at=decision.vision_transport_at
+                      AND transport.source='direct'
                     WHERE decision.raybet_match_id=? AND decision.map_number=?
                       AND decision.decided_at=? AND decision.underdog_side=?
                       AND decision.eligible=1 AND decision.model_probability=?

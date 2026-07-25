@@ -6,13 +6,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
-from .comeback import ComebackDecision, score_comeback
+from .comeback import (
+    STRATEGY_VERSION,
+    ComebackDecision,
+    no_signal_decision,
+    score_comeback,
+)
 from .market_state import build_market_surface
 from .models import ModelQuote, OddsSnapshot, RoshLineupScore, ShadowOrder
 from .profiles.draft_curve import DraftCurve
 from .profiles.player_form import PlayerForm
 from .profiles.team_style import TeamStyleProfile
 from .strategy import make_order
+from .strategy_contract import (
+    REGISTERED_STRATEGY_CONTRACTS,
+    build_strategy_contract,
+)
 from .vision import VisionObservation
 
 
@@ -28,9 +37,11 @@ class ComebackShadowStrategy:
         *,
         min_edge: float = 0.08,
         stability_tolerance: float = 0.02,
+        strategy_version: str = STRATEGY_VERSION,
     ) -> None:
         self.min_edge = min_edge
         self.stability_tolerance = stability_tolerance
+        self.strategy_version = strategy_version
 
     def evaluate(
         self,
@@ -144,28 +155,64 @@ class ComebackShadowStrategy:
                     else None
                 ),
             },
+            "previous_vision": (
+                {
+                    "captured_at": previous_observation.captured_at.isoformat(),
+                    "source_frame_ref": previous_observation.source_frame_ref,
+                    "game_clock_seconds": previous_observation.game_clock_seconds,
+                    "radiant_team_side": previous_observation.radiant_team_side,
+                    "confirmed": previous_observation.is_confirmed,
+                    "is_paused": previous_observation.is_paused,
+                    "screen_state": previous_observation.screen_state,
+                }
+                if previous_observation is not None
+                else None
+            ),
+            "post_strategy_gates": {
+                "transport_identity_valid": identity_valid,
+                "map_already_attempted": map_already_attempted,
+            },
         }
+        if self.strategy_version not in REGISTERED_STRATEGY_CONTRACTS:
+            decision = no_signal_decision(
+                observation=observation,
+                surface=surface,
+                decided_at=current_snapshot_at,
+                reason=f"strategy_contract_unavailable:{self.strategy_version}",
+                inputs=decision_inputs,
+                strategy_version=self.strategy_version,
+            )
+            return StrategyResult(decision, None)
+        try:
+            contract = build_strategy_contract(
+                strategy_version=self.strategy_version
+            )
+        except (RuntimeError, ValueError):
+            contract = None
+        if (
+            contract is None
+            or self.min_edge != contract.policy.minimum_edge
+            or self.stability_tolerance != contract.policy.stability_tolerance
+        ):
+            decision = no_signal_decision(
+                observation=observation,
+                surface=surface,
+                decided_at=current_snapshot_at,
+                reason="strategy_contract_policy_unregistered",
+                inputs=decision_inputs,
+                strategy_version=self.strategy_version,
+            )
+            return StrategyResult(decision, None)
         decision = score_comeback(
             observation=observation, surface=surface,
             underdog_style=underdog_style, favorite_style=favorite_style,
             underdog_form=underdog_form, favorite_form=favorite_form,
             draft_curve=draft_curve, decided_at=current_snapshot_at,
             stable=stable, min_edge=self.min_edge,
+            strategy_version=self.strategy_version,
             input_refs=decision_inputs,
             rosh_lineup_score=rosh_lineup_score,
         )
-        if not identity_valid:
-            decision = ComebackDecision(
-                **{
-                    **decision.__dict__,
-                    "eligible": False,
-                    "reason": "transport_identity_missing_or_reused",
-                }
-            )
-        if map_already_attempted:
-            decision = ComebackDecision(
-                **{**decision.__dict__, "eligible": False, "reason": "map_already_attempted"}
-            )
         if not decision.eligible:
             return StrategyResult(decision, None)
         if current_transport_key is None:

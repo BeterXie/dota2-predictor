@@ -368,6 +368,7 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
                 "winner|map_1|team_one|",
                 strategy_version,
                 input_ref,
+                "1.0",
             )
         )
         order = ShadowOrder(

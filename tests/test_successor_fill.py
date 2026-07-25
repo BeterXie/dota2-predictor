@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from live_betting.database_protocol import prepare_database
 from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder
@@ -664,9 +665,17 @@ class ShadowOrderMigrationTests(unittest.TestCase):
     def test_old_thirteen_column_table_upgrades_reentrantly_with_constraints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.db"
+            backup_dir = Path(directory) / "schema-backups"
+            prepare_database(
+                path,
+                backup_dir,
+                now=NOW - timedelta(seconds=1),
+            )
             connection = sqlite3.connect(path)
+            connection.execute("PRAGMA foreign_keys=OFF")
             connection.executescript(
-                """CREATE TABLE shadow_orders (
+                """DROP TABLE shadow_orders;
+                CREATE TABLE shadow_orders (
                     order_key TEXT PRIMARY KEY,
                     raybet_match_id TEXT NOT NULL,
                     odds_id TEXT NOT NULL,
@@ -680,35 +689,6 @@ class ShadowOrderMigrationTests(unittest.TestCase):
                     fill_price REAL,
                     filled_at TEXT,
                     rejection_reason TEXT
-                );
-                CREATE TABLE odds_transport_observations (
-                    observation_key TEXT PRIMARY KEY,
-                    source TEXT NOT NULL,
-                    source_event_id TEXT,
-                    raybet_match_id TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    normalized_state_hash TEXT NOT NULL,
-                    timing_status TEXT NOT NULL,
-                    processing_status TEXT NOT NULL,
-                    normalized_change_count INTEGER NOT NULL
-                );
-                CREATE TABLE odds_response_outcomes (
-                    observation_key TEXT NOT NULL,
-                    raybet_match_id TEXT NOT NULL,
-                    odds_id TEXT NOT NULL,
-                    odds_group_id TEXT,
-                    received_at TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    status TEXT,
-                    market_type TEXT NOT NULL,
-                    period TEXT NOT NULL,
-                    side TEXT,
-                    line REAL,
-                    outcome_key TEXT NOT NULL,
-                    supported INTEGER NOT NULL,
-                    last_update TEXT,
-                    raw_json TEXT NOT NULL,
-                    PRIMARY KEY (observation_key, odds_id)
                 );"""
             )
             connection.execute(
@@ -729,47 +709,13 @@ class ShadowOrderMigrationTests(unittest.TestCase):
                     None,
                 ),
             )
-            connection.execute(
-                "INSERT INTO odds_transport_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "same-time-response",
-                    "direct",
-                    None,
-                    MATCH_ID,
-                    NOW.isoformat(),
-                    "state-hash",
-                    "on_time",
-                    "processed",
-                    1,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO odds_response_outcomes VALUES
-                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    "same-time-response",
-                    MATCH_ID,
-                    TARGET_ID,
-                    "winner",
-                    NOW.isoformat(),
-                    2.0,
-                    "5",
-                    "winner",
-                    "map_1",
-                    "team_one",
-                    None,
-                    "team_one",
-                    1,
-                    None,
-                    "{}",
-                ),
-            )
             connection.commit()
             connection.close()
 
+            prepare_database(path, backup_dir, now=NOW)
+            prepare_database(path, backup_dir, now=NOW + timedelta(seconds=1))
+
             with LiveBettingStore(path) as store:
-                store.init_schema()
-                store.init_schema()
                 columns = {
                     str(row["name"]): (int(row["notnull"]), row["dflt_value"])
                     for row in store.connection.execute(

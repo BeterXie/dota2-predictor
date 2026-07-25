@@ -71,6 +71,22 @@ their existing `--start-*` flags are supplied. Use
 supervisor's `--once` mode, including `--migrate --once`, does not start the
 historical worker or make historical Rosh network requests.
 
+The standard production paper mode is direct-only. It starts the required
+collector, Vision, and shadow workers without the browser companion:
+
+```powershell
+$draftDeploymentKey = "<approved frozen draft deployment SHA-256>"
+python scripts/run_dota_shadow_service.py --database $database `
+  --start-collector --start-vision --start-shadow `
+  --start-strict-ingest --start-postmatch `
+  --draft-deployment-key $draftDeploymentKey
+```
+
+`--start-companion` is optional and reserved for browser audit/compare runs.
+When omitted, health reports `stopped / not_started_by_supervisor` as
+informational; it does not reduce direct-only readiness. Service reports and
+monitor snapshots expose `market_source_policy=direct_primary`.
+
 ### STRATZ API credentials
 
 `STRATZ_API_TOKEN` is the canonical STRATZ credential. `STRATZ_TOKEN` remains a
@@ -119,6 +135,11 @@ The Edge extension is at `edge-extension/`. See
 [edge-extension/README.md](edge-extension/README.md) for local companion
 setup. It connects directly to the localhost companion, passively captures
 sanitized Dota 2 market events, and cannot submit a wager.
+
+Fresh signed HLS URLs are process-local capabilities. Do not put them in
+commands, logs, health details, SQLite, artifacts, or Web responses. Watcher
+diagnostics identify stream failures only by error category and unsigned
+host/path.
 
 ## Database
 

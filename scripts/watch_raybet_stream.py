@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import urlsplit
+
+os.environ["OPENCV_FFMPEG_DEBUG"] = "0"
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
 
 import cv2
 
@@ -68,6 +75,65 @@ ALLOWED_STREAM_HOSTS = frozenset(
         "qplay.shyxswl.com",
     }
 )
+
+
+class WatcherFailure(RuntimeError):
+    def __init__(self, category: str, stream_location: str | None = None) -> None:
+        super().__init__(category)
+        self.category = category
+        self.stream_location = stream_location
+
+
+def _sanitized_stream_location(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.hostname is None:
+        return None
+    return f"{parsed.hostname.casefold()}{parsed.path}"[:500]
+
+
+def _watcher_error_category(error: Exception) -> str:
+    if isinstance(error, TimeoutError):
+        return "stream_timeout"
+    if isinstance(error, cv2.error):
+        return "video_backend_error"
+    if isinstance(error, ValueError):
+        return "validation_failed"
+    if isinstance(error, OSError):
+        return "io_error"
+    return "watcher_failed"
+
+
+@contextmanager
+def _suppress_native_video_stderr() -> Iterator[None]:
+    """Keep native OpenCV/FFmpeg diagnostics out of watcher logs."""
+
+    try:
+        stderr_fd = sys.__stderr__.fileno()
+    except (AttributeError, OSError, ValueError):
+        yield
+        return
+    saved_stderr = os.dup(stderr_fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        sys.stderr.flush()
+        os.dup2(devnull, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_stderr, stderr_fd)
+        os.close(saved_stderr)
+        os.close(devnull)
+
+
+def _native_safe_frames(
+    url: str, *, interval: float, count: int | None
+) -> Iterator[object]:
+    with _suppress_native_video_stderr(), HLSStreamCapture(url) as capture:
+        yield from capture.sample(interval=interval, count=count)
 
 
 def _validate_stream_url(url: object, *, description: str = "stream URL") -> str:
@@ -428,13 +494,18 @@ def _parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
 
 
 def _run_cli(args: argparse.Namespace) -> int:
-    url, map_number = resolve_source(
-        url=args.url,
-        database=args.database,
-        match_id=args.match_id,
-        map_number=args.map_number,
-        refresh_url=args.refresh_url,
-    )
+    url: str | None = None
+    try:
+        url, map_number = resolve_source(
+            url=args.url,
+            database=args.database,
+            match_id=args.match_id,
+            map_number=args.map_number,
+            refresh_url=args.refresh_url,
+        )
+    except Exception as error:
+        raise WatcherFailure(_watcher_error_category(error)) from None
+    args._resolved_stream_location = _sanitized_stream_location(url)
     output = args.output
     evidence_dir = args.evidence_dir
 
@@ -460,8 +531,10 @@ def _run_cli(args: argparse.Namespace) -> int:
     last_evidence_at = 0.0
     sample_count = 0
 
-    with HLSStreamCapture(url) as capture:
-        for frame in capture.sample(interval=args.interval, count=args.count):
+    try:
+        for frame in _native_safe_frames(
+            url, interval=args.interval, count=args.count
+        ):
             sample_count += 1
             if (
                 args.database
@@ -612,6 +685,11 @@ def _run_cli(args: argparse.Namespace) -> int:
                 writer.append(observation)
                 print(observation.model_dump_json())
                 previous = observation
+    except Exception as error:
+        raise WatcherFailure(
+            _watcher_error_category(error),
+            _sanitized_stream_location(url),
+        ) from None
     return 0
 
 
@@ -622,8 +700,21 @@ def main() -> int:
             return _run_cli(args)
         with database_writer_authority(args.database):
             return _run_cli(args)
-    except ValueError as error:
-        parser.error(str(error))
+    except Exception as error:
+        failure = (
+            error
+            if isinstance(error, WatcherFailure)
+            else WatcherFailure(
+                _watcher_error_category(error),
+                getattr(args, "_resolved_stream_location", None)
+                or _sanitized_stream_location(getattr(args, "url", None)),
+            )
+        )
+        diagnostic = {"status": "error", "category": failure.category}
+        if failure.stream_location is not None:
+            diagnostic["stream"] = failure.stream_location
+        print(json.dumps(diagnostic, sort_keys=True), file=sys.stderr, flush=True)
+        return 2
 
 
 if __name__ == "__main__":

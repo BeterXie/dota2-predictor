@@ -188,10 +188,10 @@ def test_noncanonical_net_worth_range_cannot_satisfy_v4_production_gate(
 @pytest.mark.parametrize(
     ("side", "minimum", "maximum", "eligible", "reason"),
     [
-        ("dire", 0, 999, False, "underdog_deficit_not_material"),
+        ("dire", 0, 999, False, "vision_live_situation_invalid"),
         ("dire", 1_000, 1_999, True, "eligible"),
         ("dire", 9_000, 9_999, True, "eligible"),
-        ("dire", 10_000, 10_999, False, "vision_situation_collapsed"),
+        ("dire", 10_000, 10_999, False, "vision_live_situation_invalid"),
         ("radiant", 1_000, 1_999, False, "underdog_deficit_not_material"),
     ],
 )
@@ -218,12 +218,16 @@ def test_bucketed_net_worth_advantage_is_bounded_and_side_aware(
 
     assert decision.eligible is eligible
     assert decision.reason == reason
-    assert decision.situation.net_worth_deficit_min == (
-        minimum if side == "dire" else -maximum
-    )
-    assert decision.situation.net_worth_deficit_max == (
-        maximum if side == "dire" else -minimum
-    )
+    if reason == "vision_live_situation_invalid":
+        assert decision.situation.net_worth_deficit_min is None
+        assert decision.situation.net_worth_deficit_max is None
+    else:
+        assert decision.situation.net_worth_deficit_min == (
+            minimum if side == "dire" else -maximum
+        )
+        assert decision.situation.net_worth_deficit_max == (
+            maximum if side == "dire" else -minimum
+        )
 
 
 @pytest.mark.parametrize(
@@ -270,7 +274,7 @@ def test_time_and_rosh_direction_are_explicit_hard_gates(
                 net_worth_advantage_min=11_000,
                 net_worth_advantage_max=11_999,
             ),
-            "vision_situation_collapsed",
+            "vision_live_situation_invalid",
         ),
         (
             hud_state(
@@ -292,7 +296,7 @@ def test_time_and_rosh_direction_are_explicit_hard_gates(
                 net_worth_advantage_min=0,
                 net_worth_advantage_max=999,
             ),
-            "underdog_deficit_not_material",
+            "vision_live_situation_invalid",
         ),
         (
             hud_state(
@@ -338,4 +342,4 @@ def test_policy_thresholds_are_explicitly_overridable() -> None:
         policy=policy,
     )
 
-    assert decision.reason == "vision_situation_collapsed"
+    assert decision.reason == "vision_live_situation_invalid"

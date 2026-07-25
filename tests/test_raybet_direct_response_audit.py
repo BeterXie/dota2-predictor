@@ -280,7 +280,14 @@ def test_invalid_json_failure_keeps_exact_http_receipt_metadata(
         assert row["http_status"] == 200
         assert row["provider_code"] is None
         assert row["payload_kind"] == "request_failure"
-        assert request_metadata(row) == {"match_type": 1, "page": 1}
+        timing_metadata = request_metadata(row)
+        assert timing_metadata.pop("match_type") == 1
+        assert timing_metadata.pop("page") == 1
+        assert datetime.fromisoformat(
+            str(timing_metadata.pop("request_started_at"))
+        ).tzinfo is not None
+        assert float(timing_metadata.pop("transport_duration_ms")) >= 0
+        assert timing_metadata == {}
         payload = store.direct_response_payload(str(row["audit_key"]))
         assert payload["failure"] == {"error_type": "ValueError"}
         assert "SECRET_DETAIL" not in json.dumps(payload)

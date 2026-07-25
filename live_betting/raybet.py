@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode
 
@@ -27,6 +29,8 @@ class RayBetHTTPResponse:
     received_at: datetime
     http_status: int | None
     provider_code: int | None
+    request_started_at: datetime | None = None
+    transport_duration_ms: float | None = None
 
 
 class RayBetProviderResponseError(RuntimeError):
@@ -52,12 +56,18 @@ def _annotate_transport_error(
     request_identity: str,
     received_at: datetime,
     http_status: int | None,
+    request_started_at: datetime,
+    transport_duration_ms: float,
+    transport_error: bool,
 ) -> None:
     try:
         error.raybet_endpoint = endpoint
         error.raybet_request_identity = request_identity
         error.raybet_received_at = received_at
         error.raybet_http_status = http_status
+        error.raybet_request_started_at = request_started_at
+        error.raybet_transport_duration_ms = transport_duration_ms
+        error.raybet_transport_error = transport_error
     except (AttributeError, TypeError):
         pass
 
@@ -311,9 +321,16 @@ def parse_raybet_map_final(
 
 class RayBetClient:
     def __init__(
-        self, *, timeout: float = 20.0, client: requests.Session | None = None
+        self,
+        *,
+        timeout: float = 20.0,
+        client: requests.Session | None = None,
+        wall_clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         self.timeout = timeout
+        self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
+        self._monotonic_clock = monotonic_clock or time.monotonic
         self._owns_client = client is None
         self.client = client or requests.Session(impersonate="chrome120")
         self.client.headers.update(
@@ -343,8 +360,30 @@ class RayBetClient:
             sorted((str(key), str(value)) for key, value in (params or {}).items())
         )
         request_identity = f"{endpoint}?{query}" if query else endpoint
-        response = self.client.get(endpoint, params=params, timeout=self.timeout)
-        received_at = datetime.now(timezone.utc)
+        request_started_at = self._wall_clock()
+        monotonic_started_at = self._monotonic_clock()
+        try:
+            response = self.client.get(endpoint, params=params, timeout=self.timeout)
+        except Exception as error:
+            received_at = self._wall_clock()
+            transport_duration_ms = max(
+                0.0, (self._monotonic_clock() - monotonic_started_at) * 1000.0
+            )
+            _annotate_transport_error(
+                error,
+                endpoint=endpoint,
+                request_identity=request_identity,
+                received_at=received_at,
+                http_status=None,
+                request_started_at=request_started_at,
+                transport_duration_ms=transport_duration_ms,
+                transport_error=True,
+            )
+            raise
+        received_at = self._wall_clock()
+        transport_duration_ms = max(
+            0.0, (self._monotonic_clock() - monotonic_started_at) * 1000.0
+        )
         raw_status = getattr(response, "status_code", None)
         http_status = (
             int(raw_status)
@@ -363,6 +402,9 @@ class RayBetClient:
                     request_identity=request_identity,
                     received_at=received_at,
                     http_status=http_status,
+                    request_started_at=request_started_at,
+                    transport_duration_ms=transport_duration_ms,
+                    transport_error=False,
                 )
                 raise
             _annotate_transport_error(
@@ -371,6 +413,9 @@ class RayBetClient:
                 request_identity=request_identity,
                 received_at=received_at,
                 http_status=http_status,
+                request_started_at=request_started_at,
+                transport_duration_ms=transport_duration_ms,
+                transport_error=False,
             )
             raise
         raw_code = payload.get("code") if isinstance(payload, dict) else None
@@ -386,6 +431,8 @@ class RayBetClient:
             received_at=received_at,
             http_status=http_status,
             provider_code=provider_code,
+            request_started_at=request_started_at,
+            transport_duration_ms=transport_duration_ms,
         )
         try:
             response.raise_for_status()

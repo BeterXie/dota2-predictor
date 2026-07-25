@@ -44,6 +44,7 @@ _MANAGED_CHILD_PYTHON_FLAGS = frozenset(
 _MANAGED_CHILD_REJECTED_PYTHON_FLAGS = frozenset({"-I", "-S"})
 _MANAGER_CHILD_BIND_TIMEOUT_SECONDS = 1.0
 _MANAGER_CHILD_BIND_POLL_SECONDS = 0.01
+MARKET_SOURCE_POLICY = "direct_primary"
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _MANAGER_DELEGATIONS = {
     "vision_supervisor": frozenset({"vision_watcher"}),
@@ -3354,6 +3355,7 @@ __all__ = [
     "DatabaseFileIdentity",
     "DirectoryIdentity",
     "LockOwnerMetadata",
+    "MARKET_SOURCE_POLICY",
     "ProcessIdentity",
     "ServiceDataPaths",
     "SingleInstanceLock",

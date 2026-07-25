@@ -12,7 +12,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse
 import psutil
+
+from live_betting.milestone_revocation import (
+    MilestoneRevocationConfig,
+    MilestoneRevocationIntegrityError,
+)
 
 from live_betting.service_coordination import (
     ProcessIdentity,
@@ -127,6 +133,26 @@ app = FastAPI(
     version="0.1.0",
     lifespan=_lifespan,
 )
+app.state.milestone_revocation_config = None
+
+
+def configure_milestone_revocation(
+    application: FastAPI,
+    config: MilestoneRevocationConfig | None,
+) -> None:
+    if config is not None and not isinstance(config, MilestoneRevocationConfig):
+        raise ValueError("milestone revocation configuration is incomplete")
+    application.state.milestone_revocation_config = config
+
+
+@app.exception_handler(MilestoneRevocationIntegrityError)
+async def _milestone_revocation_integrity_error(
+    _request: Request, error: MilestoneRevocationIntegrityError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"Milestone governance integrity failure: {error}"},
+    )
 
 app.include_router(matches.router)
 app.include_router(teams.router)

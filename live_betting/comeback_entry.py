@@ -234,6 +234,8 @@ def assess_comeback_situation(
     if advantage_present and (
         advantage_side not in {"radiant", "dire"}
         or not is_canonical_net_worth_bucket(advantage_min, advantage_max)
+        or int(advantage_min) < policy.minimum_net_worth_deficit
+        or int(advantage_max) >= policy.maximum_net_worth_deficit
     ):
         return _unavailable(
             underdog_side,

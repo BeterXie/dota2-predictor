@@ -8,9 +8,13 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from event_intelligence.raw_archive import sanitize_request_identity
 
 from .direct_response_audit import (
     DirectResponseContext,
@@ -36,6 +40,190 @@ from .strict_eligibility import (
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
+LIVE_LIST_CACHE_TTL_SECONDS = 60.0
+ODDS_BACKOFF_INITIAL_SECONDS = 3.0
+ODDS_BACKOFF_MAX_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class LiveListCache:
+    rows: tuple[dict[str, Any], ...]
+    fetched_at_utc: datetime
+    expires_at_monotonic: float
+
+    @classmethod
+    def create(
+        cls,
+        rows: list[dict[str, Any]],
+        *,
+        fetched_at_utc: datetime,
+        monotonic_now: float,
+    ) -> "LiveListCache":
+        if fetched_at_utc.tzinfo is None or fetched_at_utc.utcoffset() is None:
+            raise ValueError("live list cache fetched_at_utc must be timezone-aware")
+        return cls(
+            rows=tuple(dict(row) for row in rows),
+            fetched_at_utc=fetched_at_utc.astimezone(timezone.utc),
+            expires_at_monotonic=monotonic_now + LIVE_LIST_CACHE_TTL_SECONDS,
+        )
+
+    def current_rows(self, monotonic_now: float) -> list[dict[str, Any]] | None:
+        if monotonic_now >= self.expires_at_monotonic:
+            return None
+        return [dict(row) for row in self.rows]
+
+
+@dataclass(frozen=True)
+class RequestBackoffState:
+    consecutive_failures: int
+    retry_not_before_monotonic: float
+    last_http_status: int | None
+    last_provider_code: int | None
+    last_failure_reason: str
+
+
+class PerRequestBackoff:
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or time.monotonic
+        self._states: dict[tuple[str, str], RequestBackoffState] = {}
+
+    @staticmethod
+    def key(endpoint: str, request_identity: str) -> tuple[str, str]:
+        return (
+            sanitize_request_identity(endpoint),
+            sanitize_request_identity(request_identity),
+        )
+
+    def blocked(
+        self,
+        endpoint: str,
+        request_identity: str,
+        *,
+        monotonic_now: float | None = None,
+    ) -> bool:
+        state = self._states.get(self.key(endpoint, request_identity))
+        now = self._clock() if monotonic_now is None else monotonic_now
+        return state is not None and now < state.retry_not_before_monotonic
+
+    def record_success(self, endpoint: str, request_identity: str) -> None:
+        self._states.pop(self.key(endpoint, request_identity), None)
+
+    def record_failure(
+        self,
+        endpoint: str,
+        request_identity: str,
+        error: Exception,
+        *,
+        monotonic_now: float | None = None,
+    ) -> bool:
+        key = self.key(endpoint, request_identity)
+        http_status, provider_code = _error_statuses(error)
+        retryable = (
+            bool(getattr(error, "raybet_transport_error", False))
+            or isinstance(error, (TimeoutError, ConnectionError))
+            or http_status == 429
+            or (http_status is not None and 500 <= http_status <= 599)
+            or provider_code == 429
+            or (provider_code is not None and 500 <= provider_code <= 599)
+        )
+        if not retryable:
+            self._states.pop(key, None)
+            return False
+        previous = self._states.get(key)
+        failures = (previous.consecutive_failures if previous else 0) + 1
+        delay = min(
+            ODDS_BACKOFF_MAX_SECONDS,
+            ODDS_BACKOFF_INITIAL_SECONDS * (2 ** min(failures - 1, 7)),
+        )
+        now = self._clock() if monotonic_now is None else monotonic_now
+        self._states[key] = RequestBackoffState(
+            consecutive_failures=failures,
+            retry_not_before_monotonic=now + delay,
+            last_http_status=http_status,
+            last_provider_code=provider_code,
+            last_failure_reason=type(error).__name__[:100],
+        )
+        return True
+
+    def retain(self, keys: set[tuple[str, str]]) -> None:
+        self._states = {key: value for key, value in self._states.items() if key in keys}
+
+    def details(self, *, monotonic_now: float | None = None) -> dict[str, Any]:
+        now = self._clock() if monotonic_now is None else monotonic_now
+        entries = []
+        for (endpoint, request_identity), state in sorted(self._states.items()):
+            entries.append(
+                {
+                    "endpoint": endpoint,
+                    "request_identity": request_identity,
+                    "consecutive_failures": state.consecutive_failures,
+                    "retry_in_seconds": max(
+                        0.0, state.retry_not_before_monotonic - now
+                    ),
+                    "last_http_status": state.last_http_status,
+                    "last_provider_code": state.last_provider_code,
+                    "last_failure_reason": state.last_failure_reason,
+                }
+            )
+        return {"active": len(entries), "entries": entries}
+
+
+def _error_statuses(error: Exception) -> tuple[int | None, int | None]:
+    receipt = getattr(error, "raybet_response", None)
+    raw_http = getattr(receipt, "http_status", None)
+    if raw_http is None:
+        raw_http = getattr(error, "raybet_http_status", None)
+    raw_provider = getattr(receipt, "provider_code", None)
+    http_status = raw_http if type(raw_http) is int else None
+    provider_code = raw_provider if type(raw_provider) is int else None
+    return http_status, provider_code
+
+
+def _live_list_cache_details(
+    cache: LiveListCache | None,
+    *,
+    monotonic_now: float,
+    degraded: bool,
+) -> dict[str, Any]:
+    if cache is None:
+        return {
+            "state": "empty",
+            "listed": 0,
+            "ttl_seconds": LIVE_LIST_CACHE_TTL_SECONDS,
+        }
+    expires_in = max(0.0, cache.expires_at_monotonic - monotonic_now)
+    state = "expired" if expires_in == 0 else ("degraded" if degraded else "fresh")
+    return {
+        "state": state,
+        "listed": len(cache.rows),
+        "fetched_at_utc": cache.fetched_at_utc.isoformat(),
+        "expires_in_seconds": expires_in,
+        "ttl_seconds": LIVE_LIST_CACHE_TTL_SECONDS,
+    }
+
+
+def _refresh_live_list_cache(
+    store: LiveBettingStore,
+    client: Any,
+    cache: LiveListCache | None,
+    *,
+    monotonic_clock: Callable[[], float],
+    wall_clock: Callable[[], datetime],
+) -> tuple[LiveListCache, bool]:
+    try:
+        rows = _fetch_match_list(store, client, response_kind="live_match_list")
+    except Exception:
+        if cache is None or cache.current_rows(monotonic_clock()) is None:
+            raise
+        return cache, True
+    return (
+        LiveListCache.create(
+            rows,
+            fetched_at_utc=wall_clock(),
+            monotonic_now=monotonic_clock(),
+        ),
+        False,
+    )
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
@@ -335,6 +523,8 @@ def collect_once(
     list_rows: list[dict[str, Any]] | None = None,
     raw_fingerprints: dict[str, str] | None = None,
     audit_match_list: bool = True,
+    backoff: PerRequestBackoff | None = None,
+    monotonic_now: float | None = None,
 ) -> dict[str, int]:
     _require_store_archive_root(store, raw_dir)
     if list_rows is None:
@@ -347,6 +537,8 @@ def collect_once(
     odds_count = 0
     changed_count = 0
     error_count = 0
+    success_count = 0
+    backoff_skipped = 0
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
     if audit_match_list:
         _audit_match_list(
@@ -355,14 +547,31 @@ def collect_once(
             response_kind="live_match_list",
             observed_at=utc_now(),
         )
+    endpoint = f"{BASE_URL}/odds"
+    active_keys = {
+        backoff.key(endpoint, f"{endpoint}?match_id={str(row.get('id') or '')}")
+        for row in list_rows
+        if backoff is not None
+        and isinstance(row, dict)
+        and str(row.get("id") or "").isdigit()
+    }
+    if backoff is not None:
+        backoff.retain(active_keys)
     for list_row in list_rows:
         match_id = ""
+        request_identity = ""
         try:
             if not isinstance(list_row, dict):
                 raise ValueError("live match list row is not an object")
             match_id = str(list_row.get("id") or "")
             if not match_id.isdigit():
                 raise ValueError("live match list id is invalid")
+            request_identity = f"{endpoint}?match_id={match_id}"
+            if backoff is not None and backoff.blocked(
+                endpoint, request_identity, monotonic_now=monotonic_now
+            ):
+                backoff_skipped += 1
+                continue
             changes, snapshot_count, fingerprint, _ = _collect_odds_response(
                 store,
                 client,
@@ -373,29 +582,43 @@ def collect_once(
             raw_fingerprints[match_id] = fingerprint
             changed_count += changes
             odds_count += snapshot_count
+            success_count += 1
+            if backoff is not None:
+                backoff.record_success(endpoint, request_identity)
         except Exception as error:
             error_count += 1
+            if backoff is not None and request_identity:
+                backoff.record_failure(
+                    endpoint,
+                    request_identity,
+                    error,
+                    monotonic_now=monotonic_now,
+                )
             logger.warning(
                 "RayBet fetch failed for live match_id=%s (%s)",
                 match_id or "<invalid>",
                 type(error).__name__,
             )
     completed_at = utc_now()
-    if error_count:
+    if error_count or backoff_skipped:
         store.record_collector(
             "raybet",
-            success_at=completed_at if len(list_rows) > error_count else None,
+            success_at=completed_at if success_count else None,
             error_at=completed_at,
-            error=f"{error_count} live match(s) failed",
+            error=(
+                f"{error_count} live match(s) failed; "
+                f"{backoff_skipped} in backoff"
+            ),
         )
     else:
         store.record_collector("raybet", success_at=completed_at)
     return {
-        "matches": len(list_rows) - error_count,
+        "matches": success_count,
         "listed": len(list_rows),
         "odds": odds_count,
         "changed": changed_count,
         "errors": error_count,
+        "backoff_skipped": backoff_skipped,
     }
 
 
@@ -517,21 +740,34 @@ def run(args: argparse.Namespace) -> int:
             details={"source": "worker"},
         )
         failures = 0
-        list_rows: list[dict[str, Any]] | None = None
+        live_list_cache: LiveListCache | None = None
+        live_list_degraded = False
         raw_fingerprints: dict[str, str] = {}
+        odds_backoff = PerRequestBackoff()
         next_list_refresh = 0.0
         completed_rows: list[dict[str, Any]] | None = None
         next_completed_refresh = 0.0
         while True:
             try:
                 monotonic_now = time.monotonic()
-                if list_rows is None or monotonic_now >= next_list_refresh:
-                    list_rows = _fetch_match_list(
+                cached_rows = (
+                    live_list_cache.current_rows(monotonic_now)
+                    if live_list_cache is not None
+                    else None
+                )
+                if cached_rows is None or monotonic_now >= next_list_refresh:
+                    live_list_cache, live_list_degraded = _refresh_live_list_cache(
                         store,
                         client,
-                        response_kind="live_match_list",
+                        live_list_cache,
+                        monotonic_clock=time.monotonic,
+                        wall_clock=utc_now,
                     )
+                    monotonic_now = time.monotonic()
                     next_list_refresh = monotonic_now + args.list_interval
+                    cached_rows = live_list_cache.current_rows(monotonic_now)
+                if cached_rows is None:
+                    raise RuntimeError("live match list cache unavailable")
                 completed_refresh_needed = False
                 completed_summary = {
                     "matches": 0,
@@ -569,9 +805,10 @@ def run(args: argparse.Namespace) -> int:
                     else:
                         completed_refresh_needed = True
                 summary = collect_once(
-                    store, client, raw_dir, list_rows=list_rows,
+                    store, client, raw_dir, list_rows=cached_rows,
                     raw_fingerprints=raw_fingerprints,
                     audit_match_list=False,
+                    backoff=odds_backoff,
                 )
                 if completed_refresh_needed:
                     try:
@@ -596,7 +833,13 @@ def run(args: argparse.Namespace) -> int:
                         )
                 failures = 0
                 succeeded_at = utc_now()
-                partial_errors = summary["errors"] + completed_summary["errors"]
+                health_monotonic_now = time.monotonic()
+                partial_errors = (
+                    summary["errors"]
+                    + summary["backoff_skipped"]
+                    + completed_summary["errors"]
+                    + int(live_list_degraded)
+                )
                 worker_status = "degraded" if partial_errors else "healthy"
                 collection_succeeded = any(
                     (
@@ -622,6 +865,14 @@ def run(args: argparse.Namespace) -> int:
                         "source": "worker",
                         **summary,
                         "completed": completed_summary,
+                        "live_list_cache": _live_list_cache_details(
+                            live_list_cache,
+                            monotonic_now=health_monotonic_now,
+                            degraded=live_list_degraded,
+                        ),
+                        "odds_backoff": odds_backoff.details(
+                            monotonic_now=health_monotonic_now
+                        ),
                     },
                 )
                 logger.info(
@@ -640,7 +891,16 @@ def run(args: argparse.Namespace) -> int:
                     heartbeat_at=now,
                     error_at=now,
                     error=type(exc).__name__,
-                    details={"source": "worker", "consecutive_failures": failures},
+                    details={
+                        "source": "worker",
+                        "consecutive_failures": failures,
+                        "live_list_cache": _live_list_cache_details(
+                            live_list_cache,
+                            monotonic_now=time.monotonic(),
+                            degraded=True,
+                        ),
+                        "odds_backoff": odds_backoff.details(),
+                    },
                 )
                 logger.error("RayBet collection failed: %s", exc)
                 if args.once:

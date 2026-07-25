@@ -18,11 +18,12 @@ from event_intelligence.registry import EventRegistry
 from event_intelligence.storage import IntelligenceStorage
 from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
-from live_betting.models import Market, OddsSnapshot, ShadowOrder
+from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder
 from live_betting.notifications import claim
 from live_betting.raybet import parse_raybet_map_final
 from live_betting.report import build_report
 from live_betting.storage import LiveBettingStore
+from live_betting.strategy import make_order
 from live_betting.runtime_schema import prepare_runtime_schema
 from live_betting.strict_read_gate import strict_read_gate
 from live_betting.strict_eligibility import (
@@ -1923,6 +1924,42 @@ class StrictLiveEligibilityTests(unittest.TestCase):
     def test_null_mapping_legacy_order_is_audit_only(
         self,
     ) -> None:
+        market = Market("winner", "map_1", "team_one", None, "team_one", True)
+        signal = OddsSnapshot(
+            "1001",
+            "legacy-odds",
+            "legacy-group",
+            RECORDED_AT,
+            2.5,
+            1,
+            market,
+        )
+        order = make_order(
+            ModelQuote(
+                "1001",
+                None,
+                market,
+                0.6,
+                0.4,
+                0.2,
+                RECORDED_AT,
+                "legacy-strategy",
+                "legacy-input",
+            ),
+            signal,
+            min_edge=0.0,
+            signal_transport_key="legacy-transport",
+            signal_transport_at=RECORDED_AT,
+            stake_multiplier=1.0,
+        )
+        self.assertIsNotNone(order)
+        assert order is not None
+        with LiveBettingStore(self.path) as store:
+            self.store_winner_response(
+                store,
+                signal=signal,
+                observation_key=order.signal_transport_key,
+            )
         self.connection.execute(
             "DROP TRIGGER IF EXISTS shadow_orders_require_strict_mapping_insert"
         )
@@ -1941,21 +1978,21 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 signal_identity_verified, stake, status, fill_price, filled_at)
                VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "legacy-null-mapping",
-                "1001",
-                "legacy-odds",
+                order.order_key,
+                order.raybet_match_id,
+                order.odds_id,
                 "winner|map_1|team_one|",
-                RECORDED_AT.isoformat(),
-                0.6,
-                0.4,
-                2.5,
-                "legacy-transport",
-                RECORDED_AT.isoformat(),
-                (RECORDED_AT + timedelta(seconds=15)).isoformat(),
-                "legacy-group",
-                "team_one",
-                1,
-                1.0,
+                order.signaled_at.isoformat(),
+                order.model_probability,
+                order.market_probability,
+                order.signal_price,
+                order.signal_transport_key,
+                order.signal_transport_at.isoformat(),
+                order.expires_at.isoformat(),
+                order.signal_odds_group_id,
+                order.signal_outcome_key,
+                int(order.signal_identity_verified),
+                order.stake,
                 "filled",
                 2.5,
                 RECORDED_AT.isoformat(),
@@ -1966,7 +2003,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             (
                 "1001",
                 1,
-                "legacy-null-mapping",
+                order.order_key,
                 "filled",
                 RECORDED_AT.isoformat(),
             ),
@@ -1976,12 +2013,12 @@ class StrictLiveEligibilityTests(unittest.TestCase):
         with LiveBettingStore(self.path) as store:
             store.init_schema()
             self.assertEqual(
-                store.order_block_reason("legacy-null-mapping"),
+                store.order_block_reason(order.order_key),
                 "strict_mapping_unverified",
             )
             self.assertFalse(
                 store.insert_settlement(
-                    "legacy-null-mapping",
+                    order.order_key,
                     "win",
                     2.5,
                     RECORDED_AT,
@@ -1990,7 +2027,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             )
             self.assertFalse(
                 store.enqueue_notification(
-                    order_key="legacy-null-mapping",
+                    order_key=order.order_key,
                     event_type="settled",
                     payload={"result": "win"},
                     stats_cutoff_at=RECORDED_AT,
@@ -1999,11 +2036,11 @@ class StrictLiveEligibilityTests(unittest.TestCase):
             )
             self.assertTrue(
                 store.enqueue_notification(
-                    order_key="legacy-null-mapping",
+                    order_key=order.order_key,
                     event_type="monitor_alert",
                     payload={
                         "category": "paper_signal",
-                        "source": {"order_key": "legacy-null-mapping"},
+                        "source": {"order_key": order.order_key},
                     },
                     stats_cutoff_at=RECORDED_AT,
                     created_at=RECORDED_AT,

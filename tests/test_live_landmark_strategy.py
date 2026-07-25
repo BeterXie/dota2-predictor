@@ -5,9 +5,12 @@ import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from event_intelligence.incremental import SCORE_VERSION
 from event_intelligence.team_profiles import PROFILE_VERSION
+import live_betting.shadow_strategy as shadow_strategy_module
+import live_betting.strategy_contract as strategy_contract_module
 from live_betting.models import Market, OddsSnapshot, RoshLineupScore
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint, build_draft_curve
@@ -24,6 +27,31 @@ PROSPECTIVE_IDENTITY = {
     "availability_mode": "prospective",
     "input_snapshot_hash": "5" * 64,
 }
+
+
+def _register_deployed_strategy_contract(test_case: unittest.TestCase) -> None:
+    proposal = strategy_contract_module.build_strategy_contract(
+        strategy_version=strategy_contract_module.PROPOSED_STRATEGY_VERSION
+    )
+    policy_artifact = {
+        **proposal.policy_artifact,
+        "strategy_version": strategy_contract_module.DEPLOYED_STRATEGY_VERSION,
+    }
+    registry = {
+        **strategy_contract_module.REGISTERED_STRATEGY_CONTRACTS,
+        strategy_contract_module.DEPLOYED_STRATEGY_VERSION:
+            strategy_contract_module.RegisteredStrategyIdentity(
+                evaluator_hash=proposal.evaluator_hash,
+                policy_hash=hashlib.sha256(
+                    strategy_contract_module.canonical_bytes(policy_artifact)
+                ).hexdigest(),
+                serialization_version=proposal.serialization_version,
+            ),
+    }
+    for module in (strategy_contract_module, shadow_strategy_module):
+        patcher = patch.object(module, "REGISTERED_STRATEGY_CONTRACTS", registry)
+        patcher.start()
+        test_case.addCleanup(patcher.stop)
 
 
 def observation() -> VisionObservation:
@@ -359,6 +387,9 @@ class DraftCurveSelectionTests(unittest.TestCase):
 
 
 class StrictComebackStrategyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _register_deployed_strategy_contract(self)
+
     def evaluate(
         self,
         *,
@@ -369,7 +400,7 @@ class StrictComebackStrategyTests(unittest.TestCase):
         underdog_form: PlayerForm,
         favorite_form: PlayerForm,
         draft_probability: float,
-        min_edge: float = 0.001,
+        min_edge: float = 0.08,
     ):
         return ComebackShadowStrategy(min_edge=min_edge).evaluate(
             snapshots=current,
@@ -492,18 +523,18 @@ class StrictComebackStrategyTests(unittest.TestCase):
         result = self.evaluate(
             previous=snapshots(NOW),
             current=snapshots(NOW + timedelta(seconds=3)),
-            underdog_style=style(2, comeback=0.7, quality=0.2),
+            underdog_style=style(2, comeback=0.7),
             favorite_style=style(
-                1, throw=0.5, closeout=0.5, quality=0.2
+                1, throw=0.5, closeout=0.5
             ),
             underdog_form=form(),
             favorite_form=form(),
             # team_two is the underdog, so radiant=0.6 means underdog draft=0.4.
             draft_probability=0.6,
-            min_edge=0.005,
+            min_edge=0.08,
         )
 
-        self.assertGreater(result.decision.edge, 0.005)
+        self.assertGreater(result.decision.edge, 0.08)
         self.assertEqual(
             result.decision.reason, "rosh_direction_opposes_underdog"
         )

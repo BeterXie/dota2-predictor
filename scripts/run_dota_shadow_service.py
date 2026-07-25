@@ -34,6 +34,7 @@ from live_betting.health import record_health  # noqa: E402
 from live_betting.report import build_report  # noqa: E402
 from live_betting.service_coordination import (  # noqa: E402
     DatabaseFileIdentity,
+    MARKET_SOURCE_POLICY,
     ProcessIdentity,
     SingleInstanceLock,
     TerminationResult,
@@ -183,6 +184,8 @@ def _generate_service_report(database: Path, report_path: Path) -> None:
     """Build a report on a connection owned by the calling thread."""
     with LiveBettingStore(database) as store:
         result = {
+            "market_source_policy": MARKET_SOURCE_POLICY,
+            "capabilities": _service_capabilities(store.connection),
             "shadow": build_report(store.connection),
             "intelligence": build_intelligence_report(store.connection),
         }
@@ -563,8 +566,17 @@ def _companion_health(
     *,
     initial: bool = False,
 ) -> tuple[str, str, dict[str, Any]]:
+    capability = {
+        "configured": active,
+        "role": "optional_diagnostic",
+        "readiness_impact": "none",
+        "market_source_policy": MARKET_SOURCE_POLICY,
+    }
     if not active:
-        return "stopped", "not_started_by_supervisor", {}
+        return "stopped", "not_started_by_supervisor", {
+            **capability,
+            "reason": "not_started_by_supervisor",
+        }
     try:
         payload = dict(probe())
     except Exception as error:
@@ -572,10 +584,12 @@ def _companion_health(
             "starting" if initial else "unhealthy",
             "awaiting_companion_health" if initial else "companion_unreachable",
             {
+                **capability,
                 "error_type": type(error).__name__,
             },
         )
     details = {
+        **capability,
         "protocol_version": payload.get("protocol_version"),
         "service_state": payload.get("state"),
     }
@@ -594,8 +608,11 @@ def _record_component(
     *,
     reason: str | None,
     details: dict[str, Any],
+    informational: bool = False,
 ) -> None:
-    is_error = status in {"degraded", "unhealthy", "stopped"}
+    is_error = (
+        not informational and status in {"degraded", "unhealthy", "stopped"}
+    )
     record_health(
         connection,
         component,
@@ -606,6 +623,33 @@ def _record_component(
         error=reason if is_error else None,
         details={"source": "supervisor", **details},
     )
+
+
+def _service_capabilities(connection: Any) -> dict[str, dict[str, Any]]:
+    statuses = {
+        str(row["component"]): str(row["status"])
+        for row in connection.execute(
+            "SELECT component, status FROM service_health"
+        ).fetchall()
+    }
+    return {
+        "direct_market_collection": {
+            "required": True,
+            "status": statuses.get("raybet", "stopped"),
+        },
+        "vision": {
+            "required": True,
+            "status": statuses.get("vision", "stopped"),
+        },
+        "paper_decision": {
+            "required": True,
+            "status": statuses.get("shadow", "stopped"),
+        },
+        "browser_compare": {
+            "required": False,
+            "status": statuses.get("companion", "stopped"),
+        },
+    }
 
 
 def service_once(
@@ -752,13 +796,19 @@ def service_once(
             now,
             reason=companion_reason,
             details=companion_details,
+            informational=("companion" not in active_components),
         )
         reconcile_alerts(connection, now=now)
         if health_only:
             return {"pending_orders": pending}
         report = build_report(connection)
         intelligence = build_intelligence_report(connection)
-        result = {"shadow": report, "intelligence": intelligence}
+        result = {
+            "market_source_policy": MARKET_SOURCE_POLICY,
+            "capabilities": _service_capabilities(connection),
+            "shadow": report,
+            "intelligence": intelligence,
+        }
         if report_path:
             _write_service_report(report_path, result)
         return result

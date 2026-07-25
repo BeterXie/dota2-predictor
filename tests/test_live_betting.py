@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import live_betting.shadow_strategy as shadow_strategy_module
+import live_betting.strategy_contract as strategy_contract_module
 from live_betting.event_detector import detect_events
 from live_betting.alignment import align_snapshots
 from live_betting.comeback import STRATEGY_VERSION
@@ -48,6 +50,31 @@ from tests.draft_authority_fixture import seed_test_draft_authority
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def _register_deployed_strategy_contract(test_case: unittest.TestCase) -> None:
+    proposal = strategy_contract_module.build_strategy_contract(
+        strategy_version=strategy_contract_module.PROPOSED_STRATEGY_VERSION
+    )
+    policy_artifact = {
+        **proposal.policy_artifact,
+        "strategy_version": strategy_contract_module.DEPLOYED_STRATEGY_VERSION,
+    }
+    registry = {
+        **strategy_contract_module.REGISTERED_STRATEGY_CONTRACTS,
+        strategy_contract_module.DEPLOYED_STRATEGY_VERSION:
+            strategy_contract_module.RegisteredStrategyIdentity(
+                evaluator_hash=proposal.evaluator_hash,
+                policy_hash=hashlib.sha256(
+                    strategy_contract_module.canonical_bytes(policy_artifact)
+                ).hexdigest(),
+                serialization_version=proposal.serialization_version,
+            ),
+    }
+    for module in (strategy_contract_module, shadow_strategy_module):
+        patcher = patch.object(module, "REGISTERED_STRATEGY_CONTRACTS", registry)
+        patcher.start()
+        test_case.addCleanup(patcher.stop)
 
 
 def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
@@ -673,6 +700,9 @@ class ProfileTests(unittest.TestCase):
 
 
 class ComebackStrategyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _register_deployed_strategy_contract(self)
+
     @staticmethod
     def style(team_id: int, comeback: float, throw: float, closeout: float) -> TeamStyleProfile:
         return TeamStyleProfile(team_id, 100, comeback, throw, closeout, 0.7, 42, 1.0)

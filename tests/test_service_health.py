@@ -321,6 +321,34 @@ class ServiceHealthTests(unittest.TestCase):
             self.assertEqual(statuses["mail"], "degraded")
             self.assertEqual(statuses["shadow"], "stopped")
             self.assertEqual(statuses["raybet"], "stopped")
+            self.assertEqual(result["market_source_policy"], "direct_primary")
+            self.assertFalse(result["capabilities"]["browser_compare"]["required"])
+
+    def test_unconfigured_companion_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "service.db"
+            with LiveBettingStore(database) as store:
+                store.init_schema()
+                prepare_runtime_schema(store.connection)
+
+            service_once(database, active_components=set())
+
+            with LiveBettingStore(database) as store:
+                companion = next(
+                    row for row in read_health(store.connection)
+                    if row["component"] == "companion"
+                )
+            self.assertEqual(companion["status"], "stopped")
+            self.assertIsNone(companion["last_error"])
+            self.assertIsNone(companion["last_error_at"])
+            self.assertFalse(companion["details"]["configured"])
+            self.assertEqual(
+                companion["details"]["reason"], "not_started_by_supervisor"
+            )
+            self.assertEqual(companion["details"]["readiness_impact"], "none")
+            self.assertEqual(
+                companion["details"]["market_source_policy"], "direct_primary"
+            )
 
     def test_health_only_cycle_skips_slow_report_builders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

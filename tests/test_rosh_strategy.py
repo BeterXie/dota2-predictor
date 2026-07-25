@@ -16,6 +16,11 @@ from live_betting.profiles.draft_curve import DraftCurve, DraftPoint
 from live_betting.profiles.player_form import PlayerForm
 from live_betting.profiles.team_style import TeamStyleProfile
 from live_betting.shadow_strategy import ComebackShadowStrategy
+from live_betting.strategy_contract import (
+    PROPOSED_STRATEGY_VERSION,
+    replay_persisted_decision,
+    serialize_decision_payload,
+)
 from live_betting.vision import VisionComebackState, VisionObservation
 
 
@@ -205,9 +210,72 @@ def _decision(
         draft_curve=_draft_curve(),
         decided_at=NOW,
         stable=True,
-        min_edge=0.0,
+        strategy_version=PROPOSED_STRATEGY_VERSION,
         rosh_lineup_score=score,
     )
+
+
+def _persisted_row(decision) -> dict[str, object]:
+    return {
+        "decision_key": decision.decision_key,
+        "raybet_match_id": decision.raybet_match_id,
+        "map_number": decision.map_number,
+        "decided_at": decision.decided_at.isoformat(),
+        "underdog_side": decision.underdog_side,
+        "market_probability": decision.market_probability,
+        "model_probability": decision.model_probability,
+        "edge": decision.edge,
+        "data_quality": decision.data_quality,
+        "eligible": int(decision.eligible),
+        "reason": decision.reason,
+        "contributions_json": serialize_decision_payload(
+            {
+                **decision.contributions,
+                "__conservative__": decision.inputs[
+                    "conservative_contributions"
+                ],
+                "__inputs__": decision.inputs,
+            },
+            strategy_version=decision.strategy_version,
+        ),
+        "input_ref": decision.input_ref,
+        "strategy_version": decision.strategy_version,
+    }
+
+
+def test_persisted_strategy_contract_exact_replay_and_tamper() -> None:
+    decision = _decision(_score(), underdog_form_score=0.1)
+    row = _persisted_row(decision)
+
+    replay = replay_persisted_decision(row)
+
+    assert replay.valid
+    assert replay.expected_reason == decision.reason
+    tampered = dict(row)
+    tampered["reason"] = "odds_outside_range"
+    assert not replay_persisted_decision(tampered).valid
+
+
+def test_paired_persisted_output_tampering_cannot_replace_canonical_replay() -> None:
+    decision = _decision(_score(), underdog_form_score=0.1)
+    row = _persisted_row(decision)
+    payload = json.loads(str(row["contributions_json"]))
+    payload["__inputs__"]["strategy_evaluation"]["edge"] = 0.99
+    payload["team_style"] = 0.99
+    row["model_probability"] = 0.99
+    row["edge"] = 0.99 - float(row["market_probability"])
+    row["reason"] = "eligible"
+    row["eligible"] = 1
+    row["decision_key"] = "d" * 32
+    row["input_ref"] = "e" * 24
+    row["contributions_json"] = serialize_decision_payload(
+        payload, strategy_version=decision.strategy_version
+    )
+
+    replay = replay_persisted_decision(row)
+
+    assert not replay.valid
+    assert replay.reason == "persisted_evaluator_output_mismatch"
 
 
 def test_rosh_score_keeps_unbounded_upstream_values() -> None:
@@ -396,6 +464,63 @@ def test_strategy_version_does_not_allow_a_non_default_entry_policy() -> None:
         )
 
 
+def test_default_shadow_strategy_keeps_deployed_v4_fail_closed() -> None:
+    previous = _snapshots(NOW)
+    current_at = NOW + timedelta(seconds=3)
+    current = [replace(row, received_at=current_at) for row in previous]
+
+    result = ComebackShadowStrategy().evaluate(
+        snapshots=current,
+        previous_snapshots=previous,
+        observation=_observation(radiant_team_side="team_two"),
+        previous_observation=_observation(radiant_team_side="team_two"),
+        underdog_style=_style(2),
+        favorite_style=_style(1),
+        underdog_form=_form(),
+        favorite_form=_form(),
+        draft_curve=_draft_curve(),
+        rosh_lineup_score=_score(),
+        decided_at=current_at,
+        map_already_attempted=False,
+        signal_transport_key="current",
+        previous_transport_key="previous",
+    )
+
+    assert result.decision.strategy_version == "comeback-shadow-v4-controlled-entry"
+    assert result.decision.reason.startswith("strategy_contract_unavailable:")
+    assert result.order is None
+
+
+def test_unregistered_v5_policy_is_controlled_fail_closed() -> None:
+    previous = _snapshots(NOW)
+    current_at = NOW + timedelta(seconds=3)
+    current = [replace(row, received_at=current_at) for row in previous]
+
+    result = ComebackShadowStrategy(
+        strategy_version=PROPOSED_STRATEGY_VERSION,
+        min_edge=0.001,
+    ).evaluate(
+        snapshots=current,
+        previous_snapshots=previous,
+        observation=_observation(radiant_team_side="team_two"),
+        previous_observation=_observation(radiant_team_side="team_two"),
+        underdog_style=_style(2),
+        favorite_style=_style(1),
+        underdog_form=_form(),
+        favorite_form=_form(),
+        draft_curve=_draft_curve(),
+        rosh_lineup_score=_score(),
+        decided_at=current_at,
+        map_already_attempted=False,
+        signal_transport_key="current",
+        previous_transport_key="previous",
+    )
+
+    assert result.decision.reason == "strategy_contract_policy_unregistered"
+    assert result.decision.eligible is False
+    assert result.order is None
+
+
 @pytest.mark.parametrize(
     ("score", "expected_stake"),
     (
@@ -411,7 +536,9 @@ def test_shadow_order_uses_rosh_stake_multiplier(
     previous = _snapshots(NOW)
     current_at = NOW + timedelta(seconds=3)
     current = [replace(row, received_at=current_at) for row in previous]
-    result = ComebackShadowStrategy(min_edge=0.001).evaluate(
+    result = ComebackShadowStrategy(
+        strategy_version=PROPOSED_STRATEGY_VERSION
+    ).evaluate(
         snapshots=current,
         previous_snapshots=previous,
         observation=_observation(radiant_team_side="team_two"),

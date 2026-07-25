@@ -862,8 +862,8 @@ def _transport_refs(
     rows = connection.execute(
         """SELECT observation_key, observed_at, normalized_state_hash
              FROM odds_transport_observations
-           WHERE raybet_match_id=? AND observed_at<=?
-              AND timing_status='on_time' AND processing_status='processed'
+           WHERE raybet_match_id=? AND source='direct' AND observed_at<=?
+               AND timing_status='on_time' AND processing_status='processed'
            ORDER BY observed_at DESC, observation_key DESC LIMIT 2""",
         (match_id, as_of.isoformat()),
     ).fetchall()
@@ -1105,6 +1105,7 @@ def run_once(
                       ) AS transport_rank
                  FROM odds_transport_observations AS transport
                 WHERE transport.observed_at<=?
+                  AND transport.source='direct'
                   AND transport.timing_status='on_time'
                   AND transport.processing_status='processed'
            ), current_transport AS (

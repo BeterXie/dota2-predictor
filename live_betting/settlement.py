@@ -284,12 +284,23 @@ def resolve_authoritative_settlement(
     ):
         if not required.issubset(_table_columns(connection, table)):
             raise SettlementAuthorityError(schema_reasons[table])
+    order_columns = _table_columns(connection, "shadow_orders")
+    has_market_source_lineage = {
+        "signal_transport_key",
+        "signal_transport_at",
+    }.issubset(order_columns)
+    signal_transport_sql = (
+        "orders.signal_transport_key, orders.signal_transport_at,"
+        if has_market_source_lineage
+        else "NULL AS signal_transport_key, NULL AS signal_transport_at,"
+    )
     filled_at_sql = "orders.filled_at"
     order = connection.execute(
         f"""SELECT orders.raybet_match_id, orders.strict_mapping_id,
-                  orders.market_key, orders.signal_outcome_key,
-                  orders.fill_price, orders.stake,
-                  {filled_at_sql} AS filled_at,
+                   orders.market_key, orders.signal_outcome_key,
+                   orders.fill_price, orders.stake,
+                   {signal_transport_sql}
+                   {filled_at_sql} AS filled_at,
                   orders.status AS order_status,
                   attempt.raybet_match_id AS attempt_match_id,
                   attempt.map_number, attempt.status AS attempt_status
@@ -301,6 +312,24 @@ def resolve_authoritative_settlement(
     ).fetchone()
     if order is None:
         raise SettlementAuthorityError("settlement_order_missing")
+    if has_market_source_lineage:
+        try:
+            direct_signal = connection.execute(
+                """SELECT 1 FROM odds_transport_observations
+                    WHERE observation_key=? AND source='direct'
+                      AND raybet_match_id=? AND observed_at=?""",
+                (
+                    order["signal_transport_key"],
+                    order["raybet_match_id"],
+                    order["signal_transport_at"],
+                ),
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise SettlementAuthorityError(
+                "settlement_order_market_source_invalid"
+            ) from error
+        if direct_signal is None:
+            raise SettlementAuthorityError("settlement_order_market_source_invalid")
     try:
         verify_bound_order_vision_frame(connection, order_key)
     except (RuntimeError, TypeError, ValueError, sqlite3.Error) as error:

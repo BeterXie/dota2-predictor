@@ -38,7 +38,9 @@ from scripts.watch_raybet_stream import (
     ALLOWED_STREAM_HOSTS,
     ROOT,
     _meaningful,
+    _sanitized_stream_location,
     _should_persist_frame,
+    _suppress_native_video_stderr,
     _validate_stream_url,
     _write_evidence_frame,
     completion_check_due,
@@ -632,6 +634,50 @@ def test_stream_url_allowlist_accepts_public_hosts_and_signed_queries(
     assert _validate_stream_url(url) == url
 
 
+def test_signed_stream_query_is_removed_from_diagnostics() -> None:
+    marker = "SIGNED_QUERY_MARKER_9f71"
+    url = f"https://qplay.ehome.gg/live/42.m3u8?auth_key={marker}"
+
+    assert _sanitized_stream_location(url) == "qplay.ehome.gg/live/42.m3u8"
+    assert marker not in str(_sanitized_stream_location(url))
+
+
+def test_native_video_stderr_is_suppressed(capfd: pytest.CaptureFixture[str]) -> None:
+    marker = b"SIGNED_NATIVE_MARKER_0c2a"
+
+    with _suppress_native_video_stderr():
+        os.write(2, marker + b"\n")
+
+    captured = capfd.readouterr()
+    assert marker.decode() not in captured.err
+
+
+def test_watcher_cli_never_prints_exception_secret(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "SIGNED_EXCEPTION_MARKER_8b41"
+    args = SimpleNamespace(
+        database=None,
+        url=f"https://play.ehome.gg/live/42.m3u8?token={marker}",
+    )
+    parser = object()
+    with (
+        patch.object(visual_watcher, "_parse_args", return_value=(parser, args)),
+        patch.object(
+            visual_watcher,
+            "_run_cli",
+            side_effect=RuntimeError(f"backend failed for {marker}"),
+        ),
+    ):
+        assert visual_watcher.main() == 2
+
+    captured = capsys.readouterr()
+    assert marker not in captured.out
+    assert marker not in captured.err
+    assert "watcher_failed" in captured.err
+    assert "play.ehome.gg/live/42.m3u8" in captured.err
+
+
 @pytest.mark.parametrize(
     "bad_url",
     (
@@ -729,7 +775,10 @@ def _upsert_supervisor_match(
         "game_id": game_id,
         "status": status,
         "round": "bo3",
-        "team": [],
+        "team": [
+            {"pos": 1, "team_id": 101, "team_name": "Team One"},
+            {"pos": 2, "team_id": 202, "team_name": "Team Two"},
+        ],
     }
     if live_url is not None:
         row["live_url"] = live_url

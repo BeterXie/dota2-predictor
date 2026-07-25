@@ -5,7 +5,6 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import sqlite3
@@ -20,25 +19,39 @@ from live_betting.engine import price_groups
 from live_betting.browser_contract import canonical_json, payload_sha256
 from live_betting.comeback import (
     STRATEGY_VERSION,
-    _identity,
     no_signal_decision,
     score_comeback,
 )
 from live_betting.health import record_health
 from live_betting.markets import normalized_state_hash
 from live_betting.market_state import MarketSurface
+from live_betting.m1_verifier import verify_m1_qualifying_rejection
 from live_betting.models import Market, OddsSnapshot, RoshLineupScore
+from live_betting.milestone_revocation import (
+    MilestoneRevocationConfig,
+    append_milestone_revocation,
+    create_pair_baseline_manifest,
+    initialize_milestone_revocation_ledger,
+)
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
 from live_betting.shadow_monitor import _persist_decision
 from live_betting.storage import LiveBettingStore
+from live_betting.strategy_contract import (
+    PROPOSED_STRATEGY_VERSION,
+    _rebuild_canonical_evaluator_inputs,
+    build_strategy_contract,
+    parse_decision_payload,
+    replay_persisted_decision,
+    serialize_decision_payload,
+)
 from live_betting.stratz_rosh_client import (
     ROSH_FORMULA_VERSION,
     canonical_evidence_hash,
     rosh_cache_week_start,
 )
 from live_betting.strict_eligibility import query_strict_mapping_snapshot
-from live_betting.vision import VisionObservation
+from live_betting.vision import VisionComebackState, VisionObservation
 from live_betting.vision_frame_registry import (
     publish_vision_frame_bytes,
     retire_vision_frame_artifact,
@@ -48,6 +61,7 @@ from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
 )
+from tests.milestone_revocation_fixture import milestone_revocation_record
 from web import monitoring, queries
 from web.app import app
 from web.monitoring import (
@@ -421,6 +435,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         observation_key: str,
         period: str = "map_1",
         status: int = 1,
+        source: str = "direct",
     ) -> list[OddsSnapshot]:
         snapshots = [
             OddsSnapshot(
@@ -446,7 +461,7 @@ class MonitoringDashboardTests(unittest.TestCase):
                 )
             )
         self.store.store_odds_observation(
-            source="direct",
+            source=source,
             observation_key=observation_key,
             source_event_id=None,
             raybet_match_id=match_id,
@@ -514,137 +529,26 @@ class MonitoringDashboardTests(unittest.TestCase):
         *,
         map_number: int = 1,
     ) -> str:
-        mapping_id = self.ensure_strict_mapping()
-        mapping_snapshot = query_strict_mapping_snapshot(
-            self.store.connection,
-            mapping_id=mapping_id,
-            observed_at=decided_at,
-        )
-        self.assertTrue(mapping_snapshot.eligible)
-        assert mapping_snapshot.mapping is not None
-        draft_authority = seed_test_draft_authority(
-            self.store.connection,
-            raybet_match_id="match-1",
-            map_number=map_number,
-            strict_mapping_id=mapping_id,
-            observed_at=decided_at,
-            label=f"monitor:{label}",
-        )
-        vision = make_test_vision_observation(
-            raybet_match_id="match-1",
-            map_number=map_number,
-            captured_at=decided_at,
-            label=f"monitor-frame:{label}",
-        )
-        self.store.insert_vision_observation(vision)
-        rows = self.add_winner_response(
+        decision, draft_authority, vision, transport_key = self.build_scored_decision(
+            label,
             decided_at,
-            2.5,
-            5.0 / 3.0,
-            observation_key=f"monitor-transport:{label}",
-            period=f"map_{map_number}",
-        )
-        market_probability = price_groups(rows)[rows[0].odds_id]
-        bounded_market = min(1.0 - 1e-6, max(1e-6, market_probability))
-        market_logit = math.log(bounded_market / (1.0 - bounded_market))
-        raw_contributions = {
-            "team_style": team_style,
-            "player_form": -0.02,
-            "draft_curve": 0.08,
-            "late_game_style": 0.0,
-            "market_movement": 0.01,
-        }
-        model_probability = 1.0 / (
-            1.0
-            + math.exp(
-                -(market_logit + math.fsum(raw_contributions.values()))
-            )
-        )
-        conservative_contributions = {
-            "team_style": (
-                raw_contributions["team_style"] * 0.8
-                if raw_contributions["team_style"] > 0.0
-                else raw_contributions["team_style"]
-            ),
-            "player_form": -0.02,
-            "draft_curve": 0.04,
-            "late_game_style": 0.0,
-            "market_movement": 0.01,
-        }
-        conservative_probability = 1.0 / (
-            1.0
-            + math.exp(
-                -(
-                    market_logit
-                    + math.fsum(conservative_contributions.values())
-                )
-            )
-        )
-        independent_positive = (
-            raw_contributions["team_style"]
-            + raw_contributions["late_game_style"]
-            > 0.0
-            or raw_contributions["player_form"] > 0.0
-            or raw_contributions["draft_curve"] > 0.0
-        )
-        inputs = {
-            "draft_authority": asdict(draft_authority),
-            "strict_live_eligibility": {
-                "mapping_refs": mapping_snapshot.mapping.input_refs()
-            },
-            "transport": {
-                "current_key": f"monitor-transport:{label}",
-                "current_at": decided_at.isoformat(),
-            },
-            "vision": {
-                "captured_at": vision.captured_at.isoformat(),
-                "source_frame_ref": vision.source_frame_ref,
-                "game_clock_seconds": vision.game_clock_seconds,
-                "radiant_team_side": vision.radiant_team_side,
-            },
-            "conservative_contributions": conservative_contributions,
-            "conservative_probability": conservative_probability,
-            "independent_positive": independent_positive,
-        }
-        decision_key, input_ref = _identity(
-            observation=vision,
-            decided_at=decided_at,
-            underdog_side="team_one",
-            model_probability=model_probability,
-            reason="eligible",
-            inputs=inputs,
-        )
-        decision = SimpleNamespace(
-            decision_key=decision_key,
-            raybet_match_id="match-1",
             map_number=map_number,
-            decided_at=decided_at,
-            underdog_side="team_one",
-            market_probability=market_probability,
-            model_probability=model_probability,
-            edge=model_probability - market_probability,
-            data_quality=0.9,
-            eligible=True,
-            reason="eligible",
-            contributions={
-                **raw_contributions,
-                "__conservative__": conservative_contributions,
-                "__inputs__": inputs,
-            },
-            input_ref=input_ref,
-            strategy_version=STRATEGY_VERSION,
+            comeback_rate=team_style,
         )
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.reason, "eligible")
         self.assertTrue(
-            self.store.insert_decision(
+            _persist_decision(
+                self.store,
                 decision,
                 draft_authority=draft_authority,
                 vision_observation=vision,
-                vision_transport_key=f"monitor-transport:{label}",
+                vision_transport_key=transport_key,
             )
         )
-        self.assertEqual(len(decision_key), 32)
-        self.assertEqual(len(input_ref), 24)
-        return decision_key
+        self.assertRegex(decision.decision_key, r"^[0-9a-f]{32}$")
+        self.assertRegex(decision.input_ref, r"^[0-9a-f]{24}$")
+        return decision.decision_key
 
     def add_no_signal_decision(
         self,
@@ -683,10 +587,13 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertRegex(decision.input_ref, r"^[0-9a-f]{24}$")
         return decision.decision_key
 
-    def build_scored_blocked_decision(
+    def build_scored_decision(
         self,
         label: str,
         decided_at: datetime,
+        *,
+        map_number: int = 1,
+        comeback_rate: float = 0.18,
     ):
         mapping_id = self.ensure_strict_mapping()
         mapping_snapshot = query_strict_mapping_snapshot(
@@ -699,17 +606,32 @@ class MonitoringDashboardTests(unittest.TestCase):
         draft_authority = seed_test_draft_authority(
             self.store.connection,
             raybet_match_id="match-1",
-            map_number=1,
+            map_number=map_number,
             strict_mapping_id=mapping_id,
             observed_at=decided_at,
             label=f"monitor-scored-blocked:{label}",
         )
-        vision = make_test_vision_observation(
-            raybet_match_id="match-1",
-            map_number=1,
-            captured_at=decided_at,
-            game_clock_seconds=600,
-            label=f"monitor-scored-blocked-frame:{label}",
+        vision = replace(
+            make_test_vision_observation(
+                raybet_match_id="match-1",
+                map_number=map_number,
+                captured_at=decided_at,
+                game_clock_seconds=20 * 60,
+                label=f"monitor-scored-blocked-frame:{label}",
+            ),
+            comeback_state=VisionComebackState(
+                "available",
+                "vision_hud",
+                0.95,
+                14,
+                18,
+                None,
+                None,
+                None,
+                net_worth_advantage_side="dire",
+                net_worth_advantage_min=5_000,
+                net_worth_advantage_max=5_999,
+            ),
         )
         self.store.insert_vision_observation(vision)
         transport_key = f"monitor-scored-blocked-transport:{label}"
@@ -718,6 +640,7 @@ class MonitoringDashboardTests(unittest.TestCase):
             2.5,
             5.0 / 3.0,
             observation_key=transport_key,
+            period=f"map_{map_number}",
         )
         surface = MarketSurface(
             underdog_side="team_one",
@@ -774,21 +697,27 @@ class MonitoringDashboardTests(unittest.TestCase):
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        scoring_vision = replace(
+            vision,
+            source_frame_path=(
+                "tests/fixtures/monitor-analysis-available.frame.jpg"
+            ),
+        )
         decision = score_comeback(
-            observation=vision,
+            observation=scoring_vision,
             surface=surface,
             underdog_style=TeamStyleProfile(
-                11, 100, 0.28, 0.16, 0.84, 0.4, 38.0, 0.8
+                11, 100, comeback_rate, 0.2, 0.8, 0.35, 36.0, 0.8
             ),
             favorite_style=TeamStyleProfile(
                 22, 100, 0.18, 0.2, 0.8, 0.35, 36.0, 0.8
             ),
-            underdog_form=PlayerForm((1, 2, 3, 4, 5), 0.2, {}, 50, 0.8),
+            underdog_form=PlayerForm((1, 2, 3, 4, 5), 0.0, {}, 50, 0.8),
             favorite_form=PlayerForm((6, 7, 8, 9, 10), 0.0, {}, 50, 0.8),
             draft_curve=draft_curve,
             decided_at=decided_at,
             stable=True,
-            min_edge=0.99,
+            strategy_version=PROPOSED_STRATEGY_VERSION,
             rosh_lineup_score=RoshLineupScore(
                 score_key="a" * 64,
                 draft_hash=draft_hash,
@@ -831,9 +760,18 @@ class MonitoringDashboardTests(unittest.TestCase):
                 },
             },
         )
+        return decision, draft_authority, vision, transport_key
+
+    def build_scored_blocked_decision(
+        self,
+        label: str,
+        decided_at: datetime,
+    ):
+        result = self.build_scored_decision(label, decided_at)
+        decision = result[0]
         self.assertFalse(decision.eligible)
         self.assertEqual(decision.reason, "edge_below_threshold")
-        return decision, draft_authority, vision, transport_key
+        return result
 
     def add_scored_blocked_decision(
         self,
@@ -853,6 +791,82 @@ class MonitoringDashboardTests(unittest.TestCase):
             )
         )
         return decision.decision_key
+
+    def add_replayable_scored_decisions(
+        self,
+        source_key: str,
+        *,
+        count: int,
+    ) -> list[str]:
+        connection = self.store.connection
+        columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
+        ]
+        source = dict(
+            connection.execute(
+                "SELECT * FROM strategy_decisions WHERE decision_key=?",
+                (source_key,),
+            ).fetchone()
+        )
+        source_payload = parse_decision_payload(
+            source["contributions_json"],
+            strategy_version=source["strategy_version"],
+        )
+        evaluator_inputs = _rebuild_canonical_evaluator_inputs(
+            source_payload["__inputs__"]["canonical_evaluator_inputs"]
+        )
+        contract = build_strategy_contract(
+            strategy_version=PROPOSED_STRATEGY_VERSION
+        )
+        decision_keys: list[str] = []
+        for index in range(count):
+            decision = score_comeback(
+                **{
+                    **evaluator_inputs,
+                    "underdog_style": replace(
+                        evaluator_inputs["underdog_style"],
+                        comeback_rate=0.65 + (index + 1) * 1e-6,
+                    ),
+                },
+                strategy_version=PROPOSED_STRATEGY_VERSION,
+                min_edge=contract.policy.minimum_edge,
+            )
+            payload = {
+                **decision.contributions,
+                "__conservative__": decision.inputs[
+                    "conservative_contributions"
+                ],
+                "__inputs__": decision.inputs,
+            }
+            row = {
+                **source,
+                "decision_key": decision.decision_key,
+                "decided_at": decision.decided_at.isoformat(),
+                "underdog_side": decision.underdog_side,
+                "market_probability": decision.market_probability,
+                "model_probability": decision.model_probability,
+                "edge": decision.edge,
+                "data_quality": decision.data_quality,
+                "eligible": int(decision.eligible),
+                "reason": decision.reason,
+                "contributions_json": serialize_decision_payload(
+                    payload,
+                    strategy_version=decision.strategy_version,
+                ),
+                "input_ref": decision.input_ref,
+                "strategy_version": decision.strategy_version,
+            }
+            replay = replay_persisted_decision(row)
+            self.assertTrue(replay.valid, replay.reason)
+            connection.execute(
+                f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(row[column] for column in columns),
+            )
+            decision_keys.append(decision.decision_key)
+        connection.commit()
+        return decision_keys
 
     def test_stale_healthy_heartbeat_is_derived_as_unhealthy(self) -> None:
         heartbeat = NOW - timedelta(minutes=5)
@@ -904,6 +918,43 @@ class MonitoringDashboardTests(unittest.TestCase):
         mail = next(item for item in snapshot["health"] if item["component"] == "mail")
         self.assertEqual(mail["status"], "degraded")
         self.assertEqual(mail["last_error"], "configuration_missing")
+
+    def test_unconfigured_companion_is_informational_for_direct_primary(self) -> None:
+        for component in ("raybet_worker", "shadow_worker"):
+            record_health(
+                self.store.connection,
+                component,
+                "healthy",
+                heartbeat_at=NOW,
+                success_at=NOW,
+            )
+        record_health(
+            self.store.connection,
+            "companion",
+            "stopped",
+            heartbeat_at=NOW - timedelta(days=1),
+            details={
+                "configured": False,
+                "role": "optional_diagnostic",
+                "readiness_impact": "none",
+                "reason": "not_started_by_supervisor",
+            },
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+
+        self.assertEqual(snapshot["market_source_policy"], "direct_primary")
+        self.assertEqual(snapshot["summary"]["unhealthy_components"], 0)
+        self.assertFalse(snapshot["capabilities"]["browser_compare"]["required"])
+        companion = next(
+            item for item in snapshot["health"]
+            if item["component"] == "companion"
+        )
+        self.assertEqual(companion["status"], "stopped")
+        self.assertEqual(companion["freshness"], "informational")
+        self.assertEqual(
+            companion["details"]["reason"], "not_started_by_supervisor"
+        )
 
     def test_non_optional_worker_health_is_counted(self) -> None:
         for component in ("raybet_worker", "shadow_worker"):
@@ -2468,6 +2519,57 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(latest_markets[0]["side"], "team_one")
         self.assertEqual(latest_markets[0]["received_at"], NOW.isoformat())
 
+    def test_newer_browser_transport_cannot_replace_direct_web_state(self) -> None:
+        self.add_match(status=2)
+        direct_at = NOW - timedelta(seconds=30)
+        self.add_winner_response(
+            direct_at,
+            2.0,
+            2.0,
+            observation_key="direct-current",
+        )
+        self.add_winner_response(
+            NOW,
+            9.0,
+            1.01,
+            observation_key="browser-later",
+            source="browser",
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        match = snapshot["matches"][0]
+
+        self.assertEqual(match["winner"]["observed_at"], direct_at.isoformat())
+        self.assertEqual(
+            match["winner"]["prices"], {"team_one": 2.0, "team_two": 2.0}
+        )
+        self.assertEqual(match["readiness"]["odds"]["observed_at"], direct_at.isoformat())
+        self.assertEqual(match["readiness"]["odds"]["status"], "delayed")
+        self.assertEqual(match["latest_odds_activity_at"], direct_at.isoformat())
+        markets = current_markets(self.store.connection, "match-1", as_of=NOW)
+        self.assertEqual({row["price"] for row in markets}, {2.0})
+        timeline = winner_timeline(self.store.connection, "match-1", as_of=NOW)
+        self.assertEqual(timeline[-1]["observed_at"], direct_at.isoformat())
+
+    def test_browser_only_transport_blocks_legacy_web_fallback(self) -> None:
+        self.add_match(status=2)
+        self.add_winner_response(
+            NOW,
+            9.0,
+            1.01,
+            observation_key="browser-only",
+            source="browser",
+        )
+
+        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
+        match = snapshot["matches"][0]
+
+        self.assertIsNone(match["winner"])
+        self.assertEqual(match["readiness"]["odds"]["status"], "missing")
+        self.assertIsNone(match["latest_odds_activity_at"])
+        self.assertEqual(current_markets(self.store.connection, "match-1"), [])
+        self.assertEqual(winner_timeline(self.store.connection, "match-1"), [])
+
     def test_transport_schema_error_does_not_fall_back_to_legacy_winner(self) -> None:
         self.add_match(status=2)
         self.add_winner_pair(NOW - timedelta(minutes=1), 2.0, 2.0, status=1)
@@ -2857,6 +2959,10 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertEqual(bootstrap.status_code, 200)
         self.assertEqual(bootstrap.json()["matches"][0]["raybet_match_id"], "match-1")
+        self.assertEqual(
+            bootstrap.json()["milestone_governance"]["status"],
+            "not_configured",
+        )
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(len(detail.json()["winner_timeline"]), 1)
         self.assertEqual(history.status_code, 200)
@@ -3097,7 +3203,7 @@ class MonitoringDashboardTests(unittest.TestCase):
 
     def test_available_analysis_matches_cross_layer_golden_fixture(self) -> None:
         self.add_match(status=2)
-        self.add_scored_blocked_decision(
+        blocked_decision_key = self.add_scored_blocked_decision(
             "blocked-golden-v1",
             NOW - timedelta(seconds=10),
         )
@@ -3117,15 +3223,62 @@ class MonitoringDashboardTests(unittest.TestCase):
         detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
 
         assert detail is not None
+        [blocked_decision, golden_decision] = detail["analysis"]["strategy"][
+            "data"
+        ]["decisions"]
+        self.assertEqual(blocked_decision["decision_key"], blocked_decision_key)
+        self.assertRegex(blocked_decision["decision_key"], r"^[0-9a-f]{32}$")
+        self.assertRegex(blocked_decision["input_ref"], r"^[0-9a-f]{24}$")
+        expected_blocked = expected["strategy"]["data"]["decisions"][0]
+        self.assertEqual(expected_blocked["decision_key"], blocked_decision_key)
+        self.assertEqual(expected_blocked["input_ref"], blocked_decision["input_ref"])
         self.assertEqual(detail["analysis"], expected)
-        strategy = expected["strategy"]["data"]
-        self.assertEqual(strategy["displayed_count"], 1)
-        self.assertEqual(strategy["excluded_decision_count"], 1)
-        self.assertEqual(strategy["excluded"]["invalid_payload"], 1)
-        [golden_decision] = strategy["decisions"]
+        strategy = detail["analysis"]["strategy"]["data"]
+        self.assertEqual(strategy["displayed_count"], 2)
+        self.assertEqual(strategy["excluded_decision_count"], 0)
+        self.assertEqual(strategy["excluded"]["invalid_payload"], 0)
+        self.assertEqual(blocked_decision["eligible"], 0)
+        self.assertEqual(blocked_decision["reason"], "edge_below_threshold")
+        self.assertEqual(blocked_decision["strategy_version"], PROPOSED_STRATEGY_VERSION)
+        contract = blocked_decision["inputs"]["strategy_contract"]
+        self.assertEqual(contract["strategy_version"], PROPOSED_STRATEGY_VERSION)
+        self.assertEqual(contract["schema"], "dota2-executable-strategy-contract-v1")
+        self.assertEqual(
+            contract["policy_artifact"]["parameters"]["valid_economy_buckets"],
+            [f"{value}k" for value in range(1, 10)],
+        )
+        self.assertEqual(
+            contract["policy_artifact"]["parameters"]["invalid_economy_buckets"],
+            ["0k", "10k", "11k"],
+        )
+        qualification = verify_m1_qualifying_rejection(
+            self.store.connection,
+            blocked_decision_key,
+        )
+        self.assertFalse(qualification.m1_qualifying_rejection)
+        self.assertEqual(qualification.reason, "profile_or_model_refs_incomplete")
+        self.assertEqual(qualification.replay_reason, "replayed")
         self.assertEqual(golden_decision["decision_key"], decision_key)
         self.assertRegex(golden_decision["decision_key"], r"^[0-9a-f]{32}$")
         self.assertRegex(golden_decision["input_ref"], r"^[0-9a-f]{24}$")
+        self.assertEqual(golden_decision["eligible"], 1)
+        self.assertEqual(golden_decision["reason"], "eligible")
+        canonical_inputs = golden_decision["inputs"][
+            "canonical_evaluator_inputs"
+        ]
+        self.assertEqual(
+            canonical_inputs["schema"],
+            "dota2-comeback-evaluator-inputs-v1",
+        )
+        persisted = self.store.connection.execute(
+            "SELECT * FROM strategy_decisions WHERE decision_key=?",
+            (decision_key,),
+        ).fetchone()
+        assert persisted is not None
+        replay = replay_persisted_decision(dict(persisted))
+        self.assertTrue(replay.valid, replay.reason)
+        self.assertEqual(replay.reason, "replayed")
+        self.assertEqual(replay.expected_reason, "eligible")
         self.assertAlmostEqual(
             golden_decision["model_probability"],
             monitoring._strategy_probability(
@@ -3188,6 +3341,24 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(decision["conservative_contributions"], {})
         self.assertEqual(decision["draft_authority"], {})
         self.assertEqual(decision["vision_authority"], {})
+        self.assertEqual(decision["strategy_version"], STRATEGY_VERSION)
+        self.assertNotEqual(decision["strategy_version"], PROPOSED_STRATEGY_VERSION)
+        self.assertEqual(
+            decision["inputs"]["strategy_contract"],
+            {
+                "status": "unregistered_deployed_contract",
+                "strategy_version": STRATEGY_VERSION,
+            },
+        )
+        self.assertNotIn("canonical_evaluator_inputs", decision["inputs"])
+        qualification = verify_m1_qualifying_rejection(
+            self.store.connection,
+            decision_key,
+        )
+        self.assertFalse(qualification.m1_qualifying_rejection)
+        self.assertEqual(qualification.reason, "reason_not_allowlisted")
+        self.assertIsNone(qualification.evaluator_hash)
+        self.assertIsNone(qualification.policy_hash)
 
     def test_scored_blocked_decision_is_available_with_complete_authority(
         self,
@@ -3393,6 +3564,55 @@ class MonitoringDashboardTests(unittest.TestCase):
             monitoring._valid_comeback_entry_inputs(
                 bucketed,
                 strategy_version=STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
+        v5_inputs = json.loads(json.dumps(bucketed))
+        v5_inputs["strategy_contract"] = build_strategy_contract(
+            strategy_version=PROPOSED_STRATEGY_VERSION
+        ).as_input_ref()
+        self.assertTrue(
+            monitoring._valid_comeback_entry_inputs(
+                v5_inputs,
+                strategy_version=PROPOSED_STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
+        v5_policy_tamper = json.loads(json.dumps(v5_inputs))
+        v5_policy_tamper["entry_window"].update(
+            {
+                "minimum_clock_seconds": 15 * 60,
+                "maximum_clock_seconds": 50 * 60,
+            }
+        )
+        v5_policy_tamper["comeback_entry"]["policy"].update(
+            {
+                "minimum_clock_seconds": 15 * 60,
+                "maximum_clock_seconds": 50 * 60,
+                "minimum_kill_deficit": 1,
+                "maximum_kill_deficit": 20,
+                "minimum_net_worth_deficit": 100,
+                "maximum_net_worth_deficit": 20_000,
+            }
+        )
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                v5_policy_tamper,
+                strategy_version=PROPOSED_STRATEGY_VERSION,
+                require_eligible_gates=True,
+            )
+        )
+
+        v5_artifact_tamper = json.loads(json.dumps(v5_inputs))
+        v5_artifact_tamper["strategy_contract"]["policy_artifact"][
+            "parameters"
+        ]["entry"]["minimum_clock_seconds"] = 15 * 60
+        self.assertFalse(
+            monitoring._valid_comeback_entry_inputs(
+                v5_artifact_tamper,
+                strategy_version=PROPOSED_STRATEGY_VERSION,
                 require_eligible_gates=True,
             )
         )
@@ -3998,7 +4218,16 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(strategy["status"], "review")
         self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
         self.assertEqual(strategy["data"]["decisions"], [])
-        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 4)
+        self.assertEqual(
+            strategy["data"]["excluded"],
+            {
+                "vision_invalidated": 0,
+                "mapping_impacted": 0,
+                "draft_conflicted": 0,
+                "invalid_payload": 3,
+                "decision_json_non_finite_number": 1,
+            },
+        )
 
     def test_trusted_vision_candidate_scan_is_bounded(self) -> None:
         self.add_match(status=2)
@@ -4118,7 +4347,16 @@ class MonitoringDashboardTests(unittest.TestCase):
             strategy["data"]["count_scope"],
             "recent_scanned_window",
         )
-        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 200)
+        self.assertEqual(
+            strategy["data"]["excluded"],
+            {
+                "vision_invalidated": 0,
+                "mapping_impacted": 0,
+                "draft_conflicted": 0,
+                "invalid_payload": 0,
+                "decision_json_root_not_object": 200,
+            },
+        )
         self.assertEqual(strategy["data"]["excluded_decision_count"], 200)
 
     def test_strategy_scan_reports_has_more_for_201_valid_rows(self) -> None:
@@ -4127,32 +4365,15 @@ class MonitoringDashboardTests(unittest.TestCase):
             "valid-scan-base", NOW - timedelta(seconds=5), 0.65
         )
         connection = self.store.connection
-        columns = [
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(strategy_decisions)")
-        ]
-        source = dict(
-            connection.execute(
-                "SELECT * FROM strategy_decisions WHERE decision_key=?",
-                (base_key,),
-            ).fetchone()
-        )
-        for index in range(200):
-            clone = {
-                **source,
-                "decision_key": hashlib.sha256(
-                    f"valid-scan-{index:03d}".encode("ascii")
-                ).hexdigest()[:32],
-                "input_ref": hashlib.sha256(
-                    f"valid-input-{index:03d}".encode("ascii")
-                ).hexdigest()[:24],
-            }
-            connection.execute(
-                f"INSERT INTO strategy_decisions ({', '.join(columns)}) "
-                f"VALUES ({', '.join('?' for _ in columns)})",
-                tuple(clone[column] for column in columns),
-            )
-        connection.commit()
+        generated_keys = self.add_replayable_scored_decisions(base_key, count=200)
+        persisted = connection.execute(
+            "SELECT * FROM strategy_decisions WHERE raybet_match_id='match-1'"
+        ).fetchall()
+        self.assertEqual(len(persisted), 201)
+        for row in persisted:
+            replay = replay_persisted_decision(dict(row))
+            self.assertTrue(replay.valid, replay.reason)
+        self.assertEqual(len(set(generated_keys) | {base_key}), 201)
 
         detail = monitor_match_detail(connection, "match-1", now=NOW)
 
@@ -4163,6 +4384,15 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(strategy["data"]["displayed_count"], 200)
         self.assertTrue(strategy["data"]["has_more"])
         self.assertTrue(strategy["data"]["truncated"])
+        self.assertEqual(
+            strategy["data"]["excluded"],
+            {
+                "vision_invalidated": 0,
+                "mapping_impacted": 0,
+                "draft_conflicted": 0,
+                "invalid_payload": 0,
+            },
+        )
         self.assertEqual(
             strategy["data"]["count_scope"],
             "recent_scanned_window",
@@ -4355,7 +4585,16 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(strategy["status"], "review")
         self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
         self.assertEqual(strategy["data"]["decisions"], [])
-        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 2)
+        self.assertEqual(
+            strategy["data"]["excluded"],
+            {
+                "vision_invalidated": 1,
+                "mapping_impacted": 0,
+                "draft_conflicted": 0,
+                "invalid_payload": 0,
+                "decision_json_not_canonical": 2,
+            },
+        )
         self.assertEqual(strategy["data"]["excluded_decision_count"], 3)
 
     def test_eligible_strategy_requires_matching_input_authority_lineage(self) -> None:
@@ -4404,7 +4643,16 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(strategy["status"], "review")
         self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
         self.assertEqual(strategy["data"]["decisions"], [])
-        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 1)
+        self.assertEqual(
+            strategy["data"]["excluded"],
+            {
+                "vision_invalidated": 1,
+                "mapping_impacted": 0,
+                "draft_conflicted": 0,
+                "invalid_payload": 0,
+                "decision_json_not_canonical": 1,
+            },
+        )
         self.assertEqual(strategy["data"]["excluded_decision_count"], 2)
 
     def test_eligible_strategy_recomputes_probabilities_and_validates_identity(
@@ -4549,9 +4797,162 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(strategy["status"], "review")
         self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
         self.assertEqual(strategy["data"]["decisions"], [])
-        self.assertEqual(strategy["data"]["excluded"]["invalid_payload"], 11)
-        self.assertEqual(strategy["data"]["excluded"]["vision_invalidated"], 1)
+        self.assertEqual(
+            strategy["data"]["excluded"],
+            {
+                "vision_invalidated": 1,
+                "mapping_impacted": 0,
+                "draft_conflicted": 0,
+                "invalid_payload": 0,
+                "decision_json_not_canonical": 11,
+            },
+        )
         self.assertEqual(strategy["data"]["excluded_decision_count"], 12)
+
+    def test_paired_revocation_projection_hides_current_strategy_decision(
+        self,
+    ) -> None:
+        self.add_match(status=2)
+        decision_key = self.add_decision(
+            "revoked-monitor-decision",
+            NOW - timedelta(seconds=5),
+            0.65,
+        )
+        raw_root = Path(self.store.raw_archive_root)
+        raw_root.mkdir(parents=True, exist_ok=True)
+        ledger = Path(self.directory.name) / "revocations"
+        pair_manifest = create_pair_baseline_manifest(
+            self.database,
+            raw_root,
+            p0_baseline_evidence_identity="9" * 64,
+        )
+        pair_manifest_hash = hashlib.sha256(pair_manifest).hexdigest()
+        anchor = initialize_milestone_revocation_ledger(
+            ledger,
+            database_path=self.database,
+            raw_root=raw_root,
+            pair_manifest=pair_manifest,
+            expected_pair_manifest_hash=pair_manifest_hash,
+            p0_baseline_evidence_identity="9" * 64,
+        )
+        record = milestone_revocation_record()
+        record["affected"] = {
+            "decision_keys": [decision_key],
+            "order_keys": [],
+            "settlement_keys": [],
+            "sample_keys": [],
+            "sample_lineage": [],
+        }
+        anchor = append_milestone_revocation(
+            ledger,
+            record,
+            database_path=self.database,
+            raw_root=raw_root,
+            expected_anchor=anchor,
+            pair_manifest=pair_manifest,
+            expected_pair_manifest_hash=pair_manifest_hash,
+        )
+        revocation_config = MilestoneRevocationConfig(
+            root=ledger,
+            database_path=self.database,
+            raw_root=raw_root,
+            expected_anchor=anchor,
+            pair_manifest=pair_manifest,
+            expected_pair_manifest_hash=pair_manifest_hash,
+        )
+
+        snapshot = build_monitor_snapshot(
+            self.store.connection,
+            now=NOW,
+            revocation_config=revocation_config,
+        )
+        detail = monitor_match_detail(
+            self.store.connection,
+            "match-1",
+            now=NOW,
+            revocation_config=revocation_config,
+        )
+
+        assert detail is not None
+        governance = detail["milestone_governance"]
+        self.assertEqual(governance, snapshot["milestone_governance"])
+        self.assertEqual(governance["ledger_integrity"]["status"], "verified")
+        self.assertEqual(governance["isolated_keys"]["decision_keys"], [decision_key])
+        self.assertEqual(governance["records"][0]["evaluation_result"], "passed")
+        self.assertEqual(governance["records"][0]["governance_status"], "revoked")
+        strategy = detail["analysis"]["strategy"]
+        self.assertEqual(strategy["status"], "review")
+        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
+        self.assertEqual(strategy["data"]["decisions"], [])
+        self.assertEqual(
+            strategy["data"]["excluded"]["milestone_revocation"],
+            1,
+        )
+        self.assertIsNone(detail["latest_decision"])
+
+        previous_path = queries.DB_PATH
+        previous_config = app.state.milestone_revocation_config
+        queries.init_db(str(self.database))
+        try:
+            app.state.milestone_revocation_config = revocation_config
+            with TestClient(app, raise_server_exceptions=False) as client:
+                bootstrap_response = client.get("/api/monitor/bootstrap")
+                matches_response = client.get("/api/monitor/matches")
+                history_response = client.get("/api/monitor/history")
+                detail_response = client.get("/api/monitor/matches/match-1")
+                self.assertEqual(bootstrap_response.status_code, 200)
+                self.assertEqual(matches_response.status_code, 200)
+                self.assertEqual(history_response.status_code, 200)
+                self.assertEqual(detail_response.status_code, 200)
+                self.assertEqual(
+                    bootstrap_response.json()["milestone_governance"][
+                        "ledger_integrity"
+                    ]["status"],
+                    "verified",
+                )
+                self.assertEqual(
+                    detail_response.json()["milestone_governance"][
+                        "ledger_integrity"
+                    ]["status"],
+                    "verified",
+                )
+
+                bad_anchor = dict(anchor)
+                bad_anchor["head_entry_hash"] = "0" * 64
+                app.state.milestone_revocation_config = replace(
+                    revocation_config, expected_anchor=bad_anchor
+                )
+                for route in (
+                    "/api/monitor/bootstrap",
+                    "/api/monitor/health",
+                    "/api/monitor/matches",
+                    "/api/monitor/history",
+                    "/api/monitor/matches/match-1",
+                    "/api/monitor/matches/match-1/maps/1/postmatch",
+                    "/api/monitor/matches/match-1/vision-frames/"
+                    + "0" * 64
+                    + ".jpg",
+                    "/api/monitor/events",
+                ):
+                    self.assertEqual(client.get(route).status_code, 503)
+
+                app.state.milestone_revocation_config = {"ledger": ledger}
+                for route in (
+                    "/api/monitor/bootstrap",
+                    "/api/monitor/health",
+                    "/api/monitor/matches",
+                    "/api/monitor/history",
+                    "/api/monitor/matches/match-1",
+                    "/api/monitor/matches/match-1/maps/1/postmatch",
+                    "/api/monitor/matches/match-1/vision-frames/"
+                    + "0" * 64
+                    + ".jpg",
+                    "/api/monitor/events",
+                ):
+                    self.assertEqual(client.get(route).status_code, 500)
+        finally:
+            app.state.milestone_revocation_config = previous_config
+            queries.init_db(previous_path)
 
     def test_sqlite_errors_are_classified_and_busy_detail_returns_503(self) -> None:
         readonly = sqlite3.OperationalError("database is locked")

@@ -18,6 +18,13 @@ from event_intelligence.storage import IntelligenceStorage
 from live_betting.comeback import STRATEGY_VERSION
 from live_betting.comeback_entry import decide_comeback_entry
 from live_betting.markets import normalized_state_hash, snapshots_from_payload
+from live_betting.milestone_revocation import (
+    MilestoneRevocationConfig,
+    MilestoneRevocationIntegrityError,
+    append_milestone_revocation,
+    create_pair_baseline_manifest,
+    initialize_milestone_revocation_ledger,
+)
 from live_betting.models import Market, OddsSnapshot
 from live_betting.postmatch_monitor import StoredMapResult
 from live_betting.raybet import parse_raybet_map_final
@@ -36,6 +43,7 @@ from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
 )
+from tests.milestone_revocation_fixture import milestone_revocation_record
 
 
 NOW = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
@@ -1256,6 +1264,7 @@ class LiveReportCohortTests(unittest.TestCase):
             (114, 1, True, "eligible", "underdog_deficit:1k"),
             (115, 9, True, "eligible", "underdog_deficit:9k"),
             (116, 10, False, "vision_situation_collapsed", "underdog_deficit:10k"),
+            (117, 11, False, "vision_situation_collapsed", "underdog_deficit:11k"),
         )
         for index, economy_bucket, eligible, reason, _label in cases:
             with self.subTest(economy_bucket=economy_bucket):
@@ -1280,15 +1289,14 @@ class LiveReportCohortTests(unittest.TestCase):
             "forward_entry_by_strategy_version"
         ][STRATEGY_VERSION]
 
-        self.assertEqual(metrics["entry_evidence_count"], len(cases))
-        self.assertEqual(metrics["entry_evidence_invalid_count"], 0)
+        self.assertEqual(metrics["entry_evidence_count"], 2)
+        self.assertEqual(metrics["entry_evidence_invalid_count"], 3)
         self.assertEqual(metrics["eligible_count"], 2)
-        self.assertEqual(metrics["rejection_reasons"], {
-            "underdog_deficit_not_material": 1,
-            "vision_situation_collapsed": 1,
-        })
+        self.assertEqual(metrics["rejection_reasons"], {})
         self.assertEqual(metrics["candidate_buckets"]["net_worth_deficit"], {
-            label: 1 for *_values, label in cases
+            "underdog_deficit:1k": 1,
+            "underdog_deficit:9k": 1,
+            "unknown": 3,
         })
         settled = metrics["settled_performance"]
         self.assertEqual(settled["settled_order_count"], 2)
@@ -1302,7 +1310,12 @@ class LiveReportCohortTests(unittest.TestCase):
             "underdog_deficit:1k": 1,
             "underdog_deficit:9k": 1,
         })
-        self.assertNotIn("underdog_deficit:10k", settled_buckets)
+        for invalid_label in (
+            "underdog_deficit:<1k",
+            "underdog_deficit:10k",
+            "underdog_deficit:11k",
+        ):
+            self.assertNotIn(invalid_label, settled_buckets)
 
     def test_invalid_v4_entry_is_quarantined_from_funnel_and_settlement(self) -> None:
         inputs = v4_entry_inputs(
@@ -1719,6 +1732,113 @@ class LiveReportCohortTests(unittest.TestCase):
         self.assertEqual(
             report["order_audit"]["strict_mapping_unverifiable_orders"],
             1,
+        )
+
+    def test_paired_revocation_ledger_isolates_decision_and_dependent_order(
+        self,
+    ) -> None:
+        self.insert_settled_order(1)
+        self.store.connection.commit()
+        decision_key = self.store.connection.execute(
+            """SELECT decision_key FROM shadow_order_decision_lineage
+                WHERE order_key='order-1'"""
+        ).fetchone()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "report.db"
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            self.store.connection.backup(connection)
+            raw_root = root / "raw-v2"
+            raw_root.mkdir()
+            ledger = root / "revocations"
+            pair_manifest = create_pair_baseline_manifest(
+                database,
+                raw_root,
+                p0_baseline_evidence_identity="9" * 64,
+            )
+            pair_manifest_hash = hashlib.sha256(pair_manifest).hexdigest()
+            anchor = initialize_milestone_revocation_ledger(
+                ledger,
+                database_path=database,
+                raw_root=raw_root,
+                pair_manifest=pair_manifest,
+                expected_pair_manifest_hash=pair_manifest_hash,
+                p0_baseline_evidence_identity="9" * 64,
+            )
+            record = milestone_revocation_record()
+            record["affected"] = {
+                "decision_keys": [],
+                "order_keys": [],
+                "settlement_keys": [],
+                "sample_keys": ["report-sample-not-a-decision"],
+                "sample_lineage": [
+                    {
+                        "sample_key": "report-sample-not-a-decision",
+                        "settlement_key": "order-1",
+                        "order_key": "order-1",
+                        "decision_key": str(decision_key),
+                    }
+                ],
+            }
+            anchor = append_milestone_revocation(
+                ledger,
+                record,
+                database_path=database,
+                raw_root=raw_root,
+                expected_anchor=anchor,
+                pair_manifest=pair_manifest,
+                expected_pair_manifest_hash=pair_manifest_hash,
+            )
+            revocation_config = MilestoneRevocationConfig(
+                root=ledger,
+                database_path=database,
+                raw_root=raw_root,
+                expected_anchor=anchor,
+                pair_manifest=pair_manifest,
+                expected_pair_manifest_hash=pair_manifest_hash,
+            )
+
+            baseline = build_report(connection)
+            revoked = build_report(
+                connection,
+                revocation_config=revocation_config,
+            )
+            index_entries = (ledger / "index.jsonl").read_bytes().splitlines()
+            revoked_object = json.loads(index_entries[1])["object_hash"]
+            (ledger / "objects" / f"{revoked_object}.json").unlink()
+            with self.assertRaises(MilestoneRevocationIntegrityError):
+                build_report(
+                    connection,
+                    revocation_config=revocation_config,
+                )
+            connection.close()
+
+        self.assertEqual(baseline["orders"]["signals"], 1)
+        self.assertEqual(baseline["settled_orders"], 1)
+        self.assertEqual(revoked["orders"]["signals"], 0)
+        self.assertEqual(revoked["settled_orders"], 0)
+        self.assertEqual(revoked["governance_isolated_decision_count"], 1)
+        self.assertEqual(revoked["governance_isolated_order_count"], 1)
+        [m1_projection] = [
+            item
+            for item in revoked["m1_strategy_contract_verifications"]
+            if item["decision_key"] == decision_key
+        ]
+        self.assertEqual(m1_projection["governance_status"], "revoked")
+        self.assertFalse(m1_projection["authorized"])
+        self.assertFalse(m1_projection["m1_qualifying_rejection"])
+        self.assertEqual(
+            revoked["order_audit"]["exclusion_reasons"]["milestone_revocation"],
+            1,
+        )
+        governance = revoked["milestone_governance"]
+        self.assertEqual(governance["ledger_integrity"]["status"], "verified")
+        self.assertEqual(governance["records"][0]["evaluation_result"], "passed")
+        self.assertEqual(governance["records"][0]["governance_status"], "revoked")
+        self.assertEqual(
+            governance["revoked_milestones"],
+            ["M2", "M3-C", "M3-E", "M4-C", "M4-E"],
         )
 
 

@@ -13,45 +13,93 @@ from live_betting.vision_frame_registry import (
     vision_frame_ref,
 )
 from shared.sqlite import classify_sqlite_error
+from live_betting.milestone_revocation import (
+    MilestoneRevocationConfig,
+    load_milestone_revocation_projection,
+)
 
 from .. import intelligence, monitoring, queries
 
 
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
+_MISSING_REVOCATION_CONFIG = object()
 
 
-def _build_snapshot() -> dict[str, object]:
+def _revocation_config(request: Request) -> MilestoneRevocationConfig | None:
+    value = getattr(
+        request.app.state,
+        "milestone_revocation_config",
+        _MISSING_REVOCATION_CONFIG,
+    )
+    if value is _MISSING_REVOCATION_CONFIG:
+        raise RuntimeError("milestone revocation app state is not configured")
+    if value is not None and not isinstance(value, MilestoneRevocationConfig):
+        raise RuntimeError("milestone revocation app state is partially configured")
+    return value
+
+
+def _verify_revocation_configuration(
+    request: Request,
+    connection: sqlite3.Connection | None = None,
+) -> MilestoneRevocationConfig | None:
+    config = _revocation_config(request)
+    if config is None:
+        return None
+    owned = connection is None
+    if connection is None:
+        connection = queries.get_db()
+    try:
+        load_milestone_revocation_projection(
+            config=config,
+            connection=connection,
+        )
+    finally:
+        if owned:
+            connection.close()
+    return config
+
+
+def _build_snapshot(
+    revocation_config: MilestoneRevocationConfig | None,
+) -> dict[str, object]:
     """Build one monitor snapshot off the async event loop."""
     connection = queries.get_db()
     try:
-        return monitoring.build_monitor_snapshot(connection)
+        return monitoring.build_monitor_snapshot(
+            connection, revocation_config=revocation_config
+        )
     finally:
         connection.close()
 
 
 @router.get("/bootstrap")
-def bootstrap() -> dict[str, object]:
+def bootstrap(request: Request) -> dict[str, object]:
     connection = queries.get_db()
     try:
-        return monitoring.build_monitor_snapshot(connection)
+        return monitoring.build_monitor_snapshot(
+            connection, revocation_config=_revocation_config(request)
+        )
     finally:
         connection.close()
 
 
 @router.get("/health")
-def health() -> dict[str, object]:
+def health(request: Request) -> dict[str, object]:
     connection = queries.get_db()
     try:
+        _verify_revocation_configuration(request, connection)
         return {"data": monitoring.derive_health(connection)}
     finally:
         connection.close()
 
 
 @router.get("/matches")
-def matches() -> dict[str, object]:
+def matches(request: Request) -> dict[str, object]:
     connection = queries.get_db()
     try:
-        data = monitoring.monitor_matches(connection)
+        data = monitoring.monitor_matches(
+            connection, revocation_config=_revocation_config(request)
+        )
         return {"data": data, "count": len(data)}
     finally:
         connection.close()
@@ -59,6 +107,7 @@ def matches() -> dict[str, object]:
 
 @router.get("/history")
 def history(
+    request: Request,
     cursor: str | None = Query(None, max_length=768),
     limit: int = Query(20, ge=1, le=50),
 ) -> dict[str, object]:
@@ -69,6 +118,7 @@ def history(
                 connection,
                 cursor=cursor,
                 limit=limit,
+                revocation_config=_revocation_config(request),
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from None
@@ -78,6 +128,7 @@ def history(
 
 @router.get("/matches/{raybet_match_id}")
 def match_detail(
+    request: Request,
     raybet_match_id: str,
     max_points: int = Query(1200, ge=100, le=5000),
 ) -> dict[str, object]:
@@ -88,6 +139,7 @@ def match_detail(
                 connection,
                 raybet_match_id,
                 max_points=max_points,
+                revocation_config=_revocation_config(request),
             )
         except sqlite3.Error as error:
             kind = classify_sqlite_error(error)
@@ -112,10 +164,12 @@ def match_detail(
 
 @router.get("/matches/{raybet_match_id}/maps/{map_number}/postmatch")
 def postmatch_detail(
+    request: Request,
     raybet_match_id: str,
     map_number: int = Path(ge=1),
     max_points: int = Query(1200, ge=100, le=5000),
 ) -> dict[str, object]:
+    _verify_revocation_configuration(request)
     detail = intelligence.get_raybet_postmatch(
         raybet_match_id,
         map_number,
@@ -127,7 +181,9 @@ def postmatch_detail(
 
 
 @router.get("/matches/{raybet_match_id}/vision-frames/{frame_digest}.jpg")
-def vision_frame(raybet_match_id: str, frame_digest: str) -> Response:
+def vision_frame(
+    request: Request, raybet_match_id: str, frame_digest: str
+) -> Response:
     try:
         frame_ref = vision_frame_ref(frame_digest)
     except ValueError:
@@ -135,6 +191,7 @@ def vision_frame(raybet_match_id: str, frame_digest: str) -> Response:
 
     connection = queries.get_db()
     try:
+        _verify_revocation_configuration(request, connection)
         try:
             observation = monitoring.valid_vision_frame_observation(
                 connection,
@@ -178,13 +235,17 @@ async def events(
     request: Request,
     cursor: str | None = Query(None),
 ) -> StreamingResponse:
+    revocation_config = _revocation_config(request)
+    await asyncio.to_thread(_verify_revocation_configuration, request)
     previous = request.headers.get("last-event-id") or cursor
 
     async def stream():
         nonlocal previous
         last_heartbeat = time.monotonic()
         while not await request.is_disconnected():
-            snapshot = await asyncio.to_thread(_build_snapshot)
+            snapshot = await asyncio.to_thread(
+                _build_snapshot, revocation_config
+            )
             current = str(snapshot["cursor"])
             if current != previous:
                 payload = json.dumps(

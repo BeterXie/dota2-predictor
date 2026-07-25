@@ -1287,7 +1287,7 @@ class NotificationOutboxTests(unittest.TestCase):
         self.store.connection.execute("DROP TRIGGER shadow_orders_terminal_immutable")
         self.store.connection.execute(
             """UPDATE shadow_orders
-                  SET stake=2.0, fill_price=7.0, model_probability=0.9
+                  SET stake=0.5, fill_price=7.0, model_probability=0.9
                 WHERE order_key=?""",
             (order.order_key,),
         )

@@ -123,6 +123,7 @@ def filled_order_payload(
                       SELECT transport.observation_key
                         FROM odds_transport_observations AS transport
                        WHERE transport.raybet_match_id=orders.raybet_match_id
+                         AND transport.source='direct'
                          AND transport.observed_at>orders.signal_transport_at
                          AND transport.observed_at=orders.filled_at
                          AND transport.timing_status='on_time'
@@ -424,6 +425,7 @@ def _decision_lineage(
                 str(order["market_key"]),
                 str(candidate["strategy_version"]),
                 str(candidate["input_ref"]),
+                str(float(order["stake"])),
             )
         )
         if hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32] != str(

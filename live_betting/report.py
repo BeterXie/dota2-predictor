@@ -26,9 +26,18 @@ from .draft_authority import (
     draft_landmark_authority_matches,
 )
 from .health import read_health
+from .m1_verifier import verify_m1_qualifying_rejection
+from .milestone_revocation import (
+    MilestoneRevocationConfig,
+    load_milestone_revocation_projection,
+)
 from .research import research_summary
 from .service_coordination import add_single_database_argument
 from .settlement import persisted_settlement_authority_reason
+from .strategy_contract import (
+    parse_decision_payload,
+    persisted_decision_projection_failure,
+)
 from .strict_read_gate import StrictReadGate, strict_read_gate, table_has_columns
 from .vision_frame_registry import verify_registered_vision_frame
 
@@ -132,7 +141,10 @@ def _decision_draft_authority_valid(
     if authority is None:
         return False
     try:
-        payload = json.loads(str(row["contributions_json"]))
+        payload = parse_decision_payload(
+            str(row["contributions_json"]),
+            strategy_version=str(row["strategy_version"]),
+        )
         mapping_id = int(
             payload["__inputs__"]["strict_live_eligibility"]["mapping_refs"][
                 "strict_mapping_id"
@@ -228,8 +240,141 @@ def _isolate_unverified_settlements(
     return output, failures
 
 
-def build_report(connection: sqlite3.Connection) -> dict[str, object]:
+def _revocation_keys(
+    projection: Mapping[str, object], field: str
+) -> set[str]:
+    isolated = projection.get("isolated_keys")
+    if not isinstance(isolated, Mapping):
+        return set()
+    values = isolated.get(field)
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values}
+
+
+def _governance_lineage_statuses(
+    connection: sqlite3.Connection,
+    projection: Mapping[str, object],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Project explicit record lineage through persisted order/decision lineage."""
+
+    priority = {"active": 0, "review_required": 1, "revoked": 2}
+    decisions: dict[str, str] = {}
+    orders: dict[str, str] = {}
+
+    def merge(target: dict[str, str], key: object, status: str) -> None:
+        text = str(key)
+        if priority.get(status, 0) > priority.get(target.get(text, "active"), 0):
+            target[text] = status
+
+    records = projection.get("records")
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            status = str(record.get("governance_status", "review_required"))
+            affected = record.get("affected")
+            if not isinstance(affected, Mapping):
+                continue
+            for key in affected.get("decision_keys", []):
+                merge(decisions, key, status)
+            for field in ("order_keys", "settlement_keys"):
+                for key in affected.get(field, []):
+                    merge(orders, key, status)
+            lineage = affected.get("sample_lineage")
+            if isinstance(lineage, list):
+                for item in lineage:
+                    if not isinstance(item, Mapping):
+                        continue
+                    merge(decisions, item.get("decision_key"), status)
+                    merge(orders, item.get("order_key"), status)
+                    merge(orders, item.get("settlement_key"), status)
+    if not decisions and not orders:
+        return decisions, orders
+    try:
+        rows = connection.execute(
+            "SELECT order_key, decision_key FROM shadow_order_decision_lineage"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # A configured revocation with unreadable lineage cannot authorize any
+        # potentially dependent decision/order surface.
+        try:
+            for row in connection.execute("SELECT decision_key FROM strategy_decisions"):
+                merge(decisions, row[0], "review_required")
+            for row in connection.execute("SELECT order_key FROM shadow_orders"):
+                merge(orders, row[0], "review_required")
+        except sqlite3.OperationalError:
+            pass
+        return decisions, orders
+    changed = True
+    while changed:
+        changed = False
+        for order_key, decision_key in rows:
+            order_text = str(order_key)
+            decision_text = str(decision_key)
+            statuses = [
+                status
+                for status in (orders.get(order_text), decisions.get(decision_text))
+                if status is not None
+            ]
+            if not statuses:
+                continue
+            status = max(statuses, key=lambda item: priority[item])
+            before = (orders.get(order_text), decisions.get(decision_text))
+            merge(orders, order_text, status)
+            merge(decisions, decision_text, status)
+            changed = changed or before != (
+                orders.get(order_text), decisions.get(decision_text)
+            )
+    return decisions, orders
+
+
+def _add_revocation_exclusion(
+    audit: dict[str, object], count: int
+) -> dict[str, object]:
+    if count == 0:
+        return audit
+    output = dict(audit)
+    reasons = dict(output["exclusion_reasons"])
+    reasons["milestone_revocation"] = count
+    output["exclusion_reasons"] = reasons
+    if output["excluded_decisions" if "excluded_decisions" in output else "excluded_orders"] is not None:
+        key = "excluded_decisions" if "excluded_decisions" in output else "excluded_orders"
+        output[key] = int(output[key]) + count
+    return output
+
+
+def _add_decision_payload_exclusions(
+    audit: dict[str, object], failures: Mapping[str, int]
+) -> dict[str, object]:
+    if not failures:
+        return audit
+    output = dict(audit)
+    reasons = dict(output["exclusion_reasons"])
+    reasons.update(sorted(failures.items()))
+    output["exclusion_reasons"] = reasons
+    if output["excluded_decisions"] is not None:
+        output["excluded_decisions"] = int(output["excluded_decisions"]) + sum(
+            failures.values()
+        )
+    return output
+
+
+def build_report(
+    connection: sqlite3.Connection,
+    *,
+    revocation_config: MilestoneRevocationConfig | None = None,
+) -> dict[str, object]:
     connection.row_factory = sqlite3.Row
+    governance = load_milestone_revocation_projection(
+        config=revocation_config,
+        connection=connection if revocation_config is not None else None,
+    )
+    decision_governance, order_governance = _governance_lineage_statuses(
+        connection, governance
+    )
+    isolated_decision_keys = set(decision_governance)
+    isolated_order_keys = set(order_governance)
     invalidation_available = _table_exists(
         connection, "vision_derived_invalidations"
     )
@@ -263,11 +408,32 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         if invalidation_available
         else "0"
     )
+    direct_decision_filter = (
+        "EXISTS (SELECT 1 FROM odds_transport_observations AS transport "
+        "WHERE transport.raybet_match_id=decision.raybet_match_id "
+        "AND transport.observed_at=decision.decided_at "
+        "AND (decision.vision_transport_key IS NULL "
+        "OR transport.observation_key=decision.vision_transport_key) "
+        "AND transport.source='direct')"
+    )
+    decision_payload_failure_by_key: dict[str, str] = {}
+    try:
+        payload_candidates = connection.execute(
+            f"""SELECT decision.* FROM strategy_decisions AS decision
+                 WHERE {direct_decision_filter}"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        payload_candidates = []
+    for candidate in payload_candidates:
+        failure = persisted_decision_projection_failure(dict(candidate))
+        if failure is not None:
+            decision_payload_failure_by_key[str(candidate["decision_key"])] = failure
     strict_decision_filter = decision_strict_gate.included_sql
     try:
         decisions = connection.execute(
             f"""SELECT * FROM strategy_decisions AS decision
             WHERE {invalidation_filter}
+              AND {direct_decision_filter}
               AND {strict_decision_filter}
               AND NOT EXISTS (
                 SELECT 1 FROM vision_draft_anchors AS anchor
@@ -297,14 +463,32 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         decisions = connection.execute(
             f"""SELECT * FROM strategy_decisions AS decision
                 WHERE {invalidation_filter}
+                  AND {direct_decision_filter}
                   AND {strict_decision_filter}
                   AND 0"""
         ).fetchall()
     raw_decision_rows = decisions
-    decisions = [
-        row for row in decisions
+    decision_payload_failures: Counter[str] = Counter(
+        decision_payload_failure_by_key.values()
+    )
+    projection_valid_decisions = []
+    for row in decisions:
+        failure = decision_payload_failure_by_key.get(str(row["decision_key"]))
+        if failure is None:
+            projection_valid_decisions.append(row)
+    draft_valid_decisions = [
+        row for row in projection_valid_decisions
         if _decision_draft_authority_valid(connection, row)
     ]
+    draft_authority_invalid_decision_count = (
+        len(projection_valid_decisions) - len(draft_valid_decisions)
+    )
+    decisions = [
+        row
+        for row in draft_valid_decisions
+        if str(row["decision_key"]) not in isolated_decision_keys
+    ]
+    governance_isolated_decision_count = len(draft_valid_decisions) - len(decisions)
     entry_validations = {
         str(row["decision_key"]): _validate_v4_entry(row)
         for row in decisions
@@ -418,6 +602,13 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         if mapping_projection_available
         else ""
     )
+    direct_order_filter = (
+        "EXISTS (SELECT 1 FROM odds_transport_observations AS transport "
+        "WHERE transport.observation_key=o.signal_transport_key "
+        "AND transport.raybet_match_id=o.raybet_match_id "
+        "AND transport.observed_at=o.signal_transport_at "
+        "AND transport.source='direct')"
+    )
     try:
         orders = connection.execute(
             f"""SELECT o.*, attempt.map_number AS attempt_map_number,
@@ -432,6 +623,7 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
              {mapping_join}
              {reconciliation_join}
             WHERE {order_invalidation_filter}
+              AND {direct_order_filter}
               AND {strict_order_filter}
               AND NOT EXISTS (
                 SELECT 1 FROM vision_draft_anchors AS anchor
@@ -469,15 +661,40 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
                ON settlement.order_key=o.order_key
              {mapping_join}
             {reconciliation_join}
-             WHERE {order_invalidation_filter}
-               AND {strict_order_filter}
+              WHERE {order_invalidation_filter}
+                AND {direct_order_filter}
+                AND {strict_order_filter}
                AND 0"""
         ).fetchall()
     raw_order_rows = orders
-    orders = [
+    draft_valid_orders = [
         row for row in orders
         if _order_draft_authority_valid(connection, row)
     ]
+    draft_authority_invalid_order_count = len(raw_order_rows) - len(draft_valid_orders)
+    if isolated_decision_keys:
+        try:
+            linked_revoked_orders = connection.execute(
+                """SELECT lineage.order_key
+                     FROM shadow_order_decision_lineage AS lineage
+                     JOIN json_each(?) AS revoked
+                       ON revoked.value=lineage.decision_key""",
+                (json.dumps(sorted(isolated_decision_keys)),),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # A configured revocation must not leave dependent orders scored
+            # when their lineage relation cannot be read.
+            isolated_order_keys.update(
+                str(row["order_key"]) for row in draft_valid_orders
+            )
+        else:
+            isolated_order_keys.update(str(row[0]) for row in linked_revoked_orders)
+    orders = [
+        row
+        for row in draft_valid_orders
+        if str(row["order_key"]) not in isolated_order_keys
+    ]
+    governance_isolated_order_count = len(draft_valid_orders) - len(orders)
     orders, settlement_authority_failures = _isolate_unverified_settlements(
         connection, orders
     )
@@ -512,6 +729,22 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         included_decision_count=len(decisions),
         strict_gate=decision_strict_gate,
     )
+    decision_audit = _add_decision_payload_exclusions(
+        decision_audit, decision_payload_failures
+    )
+    order_audit = _add_revocation_exclusion(
+        order_audit, governance_isolated_order_count
+    )
+    decision_audit = _add_revocation_exclusion(
+        decision_audit, governance_isolated_decision_count
+    )
+    if (
+        decision_audit["excluded_decisions"] is not None
+        and decision_audit["raw_decisions"] is not None
+    ):
+        decision_audit["excluded_decisions"] = int(
+            decision_audit["raw_decisions"]
+        ) - int(decision_audit["included_decisions"])
     scorable_cohorts = [
         cohort for cohort in cohorts if cohort["identity_complete"]
     ]
@@ -539,11 +772,59 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         }
     except sqlite3.OperationalError:
         strict_counts = {"accepted_mappings": 0, "mapping_audits": 0}
+    try:
+        m1_candidates = connection.execute(
+            "SELECT decision_key FROM strategy_decisions ORDER BY decided_at, decision_key"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        m1_candidates = []
+    m1_strategy_contract_verifications = []
+    revoked_milestones = set(governance.get("revoked_milestones", []))
+    review_milestones = set(governance.get("review_required_milestones", []))
+    milestone_status = (
+        "revoked"
+        if "M1" in revoked_milestones
+        else "review_required" if "M1" in review_milestones else "active"
+    )
+    governance_priority = {"active": 0, "review_required": 1, "revoked": 2}
+    for candidate in m1_candidates:
+        verification = verify_m1_qualifying_rejection(
+            connection, str(candidate["decision_key"])
+        )
+        governance_status = max(
+            (
+                decision_governance.get(verification.decision_key, "active"),
+                milestone_status,
+            ),
+            key=lambda status: governance_priority[status],
+        )
+        authorized = governance_status == "active"
+        m1_strategy_contract_verifications.append(
+            {
+                "decision_key": verification.decision_key,
+                "strategy_version": verification.strategy_version,
+                "evaluator_hash": verification.evaluator_hash,
+                "policy_hash": verification.policy_hash,
+                "serialization_version": verification.serialization_version,
+                "m1_qualifying_rejection": (
+                    verification.m1_qualifying_rejection and authorized
+                ),
+                "governance_status": governance_status,
+                "authorized": authorized,
+                "verifier_reason": verification.reason,
+                "replay_reason": verification.replay_reason,
+            }
+        )
     return {
         "decision_count": len(decisions),
         "draft_authority_invalid_decision_count": (
-            len(raw_decision_rows) - len(decisions)
+            draft_authority_invalid_decision_count
         ),
+        "decision_payload_invalid_count": sum(decision_payload_failures.values()),
+        "decision_payload_exclusion_reasons": dict(
+            sorted(decision_payload_failures.items())
+        ),
+        "governance_isolated_decision_count": governance_isolated_decision_count,
         "decision_audit": decision_audit,
         "raw_decision_count": decision_audit["raw_decisions"],
         "included_decision_count": decision_audit["included_decisions"],
@@ -560,8 +841,9 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         "order_audit": order_audit,
         "raw_order_count": len(raw_order_rows),
         "draft_authority_invalid_order_count": (
-            len(raw_order_rows) - len(orders)
+            draft_authority_invalid_order_count
         ),
+        "governance_isolated_order_count": governance_isolated_order_count,
         # Flat aliases keep the two safety-critical counts discoverable for
         # consumers that do not yet understand the nested audit object.
         "invalidated_order_count": order_audit["invalidated_orders"],
@@ -603,6 +885,10 @@ def build_report(connection: sqlite3.Connection) -> dict[str, object]:
         "service_health": health,
         "strategy_versions": strategy_versions,
         "forward_entry_by_strategy_version": forward_entry_by_strategy_version,
+        "m1_strategy_contract_verifications": (
+            m1_strategy_contract_verifications
+        ),
+        "milestone_governance": governance,
         "strict_scope": strict_counts,
         "research": research_summary(connection),
         "stability_status": _headline_stability_status(
@@ -851,7 +1137,10 @@ def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
             "global_gate_ref": authority.global_gate_ref,
         })
     try:
-        payload = json.loads(str(decision["contributions_json"]))
+        payload = parse_decision_payload(
+            str(decision["contributions_json"]),
+            strategy_version=str(decision["strategy_version"]),
+        )
         inputs = payload["__inputs__"]
         strict = inputs["strict_live_eligibility"]["mapping_refs"]
     except (KeyError, TypeError, ValueError):
@@ -1026,7 +1315,10 @@ def _validate_v4_entry(row: sqlite3.Row) -> _EntryValidation:
     """Rebuild the persisted v4 entry decision from its own frozen policy."""
 
     try:
-        payload = json.loads(str(row["contributions_json"]))
+        payload = parse_decision_payload(
+            str(row["contributions_json"]),
+            strategy_version=str(row["strategy_version"]),
+        )
         inputs = payload["__inputs__"]
         state = inputs["comeback_state"]
         window = inputs["entry_window"]
@@ -2137,7 +2429,20 @@ def _decision_audit_counts(
                                 THEN 1 ELSE 0 END AS strict_mapping_invalidated,
                            CASE WHEN {strict_unverifiable_expr}
                                 THEN 1 ELSE 0 END AS strict_mapping_unverifiable
-                      FROM strategy_decisions AS decision
+                       FROM strategy_decisions AS decision
+                      WHERE EXISTS (
+                            SELECT 1
+                              FROM odds_transport_observations AS transport
+                             WHERE transport.raybet_match_id=
+                                   decision.raybet_match_id
+                               AND transport.observed_at=decision.decided_at
+                               AND (
+                                   decision.vision_transport_key IS NULL
+                                   OR transport.observation_key=
+                                      decision.vision_transport_key
+                               )
+                               AND transport.source='direct'
+                      )
                 )
                 SELECT COUNT(*) AS raw_decisions,
                        COALESCE(SUM(invalidated), 0) AS invalidated_decisions,
@@ -2285,11 +2590,19 @@ def _order_audit_counts(
                                 THEN 1 ELSE 0 END AS strict_mapping_unverifiable,
                            settlement.review_required,
                            settlement.result
-                      FROM shadow_orders AS o
-                      JOIN shadow_map_attempts AS attempt
-                        ON attempt.order_key=o.order_key
-                      LEFT JOIN settlements AS settlement
-                        ON settlement.order_key=o.order_key
+                       FROM shadow_orders AS o
+                       JOIN shadow_map_attempts AS attempt
+                         ON attempt.order_key=o.order_key
+                       LEFT JOIN settlements AS settlement
+                         ON settlement.order_key=o.order_key
+                      WHERE EXISTS (
+                            SELECT 1
+                              FROM odds_transport_observations AS transport
+                             WHERE transport.observation_key=o.signal_transport_key
+                               AND transport.raybet_match_id=o.raybet_match_id
+                               AND transport.observed_at=o.signal_transport_at
+                               AND transport.source='direct'
+                      )
                 )
                 SELECT COUNT(*) AS total_orders,
                        COALESCE(SUM(invalidated), 0) AS invalidated_orders,
@@ -2386,6 +2699,12 @@ def _drawdown(rows: Sequence[Mapping[str, object]]) -> float:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_single_database_argument(parser, required=True)
+    parser.add_argument("--revocation-ledger", type=Path)
+    parser.add_argument("--raw-root", type=Path)
+    parser.add_argument("--revocation-anchor", type=Path)
+    parser.add_argument("--revocation-anchor-sha256")
+    parser.add_argument("--pair-baseline-manifest", type=Path)
+    parser.add_argument("--pair-baseline-manifest-sha256")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     connection = connect(args.database, read_only=True)
@@ -2394,7 +2713,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         query_only = connection.execute("PRAGMA query_only").fetchone()
         if query_only is None or int(query_only[0]) != 1:
             raise RuntimeError("report connection did not enter query_only mode")
-        report = build_report(connection)
+        governance_fields = (
+            args.revocation_ledger,
+            args.raw_root,
+            args.revocation_anchor,
+            args.revocation_anchor_sha256,
+            args.pair_baseline_manifest,
+            args.pair_baseline_manifest_sha256,
+        )
+        if not any(value is not None for value in governance_fields):
+            report = build_report(connection)
+        else:
+            if any(value is None for value in governance_fields):
+                raise ValueError("revocation report configuration is incomplete")
+            report = build_report(
+                connection,
+                revocation_config=MilestoneRevocationConfig(
+                    root=args.revocation_ledger,
+                    database_path=args.database,
+                    raw_root=args.raw_root,
+                    expected_anchor=args.revocation_anchor,
+                    expected_anchor_hash=args.revocation_anchor_sha256,
+                    pair_manifest=args.pair_baseline_manifest,
+                    expected_pair_manifest_hash=(
+                        args.pair_baseline_manifest_sha256
+                    ),
+                ),
+            )
     finally:
         connection.close()
     content = json.dumps(report, ensure_ascii=False, indent=2)

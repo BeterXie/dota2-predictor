@@ -72,6 +72,27 @@ $env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
 `--disable-historical-rosh`。`--once`（包括 `--migrate --once`）不会启动该 worker，
 也不会发起历史 Rosh 网络请求。
 
+标准生产 paper 模式使用 direct-only，显式启动 collector、Vision 和 shadow，
+不需要 `--start-companion`：
+
+```powershell
+$draftDeploymentKey = "<已批准的 frozen draft deployment SHA-256>"
+& $python scripts\run_dota_shadow_service.py `
+  --database $database `
+  --start-collector `
+  --start-vision `
+  --start-shadow `
+  --start-strict-ingest `
+  --start-postmatch `
+  --draft-deployment-key $draftDeploymentKey
+```
+
+未配置 companion 时，健康状态显示
+`stopped / not_started_by_supervisor`，语义为 informational，不增加“异常进程”
+数量，也不降低 direct-only readiness。service report 和监控快照固定暴露
+`market_source_policy=direct_primary`。只有浏览器审计/对照运行才增加
+`--start-companion`。
+
 `STRATZ_API_TOKEN` 从 supervisor 环境继承到 worker；修改 Token 后必须重启
 supervisor。不要把 Token 写入命令参数、仓库或前端。
 
@@ -264,6 +285,11 @@ server:
 data/live_betting/logs/managed/<component>.stdout.log
 data/live_betting/logs/managed/<component>.stderr.log
 ```
+
+Vision watcher 的 signed HLS URL 只允许在 watcher 进程内存中短暂存在。不得把
+带 query 的 URL 写入命令、watcher log、`service_health`、SQLite、artifact 或 Web
+响应。OpenCV/FFmpeg 的 native 网络诊断由 watcher 进程边界抑制；Python 错误只
+记录错误分类和去除 query/fragment 后的 host/path。
 
 审计表：
 

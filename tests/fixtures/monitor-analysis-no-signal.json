@@ -18,18 +18,24 @@
           "contributions": {},
           "data_quality": 0.0,
           "decided_at": "2026-07-14T13:59:55+00:00",
-          "decision_key": "90e4b1f839f4f1a7096826605fd659c4",
+          "decision_key": "8d7e93305afbac28b079e395c8821411",
           "draft_authority": {},
           "edge": 0.0,
           "eligible": 0,
-          "input_ref": "2bfdad6bc5c9213a229e5f9b",
+          "input_ref": "f5de39bf8003bca5b15d0ab6",
           "inputs": {
             "market": {
-              "missing_markets": ["kill_handicap"],
+              "missing_markets": [
+                "kill_handicap"
+              ],
               "quality": 0.5,
               "underdog_price": 2.5,
               "underdog_probability": 0.4,
               "underdog_side": "team_one"
+            },
+            "strategy_contract": {
+              "status": "unregistered_deployed_contract",
+              "strategy_version": "comeback-shadow-v4-controlled-entry"
             },
             "vision": {
               "captured_at": "2026-07-14T13:59:55+00:00",
@@ -42,7 +48,7 @@
           "market_probability": 0.4,
           "model_probability": 0.4,
           "reason": "strict_live_ineligible:mapping_missing",
-          "strategy_version": "comeback-shadow-v2-strict-landmarks",
+          "strategy_version": "comeback-shadow-v4-controlled-entry",
           "underdog_side": "team_one",
           "vision_authority": {}
         }

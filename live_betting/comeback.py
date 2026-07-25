@@ -15,10 +15,19 @@ from .models import RoshLineupScore
 from .profiles.draft_curve import DraftCurve, DraftPoint
 from .profiles.player_form import PlayerForm
 from .profiles.team_style import TeamStyleProfile
+from .strategy_contract import (
+    DEPLOYED_STRATEGY_VERSION,
+    PROPOSED_STRATEGY_VERSION,
+    PolicyEvaluation,
+    build_strategy_contract,
+    canonical_evaluator_inputs,
+    decision_identity,
+    evaluate_policy_reason,
+)
 from .vision import VisionObservation
 
 
-STRATEGY_VERSION = "comeback-shadow-v4-controlled-entry"
+STRATEGY_VERSION = DEPLOYED_STRATEGY_VERSION
 
 
 @dataclass(frozen=True)
@@ -112,16 +121,6 @@ def _select_rosh_minute_score(
     }
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in sorted(value.items())}
-    if isinstance(value, (tuple, list)):
-        return [_jsonable(item) for item in value]
-    return value
-
-
 def _identity(
     *,
     observation: VisionObservation,
@@ -130,26 +129,19 @@ def _identity(
     model_probability: float,
     reason: str,
     inputs: Mapping[str, Any],
+    strategy_version: str,
 ) -> tuple[str, str]:
-    payload = {
-        "match": observation.raybet_match_id,
-        "map": observation.map_number,
-        "decided_at": decided_at.isoformat(),
-        "side": underdog_side,
-        "probability": round(model_probability, 10),
-        "reason": reason,
-        "inputs": _jsonable(inputs),
-        "version": STRATEGY_VERSION,
-    }
-    canonical = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-        allow_nan=False,
-    ).encode()
-    input_ref = hashlib.sha256(canonical).hexdigest()[:24]
-    decision_key = hashlib.sha256(
-        f"{observation.raybet_match_id}|{observation.map_number}|{input_ref}".encode()
-    ).hexdigest()[:32]
-    return decision_key, input_ref
+    assert observation.map_number is not None
+    return decision_identity(
+        raybet_match_id=observation.raybet_match_id,
+        map_number=observation.map_number,
+        decided_at=decided_at,
+        underdog_side=underdog_side,
+        model_probability=model_probability,
+        reason=reason,
+        inputs=inputs,
+        strategy_version=strategy_version,
+    )
 
 
 def _point_inputs(point: DraftPoint | None, wait_reason: str | None) -> dict[str, Any]:
@@ -188,10 +180,27 @@ def no_signal_decision(
     decided_at: datetime,
     reason: str,
     inputs: Mapping[str, Any] | None = None,
+    strategy_version: str = STRATEGY_VERSION,
 ) -> ComebackDecision:
     """Create a durable structured decision for a pre-strategy hard gate."""
     if observation.map_number is None:
         raise ValueError("map number is required")
+    contract_ref: dict[str, Any]
+    if strategy_version == PROPOSED_STRATEGY_VERSION:
+        try:
+            contract_ref = build_strategy_contract(
+                strategy_version=strategy_version
+            ).as_input_ref()
+        except (RuntimeError, ValueError):
+            contract_ref = {
+                "status": "strategy_contract_invalid",
+                "strategy_version": strategy_version,
+            }
+    else:
+        contract_ref = {
+            "status": "unregistered_deployed_contract",
+            "strategy_version": strategy_version,
+        }
     merged_inputs = {
         **dict(inputs or {}),
         "market": {
@@ -207,6 +216,7 @@ def no_signal_decision(
             "game_clock_seconds": observation.game_clock_seconds,
             "radiant_team_side": observation.radiant_team_side,
         },
+        "strategy_contract": contract_ref,
     }
     decision_key, input_ref = _identity(
         observation=observation,
@@ -215,6 +225,7 @@ def no_signal_decision(
         model_probability=surface.underdog_probability,
         reason=reason,
         inputs=merged_inputs,
+        strategy_version=strategy_version,
     )
     return ComebackDecision(
         decision_key=decision_key,
@@ -232,6 +243,7 @@ def no_signal_decision(
         input_ref=input_ref,
         conservative_probability=surface.underdog_probability,
         inputs=merged_inputs,
+        strategy_version=strategy_version,
     )
 
 
@@ -250,6 +262,7 @@ def score_comeback(
     draft_curve: DraftCurve,
     decided_at: datetime,
     stable: bool,
+    strategy_version: str = STRATEGY_VERSION,
     min_edge: float = 0.08,
     input_refs: Mapping[str, Any] | None = None,
     rosh_lineup_score: RoshLineupScore | None = None,
@@ -257,6 +270,32 @@ def score_comeback(
     if observation.map_number is None or observation.game_clock_seconds is None:
         raise ValueError("confirmed map and game clock are required")
 
+    stability_contract_value = (
+        input_refs.get("stability")
+        if isinstance(input_refs, Mapping)
+        else None
+    )
+    stability_tolerance = (
+        stability_contract_value.get(
+            "maximum_absolute_devigged_probability_move"
+        )
+        if isinstance(stability_contract_value, Mapping)
+        else None
+    )
+    contract = build_strategy_contract(
+        strategy_version=strategy_version,
+        minimum_edge=min_edge,
+        stability_tolerance=(
+            float(stability_tolerance)
+            if isinstance(stability_tolerance, (int, float))
+            and not isinstance(stability_tolerance, bool)
+            and math.isfinite(float(stability_tolerance))
+            else build_strategy_contract(
+                strategy_version=strategy_version
+            ).policy.stability_tolerance
+        ),
+    )
+    policy = contract.policy
     point = draft_curve.at(observation.game_clock_seconds)
     draft_wait_reason = draft_curve.wait_reason(observation.game_clock_seconds)
     team_quality = min(underdog_style.quality, favorite_style.quality)
@@ -276,12 +315,17 @@ def score_comeback(
     )
 
     team_raw = (
-        (underdog_style.comeback_rate - 0.18) * 1.2
-        + (favorite_style.throw_rate - 0.16) * 0.8
-        - (favorite_style.closeout_rate - 0.84) * 0.8
+        (underdog_style.comeback_rate - policy.team_comeback_baseline)
+        * policy.team_comeback_weight
+        + (favorite_style.throw_rate - policy.favorite_throw_baseline)
+        * policy.favorite_throw_weight
+        - (favorite_style.closeout_rate - policy.favorite_closeout_baseline)
+        * policy.favorite_closeout_weight
     )
     team_adjustment = team_raw * team_quality
-    player_raw = (underdog_form.score - favorite_form.score) * 0.35
+    player_raw = (
+        underdog_form.score - favorite_form.score
+    ) * policy.player_form_weight
     player_form_suppressed = (
         rosh_lineup_score is not None
         and rosh_lineup_score.scoring_mode == "player_adjusted"
@@ -295,7 +339,10 @@ def score_comeback(
     if selected_rosh_score is not None and observation.radiant_team_side is not None:
         radiant_probability = min(
             1.0 - 1e-6,
-            max(1e-6, (50.0 + float(selected_rosh_score["score"])) / 100.0),
+            max(
+                policy.probability_epsilon,
+                (50.0 + float(selected_rosh_score["score"])) / 100.0,
+            ),
         )
         underdog_draft_probability = (
             radiant_probability
@@ -303,7 +350,9 @@ def score_comeback(
             else 1.0 - radiant_probability
         )
         lineup_adjustment = (
-            _logit(underdog_draft_probability) * 0.45 * draft_quality
+            _logit(underdog_draft_probability)
+            * policy.lineup_logit_weight
+            * draft_quality
         )
     conservative_lineup = _conservative_positive(
         lineup_adjustment,
@@ -312,10 +361,10 @@ def score_comeback(
 
     minute = observation.game_clock_seconds / 60.0
     late_adjustment = 0.0
-    if minute >= 25:
+    if minute >= policy.late_game_minute:
         late_adjustment = (
             underdog_style.late_game_rate - favorite_style.late_game_rate
-        ) * 0.3 * team_quality
+        ) * policy.late_game_weight * team_quality
     # The market identifies the candidate underdog and price. It is not
     # independent evidence that the live situation can reverse.
     movement_adjustment = 0.0
@@ -338,10 +387,10 @@ def score_comeback(
         "market_movement": movement_adjustment,
     }
     quality = (
-        team_quality * 0.35
-        + player_quality * 0.20
-        + draft_quality * 0.30
-        + surface.quality * 0.15
+        team_quality * policy.team_quality_weight
+        + player_quality * policy.player_quality_weight
+        + draft_quality * policy.draft_quality_weight
+        + surface.quality * policy.market_quality_weight
     )
     raw_adjustment = math.fsum(contributions.values())
     conservative_adjustment = math.fsum(conservative_contributions.values())
@@ -363,55 +412,64 @@ def score_comeback(
         rosh_underdog_probability=(
             underdog_draft_probability if selected_rosh_score is not None else None
         ),
+        policy=policy.entry,
     )
 
-    reason = "eligible"
-    if not observation.is_confirmed:
-        reason = "vision_not_confirmed"
-    elif observation.radiant_team_side not in {"team_one", "team_two"}:
-        reason = "team_side_not_confirmed"
-    elif observation.is_paused is not False:
-        reason = "stream_paused_or_unknown"
-    elif not surface.complete:
-        reason = "market_surface_incomplete"
-    elif not 2.5 <= surface.underdog_price <= 12.0:
-        reason = "odds_outside_range"
-    elif not stable:
-        reason = "market_not_stable_two_snapshots"
-    elif not entry.situation.controllable:
-        reason = entry.situation.reason
-    elif rosh_lineup_score is None:
-        reason = "rosh_lineup_score_unavailable"
-    elif not rosh_matches_draft:
-        reason = "rosh_lineup_draft_mismatch"
-    elif selected_rosh_score is None:
-        reason = "rosh_minute_score_unavailable"
-    elif not entry.eligible:
-        reason = entry.reason
-    elif point is None:
-        reason = draft_wait_reason or "draft_landmark_unavailable"
-    elif not point.passes_live_gate:
-        reason = "draft_landmark_support_or_calibration_failed"
-    elif quality < 0.2:
-        reason = "insufficient_data_quality"
-    elif not independent_positive:
-        reason = "no_independent_positive_contribution"
-    elif edge < min_edge:
-        reason = "edge_below_threshold"
-    elif conservative_probability <= surface.underdog_probability:
-        reason = "conservative_probability_not_above_market"
+    post_strategy = (
+        input_refs.get("post_strategy_gates")
+        if isinstance(input_refs, Mapping)
+        else None
+    )
+    evaluation = PolicyEvaluation(
+        observation_confirmed=observation.is_confirmed,
+        team_side_confirmed=(
+            observation.radiant_team_side in {"team_one", "team_two"}
+        ),
+        stream_unpaused=observation.is_paused is False,
+        market_surface_complete=surface.complete,
+        underdog_price=surface.underdog_price,
+        stable_two_snapshots=stable,
+        situation_controllable=entry.situation.controllable,
+        situation_reason=entry.situation.reason,
+        rosh_lineup_available=rosh_lineup_score is not None,
+        rosh_matches_draft=rosh_matches_draft,
+        rosh_minute_score_available=selected_rosh_score is not None,
+        entry_eligible=entry.eligible,
+        entry_reason=entry.reason,
+        draft_point_available=point is not None,
+        draft_wait_reason=draft_wait_reason,
+        draft_passes_live_gate=(
+            point.passes_live_gate if point is not None else False
+        ),
+        data_quality=quality,
+        independent_positive=independent_positive,
+        edge=edge,
+        conservative_probability=conservative_probability,
+        market_probability=surface.underdog_probability,
+        transport_identity_valid=(
+            post_strategy.get("transport_identity_valid", True)
+            if isinstance(post_strategy, Mapping)
+            else True
+        ),
+        map_already_attempted=(
+            post_strategy.get("map_already_attempted", False)
+            if isinstance(post_strategy, Mapping)
+            else False
+        ),
+    )
+    reason = evaluate_policy_reason(evaluation, policy)
 
     stake_multiplier = 0.0
     if selected_rosh_score is not None and rosh_lineup_score is not None:
         if rosh_lineup_score.scoring_mode == "player_adjusted":
-            stake_multiplier = 1.0
+            stake_multiplier = policy.player_adjusted_stake
         else:
             stake_multiplier = max(
-                0.1,
+                policy.pure_stake_minimum,
                 min(
-                    0.5,
+                    policy.pure_stake_maximum,
                     round(
-                        0.5
+                        policy.pure_stake_scale
                         * float(selected_rosh_score["match_percentage"])
                         / 100.0,
                         2,
@@ -492,6 +550,21 @@ def score_comeback(
         "conservative_contributions": conservative_contributions,
         "conservative_probability": conservative_probability,
         "independent_positive": independent_positive,
+        "strategy_contract": contract.as_input_ref(),
+        "strategy_evaluation": evaluation.as_dict(),
+        "canonical_evaluator_inputs": canonical_evaluator_inputs(
+            observation=observation,
+            surface=surface,
+            underdog_style=underdog_style,
+            favorite_style=favorite_style,
+            underdog_form=underdog_form,
+            favorite_form=favorite_form,
+            draft_curve=draft_curve,
+            decided_at=decided_at,
+            stable=stable,
+            input_refs=dict(input_refs or {}),
+            rosh_lineup_score=rosh_lineup_score,
+        ),
     }
     decision_key, input_ref = _identity(
         observation=observation,
@@ -500,6 +573,7 @@ def score_comeback(
         model_probability=model_probability,
         reason=reason,
         inputs=merged_inputs,
+        strategy_version=contract.strategy_version,
     )
     return ComebackDecision(
         decision_key=decision_key,
@@ -518,4 +592,5 @@ def score_comeback(
         conservative_probability=conservative_probability,
         inputs=merged_inputs,
         stake_multiplier=stake_multiplier,
+        strategy_version=contract.strategy_version,
     )
