@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -851,13 +852,14 @@ class IngestAdapterTests(unittest.TestCase):
         self.storage.connection.commit()
 
         def change_earlier_history(*args: object, **kwargs: object):
-            with sqlite3.connect(self.path) as writer:
+            with closing(sqlite3.connect(self.path)) as writer:
                 writer.execute(
                     """UPDATE player_map_facts
                           SET first_usable_at=?
                         WHERE match_id=8001 AND player_slot=0""",
                     ((datetime.fromisoformat(original_usable_at) + timedelta(seconds=1)).isoformat(),),
                 )
+                writer.commit()
             return real_persist_assignments(*args, **kwargs)
 
         with patch.object(
@@ -892,11 +894,12 @@ class IngestAdapterTests(unittest.TestCase):
         self.storage.connection.commit()
 
         def change_target_authority(*args: object, **kwargs: object):
-            with sqlite3.connect(self.path) as writer:
+            with closing(sqlite3.connect(self.path)) as writer:
                 writer.execute(
                     """UPDATE strict_derived_status SET benchmark_version='race'
                         WHERE match_id=8002"""
                 )
+                writer.commit()
             return real_persist_assignments(*args, **kwargs)
 
         with patch.object(

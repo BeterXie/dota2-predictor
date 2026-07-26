@@ -12,11 +12,14 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
+from event_intelligence.storage import IntelligenceStorage
+from live_betting.runtime_schema import prepare_runtime_schema
 from live_betting.service_coordination import (
     ProcessIdentity,
     SingleInstanceLock,
     TerminationResult,
 )
+from live_betting.storage import LiveBettingStore
 from web import app as web_app
 from web import queries
 from web.queries import _sort_heroes_by_position
@@ -416,6 +419,25 @@ class PrematchMarkupTests(unittest.TestCase):
 
 
 class WebEntryRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "web-entry-routes.db"
+        with IntelligenceStorage(self.path) as storage:
+            storage.init_schema()
+        with LiveBettingStore(self.path) as store:
+            store.init_schema()
+        connection = sqlite3.connect(self.path)
+        try:
+            prepare_runtime_schema(connection)
+        finally:
+            connection.close()
+        self.database_patch = patch.object(queries, "DB_PATH", str(self.path))
+        self.database_patch.start()
+
+    def tearDown(self) -> None:
+        self.database_patch.stop()
+        self.directory.cleanup()
+
     def test_root_opens_monitor_and_preserves_view_query(self) -> None:
         with TestClient(web_app.app) as client:
             response = client.get("/?view=intelligence", follow_redirects=False)

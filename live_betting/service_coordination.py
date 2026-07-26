@@ -70,6 +70,7 @@ _WINDOWS_PATH_OPTIONS = frozenset(
 _PYTHON_PROCESS_NAMES = frozenset(
     {"python", "python.exe", "pythonw", "pythonw.exe"}
 )
+_P0_TEST_DATABASE_ROOT_ENV = "P0_TEST_DATABASE_ROOT"
 _DEFAULT_PROCESS_ITER = psutil.process_iter
 _DEFAULT_PROCESS_FACTORY = psutil.Process
 _WRITER_MODULES = frozenset(
@@ -2700,7 +2701,11 @@ def database_offline_authority(
             require_directory_identity(root_identity, label="database root")
 
 
-def _command_database(command: list[str]) -> Path:
+def _command_database(
+    command: list[str],
+    *,
+    working_directory: Path | None = None,
+) -> Path:
     candidates: list[str] = []
     for index, argument in enumerate(command):
         if argument == _MANAGED_CHILD_TARGET_SENTINEL:
@@ -2715,7 +2720,9 @@ def _command_database(command: list[str]) -> Path:
         raise ValueError("writer command must contain exactly one database argument")
     candidate = Path(candidates[0])
     if not candidate.is_absolute():
-        raise ValueError("writer database path is relative")
+        if working_directory is None or not working_directory.is_absolute():
+            raise ValueError("writer database path is relative")
+        candidate = working_directory / candidate
     return candidate.resolve()
 
 
@@ -2857,18 +2864,61 @@ def _process_environment(process: Any, info: Mapping[str, object]) -> Mapping[st
     return {str(key): str(item) for key, item in value.items()}
 
 
+def _process_working_directory(
+    process: Any,
+    info: Mapping[str, object],
+) -> Path | None:
+    value = info.get("cwd")
+    if not value:
+        value = _fallback_process_value(process, "cwd")
+    if not value:
+        return None
+    candidate = Path(str(value))
+    if not candidate.is_absolute():
+        return None
+    try:
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
+def _is_p0_isolated_test_database(database: Path) -> bool:
+    root_value = os.environ.get(_P0_TEST_DATABASE_ROOT_ENV)
+    production_value = os.environ.get("P0_PRODUCTION_DATABASE")
+    if not root_value or not production_value or not os.environ.get("P0_NODE_REPORT"):
+        return False
+    root = Path(root_value)
+    production = Path(production_value)
+    if not root.is_absolute() or not production.is_absolute():
+        return False
+    try:
+        resolved_root = root.resolve()
+        resolved_database = database.resolve()
+        resolved_production = production.resolve()
+    except OSError:
+        return False
+    return (
+        resolved_database != resolved_production
+        and resolved_database.is_relative_to(resolved_root)
+    )
+
+
 def _offline_process_database(
     command: list[str],
     environment: Mapping[str, str] | None,
     *,
     web_process: bool,
+    working_directory: Path | None = None,
 ) -> Path:
     command_has_database = any(
         argument == "--database" or argument.startswith("--database=")
         for argument in command
     )
     if command_has_database:
-        return _command_database(command)
+        return _command_database(
+            command,
+            working_directory=working_directory,
+        )
     if web_process and environment is not None:
         configured = environment.get("DATABASE_PATH")
         if configured:
@@ -2937,11 +2987,14 @@ def scan_managed_writers(
         if expected_identity is not None
         else database.resolve()
     )
+    isolated_test_database = (
+        mode == "offline" and _is_p0_isolated_test_database(expected_database)
+    )
     allowed = tuple(allowed_identities)
     conflicts: list[ProcessIdentity] = []
     unverifiable: set[int] = set()
     try:
-        attributes = ["pid", "name", "cmdline", "create_time"]
+        attributes = ["pid", "name", "cmdline", "create_time", "cwd"]
         if mode == "offline":
             attributes.append("environ")
         processes = process_iter(tuple(attributes))
@@ -2978,27 +3031,42 @@ def scan_managed_writers(
                 else []
             )
             if not command:
-                if possible_python or (
-                    not name_value
-                    and not _obvious_non_python_system_process(process, pid)
+                if (
+                    not isolated_test_database
+                    and (
+                        possible_python
+                        or (
+                            not name_value
+                            and not _obvious_non_python_system_process(process, pid)
+                        )
+                    )
                 ):
                     unverifiable.add(pid)
                 continue
             managed_writer = _is_managed_writer_command(command)
             web_process = _is_web_process_command(command)
             if not managed_writer and not (mode == "offline" and web_process):
-                if mode == "offline" and (possible_python or possible_uvicorn):
+                if (
+                    mode == "offline"
+                    and not isolated_test_database
+                    and (possible_python or possible_uvicorn)
+                ):
                     unverifiable.add(pid)
                 continue
             try:
+                working_directory = _process_working_directory(process, info)
                 if mode == "offline":
                     process_database = _offline_process_database(
                         command,
                         _process_environment(process, info),
                         web_process=web_process,
+                        working_directory=working_directory,
                     )
                 else:
-                    process_database = _command_database(command)
+                    process_database = _command_database(
+                        command,
+                        working_directory=working_directory,
+                    )
             except (OSError, RuntimeError, ValueError):
                 unverifiable.add(pid)
                 continue

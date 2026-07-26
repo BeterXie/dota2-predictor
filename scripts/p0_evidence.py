@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import unquote, urlparse
@@ -523,8 +523,29 @@ def connect(database, *args, **kwargs):
         )
     return _ORIGINAL(database, *args, **kwargs)
 
+connect._p0_production_guard = True
 sqlite3.connect = connect
 sqlite3.dbapi2.connect = connect
+'''
+
+
+_USERCUSTOMIZE = r'''"""Fallback loader when another sitecustomize shadows the P0 guard."""
+import sqlite3
+from pathlib import Path
+
+if not getattr(sqlite3.connect, "_p0_production_guard", False):
+    source = Path(__file__).with_name("sitecustomize.py")
+    exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"))
+'''
+
+
+_SQLITE_GUARD_PLUGIN = r'''"""Ensure the SQLite guard is active before pytest collection."""
+import sqlite3
+from pathlib import Path
+
+if not getattr(sqlite3.connect, "_p0_production_guard", False):
+    source = Path(__file__).with_name("sitecustomize.py")
+    exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"))
 '''
 
 
@@ -624,6 +645,12 @@ def _guard_environment(
     (guard_root / "sitecustomize.py").write_text(
         _SITECUSTOMIZE, encoding="utf-8", newline="\n"
     )
+    (guard_root / "usercustomize.py").write_text(
+        _USERCUSTOMIZE, encoding="utf-8", newline="\n"
+    )
+    (guard_root / "p0_sqlite_guard_plugin.py").write_text(
+        _SQLITE_GUARD_PLUGIN, encoding="utf-8", newline="\n"
+    )
     (guard_root / "p0_node_report_plugin.py").write_text(
         _PYTEST_PLUGIN, encoding="utf-8", newline="\n"
     )
@@ -640,6 +667,7 @@ def _guard_environment(
             "P0_SQLITE_AUDIT_LOG": str(audit_log.resolve()),
             "P0_NODE_REPORT": str(node_report.resolve()),
             "P0_GUARD_MARKER": str(marker.resolve()),
+            "P0_TEST_DATABASE_ROOT": str((guard_root.parent / "pytest-temp").resolve()),
         }
     )
     return environment
@@ -658,8 +686,13 @@ def run_tests(
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError(f"test evidence output must be fresh/empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    missing = [item for item in test_files if not (workspace / item).is_file()]
-    selected = [item for item in test_files if (workspace / item).is_file()]
+
+    def selector_exists(selector: str) -> bool:
+        path_text = selector.split("::", 1)[0]
+        return bool(path_text) and (workspace / path_text).is_file()
+
+    missing = [item for item in test_files if not selector_exists(item)]
+    selected = [item for item in test_files if selector_exists(item)]
     guard_root = output_dir / "guard"
     audit_log = output_dir / "sqlite-connections.jsonl"
     node_report = output_dir / "pytest-nodes.json"
@@ -667,12 +700,16 @@ def run_tests(
     junit = output_dir / "pytest-junit.xml"
     stdout_path = output_dir / "pytest.stdout.log"
     stderr_path = output_dir / "pytest.stderr.log"
+    test_database_root = output_dir / "pytest-temp"
     command = [
         sys.executable,
         "-m",
         "pytest",
+        f"--basetemp={test_database_root}",
         "-p",
         "no:cacheprovider",
+        "-p",
+        "p0_sqlite_guard_plugin",
         "-p",
         "p0_node_report_plugin",
         f"--junitxml={junit}",
@@ -784,6 +821,12 @@ def run_tests(
                 file_record(audit_log) if audit_log.exists() else None
             ),
             "production_path_guard": file_record(guard_root / "sitecustomize.py"),
+            "production_path_guard_fallback": file_record(
+                guard_root / "usercustomize.py"
+            ),
+            "pytest_sqlite_guard": file_record(
+                guard_root / "p0_sqlite_guard_plugin.py"
+            ),
             "pytest_node_recorder": file_record(
                 guard_root / "p0_node_report_plugin.py"
             ),
@@ -1913,6 +1956,8 @@ def verify_manifest(path: Path) -> int:
 def build_rollback_fixture(
     output_dir: Path,
     production_database: Path,
+    *,
+    seed_settlement_review: bool = True,
 ) -> int:
     output_dir = output_dir.resolve()
     production_database = production_database.resolve(strict=True)
@@ -1925,14 +1970,28 @@ def build_rollback_fixture(
     connection_audit = output_dir / "sqlite-connections.jsonl"
     before = file_identity(production_database)
     started = utc_now()
-    from live_betting.report import build_report
+    from live_betting.database_protocol import (
+        prepare_database,
+        verify_prepared_database,
+    )
+    from live_betting.markets import normalized_state_hash
+    from live_betting.models import OddsSnapshot
     from live_betting.notifications import (
         EVENT_MONITOR_ALERT,
         MONITOR_TEMPLATE_VERSION,
         enqueue,
     )
+    from live_betting.report import build_report
+    from live_betting.vision_frame_registry import (
+        publish_vision_frame_bytes,
+        read_registered_vision_frame_bytes,
+        relocate_vision_frame_artifacts,
+    )
     from tests.test_notification_outbox import NOW, NotificationOutboxTests
 
+    raw_root = output_dir / "raw"
+    runtime_raybet_root = output_dir / "live_betting" / "raw-v2"
+    vision_root = output_dir / "vision-frames"
     case = NotificationOutboxTests("test_logical_key_and_message_id_are_idempotent")
     with production_sqlite_guard(production_database, connection_audit):
         case.setUp()
@@ -1945,6 +2004,42 @@ def build_rollback_fixture(
                 draft_authority=case.draft_authority,
             ):
                 raise RuntimeError("current code could not write representative order/attempt")
+
+            non_direct_at = NOW + timedelta(seconds=1)
+            non_direct_successor = OddsSnapshot(
+                order.raybet_match_id,
+                order.odds_id,
+                order.signal_odds_group_id,
+                non_direct_at,
+                order.signal_price * 0.9,
+                1,
+                order.market,
+            )
+            case._store_odds_observation(
+                source="browser",
+                observation_key="non-direct-successor",
+                source_event_id=None,
+                raybet_match_id=order.raybet_match_id,
+                observed_at=non_direct_at,
+                normalized_state_hash=normalized_state_hash(
+                    [non_direct_successor]
+                ),
+                snapshots=[non_direct_successor],
+            )
+            current_watermark = case.store.processed_transport_watermark(
+                order.raybet_match_id, as_of=non_direct_at
+            )
+            if current_watermark != order.signal_transport_at:
+                raise RuntimeError(
+                    "current writer did not isolate direct transport watermark"
+                )
+            if case.store.process_pending_successor(
+                order, watermark=current_watermark
+            ) is not None:
+                raise RuntimeError(
+                    "current writer consumed a non-direct successor"
+                )
+
             if not enqueue(
                 case.store.connection,
                 order_key=order.order_key,
@@ -1956,21 +2051,18 @@ def build_rollback_fixture(
                 template_version=MONITOR_TEMPLATE_VERSION,
             ):
                 raise RuntimeError("current code could not write representative outbox")
-            if not case.store.insert_settlement_review(
-                order.order_key,
-                settled_at=NOW.replace(hour=2),
-                evidence_ref=f"p0-fixture-review:{order.order_key}",
-                reason="p0_fixture_authoritative_settlement_not_exercised",
-                actor="p0_fixture_builder",
-            ):
-                raise RuntimeError("current code could not write settlement review shape")
-            report = build_report(case.store.connection)
-            destination = sqlite3.connect(fixture_database)
-            try:
-                case.store.connection.backup(destination)
-            finally:
-                destination.close()
-            raw_root = output_dir / "raw"
+            if seed_settlement_review:
+                if not case.store.insert_settlement_review(
+                    order.order_key,
+                    settled_at=NOW.replace(hour=2),
+                    evidence_ref=f"p0-fixture-review:{order.order_key}",
+                    reason="p0_fixture_authoritative_settlement_not_exercised",
+                    actor="p0_fixture_builder",
+                ):
+                    raise RuntimeError(
+                        "current code could not write settlement review shape"
+                    )
+
             source_roots = {
                 "raybet": Path(case.store.raw_archive_root),
                 "opendota": Path(case.opendota_archive.root),
@@ -1978,8 +2070,59 @@ def build_rollback_fixture(
             for name, source in source_roots.items():
                 if source.exists():
                     shutil.copytree(source, raw_root / name)
+            if source_roots["raybet"].exists():
+                shutil.copytree(source_roots["raybet"], runtime_raybet_root)
+
+            frame_refs = tuple(
+                str(row[0])
+                for row in case.store.connection.execute(
+                    "SELECT frame_ref FROM vision_frame_artifacts ORDER BY frame_ref"
+                )
+            )
+            replacements: dict[str, Path] = {}
+            for frame_ref in frame_refs:
+                encoded = read_registered_vision_frame_bytes(
+                    case.store.connection, frame_ref
+                )
+                receipt = publish_vision_frame_bytes(vision_root, encoded)
+                if receipt.frame_ref != frame_ref:
+                    raise RuntimeError("copied vision frame identity changed")
+                replacements[frame_ref] = receipt.storage_path
+            if replacements:
+                if case.store.connection.in_transaction:
+                    case.store.connection.commit()
+                relocate_vision_frame_artifacts(
+                    case.store.connection,
+                    replacements,
+                    allowed_new_roots=(vision_root,),
+                    reason="package self-contained rollback fixture",
+                    actor="p0_fixture_builder",
+                    relocated_at=NOW,
+                )
+
+            destination = sqlite3.connect(fixture_database)
+            try:
+                case.store.connection.backup(destination)
+            finally:
+                destination.close()
         finally:
             case.tearDown()
+
+        preparation = prepare_database(
+            fixture_database,
+            output_dir / "migration-backups",
+            odds_raw_root=runtime_raybet_root,
+        )
+        verified = verify_prepared_database(
+            fixture_database,
+            odds_raw_root=runtime_raybet_root,
+        )
+        report_connection = sqlite3.connect(fixture_database)
+        try:
+            report = build_report(report_connection)
+        finally:
+            report_connection.close()
+
     report_path = output_dir / "representative-report.json"
     _write_canonical(report_path, report)
     check = sqlite3.connect(fixture_database)
@@ -2027,15 +2170,38 @@ def build_rollback_fixture(
         "exit_status": 0,
         "database": file_record(fixture_database),
         "report": file_record(report_path),
-        "raw_evidence": _tree_records(output_dir / "raw"),
+        "raw_evidence": _tree_records(raw_root),
+        "runtime_raybet_evidence": _tree_records(runtime_raybet_root),
+        "vision_evidence": _tree_records(vision_root),
+        "prepared_schema": {
+            "status": "verified",
+            "live_schema_version": verified.live_schema_version,
+            "intelligence_schema_version": verified.intelligence_schema_version,
+            "runtime_schema_version": verified.runtime_schema_version,
+            "migration_backup": (
+                file_record(preparation.backup)
+                if preparation.backup is not None
+                else None
+            ),
+        },
         "representative_table_counts": table_counts,
         "shape_scope": {
             "decision": "eligible current-code fixture",
             "order": "pending paper order",
             "attempt": "pending map attempt",
             "outbox": "monitor notification",
-            "settlement": "audited manual-review marker",
+            "settlement": (
+                "audited manual-review marker"
+                if seed_settlement_review
+                else "empty; reserved for cross-version authoritative handoff"
+            ),
             "report": "current build_report projection",
+            "schema": "current supervisor-prepared contract",
+            "vision_frames": "self-contained relocated active artifacts",
+            "non_direct_successor": (
+                "processed audit observation after the signal; current writer "
+                "must ignore it for watermark and fill resolution"
+            ),
             "authoritative_filled_settlement": "unverified; remains a P1 concern",
         },
         "production_connection_audit": {
@@ -2053,7 +2219,12 @@ def build_rollback_fixture(
     }
     _write_canonical(output_dir / "rollback-fixture-summary.json", summary)
     print(json.dumps(summary["representative_table_counts"], sort_keys=True))
-    return 0 if attempted_production == 0 and all(table_counts.values()) else 2
+    required_counts = {
+        key: value
+        for key, value in table_counts.items()
+        if seed_settlement_review or key != "settlements"
+    }
+    return 0 if attempted_production == 0 and all(required_counts.values()) else 2
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2072,6 +2243,14 @@ def parser() -> argparse.ArgumentParser:
     )
     fixture.add_argument("--output-dir", type=Path, required=True)
     fixture.add_argument("--production-database", type=Path, required=True)
+    fixture.add_argument(
+        "--without-settlement-review",
+        action="store_true",
+        help=(
+            "leave settlements empty so a cross-version handoff rehearsal can "
+            "exercise current authoritative settlement"
+        ),
+    )
 
     generate = commands.add_parser("generate", help="generate canonical P0 manifest")
     generate.add_argument("--workspace", type=Path, required=True)
@@ -2143,7 +2322,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             label=args.label,
         )
     if args.command == "build-rollback-fixture":
-        return build_rollback_fixture(args.output_dir, args.production_database)
+        return build_rollback_fixture(
+            args.output_dir,
+            args.production_database,
+            seed_settlement_review=not args.without_settlement_review,
+        )
     if args.command == "generate":
         return generate_manifest(args)
     if args.command == "refresh":

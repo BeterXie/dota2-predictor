@@ -309,8 +309,12 @@ class RawArchive:
         created = False
         temporary_path: Path | None = None
         try:
+            # Keep the temporary basename short.  The final content-addressed
+            # filename already contains the full SHA-256; repeating it in the
+            # temporary prefix can push otherwise valid Windows paths beyond
+            # the legacy MAX_PATH boundary before the atomic link is created.
             descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{content_hash}.", suffix=".tmp", dir=target.parent
+                prefix=".tmp-", suffix=".tmp", dir=target.parent
             )
             temporary_path = Path(temporary_name)
             with os.fdopen(descriptor, "wb") as handle:

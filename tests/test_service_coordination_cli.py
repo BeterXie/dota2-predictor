@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import psutil
@@ -1161,6 +1162,172 @@ class ManagedWriterRecognitionTests(unittest.TestCase):
                 ProcessIdentity(4212, 103.0),
             ),
         )
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_offline_mode_resolves_relative_database_from_process_cwd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "candidate" / "dota2.db"
+            other_root = root / "production"
+            other_database = other_root / "data" / "dota2.db"
+            database.parent.mkdir()
+            other_database.parent.mkdir(parents=True)
+            database.touch()
+            other_database.touch()
+            process = SimpleNamespace(info={
+                "pid": 4219,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "scripts/run_dota_shadow_service.py",
+                    "--database",
+                    "data/dota2.db",
+                ],
+                "cwd": str(other_root),
+                "create_time": 103.0,
+            })
+
+            result = scan_managed_writers(
+                database,
+                mode="offline",
+                process_iter=lambda _: [process],
+            )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_offline_mode_matches_relative_database_from_process_cwd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "data" / "dota2.db"
+            database.parent.mkdir()
+            database.touch()
+            process = SimpleNamespace(info={
+                "pid": 4223,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "scripts/run_dota_shadow_service.py",
+                    "--database",
+                    "data/dota2.db",
+                ],
+                "cwd": str(root),
+                "create_time": 104.0,
+            })
+
+            result = scan_managed_writers(
+                database,
+                mode="offline",
+                process_iter=lambda _: [process],
+            )
+
+        self.assertEqual(result.conflicts, (ProcessIdentity(4223, 104.0),))
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_offline_mode_ignores_unknown_python_only_inside_p0_test_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "pytest-temp" / "case" / "candidate.db"
+            database.parent.mkdir(parents=True)
+            database.touch()
+            opaque = SimpleNamespace(info={
+                "pid": 4224,
+                "name": "python.exe",
+                "cmdline": ["python", "opaque_tool.py"],
+                "create_time": 105.0,
+            })
+            with patch.dict(
+                os.environ,
+                {
+                    "P0_PRODUCTION_DATABASE": str(root / "production.db"),
+                    "P0_NODE_REPORT": str(root / "nodes.json"),
+                    "P0_TEST_DATABASE_ROOT": str(root / "pytest-temp"),
+                },
+                clear=False,
+            ):
+                result = scan_managed_writers(
+                    database,
+                    mode="offline",
+                    process_iter=lambda _: [opaque],
+                )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, ())
+
+    def test_offline_mode_keeps_unknown_python_outside_p0_test_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "outside" / "candidate.db"
+            database.parent.mkdir(parents=True)
+            database.touch()
+            opaque = SimpleNamespace(info={
+                "pid": 4225,
+                "name": "python.exe",
+                "cmdline": ["python", "opaque_tool.py"],
+                "create_time": 106.0,
+            })
+            with patch.dict(
+                os.environ,
+                {
+                    "P0_PRODUCTION_DATABASE": str(root / "production.db"),
+                    "P0_NODE_REPORT": str(root / "nodes.json"),
+                    "P0_TEST_DATABASE_ROOT": str(root / "pytest-temp"),
+                },
+                clear=False,
+            ):
+                result = scan_managed_writers(
+                    database,
+                    mode="offline",
+                    process_iter=lambda _: [opaque],
+                )
+
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.unverifiable_pids, (4225,))
+
+    def test_p0_test_root_still_detects_managed_writer_for_candidate_database(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "pytest-temp" / "case" / "candidate.db"
+            database.parent.mkdir(parents=True)
+            database.touch()
+            writer = SimpleNamespace(info={
+                "pid": 4226,
+                "name": "python.exe",
+                "cmdline": [
+                    "python",
+                    "scripts/run_dota_shadow_service.py",
+                    "--database",
+                    str(database),
+                ],
+                "cwd": str(root),
+                "create_time": 107.0,
+            })
+            with patch.dict(
+                os.environ,
+                {
+                    "P0_PRODUCTION_DATABASE": str(root / "production.db"),
+                    "P0_NODE_REPORT": str(root / "nodes.json"),
+                    "P0_TEST_DATABASE_ROOT": str(root / "pytest-temp"),
+                },
+                clear=False,
+            ):
+                result = scan_managed_writers(
+                    database,
+                    mode="offline",
+                    process_iter=lambda _: [writer],
+                )
+
+        self.assertEqual(result.conflicts, (ProcessIdentity(4226, 107.0),))
         self.assertEqual(result.unverifiable_pids, ())
 
     def test_offline_mode_ignores_proven_other_database_and_rejects_unknown(

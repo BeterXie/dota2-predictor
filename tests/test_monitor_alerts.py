@@ -190,6 +190,7 @@ class MonitorAlertTests(unittest.TestCase):
                 f"winner|map_{map_number}|team_one|",
                 strategy_version,
                 input_ref,
+                "1.0",
             )
         )
         persisted_order_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
@@ -435,6 +436,7 @@ class MonitorAlertTests(unittest.TestCase):
                 f"winner|map_{map_number}|team_one|",
                 "paper-test-v1",
                 f"paper-input:{order_key}",
+                "1.0",
             )
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]

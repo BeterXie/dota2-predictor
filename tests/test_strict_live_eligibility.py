@@ -380,6 +380,7 @@ class StrictLiveEligibilityTests(unittest.TestCase):
                 f"winner|map_{map_number}|team_one|",
                 strategy_version,
                 input_ref,
+                "1.0",
             )
         )
         order_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
@@ -1084,22 +1085,31 @@ class StrictLiveEligibilityTests(unittest.TestCase):
 
         for label, stake in cases:
             with self.subTest(stake=label):
-                order = self.create_pending_order(
-                    mapping.mapping_id,
-                    order_key=f"invalid-stake-{label}",
-                    expected_insert=False,
-                    order_overrides={"stake": stake},
-                )
-                for table in (
-                    "shadow_orders",
-                    "shadow_map_attempts",
-                    "shadow_order_decision_lineage",
+                before = {
+                    table: self.connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in (
+                        "shadow_orders",
+                        "shadow_map_attempts",
+                        "shadow_order_decision_lineage",
+                    )
+                }
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "shadow order stake must be greater than 0 and at most 1",
                 ):
-                    self.assertIsNone(
+                    self.create_pending_order(
+                        mapping.mapping_id,
+                        order_key=f"invalid-stake-{label}",
+                        order_overrides={"stake": stake},
+                    )
+                for table, count in before.items():
+                    self.assertEqual(
                         self.connection.execute(
-                            f"SELECT 1 FROM {table} WHERE order_key=?",
-                            (order.order_key,),
-                        ).fetchone()
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).fetchone()[0],
+                        count,
                     )
 
     def test_order_insert_rechecks_current_raybet_metadata(self) -> None:

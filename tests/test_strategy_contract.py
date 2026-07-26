@@ -62,6 +62,30 @@ def test_default_contract_is_content_addressed_and_round_trips() -> None:
     ) == contract
 
 
+def test_evaluator_identity_is_stable_across_windows_crlf_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_read_bytes = strategy_contract_module.Path.read_bytes
+    evaluator_files = {
+        "canonical_comeback_evaluator.py",
+        "comeback.py",
+        "comeback_entry.py",
+        "shadow_strategy.py",
+    }
+
+    def read_crlf(path: strategy_contract_module.Path) -> bytes:
+        value = original_read_bytes(path)
+        if path.name in evaluator_files:
+            return value.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        return value
+
+    monkeypatch.setattr(strategy_contract_module.Path, "read_bytes", read_crlf)
+
+    contract = build_strategy_contract(strategy_version=PROPOSED_STRATEGY_VERSION)
+    registered = REGISTERED_STRATEGY_CONTRACTS[PROPOSED_STRATEGY_VERSION]
+    assert contract.evaluator_hash == registered.evaluator_hash
+
+
 def test_same_version_policy_or_evaluator_drift_fails_closed() -> None:
     contract = build_strategy_contract(strategy_version=PROPOSED_STRATEGY_VERSION)
     policy_drift = contract.as_input_ref()

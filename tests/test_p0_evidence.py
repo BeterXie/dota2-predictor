@@ -16,6 +16,7 @@ from scripts.p0_evidence import (
     _tree_records,
     _verify_prefix_record,
     _write_canonical,
+    build_rollback_fixture,
     canonical_bytes,
     database_cutoffs,
     file_identity,
@@ -213,12 +214,133 @@ def test_run_tests_activates_subprocess_guard_and_freezes_artifacts(
     assert audit["guard_activated"] is True
     assert audit["guard_result"] == "passed"
     assert command["node_status_counts"] == {"passed": 1}
-    for name in ("production_path_guard", "pytest_node_recorder", "guard_activation_marker"):
+    for name in (
+        "production_path_guard",
+        "production_path_guard_fallback",
+        "pytest_sqlite_guard",
+        "pytest_node_recorder",
+        "guard_activation_marker",
+    ):
         artifact = command["artifacts"][name]
         assert Path(artifact["path"]).is_file()
         assert sha256_bytes(Path(artifact["path"]).read_bytes()) == artifact["sha256"]
     with pytest.raises(ValueError, match="fresh/empty"):
         run_tests(workspace, output, production, ["test_safe.py"], label="rerun")
+
+
+def test_run_tests_accepts_exact_pytest_node_selectors(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "test_nodes.py").write_text(
+        "def test_selected():\n"
+        "    assert True\n"
+        "def test_not_selected():\n"
+        "    raise AssertionError('must not run')\n",
+        encoding="utf-8",
+    )
+    production = tmp_path / "production.db"
+    sqlite3.connect(production).close()
+    output = tmp_path / "node-evidence"
+    selector = "test_nodes.py::test_selected"
+
+    assert run_tests(
+        workspace,
+        output,
+        production,
+        [selector],
+        label="exact-node",
+    ) == 0
+    command = json.loads((output / "command-record.json").read_text())
+    assert command["selected_test_files"] == [selector]
+    assert command["missing_test_files"] == []
+    assert command["node_status_counts"] == {"passed": 1}
+
+
+def test_build_rollback_fixture_is_prepared_and_self_contained(
+    tmp_path: Path,
+) -> None:
+    from live_betting.database_protocol import verify_prepared_database
+
+    production = tmp_path / "production.db"
+    sqlite3.connect(production).close()
+    output = tmp_path / "rollback"
+
+    assert build_rollback_fixture(output, production) == 0
+    prepared = verify_prepared_database(output / "rollback-fixture.db")
+    assert prepared.live_schema_version > 0
+    assert prepared.intelligence_schema_version > 0
+    assert prepared.runtime_schema_version > 0
+
+    summary = json.loads((output / "rollback-fixture-summary.json").read_bytes())
+    assert summary["prepared_schema"]["status"] == "verified"
+    assert summary["runtime_raybet_evidence"]["status"] == "available"
+    assert summary["vision_evidence"]["status"] == "available"
+    assert summary["production_connection_audit"][
+        "attempted_production_connections"
+    ] == 0
+
+    connection = sqlite3.connect(output / "rollback-fixture.db")
+    try:
+        browser_rows = connection.execute(
+            """SELECT observation_key, source, observed_at
+                 FROM odds_transport_observations
+                WHERE observation_key='non-direct-successor'"""
+        ).fetchall()
+        assert [tuple(row) for row in browser_rows] == [
+            ("non-direct-successor", "browser", "2026-07-14T01:00:01+00:00")
+        ]
+        assert connection.execute(
+            "SELECT status FROM shadow_orders"
+        ).fetchone()[0] == "pending"
+
+        paths = [
+            Path(row[0]).resolve()
+            for row in connection.execute(
+                """SELECT COALESCE(
+                           (SELECT relocation.new_storage_path
+                              FROM vision_frame_artifact_relocations AS relocation
+                             WHERE relocation.frame_ref=artifact.frame_ref
+                             ORDER BY relocation.relocation_sequence DESC LIMIT 1),
+                           artifact.storage_path)
+                     FROM vision_frame_artifacts AS artifact"""
+            )
+        ]
+    finally:
+        connection.close()
+    assert paths
+    assert all(path.is_relative_to(output.resolve()) for path in paths)
+    assert all(path.is_file() for path in paths)
+
+
+def test_build_rollback_fixture_can_reserve_authoritative_settlement_handoff(
+    tmp_path: Path,
+) -> None:
+    production = tmp_path / "production.db"
+    sqlite3.connect(production).close()
+    output = tmp_path / "handoff"
+
+    assert (
+        build_rollback_fixture(
+            output,
+            production,
+            seed_settlement_review=False,
+        )
+        == 0
+    )
+
+    summary = json.loads((output / "rollback-fixture-summary.json").read_bytes())
+    assert summary["representative_table_counts"]["settlements"] == 0
+    assert summary["shape_scope"]["settlement"] == (
+        "empty; reserved for cross-version authoritative handoff"
+    )
+    connection = sqlite3.connect(output / "rollback-fixture.db")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM settlements").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT status FROM shadow_orders"
+        ).fetchone()[0] == "pending"
+    finally:
+        connection.close()
 
 
 def test_run_tests_blocks_production_file_uri_in_subprocess(tmp_path: Path) -> None:

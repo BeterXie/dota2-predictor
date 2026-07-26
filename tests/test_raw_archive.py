@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +59,41 @@ class RawArchiveTests(unittest.TestCase):
                 gzip.decompress(first.path.read_bytes()),
                 canonical_json_bytes({"match_id": 123, "players": []}),
             )
+
+    def test_atomic_temp_name_stays_below_windows_legacy_path_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target_root_length = 174
+            padding_length = target_root_length - len(str(base)) - 1
+            self.assertGreater(padding_length, 0)
+            root = base / ("x" * padding_length)
+            archive = RawArchive(root)
+            real_mkstemp = tempfile.mkstemp
+
+            def windows_limited_mkstemp(*, prefix: str, suffix: str, dir: Path):
+                parent = Path(dir)
+                simulated_name = parent / f"{prefix}abcdefgh{suffix}"
+                self.assertLessEqual(len(str(simulated_name)), 259)
+                legacy_hash_prefix_name = parent / ("." + ("f" * 64) + ".abcdefgh.tmp")
+                self.assertGreater(len(str(legacy_hash_prefix_name)), 259)
+                return real_mkstemp(prefix=prefix, suffix=suffix, dir=dir)
+
+            with patch(
+                "event_intelligence.raw_archive.tempfile.mkstemp",
+                side_effect=windows_limited_mkstemp,
+            ):
+                receipt = archive.archive_json(
+                    source="raybet",
+                    endpoint="/api/odds",
+                    request_identity="/api/odds",
+                    payload_bytes=b'{"odds":[]}',
+                    observed_at=datetime(2026, 7, 26, tzinfo=UTC),
+                    match_id=123,
+                    status_code=200,
+                )
+
+            self.assertTrue(receipt.path.is_file())
+            self.assertLessEqual(len(str(receipt.path)), 259)
 
     def test_changed_payload_creates_a_new_content_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

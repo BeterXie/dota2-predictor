@@ -192,6 +192,15 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _canonical_source_bytes(path: Path) -> bytes:
+    """Return platform-stable source bytes for executable-contract identity."""
+
+    # Git may materialize text files with CRLF in a Windows worktree even when
+    # the canonical repository blob uses LF.  Newline style is not an evaluator
+    # predicate and must not create a different strategy identity.
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
 def _source_artifact() -> dict[str, Any]:
     root = Path(__file__).resolve().parent
     files = (
@@ -208,7 +217,7 @@ def _source_artifact() -> dict[str, Any]:
         "source_files": [
             {
                 "path": f"live_betting/{name}",
-                "sha256": _sha256((root / name).read_bytes()),
+                "sha256": _sha256(_canonical_source_bytes(root / name)),
             }
             for name in files
         ],
