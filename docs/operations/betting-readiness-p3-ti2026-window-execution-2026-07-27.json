@@ -1,0 +1,68 @@
+{
+  "schema": "dota2-p3-ti2026-window-execution-result-v1",
+  "generated_at_utc": "2026-07-27T01:41:37Z",
+  "window_id": "ti2026-main-event-window",
+  "decision": {
+    "window_registration": "valid",
+    "candidate_readiness": "blocked",
+    "monitoring_clock": "not_started",
+    "p3_exit_review": "no_go",
+    "p4_live_canary": "no_go",
+    "production_deployment": "no_go",
+    "production_database_mutation": "no_go"
+  },
+  "public_event_facts": {
+    "event_name": "The International 2026",
+    "full_event_start_date": "2026-08-13",
+    "full_event_end_date": "2026-08-23",
+    "aegis_stage_start_date": "2026-08-20",
+    "aegis_stage_end_date": "2026-08-23",
+    "venue": "Shanghai, China",
+    "prize_pool_usd": 1600000,
+    "team_count": 16,
+    "broadcast_channels_announced": false
+  },
+  "provider_probe": {
+    "raybet_dns_resolved": false,
+    "interpretation": "environment_dns_unavailable_no_provider_claim",
+    "exact_raybet_match_identity_confirmed": false,
+    "signed_url_observed_or_persisted": false
+  },
+  "validation": {
+    "window_sha256": "b2107beec109d8c7a99a7b192fb9ff8483c61ac31ebca47c7040b916124c7d47",
+    "integrity_status": "valid_registered_watch_window",
+    "candidate_readiness": "blocked",
+    "readiness_blocker_count": 30,
+    "focused_tests": {
+      "command": "pytest -q tests/test_p3_candidate_preflight.py tests/test_p3_window_preflight.py tests/test_event_registry.py",
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0
+    },
+    "extended_environment_checks": [
+      {
+        "scope": "test_realtime_vision.py collection",
+        "status": "not_run_missing_dependency",
+        "reason": "curl_cffi is not installed in this Linux execution environment"
+      },
+      {
+        "scope": "test_cli_docs_consistency.py subprocess help checks",
+        "status": "3_failed_environment_dependency",
+        "passed": 3,
+        "failed": 3,
+        "reason": "rfc8785 is not installed in the subprocess Python environment"
+      }
+    ],
+    "static_checks": {
+      "git_diff_check": "passed",
+      "python_compile": "passed"
+    }
+  },
+  "safety": {
+    "database_connections_performed": 0,
+    "service_processes_started": 0,
+    "production_files_modified": false,
+    "browser_companion_started": false,
+    "live_canary_started": false
+  }
+}

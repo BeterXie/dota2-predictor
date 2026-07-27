@@ -1,6 +1,6 @@
 {
   "schema": "dota2-p3-candidate-registry-v1",
-  "generated_at_utc": "2026-07-27T00:39:51Z",
+  "generated_at_utc": "2026-07-27T01:38:05Z",
   "frozen_identity": {
     "current_ref": "release/p1-betting-readiness-final-20260726",
     "current_commit": "2237d5f120ded13eb4e393a0c6a4251b096085df",
@@ -26,7 +26,7 @@
   "monitoring_clock": {
     "status": "not_started",
     "started_at_utc": null,
-    "reason": "No registered candidate yet proves mapping, frozen draft, Rosh, model/provider readiness, and runtime STANDARD_DOTA_HUD health simultaneously.",
+    "reason": "TI 2026 is registered as a watch window, but exact strict-event/OpenDota, RayBet series/map identity, frozen draft/model inputs, broadcast/HLS, and runtime STANDARD_DOTA_HUD evidence are not simultaneously ready.",
     "backfill_allowed": false
   },
   "canonical_strategy": {
@@ -43,5 +43,19 @@
     "p3_exit": "not_achieved",
     "p4_live_canary": "no_go",
     "production_deployment": "no_go"
-  }
+  },
+  "watch_windows": [
+    {
+      "window_id": "ti2026-main-event-window",
+      "event_name": "The International 2026",
+      "tournament_start_date": "2026-08-13",
+      "tournament_end_date": "2026-08-23",
+      "status": "registered_watch_window_not_candidate",
+      "source_path": "docs/operations/betting-readiness-p3-ti2026-window-2026-07-27.json",
+      "window_sha256": "b2107beec109d8c7a99a7b192fb9ff8483c61ac31ebca47c7040b916124c7d47",
+      "candidate_ready": false,
+      "monitoring_clock_eligible": false,
+      "blocker_count": 30
+    }
+  ]
 }

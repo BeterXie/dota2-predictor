@@ -66,3 +66,27 @@ python tools/p3_candidate_preflight.py `
 ```
 
 该工具只读取 JSON，不访问网络、不连接数据库、不启动服务。返回 `ready_for_p3_exit_review` 也只代表可以进入 P3 exit 人工评审，绝不等于 P4 GO。
+
+## 2026-07-27 首个监测窗口更新
+
+`The International 2026` 已登记为 `registered_watch_window_not_candidate`：
+
+- 完整赛事窗口：2026-08-13 至 2026-08-23；
+- Tier-1 公开证据：奖金池 1,600,000 美元、16 支队伍；
+- exact series/map schedule：未确认；
+- strict event/OpenDota league ID：未确认；
+- RayBet match/odds identity：未验证；
+- broadcast/HLS：未公布或未验证；
+- candidate readiness：`blocked`；
+- monitoring clock：仍为 `not_started`。
+
+使用以下命令验证窗口登记完整性：
+
+```powershell
+python tools/p3_window_preflight.py `
+  --window docs/operations/betting-readiness-p3-ti2026-window-2026-07-27.json `
+  --registry docs/operations/betting-readiness-p3-candidate-registry-2026-07-27.json `
+  --output docs/operations/betting-readiness-p3-ti2026-window-preflight-result-2026-07-27.json
+```
+
+返回 `valid_registered_watch_window` 只授权继续监测；它不授权 P3 exit、P4 canary 或生产变更。
