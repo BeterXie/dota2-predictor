@@ -1,0 +1,67 @@
+{
+  "schema": "dota2-p3-candidate-v1",
+  "candidate_id": null,
+  "registered_at_utc": null,
+  "scheduled_start_utc": null,
+  "target_mode": "m1_only",
+  "event": {
+    "tier1_approved": false,
+    "strict_event_registry_covered": false,
+    "strict_event_id": null,
+    "series_id": null,
+    "map_number": null
+  },
+  "identity": {
+    "raybet_match_id": null,
+    "raybet_match_identity_ready": false,
+    "raybet_odds_identity_ready": false,
+    "exact_match_team_map_mapping": false,
+    "team_identity_refs": []
+  },
+  "draft": {
+    "deployment_key": null,
+    "loadable": false,
+    "lineage_complete": false
+  },
+  "model_inputs": {
+    "rosh_lineup_score_ready": false,
+    "team_profiles_ready": false,
+    "player_profiles_ready": false,
+    "model_refs_ready": false
+  },
+  "provider": {
+    "hls_exact_match_refresh_ready": false,
+    "signed_url_persisted": false,
+    "direct_final_readable": false,
+    "opendota_exact_mapping_healthy": false
+  },
+  "layout": {
+    "layout_id": "STANDARD_DOTA_HUD",
+    "runtime_capability_healthy": false,
+    "positive_live_marker_evidence_sha256": null,
+    "negative_replay_highlights_evidence_sha256": null,
+    "fixed_real_frame_evidence_sha256": null
+  },
+  "strategy": {
+    "strategy_version": "comeback-shadow-v5-executable-contract",
+    "evaluator_version": "comeback-shadow-canonical-evaluator-v2",
+    "evaluator_hash": "c2d2f741e3b172b1fda1ca161619961e597070388d46d97848391b3f2f91ad24",
+    "policy_hash": "6e0c8a278378ee4c070f5d11204ca23397f54c7b6b703b544adaf105a259d696",
+    "serialization_version": "rfc8785-jcs-v1",
+    "source_path": "live_betting/strategy_contract.py"
+  },
+  "operations": {
+    "paper_only": true,
+    "browser_companion_configured": false,
+    "operations_approved": false,
+    "single_managed_writer_plan": false,
+    "database_raw_pair_frozen": false
+  },
+  "approval": {
+    "p3_candidate_approved": false,
+    "p4_live_canary_approved": false
+  },
+  "blockers": [
+    "candidate_not_populated"
+  ]
+}

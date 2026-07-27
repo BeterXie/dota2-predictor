@@ -1,0 +1,147 @@
+{
+  "schema": "dota2-p2-closeout-record-v1",
+  "generated_at_utc": "2026-07-27T00:39:51Z",
+  "generated_at_jst": "2026-07-27T09:39:51+09:00",
+  "authorization_source": "User/project authority instructed the assistant to take over and execute the next step in the current ChatGPT conversation on 2026-07-27.",
+  "governance": {
+    "owner": "user / project authority",
+    "implementer_for_this_package": "assistant acting under user instruction",
+    "independent_verifier": "not independently satisfied",
+    "single_person_governance_exception": "invoked_from_p1_and_not_represented_as_independent_review",
+    "production_operator": "user / project authority"
+  },
+  "frozen_identity": {
+    "current_ref": "release/p1-betting-readiness-final-20260726",
+    "current_commit": "2237d5f120ded13eb4e393a0c6a4251b096085df",
+    "current_tree": "84ecdfa62c5e465860495c231623d7ccef939619",
+    "recovery_commit": "a5673f0a00a86702fc25f9139686b3c42139a99e"
+  },
+  "decision": {
+    "p2_technical_validation": "passed",
+    "p2_exit_mode": "m1_only",
+    "p2_overall": "go_m1_only",
+    "m1_path_readiness": "ready",
+    "m2_readiness": "blocked",
+    "m2_blockers": [
+      "no_supported_unique_confirmed_dual_source_candidate"
+    ],
+    "p3_preparation": "go",
+    "p3_exit": "not_achieved",
+    "p4_live_canary": "no_go",
+    "production_deployment": "no_go",
+    "production_database_mutation": "not_authorized"
+  },
+  "evidence_summary": {
+    "deterministic_gate": {
+      "status": "passed",
+      "node_status_counts": {
+        "passed": 570
+      },
+      "attempted_production_connections": 0
+    },
+    "p2_1_hls_marker": {
+      "status": "passed",
+      "marker_matches": 0,
+      "scenarios": [
+        "open_failure",
+        "read_failure"
+      ],
+      "signed_url_recorded": false,
+      "attempted_production_connections": 0
+    },
+    "p2_2_browser_isolation": {
+      "status": "passed",
+      "node_status_counts": {
+        "passed": 13
+      },
+      "scenarios": [
+        "browser_first_successor",
+        "browser_only_completed_and_legacy",
+        "browser_winner_completed_settlement",
+        "newer_browser_current_and_legacy_activity"
+      ],
+      "attempted_production_connections": 0
+    },
+    "p2_3_ttl_backoff_latency": {
+      "status": "passed",
+      "node_status_counts": {
+        "passed": 11
+      },
+      "scenarios": [
+        "continuity",
+        "metadata_consistency",
+        "mixed_retryable_backoff",
+        "probe",
+        "ttl_and_restart"
+      ],
+      "attempted_production_connections": 0
+    },
+    "p2_4_database_raw_pair_identity": {
+      "status": "passed",
+      "node_status_counts": {
+        "passed": 11
+      },
+      "database_identity_stable": true,
+      "raw_directory_identity_stable": true,
+      "component_declarations_stable": true,
+      "attempted_production_connections": 0
+    },
+    "p2_5_dual_source_liveness": {
+      "status": "passed_m1_ready_m2_blocked",
+      "node_status_counts": {
+        "passed": 7
+      },
+      "witness_status": "m1_ready_m2_blocked",
+      "candidate": null,
+      "reconciliation": null,
+      "blockers": [
+        "no_supported_unique_confirmed_dual_source_candidate"
+      ],
+      "retry_after_seconds": 900,
+      "raybet_completed_rows_seen": 4,
+      "attempted_production_connections": 0
+    }
+  },
+  "source_archives": [
+    {
+      "filename": "betting-readiness-p1-controlled-import-v3-2026-07-26.zip",
+      "bytes": 2967032,
+      "sha256": "fbd4a6d9a3e9539dc251fd4fce273a13ac2fa7db91935be59f70044a5247ea48"
+    },
+    {
+      "filename": "dota2-p1-post-import-critical-result.zip",
+      "bytes": 2740089,
+      "sha256": "8c574e62568abb08c848a4925511521242d9b3ad7904f3ea40d1d5e2a4e9394f"
+    },
+    {
+      "filename": "dota2-p2-deterministic-result.zip",
+      "bytes": 5850452,
+      "sha256": "8597ab414709be5738aef32ba793efca305616cbdc905e1e18a8693e0ec8350d"
+    },
+    {
+      "filename": "dota2-p2-1-hls-marker-v2-result.zip",
+      "bytes": 9546,
+      "sha256": "5986257bf81ebe472d4b6fcc7860d0c6eae818c5cdbcefd8adc74fd226deae0d"
+    },
+    {
+      "filename": "dota2-p2-2-browser-isolation-result.zip",
+      "bytes": 279584,
+      "sha256": "86192c3e2ed19f66b4f2528a7af51d7c8c506dc7cb1203ab0ed0ea439215b31a"
+    },
+    {
+      "filename": "dota2-p2-3-ttl-backoff-latency-result.zip",
+      "bytes": 305446,
+      "sha256": "d1fedaee7f9df4a7a21f3c256e9403d1dcfe82a9544117a07b4c4c374d9acc7e"
+    },
+    {
+      "filename": "dota2-p2-4-database-raw-pair-identity-result.zip",
+      "bytes": 21958,
+      "sha256": "70390ecc9a974d9163c539b3b2dd138c9468abb424f0ecfcb64ab38ab212e035"
+    },
+    {
+      "filename": "dota2-p2-5-dual-source-liveness-v2-result.zip",
+      "bytes": 188636,
+      "sha256": "79f607226a59e99144f6ace9b7c3fd8d48dcf91eb229cc0e5d3c6ab44b7de82f"
+    }
+  ]
+}

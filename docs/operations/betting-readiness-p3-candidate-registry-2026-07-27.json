@@ -1,0 +1,47 @@
+{
+  "schema": "dota2-p3-candidate-registry-v1",
+  "generated_at_utc": "2026-07-27T00:39:51Z",
+  "frozen_identity": {
+    "current_ref": "release/p1-betting-readiness-final-20260726",
+    "current_commit": "2237d5f120ded13eb4e393a0c6a4251b096085df",
+    "current_tree": "84ecdfa62c5e465860495c231623d7ccef939619",
+    "recovery_commit": "a5673f0a00a86702fc25f9139686b3c42139a99e"
+  },
+  "p2_dependency": {
+    "closeout_status": "go_m1_only",
+    "m1_path_readiness": "ready",
+    "m2_readiness": "blocked",
+    "m2_blockers": [
+      "no_supported_unique_confirmed_dual_source_candidate"
+    ]
+  },
+  "target_mode": "m1_only",
+  "layout_policy": {
+    "preferred_layout": "STANDARD_DOTA_HUD",
+    "active_layout_expansion": null,
+    "layout_only_missed_windows": 0,
+    "expansion_trigger_met": false,
+    "expansion_allowed": false
+  },
+  "monitoring_clock": {
+    "status": "not_started",
+    "started_at_utc": null,
+    "reason": "No registered candidate yet proves mapping, frozen draft, Rosh, model/provider readiness, and runtime STANDARD_DOTA_HUD health simultaneously.",
+    "backfill_allowed": false
+  },
+  "canonical_strategy": {
+    "strategy_version": "comeback-shadow-v5-executable-contract",
+    "evaluator_version": "comeback-shadow-canonical-evaluator-v2",
+    "evaluator_hash": "c2d2f741e3b172b1fda1ca161619961e597070388d46d97848391b3f2f91ad24",
+    "policy_hash": "6e0c8a278378ee4c070f5d11204ca23397f54c7b6b703b544adaf105a259d696",
+    "serialization_version": "rfc8785-jcs-v1",
+    "source_path": "live_betting/strategy_contract.py"
+  },
+  "candidates": [],
+  "gates": {
+    "p3_preparation": "go",
+    "p3_exit": "not_achieved",
+    "p4_live_canary": "no_go",
+    "production_deployment": "no_go"
+  }
+}
