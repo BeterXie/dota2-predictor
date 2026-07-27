@@ -46,7 +46,12 @@ def test_p4_approval_cannot_be_smuggled_into_watch_window():
 
 def test_registry_hash_mismatch_fails_closed():
     registry = load(REGISTRY_PATH)
-    registry["watch_windows"][0]["window_sha256"] = "0" * 64
+    target = next(
+        entry
+        for entry in registry["watch_windows"]
+        if entry["window_id"] == "ti2026-main-event-window"
+    )
+    target["window_sha256"] = "0" * 64
     result = MODULE.validate(load(WINDOW_PATH), registry)
     assert "registry_watch_window_hash_mismatch" in result["integrity_blockers"]
 
@@ -56,3 +61,29 @@ def test_declared_blockers_must_match_computed_readiness():
     window["blockers"] = []
     result = MODULE.validate(window, load(REGISTRY_PATH))
     assert "declared_readiness_blockers_mismatch" in result["integrity_blockers"]
+
+GOTF_WINDOW_PATH = ROOT / "docs" / "operations" / "betting-readiness-p3-gotf2026-window-2026-07-27.json"
+
+
+def test_gotf2026_window_is_primary_but_schedule_conflict_stays_blocked():
+    result = MODULE.validate(load(GOTF_WINDOW_PATH), load(REGISTRY_PATH))
+    assert result["integrity_status"] == "valid_registered_watch_window"
+    assert result["candidate_readiness"] == "blocked"
+    assert "official_schedule_conflict_unreconciled" in result["readiness_blockers"]
+    assert result["authorization"]["continue_monitoring"] is True
+    assert result["authorization"]["p3_exit_review"] is False
+
+
+def test_unreconciled_schedule_conflict_cannot_claim_exact_schedule():
+    window = load(GOTF_WINDOW_PATH)
+    window["schedule"]["exact_series_schedule_published"] = True
+    window["blockers"] = MODULE.readiness_blockers(window)
+    result = MODULE.validate(window, load(REGISTRY_PATH))
+    assert "exact_schedule_claimed_while_conflict_unreconciled" in result["integrity_blockers"]
+
+
+def test_schedule_conflict_requires_observed_series_evidence():
+    window = load(GOTF_WINDOW_PATH)
+    window["schedule"]["observed_opening_series"] = []
+    result = MODULE.validate(window, load(REGISTRY_PATH))
+    assert "schedule_conflict_evidence_missing" in result["integrity_blockers"]

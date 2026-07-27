@@ -1,0 +1,57 @@
+{
+  "schema": "dota2-p3-gotf2026-window-execution-result-v1",
+  "generated_at_utc": "2026-07-27T01:55:00Z",
+  "window_id": "gotf2026-group-stage-window",
+  "decision": {
+    "window_registration": "valid",
+    "window_priority": "primary",
+    "ti2026_priority": "fallback",
+    "candidate_readiness": "blocked",
+    "monitoring_clock": "not_started",
+    "p3_exit_review": "no_go",
+    "p4_live_canary": "no_go",
+    "production_deployment": "no_go",
+    "production_database_mutation": "no_go"
+  },
+  "public_event_facts": {
+    "event_name": "Games of the Future 2026",
+    "official_dota2_start_date": "2026-07-31",
+    "official_dota2_end_date": "2026-08-05",
+    "official_arena_phase_statement_start_date": "2026-08-02",
+    "venue": "Astana, Kazakhstan",
+    "prize_pool_usd": 1000000,
+    "team_count": 16,
+    "broadcast_platform": "Phygital+",
+    "observed_friday_opening_series_count": 5,
+    "schedule_publication_conflict_reconciled": false
+  },
+  "validation": {
+    "window_sha256": "44abbe4003516bc4b7e5c2bb5b9ab097d5c48db4846cddce5a4aa92c0191a103",
+    "integrity_status": "valid_registered_watch_window",
+    "candidate_readiness": "blocked",
+    "readiness_blocker_count": 30,
+    "focused_tests": {
+      "command": "pytest -q tests/test_p3_candidate_preflight.py tests/test_p3_window_preflight.py tests/test_event_registry.py",
+      "passed": 21,
+      "failed": 0,
+      "skipped": 0
+    },
+    "static_checks": {
+      "git_diff_check": "passed",
+      "python_compile": "passed"
+    },
+    "known_limitations": [
+      "The official results page was not machine-readable in the retrieval environment.",
+      "Third-party displayed match times were not assigned a UTC timezone.",
+      "RayBet and exact-match HLS were not probed from the offline handoff environment."
+    ]
+  },
+  "safety": {
+    "database_connections_performed": 0,
+    "service_processes_started": 0,
+    "production_files_modified": false,
+    "browser_companion_started": false,
+    "live_canary_started": false,
+    "signed_url_persisted": false
+  }
+}

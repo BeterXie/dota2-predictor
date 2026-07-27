@@ -60,6 +60,11 @@ def readiness_blockers(window: dict[str, Any]) -> list[str]:
     require_true("event.opendota_league_id_confirmed", "opendota_league_id_unconfirmed")
     require_true("schedule.exact_series_schedule_published", "exact_series_schedule_unpublished")
     require_true("schedule.exact_map_schedule_ready", "exact_map_schedule_unpublished")
+    if (
+        get(window, "schedule.publication_conflict_detected") is True
+        and get(window, "schedule.official_schedule_reconciled") is not True
+    ):
+        blockers.append("official_schedule_conflict_unreconciled")
     require_true("identity.raybet_match_identity_ready", "raybet_match_identity_not_ready")
     require_true("identity.raybet_odds_identity_ready", "raybet_odds_identity_not_ready")
     require_true("identity.exact_match_team_map_mapping", "exact_match_team_map_mapping_missing")
@@ -139,6 +144,15 @@ def validate(window: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]
         integrity_blockers.append("p4_approval_must_remain_false")
     if get(window, "monitoring_clock.backfill_allowed") is not False:
         integrity_blockers.append("monitoring_clock_backfill_must_be_false")
+
+    schedule_conflict = get(window, "schedule.publication_conflict_detected") is True
+    schedule_reconciled = get(window, "schedule.official_schedule_reconciled") is True
+    if schedule_conflict and not schedule_reconciled:
+        observed = get(window, "schedule.observed_opening_series")
+        if not isinstance(observed, list) or not observed:
+            integrity_blockers.append("schedule_conflict_evidence_missing")
+        if get(window, "schedule.exact_series_schedule_published") is True:
+            integrity_blockers.append("exact_schedule_claimed_while_conflict_unreconciled")
 
     computed_readiness = readiness_blockers(window)
     declared = window.get("blockers")

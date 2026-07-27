@@ -1,6 +1,6 @@
 {
   "schema": "dota2-p3-candidate-registry-v1",
-  "generated_at_utc": "2026-07-27T01:38:05Z",
+  "generated_at_utc": "2026-07-27T01:50:23Z",
   "frozen_identity": {
     "current_ref": "release/p1-betting-readiness-final-20260726",
     "current_commit": "2237d5f120ded13eb4e393a0c6a4251b096085df",
@@ -26,7 +26,7 @@
   "monitoring_clock": {
     "status": "not_started",
     "started_at_utc": null,
-    "reason": "TI 2026 is registered as a watch window, but exact strict-event/OpenDota, RayBet series/map identity, frozen draft/model inputs, broadcast/HLS, and runtime STANDARD_DOTA_HUD evidence are not simultaneously ready.",
+    "reason": "Games of the Future 2026 is now the primary watch window beginning 2026-07-31. The official date publications are not yet reconciled with the observed opening-series listings, and strict-event/OpenDota, RayBet series/map identity, frozen draft/model inputs, exact HLS, runtime STANDARD_DOTA_HUD evidence, and operations approval are not simultaneously ready.",
     "backfill_allowed": false
   },
   "canonical_strategy": {
@@ -46,6 +46,19 @@
   },
   "watch_windows": [
     {
+      "window_id": "gotf2026-group-stage-window",
+      "event_name": "Games of the Future 2026",
+      "tournament_start_date": "2026-07-31",
+      "tournament_end_date": "2026-08-05",
+      "status": "registered_watch_window_not_candidate",
+      "priority": "primary",
+      "source_path": "docs/operations/betting-readiness-p3-gotf2026-window-2026-07-27.json",
+      "window_sha256": "44abbe4003516bc4b7e5c2bb5b9ab097d5c48db4846cddce5a4aa92c0191a103",
+      "candidate_ready": false,
+      "monitoring_clock_eligible": false,
+      "blocker_count": 30
+    },
+    {
       "window_id": "ti2026-main-event-window",
       "event_name": "The International 2026",
       "tournament_start_date": "2026-08-13",
@@ -55,7 +68,9 @@
       "window_sha256": "b2107beec109d8c7a99a7b192fb9ff8483c61ac31ebca47c7040b916124c7d47",
       "candidate_ready": false,
       "monitoring_clock_eligible": false,
-      "blocker_count": 30
+      "blocker_count": 30,
+      "priority": "fallback"
     }
-  ]
+  ],
+  "primary_window_id": "gotf2026-group-stage-window"
 }
