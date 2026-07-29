@@ -69,8 +69,11 @@ export function ProbabilityChart({
     [period, timeline],
   );
   const mapNumber = mapNumberForPeriod(period) || 0;
-  const selectedDecisions = decisions.filter(
-    (decision) => !mapNumber || decision.map_number === mapNumber,
+  const selectedDecisions = useMemo(
+    () => decisions.filter(
+      (decision) => !mapNumber || decision.map_number === mapNumber,
+    ),
+    [decisions, mapNumber],
   );
 
   const option = useMemo<EChartsCoreOption>(() => {

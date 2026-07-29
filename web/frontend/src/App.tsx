@@ -91,7 +91,6 @@ export default function App() {
   const historyViewRef = useRef<HistoryView>(
     view === "intelligence" ? "intelligence" : "replay",
   );
-  const [now, setNow] = useState(Date.now());
   const [controlSession, setControlSession] = useState<ControlSession | null>(null);
   const [components, setComponents] = useState<ControlComponent[]>([]);
   const [controlBusy, setControlBusy] = useState<string | null>(null);
@@ -364,11 +363,6 @@ export default function App() {
       if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
     };
   }, [Boolean(snapshot), realtimeEnabled]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   useEffect(() => {
     const syncMonitorLocation = () => {
@@ -997,7 +991,6 @@ export default function App() {
                 error={detailError}
                 loading={detailLoading}
                 match={workspaceMatch}
-                now={now}
                 replay={view === "replay"}
               />
             )}
@@ -1010,7 +1003,6 @@ export default function App() {
             historyLoading={view === "replay" ? historyLoading : undefined}
             matches={railMatches}
             mode={view === "replay" ? "history" : "live"}
-            now={now}
             onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
             onSelect={view === "replay" ? openReplayMatch : openLiveMatch}
             selectedId={null}

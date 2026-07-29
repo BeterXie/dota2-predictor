@@ -1,21 +1,24 @@
 import { ArrowSquareOut, Clock } from "@phosphor-icons/react";
 import { formatClock, formatDateTime } from "../../format";
 import type { MonitorMatch, VisionAnalysisData } from "../../types";
+import { RelativeAge } from "../RelativeAge";
 import { LifecycleBadge } from "../StatusBadge";
 
 interface LiveScoreboardProps {
   match: MonitorMatch;
   trustedVision: { game_clock_seconds?: number | null; map_number?: number | null } | null;
-  oddsLabel: string;
-  oddsStale: boolean;
+  now?: number;
+  oddsObservedAt: string | null;
+  oddsSnapshotLabel: string | null;
   watchLink: { kind: string; url: string } | null;
 }
 
 export function LiveScoreboard({
   match,
   trustedVision,
-  oddsLabel,
-  oddsStale,
+  now,
+  oddsObservedAt,
+  oddsSnapshotLabel,
   watchLink,
 }: LiveScoreboardProps) {
   const isLive = match.lifecycle === "live";
@@ -66,10 +69,21 @@ export function LiveScoreboard({
               {watchLink.kind === "match_page" ? "打开比赛页" : "打开直播"}
             </a>
           )}
-          <span className={oddsStale ? "source-age stale" : "source-age"} style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11px" }}>
-            <Clock size={14} />
-            {oddsLabel}
-          </span>
+          {oddsSnapshotLabel ? (
+            <span className="source-age" style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11px" }}>
+              <Clock size={14} />
+              {oddsSnapshotLabel}
+            </span>
+          ) : (
+            <RelativeAge
+              className="source-age"
+              icon={<Clock size={14} />}
+              now={now}
+              observedAt={oddsObservedAt}
+              prefix="赔率 "
+              staleAfterSeconds={60}
+            />
+          )}
         </div>
       </div>
 

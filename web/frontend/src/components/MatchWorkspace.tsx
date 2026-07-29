@@ -25,7 +25,6 @@ import {
 import { lazy, Suspense, useMemo, useState } from "react";
 
 import {
-  formatAge,
   formatClock,
   formatDateTime,
   formatOdds,
@@ -98,7 +97,7 @@ interface MatchWorkspaceProps {
   detail: MatchDetail | null;
   loading: boolean;
   error: string | null;
-  now: number;
+  now?: number;
   replay: boolean;
 }
 
@@ -145,9 +144,6 @@ export function MatchWorkspace({
     : null;
   const winner = liveWinner || prematchWinner;
   const showingPrematch = prematchWinner != null;
-  const observedAge = winner?.observed_at
-    ? Math.max(0, (now - new Date(winner.observed_at).getTime()) / 1000)
-    : null;
   const trustedVision = detail ? getTrustedVision(detail) : null;
   const watchLink = safeWatchLink(match.watch_link);
   const chartTimeline = detail?.winner_timeline || [];
@@ -160,10 +156,11 @@ export function MatchWorkspace({
       <section className="match-decision-hero" aria-label="比赛与策略结论">
         <LiveScoreboard
           match={match}
-          oddsLabel={showingPrematch
+          now={now}
+          oddsObservedAt={winner?.observed_at || null}
+          oddsSnapshotLabel={showingPrematch
             ? `赛前快照 ${formatDateTime(prematchWinner.observed_at)}`
-            : `赔率 ${formatAge(observedAge)}`}
-          oddsStale={!showingPrematch && observedAge != null && observedAge > 60}
+            : null}
           trustedVision={trustedVision}
           watchLink={watchLink}
         />
