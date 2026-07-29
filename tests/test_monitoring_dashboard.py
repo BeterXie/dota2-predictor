@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from live_betting.engine import price_groups
 from live_betting.browser_contract import canonical_json, payload_sha256
 from live_betting.comeback import (
     STRATEGY_VERSION,
@@ -365,6 +364,17 @@ class MonitoringDashboardTests(unittest.TestCase):
         finally:
             queries.init_db(previous_path)
 
+    def get_capture(self, match_id: str, digest: str):
+        previous_path = queries.DB_PATH
+        queries.init_db(str(self.database))
+        try:
+            with TestClient(app) as client:
+                return client.get(
+                    f"/api/monitor/matches/{match_id}/captures/{digest}.jpg"
+                )
+        finally:
+            queries.init_db(previous_path)
+
     def add_browser_page_event(
         self,
         *,
@@ -436,6 +446,7 @@ class MonitoringDashboardTests(unittest.TestCase):
         period: str = "map_1",
         status: int = 1,
         source: str = "direct",
+        audit_only: bool = False,
     ) -> list[OddsSnapshot]:
         snapshots = [
             OddsSnapshot(
@@ -469,6 +480,7 @@ class MonitoringDashboardTests(unittest.TestCase):
             normalized_state_hash=normalized_state_hash(snapshots),
             snapshots=snapshots,
             raw_payload=raw_odds_payload(snapshots),
+            audit_only=audit_only,
         )
         return snapshots
 
@@ -1427,6 +1439,79 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
         self.assertEqual(response.headers["etag"], f'"{receipt.content_sha256}"')
         self.assertIn("immutable", response.headers["cache-control"])
+
+    def test_unconfirmed_capture_is_visible_but_not_trusted(self) -> None:
+        self.add_match(status=2)
+        encoded = b"\xff\xd8\xff\xe0unconfirmed-epl-frame\xff\xd9"
+        receipt = publish_vision_frame_bytes(
+            Path(self.directory.name) / "vision-frames",
+            encoded,
+        )
+        observation = VisionObservation(
+            raybet_match_id="match-1",
+            map_number=None,
+            captured_at=NOW - timedelta(seconds=5),
+            game_clock_seconds=None,
+            is_paused=None,
+            radiant_hero_ids=(),
+            dire_hero_ids=(),
+            clock_confidence=0.0,
+            draft_confidence=0.0,
+            source_frame_ref=receipt.frame_ref,
+            screen_state="unknown",
+            source_frame_sha256=receipt.content_sha256,
+            source_frame_bytes=receipt.byte_length,
+            source_frame_path=str(receipt.storage_path),
+        )
+        self.store.insert_vision_observation(observation)
+        self.store.connection.commit()
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertIsNone(detail["latest_vision"])
+        self.assertEqual(detail["latest_capture"]["confirmed"], 0)
+        self.assertEqual(
+            detail["latest_capture"]["frame_url"],
+            f"/api/monitor/matches/match-1/captures/{receipt.content_sha256}.jpg",
+        )
+        response = self.get_capture("match-1", receipt.content_sha256)
+        trusted_response = self.get_frame("match-1", receipt.content_sha256)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, encoded)
+        self.assertEqual(trusted_response.status_code, 404)
+
+    def test_unconfirmed_capture_endpoint_rejects_cross_match_reference(self) -> None:
+        self.add_match(status=2)
+        self.add_match(match_id="match-2", status=2)
+        encoded = b"\xff\xd8\xff\xe0match-one-unconfirmed\xff\xd9"
+        receipt = publish_vision_frame_bytes(
+            Path(self.directory.name) / "vision-frames",
+            encoded,
+        )
+        observation = VisionObservation(
+            raybet_match_id="match-1",
+            map_number=None,
+            captured_at=NOW - timedelta(seconds=5),
+            game_clock_seconds=None,
+            is_paused=None,
+            radiant_hero_ids=(),
+            dire_hero_ids=(),
+            clock_confidence=0.0,
+            draft_confidence=0.0,
+            source_frame_ref=receipt.frame_ref,
+            screen_state="unknown",
+            source_frame_sha256=receipt.content_sha256,
+            source_frame_bytes=receipt.byte_length,
+            source_frame_path=str(receipt.storage_path),
+        )
+        self.store.insert_vision_observation(observation)
+        self.store.connection.commit()
+
+        response = self.get_capture("match-2", receipt.content_sha256)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(str(receipt.storage_path), response.text)
 
     def test_vision_frame_endpoint_rejects_cross_match_reference(self) -> None:
         self.add_match(status=2)
@@ -2463,6 +2548,53 @@ class MonitoringDashboardTests(unittest.TestCase):
         snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
 
         self.assertEqual(snapshot["matches"][0]["winner"]["period"], "map_1")
+
+    def test_detail_exposes_prematch_snapshot_without_promoting_live_odds(
+        self,
+    ) -> None:
+        self.add_match(status=1, scheduled_at="2026-07-14 23:00:00")
+        observed_at = NOW - timedelta(minutes=4)
+        self.add_winner_response(
+            observed_at,
+            1.65,
+            2.19,
+            observation_key="prematch-response",
+            audit_only=True,
+        )
+
+        detail = monitor_match_detail(self.store.connection, "match-1", now=NOW)
+
+        assert detail is not None
+        self.assertIsNone(detail["winner"])
+        self.assertEqual(
+            detail["prematch_winner"],
+            {
+                "observed_at": observed_at.isoformat(),
+                "period": "map_1",
+                "complete": True,
+                "prices": {"team_one": 1.65, "team_two": 2.19},
+                "probabilities": {
+                    "team_one": 0.5703125,
+                    "team_two": 0.4296875,
+                },
+            },
+        )
+        self.assertEqual(detail["readiness"]["odds"]["status"], "missing")
+        self.assertEqual(detail["markets"], [])
+        self.assertEqual(detail["winner_timeline"], [])
+
+        self.add_match(
+            status=2,
+            scheduled_at="2026-07-14 23:00:00",
+            updated_at=NOW + timedelta(seconds=1),
+        )
+        live_detail = monitor_match_detail(
+            self.store.connection,
+            "match-1",
+            now=NOW + timedelta(seconds=1),
+        )
+        assert live_detail is not None
+        self.assertIsNone(live_detail["prematch_winner"])
 
     def test_upcoming_match_uses_map_one_when_periods_arrive_separately(self) -> None:
         self.add_match(scheduled_at="2026-07-15 22:00:00")

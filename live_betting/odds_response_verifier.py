@@ -18,7 +18,11 @@ from event_intelligence.raw_archive import (
     schema_fingerprint,
 )
 
-from .markets import snapshots_from_payload, snapshot_state_outcome
+from .markets import (
+    is_closed_odds_member,
+    snapshots_from_payload,
+    snapshot_state_outcome,
+)
 from .odds_response_authority import (
     LEGACY_NORMALIZED_STATE_HASH_VERSION,
     NORMALIZED_STATE_HASH_VERSION,
@@ -437,7 +441,8 @@ def _verify_full_artifact(
         raise RuntimeError(f"odds raw response envelope is invalid: {artifact_hash}")
     received_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
     snapshots = snapshots_from_payload(payload, received_at=received_at)
-    if len(snapshots) != len(members):
+    closed_member_count = sum(is_closed_odds_member(member) for member in members)
+    if len(snapshots) + closed_member_count != len(members):
         raise RuntimeError(f"odds raw response contains unparsed members: {artifact_hash}")
     outcomes = canonical_state_outcomes(snapshot_state_outcome(row) for row in snapshots)
     match_id = str(result.get("id") or "")

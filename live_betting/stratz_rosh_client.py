@@ -5,13 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from types import MappingProxyType
 from typing import Any
 
 from curl_cffi import requests as cffi_requests
 
+from prematch import stratz_official_profile as official_profile
+from prematch.stratz_official_profile import RoshRequestPlan
 from prematch.stratz_rosh import (
     build_player_highlights_query,
     build_rosh_match_context,
@@ -60,6 +65,7 @@ class StratzRoshError(RuntimeError):
                 "request_cancelled",
                 "invalid_json",
                 "invalid_response",
+                "profile_drift",
                 "request_failure",
             }
             else "request_failure"
@@ -114,6 +120,17 @@ class FetchedHistoricalRoshLineupScore:
     evidence_hash: str
 
 
+@dataclass(frozen=True)
+class OfficialRoshBatch:
+    """Exact official batch evidence plus its validated parsed responses."""
+
+    request_body: bytes = field(repr=False)
+    response_body: bytes = field(repr=False)
+    responses: tuple[Mapping[str, Any], ...] = field(repr=False)
+    collected_at: datetime
+    diagnostics: Mapping[str, Any]
+
+
 def resolve_stratz_api_token(
     environment: Mapping[str, str] | None = None,
 ) -> str | None:
@@ -159,6 +176,10 @@ class StratzRoshClient:
         post: Callable[..., Any] | None = None,
         clock: Callable[[], datetime] | None = None,
         stop_requested: Callable[[], bool] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        official_max_attempts: int = 3,
+        official_backoff_base_seconds: float = 1.0,
+        official_backoff_cap_seconds: float = 8.0,
     ) -> None:
         resolved = token.strip() if isinstance(token, str) else None
         self._token = resolved or resolve_stratz_api_token()
@@ -169,6 +190,109 @@ class StratzRoshClient:
         self._post = post or cffi_requests.post
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._stop_requested = stop_requested or (lambda: False)
+        self._sleeper = sleeper or time.sleep
+        if type(official_max_attempts) is not int or official_max_attempts < 1:
+            raise ValueError("official_max_attempts must be a positive integer")
+        if not _is_non_negative_finite(official_backoff_base_seconds):
+            raise ValueError("official_backoff_base_seconds must be finite and non-negative")
+        if not _is_non_negative_finite(official_backoff_cap_seconds):
+            raise ValueError("official_backoff_cap_seconds must be finite and non-negative")
+        self._official_max_attempts = official_max_attempts
+        self._official_backoff_base_seconds = float(
+            official_backoff_base_seconds
+        )
+        self._official_backoff_cap_seconds = float(
+            official_backoff_cap_seconds
+        )
+
+    def fetch_official_batch(self, plan: RoshRequestPlan) -> OfficialRoshBatch:
+        """Execute one canonical official-v2 GraphQL batch, failing closed."""
+        _validate_official_plan_and_endpoint(plan, self.endpoint)
+        request_body = _official_request_body(plan)
+        retry_delays: list[float] = []
+
+        for attempt in range(self._official_max_attempts):
+            if self._stop_requested():
+                raise StratzRoshError(
+                    "STRATZ official request cancelled",
+                    category="request_cancelled",
+                )
+            try:
+                response = self._post(
+                    self.endpoint,
+                    data=request_body,
+                    headers={
+                        "Authorization": f"Bearer {self._token}",
+                        "Content-Type": "application/json",
+                    },
+                    impersonate="chrome120",
+                    timeout=self.timeout_seconds,
+                )
+            except Exception:
+                raise StratzRoshError(
+                    "STRATZ official request failed",
+                    retryable=True,
+                    category="network_failure",
+                ) from None
+
+            status = getattr(response, "status_code", None)
+            if status == 200:
+                response_body, responses = _parse_official_response(
+                    response,
+                    len(plan.operations),
+                )
+                collected_at = _utc(self._clock())
+                return OfficialRoshBatch(
+                    request_body=request_body,
+                    response_body=response_body,
+                    responses=responses,
+                    collected_at=collected_at,
+                    diagnostics=MappingProxyType(
+                        {
+                            "endpoint": self.endpoint,
+                            "request_hash": plan.request_hash,
+                            "operation_names": tuple(
+                                operation.operation_name
+                                for operation in plan.operations
+                            ),
+                            "attempt_count": attempt + 1,
+                            "retry_delays_seconds": tuple(retry_delays),
+                            "timeout_seconds": self.timeout_seconds,
+                        }
+                    ),
+                )
+
+            retryable = status == 429 or (
+                type(status) is int and 500 <= status <= 599
+            )
+            category = (
+                "http_auth_failure"
+                if status in {401, 403}
+                else "http_429"
+                if status == 429
+                else "http_5xx"
+                if type(status) is int and 500 <= status <= 599
+                else "http_failure"
+            )
+            retry_after = _official_retry_after_seconds(response, self._clock)
+            if retryable and attempt + 1 < self._official_max_attempts:
+                backoff = min(
+                    self._official_backoff_base_seconds * (2**attempt),
+                    self._official_backoff_cap_seconds,
+                )
+                delay = max(backoff, retry_after or 0.0)
+                retry_delays.append(delay)
+                self._sleeper(delay)
+                continue
+            safe_status = status if type(status) is int else "unknown"
+            raise StratzRoshError(
+                f"STRATZ official request returned HTTP {safe_status}",
+                retryable=retryable,
+                retry_after_seconds=retry_after,
+                category=category,
+            )
+
+        raise AssertionError("official retry loop exhausted unexpectedly")
 
     def fetch_lineup_score(
         self,
@@ -602,6 +726,170 @@ class StratzRoshClient:
                 category="invalid_response",
             )
         return payload
+
+
+def _validate_official_plan_and_endpoint(
+    plan: RoshRequestPlan,
+    endpoint: str,
+) -> None:
+    try:
+        official_profile.validate_canonical_request_plan(plan)
+    except Exception:
+        raise StratzRoshError(
+            "STRATZ official request plan failed canonical validation",
+            category="profile_drift",
+        ) from None
+    registered_endpoint = official_profile.ENDPOINT
+    if (
+        registered_endpoint != STRATZ_GRAPHQL_ENDPOINT
+        or not registered_endpoint.startswith("https://")
+        or endpoint != registered_endpoint
+    ):
+        raise StratzRoshError(
+            "STRATZ official endpoint failed profile validation",
+            category="profile_drift",
+        )
+
+
+def _official_request_body(plan: RoshRequestPlan) -> bytes:
+    payload = [
+        {
+            "operationName": operation.operation_name,
+            "variables": _transport_thaw(operation.variables),
+            "query": operation.query,
+        }
+        for operation in plan.operations
+    ]
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise StratzRoshError(
+            "STRATZ official request serialization failed",
+            category="profile_drift",
+        ) from None
+
+
+def _parse_official_response(
+    response: Any,
+    expected_count: int,
+) -> tuple[bytes, tuple[Mapping[str, Any], ...]]:
+    raw = getattr(response, "content", None)
+    if not isinstance(raw, (bytes, bytearray)):
+        raise StratzRoshError(
+            "STRATZ official response body is unavailable",
+            category="invalid_response",
+        )
+    response_body = bytes(raw)
+    try:
+        payload = json.loads(
+            response_body.decode("utf-8"),
+            parse_constant=_reject_non_finite_json_constant,
+        )
+    except (UnicodeError, ValueError):
+        raise StratzRoshError(
+            "STRATZ official response is invalid JSON",
+            category="invalid_json",
+        ) from None
+    if not isinstance(payload, list):
+        raise StratzRoshError(
+            "STRATZ official response is not a batch",
+            category="invalid_response",
+        )
+    if len(payload) != expected_count:
+        raise StratzRoshError(
+            "STRATZ official response count does not match the request plan",
+            category="invalid_response",
+        )
+
+    errors: list[Any] = []
+    missing_data = False
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise StratzRoshError(
+                "STRATZ official batch item is invalid",
+                category="invalid_response",
+            )
+        item_errors = item.get("errors")
+        if item_errors is not None:
+            if not isinstance(item_errors, list):
+                raise StratzRoshError(
+                    "STRATZ official GraphQL errors are invalid",
+                    category="invalid_response",
+                )
+            errors.extend(item_errors)
+        if not isinstance(item.get("data"), Mapping):
+            missing_data = True
+    if errors:
+        retryable, category = _graphql_retry_policy(errors)
+        raise StratzRoshError(
+            "STRATZ official GraphQL batch failed",
+            retryable=retryable,
+            category=category,
+        )
+    if missing_data:
+        raise StratzRoshError(
+            "STRATZ official batch item has no data",
+            category="invalid_response",
+        )
+    return response_body, tuple(_transport_freeze(item) for item in payload)
+
+
+def _reject_non_finite_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constants are forbidden")
+
+
+def _transport_thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _transport_thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_transport_thaw(item) for item in value]
+    return value
+
+
+def _transport_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _transport_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_transport_freeze(item) for item in value)
+    return value
+
+
+def _official_retry_after_seconds(
+    response: Any,
+    clock: Callable[[], datetime],
+) -> float | None:
+    headers = getattr(response, "headers", None)
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    raw = getter("Retry-After")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        if not isinstance(raw, str):
+            return None
+        try:
+            retry_at = parsedate_to_datetime(raw)
+            seconds = (_utc(retry_at) - _utc(clock())).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not _is_non_negative_finite(seconds):
+        return None
+    return min(float(seconds), 60.0)
+
+
+def _is_non_negative_finite(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    number = float(value)
+    return number == number and number >= 0 and number != float("inf")
 
 
 def historical_rosh_lineup_identity(

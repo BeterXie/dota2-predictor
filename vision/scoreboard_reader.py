@@ -15,7 +15,8 @@ from contracts.live_observation import (
     is_canonical_net_worth_bucket,
 )
 
-from .clock_reader import _render_templates
+from .clock_reader import ClockReader, ClockReading, _render_templates
+from .layout_selector import layout_match_confidence
 from .layouts import BroadcastLayout, NormalizedRegion, STANDARD_DOTA_HUD
 
 
@@ -75,6 +76,8 @@ class ScoreboardReader:
             for digit, template in _render_templates().items()
         }
         self.ocr = None
+        self._strip_cache_image: np.ndarray | None = None
+        self._strip_cache_result: tuple[np.ndarray, list[object]] | None = None
         if use_ocr:
             try:
                 from rapidocr_onnxruntime import RapidOCR
@@ -238,27 +241,247 @@ class ScoreboardReader:
         return ReplayGateReading("untrusted", confidence)
 
     def read_replay_gate(self, image: np.ndarray) -> ReplayGateReading:
+        if self.layout.requires_geometry_confirmation:
+            return self._read_geometry_replay_gate(image)
         region = self.layout.broadcast_status
         if region is None or self.ocr is None:
             return ReplayGateReading("untrusted", 0.0)
-        crop = region.crop(image)
-        if crop.size == 0:
-            return ReplayGateReading("untrusted", 0.0)
-        result, _ = self.ocr(crop)
-        readings = [
-            (str(item[1]), float(item[2]))
-            for item in result or []
-            if len(item) >= 3
-            and isinstance(item[1], str)
-            and isinstance(item[2], (int, float))
-            and not isinstance(item[2], bool)
-        ]
+        readings: list[tuple[str, float]] = []
+        for status_region in (region, *self.layout.replay_status_regions):
+            crop = status_region.crop(image)
+            if crop.size == 0:
+                continue
+            result, _ = self.ocr(crop)
+            readings.extend(
+                (str(item[1]), float(item[2]))
+                for item in result or []
+                if len(item) >= 3
+                and isinstance(item[1], str)
+                and isinstance(item[2], (int, float))
+                and not isinstance(item[2], bool)
+            )
         return self._classify_broadcast_text(
             readings,
             live_marker_sets=self.layout.live_broadcast_marker_sets,
         )
 
+    def _scoreboard_strip_ocr(
+        self,
+        image: np.ndarray,
+    ) -> tuple[np.ndarray, list[object]] | None:
+        strip = self.layout.scoreboard_strip
+        if strip is None or self.ocr is None:
+            return None
+        if self._strip_cache_image is image and self._strip_cache_result is not None:
+            return self._strip_cache_result
+        crop = strip.crop(image)
+        if crop.size == 0:
+            return None
+        result, _ = self.ocr(crop)
+        cached = (crop, list(result or []))
+        self._strip_cache_image = image
+        self._strip_cache_result = cached
+        return cached
+
+    def _read_geometry_replay_gate(self, image: np.ndarray) -> ReplayGateReading:
+        positioned = self._scoreboard_strip_ocr(image)
+        if positioned is None:
+            return ReplayGateReading("untrusted", 0.0)
+        crop, result = positioned
+        readings = [
+            (str(item[1]), float(item[2]))
+            for item in result
+            if isinstance(item, (list, tuple))
+            and len(item) >= 3
+            and isinstance(item[1], str)
+            and isinstance(item[2], (int, float))
+            and not isinstance(item[2], bool)
+        ]
+        replay = self._classify_broadcast_text(readings)
+        if replay.status == "replay" or replay.text is not None:
+            return replay
+        geometry_confidence = layout_match_confidence(image, self.layout)
+        scoreboard = self._scoreboard_from_ocr(crop, result)
+        clock_confidence = max(
+            (
+                confidence
+                for text, confidence in readings
+                if re.fullmatch(r"-?\d{1,2}:\d{2}", text.strip())
+            ),
+            default=0.0,
+        )
+        if (
+            geometry_confidence < COMEBACK_STATE_MIN_CONFIDENCE
+            or scoreboard is None
+            or scoreboard.confidence < 0.8
+            or clock_confidence < COMEBACK_STATE_MIN_CONFIDENCE
+        ):
+            return ReplayGateReading(
+                "untrusted",
+                max(geometry_confidence, scoreboard.confidence if scoreboard else 0.0),
+            )
+        return ReplayGateReading(
+            "live",
+            min(geometry_confidence, scoreboard.confidence, clock_confidence),
+            self.layout.name,
+        )
+
+    @staticmethod
+    def _region_contains(
+        region: NormalizedRegion | None,
+        x: float,
+        y: float,
+    ) -> bool:
+        return (
+            region is not None
+            and region.left <= x <= region.right
+            and region.top <= y <= region.bottom
+        )
+
+    def _positioned_text(
+        self,
+        item: object,
+        crop: np.ndarray,
+    ) -> tuple[str, float, float, float] | None:
+        strip = self.layout.scoreboard_strip
+        if (
+            strip is None
+            or not isinstance(item, (list, tuple))
+            or len(item) < 3
+            or not isinstance(item[0], (list, tuple))
+            or not isinstance(item[1], str)
+            or not isinstance(item[2], (int, float))
+            or isinstance(item[2], bool)
+        ):
+            return None
+        points = np.asarray(item[0], dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2:
+            return None
+        local_x = float(points[:, 0].mean()) / max(1, crop.shape[1])
+        local_y = float(points[:, 1].mean()) / max(1, crop.shape[0])
+        return (
+            str(item[1]),
+            float(item[2]),
+            strip.left + local_x * (strip.right - strip.left),
+            strip.top + local_y * (strip.bottom - strip.top),
+        )
+
+    def read_positioned_clock(self, image: np.ndarray) -> ClockReading | None:
+        positioned = self._scoreboard_strip_ocr(image)
+        if positioned is None:
+            return None
+        crop, result = positioned
+        readings: list[ClockReading] = []
+        for item in result:
+            parsed_item = self._positioned_text(item, crop)
+            if parsed_item is None:
+                continue
+            text, confidence, x, y = parsed_item
+            if not self._region_contains(self.layout.clock, x, y):
+                continue
+            reading = ClockReader._parse_digits(text, confidence)
+            if reading is not None:
+                readings.append(reading)
+        return max(readings, key=lambda item: item.confidence) if readings else None
+
+    def _read_positioned_advantage(
+        self,
+        image: np.ndarray,
+    ) -> NetWorthAdvantageReading:
+        positioned = self._scoreboard_strip_ocr(image)
+        if positioned is None:
+            return NetWorthAdvantageReading(None, None, None, 0.0)
+        crop, result = positioned
+        radiant: list[tuple[int, int, float]] = []
+        dire: list[tuple[int, int, float]] = []
+        for item in result:
+            parsed_item = self._positioned_text(item, crop)
+            if parsed_item is None:
+                continue
+            text, confidence, x, y = parsed_item
+            parsed = self._parse_advantage_text(text, confidence)
+            if parsed is None:
+                continue
+            if self._region_contains(
+                self.layout.radiant_net_worth_advantage,
+                x,
+                y,
+            ):
+                radiant.append(parsed)
+            elif self._region_contains(
+                self.layout.dire_net_worth_advantage,
+                x,
+                y,
+            ):
+                dire.append(parsed)
+        radiant_reading = max(radiant, key=lambda item: item[2]) if radiant else None
+        dire_reading = max(dire, key=lambda item: item[2]) if dire else None
+        if (radiant_reading is None) == (dire_reading is None):
+            confidence = min(
+                radiant_reading[2] if radiant_reading is not None else 0.0,
+                dire_reading[2] if dire_reading is not None else 0.0,
+            )
+            return NetWorthAdvantageReading(None, None, None, confidence)
+        side: Literal["radiant", "dire"] = (
+            "radiant" if radiant_reading is not None else "dire"
+        )
+        reading = radiant_reading if radiant_reading is not None else dire_reading
+        assert reading is not None
+        return NetWorthAdvantageReading(side, *reading)
+
+    def _scoreboard_from_ocr(
+        self,
+        crop: np.ndarray,
+        result: list[object],
+    ) -> ScoreboardReading | None:
+        strip = self.layout.scoreboard_strip
+        if strip is None:
+            return None
+        radiant: list[tuple[int, float]] = []
+        dire: list[tuple[int, float]] = []
+        for item in result or []:
+            positioned_item = self._positioned_text(item, crop)
+            if positioned_item is None:
+                continue
+            text, confidence, normalized_x, normalized_y = positioned_item
+            parsed = self._parse_text(text, confidence)
+            if parsed is None:
+                continue
+            if self._region_contains(
+                self.layout.radiant_kills,
+                normalized_x,
+                normalized_y,
+            ):
+                radiant.append(parsed)
+            elif self._region_contains(
+                self.layout.dire_kills,
+                normalized_x,
+                normalized_y,
+            ):
+                dire.append(parsed)
+        if not radiant or not dire:
+            return None
+        radiant_value = max(radiant, key=lambda item: item[1])
+        dire_value = max(dire, key=lambda item: item[1])
+        return ScoreboardReading(
+            radiant_value[0],
+            dire_value[0],
+            min(radiant_value[1], dire_value[1]),
+        )
+
+    def _read_scoreboard_strip(
+        self,
+        image: np.ndarray,
+    ) -> ScoreboardReading | None:
+        positioned = self._scoreboard_strip_ocr(image)
+        if positioned is None:
+            return None
+        return self._scoreboard_from_ocr(*positioned)
+
     def read(self, image: np.ndarray) -> ScoreboardReading:
+        strip_reading = self._read_scoreboard_strip(image)
+        if strip_reading is not None:
+            return strip_reading
         radiant = self._read_region(image, self.layout.radiant_kills)
         dire = self._read_region(image, self.layout.dire_kills)
         if radiant is None or dire is None:
@@ -277,6 +500,8 @@ class ScoreboardReader:
         self,
         image: np.ndarray,
     ) -> NetWorthAdvantageReading:
+        if self.layout.scoreboard_strip is not None:
+            return self._read_positioned_advantage(image)
         radiant = self._read_advantage_region(
             image,
             self.layout.radiant_net_worth_advantage,

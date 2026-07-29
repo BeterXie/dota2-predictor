@@ -52,9 +52,12 @@ from .sanitize import (
 )
 from .strategy import attempt_fill, is_open
 from .strategy_contract import (
+    OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
     REGISTERED_STRATEGY_CONTRACTS,
+    canonical_bytes,
     parse_decision_payload,
     serialize_decision_payload,
+    validate_official_rosh_strategy_contract,
     validate_strategy_contract,
 )
 from .strict_eligibility import (
@@ -70,7 +73,7 @@ from .vision_frame_registry import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 12
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 ROSH_LINEUP_CACHE_TTL = timedelta(minutes=15)
 ROSH_FETCH_MAX_DURATION = timedelta(minutes=10)
@@ -2130,6 +2133,258 @@ CREATE TRIGGER IF NOT EXISTS rosh_lineup_scores_immutable_delete
 BEFORE DELETE ON rosh_lineup_scores
 BEGIN
     SELECT RAISE(ABORT, 'Rosh lineup score is immutable');
+END;
+CREATE TABLE IF NOT EXISTS rosh_analysis_runs (
+    run_id TEXT PRIMARY KEY CHECK (
+        length(run_id)=64 AND run_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+    mode TEXT NOT NULL CHECK (mode IN ('historical_match', 'explicit_draft')),
+    match_id INTEGER,
+    date_time INTEGER NOT NULL CHECK (date_time>=0),
+    draft_hash TEXT NOT NULL CHECK (
+        length(draft_hash)=64 AND draft_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    draft_json TEXT NOT NULL CHECK (
+        json_valid(draft_json) AND json_type(draft_json)='object'
+    ),
+    rosh_profile_id TEXT NOT NULL CHECK (length(trim(rosh_profile_id))>0),
+    formula_version TEXT NOT NULL CHECK (length(trim(formula_version))>0),
+    request_profile_hash TEXT NOT NULL CHECK (
+        length(request_profile_hash)=64
+        AND request_profile_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    upstream_bundle_hash TEXT NOT NULL CHECK (
+        length(upstream_bundle_hash)=64
+        AND upstream_bundle_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    scorer_source_hash TEXT NOT NULL CHECK (
+        length(scorer_source_hash)=64
+        AND scorer_source_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    canonical_profile_hash TEXT NOT NULL CHECK (
+        length(canonical_profile_hash)=64
+        AND canonical_profile_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    serialization_version TEXT NOT NULL CHECK (
+        length(trim(serialization_version))>0
+    ),
+    request_hash TEXT NOT NULL CHECK (
+        length(request_hash)=64 AND request_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    request_manifest_json TEXT NOT NULL CHECK (
+        json_valid(request_manifest_json)
+        AND json_type(request_manifest_json)='object'
+    ),
+    response_manifest_json TEXT NOT NULL CHECK (
+        json_valid(response_manifest_json)
+        AND json_type(response_manifest_json)='array'
+    ),
+    radiant_team_score REAL,
+    dire_team_score REAL,
+    relative_advantage REAL,
+    result_json TEXT CHECK (
+        result_json IS NULL OR
+        (json_valid(result_json) AND json_type(result_json)='object')
+    ),
+    evidence_hash TEXT NOT NULL UNIQUE CHECK (
+        length(evidence_hash)=64 AND evidence_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    error_code TEXT,
+    collected_at TEXT NOT NULL CHECK (length(trim(collected_at))>0),
+    CHECK (
+        (mode='historical_match' AND match_id IS NOT NULL AND match_id>0)
+        OR (mode='explicit_draft' AND match_id IS NULL)
+    ),
+    CHECK (
+        (status='succeeded'
+         AND json_array_length(response_manifest_json)>0
+         AND typeof(radiant_team_score) IN ('integer', 'real')
+         AND radiant_team_score BETWEEN -1.0e308 AND 1.0e308
+         AND typeof(dire_team_score) IN ('integer', 'real')
+         AND dire_team_score BETWEEN -1.0e308 AND 1.0e308
+         AND typeof(relative_advantage) IN ('integer', 'real')
+         AND relative_advantage BETWEEN -1.0e308 AND 1.0e308
+         AND result_json IS NOT NULL AND error_code IS NULL)
+        OR
+        (status='failed' AND radiant_team_score IS NULL
+         AND dire_team_score IS NULL AND relative_advantage IS NULL
+         AND result_json IS NULL AND error_code IS NOT NULL
+         AND length(trim(error_code))>0)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_rosh_runs_match_profile
+    ON rosh_analysis_runs(match_id, rosh_profile_id, date_time);
+CREATE INDEX IF NOT EXISTS idx_rosh_runs_draft_profile
+    ON rosh_analysis_runs(draft_hash, rosh_profile_id, date_time);
+CREATE TRIGGER IF NOT EXISTS rosh_analysis_runs_immutable_update
+BEFORE UPDATE ON rosh_analysis_runs
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh analysis run is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS rosh_analysis_runs_immutable_delete
+BEFORE DELETE ON rosh_analysis_runs
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh analysis run is immutable');
+END;
+CREATE TABLE IF NOT EXISTS rosh_hero_scores (
+    run_id TEXT NOT NULL REFERENCES rosh_analysis_runs(run_id),
+    team_side TEXT NOT NULL CHECK (team_side IN ('RADIANT', 'DIRE')),
+    position_id INTEGER NOT NULL CHECK (position_id BETWEEN 1 AND 5),
+    hero_id INTEGER NOT NULL CHECK (hero_id>0),
+    raw_score REAL NOT NULL CHECK (
+        typeof(raw_score) IN ('integer', 'real')
+        AND raw_score BETWEEN -1.0e308 AND 1.0e308
+    ),
+    display_score REAL NOT NULL CHECK (
+        typeof(display_score) IN ('integer', 'real')
+        AND display_score BETWEEN -1.0e308 AND 1.0e308
+    ),
+    components_json TEXT NOT NULL CHECK (
+        json_valid(components_json) AND json_type(components_json)='object'
+    ),
+    PRIMARY KEY (run_id, team_side, position_id),
+    UNIQUE (run_id, hero_id)
+);
+CREATE TRIGGER IF NOT EXISTS rosh_hero_scores_succeeded_run_insert
+BEFORE INSERT ON rosh_hero_scores
+WHEN NOT EXISTS (
+    SELECT 1 FROM rosh_analysis_runs
+     WHERE run_id=NEW.run_id AND status='succeeded'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh hero score requires succeeded run');
+END;
+CREATE TRIGGER IF NOT EXISTS rosh_hero_scores_immutable_update
+BEFORE UPDATE ON rosh_hero_scores
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh hero score is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS rosh_hero_scores_immutable_delete
+BEFORE DELETE ON rosh_hero_scores
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh hero score is immutable');
+END;
+CREATE TABLE IF NOT EXISTS rosh_minute_points (
+    run_id TEXT NOT NULL REFERENCES rosh_analysis_runs(run_id),
+    minute INTEGER NOT NULL CHECK (minute>=0),
+    raw_score REAL NOT NULL CHECK (
+        typeof(raw_score) IN ('integer', 'real')
+        AND raw_score BETWEEN -1.0e308 AND 1.0e308
+    ),
+    display_score REAL NOT NULL CHECK (
+        typeof(display_score) IN ('integer', 'real')
+        AND display_score BETWEEN -1.0e308 AND 1.0e308
+    ),
+    radiant_time_delta REAL NOT NULL CHECK (
+        typeof(radiant_time_delta) IN ('integer', 'real')
+        AND radiant_time_delta BETWEEN -1.0e308 AND 1.0e308
+    ),
+    dire_time_delta REAL NOT NULL CHECK (
+        typeof(dire_time_delta) IN ('integer', 'real')
+        AND dire_time_delta BETWEEN -1.0e308 AND 1.0e308
+    ),
+    synergy_delta REAL NOT NULL CHECK (
+        typeof(synergy_delta) IN ('integer', 'real')
+        AND synergy_delta BETWEEN -1.0e308 AND 1.0e308
+    ),
+    source_audit_json TEXT NOT NULL CHECK (
+        json_valid(source_audit_json) AND json_type(source_audit_json)='object'
+    ),
+    PRIMARY KEY (run_id, minute)
+);
+CREATE TRIGGER IF NOT EXISTS rosh_minute_points_succeeded_run_insert
+BEFORE INSERT ON rosh_minute_points
+WHEN NOT EXISTS (
+    SELECT 1 FROM rosh_analysis_runs
+     WHERE run_id=NEW.run_id AND status='succeeded'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh minute point requires succeeded run');
+END;
+CREATE TRIGGER IF NOT EXISTS rosh_minute_points_immutable_update
+BEFORE UPDATE ON rosh_minute_points
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh minute point is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS rosh_minute_points_immutable_delete
+BEFORE DELETE ON rosh_minute_points
+BEGIN
+    SELECT RAISE(ABORT, 'Rosh minute point is immutable');
+END;
+CREATE TABLE IF NOT EXISTS official_rosh_shadow_evaluations (
+    evaluation_key TEXT PRIMARY KEY CHECK (
+        length(evaluation_key)=64
+        AND evaluation_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    candidate_hash TEXT NOT NULL CHECK (
+        length(candidate_hash)=64
+        AND candidate_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    raybet_match_id TEXT NOT NULL CHECK (length(trim(raybet_match_id))>0),
+    map_number INTEGER NOT NULL CHECK (map_number>0),
+    decided_at TEXT NOT NULL CHECK (length(trim(decided_at))>0),
+    transport_key TEXT NOT NULL CHECK (length(trim(transport_key))>0),
+    observation_draft_hash TEXT NOT NULL CHECK (
+        length(observation_draft_hash)=64
+        AND observation_draft_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_run_id TEXT REFERENCES rosh_analysis_runs(run_id),
+    strategy_version TEXT NOT NULL CHECK (
+        strategy_version='comeback-shadow-v6-official-rosh-direction'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('shadow_candidate', 'rejected')),
+    reason TEXT NOT NULL CHECK (length(trim(reason))>0),
+    record_json TEXT NOT NULL CHECK (
+        json_valid(record_json)
+        AND json_type(record_json)='object'
+        AND json_extract(record_json, '$.schema')=
+            'official-rosh-shadow-candidate/v1'
+        AND json_extract(record_json, '$.candidate_hash')=candidate_hash
+        AND json_extract(record_json, '$.strategy_version')=strategy_version
+        AND json_extract(record_json, '$.status')=status
+        AND json_extract(record_json, '$.reason')=reason
+        AND json_type(record_json, '$.calibration_artifact_ref')='null'
+        AND json_type(record_json, '$.calibrated_probability')='null'
+        AND json_type(record_json, '$.edge')='null'
+        AND json_type(record_json, '$.stake_multiplier')='null'
+        AND json_type(record_json, '$.paper_order')='null'
+        AND json_extract(record_json, '$.cohort.m3_c')=
+            'shadow_candidate_or_rejection'
+        AND json_type(record_json, '$.cohort.m3_e')='null'
+        AND (
+            (json_type(record_json, '$.rosh_direction_evidence')='null'
+             AND status='rejected')
+            OR
+            (json_type(record_json, '$.rosh_direction_evidence')='object'
+             AND json_extract(
+                    record_json,
+                    '$.rosh_direction_evidence.analysis_run_id'
+                 )=source_run_id
+             AND json_extract(
+                    record_json,
+                    '$.rosh_direction_evidence.draft_hash'
+                 )=observation_draft_hash)
+        )
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_official_rosh_shadow_match_time
+    ON official_rosh_shadow_evaluations(
+        raybet_match_id, map_number, decided_at, strategy_version
+    );
+CREATE INDEX IF NOT EXISTS idx_official_rosh_shadow_draft
+    ON official_rosh_shadow_evaluations(
+        observation_draft_hash, decided_at, strategy_version
+    );
+CREATE TRIGGER IF NOT EXISTS official_rosh_shadow_evaluations_immutable_update
+BEFORE UPDATE ON official_rosh_shadow_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'official Rosh shadow evaluations are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS official_rosh_shadow_evaluations_immutable_delete
+BEFORE DELETE ON official_rosh_shadow_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'official Rosh shadow evaluations are immutable');
 END;
 CREATE TABLE IF NOT EXISTS vision_derived_invalidations (
     dependent_type TEXT NOT NULL CHECK (dependent_type IN
@@ -7582,9 +7837,11 @@ class LiveBettingStore:
         snapshots: Sequence[OddsSnapshot],
         raw_payload: Mapping[str, Any] | None = None,
         raw_artifact: ArtifactReceipt | None = None,
+        audit_only: bool = False,
     ) -> tuple[str, int]:
         """Atomically retain transport, deduplicated state, and exact raw evidence."""
         from .markets import (
+            is_closed_odds_member,
             normalized_state_hash as compute_normalized_state_hash,
             snapshots_from_payload,
             snapshot_state_outcome,
@@ -7618,7 +7875,15 @@ class LiveBettingStore:
         raw_members = result.get("odds") if isinstance(result, dict) else None
         if not isinstance(result, dict) or str(result.get("id") or "") != raybet_match_id:
             raise ValueError("response raw payload match id mismatch")
-        if not isinstance(raw_members, list) or len(raw_members) != len(raw_snapshots):
+        closed_member_count = (
+            sum(is_closed_odds_member(member) for member in raw_members)
+            if isinstance(raw_members, list)
+            else 0
+        )
+        if (
+            not isinstance(raw_members, list)
+            or len(raw_members) != len(raw_snapshots) + closed_member_count
+        ):
             raise ValueError("response raw payload contains unparsed odds members")
         caller_members = canonical_state_outcomes(
             snapshot_state_outcome(snapshot) for snapshot in snapshots
@@ -7751,7 +8016,11 @@ class LiveBettingStore:
             timing_status = self.observation_timing_status(
                 raybet_match_id, observed_at, source=source
             )
-            processing_status = "audit_only" if timing_status == "late" else "processing"
+            processing_status = (
+                "audit_only"
+                if audit_only or timing_status == "late"
+                else "processing"
+            )
             inserted = self.insert_transport_observation(
                 observation_key=observation_key,
                 source=source,
@@ -7769,7 +8038,7 @@ class LiveBettingStore:
                 return timing_status, 0
 
             change_count = 0
-            if timing_status != "late":
+            if timing_status != "late" and not audit_only:
                 change_count = sum(int(self.insert_odds(snapshot)) for snapshot in snapshots)
                 processing_status = "processed"
             self.execute(
@@ -9726,6 +9995,153 @@ class LiveBettingStore:
                 values,
             )
             return True
+
+    def insert_official_rosh_shadow_evaluation(
+        self,
+        evaluation: Any,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        decided_at: datetime,
+        transport_key: str,
+        observation_draft_hash: str,
+        source_run_id: str | None,
+    ) -> tuple[str, bool] | None:
+        """Append one v6 M3-C shadow record without touching decision/order rows."""
+
+        if not isinstance(raybet_match_id, str) or not raybet_match_id.strip():
+            raise ValueError("raybet_match_id must be non-empty")
+        if type(map_number) is not int or map_number <= 0:
+            raise ValueError("map_number must be a positive integer")
+        if (
+            not isinstance(decided_at, datetime)
+            or decided_at.tzinfo is None
+            or decided_at.utcoffset() is None
+        ):
+            raise ValueError("decided_at must be timezone-aware")
+        if not isinstance(transport_key, str) or not transport_key.strip():
+            raise ValueError("transport_key must be non-empty")
+        if not re.fullmatch(r"[0-9a-f]{64}", observation_draft_hash):
+            raise ValueError("observation_draft_hash must be a SHA-256 digest")
+        if source_run_id is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", source_run_id
+        ):
+            raise ValueError("source_run_id must be a SHA-256 digest")
+
+        strategy_version = str(getattr(evaluation, "strategy_version", ""))
+        if strategy_version != OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION:
+            raise ValueError("unregistered official Rosh strategy version")
+        as_record = getattr(evaluation, "as_record", None)
+        if not callable(as_record):
+            raise ValueError("official Rosh evaluation record is unavailable")
+        record = as_record()
+        if not isinstance(record, Mapping):
+            raise ValueError("official Rosh evaluation record must be a mapping")
+        candidate_hash = str(record.get("candidate_hash", ""))
+        status = str(record.get("status", ""))
+        reason = str(record.get("reason", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", candidate_hash):
+            raise ValueError("candidate_hash must be a SHA-256 digest")
+        if status not in {"shadow_candidate", "rejected"} or not reason:
+            raise ValueError("official Rosh evaluation status is invalid")
+        if any(
+            record.get(field) is not None
+            for field in (
+                "calibration_artifact_ref",
+                "calibrated_probability",
+                "edge",
+                "stake_multiplier",
+                "paper_order",
+            )
+        ):
+            raise ValueError("v6 evaluation must not contain probability, stake, or order")
+        if validate_official_rosh_strategy_contract(
+            strategy_version,
+            record.get("strategy_contract"),
+        ) is None:
+            raise ValueError("official Rosh strategy contract is invalid")
+        cohort = record.get("cohort")
+        if not isinstance(cohort, Mapping) or dict(cohort) != {
+            "m3_c": "shadow_candidate_or_rejection",
+            "m3_e": None,
+        }:
+            raise ValueError("official Rosh evaluation cohort is invalid")
+        evidence = record.get("rosh_direction_evidence")
+        if evidence is not None:
+            if not isinstance(evidence, Mapping):
+                raise ValueError("Rosh direction evidence must be a mapping")
+            if evidence.get("draft_hash") != observation_draft_hash:
+                raise ValueError("Rosh direction evidence draft hash mismatch")
+            if evidence.get("analysis_run_id") != source_run_id:
+                raise ValueError("Rosh direction evidence run identity mismatch")
+        if status == "shadow_candidate" and evidence is None:
+            raise ValueError("shadow candidate requires Rosh direction evidence")
+
+        decided_at_value = decided_at.astimezone(timezone.utc).isoformat()
+        context = {
+            "schema": "official-rosh-shadow-evaluation-context/v1",
+            "candidate_hash": candidate_hash,
+            "raybet_match_id": raybet_match_id,
+            "map_number": map_number,
+            "decided_at": decided_at_value,
+            "transport_key": transport_key,
+            "observation_draft_hash": observation_draft_hash,
+            "source_run_id": source_run_id,
+            "strategy_version": strategy_version,
+        }
+        evaluation_key = hashlib.sha256(canonical_bytes(context)).hexdigest()
+        record_json = canonical_bytes(record).decode("utf-8")
+        columns = (
+            "evaluation_key",
+            "candidate_hash",
+            "raybet_match_id",
+            "map_number",
+            "decided_at",
+            "transport_key",
+            "observation_draft_hash",
+            "source_run_id",
+            "strategy_version",
+            "status",
+            "reason",
+            "record_json",
+        )
+        values = (
+            evaluation_key,
+            candidate_hash,
+            raybet_match_id,
+            map_number,
+            decided_at_value,
+            transport_key,
+            observation_draft_hash,
+            source_run_id,
+            strategy_version,
+            status,
+            reason,
+            record_json,
+        )
+        with self.transaction():
+            existing = self.connection.execute(
+                f"SELECT {', '.join(columns)} "
+                "FROM official_rosh_shadow_evaluations WHERE evaluation_key=?",
+                (evaluation_key,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise ValueError("official Rosh evaluation identity conflict")
+                return evaluation_key, False
+            if self._draft_conflict_at_or_before(
+                raybet_match_id,
+                map_number,
+                decided_at,
+            ):
+                return None
+            self.connection.execute(
+                f"INSERT INTO official_rosh_shadow_evaluations "
+                f"({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                values,
+            )
+            return evaluation_key, True
 
     def insert_research_prediction(self, prediction: Any) -> bool:
         """Append one non-actionable live prediction without touching order tables."""

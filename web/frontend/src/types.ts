@@ -41,6 +41,7 @@ export interface VisionPoint {
   source_frame_ref?: string;
   frame_digest?: string | null;
   frame_url?: string | null;
+  strategy_authority?: boolean;
 }
 
 export interface StrategyDecision {
@@ -318,9 +319,13 @@ export interface MarketQuote {
 }
 
 export interface MatchDetail extends MonitorMatch {
+  /** Display-only T-2h snapshot. It is never live strategy authority. */
+  prematch_winner?: WinnerQuote | null;
   winner_timeline: WinnerTimelinePoint[];
   decisions: StrategyDecision[];
   vision: VisionPoint[];
+  /** Latest registered capture, including observations that are not strategy authority. */
+  latest_capture?: VisionPoint | null;
   markets: MarketQuote[];
   /** Optional for fail-closed compatibility with older monitor backends. */
   analysis?: MatchAnalysis;
@@ -411,8 +416,27 @@ export interface MappingRecord {
   evidence_approval_id: number | null;
 }
 
+export interface MonitorCapability {
+  required: boolean;
+  status: ReadinessStatus | "healthy" | "unknown" | string;
+}
+
+export interface MilestoneGovernanceProjection {
+  status?: string;
+  governance_status?: string;
+  ledger_integrity?: {
+    status?: string;
+    [key: string]: unknown;
+  };
+  records?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
 export interface MonitorSnapshot {
   generated_at: string;
+  market_source_policy?: string;
+  capabilities?: Record<string, MonitorCapability>;
+  milestone_governance?: MilestoneGovernanceProjection;
   cursor: string;
   mapping_revision: string;
   health: HealthItem[];
@@ -798,4 +822,118 @@ export interface IntelligencePlayerPage {
 export interface IntelligenceTeamPage {
   data: IntelligenceTeamProfile[];
   pagination?: IntelligencePagination;
+}
+
+export interface PrematchTeam {
+  team_id: number;
+  name: string | null;
+  tag: string | null;
+  logo_url: string | null;
+  match_count: number;
+}
+
+export interface PrematchLeague {
+  leagueid: number;
+  name: string | null;
+  tier: string | null;
+  match_count: number;
+}
+
+export interface PrematchHero {
+  hero_id: number;
+  localized_name: string;
+  hero_key: string;
+  image_url: string;
+}
+
+export type PrematchHeroGrid = Record<"str" | "agi" | "int" | "all", PrematchHero[]>;
+
+export interface PrematchDraftHero {
+  hero_id: number;
+  name: string;
+  image_url: string;
+  account_id: number | null;
+}
+
+export interface PrematchDraft {
+  match_id: number;
+  radiant_team_id: number;
+  dire_team_id: number;
+  league_id: number | null;
+  start_time: number | null;
+  radiant_heroes: PrematchDraftHero[];
+  dire_heroes: PrematchDraftHero[];
+}
+
+export interface PrematchRecentMatch {
+  match_id: number;
+  radiant_team_id: number;
+  dire_team_id: number;
+  radiant_name: string | null;
+  dire_name: string | null;
+  start_time: number;
+  leagueid: number | null;
+  league_name: string | null;
+}
+
+export interface RoshAnalysisDraftSlot {
+  hero_id: number;
+  position_id: number;
+}
+
+export interface RoshAnalysisRequest {
+  mode: "historical_match" | "explicit_draft";
+  date_time: number;
+  bracket_ids: ["IMMORTAL"];
+  rosh_profile_id: "stratz-rosh-web-2026-07-28-v2";
+  match_id?: number;
+  radiant?: RoshAnalysisDraftSlot[];
+  dire?: RoshAnalysisDraftSlot[];
+}
+
+export interface RoshAnalysisHeroComponent {
+  team_side: "RADIANT" | "DIRE";
+  position_id: number;
+  hero_id: number;
+  position_base_diff: number;
+  same_team_synergy: number;
+  opponent_matchup_synergy: number;
+  raw_score: number;
+  display_score: number;
+}
+
+export interface RoshAnalysisMinutePoint {
+  minute: number;
+  radiant_time_delta: number;
+  dire_time_delta: number;
+  synergy_delta: number;
+  raw_score: number;
+  display_score: number;
+  rank_source_counts: Record<string, number>;
+  slots: Array<Record<string, unknown>>;
+}
+
+export interface RoshAnalysisRunResponse {
+  schema: "rosh-analysis-run/v1";
+  run_id: string;
+  status: "succeeded" | "failed";
+  mode: "historical_match" | "explicit_draft";
+  match_id: number | null;
+  date_time: number;
+  draft_hash: string;
+  rosh_profile_id: string;
+  formula_version: string;
+  request_profile_hash: string;
+  upstream_bundle_hash: string;
+  scorer_source_hash: string;
+  canonical_profile_hash: string;
+  serialization_version: string;
+  evidence_hash: string;
+  collected_at: string;
+  radiant_team_score: number | null;
+  dire_team_score: number | null;
+  relative_advantage: number | null;
+  hero_components: RoshAnalysisHeroComponent[];
+  minute_points: RoshAnalysisMinutePoint[];
+  error_code: string | null;
 }

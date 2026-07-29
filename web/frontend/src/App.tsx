@@ -1,12 +1,16 @@
 import { Switch, Tab, TabList } from "@fluentui/react-components";
 import {
+  ArrowLeft,
   Bell,
   BellRinging,
   Broadcast,
+  ChartLineUp,
   ClockCounterClockwise,
   Database,
   GearSix,
   Pulse,
+  ShieldCheck,
+  LockSimple,
   SpeakerHigh,
 } from "@phosphor-icons/react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
@@ -41,8 +45,8 @@ import type {
 } from "./types";
 
 type HistoryView = "replay" | "intelligence";
-type PrimaryView = "live" | "history" | "operations";
-type ViewMode = "live" | HistoryView | "operations";
+type PrimaryView = "live" | "prematch" | "history" | "operations";
+type ViewMode = "live" | "prematch" | HistoryView | "operations";
 
 const LIVE_DETAIL_REFRESH_MS = 5_000;
 
@@ -52,9 +56,18 @@ const IntelligenceDashboard = lazy(() =>
   })),
 );
 
+const PrematchWorkspace = lazy(() =>
+  import("./components/PrematchWorkspace").then((module) => ({
+    default: module.PrematchWorkspace,
+  })),
+);
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<MonitorSnapshot | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(initialMonitorMatchId);
+  const [intelligenceMatchId, setIntelligenceMatchId] = useState<number | null>(
+    initialIntelligenceMatchId,
+  );
   const [detail, setDetail] = useState<MatchDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -104,11 +117,12 @@ export default function App() {
           if (disposed) return;
           cursorRef.current = data.cursor;
           setSnapshot(data);
-          setSelectedId((current) => (
-            current && data.matches.some((match) => match.raybet_match_id === current)
+          setSelectedId((current) => {
+            if (view !== "operations") return current;
+            return current && data.matches.some((match) => match.raybet_match_id === current)
               ? current
-              : preferredMatch(data.matches, "live")
-          ));
+              : preferredMatch(data.matches, "live");
+          });
           setError(null);
         })
         .catch((reason: Error) => {
@@ -143,11 +157,6 @@ export default function App() {
         setHistoryLoaded(true);
         setHistoryLoading(false);
         setHistoryError(null);
-        setSelectedId((current) => (
-          current && page.items.some((match) => match.raybet_match_id === current)
-              ? current
-              : page.items[0]?.raybet_match_id || null
-        ));
       })
       .catch((reason: Error) => {
         if (!disposed && reason.name !== "AbortError") {
@@ -354,6 +363,50 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const syncMonitorLocation = () => {
+      const liveMatchId = liveMatchIdFromPath();
+      if (liveMatchId) {
+        setView("live");
+        setSelectedId(liveMatchId);
+        setIntelligenceMatchId(null);
+        setDetailError(null);
+        return;
+      }
+      const replayMatchId = replayMatchIdFromPath();
+      if (replayMatchId) {
+        historyViewRef.current = "replay";
+        setView("replay");
+        setSelectedId(replayMatchId);
+        setIntelligenceMatchId(null);
+        setDetailError(null);
+        return;
+      }
+      const intelligenceId = intelligenceMatchIdFromPath();
+      if (intelligenceId != null) {
+        historyViewRef.current = "intelligence";
+        setView("intelligence");
+        setSelectedId(null);
+        setIntelligenceMatchId(intelligenceId);
+        setDetailError(null);
+        return;
+      }
+      const pathname = normalizedPathname();
+      if (pathname === "/" || pathname === "/monitor") {
+        const next = initialView();
+        setView(next);
+        if (next === "replay" || next === "intelligence") {
+          historyViewRef.current = next;
+        }
+        if (next === "live" || next === "replay") setSelectedId(null);
+        if (next === "intelligence") setIntelligenceMatchId(null);
+        setDetailError(null);
+      }
+    };
+    window.addEventListener("popstate", syncMonitorLocation);
+    return () => window.removeEventListener("popstate", syncMonitorLocation);
+  }, []);
+
+  useEffect(() => {
     if (!selectedId || (view !== "live" && view !== "replay")) {
       setDetail(null);
       setDetailLoading(false);
@@ -402,21 +455,20 @@ export default function App() {
   useEffect(() => {
     if (view === "live" && snapshot) {
       const visible = matchesForView(snapshot.matches, "live");
-      setSelectedId((current) => (
-        current && visible.some((match) => match.raybet_match_id === current)
-          ? current
-          : preferredMatch(snapshot.matches, "live")
-      ));
+      if (selectedId && !visible.some((match) => match.raybet_match_id === selectedId)) {
+        setSelectedId(null);
+        setDetailError(null);
+        window.history.replaceState(null, "", "/monitor");
+      }
       return;
     }
-    if (view === "replay" && historyLoaded) {
-      setSelectedId((current) => (
-        current && historyMatches.some((match) => match.raybet_match_id === current)
-          ? current
-          : historyMatches[0]?.raybet_match_id || null
-      ));
+    if (view === "operations" && snapshot) {
+      if (!selectedId || !snapshot.matches.some((match) => match.raybet_match_id === selectedId)) {
+        setSelectedId(preferredMatch(snapshot.matches, "live"));
+      }
+      return;
     }
-  }, [historyLoaded, historyMatches, snapshot, view]);
+  }, [selectedId, snapshot, view]);
 
   useEffect(() => {
     if (!selectedId || view !== "operations") {
@@ -509,6 +561,8 @@ export default function App() {
     ? matchesForView(matches, view)
     : [];
   const selectedMatch = matches.find((match) => match.raybet_match_id === selectedId) || null;
+  const selectedDetail = detail?.raybet_match_id === selectedId ? detail : null;
+  const workspaceMatch = selectedMatch || selectedDetail;
   const mappings = mappingState.matchId === selectedId && mappingState.version === mappingVersion
     ? mappingState.records
     : [];
@@ -516,9 +570,13 @@ export default function App() {
     () => (snapshot?.alerts || []).filter((item) => !item.acknowledged_at).length,
     [snapshot?.alerts],
   );
-  const viewSummary = snapshot ? summaryForView(snapshot.summary, view) : null;
+  const viewSummary = snapshot && view !== "prematch"
+    ? summaryForView(snapshot.summary, view)
+    : null;
   const historySummary = lifecycleCounts(historyMatches);
-  const displayedError = view === "replay" ? historyError : error;
+  const displayedError = view === "prematch"
+    ? null
+    : view === "replay" ? historyError : error;
 
   const changeView = (next: ViewMode) => {
     if (next === "replay" || next === "intelligence") {
@@ -526,24 +584,25 @@ export default function App() {
     }
     setView(next);
     const query = new URLSearchParams(window.location.search);
-    if (next === "live") query.delete("view");
+    if (next === "live" || next === "prematch") query.delete("view");
     else query.set("view", next);
     const search = query.toString();
+    const pathname = next === "prematch" ? "/prematch" : "/monitor";
     window.history.replaceState(
       null,
       "",
-      `${window.location.pathname}${search ? `?${search}` : ""}${window.location.hash}`,
+      `${pathname}${search ? `?${search}` : ""}${window.location.hash}`,
     );
-    if (next === "live" && snapshot) {
-      setSelectedId(preferredMatch(snapshot.matches, "live"));
+    setIntelligenceMatchId(null);
+    if (next === "live" || next === "replay") {
+      setSelectedId(null);
+      setDetailError(null);
     } else if (
       next === "operations"
       && snapshot
       && !snapshot.matches.some((match) => match.raybet_match_id === selectedId)
     ) {
       setSelectedId(preferredMatch(snapshot.matches, "live"));
-    } else if (next === "replay") {
-      setSelectedId(historyMatches[0]?.raybet_match_id || null);
     }
   };
 
@@ -551,10 +610,73 @@ export default function App() {
     changeView(next === "history" ? historyViewRef.current : next);
   };
 
+  const openLiveMatch = (matchId: string) => {
+    setSelectedId(matchId);
+    setDetailError(null);
+    window.history.pushState(
+      { liveDetailFromList: true },
+      "",
+      `/monitor/matches/${encodeURIComponent(matchId)}`,
+    );
+  };
+
+  const openReplayMatch = (matchId: string) => {
+    setSelectedId(matchId);
+    setDetailError(null);
+    window.history.pushState(
+      { replayDetailFromList: true },
+      "",
+      `/monitor/history/odds/${encodeURIComponent(matchId)}`,
+    );
+  };
+
+  const openIntelligenceMatch = (matchId: number) => {
+    setIntelligenceMatchId(matchId);
+    window.history.pushState(
+      { intelligenceDetailFromList: true },
+      "",
+      `/monitor/history/intelligence/${matchId}`,
+    );
+  };
+
+  const returnToLiveList = () => {
+    if (window.history.state?.liveDetailFromList) {
+      setSelectedId(null);
+      setDetailError(null);
+      window.history.back();
+      return;
+    }
+    window.history.replaceState(null, "", "/monitor");
+    setSelectedId(null);
+    setDetailError(null);
+  };
+
+  const returnToReplayList = () => {
+    if (window.history.state?.replayDetailFromList) {
+      setSelectedId(null);
+      setDetailError(null);
+      window.history.back();
+      return;
+    }
+    window.history.replaceState(null, "", "/monitor?view=replay");
+    setSelectedId(null);
+    setDetailError(null);
+  };
+
+  const returnToIntelligenceList = () => {
+    if (window.history.state?.intelligenceDetailFromList) {
+      setIntelligenceMatchId(null);
+      window.history.back();
+      return;
+    }
+    window.history.replaceState(null, "", "/monitor?view=intelligence");
+    setIntelligenceMatchId(null);
+  };
+
   const primaryView: PrimaryView = view === "live"
     ? "live"
-    : view === "operations"
-      ? "operations"
+    : view === "prematch" || view === "operations"
+      ? view
       : "history";
 
   const runControl = async (
@@ -668,7 +790,8 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
+      <div className="app-header-stack">
+        <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark"><Pulse size={21} weight="bold" aria-hidden="true" /></div>
           <div>
@@ -684,6 +807,7 @@ export default function App() {
           size="small"
         >
           <Tab icon={<Broadcast size={17} />} value="live">滚球列表</Tab>
+          <Tab icon={<ChartLineUp size={17} />} value="prematch">赛前预测</Tab>
           <Tab icon={<ClockCounterClockwise size={17} />} value="history">历史比赛</Tab>
           <Tab icon={<GearSix size={17} />} value="operations">系统运行</Tab>
         </TabList>
@@ -713,7 +837,9 @@ export default function App() {
             {alertCount}
           </span>
         </div>
-      </header>
+        </header>
+        <SafetyBoundaryBar snapshot={snapshot} />
+      </div>
 
       {(view === "replay" || view === "intelligence") && (
         <div className="history-mode-bar">
@@ -749,7 +875,7 @@ export default function App() {
                 : historyLoaded ? "已全部加载" : "尚未加载"}
           </span>
         </section>
-      ) : view !== "intelligence" && snapshot && (
+      ) : view !== "intelligence" && view !== "prematch" && snapshot && (
         <section className="summary-bar" aria-label="赛事与系统摘要">
           {view === "operations" ? (
             <>
@@ -791,9 +917,17 @@ export default function App() {
         </div>
       )}
 
-      {view === "intelligence" ? (
+      {view === "prematch" ? (
+        <Suspense fallback={<div className="view-loading" role="status">正在加载赛前预测</div>}>
+          <PrematchWorkspace />
+        </Suspense>
+      ) : view === "intelligence" ? (
         <Suspense fallback={<div className="view-loading" role="status">正在加载赛后情报</div>}>
-          <IntelligenceDashboard />
+          <IntelligenceDashboard
+            initialMatchId={intelligenceMatchId}
+            onMatchList={returnToIntelligenceList}
+            onMatchOpen={openIntelligenceMatch}
+          />
         </Suspense>
       ) : view === "operations" ? (
         <div className="operations-view">
@@ -813,27 +947,56 @@ export default function App() {
             onInvalidateMapping={invalidateSelectedMapping}
           />
         </div>
-      ) : (
-        <div className={`cockpit-grid ${view === "replay" ? "history-replay" : ""}`}>
+      ) : view === "live" || view === "replay" ? (
+        selectedId ? (
+          <div className="live-detail-view">
+            <div className="live-detail-toolbar">
+              <button
+                aria-label={view === "replay" ? "返回赔率复盘列表" : "返回滚球列表"}
+                className="live-detail-back"
+                onClick={view === "replay" ? returnToReplayList : returnToLiveList}
+                type="button"
+              >
+                <ArrowLeft size={17} weight="bold" aria-hidden="true" />
+                <span>{view === "replay" ? "赔率复盘列表" : "滚球列表"}</span>
+              </button>
+              <div className="live-detail-context">
+                <strong>{workspaceMatch
+                  ? `${workspaceMatch.team_one || "队伍一"} vs ${workspaceMatch.team_two || "队伍二"}`
+                  : view === "replay" ? "赔率复盘详情" : "滚球赛事详情"}</strong>
+                <span>{workspaceMatch?.tournament || selectedId}</span>
+              </div>
+            </div>
+            {!workspaceMatch && detailLoading ? (
+              <div className="view-loading" role="status">正在加载赛事详情</div>
+            ) : (
+              <MatchWorkspace
+                detail={selectedDetail}
+                error={detailError}
+                loading={detailLoading}
+                match={workspaceMatch}
+                now={now}
+                replay={view === "replay"}
+              />
+            )}
+          </div>
+        ) : (
           <MatchRail
-            historyHasMore={historyHasMore || (!historyLoaded && Boolean(historyError))}
-            historyLoading={historyLoading}
+            historyHasMore={view === "replay"
+              ? historyHasMore || (!historyLoaded && Boolean(historyError))
+              : undefined}
+            historyLoading={view === "replay" ? historyLoading : undefined}
             matches={railMatches}
             mode={view === "replay" ? "history" : "live"}
             now={now}
-            onLoadMore={() => void loadMoreHistory()}
-            onSelect={setSelectedId}
-            selectedId={selectedId}
+            onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
+            onSelect={view === "replay" ? openReplayMatch : openLiveMatch}
+            selectedId={null}
+            variant="page"
           />
-          <MatchWorkspace
-            detail={detail?.raybet_match_id === selectedId ? detail : null}
-            error={detailError}
-            loading={detailLoading}
-            match={selectedMatch}
-            now={now}
-            replay={view === "replay"}
-          />
-        </div>
+        )
+      ) : (
+        <div className="view-loading" role="status">正在加载视图</div>
       )}
     </div>
   );
@@ -844,12 +1007,62 @@ function errorText(reason: unknown, fallback: string): string {
 }
 
 function initialView(): ViewMode {
+  if (liveMatchIdFromPath()) return "live";
+  if (replayMatchIdFromPath()) return "replay";
+  if (intelligenceMatchIdFromPath() != null) return "intelligence";
+  if (window.location.pathname.replace(/\/+$/, "") === "/prematch") {
+    return "prematch";
+  }
   const requested = new URLSearchParams(window.location.search).get("view");
   return requested === "replay"
     || requested === "intelligence"
     || requested === "operations"
     ? requested
     : "live";
+}
+
+function normalizedPathname(): string {
+  const normalized = window.location.pathname.replace(/\/+$/, "");
+  return normalized || "/";
+}
+
+function initialMonitorMatchId(): string | null {
+  return liveMatchIdFromPath() || replayMatchIdFromPath();
+}
+
+function initialIntelligenceMatchId(): number | null {
+  return intelligenceMatchIdFromPath();
+}
+
+function liveMatchIdFromPath(): string | null {
+  const match = normalizedPathname().match(/^\/monitor\/matches\/([^/]+)$/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function replayMatchIdFromPath(): string | null {
+  return decodedPathSegment(/^\/monitor\/history\/odds\/([^/]+)$/);
+}
+
+function intelligenceMatchIdFromPath(): number | null {
+  const raw = decodedPathSegment(/^\/monitor\/history\/intelligence\/([^/]+)$/);
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const matchId = Number(raw);
+  return Number.isSafeInteger(matchId) ? matchId : null;
+}
+
+function decodedPathSegment(pattern: RegExp): string | null {
+  const match = normalizedPathname().match(pattern);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
 }
 
 function playAlertTone(critical: boolean): void {
@@ -925,6 +1138,98 @@ function isHistoricalMatch(match: MonitorSnapshot["matches"][number]): boolean {
 
 function isLiveEligible(match: MonitorSnapshot["matches"][number]): boolean {
   return match.history_eligible === false;
+}
+
+function SafetyBoundaryBar({ snapshot }: { snapshot: MonitorSnapshot | null }) {
+  const directStatus = snapshot?.capabilities?.direct_market_collection?.status;
+  const paperStatus = snapshot?.capabilities?.paper_decision?.status;
+  const governance = snapshot?.milestone_governance;
+  const integrity = governance?.ledger_integrity?.status || governance?.status;
+  const governanceStatus = governance?.governance_status;
+  const governanceTone = !integrity && !governanceStatus
+    ? "neutral"
+    : governanceStatus === "revoked" || governanceStatus === "review_required"
+      ? "critical"
+      : integrity === "verified"
+        ? "positive"
+        : "warning";
+
+  return (
+    <section className="safety-boundary" aria-label="运行安全边界">
+      <div className="safety-boundary-mode">
+        <LockSimple size={17} weight="bold" aria-hidden="true" />
+        <strong>PAPER ONLY</strong>
+        <span>控制台仅提供纸面决策与本地运维，不包含真实下注入口</span>
+      </div>
+      <div className="safety-boundary-facts">
+        <SafetyFact
+          label="直连市场"
+          status={capabilityLabel(directStatus)}
+          tone={capabilityTone(directStatus)}
+        />
+        <SafetyFact
+          label="纸面策略"
+          status={capabilityLabel(paperStatus)}
+          tone={capabilityTone(paperStatus)}
+        />
+        <SafetyFact
+          label="治理链"
+          status={governanceLabel(integrity, governanceStatus)}
+          tone={governanceTone}
+        />
+      </div>
+    </section>
+  );
+}
+
+function SafetyFact({
+  label,
+  status,
+  tone,
+}: {
+  label: string;
+  status: string;
+  tone: "neutral" | "positive" | "warning" | "critical";
+}) {
+  return (
+    <span className={`safety-fact ${tone}`}>
+      <ShieldCheck size={14} aria-hidden="true" />
+      <span>{label}</span>
+      <strong>{status}</strong>
+    </span>
+  );
+}
+
+function capabilityLabel(status?: string): string {
+  if (!status) return "待加载";
+  const labels: Record<string, string> = {
+    ready: "就绪",
+    healthy: "健康",
+    delayed: "延迟",
+    stale: "过期",
+    missing: "缺失",
+    invalid: "无效",
+    unconfirmed: "待确认",
+    degraded: "降级",
+    unhealthy: "异常",
+    stopped: "未运行",
+  };
+  return labels[status] || status;
+}
+
+function capabilityTone(status?: string): "neutral" | "positive" | "warning" | "critical" {
+  if (!status) return "neutral";
+  if (status === "ready" || status === "healthy") return "positive";
+  if (status === "invalid" || status === "unhealthy") return "critical";
+  return "warning";
+}
+
+function governanceLabel(integrity?: string, status?: string): string {
+  if (status === "revoked") return "已撤销";
+  if (status === "review_required") return "需复核";
+  if (integrity === "verified") return "已校验";
+  if (integrity === "not_configured") return "未配置";
+  return integrity ? capabilityLabel(integrity) : "待加载";
 }
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {

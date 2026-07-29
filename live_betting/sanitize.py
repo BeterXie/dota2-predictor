@@ -48,6 +48,7 @@ _DROP = object()
 PUBLIC_STREAM_HOSTS = frozenset(
     {
         "play.ehome.gg",
+        "play.xmshlb.com",
         "qplay.ehome.gg",
         "qplay.shyxswl.com",
     }

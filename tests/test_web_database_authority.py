@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -103,16 +104,21 @@ def test_prediction_code_uses_the_queries_database_authority(
 
     observed: list[str] = []
 
-    def predict_match(database_path: str, *_: object, **__: object) -> dict:
-        observed.append(database_path)
-        return {
-            "radiant_win_prob": 0.5,
-            "confidence": "low",
-            "confidence_score": 0.1,
-            "components": {"hero_matchup": {}},
-            "weights_used": {},
-            "raw_score": 0.0,
-        }
+    score = SimpleNamespace(
+        pure_lineup_score=0.0,
+        player_adjusted_lineup_score=None,
+        effective_lineup_score=0.0,
+        scoring_mode="pure",
+        player_coverage_count=0,
+        stake_multiplier=0.5,
+        formula_version="rosh-test",
+        source_name="stratz",
+        source_week=1_800_000_000,
+        source_as_of=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        evidence_hash="a" * 64,
+        evidence={"pure_minute_table": []},
+    )
+    client = SimpleNamespace(fetch_lineup_score=lambda *_a, **_k: score)
 
     def format_output(*args: object) -> dict[str, object]:
         observed.append(str(args[-1]))
@@ -128,7 +134,7 @@ def test_prediction_code_uses_the_queries_database_authority(
     monkeypatch.setattr(
         web_app,
         "_get_prematch_builder",
-        lambda: (predict_match, output),
+        lambda: (client, output),
     )
     monkeypatch.setattr(web_app, "_PREDICTIONS_DIR", str(tmp_path / "predictions"))
     request = PrematchRequest(
@@ -143,7 +149,7 @@ def test_prediction_code_uses_the_queries_database_authority(
         queries.init_db(previous)
 
     assert result["status"] == "ok"
-    assert observed == [str(database.resolve()), str(database.resolve())]
+    assert observed == [str(database.resolve())]
 
 
 def test_web_lifespan_holds_its_lock_and_reaps_completed_fetch(

@@ -136,6 +136,63 @@ def test_shared_authority_verifier_recomputes_state_transport_and_raw(
         ) == (1, 1, 1, 0)
 
 
+def test_closed_even_money_member_does_not_reject_other_live_odds(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    payload = odds_payload()
+    closed = dict(payload["result"]["odds"][0])  # type: ignore[index]
+    closed.update(id="settled-map", odds="1.00", status=4)
+    payload["result"]["odds"].append(closed)  # type: ignore[index]
+    rows = snapshots_from_payload(payload, received_at=NOW)
+
+    with LiveBettingStore(
+        tmp_path / "closed.db", raw_archive_root=raw_root
+    ) as store:
+        store.init_schema()
+        _, changes = store.store_odds_observation(
+            source="direct",
+            observation_key="closed",
+            source_event_id=None,
+            raybet_match_id="1001",
+            observed_at=NOW,
+            normalized_state_hash=normalized_state_hash(rows),
+            snapshots=rows,
+            raw_payload=payload,
+        )
+        verified = verify_odds_response_authority(store.connection, raw_root)
+
+        assert changes == 2
+        assert scalar(store, "SELECT COUNT(*) FROM odds_snapshots") == 2
+        assert verified.state_count == 1
+        assert verified.transport_count == 1
+
+
+def test_unparsed_non_closed_member_still_rejects_entire_response(
+    tmp_path: Path,
+) -> None:
+    payload = odds_payload()
+    invalid = dict(payload["result"]["odds"][0])  # type: ignore[index]
+    invalid.update(id="invalid-zero", odds="0.00", status=4)
+    payload["result"]["odds"].append(invalid)  # type: ignore[index]
+    rows = snapshots_from_payload(payload, received_at=NOW)
+
+    with LiveBettingStore(tmp_path / "invalid-zero.db") as store:
+        store.init_schema()
+        with pytest.raises(ValueError, match="unparsed odds members"):
+            store.store_odds_observation(
+                source="direct",
+                observation_key="invalid-zero",
+                source_event_id=None,
+                raybet_match_id="1001",
+                observed_at=NOW,
+                normalized_state_hash=normalized_state_hash(rows),
+                snapshots=rows,
+                raw_payload=payload,
+            )
+        assert scalar(store, "SELECT COUNT(*) FROM odds_transport_observations") == 0
+
+
 def test_shared_authority_verifier_rejects_valid_artifact_bound_to_wrong_state(
     tmp_path: Path,
 ) -> None:

@@ -12,8 +12,15 @@ import {
 import type {
   IntelligenceDraftQualitySlice,
   IntelligenceOverview,
+  IntelligenceRoshMinutePoint,
 } from "../types";
-import { IntelligenceDashboard, summarizeCutoffs } from "./IntelligenceDashboard";
+import {
+  IntelligenceDashboard,
+} from "./IntelligenceDashboard";
+import {
+  selectRoshMinutePoints,
+  summarizeCutoffs,
+} from "../utils/intelligenceUtils";
 
 vi.mock("../api", () => ({
   fetchIntelligenceMatchDetail: vi.fn(),
@@ -46,6 +53,17 @@ beforeEach(() => {
 });
 
 describe("IntelligenceDashboard", () => {
+  it("keeps five-minute Rosh checkpoints and advantage reversals", () => {
+    const points = Array.from({ length: 41 }, (_, index) => {
+      const minute = index + 20;
+      return roshMinute(minute, minute < 33 ? 4.2 : -2.5, 40, 1, 1, 0);
+    });
+
+    expect(selectRoshMinutePoints(points).map((point: IntelligenceRoshMinutePoint) => point.minute)).toEqual([
+      20, 25, 30, 33, 35, 40, 45, 50, 55, 60,
+    ]);
+  });
+
   it("summarizes large benchmark cutoff sets without expanding every timestamp", () => {
     const cutoffs = Array.from({ length: 296 }, (_, index) => (
       new Date(Date.UTC(2026, 0, 1, index)).toISOString()
@@ -348,6 +366,10 @@ describe("IntelligenceDashboard", () => {
 
     renderDashboard();
 
+    expect(await screen.findByRole("main", { name: "OpenDota 比赛列表" })).toBeInTheDocument();
+    expect(detailMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /查看 Aurora 对 Beacon/ }));
+
     expect(await screen.findByText("River")).toBeInTheDocument();
     expect(screen.getAllByText("翻盘局").length).toBeGreaterThan(0);
     expect(screen.getAllByText("被翻盘局").length).toBeGreaterThan(0);
@@ -386,7 +408,9 @@ describe("IntelligenceDashboard", () => {
     expect(screen.queryByText("不合成未定义的比赛总分，保留各项可审计结果")).not.toBeInTheDocument();
     expect(screen.getByText("评分待处理")).toBeInTheDocument();
     expect(screen.getAllByText("历史重建").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("击杀比分 31 : 18")).toHaveLength(2);
+    expect(screen.getAllByText("击杀比分 31 : 18")).toHaveLength(1);
+    expect(screen.getAllByText("胜")).toHaveLength(1);
+    expect(screen.getAllByText("负")).toHaveLength(1);
     expect(screen.getByText("比赛局势分类")).toBeInTheDocument();
     expect(screen.queryByText("比赛局势评分")).not.toBeInTheDocument();
     expect(detailMock).toHaveBeenCalledWith(9001, expect.any(AbortSignal));
@@ -470,13 +494,15 @@ describe("IntelligenceDashboard", () => {
 
     renderDashboard();
 
+    fireEvent.click(await screen.findByRole("button", { name: /查看 Aurora 对 Beacon/ }));
+
     const rosh = await screen.findByRole("region", { name: "Rosh 阵容评分" });
     expect(within(rosh).getByText("当前没有可展示的 Rosh 阵容评分")).toBeInTheDocument();
     expect(within(rosh).getByText("historical_rosh_lineup_score_missing")).toBeInTheDocument();
     expect(within(rosh).queryByText("0.00")).not.toBeInTheDocument();
   });
 
-  it("prefers a completed intelligence match over a newer pending row", async () => {
+  it("opens the requested completed intelligence match without auto-selecting", async () => {
     const base = {
       radiant_team_id: 101,
       dire_team_id: 202,
@@ -540,6 +566,12 @@ describe("IntelligenceDashboard", () => {
     });
 
     renderDashboard();
+
+    expect(await screen.findByRole("main", { name: "OpenDota 比赛列表" })).toBeInTheDocument();
+    expect(detailMock).not.toHaveBeenCalled();
+    const completedRow = screen.getByText("#9001").closest("button");
+    if (!(completedRow instanceof HTMLButtonElement)) throw new Error("completed match row not found");
+    fireEvent.click(completedRow);
 
     await waitFor(() => {
       expect(detailMock).toHaveBeenCalledWith(9001, expect.any(AbortSignal));

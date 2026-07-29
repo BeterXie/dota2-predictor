@@ -534,9 +534,25 @@ def monitor_match_detail(
         else []
     )
     trusted_context = _trusted_live_context(connection, raybet_match_id, checked_at)
+    latest_capture = _latest_capture_row(
+        connection,
+        raybet_match_id,
+        now=checked_at,
+    )
     return {
         **summary,
         "milestone_governance": governance,
+        "prematch_winner": (
+            _current_winner(
+                connection,
+                raybet_match_id,
+                provider_status=str(summary["provider_status"]),
+                processing_status="audit_only",
+                transport_only=True,
+            )
+            if summary["lifecycle"] == "upcoming"
+            else None
+        ),
         "latest_decision": decisions[-1] if decisions else None,
         "winner_timeline": timeline,
         "decisions": decisions,
@@ -545,6 +561,11 @@ def monitor_match_detail(
             raybet_match_id,
             now=checked_at,
             max_points=max_points,
+        ),
+        "latest_capture": (
+            _capture_point(latest_capture, raybet_match_id)
+            if latest_capture is not None
+            else None
         ),
         "markets": current_markets(
             connection,
@@ -1551,6 +1572,8 @@ def _current_winner(
     raybet_match_id: str,
     *,
     provider_status: str,
+    processing_status: str = "processed",
+    transport_only: bool = False,
 ) -> dict[str, Any] | None:
     transport_columns = _relation_columns(
         connection, "odds_transport_observations"
@@ -1573,6 +1596,8 @@ def _current_winner(
                 WHERE raybet_match_id=? LIMIT 1""",
             (raybet_match_id,),
         ).fetchone() is not None
+    if transport_only and not has_transport:
+        return None
 
     if has_transport:
         if not _relation_has_columns(
@@ -1601,7 +1626,7 @@ def _current_winner(
                     WHERE raybet_match_id=?
                       AND source='direct'
                       AND timing_status='on_time'
-                      AND processing_status='processed'
+                      AND processing_status=?
                     ORDER BY observed_at DESC, observation_key DESC
                     LIMIT 16
                )
@@ -1618,7 +1643,7 @@ def _current_winner(
                 ORDER BY recent_transport.observed_at DESC,
                          recent_transport.observation_key DESC,
                          outcome.odds_id DESC""",
-                (raybet_match_id, raybet_match_id),
+                (raybet_match_id, processing_status, raybet_match_id),
             )
         except sqlite3.OperationalError as error:
             # Once exact transport membership exists, a malformed response
@@ -3948,6 +3973,80 @@ def valid_vision_frame_observation(
     return _vision_point(rows[0], raybet_match_id) if rows else None
 
 
+def valid_capture_frame_observation(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    frame_ref: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    row = _latest_capture_row(
+        connection,
+        raybet_match_id,
+        now=_aware_utc(now or utc_now()),
+        source_frame_ref=frame_ref,
+    )
+    return _capture_point(row, raybet_match_id) if row is not None else None
+
+
+def _latest_capture_row(
+    connection: sqlite3.Connection,
+    raybet_match_id: str,
+    *,
+    now: datetime,
+    source_frame_ref: str | None = None,
+) -> sqlite3.Row | None:
+    frame_filter = (
+        "AND observation.source_frame_ref=?" if source_frame_ref is not None else ""
+    )
+    params: tuple[Any, ...] = (raybet_match_id, now.isoformat())
+    if source_frame_ref is not None:
+        params += (source_frame_ref,)
+    try:
+        return connection.execute(
+            f"""SELECT observation.captured_at,
+                       observation.captured_at AS observed_at,
+                       observation.map_number,
+                       observation.game_clock_seconds,
+                       observation.is_paused,
+                       observation.radiant_team_side,
+                       observation.clock_confidence,
+                       observation.draft_confidence,
+                       observation.source_frame_ref,
+                       observation.screen_state,
+                       observation.confirmed,
+                       frame.content_sha256 AS _frame_digest
+                  FROM vision_observations AS observation
+                  JOIN active_vision_frame_artifacts AS frame
+                    ON frame.frame_ref=observation.source_frame_ref
+                   AND frame.content_sha256=observation.source_frame_sha256
+                   AND frame.byte_length=observation.source_frame_bytes
+                 WHERE observation.raybet_match_id=?
+                   AND julianday(observation.captured_at) IS NOT NULL
+                   AND julianday(observation.captured_at)<=julianday(?)
+                   AND observation.source_frame_ref=
+                       ? || frame.content_sha256
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM vision_observation_invalidations AS invalidation
+                         WHERE invalidation.raybet_match_id=
+                               observation.raybet_match_id
+                           AND invalidation.captured_at=observation.captured_at
+                           AND invalidation.source_frame_ref=
+                               observation.source_frame_ref
+                   )
+                   {frame_filter}
+                 ORDER BY observation.captured_at DESC,
+                          observation.source_frame_ref DESC
+                 LIMIT 1""",
+            (*params[:2], VISION_FRAME_REF_PREFIX, *params[2:]),
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if classify_sqlite_error(error) == "schema_missing":
+            return None
+        raise
+
+
 def _latest_valid_vision_row(
     connection: sqlite3.Connection,
     raybet_match_id: str,
@@ -4072,6 +4171,22 @@ def _vision_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
         point["frame_url"] = (
             f"/api/monitor/matches/{url_quote(raybet_match_id, safe='')}"
             f"/vision-frames/{digest}.jpg"
+        )
+    else:
+        point["frame_digest"] = None
+        point["frame_url"] = None
+    return point
+
+
+def _capture_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
+    point = dict(row)
+    digest = point.pop("_frame_digest", None)
+    point["strategy_authority"] = False
+    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+        point["frame_digest"] = digest
+        point["frame_url"] = (
+            f"/api/monitor/matches/{url_quote(raybet_match_id, safe='')}"
+            f"/captures/{digest}.jpg"
         )
     else:
         point["frame_digest"] = None

@@ -52,14 +52,18 @@ vi.mock("@fluentui/react-components", () => ({
   ),
 }));
 vi.mock("./components/MatchRail", () => ({
-  MatchRail: ({ matches, onSelect, historyHasMore, historyLoading, onLoadMore }: {
+  MatchRail: ({ matches, mode, onSelect, historyHasMore, historyLoading, onLoadMore, variant }: {
     matches: MonitorMatch[];
+    mode: "live" | "history";
     onSelect: (matchId: string) => void;
     historyHasMore?: boolean;
     historyLoading?: boolean;
     onLoadMore?: () => void;
+    variant?: "rail" | "page";
   }) => (
-    <nav>
+    <nav data-testid={variant === "page"
+      ? mode === "history" ? "replay-match-list" : "live-match-list"
+      : "match-rail"}>
       {matches.map((match) => (
         <button key={match.raybet_match_id} onClick={() => onSelect(match.raybet_match_id)}>
           select-{match.raybet_match_id}
@@ -78,8 +82,25 @@ vi.mock("./components/MatchWorkspace", () => ({
     <main>{replay ? "odds-replay" : "live-workspace"}</main>
   ),
 }));
+vi.mock("./components/PrematchWorkspace", () => ({
+  PrematchWorkspace: () => <main>stratz-rosh-prematch</main>,
+}));
 vi.mock("./components/IntelligenceDashboard", () => ({
-  IntelligenceDashboard: () => <section>opendota-postmatch</section>,
+  IntelligenceDashboard: ({ initialMatchId, onMatchList, onMatchOpen }: {
+    initialMatchId?: number | null;
+    onMatchList?: () => void;
+    onMatchOpen?: (matchId: number) => void;
+  }) => (
+    <section>
+      <span>opendota-postmatch</span>
+      <span data-testid="intelligence-match-id">{initialMatchId ?? "list"}</span>
+      {initialMatchId == null ? (
+        <button onClick={() => onMatchOpen?.(9001)}>open-intelligence-9001</button>
+      ) : (
+        <button onClick={onMatchList}>back-intelligence-list</button>
+      )}
+    </section>
+  ),
 }));
 vi.mock("./components/OperationsPanel", () => ({
   OperationsPanel: ({ alerts, components, controlMessage, match, mappings, onAcknowledge }: {
@@ -275,13 +296,26 @@ describe("App data recovery and ownership", () => {
   it("separates live matches, historical evidence, and operations", async () => {
     render(<App />);
 
-    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    expect(await screen.findByTestId("live-match-list")).toBeInTheDocument();
+    expect(screen.queryByText("live-workspace")).not.toBeInTheDocument();
+    expect(api.fetchMatchDetail).not.toHaveBeenCalled();
     expect(screen.queryByTestId("selected-match")).not.toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("button", { name: "select-a" }));
+    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/monitor/matches/a");
+
+    fireEvent.click(screen.getByRole("button", { name: "赛前预测" }));
+    expect(await screen.findByText("stratz-rosh-prematch")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/prematch");
+    expect(screen.queryByText("live-workspace")).not.toBeInTheDocument();
+
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    expect(window.location.pathname).toBe("/monitor");
     expect(screen.getByRole("button", { name: "赔率复盘" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
-    expect(screen.getByText("odds-replay")).toBeInTheDocument();
+    expect(screen.getByTestId("replay-match-list")).toBeInTheDocument();
+    expect(screen.queryByText("odds-replay")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "OpenDota 赛后情报" }));
     expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
@@ -293,6 +327,72 @@ describe("App data recovery and ownership", () => {
     expect(screen.getByText("活动告警")).toBeInTheDocument();
     expect(screen.queryByText("opendota-postmatch")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-a" })).not.toBeInTheDocument();
+  });
+
+  it("returns from a live detail to the list and supports direct detail links", async () => {
+    window.history.replaceState(null, "", "/monitor/matches/b");
+    render(<App />);
+
+    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    expect(api.fetchMatchDetail).toHaveBeenCalledWith("b", expect.any(AbortSignal));
+
+    fireEvent.click(screen.getByRole("button", { name: "返回滚球列表" }));
+    expect(await screen.findByTestId("live-match-list")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/monitor");
+  });
+
+  it("uses browser history when a list row opens a live detail", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "select-b" }));
+    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/monitor/matches/b");
+
+    fireEvent.click(screen.getByRole("button", { name: "返回滚球列表" }));
+    expect(await screen.findByTestId("live-match-list")).toBeInTheDocument();
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
+  });
+
+  it("opens replay and OpenDota details from their history lists", async () => {
+    const replayMatch: MonitorMatch = {
+      ...match("replay-route"),
+      lifecycle: "ended",
+      history_eligible: true,
+    };
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [replayMatch],
+      next_cursor: null,
+      has_more: false,
+    });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(await screen.findByRole("button", { name: "select-replay-route" }));
+    expect(await screen.findByText("odds-replay")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/monitor/history/odds/replay-route");
+
+    fireEvent.click(screen.getByRole("button", { name: "返回赔率复盘列表" }));
+    expect(await screen.findByTestId("replay-match-list")).toBeInTheDocument();
+    await waitFor(() => expect(window.location.pathname).toBe("/monitor"));
+
+    fireEvent.click(screen.getByRole("button", { name: "OpenDota 赛后情报" }));
+    expect(await screen.findByTestId("intelligence-match-id")).toHaveTextContent("list");
+    fireEvent.click(screen.getByRole("button", { name: "open-intelligence-9001" }));
+    expect(screen.getByTestId("intelligence-match-id")).toHaveTextContent("9001");
+    expect(window.location.pathname).toBe("/monitor/history/intelligence/9001");
+    fireEvent.click(screen.getByRole("button", { name: "back-intelligence-list" }));
+    expect(await screen.findByTestId("intelligence-match-id")).toHaveTextContent("list");
+    await waitFor(() => expect(window.location.pathname).toBe("/monitor"));
+  });
+
+  it("supports direct OpenDota detail links", async () => {
+    window.history.replaceState(null, "", "/monitor/history/intelligence/9001");
+
+    render(<App />);
+
+    expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
+    expect(screen.getByTestId("intelligence-match-id")).toHaveTextContent("9001");
+    expect(api.fetchBootstrap).not.toHaveBeenCalled();
   });
 
   it("labels history counters as the loaded page rather than an all-time total", async () => {
@@ -323,6 +423,17 @@ describe("App data recovery and ownership", () => {
 
     expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
+    expect(api.fetchBootstrap).not.toHaveBeenCalled();
+    expect(api.snapshotStream).not.toHaveBeenCalled();
+  });
+
+  it("opens the integrated prematch view directly without monitor transport", async () => {
+    window.history.replaceState(null, "", "/prematch");
+
+    render(<App />);
+
+    expect(await screen.findByText("stratz-rosh-prematch")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "赛前预测" })).toBeInTheDocument();
     expect(api.fetchBootstrap).not.toHaveBeenCalled();
     expect(api.snapshotStream).not.toHaveBeenCalled();
   });
@@ -584,8 +695,9 @@ describe("App data recovery and ownership", () => {
     });
 
     render(<App />);
-    expect(await screen.findByText("live-workspace")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "select-live" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(await screen.findByRole("button", { name: "select-replay" }));
     expect(await screen.findByText("odds-replay")).toBeInTheDocument();
     expect(close).toHaveBeenCalledTimes(1);
     await waitFor(() => {
@@ -621,6 +733,11 @@ describe("App data recovery and ownership", () => {
     render(<App />);
     await act(async () => {
       await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "select-a" }));
+    await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -825,4 +942,29 @@ describe("App data recovery and ownership", () => {
     expect(screen.getByText("incident-77-unacknowledged")).toBeInTheDocument();
     expect(screen.queryByText("incident-77-acknowledged")).not.toBeInTheDocument();
   });
+  it("shows the paper-only boundary and live capability status", async () => {
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      market_source_policy: "direct_primary",
+      capabilities: {
+        direct_market_collection: { required: true, status: "ready" },
+        paper_decision: { required: true, status: "degraded" },
+      },
+      milestone_governance: {
+        status: "configured",
+        governance_status: "active",
+        ledger_integrity: { status: "verified" },
+      },
+    });
+
+    render(<App />);
+
+    const boundary = await screen.findByRole("region", { name: "运行安全边界" });
+    expect(boundary).toHaveTextContent("PAPER ONLY");
+    expect(boundary).toHaveTextContent("不包含真实下注入口");
+    expect(boundary).toHaveTextContent("直连市场就绪");
+    expect(boundary).toHaveTextContent("纸面策略降级");
+    expect(boundary).toHaveTextContent("治理链已校验");
+  });
+
 });

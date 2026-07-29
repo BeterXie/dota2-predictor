@@ -48,6 +48,30 @@ _Avoid_: M3 readiness, automatic deployment
 The versioned canonical evaluator and policy identity that normatively determine eligibility. Human-readable gate lists are summaries.
 _Avoid_: Checklist policy
 
+**Rosh score**:
+A signed lineup-advantage score under one immutable Rosh parity profile. Positive means Radiant direction and negative means Dire direction. It is not a probability, edge, or stake input.
+_Avoid_: Win probability, confidence
+
+**Rosh minute score**:
+The signed Rosh score for one reached minute bucket. A live decision uses only the latest available bucket at or before the authoritative game minute and never a future bucket.
+_Avoid_: Forecast minute, interpolated future score
+
+**Rosh parity profile**:
+The immutable query, formula, window, fallback, rounding, serialization, and upstream-bundle identity under which Rosh parity is claimed. Any semantic or hash change creates a new profile.
+_Avoid_: Latest Rosh formula, mutable configuration
+
+**Rosh analysis attempt**:
+A request attempt before a canonical draft has been fully validated. For historical_match, transport, HTTP, GraphQL, JSON, and invalid or incomplete GetMatchPicksBans draft failures remain attempts: they return only sanitized structured errors and emit operational metrics/logs, never create a RoshAnalysisRun or invent a null, empty, or partial draft or zero hash.
+_Avoid_: Failed Rosh analysis run, partial run
+
+**RoshAnalysisRun**:
+An immutable succeeded or failed terminal analysis record created only after binding a valid 10-slot canonical draft and its draft_hash. historical_match crosses this boundary only after complete side, position 1..5, and globally unique hero validation; explicit_draft completes the same validation before request planning. A later classifiable failure may form a failed run only with the real draft, request/profile identities, existing sanitized manifest, and a stable error_code, and it has no result or children.
+_Avoid_: Pre-draft attempt, mutable analysis
+
+**Calibrated probability**:
+A probability produced by a versioned calibration artifact evaluated on its declared prospective cohort and feature schema. A raw Rosh score or a linear transformation of it is not a calibrated probability.
+_Avoid_: Rosh score, pseudo-probability
+
 **Milestone revocation**:
 An append-only governance fact that invalidates conclusions dependent on later-conflicted evidence while preserving the original records.
 _Avoid_: Deletion, result rewrite

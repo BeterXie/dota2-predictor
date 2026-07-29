@@ -22,6 +22,7 @@ from event_intelligence.incremental import (
     profile_weighting_is_current,
 )
 from event_intelligence.team_profiles import PROFILE_VERSION
+from prematch.stratz_official_profile import ProfileError, get_profile
 
 from .alignment import align_snapshots
 from .comeback import no_signal_decision
@@ -39,6 +40,9 @@ from .research import (
     append_research_successor_price_labels,
     record_research_prediction,
 )
+from .official_rosh_shadow_strategy import OfficialRoshDirectionShadowStrategy
+from .rosh_evidence import official_rosh_draft_hash
+from .rosh_parity_storage import RoshRunRepository
 from .shadow_strategy import ComebackShadowStrategy
 from .service_coordination import (
     add_single_database_argument,
@@ -1067,6 +1071,73 @@ def _canonical_live_team_ids(
     return None
 
 
+def _record_official_rosh_shadow_evaluation(
+    store: LiveBettingStore,
+    strategy: OfficialRoshDirectionShadowStrategy,
+    observation: VisionObservation,
+    *,
+    map_number: int,
+    underdog_side: str,
+    decided_at: datetime,
+    transport_key: str,
+) -> dict[str, object]:
+    """Evaluate and append the v6 M3-C record without creating an order."""
+
+    try:
+        draft_hash = official_rosh_draft_hash(
+            observation.radiant_hero_ids,
+            observation.dire_hero_ids,
+        )
+        profile = get_profile()
+        run = RoshRunRepository(store.connection).get_latest_succeeded_for_draft(
+            draft_hash,
+            rosh_profile_id=profile.rosh_profile_id,
+            collected_at_lte=decided_at,
+        )
+        evaluation = strategy.evaluate(
+            run=run,
+            observation_draft_hash=draft_hash,
+            game_clock_seconds=observation.game_clock_seconds,
+            underdog_side=underdog_side,
+            radiant_team_side=observation.radiant_team_side,
+        )
+        persisted = store.insert_official_rosh_shadow_evaluation(
+            evaluation,
+            raybet_match_id=observation.raybet_match_id,
+            map_number=map_number,
+            decided_at=decided_at,
+            transport_key=transport_key,
+            observation_draft_hash=draft_hash,
+            source_run_id=None if run is None else run.run.run_id,
+        )
+    except (ProfileError, RuntimeError, ValueError, sqlite3.Error) as error:
+        logger.error(
+            "official Rosh v6 shadow evaluation failed closed (%s)",
+            type(error).__name__,
+        )
+        return {
+            "status": "unavailable",
+            "reason": "official_rosh_v6_unavailable",
+            "inserted": False,
+        }
+    if persisted is None:
+        return {
+            "status": "unavailable",
+            "reason": "confirmed_draft_conflict",
+            "candidate_hash": evaluation.candidate_hash,
+            "inserted": False,
+        }
+    evaluation_key, inserted = persisted
+    return {
+        "status": evaluation.status,
+        "reason": evaluation.reason,
+        "candidate_hash": evaluation.candidate_hash,
+        "evaluation_key": evaluation_key,
+        "analysis_run_id": None if run is None else run.run.run_id,
+        "inserted": inserted,
+    }
+
+
 def run_once(
     store: LiveBettingStore,
     strategy: ComebackShadowStrategy,
@@ -1075,6 +1146,7 @@ def run_once(
     now: datetime | None = None,
     player_identity_resolver: LivePlayerIdentityResolver | None = None,
     rosh_fetch_coordinator: RoshFetchCoordinator | None = None,
+    official_rosh_strategy: OfficialRoshDirectionShadowStrategy | None = None,
 ) -> dict[str, object]:
     run_at = now or datetime.now(timezone.utc)
     comeback_states: dict[
@@ -1423,6 +1495,16 @@ def run_once(
             "research": research_payload,
         }
 
+    official_rosh_v6 = _record_official_rosh_shadow_evaluation(
+        store,
+        official_rosh_strategy or OfficialRoshDirectionShadowStrategy(),
+        observation,
+        map_number=map_number,
+        underdog_side=surface.underdog_side,
+        decided_at=current_transport_at,
+        transport_key=current_transport.observation_key,
+    )
+
     player_identity = None
     if player_identity_resolver is not None:
         live_team_ids = _canonical_live_team_ids(
@@ -1534,6 +1616,7 @@ def run_once(
             "edge": result.decision.edge,
             "inputs": result.decision.inputs,
             "research": research_payload,
+            "official_rosh_v6": official_rosh_v6,
         }
     return {
         "status": "no_signal", "reason": result.decision.reason,
@@ -1541,6 +1624,7 @@ def run_once(
         "decision_key": result.decision.decision_key,
         "inputs": result.decision.inputs,
         "research": research_payload,
+        "official_rosh_v6": official_rosh_v6,
     }
 
 

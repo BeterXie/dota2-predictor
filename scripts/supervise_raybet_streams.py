@@ -107,6 +107,33 @@ def _output_signature(path: Path) -> OutputSignature | None:
     return stat.st_size, stat.st_mtime_ns
 
 
+def _capture_heartbeat_path(output_dir: Path, match_id: str) -> Path:
+    return output_dir / f"{match_id}.heartbeat.json"
+
+
+def _capture_heartbeat(path: Path, match_id: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        captured_at = datetime.fromisoformat(str(payload["captured_at"]))
+        confidence = payload["layout_confidence"]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        payload.get("schema_version") != 1
+        or str(payload.get("match_id")) != match_id
+        or payload.get("capture_status")
+        not in {"producing_trusted", "capturing_unrecognized"}
+        or captured_at.tzinfo is None
+        or captured_at.utcoffset() is None
+        or isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0.0 <= float(confidence) <= 1.0
+        or not isinstance(payload.get("layout_profile"), str)
+    ):
+        return None
+    return {**payload, "captured_at_value": captured_at.astimezone(timezone.utc)}
+
+
 def supervisor_health(
     desired: set[str],
     children: Mapping[str, Child],
@@ -114,6 +141,7 @@ def supervisor_health(
     *,
     started_at: Mapping[str, datetime] | None = None,
     output_baselines: Mapping[str, OutputSignature | None] | None = None,
+    capture_baselines: Mapping[str, OutputSignature | None] | None = None,
     retry_states: Mapping[str, WatcherRetryState] | None = None,
     max_concurrent: int = MAX_CONCURRENT_WATCHERS,
     now: datetime | None = None,
@@ -122,6 +150,7 @@ def supervisor_health(
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     started_at = started_at or {}
     output_baselines = output_baselines or {}
+    capture_baselines = capture_baselines or {}
     retry_states = retry_states or {}
     running = {
         match_id
@@ -129,8 +158,11 @@ def supervisor_health(
         if (child := children.get(match_id)) is not None and child[0].poll() is None
     }
     producing: set[str] = set()
+    capturing: set[str] = set()
+    unrecognized: set[str] = set()
     watcher_details: dict[str, dict[str, object]] = {}
     stale: set[str] = set()
+    capture_stalled_matches: set[str] = set()
     retrying: set[str] = set()
     exhausted: set[str] = set()
     queued: set[str] = set()
@@ -156,12 +188,42 @@ def supervisor_health(
             if output_at is not None
             else None
         )
-        is_producing = bool(
+        heartbeat_path = _capture_heartbeat_path(output_dir, match_id)
+        heartbeat_signature = _output_signature(heartbeat_path)
+        heartbeat = _capture_heartbeat(heartbeat_path, match_id)
+        heartbeat_is_current = heartbeat_signature is not None and (
+            match_id not in capture_baselines
+            or heartbeat_signature != capture_baselines[match_id]
+        )
+        capture_at = (
+            heartbeat.get("captured_at_value") if heartbeat is not None else None
+        )
+        capture_age = (
+            max(0.0, (now - capture_at).total_seconds())
+            if isinstance(capture_at, datetime)
+            else None
+        )
+        fresh_capture = bool(
             is_running
+            and heartbeat_is_current
+            and capture_age is not None
+            and capture_age <= OUTPUT_MAX_AGE.total_seconds()
+        )
+        legacy_producing = bool(
+            heartbeat_signature is None
+            and is_running
             and has_current_output
             and output_age is not None
             and output_age <= OUTPUT_MAX_AGE.total_seconds()
         )
+        capture_status = heartbeat.get("capture_status") if heartbeat else None
+        is_capturing = fresh_capture or legacy_producing
+        is_producing = bool(
+            legacy_producing
+            or (fresh_capture and capture_status == "producing_trusted")
+        )
+        if is_capturing:
+            capturing.add(match_id)
         if is_producing:
             producing.add(match_id)
 
@@ -207,24 +269,53 @@ def supervisor_health(
         elif is_producing:
             state = "producing"
             reason = "fresh_output"
+        elif is_capturing:
+            state = "capturing"
+            reason = "capturing_unrecognized"
+            unrecognized.add(match_id)
         elif startup_age is not None and startup_age <= WATCHER_STARTUP_GRACE.total_seconds():
             state = "running"
             reason = "awaiting_first_output"
         else:
             state = "running"
-            reason = "output_stale" if has_current_output else "no_current_output"
+            reason = "capture_stalled" if heartbeat_signature is not None else (
+                "output_stale" if has_current_output else "no_current_output"
+            )
             stale.add(match_id)
+            if heartbeat_signature is not None:
+                capture_stalled_matches.add(match_id)
+        if not is_running:
+            capture_state = "stream_failed"
+        elif fresh_capture:
+            capture_state = str(capture_status)
+        elif legacy_producing:
+            capture_state = "producing_trusted"
+        elif startup_age is not None and startup_age <= WATCHER_STARTUP_GRACE.total_seconds():
+            capture_state = "starting"
+        else:
+            capture_state = "capture_stalled"
         watcher_details[match_id] = {
             "state": state,
             "running": is_running,
             "producing": is_producing,
             "reason": reason,
+            "capture_state": capture_state,
+            "capture_updated_at": (
+                capture_at.isoformat()
+                if isinstance(capture_at, datetime)
+                else None
+            ),
+            "capture_age_seconds": round(capture_age, 3) if capture_age is not None else None,
+            "layout_profile": heartbeat.get("layout_profile") if heartbeat else None,
+            "layout_confidence": heartbeat.get("layout_confidence") if heartbeat else None,
+            "screen_state": heartbeat.get("screen_state") if heartbeat else None,
+            "replay_gate_status": heartbeat.get("replay_gate_status") if heartbeat else None,
             "output_updated_at": output_at.isoformat() if output_at else None,
             "output_age_seconds": round(output_age, 3) if output_age is not None else None,
             "retry": retry_details,
         }
 
-    waiting = running - producing - stale
+    waiting = running - producing - unrecognized - stale
     if not desired:
         status = "healthy"
         reason = "idle"
@@ -239,8 +330,12 @@ def supervisor_health(
         error = f"watchers not running: {','.join(sorted(missing))}"
     elif stale:
         status = "unhealthy"
-        reason = "watchers_not_producing"
-        error = f"watchers not producing fresh output: {','.join(sorted(stale))}"
+        if capture_stalled_matches:
+            reason = "watchers_capture_stalled"
+            error = f"watchers capture stalled: {','.join(sorted(stale))}"
+        else:
+            reason = "watchers_not_producing"
+            error = f"watchers not producing fresh output: {','.join(sorted(stale))}"
     elif retrying:
         status = "degraded"
         reason = "watcher_retry_scheduled"
@@ -248,6 +343,10 @@ def supervisor_health(
     elif queued:
         status = "degraded"
         reason = "watcher_capacity_limited"
+        error = None
+    elif unrecognized:
+        status = "degraded"
+        reason = "capturing_unrecognized"
         error = None
     elif producing == desired:
         status = "healthy"
@@ -265,9 +364,11 @@ def supervisor_health(
     details: dict[str, object] = {
         "desired_watchers": len(desired),
         "running_watchers": len(running),
+        "capturing_watchers": len(capturing),
         "producing_watchers": len(producing),
         "desired_match_ids": sorted(desired),
         "running_match_ids": sorted(running),
+        "capturing_match_ids": sorted(capturing),
         "producing_match_ids": sorted(producing),
         "retrying_match_ids": sorted(retrying),
         "retry_exhausted_match_ids": sorted(exhausted),
@@ -590,6 +691,7 @@ def _run_cli(args: argparse.Namespace) -> int:
     children: dict[str, Child] = {}
     started_at: dict[str, datetime] = {}
     output_baselines: dict[str, OutputSignature | None] = {}
+    capture_baselines: dict[str, OutputSignature | None] = {}
     retry_states: dict[str, WatcherRetryState] = {}
     child_authorities: dict[str, object] = {}
     last_retention_at: float | None = None
@@ -603,6 +705,10 @@ def _run_cli(args: argparse.Namespace) -> int:
                     match_id: (
                         _output_signature(args.output_dir / f"{match_id}.jsonl")
                         != output_baselines.get(match_id)
+                        or _output_signature(
+                            _capture_heartbeat_path(args.output_dir, match_id)
+                        )
+                        != capture_baselines.get(match_id)
                     )
                     for match_id, (process, _, _) in children.items()
                     if match_id in active and process.poll() is not None
@@ -623,6 +729,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 for match_id in set(started_at) - set(children):
                     started_at.pop(match_id, None)
                     output_baselines.pop(match_id, None)
+                    capture_baselines.pop(match_id, None)
                 for match_id in startable_matches(
                     active,
                     children,
@@ -637,6 +744,9 @@ def _run_cli(args: argparse.Namespace) -> int:
                     )
                     output_baselines[match_id] = _output_signature(
                         args.output_dir / f"{match_id}.jsonl"
+                    )
+                    capture_baselines[match_id] = _output_signature(
+                        _capture_heartbeat_path(args.output_dir, match_id)
                     )
 
                     def register_watcher(
@@ -670,6 +780,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                         stdout.close()
                         stderr.close()
                         output_baselines.pop(match_id, None)
+                        capture_baselines.pop(match_id, None)
                         if not isinstance(error, Exception):
                             raise
                         retry_states[match_id] = watcher_retry_after_failure(
@@ -704,6 +815,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     args.output_dir,
                     started_at=started_at,
                     output_baselines=output_baselines,
+                    capture_baselines=capture_baselines,
                     retry_states=retry_states,
                 )
                 details["active_match_evidence"] = evidence

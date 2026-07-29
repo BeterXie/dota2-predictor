@@ -268,6 +268,13 @@ server:
 | 阵容预测发布器 | `python -u -m live_betting.draft_publisher --database data/dota2.db` |
 | 邮件投递 | `python -u scripts/run_notification_worker.py --database data/dota2.db` |
 
+赔率采集器仍按 `--list-interval` 刷新比赛状态。`status=1` 的赛前比赛只在
+进入开赛前两小时窗口后采集一次，并以 `audit_only` transport 保存；窗口外、
+重复轮询和计划开赛时间已过但状态仍未切换的比赛均不采赔率。赛前赛程默认每
+60 秒发现一次，但不会因此重复请求赔率。RayBet 首次返回 `status=2` 时立即进入
+`--interval` 指定的正式直播采集频率；赛前 transport 不会进入 strategy、
+watermark、successor 或 fill。
+
 历史 Rosh worker 不在 Web 控制 allowlist 中。它由统一 supervisor 自动托管，
 不能通过页面按钮启动、停止或替换命令。
 

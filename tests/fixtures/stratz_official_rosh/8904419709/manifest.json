@@ -1,0 +1,166 @@
+{
+  "schema": "stratz-official-rosh-fixture-manifest/v1",
+  "status": "captured",
+  "independent_verification": "verified",
+  "profile_candidate": {
+    "rosh_profile_id": "stratz-rosh-web-2026-07-28-v1",
+    "request_profile_hash": "9dee18e1e74b14bb08761ade1db59b9c408abc03d8c4e797b0116bf45bc0fceb",
+    "upstream_bundle_sha256": "9f11c70b970bab3de71f517c36551dca2cee143d176d86c649f3542a2fe90357",
+    "serialization_version": "rfc8785-jcs/v1"
+  },
+  "provenance": {
+    "page_url": "https://stratz.com/rosh/analysis?matchId=8904419709&bracketIds=IMMORTAL&dateTime=1784485548",
+    "original_tab_last_opened_at": "2026-07-28T17:00:05.675Z",
+    "captured_at": "2026-07-28T17:15:39.576Z",
+    "browser": "Google Chrome",
+    "capture_method": "Chrome DevTools Protocol network capture from a normal page reload in the existing signed-in browser context",
+    "graphql_endpoint": "https://api.stratz.com/graphql",
+    "http_status": 200,
+    "response_mime_type": "application/graphql-response+json",
+    "graphql_response_item_count": 6,
+    "graphql_error_item_count": 0
+  },
+  "input": {
+    "match_id": 8904419709,
+    "date_time": 1784485548,
+    "bracket_ids": [
+      "IMMORTAL"
+    ]
+  },
+  "operations": [
+    {
+      "index": 0,
+      "operation_name": "GetMatchPicksBans",
+      "query_sha256": "169176efde5247cf5b9bbdf49fbecb7021b463898f8b0dc2ae104e97cd4a3e16",
+      "variables": {
+        "matchId": 8904419709
+      }
+    },
+    {
+      "index": 1,
+      "operation_name": "HeroesMetaPositions",
+      "query_sha256": "dec423a401f3621227308f0599db7b07f75d7c46efd2db72d62d0bc2b01d0938",
+      "variables": {
+        "bracketIds": [
+          "IMMORTAL"
+        ],
+        "take": 7,
+        "skip": 8
+      }
+    },
+    {
+      "index": 2,
+      "operation_name": "GetMatchCountPreviousWeekDay",
+      "query_sha256": "374b9763253f434f61d1c92741482140cb49b53cf6fcc4507d8cabc4ce2c6b1d",
+      "variables": {
+        "bracketIds": [
+          "IMMORTAL"
+        ]
+      }
+    },
+    {
+      "index": 3,
+      "operation_name": "Synergy",
+      "query_sha256": "fec90da57c567b7ec5548a91dba55b0ccc1802728937bcafff7ea9c7b2eb9d62",
+      "variables": {
+        "bracketBasicIds": "DIVINE_IMMORTAL",
+        "matchLimit": 0,
+        "take": 200
+      }
+    },
+    {
+      "index": 4,
+      "operation_name": "GetHeroStatsByTime",
+      "query_sha256": "fff608962f650afd6615df57803468f0d5282656688eef900cdd731d842c2d09",
+      "variables": {
+        "week": 1784485548
+      }
+    },
+    {
+      "index": 5,
+      "operation_name": "GetHeroStatsByTime",
+      "query_sha256": "fff608962f650afd6615df57803468f0d5282656688eef900cdd731d842c2d09",
+      "variables": {
+        "bracketBasicIds": "DIVINE_IMMORTAL",
+        "week": 1784485548
+      }
+    }
+  ],
+  "bundle": {
+    "file": "upstream-bundle-7473.55187c1bd3991522.js",
+    "url": "https://stratz.com/_next/static/chunks/7473.55187c1bd3991522.js",
+    "source_map_reference": null,
+    "selection_evidence": [
+      "GetMatchPicksBans",
+      "HeroesMetaPositions",
+      "GetMatchCountPreviousWeekDay",
+      "Synergy",
+      "GetHeroStatsByTime",
+      "DIVINE_IMMORTAL"
+    ],
+    "note": "This is the exact compiled production bundle served by STRATZ, not an unminified source repository."
+  },
+  "sanitization": {
+    "request_headers_persisted": false,
+    "response_headers_persisted": false,
+    "authorization_persisted": false,
+    "cookies_persisted": false,
+    "browser_storage_inspected": false,
+    "response_body_transformations": [],
+    "response_body_is_transport_exact": true,
+    "case_insensitive_scan_terms": [
+      "authorization",
+      "cookie",
+      "token",
+      "password",
+      "session",
+      "bearer ",
+      "email",
+      "steamaccountid"
+    ],
+    "request_scan_matches": [],
+    "response_scan_matches": []
+  },
+  "files": {
+    "requests.json": {
+      "bytes": 8213,
+      "sha256": "280f11b38a29c87751c4f36c74d95d4b89bf087f00b766331fbbe379f551971f",
+      "transport_exact": true
+    },
+    "responses.sanitized.json": {
+      "bytes": 16751511,
+      "sha256": "2afbe95c420676d34b87737138133443673a8d8c9e7d2bf10069712e799e70e7",
+      "transport_exact": true
+    },
+    "upstream-bundle-7473.55187c1bd3991522.js": {
+      "bytes": 67691,
+      "sha256": "9f11c70b970bab3de71f517c36551dca2cee143d176d86c649f3542a2fe90357",
+      "transport_exact": true
+    },
+    "page-assets.json": {
+      "bytes": 12005,
+      "sha256": "ec5f08ca6c54779ee3a76a5f81401761d668908acc68d5b08d715b8e9634b70e",
+      "transport_exact": false
+    },
+    "expected.json": {
+      "bytes": 3401,
+      "sha256": "743b67ec2c5628934cea6834ee6832a951634179bdafcdbcdfa8b139d6d7305b",
+      "transport_exact": false
+    }
+  },
+  "expected_summary": {
+    "radiant_team_score": -4.9,
+    "dire_team_score": -10.7,
+    "relative_advantage": 5.8,
+    "minute_scores": {
+      "20": -7.0,
+      "30": -5.7,
+      "36": -5.5,
+      "37": -5.5,
+      "40": -5.6,
+      "50": -5.8,
+      "60": -6.0
+    }
+  },
+  "remaining_p0_work": []
+}

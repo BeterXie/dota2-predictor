@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from live_betting.storage import (
+    CURRENT_SCHEMA_VERSION,
     LiveBettingStore,
     query_rosh_lineup_score_for_trusted_draft,
 )
@@ -122,7 +123,7 @@ def insert(
         )
 
 
-def test_schema_v10_is_append_only_and_does_not_cap_total_score(
+def test_schema_current_is_append_only_and_does_not_cap_total_score(
     store: LiveBettingStore,
 ) -> None:
     started = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
@@ -136,7 +137,7 @@ def test_schema_v10_is_append_only_and_does_not_cap_total_score(
     assert score.pure_lineup_score == 145.25
     assert store.connection.execute(
         "SELECT MAX(version) FROM live_schema_version"
-    ).fetchone()[0] == 10
+    ).fetchone()[0] == CURRENT_SCHEMA_VERSION
     with pytest.raises(sqlite3.IntegrityError):
         store.connection.execute(
             "UPDATE rosh_lineup_scores SET pure_lineup_score=0 WHERE score_key=?",

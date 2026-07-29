@@ -43,6 +43,8 @@ from scripts.watch_raybet_stream import (
     _suppress_native_video_stderr,
     _validate_stream_url,
     _write_evidence_frame,
+    _write_capture_heartbeat,
+    capture_heartbeat_path,
     completion_check_due,
     current_frame_comeback_state,
     current_frame_clock_fields,
@@ -1591,6 +1593,50 @@ def test_supervisor_rejects_dead_or_stale_watchers(tmp_path: Path) -> None:
     assert error == "watchers not running: 42"
     assert details["running_watchers"] == 0
     assert details["watchers"]["42"]["state"] == "desired"
+
+
+def test_supervisor_distinguishes_unrecognized_capture_from_a_stall(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    started = now - timedelta(minutes=5)
+    output = tmp_path / "42.jsonl"
+    output.write_text("unknown frame\n", encoding="utf-8")
+    os.utime(output, (started.timestamp(), started.timestamp()))
+    _write_capture_heartbeat(
+        output,
+        match_id="42",
+        captured_at=now,
+        capture_status="capturing_unrecognized",
+        layout_name="epl_masters_live_1080p",
+        layout_confidence=0.98,
+        screen_state="game",
+        replay_gate_status="untrusted",
+    )
+    children = {"42": (FakeProcess(), StringIO(), StringIO())}
+
+    status, details, error = supervisor_health(
+        {"42"}, children, tmp_path, started_at={"42": started}, now=now
+    )
+
+    assert status == "degraded"
+    assert error is None
+    assert details["capturing_watchers"] == 1
+    assert details["producing_watchers"] == 0
+    assert details["watchers"]["42"]["capture_state"] == "capturing_unrecognized"
+    assert details["watchers"]["42"]["layout_profile"] == "epl_masters_live_1080p"
+
+    heartbeat = capture_heartbeat_path(output)
+    stale_payload = json.loads(heartbeat.read_text(encoding="utf-8"))
+    stale_payload["captured_at"] = started.isoformat()
+    heartbeat.write_text(json.dumps(stale_payload), encoding="utf-8")
+    status, details, error = supervisor_health(
+        {"42"}, children, tmp_path, started_at={"42": started}, now=now
+    )
+
+    assert status == "unhealthy"
+    assert error == "watchers capture stalled: 42"
+    assert details["watchers"]["42"]["capture_state"] == "capture_stalled"
 
 
 def test_supervisor_terminates_watchers_that_are_no_longer_active() -> None:

@@ -1,5 +1,15 @@
-import { Button, Skeleton, SkeletonItem } from "@fluentui/react-components";
 import {
+  Button,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
+  Skeleton,
+  SkeletonItem,
+} from "@fluentui/react-components";
+import {
+  ArrowsOutSimple,
   ArrowSquareOut,
   ChartLineUp,
   CheckCircle,
@@ -7,7 +17,9 @@ import {
   ClockCounterClockwise,
   Database,
   Eye,
+  TerminalWindow,
   WarningCircle,
+  X,
   XCircle,
 } from "@phosphor-icons/react";
 import { lazy, Suspense, useMemo, useState } from "react";
@@ -42,11 +54,13 @@ import type {
 } from "../types";
 import { LifecycleBadge } from "./StatusBadge";
 import { PostmatchIntelligencePanel } from "./PostmatchIntelligencePanel";
+import { LiveScoreboard } from "./live/LiveScoreboard";
 
 const RAYBET_PAGE_HOSTS = new Set(["ray086.com", "www.ray086.com"]);
 const RAYBET_PAGE_PREFIXES = ["/sports/esports", "/esports", "/dota2"];
 const PUBLIC_STREAM_HOSTS = new Set([
   "play.ehome.gg",
+  "play.xmshlb.com",
   "qplay.ehome.gg",
   "qplay.shyxswl.com",
 ]);
@@ -124,7 +138,12 @@ export function MatchWorkspace({
     );
   }
 
-  const winner = detail?.winner || match.winner;
+  const liveWinner = detail?.winner || match.winner;
+  const prematchWinner = !liveWinner && match.lifecycle === "upcoming"
+    ? detail?.prematch_winner || null
+    : null;
+  const winner = liveWinner || prematchWinner;
+  const showingPrematch = prematchWinner != null;
   const observedAge = winner?.observed_at
     ? Math.max(0, (now - new Date(winner.observed_at).getTime()) / 1000)
     : null;
@@ -141,43 +160,16 @@ export function MatchWorkspace({
   const hasModelDecisions = chartDecisions.length > 0;
 
   return (
-    <main className="workspace" aria-live="polite">
-      <header className="match-header">
-        <div className="match-title-block">
-          <div className="match-kicker">
-            <span>{match.tournament || "未知赛事"}</span>
-            <LifecycleBadge lifecycle={match.lifecycle} />
-          </div>
-          <h1>
-            <span>{match.team_one || "队伍一"}</span>
-            <small>VS</small>
-            <span>{match.team_two || "队伍二"}</span>
-          </h1>
-          <div className="match-meta">
-            <span>RayBet {match.raybet_match_id}</span>
-            <span>BO{match.best_of || "?"}</span>
-            <span>{formatDateTime(match.scheduled_at)}</span>
-          </div>
-        </div>
-        <div className="match-header-actions">
-          {watchLink && (
-            <Button
-              appearance="subtle"
-              as="a"
-              href={watchLink.url}
-              icon={<ArrowSquareOut size={16} />}
-              rel="noreferrer"
-              target="_blank"
-            >
-              {watchLink.kind === "match_page" ? "打开比赛页" : "打开直播"}
-            </Button>
-          )}
-          <span className={observedAge != null && observedAge > 60 ? "source-age stale" : "source-age"}>
-            <Clock size={15} aria-hidden="true" />
-            赔率 {formatAge(observedAge)}
-          </span>
-        </div>
-      </header>
+    <main className="workspace">
+      <LiveScoreboard
+        match={match}
+        oddsLabel={showingPrematch
+          ? `赛前快照 ${formatDateTime(prematchWinner.observed_at)}`
+          : `赔率 ${formatAge(observedAge)}`}
+        oddsStale={!showingPrematch && observedAge != null && observedAge > 60}
+        trustedVision={trustedVision}
+        watchLink={watchLink}
+      />
 
       <section className="quote-strip" aria-label="最新胜负盘">
         <QuoteCell
@@ -187,10 +179,12 @@ export function MatchWorkspace({
           tone="one"
         />
         <div className="quote-context">
-          <span>{replay ? "历史回放" : "实时胜负盘"}</span>
+          <span>{replay ? "历史回放" : showingPrematch ? "赛前快照" : "实时胜负盘"}</span>
           <strong>{trustedVision?.map_number ? `第 ${trustedVision.map_number} 局` : winner?.period || "局数待确认"}</strong>
           <small>
-            {trustedVision?.game_clock_seconds != null
+            {showingPrematch
+              ? `采集于 ${formatDateTime(prematchWinner.observed_at)} · 不进入实时策略`
+              : trustedVision?.game_clock_seconds != null
               ? `可信时钟 ${formatClock(trustedVision.game_clock_seconds)}`
               : "暂无可信比赛时钟"}
           </small>
@@ -340,7 +334,13 @@ function CurrentStrategyOverview({
   const scanText = strategy.data
     ? `扫描 ${strategy.data.scanned_count} 条 · 显示 ${strategy.data.displayed_count} 条 · 唯一排除 ${strategy.data.excluded_decision_count} 条`
     : "尚无可信策略输出";
-  const latestDataAt = detail?.winner?.observed_at || match.winner?.observed_at || match.updated_at;
+  const prematchWinner = match.lifecycle === "upcoming"
+    ? detail?.prematch_winner || null
+    : null;
+  const latestDataAt = detail?.winner?.observed_at
+    || match.winner?.observed_at
+    || prematchWinner?.observed_at
+    || match.updated_at;
   const nextStep = waitingForStart
     ? "等待比赛开始并采集可信 HUD"
     : invalid ? "复核并修复无效策略证据"
@@ -367,7 +367,7 @@ function CurrentStrategyOverview({
         </div>
         {primaryReason && (
           <details className="strategy-reason-code">
-            <summary>Reason code</summary>
+            <summary>诊断代码</summary>
             <code>{primaryReason}</code>
           </details>
         )}
@@ -378,7 +378,9 @@ function CurrentStrategyOverview({
 
       <div className="strategy-funnel" aria-label="当前比赛关键链路">
         <FunnelStep
-          detail={`赔率 ${readinessStatusText(readiness.odds.status)} · 映射 ${readinessStatusText(readiness.mapping.status)}`}
+          detail={`${prematchWinner?.complete
+            ? "赛前快照已保存"
+            : `赔率 ${readinessStatusText(readiness.odds.status)}`} · 映射 ${readinessStatusText(readiness.mapping.status)}`}
           label="数据可信"
           tone={dataTone}
         />
@@ -732,7 +734,10 @@ function AnalysisEmpty({
         <strong>{title}</strong>
       </div>
       <span>{reasonDescription[section.reason] || "系统保留了明确的阻塞原因，没有用缺失数据补算。"}</span>
-      <code>{section.reason || "reason_not_provided"}</code>
+      <details className="analysis-reason-code">
+        <summary>诊断详情</summary>
+        <code>{section.reason || "reason_not_provided"}</code>
+      </details>
     </div>
   );
 }
@@ -884,7 +889,10 @@ function DecisionRow({
           {decision.eligible === 0 && (
             <strong className="decision-blocked-label">未满足策略门槛</strong>
           )}
-          <code>{decision.reason}</code>
+          <details className="decision-reason-code">
+            <summary>诊断代码</summary>
+            <code>{decision.reason}</code>
+          </details>
         </div>
         <div className="decision-values">
           <span>模型 {formatPercent(decision.model_probability)}</span>
@@ -1205,7 +1213,7 @@ function economyDeficitDescription(state: StrategyComebackStateInput): string {
   const trailing = maximum <= 0 ? "领先" : "落后";
   const displayMinimum = maximum <= 0 ? Math.abs(maximum) : minimum;
   const displayMaximum = maximum <= 0 ? Math.abs(minimum) : maximum;
-  return `弱势方经济${trailing} ${displayMinimum.toLocaleString("zh-CN")}–${displayMaximum.toLocaleString("zh-CN")}`;
+  return `弱势方经济${trailing} ${displayMinimum.toLocaleString("zh-CN")}-${displayMaximum.toLocaleString("zh-CN")}`;
 }
 
 function canonicalEconomyBucket(minimum: number, maximum: number): boolean {
@@ -1671,11 +1679,6 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
   }
   if (!validDecisionEdge(edge, marketProbability, modelProbability)) return false;
   if ((eligible === 1) !== (reason === "eligible")) return false;
-  if (
-    value.strategy_version === COMEBACK_STRATEGY_V4
-    && !validV4ComebackInputs(inputs, eligible === 1)
-  ) return false;
-
   const hasContributions = Object.keys(contributions).length > 0;
   if (eligible === 0 && !hasContributions) {
     return validNoSignalStrategyDecision({
@@ -1691,6 +1694,10 @@ function validStrategyDecision(value: unknown): value is StrategyDecision {
       visionAuthority,
     });
   }
+  if (
+    value.strategy_version === COMEBACK_STRATEGY_V4
+    && !validV4ComebackInputs(inputs, eligible === 1)
+  ) return false;
   if (
     !hasRequiredStrategyContributions(contributions)
     || !hasRequiredStrategyContributions(conservative)
@@ -2314,7 +2321,12 @@ function EvidenceSummary({
   match: MonitorMatch;
 }) {
   const latestVision = detail?.latest_vision || null;
-  const frameUrl = safeVisionFrameUrl(detail, latestVision);
+  const latestCapture = detail?.latest_capture || null;
+  const trustedFrameUrl = safeVisionFrameUrl(detail, latestVision);
+  const captureFrameUrl = safeCaptureFrameUrl(detail, latestCapture);
+  const frameUrl = trustedFrameUrl || captureFrameUrl;
+  const displayedVision = trustedFrameUrl ? latestVision : latestCapture;
+  const untrustedCapture = !trustedFrameUrl && captureFrameUrl !== null;
   const odds = normalizeOddsSection(
     sectionOrFallback(detail?.analysis?.odds, error),
   );
@@ -2353,6 +2365,17 @@ function EvidenceSummary({
   const excludedDetail = excluded
     ? `；原因明细（可重叠）：视觉失效 ${excluded.vision_invalidated}、映射影响 ${excluded.mapping_impacted}、阵容冲突 ${excluded.draft_conflicted}、无效载荷 ${excluded.invalid_payload}`
     : "";
+  const diagnostics = [
+    ["赔率", odds.reason],
+    ["比赛映射", mapping.reason],
+    ["视觉时钟", vision.reason],
+    ["完整阵容", lineup.reason],
+    ["Rosh 阵容评分", scores.reason],
+    ["阵容曲线", curve.reason],
+    ["模型输入", modelInputs.reason],
+    ["策略进程", worker.reason],
+    ["策略输出", strategy.reason],
+  ];
 
   return (
     <section className="workspace-section evidence-section">
@@ -2372,7 +2395,7 @@ function EvidenceSummary({
         />
         <SourceStatusRow
           detail={`${detail?.readiness.mapping.count ?? 0}/${detail?.readiness.mapping.total_count ?? 0} 个有效映射`}
-          label="Strict mapping"
+          label="比赛映射"
           lifecycle={match.lifecycle}
           section={mapping}
         />
@@ -2399,7 +2422,7 @@ function EvidenceSummary({
           section={scores}
         />
         <SourceStatusRow
-          detail={curve.data ? `${curve.data.points.length} 个条件点 · active ${curve.data.active_horizon_minutes} 分钟` : "无可用曲线"}
+          detail={curve.data ? `${curve.data.points.length} 个条件点 · 当前 ${curve.data.active_horizon_minutes} 分钟` : "无可用曲线"}
           label="阵容曲线"
           lifecycle={match.lifecycle}
           section={curve}
@@ -2424,8 +2447,27 @@ function EvidenceSummary({
           section={strategy}
         />
       </div>
+      <details className="evidence-diagnostics">
+        <summary>
+          <TerminalWindow size={15} aria-hidden="true" />
+          <span>系统诊断</span>
+          <small>{diagnostics.length} 项原始状态</small>
+        </summary>
+        <dl>
+          {diagnostics.map(([label, reason]) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd><code>{reason || "reason_not_provided"}</code></dd>
+            </div>
+          ))}
+        </dl>
+      </details>
       {frameUrl ? (
-        <VisionFramePreview frameUrl={frameUrl} vision={latestVision} />
+        <VisionFramePreview
+          frameUrl={frameUrl}
+          untrusted={untrustedCapture}
+          vision={displayedVision}
+        />
       ) : (
         <div className="vision-frame-unavailable" role="status">
           <Eye size={16} aria-hidden="true" />
@@ -2452,11 +2494,50 @@ function SourceStatusRow({
   return (
     <div className="source-status-row">
       <strong>{label}</strong>
-      <AnalysisState label={statusLabel} lifecycle={lifecycle} section={section} />
+      <AnalysisState
+        label={statusLabel || sourceStatusLabel(label, section.status, lifecycle)}
+        lifecycle={lifecycle}
+        section={section}
+      />
       <span>{detail}</span>
-      <code title={section.reason}>{section.reason || "reason_not_provided"}</code>
     </div>
   );
+}
+
+function sourceStatusLabel(
+  label: string,
+  status: AnalysisSectionStatus,
+  lifecycle: MonitorMatch["lifecycle"],
+): string {
+  if (status === "waiting" && lifecycle === "upcoming") return "等待开赛";
+  const subject = {
+    "赔率": "赔率",
+    "比赛映射": "映射",
+    "视觉时钟": "HUD",
+    "完整阵容": "阵容",
+    "Rosh 阵容评分": "评分",
+    "阵容曲线": "曲线",
+    "模型输入": "输入",
+    "策略输出": "策略",
+  }[label] || label;
+  if (status === "available") {
+    return {
+      "比赛映射": "映射就绪",
+      "视觉时钟": "HUD 已确认",
+      "完整阵容": "阵容已确认",
+      "模型输入": "输入已记录",
+      "策略输出": "策略已生成",
+    }[label] || `${subject}可用`;
+  }
+  if (status === "waiting") {
+    return {
+      "视觉时钟": "HUD 识别中",
+      "完整阵容": "阵容识别中",
+      "策略输出": "策略生成中",
+    }[label] || `${subject}等待中`;
+  }
+  if (status === "review") return `${subject}需复核`;
+  return `${subject}不可用`;
 }
 
 function readinessSection(
@@ -2483,15 +2564,15 @@ const shadowWorkerPresentations: Record<
   StrategyReadinessStatus,
   { label: string; detail: string }
 > = {
-  ready: { label: "进程运行", detail: "shadow_worker 运行中" },
-  delayed: { label: "延迟", detail: "shadow_worker 心跳延迟" },
-  stale: { label: "陈旧", detail: "shadow_worker 心跳陈旧" },
-  missing: { label: "缺失", detail: "shadow_worker 心跳缺失" },
-  invalid: { label: "数据无效", detail: "shadow_worker 数据无效" },
-  unconfirmed: { label: "等待确认", detail: "shadow_worker 等待确认" },
-  degraded: { label: "降级", detail: "shadow_worker 降级" },
-  unhealthy: { label: "故障", detail: "shadow_worker 故障" },
-  stopped: { label: "未运行", detail: "shadow_worker 未运行" },
+  ready: { label: "进程运行", detail: "策略进程运行中" },
+  delayed: { label: "延迟", detail: "策略进程心跳延迟" },
+  stale: { label: "陈旧", detail: "策略进程心跳陈旧" },
+  missing: { label: "缺失", detail: "策略进程心跳缺失" },
+  invalid: { label: "数据无效", detail: "策略进程数据无效" },
+  unconfirmed: { label: "等待确认", detail: "策略进程等待确认" },
+  degraded: { label: "降级", detail: "策略进程降级运行" },
+  unhealthy: { label: "故障", detail: "策略进程运行异常" },
+  stopped: { label: "未运行", detail: "策略进程未运行" },
 };
 
 function shadowWorkerPresentation(status: unknown): { label: string; detail: string } {
@@ -2501,18 +2582,29 @@ function shadowWorkerPresentation(status: unknown): { label: string; detail: str
   ) {
     return shadowWorkerPresentations[status as StrategyReadinessStatus];
   }
-  return { label: "状态未知", detail: "shadow_worker 状态未知" };
+  return { label: "状态未知", detail: "策略进程状态未知" };
 }
 
 function VisionFramePreview({
   frameUrl,
+  untrusted,
   vision,
 }: {
   frameUrl: string;
+  untrusted: boolean;
   vision: MatchDetail["latest_vision"];
 }) {
   const [failedFrameUrl, setFailedFrameUrl] = useState<string | null>(null);
+  const [zoomed, setZoomed] = useState(false);
   const failed = failedFrameUrl === frameUrl;
+  const hudClockRecognized = untrusted
+    && vision?.screen_state === "game"
+    && typeof vision.game_clock_seconds === "number"
+    && typeof vision.clock_confidence === "number"
+    && vision.clock_confidence >= 0.9;
+  const captureStatus = hudClockRecognized
+    ? "HUD 时钟已识别，完整阵容未确认"
+    : "已捕获，HUD 未识别";
   if (failed) {
     return (
       <div className="vision-frame-unavailable" role="status">
@@ -2522,19 +2614,71 @@ function VisionFramePreview({
     );
   }
   return (
-    <div className="vision-frame-preview" aria-label="最近有效视觉观测">
-      <div className="vision-frame-stage">
+    <div
+      className="vision-frame-preview"
+      aria-label={untrusted ? "最近捕获但未确认的画面" : "最近有效视觉观测"}
+    >
+      {untrusted ? (
+        <div className="vision-frame-untrusted" role="status">
+          <WarningCircle size={16} aria-hidden="true" />
+          <span>{captureStatus}</span>
+          <strong>未确认，不能进入策略</strong>
+        </div>
+      ) : null}
+      <button
+        aria-label={untrusted ? "放大最近捕获但未确认的画面" : "放大最近有效视觉观测画面"}
+        className="vision-frame-stage vision-frame-button"
+        onClick={() => setZoomed(true)}
+        type="button"
+      >
         <img
-          alt="最近有效视觉观测画面"
+          alt={untrusted ? "最近捕获但未确认的画面" : "最近有效视觉观测画面"}
           onError={() => setFailedFrameUrl(frameUrl)}
           src={frameUrl}
         />
-      </div>
+        <span className="vision-frame-zoom-hint"><ArrowsOutSimple size={14} />放大</span>
+      </button>
       <dl className="vision-frame-meta">
         <div><dt>捕获时间</dt><dd>{vision ? formatDateTime(vision.captured_at) : "无"}</dd></div>
-        <div><dt>确认状态</dt><dd>{vision ? (vision.confirmed === 1 ? "已确认" : "未确认") : "无观测"}</dd></div>
+        <div><dt>确认状态</dt><dd>{untrusted ? "未确认，不能进入策略" : vision ? (vision.confirmed === 1 ? "已确认" : "未确认") : "无观测"}</dd></div>
         <div><dt>画面状态</dt><dd>{vision?.screen_state || "未识别"}</dd></div>
       </dl>
+      {zoomed && (
+        <Dialog modalType="modal" onOpenChange={(_, data) => setZoomed(data.open)} open>
+          <DialogSurface className="vision-frame-dialog">
+            <DialogBody>
+              <DialogTitle
+                action={(
+                  <Button
+                    appearance="subtle"
+                    aria-label="关闭画面预览"
+                    icon={<X size={18} />}
+                    onClick={() => setZoomed(false)}
+                  />
+                )}
+              >
+                {untrusted ? "未确认画面" : "最近有效视觉观测"}
+              </DialogTitle>
+              <DialogContent>
+                {untrusted && (
+                  <div className="vision-frame-untrusted" role="status">
+                    <WarningCircle size={16} aria-hidden="true" />
+                    <span>{captureStatus}</span>
+                    <strong>未确认，不能进入策略</strong>
+                  </div>
+                )}
+                <div className="vision-frame-dialog-stage">
+                  <img
+                    alt={untrusted ? "放大的未确认画面" : "放大的最近有效视觉观测画面"}
+                    onError={() => setFailedFrameUrl(frameUrl)}
+                    src={frameUrl}
+                  />
+                </div>
+              </DialogContent>
+            </DialogBody>
+          </DialogSurface>
+        </Dialog>
+      )}
     </div>
   );
 }
@@ -2677,6 +2821,28 @@ function safeVisionFrameUrl(
   }
   const expected = `/api/monitor/matches/${encodeURIComponent(detail.raybet_match_id)}`
     + `/vision-frames/${digest}.jpg`;
+  return url === expected ? url : null;
+}
+
+function safeCaptureFrameUrl(
+  detail: MatchDetail | null,
+  capture: MatchDetail["latest_capture"],
+): string | null {
+  const digest = capture?.frame_digest;
+  const url = capture?.frame_url;
+  if (
+    !detail
+    || !capture
+    || capture.strategy_authority !== false
+    || typeof digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(digest)
+    || typeof url !== "string"
+    || capture.source_frame_ref !== `vision-frame:sha256:${digest}`
+  ) {
+    return null;
+  }
+  const expected = `/api/monitor/matches/${encodeURIComponent(detail.raybet_match_id)}`
+    + `/captures/${digest}.jpg`;
   return url === expected ? url : null;
 }
 

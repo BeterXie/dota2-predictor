@@ -167,6 +167,87 @@ def test_match_lists_archive_each_actual_http_page_with_receipt_metadata(
         assert all(row["reason"] == "match_page_observed" for row in rows)
 
 
+def test_prematch_list_uses_type_three_and_retains_dota_schedule(
+    tmp_path: Path,
+) -> None:
+    client = RayBetClient(client=EmptySession())
+    responses = {
+        (3, 1): http_response(
+            {
+                "code": 200,
+                "result": [
+                    {
+                        "id": "1002",
+                        "game_id": 151,
+                        "status": 1,
+                        "start_time": "2026-07-28 02:00:00",
+                    },
+                    {"id": "ignored", "game_id": 140, "status": 1},
+                ],
+            },
+            received_at=NOW,
+            request_identity=f"{BASE_URL}/match?match_type=3&page=1",
+        ),
+        (3, 2): http_response(
+            {"code": 200, "result": []},
+            received_at=NOW + timedelta(seconds=1),
+            request_identity=f"{BASE_URL}/match?match_type=3&page=2",
+        ),
+    }
+    with (
+        LiveBettingStore(tmp_path / "live.db") as store,
+        patch.object(
+            client,
+            "match_page_response",
+            side_effect=lambda match_type, page: responses[(match_type, page)],
+        ),
+    ):
+        store.init_schema()
+        assert _fetch_match_list(
+            store,
+            client,
+            response_kind="live_match_list",
+            match_types=(3,),
+        ) == [
+            {
+                "id": "1002",
+                "game_id": 151,
+                "status": 1,
+                "start_time": "2026-07-28 02:00:00",
+            }
+        ]
+        assert [request_metadata(row) for row in audit_rows(store)] == [
+            {"match_type": 3, "page": 1},
+            {"match_type": 3, "page": 2},
+        ]
+
+
+def test_client_open_matches_include_prematch_but_live_status_wins() -> None:
+    client = RayBetClient(client=EmptySession())
+    calls: list[tuple[int, int]] = []
+    rows = {
+        3: [
+            {"id": "1001", "status": 1, "start_time": "2026-07-28 01:00:00"},
+            {"id": "1002", "status": 1, "start_time": "2026-07-28 02:00:00"},
+        ],
+        1: [{"id": "1001", "status": 2, "start_time": "2026-07-28 01:00:00"}],
+        2: [{"id": "1001", "status": 2, "start_time": "2026-07-28 01:00:00"}],
+    }
+
+    def matches(*, match_type: int, max_pages: int) -> list[dict[str, object]]:
+        calls.append((match_type, max_pages))
+        return rows[match_type]
+
+    with patch.object(client, "matches", side_effect=matches):
+        result = client.live_matches(max_pages=4)
+
+    assert calls == [(3, 4), (1, 4), (2, 4)]
+    assert [(row["id"], row["status"]) for row in result] == [
+        ("1001", 2),
+        ("1002", 1),
+    ]
+
+
 def test_second_page_failure_preserves_first_page_and_has_no_success_payload(
     tmp_path: Path,
 ) -> None:

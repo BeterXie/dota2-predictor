@@ -45,19 +45,16 @@ from live_betting.vision_frame_registry import (  # noqa: E402
     publish_vision_frame_bytes,
 )
 from shared.sqlite import connect as connect_sqlite  # noqa: E402
-from vision.clock_reader import ClockReader  # noqa: E402
 from vision.hero_recognizer import (  # noqa: E402
     DraftReading,
     DraftTracker,
-    HeroRecognizer,
 )
+from vision.hud_reader import HudReader  # noqa: E402
 from vision.map_state import ConfirmedClock, MapStateTracker  # noqa: E402
 from vision.observation_writer import ObservationWriter  # noqa: E402
-from vision.screen_state import classify_screen_state  # noqa: E402
 from vision.scoreboard_reader import (  # noqa: E402
     NetWorthAdvantageReading,
     NetWorthAdvantageTracker,
-    ScoreboardReader,
     ScoreboardReading,
     ScoreboardTracker,
     ReplayGateReading,
@@ -71,6 +68,7 @@ DEFAULT_FEATURES = ROOT / "vision" / "templates" / "hero_features.npz"
 ALLOWED_STREAM_HOSTS = frozenset(
     {
         "play.ehome.gg",
+        "play.xmshlb.com",
         "qplay.ehome.gg",
         "qplay.shyxswl.com",
     }
@@ -449,6 +447,48 @@ def _write_evidence_frame(
         raise OSError("failed to write content-addressed evidence frame") from error
 
 
+def capture_heartbeat_path(output: Path) -> Path:
+    return output.with_suffix(".heartbeat.json")
+
+
+def _write_capture_heartbeat(
+    output: Path,
+    *,
+    match_id: str,
+    captured_at: datetime,
+    capture_status: str,
+    layout_name: str,
+    layout_confidence: float,
+    screen_state: str,
+    replay_gate_status: str | None,
+) -> None:
+    if capture_status not in {"producing_trusted", "capturing_unrecognized"}:
+        raise ValueError("capture heartbeat status is invalid")
+    if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+        raise ValueError("capture heartbeat time must be timezone-aware")
+    heartbeat = capture_heartbeat_path(output)
+    heartbeat.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "match_id": match_id,
+        "captured_at": captured_at.astimezone(timezone.utc).isoformat(),
+        "capture_status": capture_status,
+        "layout_profile": layout_name,
+        "layout_confidence": round(max(0.0, min(1.0, layout_confidence)), 6),
+        "screen_state": screen_state,
+        "replay_gate_status": replay_gate_status,
+    }
+    temporary = heartbeat.with_name(f".{heartbeat.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, heartbeat)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
     if args.database is not None:
         args.database = Path(args.database).resolve()
@@ -509,13 +549,11 @@ def _run_cli(args: argparse.Namespace) -> int:
     output = args.output
     evidence_dir = args.evidence_dir
 
-    clock_reader = ClockReader()
+    hud_reader = HudReader(args.features)
     clock_tracker = MapStateTracker()
     clock_tracker.reset_map(map_number)
-    scoreboard_reader = ScoreboardReader()
     scoreboard_tracker = ScoreboardTracker()
     advantage_tracker = NetWorthAdvantageTracker()
-    hero_reader = HeroRecognizer(args.features)
     draft_tracker = DraftTracker()
     side_reader = None
     if args.database and not args.radiant_side:
@@ -530,6 +568,7 @@ def _run_cli(args: argparse.Namespace) -> int:
     radiant_team_side = args.radiant_side
     last_evidence_at = 0.0
     sample_count = 0
+    active_layout_name: str | None = None
 
     try:
         for frame in _native_safe_frames(
@@ -542,10 +581,20 @@ def _run_cli(args: argparse.Namespace) -> int:
                 and match_is_complete(args.database, args.match_id)
             ):
                 break
-            state, _ = classify_screen_state(frame.image)
+            hud = hud_reader.read(frame.image)
+            selection = hud.selection
+            if active_layout_name is not None and active_layout_name != selection.layout.name:
+                clock_tracker.reset_map(map_number)
+                scoreboard_tracker.reset()
+                advantage_tracker.reset()
+                draft_tracker.reset()
+            active_layout_name = selection.layout.name
+            state = hud.screen_state
+            replay_gate_status: str | None = None
             confirmed_clock: ConfirmedClock | None = None
             if state == "game":
-                replay_gate = scoreboard_reader.read_replay_gate(frame.image)
+                replay_gate = hud.replay_gate
+                replay_gate_status = replay_gate.status
                 if not allow_live_hud_tracking(
                     replay_gate,
                     map_number=map_number,
@@ -598,8 +647,22 @@ def _run_cli(args: argparse.Namespace) -> int:
                         writer.append(observation)
                         print(observation.model_dump_json())
                         previous = observation
+                    _write_capture_heartbeat(
+                        output,
+                        match_id=args.match_id,
+                        captured_at=captured,
+                        capture_status=(
+                            "producing_trusted"
+                            if observation.is_hud_confirmed
+                            else "capturing_unrecognized"
+                        ),
+                        layout_name=selection.layout.name,
+                        layout_confidence=selection.confidence,
+                        screen_state=observation.screen_state,
+                        replay_gate_status=replay_gate_status,
+                    )
                     continue
-                raw_clock = clock_reader.read(frame.image)
+                raw_clock = hud.clock
                 if (
                     outside_game_frames >= 5
                     and last_clock is not None
@@ -619,17 +682,15 @@ def _run_cli(args: argparse.Namespace) -> int:
                     side_tracker.reset()
                 outside_game_frames = 0
                 confirmed_clock = clock_tracker.update(raw_clock)
-                confirmed_scoreboard = scoreboard_tracker.update(
-                    scoreboard_reader.read(frame.image)
-                )
+                confirmed_scoreboard = scoreboard_tracker.update(hud.scoreboard)
                 if confirmed_clock is not None and confirmed_scoreboard is not None:
                     confirmed_advantage = advantage_tracker.update(
-                        scoreboard_reader.read_net_worth_advantage(frame.image)
+                        hud.net_worth_advantage
                     )
                 else:
                     advantage_tracker.reset()
                     confirmed_advantage = None
-                confirmed_draft = draft_tracker.update(hero_reader.read(frame.image))
+                confirmed_draft = draft_tracker.update(hud.draft)
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
                 last_draft = confirmed_draft or last_draft
@@ -685,6 +746,20 @@ def _run_cli(args: argparse.Namespace) -> int:
                 writer.append(observation)
                 print(observation.model_dump_json())
                 previous = observation
+            _write_capture_heartbeat(
+                output,
+                match_id=args.match_id,
+                captured_at=captured,
+                capture_status=(
+                    "producing_trusted"
+                    if observation.is_hud_confirmed
+                    else "capturing_unrecognized"
+                ),
+                layout_name=selection.layout.name,
+                layout_confidence=selection.confidence,
+                screen_state=observation.screen_state,
+                replay_gate_status=replay_gate_status,
+            )
     except Exception as error:
         raise WatcherFailure(
             _watcher_error_category(error),

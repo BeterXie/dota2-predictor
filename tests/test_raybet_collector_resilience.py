@@ -229,6 +229,177 @@ def test_collect_once_backoff_does_not_block_other_matches(tmp_path: Path) -> No
     assert second["matches"] == 1 and second["backoff_skipped"] == 1
 
 
+def test_prematch_collection_runs_once_in_two_hour_window_then_live_starts(
+    tmp_path: Path,
+) -> None:
+    received_at = (
+        NOW,
+        NOW + timedelta(hours=2, seconds=1),
+    )
+    calls: list[str] = []
+    start_time = "2026-07-23 11:02:03"
+
+    class Client:
+        def match_odds_response(self, match_id: str) -> RayBetHTTPResponse:
+            observed_at = received_at[len(calls)]
+            calls.append(match_id)
+            status = 2 if len(calls) == 2 else 1
+            return RayBetHTTPResponse(
+                {
+                    "code": 200,
+                    "result": {
+                        "id": int(match_id),
+                        "game_id": 151,
+                        "status": status,
+                        "round": "bo3",
+                        "team": [
+                            {"pos": 1, "team_id": 11, "team_name": "One"},
+                            {"pos": 2, "team_id": 22, "team_name": "Two"},
+                        ],
+                        "odds": [],
+                    },
+                },
+                ODDS_ENDPOINT,
+                f"{ODDS_ENDPOINT}?match_id={match_id}",
+                observed_at,
+                200,
+                200,
+            )
+
+    raw_dir = tmp_path / "raw"
+    with LiveBettingStore(
+        tmp_path / "live.db", raw_archive_root=raw_dir
+    ) as store:
+        store.init_schema()
+        before_window = collect_once(
+            store,
+            Client(),
+            raw_dir,
+            list_rows=[
+                {"id": "1001", "status": 1, "start_time": start_time}
+            ],
+            audit_match_list=False,
+            wall_clock=lambda: NOW - timedelta(seconds=1),
+        )
+        on_window = collect_once(
+            store,
+            Client(),
+            raw_dir,
+            list_rows=[
+                {"id": "1001", "status": 1, "start_time": start_time}
+            ],
+            audit_match_list=False,
+            wall_clock=lambda: NOW,
+        )
+        repeated = collect_once(
+            store,
+            Client(),
+            raw_dir,
+            list_rows=[
+                {"id": "1001", "status": 1, "start_time": start_time}
+            ],
+            audit_match_list=False,
+            wall_clock=lambda: NOW + timedelta(hours=1),
+        )
+        stale_prematch = collect_once(
+            store,
+            Client(),
+            raw_dir,
+            list_rows=[
+                {"id": "1001", "status": 1, "start_time": start_time}
+            ],
+            audit_match_list=False,
+            wall_clock=lambda: NOW + timedelta(hours=2, seconds=1),
+        )
+        live = collect_once(
+            store,
+            Client(),
+            raw_dir,
+            list_rows=[
+                {"id": "1001", "status": 2, "start_time": start_time}
+            ],
+            audit_match_list=False,
+            wall_clock=lambda: NOW + timedelta(hours=2, seconds=1),
+        )
+        audit_reasons = [
+            tuple(row)
+            for row in store.connection.execute(
+                """SELECT disposition, reason FROM direct_response_audit
+                     WHERE claimed_raybet_match_id='1001'
+                     ORDER BY observed_at"""
+            )
+        ]
+        transport_statuses = [
+            str(row[0])
+            for row in store.connection.execute(
+                """SELECT processing_status FROM odds_transport_observations
+                     WHERE raybet_match_id='1001' ORDER BY observed_at"""
+            )
+        ]
+
+    assert calls == ["1001", "1001"]
+    assert before_window["prematch_skipped"] == 1
+    assert on_window["prematch_collected"] == 1
+    assert repeated["prematch_skipped"] == 1
+    assert stale_prematch["prematch_skipped"] == 1
+    assert live["prematch_collected"] == 0
+    assert audit_reasons == [
+        ("audit_only", "prematch_observed"),
+        ("accepted", "normalized"),
+    ]
+    assert transport_statuses == ["audit_only", "processed"]
+
+
+def test_prematch_failure_does_not_delay_first_live_request(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def collect(
+        *_args: object, match_id: str, **_kwargs: object
+    ) -> tuple[int, int, str, bool]:
+        calls.append(match_id)
+        if len(calls) == 1:
+            raise TimeoutError("prematch network failure")
+        return (0, 0, match_id, False)
+
+    raw_dir = tmp_path / "raw"
+    backoff = PerRequestBackoff(clock=lambda: 0.0)
+    with LiveBettingStore(
+        tmp_path / "live.db", raw_archive_root=raw_dir
+    ) as store:
+        store.init_schema()
+        with patch("live_betting.monitor._collect_odds_response", side_effect=collect):
+            prematch = collect_once(
+                store,
+                object(),
+                raw_dir,
+                list_rows=[
+                    {
+                        "id": "1001",
+                        "status": 1,
+                        "start_time": "2026-07-23 11:02:03",
+                    }
+                ],
+                audit_match_list=False,
+                backoff=backoff,
+                monotonic_now=0.0,
+                wall_clock=lambda: NOW,
+            )
+            live = collect_once(
+                store,
+                object(),
+                raw_dir,
+                list_rows=[{"id": "1001", "status": 2}],
+                audit_match_list=False,
+                backoff=backoff,
+                monotonic_now=1.0,
+                wall_clock=lambda: NOW + timedelta(seconds=1),
+            )
+
+    assert calls == ["1001", "1001"]
+    assert prematch["errors"] == 1
+    assert live["matches"] == 1
+
+
 def test_non_retryable_rejection_does_not_create_backoff() -> None:
     backoff = PerRequestBackoff(clock=lambda: 0.0)
     identity = f"{ODDS_ENDPOINT}?match_id=1001"

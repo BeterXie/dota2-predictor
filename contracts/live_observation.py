@@ -178,5 +178,19 @@ class LiveObservation(BaseModel):
         )
 
     @property
+    def is_hud_confirmed(self) -> bool:
+        """Keep trusted HUD facts independent from full draft confirmation."""
+        return (
+            self.map_number is not None
+            and self.game_clock_seconds is not None
+            and self.clock_confidence >= COMEBACK_STATE_MIN_CONFIDENCE
+            and self.screen_state == "game"
+            and self.comeback_state.status == "available"
+            and self.comeback_state.source == "vision_hud"
+            and self.comeback_state.confidence >= COMEBACK_STATE_MIN_CONFIDENCE
+            and bool(self.source_frame_ref.strip())
+        )
+
+    @property
     def is_strategy_ready(self) -> bool:
         return self.is_confirmed and self.radiant_team_side is not None

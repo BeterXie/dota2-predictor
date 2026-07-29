@@ -22,14 +22,27 @@ import type {
 vi.mock("@fluentui/react-components", () => ({
   Badge: ({ children }: { children: ReactNode }) => <span>{children}</span>,
   Button: ({
+    "aria-label": ariaLabel,
     as,
     children,
     href,
+    onClick,
   }: {
+    "aria-label"?: string;
     as?: string;
     children: ReactNode;
     href?: string;
-  }) => as === "a" ? <a href={href}>{children}</a> : <button>{children}</button>,
+    onClick?: () => void;
+  }) => as === "a"
+    ? <a aria-label={ariaLabel} href={href}>{children}</a>
+    : <button aria-label={ariaLabel} onClick={onClick}>{children}</button>,
+  Dialog: ({ children }: { children: ReactNode }) => <>{children}</>,
+  DialogBody: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  DialogContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  DialogSurface: ({ children }: { children: ReactNode }) => <div role="dialog">{children}</div>,
+  DialogTitle: ({ action, children }: { action?: ReactNode; children: ReactNode }) => (
+    <header><h2>{children}</h2>{action}</header>
+  ),
   Skeleton: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   SkeletonItem: () => <div />,
 }));
@@ -444,6 +457,48 @@ function sourceRow(label: string): HTMLElement {
 describe("MatchWorkspace", () => {
   afterEach(cleanup);
 
+  it("shows the prematch snapshot without treating it as live odds", () => {
+    const upcoming: MatchDetail = {
+      ...detail(0, "missing"),
+      lifecycle: "upcoming",
+      provider_status: "1",
+      winner: null,
+      prematch_winner: {
+        observed_at: "2026-07-16T12:04:01+00:00",
+        period: "map_1",
+        complete: true,
+        prices: { team_one: 1.65, team_two: 2.19 },
+        probabilities: { team_one: 0.5703125, team_two: 0.4296875 },
+      },
+      readiness: {
+        ...match.readiness,
+        odds: { status: "missing" },
+        mapping: { status: "missing" },
+        vision: { status: "missing" },
+      },
+    };
+
+    const view = render(
+      <MatchWorkspace
+        detail={upcoming}
+        error={null}
+        loading={false}
+        match={upcoming}
+        now={Date.parse("2026-07-16T12:10:00+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getAllByText("赛前快照").length).toBeGreaterThan(0);
+    expect(screen.getByText(/赛前快照 .*20:04:01/)).toBeInTheDocument();
+    expect(screen.getByText("1.65")).toBeInTheDocument();
+    expect(screen.getByText("2.19")).toBeInTheDocument();
+    expect(screen.getByText(/不进入实时策略/)).toBeInTheDocument();
+    expect(screen.getByText(/赛前快照已保存 · 映射/)).toBeInTheDocument();
+    expect(screen.queryByText("实时胜负盘")).not.toBeInTheDocument();
+    expect(view.container.querySelector(".source-age.stale")).not.toBeInTheDocument();
+  });
+
   it("requires a confirmed and fresh-enough vision observation", () => {
     const view = render(
       <MatchWorkspace
@@ -511,6 +566,82 @@ describe("MatchWorkspace", () => {
     expect(image).not.toHaveAttribute("src", framed.watch_link.url);
     expect(screen.getByText("已确认")).toBeInTheDocument();
     expect(screen.getByText("game")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "放大最近有效视觉观测画面" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "放大的最近有效视觉观测画面" })).toHaveAttribute(
+      "src",
+      framed.latest_vision!.frame_url,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭画面预览" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows an unrecognized capture without treating it as strategy evidence", () => {
+    const captured = detail(1, "unconfirmed");
+    const digest = "b".repeat(64);
+    captured.latest_capture = {
+      captured_at: "2026-07-16T12:00:04+00:00",
+      map_number: null,
+      game_clock_seconds: null,
+      screen_state: "unknown",
+      confirmed: 0,
+      clock_confidence: 0,
+      draft_confidence: 0,
+      source_frame_ref: `vision-frame:sha256:${digest}`,
+      frame_digest: digest,
+      frame_url: `/api/monitor/matches/match-1/captures/${digest}.jpg`,
+      strategy_authority: false,
+    };
+
+    render(
+      <MatchWorkspace
+        detail={captured}
+        error={null}
+        loading={false}
+        match={captured}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const image = screen.getByRole("img", { name: "最近捕获但未确认的画面" });
+    expect(image).toHaveAttribute("src", captured.latest_capture.frame_url);
+    expect(screen.getByText("已捕获，HUD 未识别")).toBeInTheDocument();
+    expect(screen.getAllByText("未确认，不能进入策略")).toHaveLength(2);
+  });
+
+  it("distinguishes a recognized HUD clock from an unconfirmed draft", () => {
+    const captured = detail(1, "unconfirmed");
+    const digest = "c".repeat(64);
+    captured.latest_capture = {
+      captured_at: "2026-07-16T12:00:04+00:00",
+      map_number: 2,
+      game_clock_seconds: 2886,
+      screen_state: "game",
+      confirmed: 0,
+      clock_confidence: 0.99,
+      draft_confidence: 0,
+      source_frame_ref: `vision-frame:sha256:${digest}`,
+      frame_digest: digest,
+      frame_url: `/api/monitor/matches/match-1/captures/${digest}.jpg`,
+      strategy_authority: false,
+    };
+
+    render(
+      <MatchWorkspace
+        detail={captured}
+        error={null}
+        loading={false}
+        match={captured}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByText("HUD 时钟已识别，完整阵容未确认")).toBeInTheDocument();
+    expect(screen.queryByText("已捕获，HUD 未识别")).not.toBeInTheDocument();
+    expect(screen.getAllByText("未确认，不能进入策略")).toHaveLength(2);
   });
 
   it("shows an explicit empty state when a frame is missing or fails to load", () => {
@@ -603,6 +734,32 @@ describe("MatchWorkspace", () => {
       "https://qplay.ehome.gg/live/42.m3u8",
     );
     expect(screen.queryByRole("link", { name: "打开比赛页" })).not.toBeInTheDocument();
+  });
+
+  it("allows the current RayBet CDN as an unsigned public stream", () => {
+    render(
+      <MatchWorkspace
+        detail={null}
+        error={null}
+        loading={false}
+        match={{
+          ...match,
+          watch_link: {
+            kind: "public_stream",
+            availability: "available",
+            url: "https://play.xmshlb.com/live/42.m3u8",
+            reason: "verified_unsigned_stream",
+          },
+        }}
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "打开直播" })).toHaveAttribute(
+      "href",
+      "https://play.xmshlb.com/live/42.m3u8",
+    );
   });
 
   it("does not fall back to a legacy or unavailable live_url", () => {
@@ -744,7 +901,7 @@ describe("MatchWorkspace", () => {
     const situation = within(row).getByLabelText("决策时实时局势证据");
     expect(within(situation).getByText("实时局势 可控劣势")).toBeInTheDocument();
     expect(within(situation).getByText("弱势方击杀落后 4")).toBeInTheDocument();
-    expect(within(situation).getByText("弱势方经济落后 5,000–5,999")).toBeInTheDocument();
+    expect(within(situation).getByText("弱势方经济落后 5,000-5,999")).toBeInTheDocument();
     expect(within(situation).getByText(/HUD vision_hud · 置信 96\.0%/)).toBeInTheDocument();
     expect(within(situation).getByText(FRAME_REF)).toBeInTheDocument();
     expect(within(situation).getByText(/入场时间窗 命中 · 20:00-45:00/)).toBeInTheDocument();
@@ -755,7 +912,7 @@ describe("MatchWorkspace", () => {
     expect(within(overview).getByText("最终策略合格")).toBeInTheDocument();
     expect(within(overview).getByText("证据有效")).toBeInTheDocument();
     expect(within(overview).getByText(/HUD 已验证 · 置信 96\.0%/)).toBeInTheDocument();
-    expect(within(overview).getByText("入场门槛通过 · 击杀落后 4 · 经济落后 5,000–5,999")).toBeInTheDocument();
+    expect(within(overview).getByText("入场门槛通过 · 击杀落后 4 · 经济落后 5,000-5,999")).toBeInTheDocument();
     expect(within(overview).getByText("52.8% 支持弱势方")).toBeInTheDocument();
     expect(within(overview).getByText("最终合格")).toBeInTheDocument();
     expect(within(overview).getByText("v4 仅为纸面影子信号，不代表策略表现已验证。")).toBeInTheDocument();
@@ -891,7 +1048,7 @@ describe("MatchWorkspace", () => {
 
     const row = view.container.querySelector(".decision-row");
     if (!(row instanceof HTMLElement)) throw new Error("decision row not found");
-    expect(within(row).getByText("弱势方经济领先 5,000–5,999")).toBeInTheDocument();
+    expect(within(row).getByText("弱势方经济领先 5,000-5,999")).toBeInTheDocument();
     const overview = view.getByLabelText("当前策略结论与入场链路");
     expect(within(overview).getByText("当前策略拒绝")).toBeInTheDocument();
     expect(within(overview).getByText("证据有效")).toBeInTheDocument();
@@ -1022,28 +1179,31 @@ describe("MatchWorkspace", () => {
     expect(inputRef).toMatch(/^[0-9a-f]{24}$/);
     const eligibleRow = within(strategy).getByText(decisionKey).closest(".decision-row");
     if (!(eligibleRow instanceof HTMLElement)) throw new Error("eligible decision row not found");
-    expect(within(eligibleRow).getByText("eligible")).toBeInTheDocument();
+    const eligibleReason = eligibleRow.querySelector(".decision-reason-code");
+    if (!(eligibleReason instanceof HTMLElement)) throw new Error("eligible reason not found");
+    expect(within(eligibleReason).getByText("eligible")).toBeInTheDocument();
     expect(within(eligibleRow).getByText(inputRef)).toBeInTheDocument();
     expect(within(eligibleRow).getByText("队伍风格")).toBeInTheDocument();
-    expect(within(eligibleRow).getByText("Δlogit +0.650")).toBeInTheDocument();
-    expect(within(eligibleRow).getByText("保守 +0.520")).toBeInTheDocument();
-    expect(within(eligibleRow).getByText("模型 57.8%")).toBeInTheDocument();
+    expect(within(eligibleRow).getByText("Δlogit +0.502")).toBeInTheDocument();
+    expect(within(eligibleRow).getByText("保守 +0.402")).toBeInTheDocument();
+    expect(within(eligibleRow).getByText("模型 56.0%")).toBeInTheDocument();
     expect(within(eligibleRow).getByText("市场 40.0%")).toBeInTheDocument();
-    expect(within(eligibleRow).getByText("Edge +17.8%")).toBeInTheDocument();
-    expect(within(eligibleRow).getByText("质量 90.0%")).toBeInTheDocument();
+    expect(within(eligibleRow).getByText("Edge +16.0%")).toBeInTheDocument();
+    expect(within(eligibleRow).getByText("质量 83.0%")).toBeInTheDocument();
     expect(within(eligibleRow).getByText("test-draft-model-v1")).toBeInTheDocument();
     expect(within(strategy).getByText("扫描范围：最近 2 条候选记录")).toBeInTheDocument();
     const evidence = within(eligibleRow).getByLabelText("持久化决策证据");
     expect(within(evidence).getByText(/^视觉 (?!未提供).+/)).toBeInTheDocument();
-    expect(within(evidence).getByText("时钟 10:00")).toBeInTheDocument();
+    expect(within(evidence).getByText("时钟 20:00")).toBeInTheDocument();
     expect(within(evidence).getByText(
-      "vision-frame:sha256:7f75e66f0d00cc074e26ac35e66da4aa8fcb9473947a2fb5bc334aa2bbec85a7",
+      "vision-frame:sha256:3fa7663391a9ab14c04a63dc43b72516d9c92db8e13ac0d7f5e8acb767bca5d9",
     )).toBeInTheDocument();
     const blockedRow = within(strategy).getByText(blockedDecision.input_ref!).closest(".decision-row");
     if (!(blockedRow instanceof HTMLElement)) throw new Error("blocked decision row not found");
     expect(Object.keys(blockedDecision.contributions!).sort()).toEqual([
       "draft_curve",
       "late_game_style",
+      "lineup_rosh",
       "market_movement",
       "player_form",
       "team_style",
@@ -1053,8 +1213,8 @@ describe("MatchWorkspace", () => {
     expect(within(blockedRow).getByText("未满足策略门槛")).toBeInTheDocument();
     expect(within(blockedRow).getByText(blockedDecision.reason)).toBeInTheDocument();
     expect(within(blockedRow).getByText("队伍风格")).toBeInTheDocument();
-    expect(within(blockedRow).getByText("Δlogit +0.650")).toBeInTheDocument();
-    expect(within(blockedRow).getByText("保守 +0.520")).toBeInTheDocument();
+    expect(within(blockedRow).getByText("Δlogit +0.502")).toBeInTheDocument();
+    expect(within(blockedRow).getByText("保守 +0.402")).toBeInTheDocument();
     expect(within(blockedRow).getByText("test-draft-model-v1")).toBeInTheDocument();
     expect(within(blockedRow).queryByText("没有持久化贡献项")).not.toBeInTheDocument();
     expect(within(strategy).queryByText("strategy_evidence_invalid")).not.toBeInTheDocument();
@@ -1116,7 +1276,7 @@ describe("MatchWorkspace", () => {
 
     expect(within(section).getByText("未满足策略门槛")).toBeInTheDocument();
     expect(within(section).getByText("edge_below_threshold")).toBeInTheDocument();
-    expect(within(section).getByText("Δlogit +0.650")).toBeInTheDocument();
+    expect(within(section).getByText("Δlogit +0.502")).toBeInTheDocument();
     expect(within(section).queryByText("strategy_evidence_invalid")).not.toBeInTheDocument();
   });
 
@@ -1155,7 +1315,14 @@ describe("MatchWorkspace", () => {
 
   it("prefers input vision evidence and falls back to golden vision authority", () => {
     const analysis = structuredClone(goldenAvailableAnalysis) as unknown as MatchAnalysis;
-    const decision = fixtureStrategyDecision(analysis, 1);
+    const decision = strategyDecision({
+      decided_at: "2026-07-14T14:00:00+00:00",
+      vision_authority: {
+        aligned_game_clock_seconds: 600,
+        captured_at: "2026-07-14T13:59:50+00:00",
+        source_frame_ref: FRAME_REF,
+      },
+    });
     const inputFrameRef = `vision-frame:sha256:${"9".repeat(64)}`;
     decision.inputs = {
       ...decision.inputs,
@@ -1164,6 +1331,16 @@ describe("MatchWorkspace", () => {
         game_clock_seconds: 660,
         source_frame_ref: inputFrameRef,
       },
+    };
+    analysis.strategy.data!.decisions = [decision];
+    analysis.strategy.data!.displayed_count = 1;
+    analysis.strategy.data!.scanned_count = 1;
+    analysis.strategy.data!.excluded_decision_count = 0;
+    analysis.strategy.data!.excluded = {
+      vision_invalidated: 0,
+      mapping_impacted: 0,
+      draft_conflicted: 0,
+      invalid_payload: 0,
     };
     const view = render(
       <MatchWorkspace
@@ -1200,9 +1377,7 @@ describe("MatchWorkspace", () => {
     evidence = eligibleEvidence();
     expect(within(evidence).getByText(/^视觉 (?!未提供).+/)).toBeInTheDocument();
     expect(within(evidence).getByText("时钟 10:00")).toBeInTheDocument();
-    expect(within(evidence).getByText(
-      "vision-frame:sha256:7f75e66f0d00cc074e26ac35e66da4aa8fcb9473947a2fb5bc334aa2bbec85a7",
-    )).toBeInTheDocument();
+    expect(within(evidence).getByText(FRAME_REF)).toBeInTheDocument();
   });
 
   it("rejects a partial eligible contribution set derived from the backend golden", () => {
@@ -1464,7 +1639,8 @@ describe("MatchWorkspace", () => {
     ]) {
       expect(screen.getAllByText(reason).length).toBeGreaterThan(0);
     }
-    expect(screen.getByText("shadow_worker 运行中")).toBeInTheDocument();
+    expect(screen.getByText("策略进程运行中")).toBeInTheDocument();
+    expect(screen.getByText("系统诊断")).toBeInTheDocument();
     expect(screen.queryByText("策略就绪")).not.toBeInTheDocument();
   });
 
@@ -1839,8 +2015,10 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    expect(within(sourceRow("赔率")).getByText("odds_payload_invalid")).toBeInTheDocument();
-    expect(within(sourceRow("视觉时钟")).getByText("vision_payload_invalid")).toBeInTheDocument();
+    expect(screen.getByText("odds_payload_invalid")).toBeInTheDocument();
+    expect(screen.getByText("vision_payload_invalid")).toBeInTheDocument();
+    expect(within(sourceRow("赔率")).queryByText("odds_payload_invalid")).not.toBeInTheDocument();
+    expect(within(sourceRow("视觉时钟")).queryByText("vision_payload_invalid")).not.toBeInTheDocument();
     expect(screen.queryByText(unsafeRef)).not.toBeInTheDocument();
     expect(screen.queryByText(/2099/)).not.toBeInTheDocument();
   });
@@ -1874,13 +2052,13 @@ describe("MatchWorkspace", () => {
 
     expect(within(sourceRow("赔率")).queryByText(/999/)).not.toBeInTheDocument();
     expect(within(sourceRow("视觉时钟")).queryByText(/2099|9999/)).not.toBeInTheDocument();
-    expect(within(sourceRow("赔率")).getByText("odds_waiting")).toBeInTheDocument();
-    expect(within(sourceRow("视觉时钟")).getByText("vision_review")).toBeInTheDocument();
+    expect(screen.getByText("odds_waiting")).toBeInTheDocument();
+    expect(screen.getByText("vision_review")).toBeInTheDocument();
   });
 
   it.each([
     ["waiting", "upcoming", "waiting_for_complete_draft", "等待开赛"],
-    ["review", "live", "draft_conflict", "需复核"],
+    ["review", "live", "draft_conflict", "曲线需复核"],
   ] as const)(
     "inherits lineup %s state into the curve source row",
     (status, lifecycle, reason, expected) => {
@@ -1899,7 +2077,7 @@ describe("MatchWorkspace", () => {
 
       const row = sourceRow("阵容曲线");
       expect(within(row).getByText(expected)).toBeInTheDocument();
-      expect(within(row).getByText(reason)).toBeInTheDocument();
+      expect(screen.getAllByText(reason).length).toBeGreaterThan(0);
     },
   );
 
@@ -1973,16 +2151,16 @@ describe("MatchWorkspace", () => {
   });
 
   it.each([
-    ["ready", "进程运行", "shadow_worker 运行中"],
-    ["delayed", "延迟", "shadow_worker 心跳延迟"],
-    ["stale", "陈旧", "shadow_worker 心跳陈旧"],
-    ["missing", "缺失", "shadow_worker 心跳缺失"],
-    ["invalid", "数据无效", "shadow_worker 数据无效"],
-    ["unconfirmed", "等待确认", "shadow_worker 等待确认"],
-    ["degraded", "降级", "shadow_worker 降级"],
-    ["unhealthy", "故障", "shadow_worker 故障"],
-    ["stopped", "未运行", "shadow_worker 未运行"],
-    ["future_status", "状态未知", "shadow_worker 状态未知"],
+    ["ready", "进程运行", "策略进程运行中"],
+    ["delayed", "延迟", "策略进程心跳延迟"],
+    ["stale", "陈旧", "策略进程心跳陈旧"],
+    ["missing", "缺失", "策略进程心跳缺失"],
+    ["invalid", "数据无效", "策略进程数据无效"],
+    ["unconfirmed", "等待确认", "策略进程等待确认"],
+    ["degraded", "降级", "策略进程降级运行"],
+    ["unhealthy", "故障", "策略进程运行异常"],
+    ["stopped", "未运行", "策略进程未运行"],
+    ["future_status", "状态未知", "策略进程状态未知"],
   ] as const)("shows shadow worker freshness %s precisely", (status, label, description) => {
     const value = detailWithAnalysis();
     value.readiness = {

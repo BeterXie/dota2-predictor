@@ -10,7 +10,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,13 @@ from .direct_response_audit import (
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
 from .models import utc_now
-from .raybet import BASE_URL, DOTA2_GAME_ID, RayBetClient
+from .raybet import (
+    BASE_URL,
+    DOTA2_GAME_ID,
+    LIVE_MATCH_TYPES,
+    PREMATCH_MATCH_TYPES,
+    RayBetClient,
+)
 from .sanitize import sanitize_raybet_payload, verified_public_stream_url
 from .service_coordination import (
     add_single_database_argument,
@@ -41,6 +47,8 @@ from .strict_eligibility import (
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_LIST_CACHE_TTL_SECONDS = 60.0
+PREMATCH_COLLECTION_LEAD_TIME = timedelta(hours=2)
+RAYBET_SCHEDULE_TIMEZONE = timezone(timedelta(hours=8))
 ODDS_BACKOFF_INITIAL_SECONDS = 3.0
 ODDS_BACKOFF_MAX_SECONDS = 300.0
 
@@ -293,8 +301,13 @@ def _fetch_provider_match_pages(
     *,
     response_kind: str,
     max_pages: int = 10,
+    match_types: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    match_types = (1, 2) if response_kind == "live_match_list" else (4,)
+    match_types = match_types or (
+        LIVE_MATCH_TYPES
+        if response_kind == "live_match_list"
+        else (4,)
+    )
     combined: dict[str, dict[str, Any]] = {}
     endpoint = f"{BASE_URL}/match"
     for match_type in match_types:
@@ -346,11 +359,39 @@ def _fetch_match_list(
     client: Any,
     *,
     response_kind: str,
+    match_types: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     if callable(getattr(client, "match_page_response", None)):
         return _fetch_provider_match_pages(
-            store, client, response_kind=response_kind
+            store,
+            client,
+            response_kind=response_kind,
+            match_types=match_types,
         )
+    if match_types is not None:
+        matches = getattr(client, "matches", None)
+        combined: dict[str, dict[str, Any]] = {}
+        if callable(matches):
+            for match_type in match_types:
+                for row in matches(match_type=match_type):
+                    if isinstance(row, dict):
+                        combined[str(row.get("id") or "")] = row
+        elif match_types == PREMATCH_MATCH_TYPES and callable(
+            getattr(client, "live_matches", None)
+        ):
+            for row in client.live_matches():
+                if isinstance(row, dict) and str(row.get("status") or "") == "1":
+                    combined[str(row.get("id") or "")] = row
+        else:
+            raise TypeError("RayBet client cannot fetch selected match types")
+        rows = list(combined.values())
+        _audit_match_list(
+            store,
+            rows,
+            response_kind=response_kind,
+            observed_at=utc_now(),
+        )
+        return rows
     fetch = (
         client.live_matches
         if response_kind == "live_match_list"
@@ -415,6 +456,53 @@ def _fetch_odds(
     return client.match_odds(match_id)
 
 
+def _prematch_collection_due(
+    store: LiveBettingStore,
+    match_id: str,
+    list_row: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("prematch collection clock must be timezone-aware")
+    raw_start = list_row.get("start_time")
+    if not isinstance(raw_start, str):
+        return False
+    start_text = raw_start.strip()
+    try:
+        if len(start_text) == 19:
+            scheduled_at = datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S")
+            scheduled_at = scheduled_at.replace(tzinfo=RAYBET_SCHEDULE_TIMEZONE)
+        elif len(start_text) == 25:
+            scheduled_at = datetime.fromisoformat(start_text)
+        else:
+            return False
+    except ValueError:
+        return False
+    if scheduled_at.tzinfo is None or scheduled_at.utcoffset() is None:
+        return False
+    scheduled_at = scheduled_at.astimezone(timezone.utc)
+    now_utc = now.astimezone(timezone.utc)
+    until_start = scheduled_at - now_utc
+    if not timedelta(0) < until_start <= PREMATCH_COLLECTION_LEAD_TIME:
+        return False
+
+    window_start = scheduled_at - PREMATCH_COLLECTION_LEAD_TIME
+    row = store.connection.execute(
+        """SELECT 1 FROM direct_response_audit
+             WHERE response_kind='live_odds'
+               AND claimed_raybet_match_id=?
+               AND payload_kind='provider_response'
+               AND disposition='audit_only'
+               AND reason='prematch_observed'
+               AND julianday(observed_at)>=julianday(?)
+               AND julianday(observed_at)<julianday(?)
+             LIMIT 1""",
+        (match_id, window_start.isoformat(), scheduled_at.isoformat()),
+    ).fetchone()
+    return row is None
+
+
 def _collect_odds_response(
     store: LiveBettingStore,
     client: Any,
@@ -422,6 +510,7 @@ def _collect_odds_response(
     match_id: str,
     response_kind: str,
     list_row: dict[str, Any],
+    audit_only: bool = False,
 ) -> tuple[int, int, str, bool]:
     endpoint = f"{BASE_URL}/odds"
     request_identity = f"{endpoint}?match_id={match_id}"
@@ -485,6 +574,14 @@ def _collect_odds_response(
                 snapshots=snapshots,
                 raw_payload=payload,
                 raw_artifact=context.receipt,
+                audit_only=audit_only,
+            )
+        if audit_only:
+            return DirectResponseDecision(
+                (changes, len(snapshots), fingerprint, False),
+                disposition="audit_only",
+                reason="prematch_observed",
+                observed_raybet_match_id=observed_match_id,
             )
         return DirectResponseDecision(
             (changes, len(snapshots), fingerprint, False),
@@ -525,6 +622,7 @@ def collect_once(
     audit_match_list: bool = True,
     backoff: PerRequestBackoff | None = None,
     monotonic_now: float | None = None,
+    wall_clock: Callable[[], datetime] = utc_now,
 ) -> dict[str, int]:
     _require_store_archive_root(store, raw_dir)
     if list_rows is None:
@@ -539,6 +637,9 @@ def collect_once(
     error_count = 0
     success_count = 0
     backoff_skipped = 0
+    prematch_collected = 0
+    prematch_skipped = 0
+    collection_now = wall_clock()
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
     if audit_match_list:
         _audit_match_list(
@@ -560,6 +661,7 @@ def collect_once(
     for list_row in list_rows:
         match_id = ""
         request_identity = ""
+        is_prematch = False
         try:
             if not isinstance(list_row, dict):
                 raise ValueError("live match list row is not an object")
@@ -567,6 +669,12 @@ def collect_once(
             if not match_id.isdigit():
                 raise ValueError("live match list id is invalid")
             request_identity = f"{endpoint}?match_id={match_id}"
+            is_prematch = str(list_row.get("status") or "") == "1"
+            if is_prematch and not _prematch_collection_due(
+                store, match_id, list_row, now=collection_now
+            ):
+                prematch_skipped += 1
+                continue
             if backoff is not None and backoff.blocked(
                 endpoint, request_identity, monotonic_now=monotonic_now
             ):
@@ -578,16 +686,18 @@ def collect_once(
                 match_id=match_id,
                 response_kind="live_odds",
                 list_row=list_row,
+                audit_only=is_prematch,
             )
             raw_fingerprints[match_id] = fingerprint
             changed_count += changes
             odds_count += snapshot_count
             success_count += 1
+            prematch_collected += int(is_prematch)
             if backoff is not None:
                 backoff.record_success(endpoint, request_identity)
         except Exception as error:
             error_count += 1
-            if backoff is not None and request_identity:
+            if backoff is not None and request_identity and not is_prematch:
                 backoff.record_failure(
                     endpoint,
                     request_identity,
@@ -619,6 +729,8 @@ def collect_once(
         "changed": changed_count,
         "errors": error_count,
         "backoff_skipped": backoff_skipped,
+        "prematch_collected": prematch_collected,
+        "prematch_skipped": prematch_skipped,
     }
 
 
@@ -747,6 +859,8 @@ def run(args: argparse.Namespace) -> int:
         next_list_refresh = 0.0
         completed_rows: list[dict[str, Any]] | None = None
         next_completed_refresh = 0.0
+        prematch_rows: list[dict[str, Any]] | None = None
+        next_prematch_refresh = 0.0
         while True:
             try:
                 monotonic_now = time.monotonic()
@@ -810,6 +924,59 @@ def run(args: argparse.Namespace) -> int:
                     audit_match_list=False,
                     backoff=odds_backoff,
                 )
+                prematch_summary = {
+                    "matches": 0,
+                    "listed": len(prematch_rows or []),
+                    "odds": 0,
+                    "changed": 0,
+                    "errors": 0,
+                    "backoff_skipped": 0,
+                    "prematch_collected": 0,
+                    "prematch_skipped": 0,
+                }
+                if (
+                    prematch_rows is None
+                    or monotonic_now >= next_prematch_refresh
+                ):
+                    prematch_interval = float(
+                        getattr(args, "prematch_interval", 60.0)
+                    )
+                    next_prematch_refresh = time.monotonic() + prematch_interval
+                    try:
+                        discovered_prematch = _fetch_match_list(
+                            store,
+                            client,
+                            response_kind="live_match_list",
+                            match_types=PREMATCH_MATCH_TYPES,
+                        )
+                        live_ids = {
+                            str(row.get("id") or "")
+                            for row in cached_rows
+                            if isinstance(row, dict)
+                        }
+                        prematch_rows = [
+                            row
+                            for row in discovered_prematch
+                            if str(row.get("id") or "") not in live_ids
+                        ]
+                        prematch_summary = collect_once(
+                            store,
+                            client,
+                            raw_dir,
+                            list_rows=prematch_rows,
+                            raw_fingerprints=raw_fingerprints,
+                            audit_match_list=False,
+                        )
+                    except Exception as error:
+                        next_prematch_refresh = (
+                            time.monotonic()
+                            + min(prematch_interval, 60.0)
+                        )
+                        prematch_summary["errors"] = 1
+                        logger.warning(
+                            "prematch RayBet refresh failed (%s)",
+                            type(error).__name__,
+                        )
                 if completed_refresh_needed:
                     try:
                         completed_summary = collect_completed_once(
@@ -837,6 +1004,7 @@ def run(args: argparse.Namespace) -> int:
                 partial_errors = (
                     summary["errors"]
                     + summary["backoff_skipped"]
+                    + prematch_summary["errors"]
                     + completed_summary["errors"]
                     + int(live_list_degraded)
                 )
@@ -845,9 +1013,10 @@ def run(args: argparse.Namespace) -> int:
                     (
                         item["matches"] > 0
                         or item.get("skipped", 0) > 0
+                        or item.get("prematch_skipped", 0) > 0
                         or (item["listed"] == 0 and item["errors"] == 0)
                     )
-                    for item in (summary, completed_summary)
+                    for item in (summary, prematch_summary, completed_summary)
                 )
                 record_health(
                     store.connection,
@@ -864,6 +1033,7 @@ def run(args: argparse.Namespace) -> int:
                     details={
                         "source": "worker",
                         **summary,
+                        "prematch": prematch_summary,
                         "completed": completed_summary,
                         "live_list_cache": _live_list_cache_details(
                             live_list_cache,
@@ -876,8 +1046,9 @@ def run(args: argparse.Namespace) -> int:
                     },
                 )
                 logger.info(
-                    "collected matches=%d odds=%d changed=%d completed=%d",
+                    "collected matches=%d odds=%d changed=%d prematch=%d completed=%d",
                     summary["matches"], summary["odds"], summary["changed"],
+                    prematch_summary["matches"],
                     completed_summary["matches"],
                 )
             except Exception as exc:
@@ -920,6 +1091,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--list-interval", type=float, default=15.0)
+    parser.add_argument(
+        "--prematch-interval",
+        type=float,
+        default=60.0,
+        help="seconds between schedule discovery refreshes; odds are captured once inside T-2h",
+    )
     parser.add_argument("--completed-interval", type=float, default=300.0)
     parser.add_argument("--max-backoff", type=float, default=300.0)
     parser.add_argument("--once", action="store_true")

@@ -230,6 +230,58 @@ def vision_frame(
     )
 
 
+@router.get("/matches/{raybet_match_id}/captures/{frame_digest}.jpg")
+def capture_frame(
+    request: Request,
+    raybet_match_id: str,
+    frame_digest: str,
+) -> Response:
+    try:
+        frame_ref = vision_frame_ref(frame_digest)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Capture frame not found") from None
+
+    connection = queries.get_db()
+    try:
+        _verify_revocation_configuration(request, connection)
+        try:
+            observation = monitoring.valid_capture_frame_observation(
+                connection,
+                raybet_match_id,
+                frame_ref,
+            )
+        except sqlite3.Error:
+            raise HTTPException(
+                status_code=409,
+                detail="Capture frame authority is unavailable",
+            ) from None
+        if observation is None or observation.get("frame_digest") != frame_digest:
+            raise HTTPException(status_code=404, detail="Capture frame not found")
+        try:
+            encoded = read_registered_vision_frame_bytes(
+                connection,
+                frame_ref,
+                expected_sha256=frame_digest,
+            )
+        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+            raise HTTPException(
+                status_code=409,
+                detail="Capture frame integrity check failed",
+            ) from None
+    finally:
+        connection.close()
+
+    return Response(
+        content=encoded,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": f'"{frame_digest}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/events")
 async def events(
     request: Request,

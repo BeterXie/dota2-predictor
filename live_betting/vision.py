@@ -88,6 +88,20 @@ class VisionObservation:
             and bool(self.source_frame_ref.strip())
         )
 
+    @property
+    def is_hud_confirmed(self) -> bool:
+        return (
+            self.map_number is not None
+            and self.game_clock_seconds is not None
+            and self.clock_confidence >= 0.9
+            and self.screen_state == "game"
+            and self.comeback_state.is_available
+            and self.comeback_state.source == "vision_hud"
+            and self.comeback_state.confidence >= 0.9
+            and isinstance(self.source_frame_ref, str)
+            and bool(self.source_frame_ref.strip())
+        )
+
 
 def parse_observation(payload: dict) -> VisionObservation:
     schema_version = payload.get("schema_version")

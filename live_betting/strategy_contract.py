@@ -16,9 +16,9 @@ import rfc8785
 
 from .canonical_comeback_evaluator import (
     ComebackStrategyPolicy,
-    PolicyEvaluation,
-    evaluate_policy_reason,
-    strategy_probability,
+    PolicyEvaluation,  # noqa: F401 - public compatibility export
+    evaluate_policy_reason,  # noqa: F401 - public compatibility export
+    strategy_probability,  # noqa: F401 - public compatibility export
 )
 from .comeback_entry import ComebackEntryPolicy
 
@@ -33,12 +33,20 @@ if TYPE_CHECKING:
 
 DEPLOYED_STRATEGY_VERSION = "comeback-shadow-v4-controlled-entry"
 PROPOSED_STRATEGY_VERSION = "comeback-shadow-v5-executable-contract"
+OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION = (
+    "comeback-shadow-v6-official-rosh-direction"
+)
 SERIALIZATION_VERSION = "rfc8785-jcs-v1"
 EVALUATOR_VERSION = "comeback-shadow-canonical-evaluator-v2"
 POLICY_SCHEMA = "dota2-comeback-strategy-policy-v1"
 EVALUATOR_SCHEMA = "dota2-comeback-evaluator-artifact-v1"
 CONTRACT_SCHEMA = "dota2-executable-strategy-contract-v1"
 EVALUATOR_INPUT_SCHEMA = "dota2-comeback-evaluator-inputs-v1"
+OFFICIAL_ROSH_CONTRACT_SCHEMA = (
+    "dota2-official-rosh-direction-strategy-contract-v1"
+)
+OFFICIAL_ROSH_POLICY_SCHEMA = "dota2-official-rosh-direction-policy-v1"
+OFFICIAL_ROSH_EVALUATOR_SCHEMA = "dota2-official-rosh-direction-evaluator-v1"
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,18 @@ REGISTERED_STRATEGY_CONTRACTS: Mapping[str, RegisteredStrategyIdentity] = (
             )
         }
     )
+)
+
+REGISTERED_OFFICIAL_ROSH_STRATEGY_CONTRACTS: Mapping[
+    str, RegisteredStrategyIdentity
+] = MappingProxyType(
+    {
+        OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION: RegisteredStrategyIdentity(
+            evaluator_hash="7bbb97c9fc30751fff65e9fa1dd79509ffe32c7716c402289257312ce7b8562e",
+            policy_hash="18638a54baf48838ca312937f17949ee6a561dfa89e5c228781711851c270b4b",
+            serialization_version=SERIALIZATION_VERSION,
+        )
+    }
 )
 
 
@@ -83,6 +103,29 @@ class StrategyContract:
             "policy_artifact": self.policy_artifact,
             "evaluator_artifact": self.evaluator_artifact,
         })
+
+
+@dataclass(frozen=True)
+class OfficialRoshStrategyContract:
+    strategy_version: str
+    evaluator_hash: str
+    policy_hash: str
+    serialization_version: str
+    policy_artifact: dict[str, Any]
+    evaluator_artifact: dict[str, Any]
+
+    def as_input_ref(self) -> dict[str, Any]:
+        return deepcopy(
+            {
+                "schema": OFFICIAL_ROSH_CONTRACT_SCHEMA,
+                "strategy_version": self.strategy_version,
+                "evaluator_hash": self.evaluator_hash,
+                "policy_hash": self.policy_hash,
+                "serialization_version": self.serialization_version,
+                "policy_artifact": self.policy_artifact,
+                "evaluator_artifact": self.evaluator_artifact,
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -222,6 +265,125 @@ def _source_artifact() -> dict[str, Any]:
             for name in files
         ],
     }
+
+
+def _official_rosh_source_artifact() -> dict[str, Any]:
+    root = Path(__file__).resolve().parent
+    files = ("official_rosh_shadow_strategy.py", "rosh_evidence.py")
+    return {
+        "schema": OFFICIAL_ROSH_EVALUATOR_SCHEMA,
+        "strategy_version": OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
+        "entrypoint": (
+            "live_betting.official_rosh_shadow_strategy."
+            "OfficialRoshDirectionShadowStrategy.evaluate"
+        ),
+        "source_files": [
+            {
+                "path": f"live_betting/{name}",
+                "sha256": _sha256(_canonical_source_bytes(root / name)),
+            }
+            for name in files
+        ],
+    }
+
+
+def _official_rosh_policy_artifact() -> dict[str, Any]:
+    from prematch.stratz_official_profile import get_profile
+
+    profile = get_profile()
+    return {
+        "schema": OFFICIAL_ROSH_POLICY_SCHEMA,
+        "strategy_version": OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
+        "serialization_version": SERIALIZATION_VERSION,
+        "reason_precedence": [
+            "rosh_analysis_unavailable",
+            "rosh_profile_mismatch",
+            "rosh_lineup_draft_mismatch",
+            "team_side_not_confirmed",
+            "game_clock_unavailable",
+            "rosh_minute_score_unavailable",
+            "rosh_evidence_hash_mismatch",
+            "rosh_direction_neutral",
+            "rosh_direction_opposes_underdog",
+            "calibration_artifact_unregistered",
+            "calibrated_probability_unavailable",
+        ],
+        "rosh_profile": {
+            "rosh_profile_id": profile.rosh_profile_id,
+            "formula_version": profile.formula_version,
+            "request_profile_hash": profile.request_profile_hash,
+            "upstream_bundle_hash": profile.upstream_bundle_hash,
+            "scorer_source_hash": profile.scorer_source_hash,
+            "canonical_profile_hash": profile.canonical_profile_hash,
+            "serialization_version": profile.serialization_version,
+        },
+        "direction_evidence": {
+            "schema": "rosh-direction-evidence/v1",
+            "minute_selection": "max(minute) where minute*60 <= game_clock_seconds",
+            "radiant_underdog_transform": "radiant_score",
+            "dire_underdog_transform": "-radiant_score",
+            "required_direction": "supports_underdog",
+        },
+        "probability": {
+            "source": "independent_versioned_calibration_artifact",
+            "current_status": "prospective_forward_data_unavailable",
+            "rosh_score_to_probability": False,
+            "calibrated_probability_when_unavailable": None,
+        },
+        "stake": {
+            "rosh_magnitude_used": False,
+            "match_percentage_used": False,
+            "stake_multiplier_when_calibration_unavailable": None,
+        },
+        "execution": {
+            "paper_order_creation": False,
+            "real_money_execution": False,
+            "m3_c_record": "shadow_candidate_or_rejection",
+            "m3_e_record": None,
+        },
+    }
+
+
+def build_official_rosh_strategy_contract(
+    *,
+    strategy_version: str = OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
+) -> OfficialRoshStrategyContract:
+    if strategy_version not in REGISTERED_OFFICIAL_ROSH_STRATEGY_CONTRACTS:
+        raise ValueError("unregistered official Rosh strategy version")
+    policy_artifact = _official_rosh_policy_artifact()
+    evaluator_artifact = _official_rosh_source_artifact()
+    contract = OfficialRoshStrategyContract(
+        strategy_version=strategy_version,
+        evaluator_hash=_sha256(canonical_bytes(evaluator_artifact)),
+        policy_hash=_sha256(canonical_bytes(policy_artifact)),
+        serialization_version=SERIALIZATION_VERSION,
+        policy_artifact=policy_artifact,
+        evaluator_artifact=evaluator_artifact,
+    )
+    registered = REGISTERED_OFFICIAL_ROSH_STRATEGY_CONTRACTS[strategy_version]
+    actual = RegisteredStrategyIdentity(
+        evaluator_hash=contract.evaluator_hash,
+        policy_hash=contract.policy_hash,
+        serialization_version=contract.serialization_version,
+    )
+    if registered != actual:
+        raise RuntimeError("registered official Rosh strategy contract drift")
+    return contract
+
+
+def validate_official_rosh_strategy_contract(
+    strategy_version: str,
+    value: object,
+) -> OfficialRoshStrategyContract | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        expected = build_official_rosh_strategy_contract(
+            strategy_version=strategy_version
+        )
+    except (RuntimeError, ValueError):
+        return None
+    return expected if dict(value) == expected.as_input_ref() else None
 
 
 def _policy_parameters(policy: ComebackStrategyPolicy) -> dict[str, Any]:
@@ -594,7 +756,6 @@ def replay_persisted_decision(row: Mapping[str, Any]) -> ReplayResult:
     except (TypeError, ValueError):
         return ReplayResult(False, "persisted_numeric_identity_invalid", contract=contract)
     expected_model = replayed.model_probability
-    expected_conservative = replayed.conservative_probability
     if (
         not math.isclose(model_probability, expected_model, rel_tol=1e-9, abs_tol=1e-9)
         or not math.isclose(edge, model_probability - market_probability, rel_tol=1e-9, abs_tol=1e-9)
@@ -635,7 +796,7 @@ def persisted_decision_projection_failure(
             str(row["contributions_json"]),
             strategy_version=strategy_version,
         )
-    except (KeyError, TypeError) as error:
+    except (KeyError, TypeError):
         return "decision_json_invalid"
     except DecisionPayloadError as error:
         return error.reason

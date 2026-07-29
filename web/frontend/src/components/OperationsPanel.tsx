@@ -30,6 +30,7 @@ import type {
   ReadinessStatus,
 } from "../types";
 import { ReadinessBadge } from "./StatusBadge";
+import { PipelineTopology } from "./operations/PipelineTopology";
 
 interface OperationsPanelProps {
   alerts: AlertIncident[];
@@ -96,6 +97,7 @@ export function OperationsPanel({
 
   return (
     <aside className="operations-panel" aria-label="就绪状态与操作">
+      <PipelineTopology match={match} />
       <section className={`operations-overview ${chainReady ? "ready" : "degraded"}`} aria-label="数据链路与活动告警结论">
         <div>
           {chainReady

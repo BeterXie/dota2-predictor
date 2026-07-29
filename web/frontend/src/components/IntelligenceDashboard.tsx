@@ -9,8 +9,10 @@ import {
 } from "@fluentui/react-components";
 import {
   ArrowClockwise,
+  CaretDown,
   CaretLeft,
   CaretRight,
+  CaretUp,
   ChartBar,
   CheckCircle,
   Database,
@@ -51,11 +53,18 @@ import type {
   IntelligenceTeamState,
 } from "../types";
 import "../intelligence.css";
+import { OverviewPanel } from "./intelligence/OverviewPanel";
+import { MatchRatingPanel } from "./intelligence/MatchRatingPanel";
+import { RoshScorePanel } from "./intelligence/RoshScorePanel";
+import { summarizeCutoffs } from "../utils/intelligenceUtils";
 
 export type IntelligenceMode = "matches" | "players" | "teams" | "drafts";
 
 interface IntelligenceDashboardProps {
   initialMode?: IntelligenceMode;
+  initialMatchId?: number | null;
+  onMatchList?: () => void;
+  onMatchOpen?: (matchId: number) => void;
 }
 
 const PAGE_SIZE = 12;
@@ -95,6 +104,9 @@ const RATE_LABELS: Record<string, string> = {
 
 export function IntelligenceDashboard({
   initialMode = "matches",
+  initialMatchId = null,
+  onMatchList,
+  onMatchOpen,
 }: IntelligenceDashboardProps) {
   const [mode, setMode] = useState<IntelligenceMode>(initialMode);
   const [overview, setOverview] = useState<IntelligenceOverview | null>(null);
@@ -110,7 +122,7 @@ export function IntelligenceDashboard({
   const [matchLabel, setMatchLabel] = useState("");
   const [matchLoading, setMatchLoading] = useState(false);
   const [matchError, setMatchError] = useState<string | null>(null);
-  const [selectedMatchId, setSelectedMatchId] = useState<number | null>(null);
+  const [selectedMatchId, setSelectedMatchId] = useState<number | null>(initialMatchId);
   const [matchDetail, setMatchDetail] = useState<IntelligenceMatchDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -128,6 +140,10 @@ export function IntelligenceDashboard({
   const [teamSearch, setTeamSearch] = useState("");
   const [teamLoading, setTeamLoading] = useState(false);
   const [teamError, setTeamError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSelectedMatchId(initialMatchId);
+  }, [initialMatchId]);
 
   useEffect(() => {
     if (mode !== "drafts") return;
@@ -162,13 +178,6 @@ export function IntelligenceDashboard({
       .then((value) => {
         setMatchPage(value);
         setMatchError(null);
-        setSelectedMatchId((current) => {
-          if (current && value.data.some((item) => item.match_id === current)) return current;
-          const complete = value.data.find(
-            (item) => item.radiant_state != null || item.dire_state != null,
-          );
-          return complete?.match_id ?? value.data[0]?.match_id ?? null;
-        });
       })
       .catch((reason: Error) => {
         if (reason.name !== "AbortError") {
@@ -282,6 +291,23 @@ export function IntelligenceDashboard({
     setOverviewRefresh((value) => value + 1);
   };
 
+  const selectMatch = (matchId: number) => {
+    setSelectedMatchId(matchId);
+    setDetailError(null);
+    onMatchOpen?.(matchId);
+  };
+
+  const showMatchList = () => {
+    setSelectedMatchId(null);
+    setDetailError(null);
+    onMatchList?.();
+  };
+
+  const changeMode = (next: IntelligenceMode) => {
+    setMode(next);
+    if (next !== "matches" && selectedMatchId != null) showMatchList();
+  };
+
   return (
     <section className="intelligence-dashboard" aria-label="历史比赛情报">
       <header className="intel-header">
@@ -306,7 +332,7 @@ export function IntelligenceDashboard({
         <TabList
           aria-label="历史情报视图"
           selectedValue={mode}
-          onTabSelect={(_, data) => setMode(data.value as IntelligenceMode)}
+          onTabSelect={(_, data) => changeMode(data.value as IntelligenceMode)}
           size="small"
         >
           <Tab icon={<Sword size={17} />} value="matches">比赛复盘</Tab>
@@ -340,7 +366,8 @@ export function IntelligenceDashboard({
           onPageChange={setMatchPageNumber}
           onSearchDraftChange={setMatchSearchDraft}
           onSearchSubmit={submitMatchSearch}
-          onSelect={setSelectedMatchId}
+          onBack={showMatchList}
+          onSelect={selectMatch}
           page={matchPage}
           searchDraft={matchSearchDraft}
           selectedId={selectedMatchId}
@@ -382,164 +409,6 @@ export function IntelligenceDashboard({
   );
 }
 
-function OverviewPanel({
-  error,
-  loading,
-  onRetry,
-  overview,
-}: {
-  error: string | null;
-  loading: boolean;
-  onRetry: () => void;
-  overview: IntelligenceOverview | null;
-}) {
-  if (loading && !overview) return <OverviewSkeleton />;
-  if (error && !overview) {
-    return <ErrorState message={error} onRetry={onRetry} />;
-  }
-  if (!overview) return null;
-
-  const quality = qualitySlices(overview);
-  const reconstructed = availabilityStatus(overview, quality, "reconstructed_walk_forward");
-  const prospective = availabilityStatus(overview, quality, "prospective");
-  const failures = quality.filter((item) => item.status === "failed");
-  const provisional = quality.filter((item) => item.status === "provisional");
-  const unsupported = quality.filter((item) => item.status === "unsupported");
-
-  return (
-    <section className="intel-overview" aria-label="评分与模型总览">
-      {error && <div className="intel-stale-note">总览刷新失败，当前显示上一次成功结果</div>}
-      <div className="intel-version-strip">
-        <strong>当前版本</strong>
-        {Object.entries(overview.versions).map(([name, version]) => (
-          <span key={name}>
-            {versionLabel(name)} <code>{version}</code>
-          </span>
-        ))}
-      </div>
-
-      <div className="intel-overview-grid">
-        <section className="intel-metric-group">
-          <h2>数据覆盖</h2>
-          <div className="intel-metric-grid">
-            {Object.entries(overview.coverage).map(([name, value]) => (
-              <div key={name}>
-                <strong>{integer(value)}</strong>
-                <span>{COVERAGE_LABELS[name] || name}</span>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="intel-state-summary">
-          <h2>局势分类</h2>
-          <div>
-            {(Object.keys(STATE_LABELS) as IntelligenceStateLabel[]).map((label) => (
-              <span className={`intel-state-count state-${label}`} key={label}>
-                <strong>{overview.team_state_distribution[label] || 0}</strong>
-                {STATE_LABELS[label]}
-              </span>
-            ))}
-          </div>
-        </section>
-      </div>
-
-      <section className="intel-quality-section">
-        <div className="intel-section-heading">
-          <div>
-            <h2>阵容模型校准</h2>
-            <p>验收门槛：样本不少于 100，Brier 低于 0.25，Log loss 低于 ln2，ECE 不高于 0.10，ECE 90% bootstrap 上界不高于 0.15</p>
-          </div>
-          <div className="intel-availability" aria-label="预测数据可用性">
-            <StatusTag ok={reconstructed}>历史重建 {reconstructed ? "有数据" : "无数据"}</StatusTag>
-            <StatusTag ok={prospective}>前瞻验证 {prospective ? "有数据" : "尚未建立"}</StatusTag>
-          </div>
-        </div>
-
-        {!prospective && reconstructed && (
-          <div className="intel-quality-warning" role="status">
-            <WarningCircle size={17} weight="fill" aria-hidden="true" />
-            当前只有历史重建回测，不能视为真实前瞻表现。
-          </div>
-        )}
-        {!prospective && !reconstructed && (
-          <div className="intel-quality-warning" role="status">
-            <WarningCircle size={17} weight="fill" aria-hidden="true" />
-            历史重建和真实前瞻数据都尚未建立，当前没有可验收的阵容概率。
-          </div>
-        )}
-        {failures.length > 0 && (
-          <div className="intel-quality-warning critical" role="alert">
-            <WarningCircle size={17} weight="fill" aria-hidden="true" />
-            校准验收未通过：{failures.length} 个切片明确未通过门槛，阵容概率仅供研究复盘。
-          </div>
-        )}
-        {provisional.length > 0 && (
-          <div className="intel-quality-warning" role="status">
-            <WarningCircle size={17} weight="fill" aria-hidden="true" />
-            校准状态暂定：{provisional.length} 个切片的点估计通过，但完整 ECE bootstrap 验收尚未完成，不能标为通过。
-          </div>
-        )}
-        {unsupported.length > 0 && (
-          <div className="intel-quality-warning" role="status">
-            <WarningCircle size={17} weight="fill" aria-hidden="true" />
-            校准暂不支持：{unsupported.length} 个切片样本不足或没有可结算点，尚不能验收。
-          </div>
-        )}
-
-        <QualityTable slices={quality} />
-      </section>
-    </section>
-  );
-}
-
-function QualityTable({ slices }: { slices: IntelligenceDraftQualitySlice[] }) {
-  if (!slices.length) {
-    return <EmptyState compact message="暂无可计算的阵容模型切片" />;
-  }
-  return (
-    <div className="intel-table-scroll">
-      <table className="intel-table intel-quality-table">
-        <thead>
-          <tr>
-            <th>模型</th>
-            <th>时点</th>
-            <th>数据模式</th>
-            <th>样本</th>
-            <th>Brier</th>
-            <th>Log loss</th>
-            <th>ECE</th>
-            <th>ECE 90% 上界</th>
-            <th>验收</th>
-          </tr>
-        </thead>
-        <tbody>
-          {slices.map((slice) => (
-            <tr key={`${slice.model_kind}-${slice.horizon_minutes}-${slice.availability_mode}`}>
-              <td>{modelKindLabel(slice.model_kind)}</td>
-              <td className="intel-number">{slice.horizon_minutes} 分钟</td>
-              <td>{availabilityLabel(slice.availability_mode)}</td>
-              <td className="intel-number">{slice.support}</td>
-              <td className="intel-number">{decimal(slice.brier_score, 3)}</td>
-              <td className="intel-number">{decimal(slice.log_loss, 3)}</td>
-              <td className="intel-number">{decimal(slice.ece_5_bin, 3)}</td>
-              <td className="intel-number">{decimal(slice.ece_90_upper, 3)}</td>
-              <td>
-                <span
-                  className={`intel-quality-status ${slice.status}`}
-                  title={slice.gate_failures.map(gateFailureLabel).join("、")}
-                >
-                  {qualityStatusLabel(slice.status)}
-                </span>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 function MatchesView({
   detail,
   detailError,
@@ -548,6 +417,7 @@ function MatchesView({
   label,
   loading,
   onLabelChange,
+  onBack,
   onPageChange,
   onSearchDraftChange,
   onSearchSubmit,
@@ -563,6 +433,7 @@ function MatchesView({
   label: string;
   loading: boolean;
   onLabelChange: (value: string) => void;
+  onBack: () => void;
   onPageChange: (value: number) => void;
   onSearchDraftChange: (value: string) => void;
   onSearchSubmit: (event: FormEvent) => void;
@@ -573,7 +444,7 @@ function MatchesView({
 }) {
   return (
     <div className="intel-match-layout">
-      <aside className="intel-match-list" aria-label="历史比赛列表">
+      {selectedId == null ? <main className="intel-match-list intel-match-list-page" aria-label="OpenDota 比赛列表">
         <form className="intel-filter-row" onSubmit={onSearchSubmit}>
           <Input
             aria-label="搜索历史比赛"
@@ -595,6 +466,13 @@ function MatchesView({
           </Select>
         </form>
 
+        <div className="intel-match-columns" aria-hidden="true">
+          <span>赛事与时间</span>
+          <span>对阵与结果</span>
+          <span>局势分类</span>
+          <span />
+        </div>
+
         {error && !page ? <ErrorState message={error} /> : null}
         {error && page ? <div className="intel-stale-note">比赛列表刷新失败，当前显示上一次成功结果</div> : null}
         {loading && !page ? <ListSkeleton /> : null}
@@ -608,20 +486,33 @@ function MatchesView({
                 key={match.match_id}
                 match={match}
                 onSelect={onSelect}
-                selected={selectedId === match.match_id}
               />
             ))}
           </div>
         ) : null}
         {page && <PaginationControls pagination={page.pagination} onPageChange={onPageChange} />}
-      </aside>
-
-      <MatchDetailPanel
-        detail={detail}
-        error={detailError}
-        loading={detailLoading}
-        selectedId={selectedId}
-      />
+      </main> : (
+        <div className="intel-match-detail-view">
+          <div className="intel-detail-toolbar">
+            <button
+              aria-label="返回 OpenDota 比赛列表"
+              className="intel-detail-back"
+              onClick={onBack}
+              type="button"
+            >
+              <CaretLeft size={17} weight="bold" aria-hidden="true" />
+              <span>OpenDota 比赛列表</span>
+            </button>
+            <span>比赛 #{selectedId}</span>
+          </div>
+          <MatchDetailPanel
+            detail={detail}
+            error={detailError}
+            loading={detailLoading}
+            selectedId={selectedId}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -629,19 +520,18 @@ function MatchesView({
 function MatchListRow({
   match,
   onSelect,
-  selected,
 }: {
   match: IntelligenceMatchSummary;
   onSelect: (matchId: number) => void;
-  selected: boolean;
 }) {
   const radiant = teamName(match.radiant_team_name, match.radiant_team_id, "天辉");
   const dire = teamName(match.dire_team_name, match.dire_team_id, "夜魇");
+  const resultKnown = match.radiant_win !== null;
+  const winner = match.radiant_win === true ? radiant : match.radiant_win === false ? dire : null;
   return (
     <button
-      aria-label={`查看 ${radiant} 对 ${dire} 的比赛复盘详情`}
-      aria-pressed={selected}
-      className={selected ? "intel-match-row selected" : "intel-match-row"}
+      aria-label={`查看 ${radiant} 对 ${dire} 的比赛复盘详情${winner ? `，${winner} 获胜` : ""}`}
+      className="intel-match-row"
       onClick={() => onSelect(match.match_id)}
       type="button"
     >
@@ -650,15 +540,22 @@ function MatchListRow({
         <code>{formatUnixTime(match.start_time)}</code>
       </span>
       <span className="intel-row-teams">
-        <strong className={match.radiant_win ? "winner" : ""}>{radiant}</strong>
+        <strong className={resultKnown ? (match.radiant_win ? "winner" : "loser") : ""}>
+          <span className="intel-team-name">{radiant}</span>
+          {resultKnown && <span className={`intel-result-badge ${match.radiant_win ? "win" : "loss"}`}>{match.radiant_win ? "胜" : "负"}</span>}
+        </strong>
         <span className="intel-kill-score">击杀比分 {match.radiant_score ?? "-"} : {match.dire_score ?? "-"}</span>
-        <strong className={match.radiant_win === false ? "winner" : ""}>{dire}</strong>
+        <strong className={resultKnown ? (match.radiant_win === false ? "winner" : "loser") : ""}>
+          <span className="intel-team-name">{dire}</span>
+          {resultKnown && <span className={`intel-result-badge ${match.radiant_win === false ? "win" : "loss"}`}>{match.radiant_win === false ? "胜" : "负"}</span>}
+        </strong>
       </span>
       <span className="intel-row-states">
         <StateTag state={match.radiant_state} />
         <StateTag state={match.dire_state} />
         <code>#{match.match_id}</code>
       </span>
+      <CaretRight className="intel-row-enter" size={17} aria-hidden="true" />
     </button>
   );
 }
@@ -700,9 +597,15 @@ function MatchDetailPanel({
         <div>
           <span>{match.league_name || `联赛 ${match.leagueid || "未知"}`}</span>
           <h2>
-            <strong className={match.radiant_win ? "winner" : ""}>{radiant}</strong>
+            <strong className={match.radiant_win == null ? "" : match.radiant_win ? "winner" : "loser"}>
+              <span>{radiant}</span>
+              {match.radiant_win != null && <span className={`intel-result-badge ${match.radiant_win ? "win" : "loss"}`}>{match.radiant_win ? "胜" : "负"}</span>}
+            </strong>
             <small>击杀比分 {match.radiant_score ?? "-"} : {match.dire_score ?? "-"}</small>
-            <strong className={match.radiant_win === false ? "winner" : ""}>{dire}</strong>
+            <strong className={match.radiant_win == null ? "" : match.radiant_win === false ? "winner" : "loser"}>
+              <span>{dire}</span>
+              {match.radiant_win != null && <span className={`intel-result-badge ${match.radiant_win === false ? "win" : "loss"}`}>{match.radiant_win === false ? "胜" : "负"}</span>}
+            </strong>
           </h2>
           <p>
             比赛 #{match.match_id}　{formatUnixTime(match.start_time)}　时长 {formatDuration(match.duration)}
@@ -722,7 +625,7 @@ function MatchDetailPanel({
         dire={dire}
       />
 
-      <RoshHistoricalScorePanel
+      <RoshScorePanel
         dire={dire}
         radiant={radiant}
         score={value.roshLineupScore}
@@ -770,215 +673,7 @@ function MatchDetailPanel({
   );
 }
 
-function MatchRatingPanel({
-  rating,
-  radiant,
-  dire,
-}: {
-  rating: IntelligenceMatchRating | null;
-  radiant: string;
-  dire: string;
-}) {
-  if (!rating) {
-    return (
-      <section className="intel-match-rating unavailable" aria-label="比赛综合评分">
-        <strong>比赛综合评分</strong>
-        <span>当前评分证据不满足 10 人同版本、同基准截止条件</span>
-      </section>
-    );
-  }
-  return (
-    <section className="intel-match-rating" aria-label="比赛综合评分">
-      <header>
-        <div>
-          <h3>比赛综合评分</h3>
-          <p>{rating.player_count} 名当前版本选手评分的算术平均</p>
-        </div>
-        <code>{rating.rating_version}</code>
-      </header>
-      <div className="intel-match-rating-groups">
-        <MatchRatingGroup label="全场" values={rating.overall} />
-        <MatchRatingGroup label={radiant} values={rating.radiant} />
-        <MatchRatingGroup label={dire} values={rating.dire} />
-      </div>
-      <footer>
-        <span>来源版本 <code>{rating.source_score_version}</code></span>
-        <span>基准截止 <code>{formatCutoff(rating.benchmark_cutoff)}</code></span>
-      </footer>
-    </section>
-  );
-}
 
-function MatchRatingGroup({
-  label,
-  values,
-}: {
-  label: string;
-  values: IntelligenceMatchRating["overall"];
-}) {
-  return (
-    <div className="intel-match-rating-group">
-      <strong>{label}</strong>
-      <dl>
-        <div><dt>执行分</dt><dd>{decimal(values.execution_score, 2)}</dd></div>
-        <div><dt>赛果修正</dt><dd>{decimal(values.result_adjusted_score, 2)}</dd></div>
-        <div><dt>覆盖率</dt><dd>{percent(values.coverage)}</dd></div>
-      </dl>
-    </div>
-  );
-}
-
-function RoshHistoricalScorePanel({
-  dire,
-  radiant,
-  score,
-}: {
-  dire: string;
-  radiant: string;
-  score: IntelligenceRoshLineupScoreSection | null;
-}) {
-  const data = score?.status === "available" ? score.data : null;
-  if (!data) {
-    return (
-      <section className="intel-rosh-score unavailable" aria-label="Rosh 阵容评分">
-        <header>
-          <div>
-            <h3>Rosh 阵容评分</h3>
-            <p>历史 OpenDota 比赛的 dematus 阵容评分</p>
-          </div>
-          <Sword size={19} aria-hidden="true" />
-        </header>
-        <div className="intel-rosh-empty">
-          <strong>当前没有可展示的 Rosh 阵容评分</strong>
-          <span>{score?.reason || "历史阵容评分尚未生成"}</span>
-        </div>
-      </section>
-    );
-  }
-
-  const coverage = Math.max(0, Math.min(10, data.player_coverage_count)) / 10;
-  const hasCurrentCorrection = data.current_player_adjusted_lineup_score != null;
-  const displayStatus = score?.status === "available" ? "可展示" : score?.status || "未知";
-  return (
-    <section className="intel-rosh-score" aria-label="Rosh 阵容评分">
-      <header>
-        <div>
-          <h3>Rosh 阵容评分</h3>
-          <p>纯阵容分与当前 STRATZ 选手修正分分开显示</p>
-        </div>
-        <Sword size={19} aria-hidden="true" />
-      </header>
-      <div className="intel-rosh-score-grid">
-        <div>
-          <dt>纯阵容分</dt>
-          <dd>{roshAdvantageLabel(data.pure_lineup_score, radiant, dire)}</dd>
-        </div>
-        <div>
-          <dt>当前选手修正分</dt>
-          <dd>
-            {hasCurrentCorrection
-              ? roshAdvantageLabel(data.current_player_adjusted_lineup_score, radiant, dire)
-              : "不可用"}
-          </dd>
-        </div>
-        <div>
-          <dt>最终展示分</dt>
-          <dd className="score-primary">
-            {roshAdvantageLabel(data.effective_lineup_score, radiant, dire)}
-          </dd>
-        </div>
-        <div>
-          <dt>选手覆盖</dt>
-          <dd>{percent(coverage)} ({data.player_coverage_count}/10)</dd>
-        </div>
-        <div>
-          <dt>评分模式</dt>
-          <dd>{data.scoring_mode === "current_player_adjusted" ? "当前选手修正" : "纯阵容"}</dd>
-        </div>
-        <div>
-          <dt>状态</dt>
-          <dd>{displayStatus}</dd>
-        </div>
-      </div>
-      <dl className="intel-rosh-score-meta">
-        <div><dt>公式版本</dt><dd><code>{data.formula_version}</code></dd></div>
-        <div><dt>数据源</dt><dd><code>{data.source_name}</code></dd></div>
-        <div><dt>阵容数据时间</dt><dd><code>{data.source_as_of}</code></dd></div>
-        <div><dt>选手数据时间</dt><dd><code>{data.player_stats_as_of || "未提供"}</code></dd></div>
-      </dl>
-      <p className="intel-rosh-score-warning">
-        当前选手修正来自当前 STRATZ 数据，不是比赛当时快照；该修正不可用于历史回测或下注证据。
-      </p>
-      <RoshMinuteTable
-        adjusted={data.current_player_adjusted_minute_table}
-        dire={dire}
-        pure={data.pure_minute_table}
-        radiant={radiant}
-      />
-    </section>
-  );
-}
-
-function RoshMinuteTable({
-  adjusted,
-  dire,
-  pure,
-  radiant,
-}: {
-  adjusted: IntelligenceRoshMinutePoint[] | null;
-  dire: string;
-  pure: IntelligenceRoshMinutePoint[];
-  radiant: string;
-}) {
-  const adjustedByMinute = new Map((adjusted || []).map((point) => [point.minute, point]));
-  return (
-    <div className="intel-rosh-curve">
-      <div className="intel-rosh-curve-heading">
-        <strong>20-60 分钟优势曲线</strong>
-        <span>每一行是该时间桶的 Rosh 有符号优势，不将 60 分钟值冒充整场评分</span>
-      </div>
-      {!pure.length ? (
-        <div className="intel-rosh-curve-empty">暂无可展示的 20-60 分钟纯阵容曲线</div>
-      ) : (
-        <div className="intel-table-scroll">
-          <table className="intel-table intel-rosh-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>样本时间窗</th>
-                <th>纯阵容优势</th>
-                <th>当前选手修正优势</th>
-                <th>样本覆盖</th>
-                <th>纯调整</th>
-                <th>选手调整</th>
-              </tr>
-            </thead>
-            <tbody>
-              {pure.map((point) => {
-                const current = adjustedByMinute.get(point.minute);
-                return (
-                  <tr key={point.minute}>
-                    <td className="intel-number">{point.minute} 分钟</td>
-                    <td className="intel-number">{point.time_start}-{point.time_end} 分钟</td>
-                    <td>{roshAdvantageLabel(point.win_rate_graph, radiant, dire)}</td>
-                    <td>
-                      {current
-                        ? roshAdvantageLabel(current.win_rate_graph, radiant, dire)
-                        : "不可用"}
-                    </td>
-                    <td className="intel-number">{percentagePoints(point.match_percentage)}</td>
-                    <td className="intel-number">{signedDecimal(point.hero_adjustment + point.synergy_adjustment)}</td>
-                    <td className="intel-number">{current ? signedDecimal(current.player_adjustment) : "-"}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-}
 
 function ScoreEvidenceStrip({
   benchmarkCutoffs,
@@ -1575,16 +1270,6 @@ function collectRankingEvidence(rows: IntelligencePlayerRanking[]): {
 
 function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
-}
-
-export function summarizeCutoffs(values: string[]): {
-  count: number;
-  first: string;
-  last: string;
-} | null {
-  const cutoffs = uniqueNonEmpty(values).sort((left, right) => left.localeCompare(right));
-  if (!cutoffs.length) return null;
-  return { count: cutoffs.length, first: cutoffs[0], last: cutoffs.at(-1) || cutoffs[0] };
 }
 
 function formatCutoff(value: string): string {

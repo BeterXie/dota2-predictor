@@ -9,6 +9,7 @@ from pathlib import Path
 from live_betting.models import Market, OddsSnapshot
 from live_betting.monitor import _collect_odds_response
 from live_betting.sanitize import (
+    PUBLIC_STREAM_HOSTS,
     PUBLIC_STREAM_EVIDENCE_KEY,
     sanitize_public_url,
     sanitize_raybet_payload,
@@ -19,6 +20,13 @@ from live_betting.storage import LiveBettingStore
 
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+
+
+def test_current_raybet_cdn_host_is_allowlisted() -> None:
+    assert "play.xmshlb.com" in PUBLIC_STREAM_HOSTS
+    public_url = "https://play.xmshlb.com/live/42.m3u8"
+    assert verified_public_stream_url(public_url) == public_url
+    assert verified_public_stream_url(f"{public_url}?token=secret") is None
 
 
 def test_payload_redaction_removes_sensitive_keys_and_url_query() -> None:

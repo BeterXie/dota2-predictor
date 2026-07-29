@@ -23,7 +23,7 @@
 当前代码不是“必须依赖扩展才能采集”的架构，direct-only 主链的大部分能力已经存在：
 
 - `live_betting/raybet.py` 的 `RayBetClient` 使用 `curl_cffi` 直接请求 `https://cfinfo.365raylinks.com/v2/match` 和 `/v2/odds`，默认超时 20 秒，并同时检查 HTTP 状态、JSON object envelope 和 provider `code == 200`。
-- `live_betting/monitor.py` 已按默认 3 秒 odds、15 秒 match list、300 秒 completed feed 周期运行 direct collector；live list 合并 `match_type=1/2`，completed list 使用 `match_type=4`。
+- `live_betting/monitor.py` 已按默认 3 秒 odds、15 秒 live match list、3600 秒 prematch list、300 秒 completed feed 周期运行 direct collector；live list 合并 `match_type=1/2`，prematch list 使用 `match_type=3`，completed list 使用 `match_type=4`。
 - `live_betting/direct_response_audit.py` 已统一执行接收时间记录、payload 脱敏、immutable raw artifact、request identity 校验和接受/拒绝审计。
 - `scripts/supervise_raybet_streams.py` 创建 watcher 时始终传入 `--refresh-url`。`scripts/watch_raybet_stream.py` 已能对精确 match ID 直接请求 `/odds`，在内存中取得 fresh signed HLS URL 后启动 Vision。
 - `live_betting/browser_companion.py` 只有显式 `--start-companion` 才启动；未启动时 `scripts/run_dota_shadow_service.py` 已记录 `stopped / not_started_by_supervisor`。
@@ -133,6 +133,7 @@ flowchart LR
 | 操作 | Endpoint | 参数 | 周期默认值 | response_kind |
 |---|---|---|---|---|
 | live list | `/v2/match` | `match_type=1/2&page=N` | 15 秒刷新列表，最多 10 页/类型 | `live_match_list` |
+| prematch list | `/v2/match` | `match_type=3&page=N` | 3600 秒刷新列表，最多 10 页 | `live_match_list` |
 | completed list | `/v2/match` | `match_type=4&page=N` | 300 秒 | `completed_match_list` |
 | live odds | `/v2/odds` | `match_id=<id>` | 每轮默认 3 秒 | `live_odds` |
 | completed odds | `/v2/odds` | `match_id=<id>` | 跟随 completed refresh | `completed_odds` |

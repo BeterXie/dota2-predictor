@@ -170,7 +170,8 @@ def get_match_draft(match_id: int) -> dict | None:
     IMG = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes"
     try:
         match = conn.execute(
-            "SELECT radiant_team_id, dire_team_id, leagueid FROM matches WHERE match_id = ?",
+            """SELECT radiant_team_id, dire_team_id, leagueid, start_time
+                 FROM matches WHERE match_id = ?""",
             (match_id,),
         ).fetchone()
         if not match:
@@ -180,6 +181,7 @@ def get_match_draft(match_id: int) -> dict | None:
             "radiant_team_id": match["radiant_team_id"],
             "dire_team_id": match["dire_team_id"],
             "league_id": match["leagueid"],
+            "start_time": match["start_time"],
         }
         heroes = conn.execute(
             """SELECT mp.hero_id, mp.is_radiant, mp.account_id,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from collections.abc import Sequence
@@ -17,6 +18,17 @@ from .odds_response_authority import (
 
 NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 RACE_RE = re.compile(r"first team to (?:get )?(\d+) kills", re.IGNORECASE)
+
+
+def is_closed_odds_member(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    odds_id = str(item.get("odds_id") or item.get("id") or "")
+    try:
+        price = float(item.get("odds"))
+    except (TypeError, ValueError):
+        return False
+    return bool(odds_id) and math.isfinite(price) and price == 1.0
 
 
 def _number(value: Any) -> float | None:

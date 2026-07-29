@@ -12,6 +12,13 @@ import type {
   MatchDetail,
   MonitorHistoryPage,
   MonitorSnapshot,
+  PrematchDraft,
+  PrematchHeroGrid,
+  PrematchLeague,
+  PrematchRecentMatch,
+  PrematchTeam,
+  RoshAnalysisRequest,
+  RoshAnalysisRunResponse,
 } from "./types";
 
 const MONITOR_API = "/api/monitor";
@@ -234,4 +241,91 @@ export function fetchIntelligenceTeams(
   signal?: AbortSignal,
 ): Promise<IntelligenceTeamPage> {
   return getJson<IntelligenceTeamPage>(`${INTELLIGENCE_API}/teams`, signal);
+}
+
+export function fetchPrematchTeams(signal?: AbortSignal): Promise<PrematchTeam[]> {
+  return getJson<PrematchTeam[]>("/api/teams", signal);
+}
+
+export function fetchPrematchLeagues(signal?: AbortSignal): Promise<PrematchLeague[]> {
+  return getJson<PrematchLeague[]>("/api/leagues", signal);
+}
+
+export function fetchPrematchHeroGrid(signal?: AbortSignal): Promise<PrematchHeroGrid> {
+  return getJson<PrematchHeroGrid>("/api/hero-grid", signal);
+}
+
+export function fetchPrematchRecentMatches(
+  signal?: AbortSignal,
+): Promise<PrematchRecentMatch[]> {
+  return getJson<PrematchRecentMatch[]>("/api/recent-matches?limit=30", signal);
+}
+
+export function fetchPrematchDraft(
+  matchId: number,
+  signal?: AbortSignal,
+): Promise<PrematchDraft> {
+  return getJson<PrematchDraft>(
+    `/api/matches/${encodeURIComponent(matchId)}/draft`,
+    signal,
+  );
+}
+
+export async function createRoshAnalysis(
+  payload: RoshAnalysisRequest,
+  signal?: AbortSignal,
+): Promise<RoshAnalysisRunResponse> {
+  const response = await fetch("/api/prematch/rosh-analysis", {
+    method: "POST",
+    signal,
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null) as {
+      detail?: string | { message?: string; error_code?: string };
+    } | null;
+    const detail = error?.detail;
+    const message = typeof detail === "string"
+      ? detail
+      : detail?.message || detail?.error_code;
+    throw new Error(message || `请求失败 (${response.status})`);
+  }
+  return response.json() as Promise<RoshAnalysisRunResponse>;
+}
+
+export function fetchRoshAnalysis(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<RoshAnalysisRunResponse> {
+  return getJson<RoshAnalysisRunResponse>(
+    `/api/prematch/rosh-analysis/${encodeURIComponent(runId)}`,
+    signal,
+  );
+}
+
+export async function triggerPrematchFetch(
+  matchId?: number,
+): Promise<{ status: string; message: string }> {
+  const query = new URLSearchParams();
+  if (matchId) {
+    query.set("match_id", String(matchId));
+    query.set("force", "true");
+  }
+  const response = await fetch(`/api/fetch-latest${query.size ? `?${query}` : ""}`, {
+    method: "POST",
+    headers: { Accept: "application/json", "X-Dota2-Admin-Action": "fetch" },
+  });
+  const payload = await response.json().catch(() => null) as {
+    status?: string;
+    message?: string;
+    detail?: string;
+  } | null;
+  if (!response.ok) {
+    throw new Error(payload?.detail || `请求失败 (${response.status})`);
+  }
+  return {
+    status: payload?.status || "started",
+    message: payload?.message || "抓取任务已启动",
+  };
 }

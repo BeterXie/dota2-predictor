@@ -46,8 +46,8 @@ python -m train.main
 # Generate a prematch prediction
 python -m predict.main --radiant 9247354 --dire 10150538
 
-# Use the same existing database path for both long-running processes.
-$database = "<absolute path to the existing dota2.db>"
+# Use the current cutover database for both long-running processes.
+$database = "D:\dota2-predictor-cutovers\20260718-043023\restore\dota2.db"
 
 # Terminal 1: start the service supervisor. Historical Rosh is managed by
 # default; no --start-* flag is required for it.
@@ -116,20 +116,29 @@ strictly read-only against RayBet and can create hypothetical shadow orders
 only. There is no real betting endpoint.
 
 ```powershell
+$database = "D:\dota2-predictor-cutovers\20260718-043023\restore\dota2.db"
+$rawDir = "D:\dota2-predictor-cutovers\20260718-043023\restore\live_betting\raw-v2"
+$visionJsonl = "D:\dota2-predictor-cutovers\20260718-043023\restore\live_betting\live_observations"
+
 # Read-only RayBet odds collection
-python -m live_betting.monitor --database data/dota2.db `
-  --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30
+python -m live_betting.monitor --database $database `
+  --raw-dir $rawDir --interval 6 --list-interval 30
 
 # Visual observation supervisor
-python scripts/supervise_raybet_streams.py --database data/dota2.db
+python scripts/supervise_raybet_streams.py --database $database
 
 # Shadow strategy (paper orders only)
-python scripts/run_comeback_shadow.py --database data/dota2.db `
-  --vision-jsonl data/live_betting/live_observations
+python scripts/run_comeback_shadow.py --database $database `
+  --vision-jsonl $visionJsonl
 
 # Strict approved-event scheduler
-python scripts/run_strict_event_ingest.py --database data/dota2.db
+python scripts/run_strict_event_ingest.py --database $database
 ```
+
+RayBet rows with provider `status=1` are sampled at most once per match per
+hour and retained as audit-only prematch transports.  The normal high-frequency
+odds cadence starts immediately when RayBet reports `status=2`; prematch
+transports cannot become strategy, watermark, successor, or fill inputs.
 
 The Edge extension is at `edge-extension/`. See
 [edge-extension/README.md](edge-extension/README.md) for local companion
@@ -143,8 +152,11 @@ host/path.
 
 ## Database
 
-All match data lives in `data/dota2.db`. The web API and live shadow workers
-share that database. RayBet raw response artifacts live in the paired
-`data/live_betting/raw-v2` tree. Runtime artifacts under `data/` are ignored by
+The current runtime match data lives in
+`D:\dota2-predictor-cutovers\20260718-043023\restore\dota2.db`. The web API and
+live shadow workers share that database. RayBet raw response artifacts live in
+the paired
+`D:\dota2-predictor-cutovers\20260718-043023\restore\live_betting\raw-v2` tree.
+Runtime artifacts under the source checkout's `data/` directory are ignored by
 Git. The migration, offline compaction, and self-contained bundle runbook is in
 [`live_betting/README.md`](live_betting/README.md#database-migration-compaction-and-bundles).

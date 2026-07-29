@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
@@ -20,13 +21,38 @@ from live_betting.service_coordination import (
     TerminationResult,
 )
 from live_betting.storage import LiveBettingStore
+from live_betting.stratz_rosh_client import StratzRoshError
 from web import app as web_app
 from web import queries
 from web.queries import _sort_heroes_by_position
+from web.routers.leagues import router as league_router
 from web.schemas import PrematchRequest
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class PrematchShellRouteTests(unittest.TestCase):
+    def test_prematch_uses_integrated_monitor_frontend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dist = Path(directory)
+            index = dist / "index.html"
+            index.write_text("<div id='root'></div>", encoding="utf-8")
+            with patch.object(web_app, "MONITOR_DIST_DIR", dist):
+                response = web_app.serve_prematch_page()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Path(response.path).resolve(), index.resolve())
+        self.assertEqual(
+            response.headers["cache-control"],
+            "no-cache, no-store, must-revalidate",
+        )
+
+    def test_matches_redirects_to_monitor_history(self) -> None:
+        response = web_app.serve_legacy_matches()
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "/monitor?view=replay")
 
 
 def hero(hero_id: int, lane_role: int, gpm: int) -> dict:
@@ -74,11 +100,196 @@ class PrematchSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "both sides"):
             PrematchRequest(**values)
 
+        values = self.valid()
+        values["radiant_players"] = [101, 102, 103, 104, 105]
+        values["dire_players"] = [201, 202, 203, 204, 205]
+        with self.assertRaisesRegex(ValidationError, "trusted source match"):
+            PrematchRequest(**values)
+
+        values["source_match_id"] = 123
+        self.assertEqual(PrematchRequest(**values).source_match_id, 123)
+
     def test_duplicate_draft_is_rejected(self) -> None:
         values = self.valid()
         values["dire_heroes"][-1] = 5
         with self.assertRaisesRegex(ValidationError, "10 distinct"):
             PrematchRequest(**values)
+
+
+class LeagueApiTests(unittest.TestCase):
+    def test_league_response_preserves_match_count(self) -> None:
+        app = FastAPI()
+        app.include_router(league_router)
+        with patch.object(
+            queries,
+            "get_leagues",
+            return_value=[{
+                "leagueid": 19785,
+                "name": "Esports World Cup 2026",
+                "tier": "professional",
+                "match_count": 157,
+            }],
+        ):
+            with TestClient(app) as client:
+                response = client.get("/api/leagues")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["match_count"], 157)
+
+
+class PrematchRoshRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = Path(self.directory.name) / "prematch-rosh.db"
+        connection = sqlite3.connect(self.database)
+        connection.execute("CREATE TABLE teams (team_id INTEGER PRIMARY KEY)")
+        connection.executemany("INSERT INTO teams VALUES (?)", [(10,), (20,)])
+        connection.commit()
+        connection.close()
+        self.database_patch = patch.object(queries, "DB_PATH", str(self.database))
+        self.database_patch.start()
+
+    def tearDown(self) -> None:
+        self.database_patch.stop()
+        self.directory.cleanup()
+
+    @staticmethod
+    def score(*, pure: float, adjusted: float | None, mode: str, coverage: int):
+        values = {
+            "pure_lineup_score": pure,
+            "effective_lineup_score": adjusted if adjusted is not None else pure,
+            "scoring_mode": mode,
+            "player_coverage_count": coverage,
+            "formula_version": "rosh-test",
+            "source_name": "stratz",
+            "source_week": 1_800_000_000,
+            "source_as_of": datetime(2026, 7, 28, tzinfo=timezone.utc),
+            "evidence_hash": "a" * 64,
+            "evidence": {"pure_minute_table": [{"minute": 20}]},
+        }
+        if mode == "current_player_adjusted":
+            values["current_player_adjusted_lineup_score"] = adjusted
+        else:
+            values["player_adjusted_lineup_score"] = adjusted
+            values["stake_multiplier"] = 1.0 if adjusted is not None else 0.5
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def output():
+        def format_output(prediction, *_args):
+            return {"prediction": prediction}
+
+        return SimpleNamespace(
+            format_output=format_output,
+            save_prediction=lambda *_args: "prediction.json",
+            _sanitize=lambda value: value,
+        )
+
+    @staticmethod
+    def request(**values) -> PrematchRequest:
+        return PrematchRequest(
+            radiant_id=10,
+            dire_id=20,
+            radiant_heroes=[1, 2, 3, 4, 5],
+            dire_heroes=[6, 7, 8, 9, 10],
+            **values,
+        )
+
+    @staticmethod
+    def local_draft() -> dict:
+        return {
+            "match_id": 123,
+            "radiant_team_id": 10,
+            "dire_team_id": 20,
+            "radiant_heroes": [
+                {"hero_id": hero_id, "account_id": 100 + hero_id}
+                for hero_id in range(1, 6)
+            ],
+            "dire_heroes": [
+                {"hero_id": hero_id, "account_id": 200 + hero_id}
+                for hero_id in range(6, 11)
+            ],
+        }
+
+    def test_manual_lineup_uses_pure_rosh_probability(self) -> None:
+        score = self.score(pure=8.7, adjusted=None, mode="pure", coverage=0)
+        client = SimpleNamespace(fetch_lineup_score=Mock(return_value=score))
+        with patch.object(web_app, "_get_prematch_builder", return_value=(client, self.output())):
+            result = web_app.create_prematch_prediction(self.request())
+
+        prediction = result["prediction"]
+        self.assertEqual(prediction["radiant_win_prob"], 0.587)
+        self.assertEqual(prediction["scoring_mode"], "pure")
+        self.assertEqual(prediction["player_coverage_count"], 0)
+        call = client.fetch_lineup_score.call_args
+        self.assertEqual(call.args, ([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]))
+        self.assertIsNotNone(call.kwargs["as_of"].utcoffset())
+
+    def test_trusted_match_uses_current_player_highlights(self) -> None:
+        score = self.score(
+            pure=8.7,
+            adjusted=9.1,
+            mode="current_player_adjusted",
+            coverage=10,
+        )
+        fetched = SimpleNamespace(
+            context={
+                "radiant_picks": [{"heroId": hero_id} for hero_id in range(1, 6)],
+                "dire_picks": [{"heroId": hero_id} for hero_id in range(6, 11)],
+            },
+            score=score,
+            minute_table=({"minute": 20, "win_rate_graph": 9.1},),
+        )
+        client = SimpleNamespace(
+            fetch_historical_match_score=Mock(return_value=fetched)
+        )
+        request = self.request(
+            source_match_id=123,
+            radiant_players=[101, 102, 103, 104, 105],
+            dire_players=[206, 207, 208, 209, 210],
+        )
+        with (
+            patch.object(queries, "get_match_draft", return_value=self.local_draft()),
+            patch.object(web_app, "_get_prematch_builder", return_value=(client, self.output())),
+        ):
+            result = web_app.create_prematch_prediction(request)
+
+        prediction = result["prediction"]
+        self.assertEqual(prediction["radiant_win_prob"], 0.591)
+        self.assertEqual(prediction["scoring_mode"], "current_player_adjusted")
+        self.assertEqual(prediction["player_coverage_count"], 10)
+        client.fetch_historical_match_score.assert_called_once_with(
+            123,
+            include_current_player_adjustment=True,
+        )
+
+    def test_source_mismatch_is_rejected_before_stratz_request(self) -> None:
+        client = SimpleNamespace(fetch_historical_match_score=Mock())
+        request = self.request(source_match_id=123)
+        draft = self.local_draft()
+        draft["radiant_team_id"] = 99
+        with (
+            patch.object(queries, "get_match_draft", return_value=draft),
+            patch.object(web_app, "_get_prematch_builder", return_value=(client, self.output())),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            web_app.create_prematch_prediction(request)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        client.fetch_historical_match_score.assert_not_called()
+
+    def test_stratz_failure_is_service_unavailable(self) -> None:
+        client = SimpleNamespace(
+            fetch_lineup_score=Mock(side_effect=StratzRoshError("rate limited"))
+        )
+        with (
+            patch.object(web_app, "_get_prematch_builder", return_value=(client, self.output())),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            web_app.create_prematch_prediction(self.request())
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("STRATZ Rosh", raised.exception.detail)
 
 
 class FetchAdminTests(unittest.TestCase):
@@ -414,6 +625,8 @@ class PrematchMarkupTests(unittest.TestCase):
         )[0]
         self.assertIn("players[index]", roster_function)
         self.assertNotIn("players.every", roster_function)
+        self.assertIn("source_match_id: loadedSourceMatchId", html)
+        self.assertIn("invalidateLoadedSource();", html)
         self.assertIn("includePlayerRosters ? radiantPlayers : null", html)
         self.assertIn("includePlayerRosters ? direPlayers : null", html)
 
@@ -444,12 +657,11 @@ class WebEntryRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 307)
             self.assertEqual(response.headers["location"], "/monitor?view=intelligence")
 
-    def test_legacy_matches_page_has_an_explicit_route(self) -> None:
+    def test_legacy_matches_page_redirects_to_monitor_history(self) -> None:
         with TestClient(web_app.app) as client:
-            response = client.get("/matches")
-            self.assertEqual(response.status_code, 200)
-            self.assertIn("Dota 2 Predictor", response.text)
-            self.assertIn('href="/monitor"', response.text)
+            response = client.get("/matches", follow_redirects=False)
+            self.assertEqual(response.status_code, 307)
+            self.assertEqual(response.headers["location"], "/monitor?view=replay")
 
 
 if __name__ == "__main__":

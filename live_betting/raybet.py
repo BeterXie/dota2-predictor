@@ -17,6 +17,9 @@ from curl_cffi import requests
 BASE_URL = "https://cfinfo.365raylinks.com/v2"
 SITE_URL = "https://www.ray086.com/"
 DOTA2_GAME_ID = 151
+PREMATCH_MATCH_TYPES = (3,)
+LIVE_MATCH_TYPES = (1, 2)
+OPEN_MATCH_TYPES = PREMATCH_MATCH_TYPES + LIVE_MATCH_TYPES
 
 
 @dataclass(frozen=True)
@@ -495,7 +498,7 @@ class RayBetClient:
 
     def live_matches(self, *, max_pages: int = 10) -> list[dict[str, Any]]:
         combined: dict[str, dict[str, Any]] = {}
-        for match_type in (1, 2):
+        for match_type in OPEN_MATCH_TYPES:
             for row in self.matches(match_type=match_type, max_pages=max_pages):
                 combined[str(row.get("id"))] = row
         return sorted(combined.values(), key=lambda row: str(row.get("start_time") or ""))

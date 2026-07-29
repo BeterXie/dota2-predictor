@@ -1,5 +1,5 @@
 import { Input } from "@fluentui/react-components";
-import { MagnifyingGlass } from "@phosphor-icons/react";
+import { CaretRight, MagnifyingGlass } from "@phosphor-icons/react";
 import { useMemo, useState } from "react";
 
 import { ageSeconds, formatAge, formatOdds, lifecycleLabel } from "../format";
@@ -17,6 +17,7 @@ interface MatchRailProps {
   historyHasMore?: boolean;
   historyLoading?: boolean;
   onLoadMore?: () => void;
+  variant?: "rail" | "page";
 }
 
 export function MatchRail({
@@ -28,6 +29,7 @@ export function MatchRail({
   historyHasMore = false,
   historyLoading = false,
   onLoadMore,
+  variant = "rail",
 }: MatchRailProps) {
   const [query, setQuery] = useState("");
   const [mobileExpanded, setMobileExpanded] = useState(false);
@@ -44,9 +46,18 @@ export function MatchRail({
     );
   }, [matches, query]);
 
+  const Root = variant === "page" ? "main" : "aside";
+
   return (
-    <aside className={`match-rail${mobileExpanded ? " expanded" : ""}`} aria-label="赛事列表">
-        <button
+    <Root
+      className={variant === "page"
+        ? "match-list-page"
+        : `match-rail${mobileExpanded ? " expanded" : ""}`}
+      aria-label={variant === "page"
+        ? mode === "history" ? "历史赛事列表" : "滚球赛事列表"
+        : "赛事列表"}
+    >
+        {variant === "rail" && <button
           aria-expanded={mobileExpanded}
           className="mobile-rail-summary"
           onClick={() => setMobileExpanded((current) => !current)}
@@ -56,7 +67,7 @@ export function MatchRail({
           <strong>{matches.find((item) => item.raybet_match_id === selectedId)?.team_one || "未选择"}</strong>
           <span>VS</span>
           <strong>{matches.find((item) => item.raybet_match_id === selectedId)?.team_two || "未选择"}</strong>
-        </button>
+        </button>}
         <div className="rail-body">
           <div className="rail-header">
             <div>
@@ -73,6 +84,15 @@ export function MatchRail({
               onChange={(_, data) => setQuery(data.value)}
             />
           </div>
+
+          {variant === "page" && (
+            <div className="match-list-columns" aria-hidden="true">
+              <span>赛事与状态</span>
+              <span>对阵</span>
+              <span>胜负赔率与更新</span>
+              <span />
+            </div>
+          )}
 
           <nav className="match-groups" aria-label="按状态分组的赛事">
         {lifecycleOrder.map((lifecycle) => {
@@ -117,6 +137,7 @@ export function MatchRail({
                           {formatAge(age)}
                         </span>
                       </div>
+                      <CaretRight className="match-row-enter" size={17} aria-hidden="true" />
                     </button>
                   );
                 })}
@@ -147,6 +168,6 @@ export function MatchRail({
         )}
           </nav>
         </div>
-    </aside>
+    </Root>
   );
 }

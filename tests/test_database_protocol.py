@@ -1838,6 +1838,118 @@ def test_live_store_itself_rejects_a_future_schema(tmp_path: Path) -> None:
         )
 
 
+def test_live_current_official_rosh_schema_initializes_empty_database_idempotently(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live-current-empty.db"
+
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.init_schema()
+        objects = {
+            (str(row[0]), str(row[1]))
+            for row in store.connection.execute(
+                """SELECT type, name FROM sqlite_master
+                    WHERE name LIKE 'rosh_analysis_runs%'
+                       OR name LIKE 'rosh_hero_scores%'
+                       OR name LIKE 'rosh_minute_points%'
+                       OR name LIKE 'official_rosh_shadow_evaluations%'
+                       OR name LIKE 'idx_rosh_runs_%'"""
+            )
+        }
+        assert store.connection.execute(
+            "SELECT MAX(version) FROM live_schema_version"
+        ).fetchone()[0] == LIVE_VERSION
+    assert {
+        ("table", "rosh_analysis_runs"),
+        ("table", "rosh_hero_scores"),
+        ("table", "rosh_minute_points"),
+        ("table", "official_rosh_shadow_evaluations"),
+        ("index", "idx_rosh_runs_match_profile"),
+        ("index", "idx_rosh_runs_draft_profile"),
+        ("trigger", "rosh_analysis_runs_immutable_update"),
+        ("trigger", "rosh_analysis_runs_immutable_delete"),
+        ("trigger", "rosh_hero_scores_immutable_update"),
+        ("trigger", "rosh_hero_scores_immutable_delete"),
+        ("trigger", "rosh_minute_points_immutable_update"),
+        ("trigger", "rosh_minute_points_immutable_delete"),
+        ("trigger", "official_rosh_shadow_evaluations_immutable_update"),
+        ("trigger", "official_rosh_shadow_evaluations_immutable_delete"),
+    }.issubset(objects)
+
+
+def test_live_v10_rosh_migration_is_additive_and_external_transaction_owned(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "live-v10-rosh.db"
+    with LiveBettingStore(database) as store:
+        store.init_schema()
+        store.connection.executescript(
+            """DROP TABLE official_rosh_shadow_evaluations;
+               DROP TABLE rosh_minute_points;
+               DROP TABLE rosh_hero_scores;
+               DROP TABLE rosh_analysis_runs;
+               DELETE FROM live_schema_version;
+               INSERT INTO live_schema_version VALUES (10, 'v10');
+               CREATE TABLE operator_v10_data (value TEXT NOT NULL);
+               INSERT INTO operator_v10_data VALUES ('preserve-me');"""
+        )
+        store.connection.commit()
+
+        store.connection.execute("BEGIN IMMEDIATE")
+        store.init_schema(external_transaction=True)
+        assert store.connection.in_transaction
+        assert store.connection.execute(
+            "SELECT MAX(version) FROM live_schema_version"
+        ).fetchone()[0] == LIVE_VERSION
+        store.connection.rollback()
+        assert store.connection.execute(
+            "SELECT MAX(version) FROM live_schema_version"
+        ).fetchone()[0] == 10
+        assert store.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='rosh_analysis_runs'"
+        ).fetchone() is None
+
+        store.init_schema()
+        store.init_schema()
+        assert store.connection.execute(
+            "SELECT value FROM operator_v10_data"
+        ).fetchone()[0] == "preserve-me"
+        assert [
+            int(row[0])
+            for row in store.connection.execute(
+                "SELECT version FROM live_schema_version ORDER BY version"
+            )
+        ] == [10, LIVE_VERSION]
+
+
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    (
+        ("DROP TABLE rosh_minute_points", "missing tables: rosh_minute_points"),
+        ("DROP INDEX idx_rosh_runs_match_profile", "missing indexes"),
+        (
+            "DROP TRIGGER rosh_analysis_runs_immutable_update",
+            "missing triggers",
+        ),
+    ),
+)
+def test_database_protocol_contract_covers_official_rosh_objects(
+    tmp_path: Path,
+    statement: str,
+    message: str,
+) -> None:
+    database = tmp_path / "rosh-contract.db"
+    prepare_database(database, tmp_path / "migration-backups")
+    connection = connect(database)
+    connection.execute(statement)
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match=message):
+        verify_prepared_database(database)
+
+
 def test_live_v1_schema_migrates_to_current_and_is_idempotent(tmp_path: Path) -> None:
     database = tmp_path / "live-v1.db"
     connection = connect(database)

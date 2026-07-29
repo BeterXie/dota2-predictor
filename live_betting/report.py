@@ -35,8 +35,10 @@ from .research import research_summary
 from .service_coordination import add_single_database_argument
 from .settlement import persisted_settlement_authority_reason
 from .strategy_contract import (
+    OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
     parse_decision_payload,
     persisted_decision_projection_failure,
+    validate_official_rosh_strategy_contract,
 )
 from .strict_read_gate import StrictReadGate, strict_read_gate, table_has_columns
 from .vision_frame_registry import verify_registered_vision_frame
@@ -360,6 +362,110 @@ def _add_decision_payload_exclusions(
     return output
 
 
+def _official_rosh_v6_shadow_summary(
+    connection: sqlite3.Connection,
+) -> dict[str, object]:
+    """Report v6 M3-C records separately from probability/order cohorts."""
+
+    base: dict[str, object] = {
+        "schema": "official-rosh-v6-shadow-summary/v1",
+        "strategy_version": OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
+        "cohort": {"m3_c": "shadow_candidate_or_rejection", "m3_e": None},
+        "status": "not_started",
+        "raw_records": 0,
+        "valid_records": 0,
+        "shadow_candidates": 0,
+        "rejections": 0,
+        "reasons": {},
+        "invalid_records": 0,
+        "invalid_reasons": {},
+        "calibrated_probability_records": 0,
+        "m3_e_records": 0,
+        "paper_orders": 0,
+    }
+    if not _table_exists(connection, "official_rosh_shadow_evaluations"):
+        return base
+    try:
+        rows = connection.execute(
+            """SELECT candidate_hash, strategy_version, status, reason, record_json
+                 FROM official_rosh_shadow_evaluations
+                ORDER BY decided_at, evaluation_key"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {**base, "status": "unavailable"}
+
+    statuses: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    invalid_reasons: Counter[str] = Counter()
+    for row in rows:
+        try:
+            record = json.loads(str(row["record_json"]))
+        except (json.JSONDecodeError, TypeError):
+            invalid_reasons["record_json_invalid"] += 1
+            continue
+        if not isinstance(record, Mapping):
+            invalid_reasons["record_shape_invalid"] += 1
+            continue
+        if (
+            record.get("candidate_hash") != str(row["candidate_hash"])
+            or record.get("strategy_version") != str(row["strategy_version"])
+            or record.get("status") != str(row["status"])
+            or record.get("reason") != str(row["reason"])
+        ):
+            invalid_reasons["record_identity_mismatch"] += 1
+            continue
+        if str(row["strategy_version"]) != OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION:
+            invalid_reasons["strategy_version_mismatch"] += 1
+            continue
+        if validate_official_rosh_strategy_contract(
+            str(row["strategy_version"]),
+            record.get("strategy_contract"),
+        ) is None:
+            invalid_reasons["strategy_contract_invalid"] += 1
+            continue
+        if any(
+            record.get(field) is not None
+            for field in (
+                "calibration_artifact_ref",
+                "calibrated_probability",
+                "edge",
+                "stake_multiplier",
+                "paper_order",
+            )
+        ):
+            invalid_reasons["forbidden_probability_or_order"] += 1
+            continue
+        if record.get("cohort") != {
+            "m3_c": "shadow_candidate_or_rejection",
+            "m3_e": None,
+        }:
+            invalid_reasons["cohort_mismatch"] += 1
+            continue
+        status = str(row["status"])
+        statuses[status] += 1
+        reasons[str(row["reason"])] += 1
+
+    valid = sum(statuses.values())
+    invalid = sum(invalid_reasons.values())
+    if invalid and not valid:
+        status = "invalid_records"
+    elif valid:
+        status = "shadow_only_no_calibration"
+    else:
+        status = "not_started"
+    return {
+        **base,
+        "status": status,
+        "raw_records": len(rows),
+        "valid_records": valid,
+        "shadow_candidates": statuses["shadow_candidate"],
+        "rejections": statuses["rejected"],
+        "reasons": dict(sorted(reasons.items())),
+        "invalid_records": invalid,
+        "invalid_reasons": dict(sorted(invalid_reasons.items())),
+    }
+
+
 def build_report(
     connection: sqlite3.Connection,
     *,
@@ -467,7 +573,6 @@ def build_report(
                   AND {strict_decision_filter}
                   AND 0"""
         ).fetchall()
-    raw_decision_rows = decisions
     decision_payload_failures: Counter[str] = Counter(
         decision_payload_failure_by_key.values()
     )
@@ -758,6 +863,7 @@ def build_report(
     strategy_versions = dict(sorted(Counter(
         str(row["strategy_version"]) for row in decisions
     ).items()))
+    official_rosh_v6_shadow = _official_rosh_v6_shadow_summary(connection)
     forward_entry_by_strategy_version = _forward_entry_evaluation(
         decisions, cohorts, entry_validations
     )
@@ -884,6 +990,7 @@ def build_report(
         ),
         "service_health": health,
         "strategy_versions": strategy_versions,
+        "official_rosh_v6_shadow": official_rosh_v6_shadow,
         "forward_entry_by_strategy_version": forward_entry_by_strategy_version,
         "m1_strategy_contract_verifications": (
             m1_strategy_contract_verifications

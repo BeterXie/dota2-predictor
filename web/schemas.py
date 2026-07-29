@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # --- Pagination ---
@@ -57,6 +57,7 @@ class LeagueBase(BaseModel):
     leagueid: int
     name: str | None = None
     tier: str | None = None
+    match_count: int = 0
 
 
 # --- Teams ---
@@ -184,6 +185,7 @@ class PrematchRequest(BaseModel):
     radiant_heroes: list[int] = Field(min_length=5, max_length=5)
     dire_heroes: list[int] = Field(min_length=5, max_length=5)
     league_id: int | None = None
+    source_match_id: int | None = Field(default=None, gt=0)
     radiant_players: list[int] | None = Field(default=None, min_length=5, max_length=5)
     dire_players: list[int] | None = Field(default=None, min_length=5, max_length=5)
 
@@ -199,7 +201,100 @@ class PrematchRequest(BaseModel):
             players = self.radiant_players + self.dire_players
             if any(account_id <= 0 for account_id in players) or len(set(players)) != 10:
                 raise ValueError("rosters must contain 10 distinct positive account IDs")
+            if self.source_match_id is None:
+                raise ValueError("player rosters require a trusted source match")
         return self
+
+
+class RoshAnalysisDraftSlot(BaseModel):
+    hero_id: int = Field(gt=0)
+    position_id: int = Field(ge=1, le=5)
+
+
+class RoshAnalysisRequest(BaseModel):
+    mode: Literal["historical_match", "explicit_draft"]
+    date_time: int = Field(gt=0)
+    bracket_ids: list[Literal["IMMORTAL"]] = Field(
+        default_factory=lambda: ["IMMORTAL"],
+        min_length=1,
+        max_length=1,
+    )
+    rosh_profile_id: str = "stratz-rosh-web-2026-07-28-v2"
+    match_id: int | None = Field(default=None, gt=0)
+    radiant: list[RoshAnalysisDraftSlot] = Field(default_factory=list)
+    dire: list[RoshAnalysisDraftSlot] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "RoshAnalysisRequest":
+        if self.mode == "historical_match":
+            if self.match_id is None or self.radiant or self.dire:
+                raise ValueError(
+                    "historical_match requires match_id and no explicit draft"
+                )
+            return self
+        if self.match_id is not None:
+            raise ValueError("explicit_draft must not include match_id")
+        rows = self.radiant + self.dire
+        if len(self.radiant) != 5 or len(self.dire) != 5:
+            raise ValueError("explicit_draft requires five heroes per side")
+        if len({row.hero_id for row in rows}) != 10:
+            raise ValueError("explicit_draft requires ten distinct heroes")
+        for side in (self.radiant, self.dire):
+            if {row.position_id for row in side} != set(range(1, 6)):
+                raise ValueError("each side must cover positions 1 through 5")
+        return self
+
+
+class RoshAnalysisHeroComponent(BaseModel):
+    team_side: Literal["RADIANT", "DIRE"]
+    position_id: int
+    hero_id: int
+    position_base_diff: float
+    same_team_synergy: float
+    opponent_matchup_synergy: float
+    raw_score: float
+    display_score: float
+
+
+class RoshAnalysisMinutePoint(BaseModel):
+    minute: int
+    radiant_time_delta: float
+    dire_time_delta: float
+    synergy_delta: float
+    raw_score: float
+    display_score: float
+    rank_source_counts: dict[str, int]
+    slots: list[dict[str, Any]]
+
+
+class RoshAnalysisRunResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_: Literal["rosh-analysis-run/v1"] = Field(
+        default="rosh-analysis-run/v1",
+        alias="schema",
+    )
+    run_id: str
+    status: Literal["succeeded", "failed"]
+    mode: Literal["historical_match", "explicit_draft"]
+    match_id: int | None
+    date_time: int
+    draft_hash: str
+    rosh_profile_id: str
+    formula_version: str
+    request_profile_hash: str
+    upstream_bundle_hash: str
+    scorer_source_hash: str
+    canonical_profile_hash: str
+    serialization_version: str
+    evidence_hash: str
+    collected_at: str
+    radiant_team_score: float | None
+    dire_team_score: float | None
+    relative_advantage: float | None
+    hero_components: list[RoshAnalysisHeroComponent]
+    minute_points: list[RoshAnalysisMinutePoint]
+    error_code: str | None
 
 
 class PredictionFactor(BaseModel):

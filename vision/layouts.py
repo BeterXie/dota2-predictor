@@ -40,6 +40,9 @@ class BroadcastLayout:
     live_broadcast_marker_sets: tuple[tuple[str, ...], ...] = field(
         default_factory=tuple
     )
+    scoreboard_strip: NormalizedRegion | None = None
+    replay_status_regions: tuple[NormalizedRegion, ...] = field(default_factory=tuple)
+    requires_geometry_confirmation: bool = False
 
 
 STANDARD_DOTA_HUD = BroadcastLayout(
@@ -62,6 +65,26 @@ STANDARD_DOTA_HUD = BroadcastLayout(
     dire_net_worth_advantage=NormalizedRegion(0.527, 0.038, 0.555, 0.055),
     broadcast_status=NormalizedRegion(0.830, 0.000, 0.990, 0.280),
     live_broadcast_marker_sets=(("playoffs", "quarterfinal"),),
+)
+
+
+EPL_MASTERS_LIVE = BroadcastLayout(
+    name="epl_masters_live_1080p",
+    clock=STANDARD_DOTA_HUD.clock,
+    draft_banner=STANDARD_DOTA_HUD.draft_banner,
+    radiant_heroes=STANDARD_DOTA_HUD.radiant_heroes,
+    dire_heroes=STANDARD_DOTA_HUD.dire_heroes,
+    radiant_team_logo=STANDARD_DOTA_HUD.radiant_team_logo,
+    dire_team_logo=STANDARD_DOTA_HUD.dire_team_logo,
+    radiant_kills=NormalizedRegion(0.446, 0.005, 0.468, 0.034),
+    dire_kills=NormalizedRegion(0.532, 0.005, 0.554, 0.034),
+    radiant_net_worth_advantage=STANDARD_DOTA_HUD.radiant_net_worth_advantage,
+    dire_net_worth_advantage=STANDARD_DOTA_HUD.dire_net_worth_advantage,
+    broadcast_status=NormalizedRegion(0.680, 0.840, 0.860, 1.000),
+    live_broadcast_marker_sets=(),
+    scoreboard_strip=NormalizedRegion(0.300, 0.000, 0.700, 0.250),
+    replay_status_regions=(),
+    requires_geometry_confirmation=True,
 )
 
 

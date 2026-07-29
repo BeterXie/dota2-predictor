@@ -3,15 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.responses import JSONResponse
 import psutil
 
@@ -19,6 +23,14 @@ from live_betting.milestone_revocation import (
     MilestoneRevocationConfig,
     MilestoneRevocationIntegrityError,
 )
+from live_betting.rosh_parity import (
+    ExactByteArtifactStore,
+    RoshAnalysisError,
+    RoshParityOrchestrator,
+)
+from live_betting.rosh_parity_storage import RoshRunRepository, StoredRoshRun
+from live_betting.stratz_rosh_client import StratzRoshClient, StratzRoshError
+from prematch.stratz_official_profile import ProfileError, get_profile
 
 from live_betting.service_coordination import (
     ProcessIdentity,
@@ -44,13 +56,26 @@ from .routers import (
     monitor,
     teams,
 )
-from .schemas import H2HComparison, MatchSummary, PrematchRequest, PredictionRequest, TeamBase
+from .schemas import (
+    H2HComparison,
+    MatchSummary,
+    PrematchRequest,
+    PredictionRequest,
+    RoshAnalysisRequest,
+    RoshAnalysisRunResponse,
+    TeamBase,
+)
 
 # Resolve paths for the prediction module
 _WEB_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _WEB_DIR.parent
 _MODELS_DIR = os.environ.get("MODELS_DIR", str(_PROJECT_DIR / "data" / "models"))
 _PREDICTIONS_DIR = os.environ.get("PREDICTIONS_DIR", str(_PROJECT_DIR / "data" / "predictions"))
+_ROSH_ARTIFACTS_DIR = os.environ.get(
+    "ROSH_ANALYSIS_ARTIFACTS_DIR",
+    str(_PROJECT_DIR / "data" / "rosh-analysis-artifacts"),
+)
+logger = logging.getLogger(__name__)
 
 # Ensure project root is on sys.path (once at startup, not lazily)
 _project_root_str = str(_PROJECT_DIR)
@@ -134,6 +159,38 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 app.state.milestone_revocation_config = None
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(
+    request: Request,
+    error: RequestValidationError,
+) -> JSONResponse:
+    if request.url.path == "/api/prematch/rosh-analysis":
+        _rosh_analysis_event(
+            {
+                "event": "rosh_analysis_failed",
+                "stage": "pre_draft",
+                "error_code": "invalid_request",
+                "mode": None,
+                "profile_id": None,
+                "request_hash_prefix": None,
+                "run_id_prefix": None,
+            }
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "error_code": "invalid_request",
+                    "message": "Rosh analysis request is invalid",
+                }
+            },
+        )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(error.errors())},
+    )
 
 
 def configure_milestone_revocation(
@@ -457,13 +514,10 @@ def serve_index(request: Request) -> RedirectResponse:
     return RedirectResponse(target, status_code=307)
 
 
-@app.get("/matches", response_class=HTMLResponse)
-def serve_legacy_matches():
-    """Serve the legacy searchable match table at an explicit secondary route."""
-    index_path = STATIC_DIR / "index.html"
-    if index_path.exists():
-        return HTMLResponse(index_path.read_text(encoding="utf-8"))
-    return HTMLResponse("<h1>Dota 2 Predictor</h1><p>index.html not found.</p>")
+@app.get("/matches", include_in_schema=False)
+def serve_legacy_matches() -> RedirectResponse:
+    """Retire the legacy table in favor of the console history view."""
+    return RedirectResponse("/monitor?view=replay", status_code=307)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -577,18 +631,10 @@ def create_prediction(request: PredictionRequest):
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
 
-@app.get("/prematch", response_class=HTMLResponse)
+@app.get("/prematch", include_in_schema=False)
 def serve_prematch_page():
-    from fastapi.responses import Response
-    index_path = STATIC_DIR / "prematch.html"
-    if index_path.exists():
-        content = index_path.read_text(encoding="utf-8")
-        return Response(
-            content=content,
-            media_type="text/html",
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
-        )
-    return HTMLResponse("<h1>Pre-Match Prediction</h1><p>prematch.html not found.</p>")
+    """Serve the integrated console with the prematch view selected."""
+    return serve_monitor()
 
 
 _prematch_builder = None
@@ -597,10 +643,267 @@ _prematch_builder = None
 def _get_prematch_builder():
     global _prematch_builder
     if _prematch_builder is None:
-        from prematch.scorer import predict_match
         from predict import output
-        _prematch_builder = (predict_match, output)
+        _prematch_builder = (StratzRoshClient(), output)
     return _prematch_builder
+
+
+def _rosh_analysis_event(event: dict) -> None:
+    logger.info("official_rosh_analysis %s", json.dumps(event, sort_keys=True))
+
+
+def _get_rosh_analysis_orchestrator(connection) -> RoshParityOrchestrator:
+    return RoshParityOrchestrator(
+        transport=StratzRoshClient(),
+        artifacts=ExactByteArtifactStore(_ROSH_ARTIFACTS_DIR),
+        repository=RoshRunRepository(connection),
+        event_hook=_rosh_analysis_event,
+    )
+
+
+def _rosh_run_response(stored: StoredRoshRun) -> dict:
+    run = stored.run
+    return {
+        "schema": "rosh-analysis-run/v1",
+        "run_id": run.run_id,
+        "status": run.status,
+        "mode": run.mode,
+        "match_id": run.match_id,
+        "date_time": run.date_time,
+        "draft_hash": run.draft_hash,
+        "rosh_profile_id": run.rosh_profile_id,
+        "formula_version": run.formula_version,
+        "request_profile_hash": run.request_profile_hash,
+        "upstream_bundle_hash": run.upstream_bundle_hash,
+        "scorer_source_hash": run.scorer_source_hash,
+        "canonical_profile_hash": run.canonical_profile_hash,
+        "serialization_version": run.serialization_version,
+        "evidence_hash": run.evidence_hash,
+        "collected_at": run.collected_at,
+        "radiant_team_score": run.radiant_team_score,
+        "dire_team_score": run.dire_team_score,
+        "relative_advantage": run.relative_advantage,
+        "hero_components": [
+            {
+                "team_side": row.team_side,
+                "position_id": row.position_id,
+                "hero_id": row.hero_id,
+                **dict(row.components),
+                "raw_score": row.raw_score,
+                "display_score": row.display_score,
+            }
+            for row in stored.hero_scores
+        ],
+        "minute_points": [
+            {
+                "minute": row.minute,
+                "radiant_time_delta": row.radiant_time_delta,
+                "dire_time_delta": row.dire_time_delta,
+                "synergy_delta": row.synergy_delta,
+                "raw_score": row.raw_score,
+                "display_score": row.display_score,
+                **dict(row.source_audit),
+            }
+            for row in stored.minute_points
+        ],
+        "error_code": run.error_code,
+    }
+
+
+_ROSH_ERROR_STATUS = {
+    "invalid_request": 400,
+    "source_match_not_found": 404,
+    "source_draft_mismatch": 409,
+    "profile_drift": 409,
+    "source_data_incomplete": 422,
+    "upstream_rate_limited": 429,
+    "upstream_unavailable": 503,
+}
+
+
+def _raise_rosh_http(error: RoshAnalysisError) -> None:
+    detail = {
+        "error_code": error.error_code,
+        "message": str(error),
+    }
+    if error.run_id is not None:
+        detail["run_id"] = error.run_id
+    raise HTTPException(
+        status_code=_ROSH_ERROR_STATUS[error.error_code],
+        detail=detail,
+    ) from None
+
+
+@app.post(
+    "/api/prematch/rosh-analysis",
+    response_model=RoshAnalysisRunResponse,
+    tags=["predictions"],
+)
+def create_rosh_analysis(request: RoshAnalysisRequest):
+    connection = queries.get_db()
+    try:
+        try:
+            profile = get_profile(request.rosh_profile_id)
+        except ProfileError:
+            _rosh_analysis_event(
+                {
+                    "event": "rosh_analysis_failed",
+                    "stage": "pre_draft",
+                    "error_code": "profile_drift",
+                    "mode": request.mode,
+                    "profile_id": request.rosh_profile_id,
+                    "request_hash_prefix": None,
+                    "run_id_prefix": None,
+                }
+            )
+            _raise_rosh_http(RoshAnalysisError("profile_drift"))
+        analysis_input = request.model_dump(exclude={"rosh_profile_id"})
+        stored = _get_rosh_analysis_orchestrator(connection).execute(
+            analysis_input,
+            profile,
+        )
+        return _rosh_run_response(stored)
+    except RoshAnalysisError as error:
+        _raise_rosh_http(error)
+    finally:
+        connection.close()
+
+
+@app.get(
+    "/api/prematch/rosh-analysis/{run_id}",
+    response_model=RoshAnalysisRunResponse,
+    tags=["predictions"],
+)
+def get_rosh_analysis(run_id: str):
+    if len(run_id) != 64 or any(character not in "0123456789abcdef" for character in run_id):
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "analysis_not_found", "message": "Rosh analysis was not found"},
+        )
+    connection = queries.get_db()
+    try:
+        stored = RoshRunRepository(connection).get(run_id)
+        if stored is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error_code": "analysis_not_found",
+                    "message": "Rosh analysis was not found",
+                },
+            )
+        return _rosh_run_response(stored)
+    finally:
+        connection.close()
+
+
+def _validated_source_match(request: PrematchRequest) -> dict:
+    assert request.source_match_id is not None
+    draft = queries.get_match_draft(request.source_match_id)
+    if draft is None:
+        raise HTTPException(status_code=400, detail="Source match is not available locally")
+    if (
+        draft.get("radiant_team_id") != request.radiant_id
+        or draft.get("dire_team_id") != request.dire_id
+    ):
+        raise HTTPException(status_code=400, detail="Source match teams do not match the request")
+
+    radiant = draft.get("radiant_heroes") or []
+    dire = draft.get("dire_heroes") or []
+    if (
+        {row.get("hero_id") for row in radiant} != set(request.radiant_heroes)
+        or {row.get("hero_id") for row in dire} != set(request.dire_heroes)
+    ):
+        raise HTTPException(status_code=400, detail="Source match draft does not match the request")
+
+    if request.radiant_players is not None and request.dire_players is not None:
+        submitted = {
+            hero_id: account_id
+            for hero_id, account_id in zip(
+                request.radiant_heroes + request.dire_heroes,
+                request.radiant_players + request.dire_players,
+            )
+        }
+        observed = {
+            row.get("hero_id"): row.get("account_id")
+            for row in (*radiant, *dire)
+        }
+        if observed != submitted:
+            raise HTTPException(
+                status_code=400,
+                detail="Source match player identities do not match the request",
+            )
+    return draft
+
+
+def _validate_stratz_source_lineup(context: dict, request: PrematchRequest) -> None:
+    radiant = {pick.get("heroId") for pick in context.get("radiant_picks", [])}
+    dire = {pick.get("heroId") for pick in context.get("dire_picks", [])}
+    if radiant != set(request.radiant_heroes) or dire != set(request.dire_heroes):
+        raise HTTPException(
+            status_code=502,
+            detail="STRATZ source match lineup differs from the local draft",
+        )
+
+
+def _rosh_prediction(score, minute_table: list[dict], source_match_id: int | None) -> dict:
+    pure_score = float(score.pure_lineup_score)
+    adjusted_score = getattr(score, "player_adjusted_lineup_score", None)
+    if adjusted_score is None:
+        adjusted_score = getattr(score, "current_player_adjusted_lineup_score", None)
+    adjusted_score = None if adjusted_score is None else float(adjusted_score)
+    effective_score = float(score.effective_lineup_score)
+    player_coverage = int(score.player_coverage_count)
+    adjusted_mode = adjusted_score is not None and player_coverage == 10
+    confidence_score = 1.0 if adjusted_mode else 0.5
+    probability = min(1.0 - 1e-6, max(1e-6, (50.0 + effective_score) / 100.0))
+
+    factors = []
+    if effective_score != 0.0:
+        factors.append({
+            "factor": "stratz_rosh_lineup",
+            "impact": round(abs(effective_score) / 100.0, 4),
+            "direction": "radiant" if effective_score > 0 else "dire",
+        })
+    if adjusted_score is not None and adjusted_score != pure_score:
+        delta = adjusted_score - pure_score
+        factors.append({
+            "factor": "stratz_player_highlights",
+            "impact": round(abs(delta) / 100.0, 4),
+            "direction": "radiant" if delta > 0 else "dire",
+        })
+
+    evidence = dict(score.evidence)
+    return {
+        "radiant_win_prob": round(probability, 4),
+        "confidence": "high" if adjusted_mode else "medium",
+        "confidence_score": confidence_score,
+        "scoring_mode": str(score.scoring_mode),
+        "player_coverage_count": player_coverage,
+        "source_match_id": source_match_id,
+        "top_factors": factors,
+        "hero_matrix": [],
+        "radiant_heroes": [],
+        "dire_heroes": [],
+        "components": {
+            "stratz_rosh": {
+                "pure_lineup_score": pure_score,
+                "player_adjusted_lineup_score": adjusted_score,
+                "effective_lineup_score": effective_score,
+                "scoring_mode": str(score.scoring_mode),
+                "player_coverage_count": player_coverage,
+                "stake_multiplier": float(getattr(score, "stake_multiplier", confidence_score)),
+                "formula_version": str(score.formula_version),
+                "source_name": str(score.source_name),
+                "source_week": int(score.source_week),
+                "source_as_of": score.source_as_of.isoformat(),
+                "evidence_hash": str(score.evidence_hash),
+                "minute_table": minute_table,
+                "evidence": evidence,
+            }
+        },
+        "weights_used": {"stratz_rosh": 1.0},
+        "raw_score": effective_score,
+    }
 
 
 @app.post("/api/prematch-predict", tags=["predictions"])
@@ -627,54 +930,52 @@ def create_prematch_prediction(request: PrematchRequest):
         conn.close()
 
     try:
-        predict_match, output = _get_prematch_builder()
+        client, output = _get_prematch_builder()
+        if request.source_match_id is not None:
+            _validated_source_match(request)
+            fetched = client.fetch_historical_match_score(
+                request.source_match_id,
+                include_current_player_adjustment=request.radiant_players is not None,
+            )
+            _validate_stratz_source_lineup(fetched.context, request)
+            if fetched.score is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="STRATZ Rosh score is unavailable for the source match",
+                )
+            score = fetched.score
+            minute_table = [dict(row) for row in fetched.minute_table]
+        else:
+            score = client.fetch_lineup_score(
+                request.radiant_heroes,
+                request.dire_heroes,
+                as_of=datetime.now(timezone.utc),
+            )
+            table_key = (
+                "minute_table"
+                if score.player_adjusted_lineup_score is not None
+                else "pure_minute_table"
+            )
+            minute_table = [dict(row) for row in score.evidence.get(table_key, [])]
 
-        result = predict_match(
-            queries.DB_PATH,
-            request.radiant_id, request.dire_id,
-            request.radiant_heroes, request.dire_heroes,
-            radiant_players=request.radiant_players,
-            dire_players=request.dire_players,
-        )
-
-        # Wrap result to match expected format
-        prediction = {
-            "radiant_win_prob": result["radiant_win_prob"],
-            "confidence": result["confidence"],
-            "confidence_score": result["confidence_score"],
-            "top_factors": _format_scorer_factors(result),
-            "hero_matrix": result["components"]["hero_matchup"].get("matrix", []),
-            "radiant_heroes": result["components"]["hero_matchup"].get("radiant_heroes", []),
-            "dire_heroes": result["components"]["hero_matchup"].get("dire_heroes", []),
-            # Full component breakdowns for team comparison view
-            "components": result["components"],
-            "weights_used": result["weights_used"],
-            "raw_score": result["raw_score"],
-        }
+        prediction = _rosh_prediction(score, minute_table, request.source_match_id)
 
         prediction_output = output.format_output(
             prediction, request.radiant_id, request.dire_id,
             request.league_id or 0,
-            {"timestamp": "scorer", "metrics": {}}, queries.DB_PATH,
+            {"timestamp": score.formula_version, "metrics": {}}, queries.DB_PATH,
         )
         file_path = output.save_prediction(prediction_output, _PREDICTIONS_DIR)
         prediction_output["file_path"] = file_path
         return output._sanitize(prediction_output)
+    except HTTPException:
+        raise
+    except StratzRoshError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"STRATZ Rosh is unavailable: {e}",
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
-
-
-def _format_scorer_factors(result: dict) -> list[dict]:
-    factors = []
-    for name, comp in result.get("components", {}).items():
-        score = comp.get("score", 0)
-        if abs(score) < 0.01:
-            continue
-        direction = "radiant" if score > 0 else "dire"
-        factors.append({
-            "factor": name,
-            "impact": round(abs(score), 4),
-            "direction": direction,
-        })
-    factors.sort(key=lambda x: x["impact"], reverse=True)
-    return factors

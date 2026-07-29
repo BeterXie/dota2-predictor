@@ -17,8 +17,15 @@ from scripts.build_hero_features import build_hero_features
 from scripts.fetch_hero_portraits import valid_portrait_bytes
 from vision.clock_reader import ClockReader, ClockReading
 from vision.hero_recognizer import DraftReading, DraftTracker, HeroRecognizer
+from vision.hud_reader import HudReader
 from vision.image_features import color_histogram, compute_phash
-from vision.layouts import BroadcastLayout, NormalizedRegion, STANDARD_DOTA_HUD
+from vision.layout_selector import select_broadcast_layout
+from vision.layouts import (
+    BroadcastLayout,
+    EPL_MASTERS_LIVE,
+    NormalizedRegion,
+    STANDARD_DOTA_HUD,
+)
 from vision.map_state import MapStateTracker
 from vision.observation_writer import ObservationWriter
 from vision.screen_state import classify_screen_state
@@ -47,6 +54,149 @@ SCORE_LAYOUT = BroadcastLayout(
     radiant_kills=LEFT,
     dire_kills=RIGHT,
 )
+
+
+def _synthetic_epl_hud() -> np.ndarray:
+    image = np.full((1080, 1920, 3), 70, dtype=np.uint8)
+    cyan = (255, 255, 0)
+    cv2.rectangle(image, (451, 0), (480, 70), cyan, -1)
+    cv2.rectangle(image, (1440, 0), (1469, 70), cyan, -1)
+    cv2.rectangle(image, (1305, 918), (1651, 1079), (12, 12, 12), -1)
+    cv2.rectangle(image, (1536, 928), (1612, 1079), cyan, -1)
+    return image
+
+
+def test_epl_layout_requires_the_complete_hud_geometry() -> None:
+    image = _synthetic_epl_hud()
+    selection = select_broadcast_layout(image)
+
+    assert selection.layout == EPL_MASTERS_LIVE
+    assert selection.confidence >= 0.9
+
+    image[:, 1440:1470] = 70
+    fallback = select_broadcast_layout(image)
+    assert fallback.layout == STANDARD_DOTA_HUD
+
+
+def test_epl_scoreboard_strip_uses_positioned_ocr_results() -> None:
+    reader = ScoreboardReader(EPL_MASTERS_LIVE, use_ocr=False)
+
+    class PositionedOcr:
+        def __call__(self, image, **kwargs):
+            del image, kwargs
+            return [
+                [[[300, 10], [325, 10], [325, 30], [300, 30]], "6", 0.99],
+                [[[450, 10], [465, 10], [465, 30], [450, 30]], "3", 0.98],
+                [[[295, 42], [328, 42], [328, 55], [295, 55]], "<1k", 0.999],
+            ], None
+
+    reader.ocr = PositionedOcr()
+    reading = reader.read(np.zeros((1080, 1920, 3), dtype=np.uint8))
+
+    assert reading == ScoreboardReading(6, 3, 0.98)
+
+
+def test_epl_positioned_ocr_is_reused_for_clock_and_advantage() -> None:
+    reader = ScoreboardReader(EPL_MASTERS_LIVE, use_ocr=False)
+
+    class PositionedOcr:
+        calls = 0
+
+        def __call__(self, image, **kwargs):
+            del image, kwargs
+            self.calls += 1
+            return [
+                [[[300, 10], [325, 10], [325, 30], [300, 30]], "6", 0.99],
+                [[[450, 10], [465, 10], [465, 30], [450, 30]], "3", 0.98],
+                [[[365, 23], [402, 23], [402, 36], [365, 36]], "6:03", 0.97],
+                [[[295, 42], [328, 42], [328, 55], [295, 55]], "<1k", 0.96],
+            ], None
+
+    ocr = PositionedOcr()
+    reader.ocr = ocr
+    image = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    assert reader.read_positioned_clock(image) == ClockReading(363, 0.97, "6:03")
+    assert reader.read(image) == ScoreboardReading(6, 3, 0.98)
+    assert reader.read_net_worth_advantage(image) == NetWorthAdvantageReading(
+        "radiant",
+        0,
+        999,
+        0.96,
+    )
+    assert ocr.calls == 1
+
+
+def test_layout_aware_hud_reader_keeps_hud_independent_from_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = _synthetic_epl_hud()
+    reader = HudReader(use_ocr=False)
+    profile = reader._profile(EPL_MASTERS_LIVE)
+
+    class PositionedOcr:
+        def __call__(self, image, **kwargs):
+            del image, kwargs
+            return [
+                [[[300, 10], [325, 10], [325, 30], [300, 30]], "12", 0.99],
+                [[[450, 10], [475, 10], [475, 30], [450, 30]], "3", 0.99],
+                [[[365, 23], [402, 23], [402, 36], [365, 36]], "13:28", 0.98],
+                [[[295, 42], [328, 42], [328, 55], [295, 55]], "11k", 0.97],
+            ], None
+
+    profile.scoreboard.ocr = PositionedOcr()
+    monkeypatch.setattr(
+        "vision.hud_reader.classify_screen_state",
+        lambda image, layout: ("game", 0.98),
+    )
+
+    reading = reader.read(image)
+
+    assert reading.selection.layout == EPL_MASTERS_LIVE
+    assert reading.replay_gate.status == "live"
+    assert reading.clock == ClockReading(808, 0.98, "13:28")
+    assert reading.scoreboard == ScoreboardReading(12, 3, 0.99)
+    assert reading.net_worth_advantage == NetWorthAdvantageReading(
+        "radiant", 11_000, 11_999, 0.97
+    )
+    assert reading.is_hud_available
+    assert reading.draft == DraftReading((), (), 0.0)
+
+
+def test_epl_live_gate_requires_scoreboard_geometry_and_replay_overrides() -> None:
+    image = _synthetic_epl_hud()
+    reader = ScoreboardReader(EPL_MASTERS_LIVE, use_ocr=False)
+
+    class PositionedOcr:
+        replay = False
+
+        def __call__(self, image, **kwargs):
+            del image, kwargs
+            rows = [
+                [[[300, 10], [325, 10], [325, 30], [300, 30]], "6", 0.99],
+                [[[450, 10], [465, 10], [465, 30], [450, 30]], "3", 0.98],
+                [[[365, 23], [402, 23], [402, 36], [365, 36]], "6:03", 0.97],
+            ]
+            if self.replay:
+                rows.append(
+                    [[[320, 65], [420, 65], [420, 82], [320, 82]], "REPLAY", 0.99]
+                )
+            return rows, None
+
+    ocr = PositionedOcr()
+    reader.ocr = ocr
+    assert reader.read_replay_gate(image).status == "live"
+
+    ocr.replay = True
+    reader._strip_cache_image = None
+    assert reader.read_replay_gate(image).status == "replay"
+
+    reader.ocr = lambda image, **kwargs: (
+        [[[[90, 40], [180, 40], [180, 60], [90, 60]], "EPL MASTERS", 0.99]],
+        None,
+    )
+    reader._strip_cache_image = None
+    assert reader.read_replay_gate(image).status == "untrusted"
 
 
 def _portrait(color: tuple[int, int, int], marker: str) -> np.ndarray:
@@ -476,6 +626,40 @@ def test_available_comeback_state_round_trips_from_the_same_evidence_frame(
     assert state.dire_kills == 25
     assert state.radiant_net_worth == 42_000
     assert state.dire_net_worth == 49_500
+
+
+def test_hud_confirmation_does_not_require_a_confirmed_draft(tmp_path: Path) -> None:
+    observation = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        map_number=2,
+        game_clock_seconds=808,
+        is_paused=False,
+        clock_confidence=0.98,
+        draft_confidence=0.0,
+        source_frame_ref="frame.jpg",
+        screen_state="game",
+        comeback_state=ComebackState(
+            status="available",
+            source="vision_hud",
+            confidence=0.97,
+            radiant_kills=12,
+            dire_kills=3,
+            net_worth_advantage_side="radiant",
+            net_worth_advantage_min=11_000,
+            net_worth_advantage_max=11_999,
+            unavailable_reason=None,
+        ),
+    )
+
+    assert observation.is_hud_confirmed
+    assert not observation.is_confirmed
+
+    path = tmp_path / "42.jsonl"
+    ObservationWriter(path).append(observation)
+    parsed = read_jsonl(path)[0]
+    assert parsed.is_hud_confirmed
+    assert not parsed.is_confirmed
 
 
 def test_bucketed_net_worth_advantage_round_trips_without_exact_totals(
