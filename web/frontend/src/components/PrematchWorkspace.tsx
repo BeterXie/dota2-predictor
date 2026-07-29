@@ -152,7 +152,7 @@ export function PrematchWorkspace() {
     setSourceMatchId(
       radiant.length === 5 && dire.length === 5 ? draft.match_id : null,
     );
-    setSourceDateTime(draft.start_time);
+    setSourceDateTime(draft.end_time);
     setSourceStatus(`比赛 ${draft.match_id} 已载入，位置按 1-5 号位绑定`);
     setPrediction(null);
     setPredictionError(null);

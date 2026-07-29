@@ -1,6 +1,7 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { createRoshAnalysis, fetchPrematchDraft } from "../api";
 import type { RoshAnalysisRunResponse } from "../types";
 import { PredictionResult, PrematchWorkspace } from "./PrematchWorkspace";
 
@@ -21,6 +22,46 @@ describe("PrematchWorkspace", () => {
 
     expect(screen.queryByRole("button", { name: "重新抓取" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "抓取新数据" })).not.toBeInTheDocument();
+  });
+
+  it("uses the source match end time for historical Rosh identity", async () => {
+    vi.mocked(fetchPrematchDraft).mockResolvedValue({
+      match_id: 8904322271,
+      radiant_team_id: 10,
+      dire_team_id: 20,
+      league_id: 19785,
+      start_time: 1784478900,
+      end_time: 1784481374,
+      radiant_heroes: [1, 2, 3, 4, 5].map((hero_id) => ({
+        hero_id,
+        name: `Radiant ${hero_id}`,
+        image_url: "",
+        account_id: hero_id,
+      })),
+      dire_heroes: [6, 7, 8, 9, 10].map((hero_id) => ({
+        hero_id,
+        name: `Dire ${hero_id}`,
+        image_url: "",
+        account_id: hero_id,
+      })),
+    });
+    vi.mocked(createRoshAnalysis).mockResolvedValue(predictionResult);
+    render(<PrematchWorkspace />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "比赛 ID" }), {
+      target: { value: "8904322271" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "自动填充" }));
+    await screen.findByText(/比赛 8904322271 已载入/);
+    fireEvent.click(screen.getByRole("button", { name: "分析阵容" }));
+
+    await waitFor(() => expect(createRoshAnalysis).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mode: "historical_match",
+        match_id: 8904322271,
+        date_time: 1784481374,
+      }),
+    ));
   });
 });
 

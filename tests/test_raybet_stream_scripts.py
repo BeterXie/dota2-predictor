@@ -38,6 +38,7 @@ from scripts.watch_raybet_stream import (
     ALLOWED_STREAM_HOSTS,
     ROOT,
     _meaningful,
+    _draft_for_tracking,
     _sanitized_stream_location,
     _should_persist_frame,
     _suppress_native_video_stderr,
@@ -55,6 +56,8 @@ from scripts.watch_raybet_stream import (
     resolve_data_paths as resolve_watcher_data_paths,
 )
 from contracts.live_observation import ComebackState, LiveObservation
+from vision.hero_recognizer import DraftReading
+from vision.layouts import EPL_MASTERS_LIVE, STANDARD_DOTA_HUD
 from vision.map_state import ConfirmedClock
 from vision.scoreboard_reader import (
     NetWorthAdvantageReading,
@@ -891,6 +894,42 @@ def test_unconfirmed_frame_never_refreshes_previous_clock_value() -> None:
     previous = ConfirmedClock(1, 1392, False, 0.94)
     assert current_frame_clock_fields(previous) == (1392, False, 0.94)
     assert current_frame_clock_fields(None) == (None, None, 0.0)
+
+
+def test_epl_draft_tracking_uses_current_or_last_confirmed_early_clock() -> None:
+    draft = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.91)
+    early = ConfirmedClock(1, 180, False, 0.94)
+
+    assert _draft_for_tracking(EPL_MASTERS_LIVE, draft, early, None) == draft
+    assert _draft_for_tracking(EPL_MASTERS_LIVE, draft, None, early) == draft
+
+
+@pytest.mark.parametrize(
+    ("confirmed_clock", "last_clock"),
+    [
+        (ConfirmedClock(1, 181, False, 0.94), None),
+        (None, ConfirmedClock(1, 181, False, 0.94)),
+        (None, None),
+    ],
+)
+def test_epl_draft_tracking_fails_closed_without_safe_early_clock(
+    confirmed_clock: ConfirmedClock | None,
+    last_clock: ConfirmedClock | None,
+) -> None:
+    draft = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.91)
+
+    assert _draft_for_tracking(
+        EPL_MASTERS_LIVE,
+        draft,
+        confirmed_clock,
+        last_clock,
+    ) == DraftReading((), (), 0.0)
+
+
+def test_standard_layout_draft_tracking_has_no_clock_window() -> None:
+    draft = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.91)
+
+    assert _draft_for_tracking(STANDARD_DOTA_HUD, draft, None, None) == draft
 
 
 def test_comeback_state_requires_current_confirmed_hud_inputs() -> None:

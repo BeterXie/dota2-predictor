@@ -17,8 +17,11 @@ from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
 from live_betting.draft_authority import DraftLandmarkAuthority
 from live_betting.models import Market, OddsSnapshot, ShadowOrder
+from live_betting.official_rosh_run import OfficialRoshRunCoordinator
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
+from live_betting.rosh_parity import RoshParityOrchestrator
+from live_betting.stratz_rosh_client import OfficialRoshBatch
 from live_betting.shadow_monitor import _observation, persist_alignments, run_once
 from live_betting.storage import LiveBettingStore
 from live_betting.strict_eligibility import (
@@ -26,6 +29,12 @@ from live_betting.strict_eligibility import (
     init_strict_live_eligibility_schema,
 )
 from live_betting.vision import VisionObservation
+from prematch.stratz_official_score import (
+    HeroScore,
+    MinutePoint,
+    MinuteSlot,
+    OfficialRoshResult,
+)
 from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
@@ -1974,6 +1983,157 @@ class ShadowMonitorSafetyTests(unittest.TestCase):
         self.assertIsNotNone(call["previous_snapshots"])
         self.assertEqual(call["observation"].game_clock_seconds, 604)
         self.assertEqual(call["previous_observation"].game_clock_seconds, 601)
+
+    def test_fake_transport_e2e_creates_causal_official_rosh_v6_evaluation(
+        self,
+    ) -> None:
+        high_clock = reframe(
+            observation(NOW),
+            frame="official-rosh-e2e",
+            game_clock_seconds=40 * 60,
+        )
+        self.store.insert_vision_observation(high_clock)
+        strategy, _, _ = self._prepare_strategy_run(add_observation=False)
+        first_at = NOW + timedelta(seconds=1)
+        collected_at = NOW + timedelta(seconds=2)
+        second_at = NOW + timedelta(seconds=4)
+        self.record_transport(first_at, key="official-rosh-before")
+        transport_calls = []
+
+        class FakeTransport:
+            def fetch_official_batch(_self, plan):
+                from live_betting import rosh_parity
+
+                transport_calls.append(plan.request_hash)
+                request_body = rosh_parity._request_body(plan)
+                responses = tuple({"data": {}} for _ in plan.operations)
+                response_body = __import__("json").dumps(
+                    responses, separators=(",", ":")
+                ).encode("utf-8")
+                return OfficialRoshBatch(
+                    request_body,
+                    response_body,
+                    responses,
+                    collected_at,
+                    {},
+                )
+
+        heroes = tuple(
+            HeroScore(side, hero_id, position, 0.0, 0.0, 0.0, 0.0, 0.0)
+            for side, values in (
+                ("RADIANT", tuple(range(1, 6))),
+                ("DIRE", tuple(range(6, 11))),
+            )
+            for position, hero_id in enumerate(values, 1)
+        )
+        slots = tuple(
+            MinuteSlot(side, hero_id, position, "DIVINE_IMMORTAL", 1000, 0.0)
+            for side, values in (
+                ("RADIANT", tuple(range(1, 6))),
+                ("DIRE", tuple(range(6, 11))),
+            )
+            for position, hero_id in enumerate(values, 1)
+        )
+        score = OfficialRoshResult(
+            "stratz-official-rosh/2026-07-28-v2",
+            5.5,
+            5.5,
+            0.0,
+            0.0,
+            5.5,
+            5.5,
+            heroes,
+            (
+                MinutePoint(
+                    40,
+                    -1.0,
+                    1.0,
+                    5.5,
+                    5.5,
+                    5.5,
+                    {"DIVINE_IMMORTAL": 10, "ALL_RANK_FALLBACK": 0},
+                    slots,
+                ),
+            ),
+            hashlib.sha256(b"live-official-rosh-e2e").hexdigest(),
+        )
+
+        def runner_factory(repository, artifacts):
+            return RoshParityOrchestrator(
+                transport=FakeTransport(),
+                artifacts=artifacts,
+                repository=repository,
+                clock=lambda: collected_at,
+            )
+
+        def live_draft(*args, **kwargs):
+            curve = strategy.fake_draft(*args, **kwargs)
+            return replace(
+                curve,
+                points=(replace(curve.points[0], minute=40),),
+            )
+
+        coordinator = OfficialRoshRunCoordinator(
+            database_path=self.store.path,
+            artifact_root=Path(self.directory.name) / "rosh-artifacts",
+            runner_factory=runner_factory,
+        )
+        try:
+            with (
+                patch("live_betting.shadow_monitor._profiles", side_effect=strategy.fake_profiles),
+                patch(
+                    "live_betting.shadow_monitor.build_draft_curve",
+                    side_effect=live_draft,
+                ),
+                patch("live_betting.rosh_parity.normalize_official_responses", return_value=object()),
+                patch("live_betting.rosh_parity.score_official_rosh", return_value=score),
+                patch.object(self.store, "insert_decision", return_value=True),
+            ):
+                first = run_once(
+                    self.store,
+                    strategy,
+                    MISSING_VISION,
+                    now=NOW + timedelta(seconds=2),
+                    official_rosh_run_coordinator=coordinator,
+                )
+                self.assertIn("official_rosh_v6", first, first)
+                self.assertEqual(
+                    first["official_rosh_v6"]["analysis_status"], "pending"
+                )
+                assert coordinator._active is not None
+                coordinator._active.future.result(timeout=2)
+                self.record_transport(second_at, key="official-rosh-after")
+                second = run_once(
+                    self.store,
+                    strategy,
+                    MISSING_VISION,
+                    now=NOW + timedelta(seconds=5),
+                    official_rosh_run_coordinator=coordinator,
+                )
+
+            self.assertEqual(
+                second["official_rosh_v6"]["analysis_status"], "succeeded"
+            )
+            self.assertEqual(second["official_rosh_v6"]["status"], "shadow_candidate")
+            self.assertEqual(len(transport_calls), 1)
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM rosh_analysis_runs WHERE status='succeeded'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM official_rosh_shadow_evaluations"
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                self.store.connection.execute("SELECT COUNT(*) FROM shadow_orders").fetchone()[0],
+                0,
+            )
+        finally:
+            coordinator.close()
 
     def test_repolling_one_transport_never_invents_previous_state(self) -> None:
         strategy, _, _ = self._prepare_strategy_run()

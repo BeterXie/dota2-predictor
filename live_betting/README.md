@@ -140,14 +140,19 @@ takes a full online backup:
 python scripts/run_dota_shadow_service.py --migrate --once --database data/dota2.db
 ```
 
-The current protocol target is live schema `v9` and intelligence schema `v9`.
-Live schema v9 adds bounded monitor-candidate indexes and a trigger-maintained
-per-match odds-activity projection. Its migration scans the much smaller match
-registry and uses existing per-match time indexes, rather than aggregating the
-complete legacy odds tables.
+The current protocol target is live schema `v12` and intelligence schema `v10`.
+Schema compatibility is defined by `live_betting.storage.CURRENT_SCHEMA_VERSION`
+and `event_intelligence.storage.CURRENT_SCHEMA_VERSION`; operational checks must
+read those constants rather than copying an older version number into scripts.
 The live migration does not invent hashes for legacy visual evidence: a frame
 without its registered SHA-256 and byte length remains audit-only and cannot
 authorize a decision, order, notification, report score, or settlement.
+
+Official R.O.S.H. exact request and response evidence is stored under
+`ROSH_ANALYSIS_ARTIFACTS_DIR` (default `data\rosh-analysis-artifacts`). The live
+shadow loop submits explicit-draft analysis to one background worker and opens a
+separate SQLite connection in that worker. A completed run is eligible only for
+odds transports whose `observed_at` is at or after the run's `collected_at`.
 
 Use the dedicated read-only command for routine schema, contract, and artifact
 verification:

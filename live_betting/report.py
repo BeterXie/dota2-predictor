@@ -367,6 +367,23 @@ def _official_rosh_v6_shadow_summary(
 ) -> dict[str, object]:
     """Report v6 M3-C records separately from probability/order cohorts."""
 
+    current_analysis_status = "unavailable"
+    if _table_exists(connection, "service_health"):
+        health_row = connection.execute(
+            "SELECT details_json FROM service_health WHERE component='shadow_worker'"
+        ).fetchone()
+        if health_row is not None:
+            try:
+                health_details = json.loads(str(health_row[0]))
+            except (json.JSONDecodeError, TypeError):
+                health_details = None
+            if isinstance(health_details, Mapping):
+                candidate = str(
+                    health_details.get("official_rosh_status", "unavailable")
+                )
+                if candidate in {"pending", "succeeded", "failed", "unavailable"}:
+                    current_analysis_status = candidate
+
     base: dict[str, object] = {
         "schema": "official-rosh-v6-shadow-summary/v1",
         "strategy_version": OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
@@ -382,6 +399,14 @@ def _official_rosh_v6_shadow_summary(
         "calibrated_probability_records": 0,
         "m3_e_records": 0,
         "paper_orders": 0,
+        "analysis_statuses": {
+            "pending": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "unavailable": 0,
+        },
+        "analysis_runs": {"succeeded": 0, "failed": 0},
+        "current_analysis_status": current_analysis_status,
     }
     if not _table_exists(connection, "official_rosh_shadow_evaluations"):
         return base
@@ -396,6 +421,7 @@ def _official_rosh_v6_shadow_summary(
 
     statuses: Counter[str] = Counter()
     reasons: Counter[str] = Counter()
+    analysis_statuses: Counter[str] = Counter()
     invalid_reasons: Counter[str] = Counter()
     for row in rows:
         try:
@@ -444,6 +470,26 @@ def _official_rosh_v6_shadow_summary(
         status = str(row["status"])
         statuses[status] += 1
         reasons[str(row["reason"])] += 1
+        if record.get("rosh_direction_evidence") is not None:
+            analysis_statuses["succeeded"] += 1
+        elif str(row["reason"]) == "rosh_analysis_pending":
+            analysis_statuses["pending"] += 1
+        elif str(row["reason"]) == "rosh_analysis_failed":
+            analysis_statuses["failed"] += 1
+        else:
+            analysis_statuses["unavailable"] += 1
+
+    analysis_runs = Counter()
+    if _table_exists(connection, "rosh_analysis_runs"):
+        analysis_runs.update(
+            {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    """SELECT status, COUNT(*) AS count FROM rosh_analysis_runs
+                         WHERE mode='explicit_draft' GROUP BY status"""
+                )
+            }
+        )
 
     valid = sum(statuses.values())
     invalid = sum(invalid_reasons.values())
@@ -463,6 +509,13 @@ def _official_rosh_v6_shadow_summary(
         "reasons": dict(sorted(reasons.items())),
         "invalid_records": invalid,
         "invalid_reasons": dict(sorted(invalid_reasons.items())),
+        "analysis_statuses": {
+            name: analysis_statuses[name]
+            for name in ("pending", "succeeded", "failed", "unavailable")
+        },
+        "analysis_runs": {
+            name: analysis_runs[name] for name in ("succeeded", "failed")
+        },
     }
 
 

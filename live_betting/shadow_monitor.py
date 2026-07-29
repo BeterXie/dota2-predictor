@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -41,6 +42,7 @@ from .research import (
     record_research_prediction,
 )
 from .official_rosh_shadow_strategy import OfficialRoshDirectionShadowStrategy
+from .official_rosh_run import OfficialRoshRunCoordinator, OfficialRoshRunKey
 from .rosh_evidence import official_rosh_draft_hash
 from .rosh_parity_storage import RoshRunRepository
 from .shadow_strategy import ComebackShadowStrategy
@@ -1080,6 +1082,9 @@ def _record_official_rosh_shadow_evaluation(
     underdog_side: str,
     decided_at: datetime,
     transport_key: str,
+    analysis_date_time: int | None = None,
+    request_started_at: datetime | None = None,
+    run_coordinator: OfficialRoshRunCoordinator | None = None,
 ) -> dict[str, object]:
     """Evaluate and append the v6 M3-C record without creating an order."""
 
@@ -1089,11 +1094,29 @@ def _record_official_rosh_shadow_evaluation(
             observation.dire_hero_ids,
         )
         profile = get_profile()
+        background_status = None
+        if analysis_date_time is not None and run_coordinator is not None:
+            background_status = run_coordinator.poll_or_submit(
+                OfficialRoshRunKey(
+                    draft_hash=draft_hash,
+                    rosh_profile_id=profile.rosh_profile_id,
+                    canonical_profile_hash=profile.canonical_profile_hash,
+                    date_time=analysis_date_time,
+                ),
+                radiant_hero_ids=observation.radiant_hero_ids,
+                dire_hero_ids=observation.dire_hero_ids,
+                request_started_at=request_started_at or decided_at,
+                profile=profile,
+            )
         run = RoshRunRepository(store.connection).get_latest_succeeded_for_draft(
             draft_hash,
             rosh_profile_id=profile.rosh_profile_id,
             collected_at_lte=decided_at,
         )
+        analysis_status = "succeeded" if run is not None else "unavailable"
+        if run is None and background_status is not None:
+            if background_status.status in {"pending", "failed"}:
+                analysis_status = background_status.status
         evaluation = strategy.evaluate(
             run=run,
             observation_draft_hash=draft_hash,
@@ -1118,12 +1141,14 @@ def _record_official_rosh_shadow_evaluation(
         return {
             "status": "unavailable",
             "reason": "official_rosh_v6_unavailable",
+            "analysis_status": "unavailable",
             "inserted": False,
         }
     if persisted is None:
         return {
             "status": "unavailable",
             "reason": "confirmed_draft_conflict",
+            "analysis_status": "unavailable",
             "candidate_hash": evaluation.candidate_hash,
             "inserted": False,
         }
@@ -1134,8 +1159,49 @@ def _record_official_rosh_shadow_evaluation(
         "candidate_hash": evaluation.candidate_hash,
         "evaluation_key": evaluation_key,
         "analysis_run_id": None if run is None else run.run.run_id,
+        "analysis_status": analysis_status,
+        "background_status": (
+            None if background_status is None else background_status.status
+        ),
+        "analysis_attempts": (
+            0 if background_status is None else background_status.attempts
+        ),
         "inserted": inserted,
     }
+
+
+def _official_rosh_analysis_date_time(
+    store: LiveBettingStore,
+    observation: VisionObservation,
+    *,
+    map_number: int,
+) -> int | None:
+    """Return the immutable first-confirmed draft timestamp for a stable anchor."""
+
+    row = store.connection.execute(
+        """SELECT radiant_hero_ids, dire_hero_ids, anchored_at, status
+             FROM vision_draft_anchors
+            WHERE raybet_match_id=? AND map_number=?""",
+        (observation.raybet_match_id, map_number),
+    ).fetchone()
+    if row is None or str(row["status"]) != "anchored":
+        return None
+    try:
+        radiant = tuple(int(item) for item in json.loads(str(row["radiant_hero_ids"])))
+        dire = tuple(int(item) for item in json.loads(str(row["dire_hero_ids"])))
+        anchored_at = datetime.fromisoformat(
+            str(row["anchored_at"]).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        radiant != observation.radiant_hero_ids
+        or dire != observation.dire_hero_ids
+        or anchored_at.tzinfo is None
+        or anchored_at.utcoffset() is None
+    ):
+        return None
+    return int(anchored_at.astimezone(timezone.utc).timestamp())
 
 
 def run_once(
@@ -1147,6 +1213,7 @@ def run_once(
     player_identity_resolver: LivePlayerIdentityResolver | None = None,
     rosh_fetch_coordinator: RoshFetchCoordinator | None = None,
     official_rosh_strategy: OfficialRoshDirectionShadowStrategy | None = None,
+    official_rosh_run_coordinator: OfficialRoshRunCoordinator | None = None,
 ) -> dict[str, object]:
     run_at = now or datetime.now(timezone.utc)
     comeback_states: dict[
@@ -1503,6 +1570,13 @@ def run_once(
         underdog_side=surface.underdog_side,
         decided_at=current_transport_at,
         transport_key=current_transport.observation_key,
+        analysis_date_time=_official_rosh_analysis_date_time(
+            store,
+            observation,
+            map_number=map_number,
+        ),
+        request_started_at=run_at,
+        run_coordinator=official_rosh_run_coordinator,
     )
 
     player_identity = None
@@ -1634,6 +1708,13 @@ def _run_cli(args: argparse.Namespace) -> int:
     with (
         LiveBettingStore(args.database) as store,
         RoshFetchCoordinator() as rosh_fetch_coordinator,
+        OfficialRoshRunCoordinator(
+            database_path=args.database,
+            artifact_root=os.environ.get(
+                "ROSH_ANALYSIS_ARTIFACTS_DIR",
+                str(ROOT / "data" / "rosh-analysis-artifacts"),
+            ),
+        ) as official_rosh_run_coordinator,
     ):
         if not getattr(args, "schema_prepared", False):
             store.init_schema()
@@ -1653,6 +1734,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     args.vision_jsonl,
                     player_identity_resolver=player_identity_resolver,
                     rosh_fetch_coordinator=rosh_fetch_coordinator,
+                    official_rosh_run_coordinator=official_rosh_run_coordinator,
                 )
                 succeeded_at = datetime.now(timezone.utc)
                 record_health(
@@ -1664,6 +1746,13 @@ def _run_cli(args: argparse.Namespace) -> int:
                     details={
                         "source": "worker",
                         "run_status": str(result.get("status", "unknown")),
+                        "official_rosh_status": str(
+                            (
+                                result.get("official_rosh_v6")
+                                if isinstance(result.get("official_rosh_v6"), Mapping)
+                                else {}
+                            ).get("analysis_status", "unavailable")
+                        ),
                     },
                 )
                 print(json.dumps(result, ensure_ascii=False, default=str))

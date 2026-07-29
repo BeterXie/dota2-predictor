@@ -43,6 +43,7 @@ class BroadcastLayout:
     scoreboard_strip: NormalizedRegion | None = None
     replay_status_regions: tuple[NormalizedRegion, ...] = field(default_factory=tuple)
     requires_geometry_confirmation: bool = False
+    draft_recognition_max_clock_seconds: int | None = None
 
 
 STANDARD_DOTA_HUD = BroadcastLayout(
@@ -72,8 +73,24 @@ EPL_MASTERS_LIVE = BroadcastLayout(
     name="epl_masters_live_1080p",
     clock=STANDARD_DOTA_HUD.clock,
     draft_banner=STANDARD_DOTA_HUD.draft_banner,
-    radiant_heroes=STANDARD_DOTA_HUD.radiant_heroes,
-    dire_heroes=STANDARD_DOTA_HUD.dire_heroes,
+    radiant_heroes=tuple(
+        NormalizedRegion(
+            0.288 + index * 0.0315,
+            0.002,
+            0.3155 + index * 0.0315,
+            0.043,
+        )
+        for index in range(5)
+    ),
+    dire_heroes=tuple(
+        NormalizedRegion(
+            0.558 + index * 0.0315,
+            0.002,
+            0.5855 + index * 0.0315,
+            0.043,
+        )
+        for index in range(5)
+    ),
     radiant_team_logo=STANDARD_DOTA_HUD.radiant_team_logo,
     dire_team_logo=STANDARD_DOTA_HUD.dire_team_logo,
     radiant_kills=NormalizedRegion(0.446, 0.005, 0.468, 0.034),
@@ -85,6 +102,7 @@ EPL_MASTERS_LIVE = BroadcastLayout(
     scoreboard_strip=NormalizedRegion(0.300, 0.000, 0.700, 0.250),
     replay_status_regions=(),
     requires_geometry_confirmation=True,
+    draft_recognition_max_clock_seconds=180,
 )
 
 

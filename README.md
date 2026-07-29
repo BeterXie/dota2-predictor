@@ -160,3 +160,9 @@ the paired
 Runtime artifacts under the source checkout's `data/` directory are ignored by
 Git. The migration, offline compaction, and self-contained bundle runbook is in
 [`live_betting/README.md`](live_betting/README.md#database-migration-compaction-and-bundles).
+
+Dogfood logs and screenshots belong under `dogfood-output/`, and TypeScript
+incremental build state uses `*.tsbuildinfo`; both are generated local evidence
+and must not be staged. Handoff documents under `docs/` are not blanket-ignored,
+so add them only when they are intentional project documentation rather than a
+local session artifact.

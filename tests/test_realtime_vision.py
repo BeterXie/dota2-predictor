@@ -78,6 +78,56 @@ def test_epl_layout_requires_the_complete_hud_geometry() -> None:
     assert fallback.layout == STANDARD_DOTA_HUD
 
 
+def test_epl_layout_uses_portrait_insets_for_hero_recognition() -> None:
+    radiant = EPL_MASTERS_LIVE.radiant_heroes
+    dire = EPL_MASTERS_LIVE.dire_heroes
+    assert (
+        radiant[0].left,
+        radiant[0].top,
+        radiant[0].right,
+        radiant[0].bottom,
+    ) == pytest.approx((
+        0.288,
+        0.002,
+        0.3155,
+        0.043,
+    ))
+    assert (
+        radiant[-1].left,
+        radiant[-1].top,
+        radiant[-1].right,
+        radiant[-1].bottom,
+    ) == pytest.approx((
+        0.414,
+        0.002,
+        0.4415,
+        0.043,
+    ))
+    assert (
+        dire[0].left,
+        dire[0].top,
+        dire[0].right,
+        dire[0].bottom,
+    ) == pytest.approx((
+        0.558,
+        0.002,
+        0.5855,
+        0.043,
+    ))
+    assert (
+        dire[-1].left,
+        dire[-1].top,
+        dire[-1].right,
+        dire[-1].bottom,
+    ) == pytest.approx((
+        0.684,
+        0.002,
+        0.7115,
+        0.043,
+    ))
+    assert EPL_MASTERS_LIVE.draft_recognition_max_clock_seconds == 180
+
+
 def test_epl_scoreboard_strip_uses_positioned_ocr_results() -> None:
     reader = ScoreboardReader(EPL_MASTERS_LIVE, use_ocr=False)
 
@@ -145,6 +195,12 @@ def test_layout_aware_hud_reader_keeps_hud_independent_from_draft(
             ], None
 
     profile.scoreboard.ocr = PositionedOcr()
+    expected_draft = DraftReading(
+        (54, 36, 96, 121, 100),
+        (106, 19, 85, 123, 119),
+        0.91,
+    )
+    monkeypatch.setattr(profile.heroes, "read", lambda image: expected_draft)
     monkeypatch.setattr(
         "vision.hud_reader.classify_screen_state",
         lambda image, layout: ("game", 0.98),
@@ -160,7 +216,7 @@ def test_layout_aware_hud_reader_keeps_hud_independent_from_draft(
         "radiant", 11_000, 11_999, 0.97
     )
     assert reading.is_hud_available
-    assert reading.draft == DraftReading((), (), 0.0)
+    assert reading.draft == expected_draft
 
 
 def test_epl_live_gate_requires_scoreboard_geometry_and_replay_overrides() -> None:

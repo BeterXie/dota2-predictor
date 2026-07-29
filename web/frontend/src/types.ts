@@ -861,6 +861,7 @@ export interface PrematchDraft {
   dire_team_id: number;
   league_id: number | null;
   start_time: number | null;
+  end_time: number | null;
   radiant_heroes: PrematchDraftHero[];
   dire_heroes: PrematchDraftHero[];
 }

@@ -672,6 +672,42 @@ class RoshRunRepository:
         ).fetchone()
         return None if row is None else self.get(str(row[0]))
 
+    def get_succeeded_for_explicit_identity(
+        self,
+        draft_hash: str,
+        *,
+        rosh_profile_id: str,
+        canonical_profile_hash: str,
+        date_time: int,
+    ) -> StoredRoshRun | None:
+        """Return an already completed live request regardless of causal cutoff."""
+
+        _hash(draft_hash, "draft_hash")
+        _hash(canonical_profile_hash, "canonical_profile_hash")
+        if not isinstance(rosh_profile_id, str) or not rosh_profile_id.strip():
+            raise ValueError("rosh_profile_id must be non-empty")
+        if type(date_time) is not int or date_time <= 0:
+            raise ValueError("date_time must be a positive integer")
+        row = self.connection.execute(
+            """SELECT run_id
+                 FROM rosh_analysis_runs
+                WHERE status='succeeded'
+                  AND mode='explicit_draft'
+                  AND draft_hash=?
+                  AND rosh_profile_id=?
+                  AND canonical_profile_hash=?
+                  AND date_time=?
+                ORDER BY julianday(collected_at) DESC, run_id DESC
+                LIMIT 1""",
+            (
+                draft_hash,
+                rosh_profile_id,
+                canonical_profile_hash,
+                date_time,
+            ),
+        ).fetchone()
+        return None if row is None else self.get(str(row[0]))
+
     def _existing(
         self,
         intended: StoredRoshRun,

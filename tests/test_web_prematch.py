@@ -78,6 +78,49 @@ class DraftSortingTests(unittest.TestCase):
         self.assertEqual([row["hero_id"] for row in ordered], [1, 3, 5, 4, 2])
         self.assertEqual(len({row["account_id"] for row in ordered}), 5)
 
+    def test_match_draft_exposes_end_time_for_official_rosh_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "draft.db"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE matches (
+                    match_id INTEGER PRIMARY KEY,
+                    radiant_team_id INTEGER,
+                    dire_team_id INTEGER,
+                    leagueid INTEGER,
+                    start_time INTEGER,
+                    duration INTEGER
+                );
+                CREATE TABLE match_players (
+                    match_id INTEGER,
+                    hero_id INTEGER,
+                    is_radiant INTEGER,
+                    account_id INTEGER,
+                    player_slot INTEGER,
+                    lane_role INTEGER,
+                    gold_per_min INTEGER
+                );
+                CREATE TABLE heroes (
+                    hero_id INTEGER PRIMARY KEY,
+                    localized_name TEXT,
+                    hero_key TEXT
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO matches VALUES (?, ?, ?, ?, ?, ?)",
+                (8904322271, 10, 20, 19785, 1784478900, 2474),
+            )
+            connection.commit()
+            connection.close()
+
+            with patch.object(queries, "DB_PATH", str(database)):
+                draft = queries.get_match_draft(8904322271)
+
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft["end_time"], 1784481374)
+
 
 class PrematchSchemaTests(unittest.TestCase):
     def valid(self) -> dict:

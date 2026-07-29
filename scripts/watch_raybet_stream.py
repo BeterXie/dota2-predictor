@@ -50,6 +50,7 @@ from vision.hero_recognizer import (  # noqa: E402
     DraftTracker,
 )
 from vision.hud_reader import HudReader  # noqa: E402
+from vision.layouts import BroadcastLayout  # noqa: E402
 from vision.map_state import ConfirmedClock, MapStateTracker  # noqa: E402
 from vision.observation_writer import ObservationWriter  # noqa: E402
 from vision.scoreboard_reader import (  # noqa: E402
@@ -360,6 +361,21 @@ def current_frame_clock_fields(
         confirmed_clock.is_paused,
         confirmed_clock.confidence,
     )
+
+
+def _draft_for_tracking(
+    layout: BroadcastLayout,
+    draft: DraftReading,
+    confirmed_clock: ConfirmedClock | None,
+    last_clock: ConfirmedClock | None,
+) -> DraftReading:
+    max_seconds = layout.draft_recognition_max_clock_seconds
+    if max_seconds is None:
+        return draft
+    trusted_clock = confirmed_clock or last_clock
+    if trusted_clock is None or trusted_clock.seconds > max_seconds:
+        return DraftReading((), (), 0.0)
+    return draft
 
 
 def current_frame_comeback_state(
@@ -690,7 +706,14 @@ def _run_cli(args: argparse.Namespace) -> int:
                 else:
                     advantage_tracker.reset()
                     confirmed_advantage = None
-                confirmed_draft = draft_tracker.update(hud.draft)
+                confirmed_draft = draft_tracker.update(
+                    _draft_for_tracking(
+                        selection.layout,
+                        hud.draft,
+                        confirmed_clock,
+                        last_clock,
+                    )
+                )
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
                 last_draft = confirmed_draft or last_draft
