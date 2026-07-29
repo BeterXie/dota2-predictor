@@ -28,12 +28,36 @@ const match: MonitorMatch = {
   },
 };
 
+const decisionMatch: MonitorMatch = {
+  ...match,
+  latest_vision: {
+    captured_at: "2026-07-16T12:00:04+00:00",
+    map_number: 2,
+    game_clock_seconds: 1_234,
+    screen_state: "gameplay",
+    confirmed: 1,
+    clock_confidence: 0.99,
+    draft_confidence: 0.98,
+  },
+  latest_decision: {
+    decided_at: "2026-07-16T12:00:04+00:00",
+    map_number: 2,
+    underdog_side: "team_one",
+    market_probability: 0.44,
+    model_probability: 0.56,
+    edge: 0.12,
+    eligible: 1,
+    reason: "eligible",
+    strategy_version: "test-v1",
+  },
+};
+
 describe("MatchRail", () => {
   it("renders the live collection as a full page list", () => {
     const onSelect = vi.fn();
     const view = render(
       <MatchRail
-        matches={[match]}
+        matches={[decisionMatch]}
         mode="live"
         now={Date.parse("2026-07-16T12:00:05+00:00")}
         onSelect={onSelect}
@@ -42,9 +66,12 @@ describe("MatchRail", () => {
       />,
     );
 
-    expect(screen.getByLabelText("滚球赛事列表")).toHaveClass("match-list-page");
-    expect(screen.queryByRole("button", { name: /切换滚球赛事/ })).not.toBeInTheDocument();
-    expect(view.container.querySelector(".match-list-columns")).toBeInTheDocument();
+    expect(screen.getByLabelText("实时赛事列表")).toHaveClass("match-list-page");
+    expect(screen.queryByRole("button", { name: /切换实时赛事/ })).not.toBeInTheDocument();
+    expect(view.container.querySelector(".match-list-columns")).not.toBeInTheDocument();
+    expect(screen.getByText("第 2 局 · 20:34")).toBeInTheDocument();
+    expect(screen.getByText("策略合格")).toBeInTheDocument();
+    expect(screen.getByText("关注 Radiant")).toBeInTheDocument();
 
     const row = view.container.querySelector(".match-row");
     if (!(row instanceof HTMLButtonElement)) throw new Error("match row not found");
@@ -84,7 +111,7 @@ describe("MatchRail", () => {
     expect(body).toBeInTheDocument();
     expect(body?.closest("details")).toBeNull();
 
-    const toggle = screen.getByRole("button", { name: /切换滚球赛事/ });
+    const toggle = screen.getByRole("button", { name: /切换实时赛事/ });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(toggle);
     expect(rail).toHaveClass("expanded");

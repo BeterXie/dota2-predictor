@@ -161,50 +161,52 @@ export function MatchWorkspace({
 
   return (
     <main className="workspace">
-      <LiveScoreboard
-        match={match}
-        oddsLabel={showingPrematch
-          ? `赛前快照 ${formatDateTime(prematchWinner.observed_at)}`
-          : `赔率 ${formatAge(observedAge)}`}
-        oddsStale={!showingPrematch && observedAge != null && observedAge > 60}
-        trustedVision={trustedVision}
-        watchLink={watchLink}
-      />
+      <section className="match-decision-hero" aria-label="比赛与策略结论">
+        <LiveScoreboard
+          match={match}
+          oddsLabel={showingPrematch
+            ? `赛前快照 ${formatDateTime(prematchWinner.observed_at)}`
+            : `赔率 ${formatAge(observedAge)}`}
+          oddsStale={!showingPrematch && observedAge != null && observedAge > 60}
+          trustedVision={trustedVision}
+          watchLink={watchLink}
+        />
 
-      <section className="quote-strip" aria-label="最新胜负盘">
-        <QuoteCell
-          label={match.team_one || "队伍一"}
-          odds={winner?.prices?.team_one}
-          probability={winner?.probabilities?.team_one}
-          tone="one"
-        />
-        <div className="quote-context">
-          <span>{replay ? "历史回放" : showingPrematch ? "赛前快照" : "实时胜负盘"}</span>
-          <strong>{trustedVision?.map_number ? `第 ${trustedVision.map_number} 局` : winner?.period || "局数待确认"}</strong>
-          <small>
-            {showingPrematch
-              ? `采集于 ${formatDateTime(prematchWinner.observed_at)} · 不进入实时策略`
-              : trustedVision?.game_clock_seconds != null
-              ? `可信时钟 ${formatClock(trustedVision.game_clock_seconds)}`
-              : "暂无可信比赛时钟"}
-          </small>
-        </div>
-        <QuoteCell
-          label={match.team_two || "队伍二"}
-          odds={winner?.prices?.team_two}
-          probability={winner?.probabilities?.team_two}
-          tone="two"
-        />
+        <section className="quote-strip" aria-label="最新胜负盘">
+          <QuoteCell
+            label={match.team_one || "队伍一"}
+            odds={winner?.prices?.team_one}
+            probability={winner?.probabilities?.team_one}
+            tone="one"
+          />
+          <div className="quote-context">
+            <span>{replay ? "历史回放" : showingPrematch ? "赛前快照" : "实时胜负盘"}</span>
+            <strong>{trustedVision?.map_number ? `第 ${trustedVision.map_number} 局` : winner?.period || "局数待确认"}</strong>
+            <small>
+              {showingPrematch
+                ? `采集于 ${formatDateTime(prematchWinner.observed_at)} · 不进入实时策略`
+                : trustedVision?.game_clock_seconds != null
+                ? `可信时钟 ${formatClock(trustedVision.game_clock_seconds)}`
+                : "暂无可信比赛时钟"}
+            </small>
+          </div>
+          <QuoteCell
+            label={match.team_two || "队伍二"}
+            odds={winner?.prices?.team_two}
+            probability={winner?.probabilities?.team_two}
+            tone="two"
+          />
+        </section>
+
+        {error && (
+          <div className="inline-error" role="alert">
+            <WarningCircle size={18} aria-hidden="true" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <CurrentStrategyOverview detail={detail} error={error} match={match} />
       </section>
-
-      {error && (
-        <div className="inline-error" role="alert">
-          <WarningCircle size={18} aria-hidden="true" />
-          <span>{error}</span>
-        </div>
-      )}
-
-      <CurrentStrategyOverview detail={detail} error={error} match={match} />
 
       {loading && !detail ? (
         <WorkspaceSkeleton />
@@ -251,18 +253,26 @@ export function MatchWorkspace({
             />
           )}
 
-          <LineupAnalysis
-            detail={detail}
-            error={error}
-            match={match}
-          />
+          <details className="advanced-analysis">
+            <summary>
+              <span>查看阵容、策略记录与原始证据</span>
+              <small>用于复核当前结论</small>
+            </summary>
+            <div className="advanced-analysis-content">
+              <LineupAnalysis
+                detail={detail}
+                error={error}
+                match={match}
+              />
 
-          <section className="workspace-lower-grid">
-            <DecisionTimeline detail={detail} error={error} match={match} />
-            <EvidenceSummary detail={detail} error={error} match={match} />
-          </section>
+              <section className="workspace-lower-grid">
+                <DecisionTimeline detail={detail} error={error} match={match} />
+                <EvidenceSummary detail={detail} error={error} match={match} />
+              </section>
 
-          <MarketDrawer detail={detail} />
+              <MarketDrawer detail={detail} />
+            </div>
+          </details>
         </>
       )}
     </main>

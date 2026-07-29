@@ -457,6 +457,29 @@ function sourceRow(label: string): HTMLElement {
 describe("MatchWorkspace", () => {
   afterEach(cleanup);
 
+  it("keeps the decision surface primary and technical evidence collapsed", () => {
+    const view = render(
+      <MatchWorkspace
+        detail={detailWithAnalysis()}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const decisionHero = view.container.querySelector(".match-decision-hero");
+    const advanced = view.container.querySelector(".advanced-analysis");
+    expect(decisionHero).toContainElement(view.container.querySelector(".strategy-overview"));
+    expect(advanced).not.toHaveAttribute("open");
+    expect(screen.getByText("查看阵容、策略记录与原始证据")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("查看阵容、策略记录与原始证据"));
+    expect(advanced).toHaveAttribute("open");
+    expect(screen.getByLabelText("Radiant 阵容")).toBeInTheDocument();
+  });
+
   it("shows the prematch snapshot without treating it as live odds", () => {
     const upcoming: MatchDetail = {
       ...detail(0, "missing"),

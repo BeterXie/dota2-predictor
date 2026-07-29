@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createRoshAnalysis, fetchPrematchDraft } from "../api";
+import { createRoshAnalysis, fetchPrematchDraft, fetchPrematchHeroGrid } from "../api";
 import type { RoshAnalysisRunResponse } from "../types";
 import { PredictionResult, PrematchWorkspace } from "./PrematchWorkspace";
 
@@ -63,12 +63,38 @@ describe("PrematchWorkspace", () => {
       }),
     ));
   });
+
+  it("uses an accessible hero dialog with focus and Escape handling", async () => {
+    vi.mocked(fetchPrematchHeroGrid).mockResolvedValue({
+      str: [{
+        hero_id: 54,
+        localized_name: "Lifestealer",
+        hero_key: "npc_dota_hero_life_stealer",
+        image_url: "",
+      }],
+      agi: [],
+      int: [],
+      all: [],
+    });
+    render(<PrematchWorkspace />);
+
+    const opener = await screen.findByRole("button", { name: "选择 Radiant 1 号位英雄" });
+    fireEvent.click(opener);
+    const search = await screen.findByRole("textbox", { name: "搜索英雄" });
+
+    expect(screen.getByRole("dialog", { name: "英雄选择器" })).toBeInTheDocument();
+    await waitFor(() => expect(search).toHaveFocus());
+    fireEvent.keyDown(search, { key: "Escape", code: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "英雄选择器" }))
+      .not.toBeInTheDocument());
+  });
 });
 
 describe("PredictionResult", () => {
   it("shows the complete minute range instead of only the last ten points", () => {
     render(<PredictionResult result={predictionResult} />);
 
+    fireEvent.click(screen.getByText("查看详细评分与证据"));
     expect(screen.getByText("共 3 个时间点 · 20-60 分钟")).toBeInTheDocument();
     const rows = screen.getAllByRole("row");
     expect(rows.some((row) => within(row).queryByText("20"))).toBe(true);
@@ -78,10 +104,31 @@ describe("PredictionResult", () => {
   it("shows official score semantics without pseudo probability", () => {
     render(<PredictionResult result={predictionResult} />);
 
+    expect(screen.getByText("阵容更偏向 Radiant")).toBeInTheDocument();
+    expect(screen.getByText("中等")).toBeInTheDocument();
+    expect(screen.getByText("约 20 分钟")).toBeInTheDocument();
+    expect(screen.getByText("位置对位贡献最大")).toBeInTheDocument();
     expect(screen.getAllByText("+5.8").length).toBeGreaterThan(0);
-    expect(screen.getByText("Rosh score，不是胜率")).toBeInTheDocument();
+    expect(screen.getByText(/Rosh 阵容方向评分，不等同于比赛胜率/)).toBeInTheDocument();
     expect(screen.queryByText("55.8%")).not.toBeInTheDocument();
     expect(screen.queryByText(/Radiant 胜率|Dire 胜率/)).not.toBeInTheDocument();
+  });
+
+  it("keeps technical evidence collapsed while preserving named hero details", () => {
+    const view = render(
+      <PredictionResult
+        heroNames={new Map([[54, "Lifestealer"]])}
+        result={predictionResult}
+      />,
+    );
+
+    const details = view.container.querySelector(".prematch-result-details");
+    expect(details).not.toHaveAttribute("open");
+    expect(screen.getByText("英雄分解")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("查看详细评分与证据"));
+    expect(details).toHaveAttribute("open");
+    expect(screen.getByText("Lifestealer")).toBeInTheDocument();
+    expect(screen.getByText("#54")).toBeInTheDocument();
   });
 });
 

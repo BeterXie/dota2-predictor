@@ -1,4 +1,12 @@
-import { Switch, Tab, TabList } from "@fluentui/react-components";
+import {
+  Button,
+  Popover,
+  PopoverSurface,
+  PopoverTrigger,
+  Switch,
+  Tab,
+  TabList,
+} from "@fluentui/react-components";
 import {
   ArrowLeft,
   Bell,
@@ -795,8 +803,8 @@ export default function App() {
         <div className="brand-lockup">
           <div className="brand-mark"><Pulse size={21} weight="bold" aria-hidden="true" /></div>
           <div>
-            <strong>Dota 2 滚球监控台</strong>
-            <span>本机只读证据与纸面策略</span>
+            <strong>Dota 2 比赛分析</strong>
+            <span>市场、阵容与策略结论</span>
           </div>
         </div>
 
@@ -806,36 +814,50 @@ export default function App() {
           onTabSelect={(_, data) => changePrimaryView(data.value as PrimaryView)}
           size="small"
         >
-          <Tab icon={<Broadcast size={17} />} value="live">滚球列表</Tab>
-          <Tab icon={<ChartLineUp size={17} />} value="prematch">赛前预测</Tab>
-          <Tab icon={<ClockCounterClockwise size={17} />} value="history">历史比赛</Tab>
-          <Tab icon={<GearSix size={17} />} value="operations">系统运行</Tab>
+          <Tab icon={<Broadcast size={17} />} value="live">实时赛事</Tab>
+          <Tab icon={<ChartLineUp size={17} />} value="prematch">赛前分析</Tab>
+          <Tab icon={<ClockCounterClockwise size={17} />} value="history">历史复盘</Tab>
+          <Tab icon={<GearSix size={17} />} value="operations">系统状态</Tab>
         </TabList>
 
         <div className="topbar-status">
           {realtimeEnabled && <ConnectionBadge state={connection} />}
-          <span className="compact-switch" title="声音告警">
-            <SpeakerHigh size={16} aria-hidden="true" />
-            <Switch
-              aria-label="声音告警"
-              checked={soundEnabled}
-              label="声音"
-              onChange={(_, data) => toggleSound(data.checked)}
-            />
-          </span>
-          <span className="compact-switch" title="浏览器系统通知">
-            <BellRinging size={16} aria-hidden="true" />
-            <Switch
-              aria-label="浏览器系统通知"
-              checked={browserAlerts}
-              label="系统通知"
-              onChange={(_, data) => void toggleBrowserAlerts(data.checked)}
-            />
-          </span>
           <span className="alert-count" title="未确认告警">
             <Bell size={17} aria-hidden="true" />
             {alertCount}
           </span>
+          <Popover positioning="below-end" withArrow>
+            <PopoverTrigger disableButtonEnhancement>
+              <Button
+                appearance="subtle"
+                aria-label="偏好设置"
+                className="settings-trigger"
+                icon={<GearSix size={18} aria-hidden="true" />}
+              />
+            </PopoverTrigger>
+            <PopoverSurface aria-label="偏好设置" className="settings-popover">
+              <header>
+                <strong>偏好设置</strong>
+                <span>只影响此浏览器</span>
+              </header>
+              <label className="settings-row">
+                <span><SpeakerHigh size={17} aria-hidden="true" />声音提醒</span>
+                <Switch
+                  aria-label="声音告警"
+                  checked={soundEnabled}
+                  onChange={(_, data) => toggleSound(data.checked)}
+                />
+              </label>
+              <label className="settings-row">
+                <span><BellRinging size={17} aria-hidden="true" />系统通知</span>
+                <Switch
+                  aria-label="浏览器系统通知"
+                  checked={browserAlerts}
+                  onChange={(_, data) => void toggleBrowserAlerts(data.checked)}
+                />
+              </label>
+            </PopoverSurface>
+          </Popover>
         </div>
         </header>
         <SafetyBoundaryBar snapshot={snapshot} />
@@ -1153,31 +1175,44 @@ function SafetyBoundaryBar({ snapshot }: { snapshot: MonitorSnapshot | null }) {
       : integrity === "verified"
         ? "positive"
         : "warning";
+  const facts = [
+    {
+      label: "直连市场",
+      status: capabilityLabel(directStatus),
+      tone: capabilityTone(directStatus),
+    },
+    {
+      label: "纸面策略",
+      status: capabilityLabel(paperStatus),
+      tone: capabilityTone(paperStatus),
+    },
+    {
+      label: "治理链",
+      status: governanceLabel(integrity, governanceStatus),
+      tone: governanceTone,
+    },
+  ] as const;
+  const abnormalFacts = facts.filter((fact) => fact.tone !== "positive");
 
   return (
     <section className="safety-boundary" aria-label="运行安全边界">
       <div className="safety-boundary-mode">
         <LockSimple size={17} weight="bold" aria-hidden="true" />
-        <strong>PAPER ONLY</strong>
-        <span>控制台仅提供纸面决策与本地运维，不包含真实下注入口</span>
+        <strong>Paper Only</strong>
+        <span>不包含真实下注入口</span>
       </div>
-      <div className="safety-boundary-facts">
-        <SafetyFact
-          label="直连市场"
-          status={capabilityLabel(directStatus)}
-          tone={capabilityTone(directStatus)}
-        />
-        <SafetyFact
-          label="纸面策略"
-          status={capabilityLabel(paperStatus)}
-          tone={capabilityTone(paperStatus)}
-        />
-        <SafetyFact
-          label="治理链"
-          status={governanceLabel(integrity, governanceStatus)}
-          tone={governanceTone}
-        />
-      </div>
+      {snapshot && (
+        <div className="safety-boundary-facts">
+          {abnormalFacts.length === 0 ? (
+            <span className="safety-boundary-ok">
+              <ShieldCheck size={15} weight="fill" aria-hidden="true" />
+              系统边界正常
+            </span>
+          ) : abnormalFacts.map((fact) => (
+            <SafetyFact key={fact.label} {...fact} />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -1235,8 +1270,8 @@ function governanceLabel(integrity?: string, status?: string): string {
 function ConnectionBadge({ state }: { state: ConnectionState }) {
   const labels: Record<ConnectionState, string> = {
     connecting: "正在连接",
-    live: "SSE 实时",
-    fallback: "轮询降级",
+    live: "实时连接",
+    fallback: "数据延迟",
     offline: "离线",
   };
   return (

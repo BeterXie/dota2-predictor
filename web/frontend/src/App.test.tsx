@@ -28,10 +28,30 @@ const api = vi.hoisted(() => ({
 
 vi.mock("./api", () => api);
 vi.mock("@fluentui/react-components", () => ({
-  Switch: ({ "aria-label": ariaLabel, checked }: {
+  Button: ({ "aria-label": ariaLabel, children, onClick }: {
+    "aria-label"?: string;
+    children?: ReactNode;
+    onClick?: () => void;
+  }) => <button aria-label={ariaLabel} onClick={onClick}>{children}</button>,
+  Popover: ({ children }: { children: ReactNode }) => <>{children}</>,
+  PopoverSurface: ({ "aria-label": ariaLabel, children }: {
+    "aria-label"?: string;
+    children: ReactNode;
+  }) => <section aria-label={ariaLabel}>{children}</section>,
+  PopoverTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  Switch: ({ "aria-label": ariaLabel, checked, onChange }: {
     "aria-label"?: string;
     checked?: boolean;
-  }) => <input aria-label={ariaLabel} checked={checked} readOnly type="checkbox" />,
+    onChange?: (event: unknown, data: { checked: boolean }) => void;
+  }) => (
+    <input
+      aria-label={ariaLabel}
+      checked={checked}
+      onChange={(event) => onChange?.(event, { checked: event.currentTarget.checked })}
+      role="switch"
+      type="checkbox"
+    />
+  ),
   Tab: ({ children, value }: { children: ReactNode; value: string }) => (
     <button data-tab-value={value}>{children}</button>
   ),
@@ -247,6 +267,7 @@ describe("App data recovery and ownership", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   beforeEach(() => {
@@ -283,11 +304,11 @@ describe("App data recovery and ownership", () => {
   it("never exposes mappings from the previously selected match", async () => {
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
     expect(await screen.findByText("mapping-101")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "滚球列表" }));
+    fireEvent.click(screen.getByRole("button", { name: "实时赛事" }));
     fireEvent.click(screen.getByRole("button", { name: "select-b" }));
-    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
 
     expect(await screen.findByTestId("selected-match")).toHaveTextContent("b");
     expect(screen.queryByText("mapping-101")).not.toBeInTheDocument();
@@ -305,12 +326,12 @@ describe("App data recovery and ownership", () => {
     expect(await screen.findByText("live-workspace")).toBeInTheDocument();
     expect(window.location.pathname).toBe("/monitor/matches/a");
 
-    fireEvent.click(screen.getByRole("button", { name: "赛前预测" }));
+    fireEvent.click(screen.getByRole("button", { name: "赛前分析" }));
     expect(await screen.findByText("stratz-rosh-prematch")).toBeInTheDocument();
     expect(window.location.pathname).toBe("/prematch");
     expect(screen.queryByText("live-workspace")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     expect(window.location.pathname).toBe("/monitor");
     expect(screen.getByRole("button", { name: "赔率复盘" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "OpenDota 赛后情报" })).toBeInTheDocument();
@@ -321,7 +342,7 @@ describe("App data recovery and ownership", () => {
     expect(await screen.findByText("opendota-postmatch")).toBeInTheDocument();
     expect(screen.queryByText("odds-replay")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
     expect(await screen.findByTestId("selected-match")).toHaveTextContent("a");
     expect(screen.getByText("数据降级赛事")).toBeInTheDocument();
     expect(screen.getByText("活动告警")).toBeInTheDocument();
@@ -366,7 +387,7 @@ describe("App data recovery and ownership", () => {
     });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     fireEvent.click(await screen.findByRole("button", { name: "select-replay-route" }));
     expect(await screen.findByText("odds-replay")).toBeInTheDocument();
     expect(window.location.pathname).toBe("/monitor/history/odds/replay-route");
@@ -408,7 +429,7 @@ describe("App data recovery and ownership", () => {
     });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     expect(await screen.findByText("已加载历史")).toBeInTheDocument();
     expect(screen.getByText("7")).toBeInTheDocument();
     expect(screen.getByText("历史降级")).toBeInTheDocument();
@@ -433,7 +454,8 @@ describe("App data recovery and ownership", () => {
     render(<App />);
 
     expect(await screen.findByText("stratz-rosh-prematch")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "赛前预测" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "赛前分析" })).toBeInTheDocument();
+    expect(screen.queryByText("直连市场待加载")).not.toBeInTheDocument();
     expect(api.fetchBootstrap).not.toHaveBeenCalled();
     expect(api.snapshotStream).not.toHaveBeenCalled();
   });
@@ -449,9 +471,9 @@ describe("App data recovery and ownership", () => {
     render(<App />);
 
     await waitFor(() => expect(api.snapshotStream).toHaveBeenCalledTimes(1));
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
-    fireEvent.click(screen.getByRole("button", { name: "滚球列表" }));
+    fireEvent.click(screen.getByRole("button", { name: "实时赛事" }));
     await waitFor(() => expect(api.snapshotStream).toHaveBeenCalledTimes(2));
   });
 
@@ -475,7 +497,7 @@ describe("App data recovery and ownership", () => {
         has_more: false,
       });
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
 
     expect(await screen.findByRole("button", { name: "select-history-a" })).toBeInTheDocument();
     const firstLoadMore = screen.getByRole("button", { name: "load-more-history" });
@@ -513,7 +535,7 @@ describe("App data recovery and ownership", () => {
         resolveMore = resolve;
       }));
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
 
     expect(await screen.findByRole("button", { name: "select-history-a" })).toBeInTheDocument();
     const loadMore = screen.getByRole("button", { name: "load-more-history" });
@@ -550,11 +572,11 @@ describe("App data recovery and ownership", () => {
       });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     expect(await screen.findByRole("button", { name: "select-history-old" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "滚球列表" }));
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "实时赛事" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
 
     expect(await screen.findByRole("button", { name: "select-history-new" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-history-old" })).not.toBeInTheDocument();
@@ -642,7 +664,7 @@ describe("App data recovery and ownership", () => {
       await Promise.resolve();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     fireEvent.click(screen.getByRole("button", { name: "OpenDota 赛后情报" }));
     await act(async () => {
       await Promise.resolve();
@@ -696,7 +718,7 @@ describe("App data recovery and ownership", () => {
 
     render(<App />);
     expect(await screen.findByRole("button", { name: "select-live" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     fireEvent.click(await screen.findByRole("button", { name: "select-replay" }));
     expect(await screen.findByText("odds-replay")).toBeInTheDocument();
     expect(close).toHaveBeenCalledTimes(1);
@@ -800,7 +822,7 @@ describe("App data recovery and ownership", () => {
     expect(await screen.findByRole("button", { name: "select-live" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-ended" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     expect(await screen.findByRole("button", { name: "select-ended" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
   });
@@ -820,7 +842,7 @@ describe("App data recovery and ownership", () => {
       expect(screen.queryByRole("button", { name: "select-missing-eligibility" }))
         .not.toBeInTheDocument();
     });
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     expect(screen.queryByRole("button", { name: "select-missing-eligibility" })).not.toBeInTheDocument();
   });
 
@@ -845,7 +867,7 @@ describe("App data recovery and ownership", () => {
     expect(await screen.findByRole("button", { name: "select-live" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-archived" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "历史比赛" }));
+    fireEvent.click(screen.getByRole("button", { name: "历史复盘" }));
     expect(await screen.findByRole("button", { name: "select-archived" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-live" })).not.toBeInTheDocument();
   });
@@ -871,7 +893,7 @@ describe("App data recovery and ownership", () => {
       });
 
       expect(api.fetchBootstrap).toHaveBeenCalledTimes(2);
-      fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+      fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
       expect(screen.getByTestId("selected-match")).toHaveTextContent("a");
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     } finally {
@@ -886,7 +908,7 @@ describe("App data recovery and ownership", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -912,7 +934,7 @@ describe("App data recovery and ownership", () => {
       components: [stoppedComponent],
     });
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -932,7 +954,7 @@ describe("App data recovery and ownership", () => {
     api.acknowledgeAlert.mockResolvedValue({ acknowledged: false });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "系统运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统状态" }));
     expect(await screen.findByText("incident-77-unacknowledged")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "ack-first-alert" }));
 
@@ -942,7 +964,23 @@ describe("App data recovery and ownership", () => {
     expect(screen.getByText("incident-77-unacknowledged")).toBeInTheDocument();
     expect(screen.queryByText("incident-77-acknowledged")).not.toBeInTheDocument();
   });
-  it("shows the paper-only boundary and live capability status", async () => {
+  it("keeps notification preferences inside the settings popover", async () => {
+    const requestPermission = vi.fn().mockResolvedValue("granted");
+    vi.stubGlobal("Notification", { requestPermission });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "偏好设置" }));
+    const soundSwitch = await screen.findByRole("switch", { name: "声音告警" });
+    const notificationSwitch = screen.getByRole("switch", { name: "浏览器系统通知" });
+
+    fireEvent.click(soundSwitch);
+    expect(localStorage.getItem("dota2-monitor-sound")).toBe("on");
+    fireEvent.click(notificationSwitch);
+    await waitFor(() => expect(requestPermission).toHaveBeenCalledTimes(1));
+    expect(localStorage.getItem("dota2-monitor-browser-alerts")).toBe("on");
+  });
+
+  it("shows only abnormal capabilities in the paper-only boundary", async () => {
     api.fetchBootstrap.mockResolvedValue({
       ...snapshot,
       market_source_policy: "direct_primary",
@@ -960,11 +998,32 @@ describe("App data recovery and ownership", () => {
     render(<App />);
 
     const boundary = await screen.findByRole("region", { name: "运行安全边界" });
-    expect(boundary).toHaveTextContent("PAPER ONLY");
+    expect(boundary).toHaveTextContent("Paper Only");
     expect(boundary).toHaveTextContent("不包含真实下注入口");
-    expect(boundary).toHaveTextContent("直连市场就绪");
     expect(boundary).toHaveTextContent("纸面策略降级");
-    expect(boundary).toHaveTextContent("治理链已校验");
+    expect(boundary).not.toHaveTextContent("直连市场就绪");
+    expect(boundary).not.toHaveTextContent("治理链已校验");
+  });
+
+  it("collapses fully healthy capabilities into one status", async () => {
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      capabilities: {
+        direct_market_collection: { required: true, status: "ready" },
+        paper_decision: { required: true, status: "healthy" },
+      },
+      milestone_governance: {
+        status: "configured",
+        governance_status: "active",
+        ledger_integrity: { status: "verified" },
+      },
+    });
+
+    render(<App />);
+
+    const boundary = await screen.findByRole("region", { name: "运行安全边界" });
+    expect(boundary).toHaveTextContent("系统边界正常");
+    expect(boundary).not.toHaveTextContent("直连市场就绪");
   });
 
 });

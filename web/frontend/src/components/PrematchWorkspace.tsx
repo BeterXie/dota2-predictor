@@ -1,4 +1,14 @@
-import { Button, Input, Select, Spinner } from "@fluentui/react-components";
+import {
+  Button,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
+  Input,
+  Select,
+  Spinner,
+} from "@fluentui/react-components";
 import { AdvantageSparkline } from "./common/AdvantageSparkline";
 import {
   ChartLineUp,
@@ -7,7 +17,7 @@ import {
   ShieldCheck,
   X,
 } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createRoshAnalysis,
@@ -64,6 +74,7 @@ export function PrematchWorkspace() {
   const [picker, setPicker] = useState<{ side: Side; position: number } | null>(null);
   const [attribute, setAttribute] = useState<Attribute>("str");
   const [heroSearch, setHeroSearch] = useState("");
+  const heroSearchRef = useRef<HTMLInputElement>(null);
   const [prediction, setPrediction] = useState<RoshAnalysisRunResponse | null>(null);
   const [predicting, setPredicting] = useState(false);
   const [predictionError, setPredictionError] = useState<string | null>(null);
@@ -98,11 +109,24 @@ export function PrematchWorkspace() {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    if (!picker) return undefined;
+    const timer = window.setTimeout(() => heroSearchRef.current?.focus(), 0);
+    return () => window.clearTimeout(timer);
+  }, [picker]);
+
   const pickerHeroes = useMemo(() => {
     const query = heroSearch.trim().toLocaleLowerCase("zh-CN");
     return heroGrid[attribute].filter((hero) =>
       !query || hero.localized_name.toLocaleLowerCase("zh-CN").includes(query));
   }, [attribute, heroGrid, heroSearch]);
+  const heroNames = useMemo(() => new Map(
+    [
+      ...Object.values(heroGrid).flat(),
+      ...radiantHeroes.filter((hero): hero is PrematchHero => hero !== null),
+      ...direHeroes.filter((hero): hero is PrematchHero => hero !== null),
+    ].map((hero) => [hero.hero_id, hero.localized_name]),
+  ), [direHeroes, heroGrid, radiantHeroes]);
 
   const clearSource = () => {
     setSourceMatchId(null);
@@ -353,62 +377,73 @@ export function PrematchWorkspace() {
       {predictionError && (
         <div className="prematch-error" role="alert">{predictionError}</div>
       )}
-      {prediction && <PredictionResult result={prediction} />}
+      {prediction && <PredictionResult heroNames={heroNames} result={prediction} />}
 
       {picker && (
-        <div className="hero-picker-backdrop" role="presentation" onMouseDown={() => setPicker(null)}>
-          <section
-            aria-label="英雄选择器"
-            aria-modal="true"
-            className="hero-picker-dialog"
-            role="dialog"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
-            <header>
-              <div>
-                <strong>{picker.side === "radiant" ? "Radiant" : "Dire"}</strong>
-                <span>{POSITIONS[picker.position]}</span>
-              </div>
-              <Button
-                appearance="subtle"
-                aria-label="关闭英雄选择器"
-                icon={<X size={18} />}
-                onClick={() => setPicker(null)}
-              />
-            </header>
-            <div className="hero-picker-controls">
-              <div role="tablist" aria-label="英雄属性">
-                {(Object.keys(ATTRIBUTE_LABELS) as Attribute[]).map((key) => (
+        <Dialog
+          modalType="modal"
+          open
+          onOpenChange={(_, data) => {
+            if (!data.open) {
+              setPicker(null);
+              setHeroSearch("");
+            }
+          }}
+        >
+          <DialogSurface aria-label="英雄选择器" className="hero-picker-dialog">
+            <DialogBody className="hero-picker-body">
+              <DialogTitle
+                action={(
                   <Button
-                    key={key}
-                    appearance={attribute === key ? "primary" : "subtle"}
-                    aria-selected={attribute === key}
-                    role="tab"
-                    onClick={() => setAttribute(key)}
-                  >
-                    {ATTRIBUTE_LABELS[key]}
-                  </Button>
-                ))}
-              </div>
-              <Input
-                aria-label="搜索英雄"
-                contentBefore={<MagnifyingGlass size={16} />}
-                placeholder="搜索英雄"
-                value={heroSearch}
-                onChange={(_, data) => setHeroSearch(data.value)}
-              />
-            </div>
-            <div className="hero-picker-grid">
-              {pickerHeroes.map((hero) => (
-                <button key={hero.hero_id} type="button" onClick={() => setHero(hero)}>
-                  <HeroImage hero={hero} />
-                  <span>{hero.localized_name}</span>
-                </button>
-              ))}
-              {pickerHeroes.length === 0 && <p>没有匹配的英雄</p>}
-            </div>
-          </section>
-        </div>
+                    appearance="subtle"
+                    aria-label="关闭英雄选择器"
+                    icon={<X size={18} />}
+                    onClick={() => setPicker(null)}
+                  />
+                )}
+              >
+                <span className="hero-picker-title">
+                  <strong>{picker.side === "radiant" ? "Radiant" : "Dire"}</strong>
+                  <small>{POSITIONS[picker.position]}</small>
+                </span>
+              </DialogTitle>
+              <DialogContent className="hero-picker-content">
+                <div className="hero-picker-controls">
+                  <div role="tablist" aria-label="英雄属性">
+                    {(Object.keys(ATTRIBUTE_LABELS) as Attribute[]).map((key) => (
+                      <Button
+                        key={key}
+                        appearance={attribute === key ? "primary" : "subtle"}
+                        aria-selected={attribute === key}
+                        role="tab"
+                        onClick={() => setAttribute(key)}
+                      >
+                        {ATTRIBUTE_LABELS[key]}
+                      </Button>
+                    ))}
+                  </div>
+                  <Input
+                    aria-label="搜索英雄"
+                    contentBefore={<MagnifyingGlass size={16} />}
+                    placeholder="搜索英雄"
+                    ref={heroSearchRef}
+                    value={heroSearch}
+                    onChange={(_, data) => setHeroSearch(data.value)}
+                  />
+                </div>
+                <div className="hero-picker-grid">
+                  {pickerHeroes.map((hero) => (
+                    <button key={hero.hero_id} type="button" onClick={() => setHero(hero)}>
+                      <HeroImage hero={hero} />
+                      <span>{hero.localized_name}</span>
+                    </button>
+                  ))}
+                  {pickerHeroes.length === 0 && <p>没有匹配的英雄</p>}
+                </div>
+              </DialogContent>
+            </DialogBody>
+          </DialogSurface>
+        </Dialog>
       )}
     </main>
   );
@@ -479,37 +514,42 @@ function TeamLineup({
   );
 }
 
-export function PredictionResult({ result }: { result: RoshAnalysisRunResponse }) {
+export function PredictionResult({
+  heroNames = new Map<number, string>(),
+  result,
+}: {
+  heroNames?: ReadonlyMap<number, string>;
+  result: RoshAnalysisRunResponse;
+}) {
   const minutes = result.minute_points;
   const sparklinePoints = minutes.map((m) => ({
     minute: m.minute,
     win_rate_graph: m.display_score,
   }));
   const direction = scoreDirection(result.relative_advantage);
+  const directionTitle = direction === "均势"
+    ? "两边阵容接近均势"
+    : `阵容更偏向 ${direction}`;
 
   return (
-    <section className="prematch-result" aria-label="STRATZ Rosh 官方阵容分析" aria-live="polite" style={{ padding: "16px 20px" }}>
-      <header>
-        <div>
-          <span>相对阵容优势</span>
+    <section className="prematch-result" aria-label="STRATZ Rosh 官方阵容分析" aria-live="polite">
+      <header className="prematch-result-summary">
+        <div className="prematch-result-copy">
+          <span>官方 Rosh 阵容方向</span>
+          <h2>{directionTitle}</h2>
+          <p>这是 Rosh 阵容方向评分，不等同于比赛胜率。分差程度只描述当前相对分数。</p>
+        </div>
+        <div className={`prematch-result-score ${scoreTone(result.relative_advantage)}`}>
+          <span>相对阵容分差</span>
           <strong>{signedNullable(result.relative_advantage)}</strong>
-        </div>
-        <div className="prematch-result-mode">
-          <span>方向</span>
-          <strong>{direction}</strong>
-          <small>Rosh score，不是胜率</small>
-        </div>
-        <div className="dire-result">
-          <span>运行状态</span>
-          <strong>{result.status === "succeeded" ? "完整" : "失败"}</strong>
+          <small>{result.status === "succeeded" ? "分析完整" : "分析失败"}</small>
         </div>
       </header>
 
-      <dl className="prematch-rosh-metrics">
-        <div><dt>Radiant 队伍分</dt><dd>{signedNullable(result.radiant_team_score)}</dd></div>
-        <div><dt>Dire 队伍分</dt><dd>{signedNullable(result.dire_team_score)}</dd></div>
-        <div><dt>相对优势</dt><dd>{signedNullable(result.relative_advantage)}</dd></div>
-        <div><dt>证据</dt><dd><code>{result.evidence_hash.slice(0, 12)}</code></dd></div>
+      <dl className="prematch-result-insights">
+        <div><dt>分差程度</dt><dd>{scoreStrength(result.relative_advantage)}</dd></div>
+        <div><dt>主要优势阶段</dt><dd>{strongestMinuteLabel(minutes)}</dd></div>
+        <div><dt>主要分差来源</dt><dd>{primaryScoreReason(result.hero_components)}</dd></div>
       </dl>
 
       {sparklinePoints.length > 0 && (
@@ -524,59 +564,74 @@ export function PredictionResult({ result }: { result: RoshAnalysisRunResponse }
         </div>
       )}
 
-      <div className="prematch-minute-table">
-        <header><h2>英雄分解</h2><span>服务端官方 scorer 输出</span></header>
-        <div>
-          <table>
-            <thead><tr><th>阵营 / 位置</th><th>英雄</th><th>基础</th><th>同队协同</th><th>对手克制</th><th>合计</th></tr></thead>
-            <tbody>
-              {result.hero_components.map((row) => (
-                <tr key={`${row.team_side}-${row.position_id}`}>
-                  <td>{row.team_side === "RADIANT" ? "Radiant" : "Dire"} {row.position_id}</td>
-                  <td>Hero {row.hero_id}</td>
-                  <td>{signed(row.position_base_diff)}</td>
-                  <td>{signed(row.same_team_synergy)}</td>
-                  <td>{signed(row.opponent_matchup_synergy)}</td>
-                  <td>{signed(row.display_score)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      <details className="prematch-result-details">
+        <summary>查看详细评分与证据</summary>
+        <div className="prematch-result-details-content">
+          <dl className="prematch-rosh-metrics">
+            <div><dt>Radiant 队伍分</dt><dd>{signedNullable(result.radiant_team_score)}</dd></div>
+            <div><dt>Dire 队伍分</dt><dd>{signedNullable(result.dire_team_score)}</dd></div>
+            <div><dt>相对分差</dt><dd>{signedNullable(result.relative_advantage)}</dd></div>
+            <div><dt>证据</dt><dd><code>{result.evidence_hash.slice(0, 12)}</code></dd></div>
+          </dl>
 
-      {minutes.length > 0 && (
-        <div className="prematch-minute-table">
-          <header>
-            <h2>分钟评分</h2>
-            <span>{minuteRangeLabel(minutes)}</span>
-          </header>
-          <div>
-            <table>
-              <thead><tr><th>分钟</th><th>方向</th><th>优势分</th><th>Radiant 时间</th><th>Dire 时间</th><th>协同</th><th>高分段 / 回退</th></tr></thead>
-              <tbody>
-                {minutes.map((row) => (
-                  <tr key={row.minute}>
-                    <td>{row.minute}</td>
-                    <td>{scoreDirection(row.display_score)}</td>
-                    <td>{signed(row.display_score)}</td>
-                    <td>{signed(row.radiant_time_delta)}</td>
-                    <td>{signed(row.dire_time_delta)}</td>
-                    <td>{signed(row.synergy_delta)}</td>
-                    <td>{row.rank_source_counts.DIVINE_IMMORTAL || 0} / {row.rank_source_counts.ALL_RANK_FALLBACK || 0}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="prematch-minute-table">
+            <header><h2>英雄分解</h2><span>服务端官方 scorer 输出</span></header>
+            <div>
+              <table>
+                <thead><tr><th>阵营 / 位置</th><th>英雄</th><th>基础</th><th>同队协同</th><th>对手克制</th><th>合计</th></tr></thead>
+                <tbody>
+                  {result.hero_components.map((row) => (
+                    <tr key={`${row.team_side}-${row.position_id}`}>
+                      <td>{row.team_side === "RADIANT" ? "Radiant" : "Dire"} {row.position_id}</td>
+                      <td className="prematch-hero-name">
+                        <strong>{heroNames.get(row.hero_id) || `英雄 ${row.hero_id}`}</strong>
+                        <small>#{row.hero_id}</small>
+                      </td>
+                      <td>{signed(row.position_base_diff)}</td>
+                      <td>{signed(row.same_team_synergy)}</td>
+                      <td>{signed(row.opponent_matchup_synergy)}</td>
+                      <td>{signed(row.display_score)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
-      )}
 
-      <footer>
-        <span>{result.rosh_profile_id}</span>
-        <code>{result.formula_version}</code>
-        <time dateTime={result.collected_at}>{new Date(result.collected_at).toLocaleString("zh-CN", { hour12: false })}</time>
-      </footer>
+          {minutes.length > 0 && (
+            <div className="prematch-minute-table">
+              <header>
+                <h2>分钟评分</h2>
+                <span>{minuteRangeLabel(minutes)}</span>
+              </header>
+              <div>
+                <table>
+                  <thead><tr><th>分钟</th><th>方向</th><th>优势分</th><th>Radiant 时间</th><th>Dire 时间</th><th>协同</th><th>高分段 / 回退</th></tr></thead>
+                  <tbody>
+                    {minutes.map((row) => (
+                      <tr key={row.minute}>
+                        <td>{row.minute}</td>
+                        <td>{scoreDirection(row.display_score)}</td>
+                        <td>{signed(row.display_score)}</td>
+                        <td>{signed(row.radiant_time_delta)}</td>
+                        <td>{signed(row.dire_time_delta)}</td>
+                        <td>{signed(row.synergy_delta)}</td>
+                        <td>{row.rank_source_counts.DIVINE_IMMORTAL || 0} / {row.rank_source_counts.ALL_RANK_FALLBACK || 0}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          <footer>
+            <span>{result.rosh_profile_id}</span>
+            <code>{result.formula_version}</code>
+            <time dateTime={result.collected_at}>{new Date(result.collected_at).toLocaleString("zh-CN", { hour12: false })}</time>
+          </footer>
+        </div>
+      </details>
     </section>
   );
 }
@@ -628,6 +683,45 @@ function minuteRangeLabel(minutes: RoshAnalysisRunResponse["minute_points"]): st
 function scoreDirection(score: number | null): string {
   if (score == null || score === 0) return "均势";
   return score > 0 ? "Radiant" : "Dire";
+}
+
+function scoreTone(score: number | null): "radiant" | "dire" | "neutral" {
+  if (score == null || score === 0) return "neutral";
+  return score > 0 ? "radiant" : "dire";
+}
+
+function scoreStrength(score: number | null): string {
+  if (score == null) return "不可用";
+  const distance = Math.abs(score);
+  if (distance < 3) return "轻微";
+  if (distance < 8) return "中等";
+  return "明显";
+}
+
+function strongestMinuteLabel(minutes: RoshAnalysisRunResponse["minute_points"]): string {
+  if (!minutes.length) return "不可用";
+  const strongest = minutes.reduce((current, point) => (
+    Math.abs(point.display_score) > Math.abs(current.display_score) ? point : current
+  ));
+  return `约 ${strongest.minute} 分钟`;
+}
+
+function primaryScoreReason(
+  components: RoshAnalysisRunResponse["hero_components"],
+): string {
+  if (!components.length) return "等待英雄分解";
+  const totals = {
+    position: components.reduce((sum, row) => sum + Math.abs(row.position_base_diff), 0),
+    synergy: components.reduce((sum, row) => sum + Math.abs(row.same_team_synergy), 0),
+    matchup: components.reduce((sum, row) => sum + Math.abs(row.opponent_matchup_synergy), 0),
+  };
+  const strongest = (Object.entries(totals) as Array<[keyof typeof totals, number]>)
+    .sort((left, right) => right[1] - left[1])[0]?.[0];
+  return {
+    position: "位置对位贡献最大",
+    synergy: "同队英雄协同贡献最大",
+    matchup: "对手克制关系贡献最大",
+  }[strongest || "position"];
 }
 
 function errorText(reason: unknown, fallback: string): string {
