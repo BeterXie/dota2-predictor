@@ -32,6 +32,10 @@ const match: MonitorMatch = {
 
 const decisionMatch: MonitorMatch = {
   ...match,
+  readiness: {
+    ...match.readiness,
+    model: { status: "ready" },
+  },
   latest_vision: {
     captured_at: "2026-07-16T12:00:04+00:00",
     map_number: 2,
@@ -72,7 +76,8 @@ describe("MatchRail", () => {
     expect(screen.queryByRole("button", { name: /切换实时赛事/ })).not.toBeInTheDocument();
     expect(view.container.querySelector(".match-list-columns")).not.toBeInTheDocument();
     expect(screen.getByText("第 2 局 · 20:34")).toBeInTheDocument();
-    expect(screen.getByText("策略合格")).toBeInTheDocument();
+    expect(view.container.querySelector(".match-row-strategy strong"))
+      .toHaveTextContent("策略合格");
     expect(screen.getByText("关注 Radiant")).toBeInTheDocument();
 
     const row = view.container.querySelector(".match-row");
@@ -179,6 +184,65 @@ describe("MatchRail", () => {
     );
 
     expect(screen.getByLabelText("历史赛事列表")).toBeInTheDocument();
+    expect(screen.queryByLabelText("关注状态筛选")).not.toBeInTheDocument();
+  });
+
+  it("filters the live attention queue with visible counts", () => {
+    const reviewMatch: MonitorMatch = {
+      ...decisionMatch,
+      raybet_match_id: "match-review",
+      team_one: "Review team",
+      latest_decision: {
+        ...decisionMatch.latest_decision!,
+        reason: "rosh_profile_mismatch",
+      },
+    };
+    const degradedMatch: MonitorMatch = {
+      ...match,
+      raybet_match_id: "match-degraded",
+      team_one: "Delayed team",
+      readiness: {
+        ...match.readiness,
+        odds: { status: "stale" },
+      },
+    };
+    const waitingMatch: MonitorMatch = {
+      ...match,
+      raybet_match_id: "match-waiting",
+      team_one: "Waiting team",
+      readiness: decisionMatch.readiness,
+    };
+    const upcomingMatch: MonitorMatch = {
+      ...waitingMatch,
+      raybet_match_id: "match-upcoming",
+      team_one: "Upcoming team",
+      lifecycle: "upcoming",
+    };
+    const view = render(
+      <MatchRail
+        matches={[waitingMatch, upcomingMatch, degradedMatch, decisionMatch, reviewMatch]}
+        mode="live"
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        onSelect={vi.fn()}
+        selectedId={null}
+        variant="page"
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /需处理 3/ })).toBeInTheDocument();
+    expect(Array.from(view.container.querySelectorAll(".match-row")).map(
+      (row) => row.textContent,
+    )).toEqual(expect.arrayContaining([
+      expect.stringContaining("Review team"),
+      expect.stringContaining("Radiant"),
+      expect.stringContaining("Delayed team"),
+    ]));
+
+    fireEvent.click(screen.getByRole("button", { name: /需处理 3/ }));
+
+    expect(view.container.querySelectorAll(".match-row")).toHaveLength(3);
+    expect(screen.queryByText("Waiting team")).not.toBeInTheDocument();
+    expect(screen.queryByText("Upcoming team")).not.toBeInTheDocument();
   });
 
   it("keeps the desktop rail body rendered and only toggles the mobile presentation", () => {

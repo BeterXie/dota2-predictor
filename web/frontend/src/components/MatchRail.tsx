@@ -3,24 +3,44 @@ import { CaretRight, MagnifyingGlass } from "@phosphor-icons/react";
 import { useMemo, useState } from "react";
 
 import {
-  ageSeconds,
-  formatAge,
   formatClock,
   formatOdds,
   lifecycleLabel,
 } from "../format";
-import { getTrustedVision } from "../matchPresentation";
+import {
+  getMatchAttentionState,
+  getTrustedVision,
+  matchesAttentionFilter,
+  sortMatchesByAttention,
+  type MatchAttentionCategory,
+  type MatchAttentionFilter,
+  type MatchAttentionSort,
+} from "../matchPresentation";
 import type { Lifecycle, MonitorMatch } from "../types";
+import { RelativeAge } from "./RelativeAge";
 import { LifecycleBadge } from "./StatusBadge";
 
 const lifecycleOrder: Lifecycle[] = ["live", "degraded", "upcoming", "ended"];
+const attentionFilters: Array<{ label: string; value: MatchAttentionFilter }> = [
+  { value: "all", label: "全部" },
+  { value: "action", label: "需处理" },
+  { value: "eligible", label: "策略合格" },
+  { value: "review", label: "证据复核" },
+  { value: "degraded", label: "数据延迟" },
+  { value: "upcoming", label: "待开赛" },
+];
+const attentionSortLabels: Record<MatchAttentionSort, string> = {
+  priority: "关注顺序",
+  updated: "最近更新",
+  scheduled: "开赛时间",
+};
 
 interface MatchRailProps {
   matches: MonitorMatch[];
   mode: "live" | "history";
   selectedId: string | null;
   onSelect: (matchId: string) => void;
-  now: number;
+  now?: number;
   historyHasMore?: boolean;
   historyLoading?: boolean;
   onLoadMore?: () => void;
@@ -40,7 +60,9 @@ export function MatchRail({
 }: MatchRailProps) {
   const [query, setQuery] = useState("");
   const [mobileExpanded, setMobileExpanded] = useState(false);
-  const filtered = useMemo(() => {
+  const [attentionFilter, setAttentionFilter] = useState<MatchAttentionFilter>("all");
+  const [attentionSort, setAttentionSort] = useState<MatchAttentionSort>("priority");
+  const searched = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
     if (!normalized) return matches;
     return matches.filter((match) =>
@@ -52,6 +74,35 @@ export function MatchRail({
       ].some((value) => String(value || "").toLocaleLowerCase("zh-CN").includes(normalized)),
     );
   }, [matches, query]);
+  const attentionCounts = useMemo(() => new Map(
+    attentionFilters.map(({ value }) => [
+      value,
+      matches.filter((match) => matchesAttentionFilter(match, value)).length,
+    ]),
+  ), [matches]);
+  const filtered = useMemo(
+    () => mode === "live"
+      ? searched.filter((match) => matchesAttentionFilter(match, attentionFilter))
+      : searched,
+    [attentionFilter, mode, searched],
+  );
+  const visibleMatches = useMemo(
+    () => mode === "live" ? sortMatchesByAttention(filtered, attentionSort) : filtered,
+    [attentionSort, filtered, mode],
+  );
+  const groups = useMemo(() => {
+    if (mode === "live") {
+      return visibleMatches.length
+        ? [{ key: attentionSort, label: attentionSortLabels[attentionSort], matches: visibleMatches }]
+        : [];
+    }
+    return lifecycleOrder.flatMap((lifecycle) => {
+      const group = visibleMatches.filter((match) => match.lifecycle === lifecycle);
+      return group.length
+        ? [{ key: lifecycle, label: lifecycleLabel[lifecycle], matches: group }]
+        : [];
+    });
+  }, [attentionSort, mode, visibleMatches]);
 
   const Root = variant === "page" ? "main" : "aside";
 
@@ -90,25 +141,55 @@ export function MatchRail({
               value={query}
               onChange={(_, data) => setQuery(data.value)}
             />
+            {mode === "live" && (
+              <div className="attention-toolbar" aria-label="实时赛事筛选与排序">
+                <div className="attention-filters" role="group" aria-label="关注状态筛选">
+                  {attentionFilters.map(({ label, value }) => (
+                    <button
+                      aria-pressed={attentionFilter === value}
+                      className={`attention-filter${attentionFilter === value ? " active" : ""}`}
+                      key={value}
+                      onClick={() => setAttentionFilter(value)}
+                      type="button"
+                    >
+                      <span>{label}</span>
+                      <strong>{attentionCounts.get(value) || 0}</strong>
+                    </button>
+                  ))}
+                </div>
+                <label className="attention-sort">
+                  <span>排序</span>
+                  <select
+                    aria-label="赛事排序"
+                    value={attentionSort}
+                    onChange={(event) => setAttentionSort(event.target.value as MatchAttentionSort)}
+                  >
+                    <option value="priority">优先级</option>
+                    <option value="updated">最近更新</option>
+                    <option value="scheduled">开赛时间</option>
+                  </select>
+                </label>
+              </div>
+            )}
           </div>
 
-          <nav className="match-groups" aria-label="按状态分组的赛事">
-        {lifecycleOrder.map((lifecycle) => {
-          const group = filtered.filter((match) => match.lifecycle === lifecycle);
-          if (!group.length) return null;
+          <nav
+            className="match-groups"
+            aria-label={mode === "live" ? "实时赛事关注队列" : "按状态分组的赛事"}
+          >
+        {groups.map((group) => {
           return (
-            <section className="match-group" key={lifecycle}>
+            <section className="match-group" key={group.key}>
               <div className="match-group-title">
-                <span>{lifecycleLabel[lifecycle]}</span>
-                <span>{group.length}</span>
+                <span>{group.label}</span>
+                <span>{group.matches.length}</span>
               </div>
               <div className="match-group-items">
-                {group.map((match) => {
+                {group.matches.map((match) => {
                   const selected = match.raybet_match_id === selectedId;
                   const observedAt = match.winner?.observed_at;
-                  const age = ageSeconds(observedAt, now);
                   const progress = matchProgressLabel(match);
-                  const strategy = matchStrategySummary(match);
+                  const strategy = getMatchAttentionState(match);
                   return (
                     <button
                       className={`match-row${selected ? " selected" : ""}`}
@@ -134,15 +215,18 @@ export function MatchRail({
                         <small>{progress}</small>
                       </div>
                       <div className="match-row-strategy">
-                        <strong className={strategy.tone}>{strategy.label}</strong>
+                        <strong className={attentionTone(strategy.category)}>{strategy.label}</strong>
                         <span>{strategy.detail}</span>
                       </div>
                       <div className="match-row-prices">
                         <span>{formatOdds(match.winner?.prices?.team_one)}</span>
                         <span>{formatOdds(match.winner?.prices?.team_two)}</span>
-                        <span className={age != null && age > 60 ? "age stale" : "age"}>
-                          {formatAge(age)}
-                        </span>
+                        <RelativeAge
+                          className="age"
+                          now={now}
+                          observedAt={observedAt}
+                          staleAfterSeconds={60}
+                        />
                       </div>
                       <CaretRight className="match-row-enter" size={17} aria-hidden="true" />
                     </button>
@@ -152,11 +236,13 @@ export function MatchRail({
             </section>
           );
         })}
-        {!filtered.length && (
+        {!visibleMatches.length && (
           <div className="rail-empty">
             <MagnifyingGlass size={24} aria-hidden="true" />
             <span>{query
               ? "没有匹配的赛事"
+              : mode === "live" && attentionFilter !== "all"
+                ? `当前没有${attentionFilters.find((item) => item.value === attentionFilter)?.label || "符合条件的"}赛事`
               : mode === "history" && historyLoading
                 ? "正在加载历史比赛"
                 : mode === "history" ? "暂无历史比赛" : "暂无实时赛事"}</span>
@@ -192,33 +278,11 @@ function matchProgressLabel(match: MonitorMatch): string {
   return "等待可信比赛时钟";
 }
 
-function matchStrategySummary(match: MonitorMatch): {
-  detail: string;
-  label: string;
-  tone: "positive" | "warning" | "neutral" | "critical";
-} {
-  const decision = match.latest_decision;
-  if (!decision) {
-    return match.lifecycle === "upcoming"
-      ? { label: "等待开赛", detail: "尚未形成策略结论", tone: "neutral" }
-      : { label: "等待判断", detail: "等待下一次可信输入", tone: "neutral" };
-  }
-  const direction = decision.underdog_side === "team_one"
-    ? match.team_one
-    : decision.underdog_side === "team_two" ? match.team_two : null;
-  if (decision.eligible === 1) {
-    return {
-      label: "策略合格",
-      detail: direction ? `关注 ${direction}` : "纸面候选已通过",
-      tone: "positive",
-    };
-  }
-  const invalid = decision.reason.includes("invalid") || decision.reason.includes("mismatch");
-  return {
-    label: invalid ? "证据需复核" : "策略拒绝",
-    detail: direction
-      ? invalid ? `涉及 ${direction}` : `已拒绝 ${direction}`
-      : "等待下一次可信输入",
-    tone: invalid ? "critical" : "warning",
-  };
+function attentionTone(
+  category: MatchAttentionCategory,
+): "positive" | "warning" | "neutral" | "critical" {
+  if (category === "review") return "critical";
+  if (category === "eligible") return "positive";
+  if (category === "degraded" || category === "blocked") return "warning";
+  return "neutral";
 }
