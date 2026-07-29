@@ -87,6 +87,17 @@ describe("PrematchWorkspace", () => {
     fireEvent.keyDown(search, { key: "Escape", code: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "英雄选择器" }))
       .not.toBeInTheDocument());
+
+    fireEvent.click(opener);
+    const reopenedSearch = await screen.findByRole("textbox", { name: "搜索英雄" });
+    fireEvent.change(reopenedSearch, { target: { value: "Life" } });
+    expect(reopenedSearch).toHaveValue("Life");
+    fireEvent.click(screen.getByRole("button", { name: "关闭英雄选择器" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "英雄选择器" }))
+      .not.toBeInTheDocument());
+
+    fireEvent.click(opener);
+    expect(await screen.findByRole("textbox", { name: "搜索英雄" })).toHaveValue("");
   });
 });
 

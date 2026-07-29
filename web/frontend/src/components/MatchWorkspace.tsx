@@ -31,6 +31,7 @@ import {
   formatOdds,
   formatPercent,
 } from "../format";
+import { getTrustedVision } from "../matchPresentation";
 import { comparePeriods, mapNumberForPeriod, resolvePeriod } from "../probability-period";
 import type {
   AnalysisSection,
@@ -147,12 +148,7 @@ export function MatchWorkspace({
   const observedAge = winner?.observed_at
     ? Math.max(0, (now - new Date(winner.observed_at).getTime()) / 1000)
     : null;
-  const vision = detail?.latest_vision;
-  const visionStatus = (detail || match).readiness.vision.status;
-  const trustedVision = vision?.confirmed === 1
-    && (visionStatus === "ready" || visionStatus === "delayed")
-    ? vision
-    : null;
+  const trustedVision = detail ? getTrustedVision(detail) : null;
   const watchLink = safeWatchLink(match.watch_link);
   const chartTimeline = detail?.winner_timeline || [];
   const chartDecisions = detail?.decisions || [];

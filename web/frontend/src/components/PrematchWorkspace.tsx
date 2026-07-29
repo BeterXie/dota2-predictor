@@ -140,6 +140,11 @@ export function PrematchWorkspace() {
     else setDireTeam(value);
   };
 
+  const closeHeroPicker = () => {
+    setPicker(null);
+    setHeroSearch("");
+  };
+
   const setHero = (hero: PrematchHero) => {
     if (!picker) return;
     clearSource();
@@ -150,8 +155,7 @@ export function PrematchWorkspace() {
     };
     if (picker.side === "radiant") setRadiantHeroes(update);
     else setDireHeroes(update);
-    setPicker(null);
-    setHeroSearch("");
+    closeHeroPicker();
   };
 
   const clearHero = (side: Side, position: number) => {
@@ -384,10 +388,7 @@ export function PrematchWorkspace() {
           modalType="modal"
           open
           onOpenChange={(_, data) => {
-            if (!data.open) {
-              setPicker(null);
-              setHeroSearch("");
-            }
+            if (!data.open) closeHeroPicker();
           }}
         >
           <DialogSurface aria-label="英雄选择器" className="hero-picker-dialog">
@@ -398,7 +399,7 @@ export function PrematchWorkspace() {
                     appearance="subtle"
                     aria-label="关闭英雄选择器"
                     icon={<X size={18} />}
-                    onClick={() => setPicker(null)}
+                    onClick={closeHeroPicker}
                   />
                 )}
               >

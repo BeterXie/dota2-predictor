@@ -9,6 +9,7 @@ import {
   formatOdds,
   lifecycleLabel,
 } from "../format";
+import { getTrustedVision } from "../matchPresentation";
 import type { Lifecycle, MonitorMatch } from "../types";
 import { LifecycleBadge } from "./StatusBadge";
 
@@ -179,8 +180,8 @@ export function MatchRail({
 }
 
 function matchProgressLabel(match: MonitorMatch): string {
-  const vision = match.latest_vision;
-  if (vision?.confirmed === 1 && vision.map_number) {
+  const vision = getTrustedVision(match);
+  if (vision?.map_number) {
     const clock = vision.game_clock_seconds == null
       ? "时钟待确认"
       : formatClock(vision.game_clock_seconds);
@@ -215,7 +216,9 @@ function matchStrategySummary(match: MonitorMatch): {
   const invalid = decision.reason.includes("invalid") || decision.reason.includes("mismatch");
   return {
     label: invalid ? "证据需复核" : "策略拒绝",
-    detail: direction ? `当前关注 ${direction}` : "等待下一次可信输入",
+    detail: direction
+      ? invalid ? `涉及 ${direction}` : `已拒绝 ${direction}`
+      : "等待下一次可信输入",
     tone: invalid ? "critical" : "warning",
   };
 }

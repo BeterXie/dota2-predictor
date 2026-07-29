@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { MonitorMatch } from "../types";
 import { MatchRail } from "./MatchRail";
+
+afterEach(cleanup);
 
 const match: MonitorMatch = {
   raybet_match_id: "match-1",
@@ -77,6 +79,91 @@ describe("MatchRail", () => {
     if (!(row instanceof HTMLButtonElement)) throw new Error("match row not found");
     fireEvent.click(row);
     expect(onSelect).toHaveBeenCalledWith(match.raybet_match_id);
+  });
+
+  it("only shows a confirmed clock when vision readiness is usable", () => {
+    const staleMatch: MonitorMatch = {
+      ...decisionMatch,
+      readiness: {
+        ...decisionMatch.readiness,
+        vision: { status: "stale" },
+      },
+    };
+    const view = render(
+      <MatchRail
+        matches={[staleMatch]}
+        mode="live"
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        onSelect={vi.fn()}
+        selectedId={null}
+        variant="page"
+      />,
+    );
+
+    expect(screen.getByText("等待可信比赛时钟")).toBeInTheDocument();
+    expect(screen.queryByText("第 2 局 · 20:34")).not.toBeInTheDocument();
+
+    view.rerender(
+      <MatchRail
+        matches={[{
+          ...staleMatch,
+          readiness: {
+            ...staleMatch.readiness,
+            vision: { status: "delayed" },
+          },
+        }]}
+        mode="live"
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        onSelect={vi.fn()}
+        selectedId={null}
+        variant="page"
+      />,
+    );
+    expect(screen.getByText("第 2 局 · 20:34")).toBeInTheDocument();
+  });
+
+  it("does not describe rejected or invalid decisions as current attention", () => {
+    const rejectedMatch: MonitorMatch = {
+      ...decisionMatch,
+      latest_decision: {
+        ...decisionMatch.latest_decision!,
+        eligible: 0,
+        reason: "edge_below_threshold",
+      },
+    };
+    const view = render(
+      <MatchRail
+        matches={[rejectedMatch]}
+        mode="live"
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        onSelect={vi.fn()}
+        selectedId={null}
+        variant="page"
+      />,
+    );
+
+    expect(screen.getByText("策略拒绝")).toBeInTheDocument();
+    expect(screen.getByText("已拒绝 Radiant")).toBeInTheDocument();
+    expect(screen.queryByText("当前关注 Radiant")).not.toBeInTheDocument();
+
+    view.rerender(
+      <MatchRail
+        matches={[{
+          ...rejectedMatch,
+          latest_decision: {
+            ...rejectedMatch.latest_decision!,
+            reason: "rosh_profile_mismatch",
+          },
+        }]}
+        mode="live"
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        onSelect={vi.fn()}
+        selectedId={null}
+        variant="page"
+      />,
+    );
+    expect(screen.getByText("证据需复核")).toBeInTheDocument();
+    expect(screen.getByText("涉及 Radiant")).toBeInTheDocument();
   });
 
   it("labels a full history collection as a history list", () => {
