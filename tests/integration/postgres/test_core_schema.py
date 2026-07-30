@@ -97,7 +97,7 @@ def test_core_migration_and_transaction_contract(postgres_database_url: str) -> 
                 text("SELECT version_num FROM alembic_version"),
             ).scalar_one()
         assert count == 0
-        assert revision == "20260730_0008"
+        assert revision == "20260730_0009"
     finally:
         engine.dispose()
 

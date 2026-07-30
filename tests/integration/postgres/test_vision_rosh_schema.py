@@ -138,6 +138,82 @@ def test_strategy_decision_is_immutable_and_eligible_rows_fail_closed(
             )
 
 
+def test_monitor_runtime_contract_and_outbox_payload_are_enforced(
+    postgres_engine: Engine,
+) -> None:
+    inspector = inspect(postgres_engine)
+    assert {
+        "runtime_schema_version",
+        "monitor_process_registry",
+        "monitor_control_audit",
+        "monitor_alert_candidates",
+        "monitor_alert_incidents",
+        "monitor_alert_audit",
+    } <= set(inspector.get_table_names())
+
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO notification_outbox (
+                    order_key, event_type, recipient, message_id, payload_json,
+                    statistics_cutoff, template_version, created_at, updated_at
+                ) VALUES (
+                    'alert-1', 'monitor_alert', 'ops@example.invalid',
+                    'message-1', '{}', '2026-07-30T00:00:00Z', 'template-v1',
+                    '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z'
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE notification_outbox SET status = 'sent', "
+                "sent_at = '2026-07-30T00:01:00Z' WHERE message_id = 'message-1'"
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO monitor_control_audit (
+                    request_id, component, action, result, ok, client_host,
+                    requested_at, response_json
+                ) VALUES (
+                    'request-1', 'shadow_monitor', 'start', 'started', 1,
+                    '127.0.0.1', '2026-07-30T00:00:00Z', '{}'
+                )
+                """
+            )
+        )
+
+    with postgres_engine.connect() as connection:
+        version = connection.execute(
+            text(
+                "SELECT version, length(contract_digest) "
+                "FROM runtime_schema_version"
+            )
+        ).one()
+    assert version == (1, 64)
+
+    with pytest.raises(DBAPIError, match="outbox payload is immutable"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE notification_outbox SET payload_json = :payload_json "
+                    "WHERE message_id = 'message-1'"
+                ),
+                {"payload_json": '{"x":1}'},
+            )
+
+    with pytest.raises(DBAPIError, match="control audit rows are immutable"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE monitor_control_audit SET result = 'mutated' "
+                    "WHERE request_id = 'request-1'"
+                )
+            )
+
 def test_trusted_vision_requires_active_frame_and_no_invalidation(
     postgres_engine: Engine,
 ) -> None:
