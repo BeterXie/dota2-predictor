@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from database.session import PostgresSession
 
 from .raw_archive import verify_raw_artifact_file
 
@@ -25,7 +26,7 @@ _ARTIFACT_COLUMNS = (
 
 
 def _artifact_row(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     artifact_id: str,
 ) -> dict[str, Any]:
     row = connection.execute(
@@ -40,7 +41,7 @@ def _artifact_row(
 
 
 def verify_registered_raw_source_artifact(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     artifact_id: str,
 ) -> Path:
     """Verify the registry metadata against its current physical artifact."""
@@ -101,7 +102,7 @@ def raw_source_relocation_id(payload: Mapping[str, Any]) -> str:
 
 
 def relocate_raw_source_artifacts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     replacements: Mapping[str, str | Path],
     *,
     allowed_new_roots: Iterable[str | Path],
@@ -168,8 +169,7 @@ def relocate_raw_source_artifacts(
         planned.append((authority, destination, incoming))
 
     relocation_ids: list[str] = []
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         for authority, destination, incoming in planned:
             artifact_id = str(authority["artifact_id"])
             current = _artifact_row(connection, artifact_id)
@@ -236,10 +236,6 @@ def relocate_raw_source_artifacts(
             if updated.rowcount != 1:
                 raise RuntimeError(f"raw source artifact vanished: {artifact_id}")
             relocation_ids.append(relocation_id)
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
     return tuple(relocation_ids)
 
 

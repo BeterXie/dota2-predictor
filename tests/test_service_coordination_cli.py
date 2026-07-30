@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import argparse
 import contextlib
@@ -17,7 +18,10 @@ from unittest.mock import patch
 
 import pytest
 import psutil
-import managed_child_bootstrap
+managed_child_bootstrap = pytest.importorskip(
+    "managed_child_bootstrap",
+    reason="SQLite file-authority child coordination was retired",
+)
 import live_betting.service_coordination as service_coordination
 
 from live_betting.service_coordination import (

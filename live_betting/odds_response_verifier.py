@@ -6,12 +6,13 @@ import gzip
 import hashlib
 import json
 import math
-import sqlite3
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from database.session import PostgresSession
 
 from event_intelligence.raw_archive import (
     canonical_json_value_bytes,
@@ -53,14 +54,17 @@ class _StateAuthority:
     outcomes: tuple[ResponseStateOutcome, ...]
 
 
-def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+def _table_exists(connection: PostgresSession, table: str) -> bool:
     return connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        """SELECT 1 FROM information_schema.tables
+            WHERE table_schema=current_schema()
+              AND table_type='BASE TABLE' AND table_name=?""",
+        (table,),
     ).fetchone() is not None
 
 
 def _state_groups(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> Iterator[tuple[tuple[Any, ...], tuple[Sequence[Any], ...]]]:
     cursor = connection.execute(
         """SELECT state.response_state_hash, state.raybet_match_id,
@@ -159,7 +163,7 @@ def _state_authority(
     )
 
 
-def _verify_states(connection: sqlite3.Connection) -> int:
+def _verify_states(connection: PostgresSession) -> int:
     state_count = 0
     for metadata, raw_outcomes in _state_groups(connection):
         _state_authority(metadata, raw_outcomes)
@@ -181,7 +185,7 @@ def _verify_states(connection: sqlite3.Connection) -> int:
 
 
 def _transport_groups(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> Iterator[tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]]:
     cursor = connection.execute(
         """SELECT transport.observation_key, transport.raybet_match_id,
@@ -265,7 +269,7 @@ def _verify_legacy_transport(
 
 
 def _verify_transports(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> tuple[int, int]:
     transport_count = 0
     legacy_count = 0
@@ -314,9 +318,9 @@ def _verify_transports(
 
 
 def _artifact_state_groups(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> Iterator[tuple[str, _StateAuthority]]:
-    # SQLite may spill this distinct-pair grouping to its temporary store; the
+    # The database may spill this distinct-pair grouping to temporary storage; the
     # Python verifier retains only one state manifest at a time.
     cursor = connection.execute(
         """WITH artifact_states AS (
@@ -452,7 +456,7 @@ def _verify_full_artifact(
 
 
 def _verify_artifacts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raw_archive_root: Path,
 ) -> int:
     state_groups = iter(_artifact_state_groups(connection))
@@ -500,7 +504,7 @@ def _verify_artifacts(
 
 
 def verify_odds_response_authority(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raw_archive_root: str | Path,
 ) -> OddsResponseAuthorityVerification:
     """Recompute every persisted state, transport binding, and raw artifact."""

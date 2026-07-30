@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
@@ -19,10 +20,13 @@ from sqlalchemy import MetaData, Table, inspect, text
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Connection, Engine
 
-from database.engine import build_engine, require_database_url
-
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from database.engine import build_engine, require_database_url  # noqa: E402
+
+
 BATCH_SIZE = 500
 CONTROL_TABLES = {
     "alembic_version",
@@ -36,7 +40,6 @@ SINGLETON_TABLES = {
     "draft_lineage_revisions",
 }
 SEEDED_APPEND_TABLES = {
-    "draft_lineage_changes",
     "raybet_match_odds_activity",
     "research_result_labels",
 }
@@ -48,6 +51,11 @@ CRITICAL_ID_COLUMNS = {
     "message_id",
 }
 EXTRA_DEPENDENCIES: dict[str, set[str]] = {
+    "browser_events": {"odds_raw_artifacts"},
+    "draft_deployment_bundles": {
+        "draft_calibration_artifacts",
+        "draft_model_artifacts",
+    },
     "prospective_draft_outcomes": {
         "map_results",
         "settlement_reconciliations",
@@ -75,6 +83,20 @@ EXTRA_DEPENDENCIES: dict[str, set[str]] = {
         "vision_observations",
     },
 }
+DRAFT_LINEAGE_DEPENDENCY_TABLES = (
+    "event_registry",
+    "match_ingest_status",
+    "matches",
+    "raw_source_artifacts",
+    "raw_source_observations",
+    "player_map_facts",
+    "match_players",
+    "picks_bans",
+    "player_role_assignments",
+    "player_map_scores",
+    "team_map_states",
+)
+DRAFT_LINEAGE_ARTIFACT_TABLES = ("draft_model_runs", "draft_predictions")
 
 
 @dataclass(frozen=True)
@@ -156,6 +178,7 @@ def migrate_sqlite_to_postgres(
 
         with engine.begin() as target:
             target.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+            _set_import_triggers(target, enabled=False)
             _truncate_target(target, inspector, target_tables)
             for table_name in order:
                 _copy_table(
@@ -167,6 +190,7 @@ def migrate_sqlite_to_postgres(
                         or table_name in SINGLETON_TABLES
                     ),
                 )
+            _set_import_triggers(target, enabled=True)
             _reset_identity_sequences(target, inspect(target), target_tables)
 
         report = _validate_import(
@@ -315,6 +339,44 @@ def _truncate_target(
     )
 
 
+def _set_import_triggers(
+    connection: Connection,
+    *,
+    enabled: bool,
+) -> None:
+    preparer = connection.dialect.identifier_preparer
+    action = "ENABLE" if enabled else "DISABLE"
+    for kind, tables in (
+        ("dependency", DRAFT_LINEAGE_DEPENDENCY_TABLES),
+        ("artifact", DRAFT_LINEAGE_ARTIFACT_TABLES),
+    ):
+        for table in tables:
+            quoted_table = preparer.quote(table)
+            for operation in ("insert", "update", "delete"):
+                trigger = f"draft_lineage_{kind}_{table}_{operation}"
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {quoted_table} {action} TRIGGER "
+                    + preparer.quote(trigger)
+                )
+    for trigger in (
+        "draft_lineage_changes_append_only",
+        "draft_lineage_changes_no_update",
+        "draft_lineage_changes_no_delete",
+    ):
+        connection.exec_driver_sql(
+            f"ALTER TABLE draft_lineage_changes {action} TRIGGER "
+            + preparer.quote(trigger)
+        )
+    connection.exec_driver_sql(
+        f"ALTER TABLE browser_events {action} TRIGGER "
+        + preparer.quote("browser_events_require_external_payload")
+    )
+    connection.exec_driver_sql(
+        f"ALTER TABLE odds_transport_observations {action} TRIGGER "
+        + preparer.quote("odds_transport_observations_require_v2_state")
+    )
+
+
 def _copy_table(
     source: sqlite3.Connection,
     target: Connection,
@@ -322,6 +384,9 @@ def _copy_table(
     *,
     conflict_tolerant: bool,
 ) -> None:
+    if table.name == "raw_source_artifact_relocations":
+        _copy_raw_source_artifact_relocations(source, target, table)
+        return
     columns = _source_columns(source, table.name)
     if not columns:
         return
@@ -331,6 +396,14 @@ def _copy_table(
     )
     column_types = {column.name: column.type for column in table.columns}
     primary_key = [column.name for column in table.primary_key.columns]
+    relocation_old_paths: dict[str, str] = {}
+    if table.name == "raw_source_artifacts":
+        for row in source.execute(
+            "SELECT artifact_id, old_storage_path "
+            "FROM raw_source_artifact_relocations "
+            "ORDER BY artifact_id, relocation_sequence"
+        ):
+            relocation_old_paths.setdefault(str(row[0]), str(row[1]))
     while rows := cursor.fetchmany(BATCH_SIZE):
         payload = [
             {
@@ -339,6 +412,15 @@ def _copy_table(
             }
             for row in rows
         ]
+        if relocation_old_paths:
+            for row in payload:
+                artifact_id = str(row["artifact_id"])
+                old_path = relocation_old_paths.get(artifact_id)
+                if old_path is not None:
+                    row["storage_path"] = old_path
+        if table.name == "vision_draft_anchors":
+            _insert_vision_draft_anchors(target, table, payload)
+            continue
         if conflict_tolerant and primary_key:
             statement = postgresql_insert(table).values(payload)
             if table.name in SINGLETON_TABLES:
@@ -361,6 +443,64 @@ def _copy_table(
                 )
         else:
             target.execute(table.insert(), payload)
+
+
+def _copy_raw_source_artifact_relocations(
+    source: sqlite3.Connection,
+    target: Connection,
+    table: Table,
+) -> None:
+    columns = _source_columns(source, table.name)
+    quoted = ", ".join(_sqlite_identifier(column) for column in columns)
+    rows = source.execute(
+        f"SELECT {quoted} FROM {_sqlite_identifier(table.name)} "
+        "ORDER BY artifact_id, relocation_sequence"
+    )
+    for row in rows:
+        payload = {column: row[column] for column in columns}
+        target.execute(table.insert(), payload)
+        target.execute(
+            text(
+                "UPDATE raw_source_artifacts "
+                "SET storage_path = :new_storage_path "
+                "WHERE artifact_id = :artifact_id"
+            ),
+            {
+                "new_storage_path": payload["new_storage_path"],
+                "artifact_id": payload["artifact_id"],
+            },
+        )
+
+
+def _insert_vision_draft_anchors(
+    target: Connection,
+    table: Table,
+    payload: list[dict[str, Any]],
+) -> None:
+    conflict_transitions: list[dict[str, Any]] = []
+    insert_payload: list[dict[str, Any]] = []
+    for row in payload:
+        if row.get("status") != "conflict":
+            insert_payload.append(row)
+            continue
+        conflict_at = row.get("conflict_at")
+        if conflict_at is None:
+            raise RuntimeError(
+                "conflicted vision draft anchor is missing conflict_at"
+            )
+        insert_payload.append({**row, "status": "anchored", "conflict_at": None})
+        conflict_transitions.append(row)
+    if insert_payload:
+        target.execute(table.insert(), insert_payload)
+    for row in conflict_transitions:
+        target.execute(
+            table.update()
+            .where(
+                (table.c.raybet_match_id == row["raybet_match_id"])
+                & (table.c.map_number == row["map_number"])
+            )
+            .values(status="conflict", conflict_at=row["conflict_at"])
+        )
 
 
 def _coerce_value(value: Any, column_type: sa.types.TypeEngine[Any]) -> Any:

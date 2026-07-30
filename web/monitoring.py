@@ -9,7 +9,6 @@ import json
 import math
 import re
 import secrets
-import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict
@@ -30,7 +29,7 @@ from live_betting.milestone_revocation import (
     load_milestone_revocation_projection,
 )
 from live_betting.sanitize import stored_public_stream_url
-from live_betting.service_coordination import MARKET_SOURCE_POLICY
+from live_betting.process_control import MARKET_SOURCE_POLICY
 from live_betting.storage import query_rosh_lineup_score_for_trusted_draft
 from live_betting.strategy_contract import (
     parse_decision_payload,
@@ -46,7 +45,9 @@ from live_betting.strict_eligibility import (
     query_strict_live_eligibility,
 )
 from live_betting.vision_frame_registry import VISION_FRAME_REF_PREFIX
-from shared.sqlite import classify_sqlite_error
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from .alerts import active_alerts
 
@@ -194,25 +195,12 @@ _HISTORY_CURSOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
 _HISTORY_CURSOR_DOMAIN = b"dota2-monitor-history-v1\0"
 _HISTORY_CURSOR_SECRET = secrets.token_bytes(32)
 _CURSOR_VOLATILE_FIELDS = frozenset({"cursor", "generated_at", "age_seconds"})
-_SCHEDULE_UTC_JULIANDAY = """CASE
-    WHEN length(scheduled_at)=19
-     AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-     AND strftime('%Y-%m-%d %H:%M:%S', julianday(scheduled_at))=scheduled_at
-    THEN julianday(scheduled_at, '-8 hours')
-    WHEN length(scheduled_at)=25
-     AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-     AND strftime(
-         '%Y-%m-%dT%H:%M:%S+00:00',
-         julianday(scheduled_at)
-     )=scheduled_at
-    THEN julianday(scheduled_at)
-    ELSE NULL
-END"""
-_TIMELINE_KEY_SQL = f"""CAST(COALESCE(
+_SCHEDULE_UTC_JULIANDAY = "live_text_timestamp_utc(scheduled_at)"
+_TIMELINE_KEY_SQL = f"""CAST(EXTRACT(EPOCH FROM COALESCE(
     ({_SCHEDULE_UTC_JULIANDAY}),
-    julianday(updated_at),
-    0
-) * 86400000 AS INTEGER)"""
+    live_text_timestamp_utc(updated_at),
+    '1970-01-01T00:00:00+00:00'::timestamptz
+)) * 1000 AS BIGINT)"""
 
 
 def utc_now() -> datetime:
@@ -220,7 +208,7 @@ def utc_now() -> datetime:
 
 
 def derive_health(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -296,7 +284,7 @@ def derive_health(
 
 
 def build_monitor_snapshot(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     now: datetime | None = None,
     revocation_config: MilestoneRevocationConfig | None = None,
@@ -375,7 +363,7 @@ def _monitor_capabilities(
 
 
 def monitor_matches(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     now: datetime | None = None,
     revocation_config: MilestoneRevocationConfig | None = None,
@@ -410,7 +398,7 @@ def monitor_matches(
 
 
 def monitor_history_page(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     cursor: str | None = None,
     limit: int = _HISTORY_DEFAULT_LIMIT,
@@ -450,8 +438,8 @@ def monitor_history_page(
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
     items: list[dict[str, Any]] = []
-    returned_rows: list[sqlite3.Row] = []
-    last_scanned: sqlite3.Row | None = None
+    returned_rows: list[DatabaseRow] = []
+    last_scanned: DatabaseRow | None = None
     found_extra = False
     for row in candidates:
         last_scanned = row
@@ -467,7 +455,7 @@ def monitor_history_page(
         returned_rows.append(row)
 
     has_more = found_extra or candidate_more or raw_more
-    anchor: sqlite3.Row | None = None
+    anchor: DatabaseRow | None = None
     if found_extra:
         anchor = returned_rows[-1]
     elif candidate_more:
@@ -487,7 +475,7 @@ def monitor_history_page(
 
 
 def monitor_match_detail(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime | None = None,
@@ -590,7 +578,7 @@ def monitor_match_detail(
 
 
 def winner_timeline(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     max_points: int | None = 1200,
@@ -601,9 +589,13 @@ def winner_timeline(
     authority_relations = {
         str(row[0])
         for row in connection.execute(
-            """SELECT name FROM sqlite_master
-                 WHERE type IN ('table', 'view')
-                   AND name IN (
+            """SELECT relation.relname
+                 FROM pg_class AS relation
+                 JOIN pg_namespace AS namespace
+                   ON namespace.oid=relation.relnamespace
+                WHERE namespace.nspname=current_schema()
+                  AND relation.relkind IN ('r', 'p', 'v')
+                  AND relation.relname IN (
                        'odds_transport_observations',
                        'odds_response_outcomes_effective'
                    )"""
@@ -640,41 +632,42 @@ def winner_timeline(
                        ON snapshot.raybet_match_id=transport.raybet_match_id
                       AND snapshot.odds_id=outcome.odds_id
                       AND snapshot.received_at=transport.observed_at
-                      AND snapshot.odds_group_id IS outcome.odds_group_id
+                       AND snapshot.odds_group_id IS NOT DISTINCT FROM
+                           outcome.odds_group_id
                       AND snapshot.price=outcome.price
-                      AND snapshot.status IS outcome.status
+                       AND snapshot.status IS NOT DISTINCT FROM outcome.status
                       AND snapshot.market_type=outcome.market_type
                       AND snapshot.period=outcome.period
-                      AND snapshot.side IS outcome.side
-                      AND snapshot.line IS outcome.line
+                       AND snapshot.side IS NOT DISTINCT FROM outcome.side
+                       AND snapshot.line IS NOT DISTINCT FROM outcome.line
                       AND snapshot.outcome_key=outcome.outcome_key
                       AND snapshot.supported=outcome.supported
-                      AND snapshot.last_update IS outcome.last_update
+                       AND snapshot.last_update IS NOT DISTINCT FROM
+                           outcome.last_update
                      LEFT JOIN odds_alignments AS alignment
                        ON alignment.odds_snapshot_id=snapshot.id
                      WHERE transport.raybet_match_id=?
                        AND transport.source='direct'
-                       AND (? IS NULL OR julianday(transport.observed_at)<=julianday(?))
+                       AND (CAST(? AS text) IS NULL OR live_text_timestamp_utc(
+                               transport.observed_at
+                           )<=CAST(? AS timestamptz))
                        AND transport.timing_status='on_time'
                       AND transport.processing_status='processed'
                       AND outcome.market_type='winner'
                       AND outcome.supported=1
-                      AND (? IS NULL OR outcome.period=?)
+                      AND (CAST(? AS text) IS NULL OR outcome.period=?)
                     ORDER BY transport.observed_at, transport.observation_key,
                              outcome.period, outcome.odds_group_id,
                              outcome.odds_id""",
                     (raybet_match_id, cutoff, cutoff, period, period),
             )
-        except sqlite3.OperationalError as error:
-            # A partial or malformed response-authority schema must not revive
-            # carried-forward legacy snapshots as product data.
-            if classify_sqlite_error(error) == "schema_missing":
-                return []
-            raise
+        except SQLAlchemyError:
+            return []
     else:
         has_alignment_relation = connection.execute(
-            """SELECT 1 FROM sqlite_master
-                 WHERE type IN ('table', 'view') AND name='odds_alignments'"""
+            """SELECT 1 FROM information_schema.tables
+                WHERE table_schema=current_schema()
+                  AND table_name='odds_alignments'"""
         ).fetchone() is not None
         alignment_columns = (
             """alignment.map_number, alignment.game_clock_seconds,
@@ -704,15 +697,18 @@ def winner_timeline(
                  FROM odds_snapshots AS odds
                  {alignment_join}
                 WHERE odds.raybet_match_id=?
-                  AND (? IS NULL OR julianday(odds.received_at)<=julianday(?))
+                  AND (CAST(? AS text) IS NULL OR live_text_timestamp_utc(
+                          odds.received_at
+                      )<=
+                      CAST(? AS timestamptz))
                   AND odds.market_type='winner' AND odds.supported=1
-                  AND (? IS NULL OR odds.period=?)
+                  AND (CAST(? AS text) IS NULL OR odds.period=?)
                 ORDER BY odds.received_at, odds.period,
                          odds.odds_group_id, odds.id""",
             (raybet_match_id, cutoff, cutoff, period, period),
         )
 
-    grouped: dict[tuple[str, str, str, str], list[sqlite3.Row]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str], list[DatabaseRow]] = defaultdict(list)
     for row in rows:
         side = str(row["side"] or "")
         if side not in {"team_one", "team_two"}:
@@ -821,7 +817,7 @@ def winner_timeline(
 
 
 def current_markets(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     as_of: datetime | None = None,
@@ -835,7 +831,10 @@ def current_markets(
                      FROM odds_transport_observations
                      WHERE raybet_match_id=?
                        AND source='direct'
-                       AND (? IS NULL OR julianday(observed_at)<=julianday(?))
+                       AND (CAST(? AS text) IS NULL OR live_text_timestamp_utc(
+                               observed_at
+                           )<=
+                           CAST(? AS timestamptz))
                        AND timing_status='on_time'
                       AND processing_status='processed'
                     ORDER BY observed_at DESC, observation_key DESC LIMIT 1
@@ -848,7 +847,10 @@ def current_markets(
                  JOIN odds_response_outcomes_effective AS outcome
                    ON outcome.observation_key=latest.observation_key
                  WHERE outcome.raybet_match_id=?
-                   AND (? IS NULL OR julianday(outcome.received_at)<=julianday(?))
+                   AND (CAST(? AS text) IS NULL OR live_text_timestamp_utc(
+                           outcome.received_at
+                       )<=
+                       CAST(? AS timestamptz))
                 ORDER BY CASE WHEN outcome.market_type='winner' THEN 0 ELSE 1 END,
                          outcome.period, outcome.market_type,
                          outcome.odds_group_id, outcome.outcome_key""",
@@ -869,7 +871,10 @@ def current_markets(
                        PARTITION BY odds_id ORDER BY received_at DESC, id DESC
                     ) AS rank
                     FROM odds_snapshots WHERE raybet_match_id=?
-                      AND (? IS NULL OR julianday(received_at)<=julianday(?))
+                      AND (CAST(? AS text) IS NULL OR live_text_timestamp_utc(
+                              received_at
+                          )<=
+                          CAST(? AS timestamptz))
                )
                SELECT odds_id, odds_group_id, received_at, price, status,
                       market_type, period, side, line, outcome_key, supported
@@ -882,7 +887,7 @@ def current_markets(
 
 
 def monitor_cursor(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     now: datetime | None = None,
 ) -> str:
@@ -915,12 +920,14 @@ def _stable_cursor_projection(value: Any) -> Any:
     return value
 
 
-def mapping_revision(connection: sqlite3.Connection) -> str:
+def mapping_revision(connection: PostgresSession) -> str:
     try:
         impact_revision = _latest_value(
             connection, "strict_live_mapping_impacts", "impact_id"
         )
-    except sqlite3.OperationalError:
+    except SQLAlchemyError as error:
+        if not _is_schema_missing_error(error):
+            raise
         impact_revision = "unavailable"
     values = {
         "mapping": _latest_value(
@@ -946,18 +953,18 @@ def _selected_match_columns(alias: str | None = None) -> str:
 
 
 def _realtime_match_candidates(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     checked_at: datetime,
-) -> list[sqlite3.Row]:
+) -> list[DatabaseRow]:
     """Return bounded candidates before any per-match projection queries."""
 
     selected = _selected_match_columns()
     qualified = _selected_match_columns("match_row")
-    buckets: list[tuple[int, list[sqlite3.Row]]] = []
+    buckets: list[tuple[int, list[DatabaseRow]]] = []
 
     provider_live = _rows(
         connection,
-        f"""SELECT rowid AS _candidate_rowid, {selected}
+        f"""SELECT 0 AS _candidate_rowid, {selected}
                FROM raybet_matches
               WHERE status='2'
                 AND updated_at>=?
@@ -980,7 +987,7 @@ def _realtime_match_candidates(
         placeholders = ",".join("?" for _ in vision_ids)
         vision_rows = _rows(
             connection,
-            f"""SELECT rowid AS _candidate_rowid, {selected}
+            f"""SELECT 0 AS _candidate_rowid, {selected}
                    FROM raybet_matches
                   WHERE raybet_match_id IN ({placeholders})
                   LIMIT ?""",
@@ -1003,7 +1010,7 @@ def _realtime_match_candidates(
                        WHERE transport.raybet_match_id=activity.raybet_match_id
                 )
            )
-           SELECT match_row.rowid AS _candidate_rowid, {qualified}
+           SELECT 0 AS _candidate_rowid, {qualified}
              FROM production_activity AS activity
              JOIN raybet_matches AS match_row
                ON match_row.raybet_match_id=activity.raybet_match_id
@@ -1022,9 +1029,9 @@ def _realtime_match_candidates(
 
     upcoming = _rows(
         connection,
-        f"""SELECT rowid AS _candidate_rowid, {selected}
+        f"""SELECT 0 AS _candidate_rowid, {selected}
                FROM raybet_matches
-              WHERE {_SCHEDULE_UTC_JULIANDAY}>julianday(?)
+              WHERE {_SCHEDULE_UTC_JULIANDAY}>CAST(? AS timestamptz)
               ORDER BY {_SCHEDULE_UTC_JULIANDAY}, raybet_match_id
               LIMIT ?""",
         (
@@ -1036,7 +1043,7 @@ def _realtime_match_candidates(
 
     recent_metadata = _rows(
         connection,
-        f"""SELECT rowid AS _candidate_rowid, {selected}
+        f"""SELECT 0 AS _candidate_rowid, {selected}
                FROM raybet_matches
               WHERE updated_at>=?
                 AND updated_at<=?
@@ -1052,10 +1059,11 @@ def _realtime_match_candidates(
 
     recent_history = _rows(
         connection,
-        f"""SELECT rowid AS _candidate_rowid, {selected}
+        f"""SELECT 0 AS _candidate_rowid, {selected}
                FROM raybet_matches
               WHERE {_TIMELINE_KEY_SQL}<=
-                    CAST(julianday(?) * 86400000 AS INTEGER)
+                    CAST(EXTRACT(EPOCH FROM CAST(? AS timestamptz)) * 1000
+                         AS BIGINT)
               ORDER BY {_TIMELINE_KEY_SQL} DESC, raybet_match_id DESC
               LIMIT ?""",
         (
@@ -1065,7 +1073,7 @@ def _realtime_match_candidates(
     )
     buckets.append((6, recent_history))
 
-    by_match: dict[str, tuple[int, sqlite3.Row]] = {}
+    by_match: dict[str, tuple[int, DatabaseRow]] = {}
     for priority, rows in buckets:
         for row in rows:
             if not is_head_to_head_match_row(row):
@@ -1086,20 +1094,19 @@ def _realtime_match_candidates(
 
 
 def _ended_review_match_candidates(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     checked_at: datetime,
-) -> list[sqlite3.Row]:
+) -> list[DatabaseRow]:
     """Return a bounded indexed window of contradictory ended rows."""
 
     selected = _selected_match_columns()
     future = _rows(
         connection,
-        f"""SELECT rowid AS _candidate_rowid, {selected}
+        f"""SELECT 0 AS _candidate_rowid, {selected}
                FROM raybet_matches
-                    INDEXED BY idx_raybet_matches_ended_schedule_review
               WHERE {_ENDED_STATUS_SQL}
                 AND scheduled_at IS NOT NULL
-                AND ({_SCHEDULE_UTC_JULIANDAY})>julianday(?)
+                AND ({_SCHEDULE_UTC_JULIANDAY})>CAST(? AS timestamptz)
               ORDER BY ({_SCHEDULE_UTC_JULIANDAY}),
                        updated_at DESC, raybet_match_id DESC
               LIMIT ?""",
@@ -1110,9 +1117,8 @@ def _ended_review_match_candidates(
     )
     malformed = _rows(
         connection,
-        f"""SELECT rowid AS _candidate_rowid, {selected}
+        f"""SELECT 0 AS _candidate_rowid, {selected}
                FROM raybet_matches
-                    INDEXED BY idx_raybet_matches_ended_schedule_review
               WHERE {_ENDED_STATUS_SQL}
                 AND scheduled_at IS NOT NULL
                 AND ({_SCHEDULE_UTC_JULIANDAY}) IS NULL
@@ -1141,7 +1147,7 @@ def _ended_review_match_candidates(
 
 
 def _recent_vision_match_ids(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     checked_at: datetime,
 ) -> tuple[str, ...]:
     rows = _rows(
@@ -1178,11 +1184,11 @@ def _recent_vision_match_ids(
 
 
 def _history_candidate_window(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     checked_at: datetime,
     before: tuple[int, str] | None,
-) -> tuple[list[sqlite3.Row], bool, sqlite3.Row | None]:
+) -> tuple[list[DatabaseRow], bool, DatabaseRow | None]:
     selected = _selected_match_columns()
     if before is None:
         keyset_clause = ""
@@ -1201,7 +1207,8 @@ def _history_candidate_window(
         f"""SELECT {_TIMELINE_KEY_SQL} AS _timeline_key, {selected}
                FROM raybet_matches
               WHERE {_TIMELINE_KEY_SQL}<=
-                    CAST(julianday(?) * 86400000 AS INTEGER)
+                    CAST(EXTRACT(EPOCH FROM CAST(? AS timestamptz)) * 1000
+                         AS BIGINT)
                 {keyset_clause}
               ORDER BY {_TIMELINE_KEY_SQL} DESC, raybet_match_id DESC
               LIMIT ?""",
@@ -1212,8 +1219,8 @@ def _history_candidate_window(
         ),
     )
     raw_more = len(raw_rows) > _HISTORY_RAW_SCAN_LIMIT
-    candidates: list[sqlite3.Row] = []
-    raw_anchor: sqlite3.Row | None = None
+    candidates: list[DatabaseRow] = []
+    raw_anchor: DatabaseRow | None = None
     for row in raw_rows[:_HISTORY_RAW_SCAN_LIMIT]:
         raw_anchor = row
         if is_head_to_head_match_row(row):
@@ -1224,7 +1231,7 @@ def _history_candidate_window(
     return candidates, raw_more, raw_anchor
 
 
-def is_head_to_head_match_row(row: sqlite3.Row) -> bool:
+def is_head_to_head_match_row(row: DatabaseRow) -> bool:
     try:
         payload = json.loads(str(row["raw_json"]))
         if not isinstance(payload, dict):
@@ -1243,7 +1250,7 @@ def is_head_to_head_match_row(row: sqlite3.Row) -> bool:
         and team_two
         and team_one.casefold() != team_two.casefold()
     )
-def _encode_history_cursor(row: sqlite3.Row, checked_at: datetime) -> str:
+def _encode_history_cursor(row: DatabaseRow, checked_at: datetime) -> str:
     payload = {
         "checked_at": checked_at.isoformat(),
         "match_id": str(row["raybet_match_id"]),
@@ -1319,7 +1326,7 @@ def _decode_history_cursor(cursor: str) -> dict[str, Any]:
 
 
 def _require_history_cursor_anchor(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     cursor: dict[str, Any],
 ) -> None:
     row = connection.execute(
@@ -1335,8 +1342,8 @@ def _require_history_cursor_anchor(
 
 
 def _monitor_match(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    connection: PostgresSession,
+    row: DatabaseRow,
     now: datetime,
     health: dict[str, dict[str, Any]],
     governance: Mapping[str, object],
@@ -1348,7 +1355,7 @@ def _monitor_match(
             """SELECT observed_at FROM odds_transport_observations
                 WHERE raybet_match_id=?
                   AND source='direct'
-                  AND julianday(observed_at)<=julianday(?)
+                  AND live_text_timestamp_utc(observed_at)<=CAST(? AS timestamptz)
                   AND timing_status='on_time'
                   AND processing_status='processed'
                 ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
@@ -1359,7 +1366,7 @@ def _monitor_match(
             connection,
             """SELECT received_at AS observed_at FROM odds_snapshots
                 WHERE raybet_match_id=?
-                  AND julianday(received_at)<=julianday(?)
+                  AND live_text_timestamp_utc(received_at)<=CAST(? AS timestamptz)
                 ORDER BY received_at DESC, id DESC LIMIT 1""",
             (match_id, now.isoformat()),
         )
@@ -1435,8 +1442,8 @@ def _monitor_match(
 
 
 def _watch_link(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    connection: PostgresSession,
+    row: DatabaseRow,
 ) -> dict[str, str | None]:
     match_page = _captured_raybet_page_url(
         connection, str(row["raybet_match_id"])
@@ -1465,7 +1472,7 @@ def _watch_link(
 
 
 def _captured_raybet_page_url(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
 ) -> str | None:
     if not _relation_has_columns(
@@ -1497,8 +1504,8 @@ def _captured_raybet_page_url(
                 LIMIT 50""",
             (raybet_match_id,),
         ).fetchall()
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return None
         raise
     for event in rows:
@@ -1525,7 +1532,7 @@ def _safe_raybet_page_url(origin: object, path: object) -> str | None:
 
 
 def _mapping_readiness(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     now: datetime,
 ) -> dict[str, Any]:
@@ -1541,8 +1548,8 @@ def _mapping_readiness(
                 ORDER BY mapping.map_number""",
             (raybet_match_id,),
         ).fetchall()
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             rows = []
         else:
             raise
@@ -1568,7 +1575,7 @@ def _mapping_readiness(
 
 
 def _current_winner(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     provider_status: str,
@@ -1645,10 +1652,10 @@ def _current_winner(
                          outcome.odds_id DESC""",
                 (raybet_match_id, processing_status, raybet_match_id),
             )
-        except sqlite3.OperationalError as error:
+        except SQLAlchemyError as error:
             # Once exact transport membership exists, a malformed response
             # schema cannot be replaced by carried-forward legacy snapshots.
-            if classify_sqlite_error(error) == "schema_missing":
+            if _is_schema_missing_error(error):
                 return None
             raise
     else:
@@ -1664,7 +1671,7 @@ def _current_winner(
     exact_responses = has_transport
     if not quotes:
         return None
-    grouped: dict[tuple[str, str, str], dict[str, sqlite3.Row]] = defaultdict(dict)
+    grouped: dict[tuple[str, str, str], dict[str, DatabaseRow]] = defaultdict(dict)
     for quote in quotes:
         side = str(quote["side"] or "")
         if side in {"team_one", "team_two"}:
@@ -1679,7 +1686,7 @@ def _current_winner(
                 str(quote["odds_group_id"] or ""),
             )
             grouped[key].setdefault(side, quote)
-    by_period: dict[str, tuple[str, str, dict[str, sqlite3.Row]]] = {}
+    by_period: dict[str, tuple[str, str, dict[str, DatabaseRow]]] = {}
     for (period, response_key, _group_id), sides in grouped.items():
         if set(sides) != {"team_one", "team_two"}:
             continue
@@ -1770,7 +1777,7 @@ def _milestone_revocation_keys(
 
 
 def _milestone_revocation_decision_keys(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     projection: Mapping[str, object],
 ) -> set[str]:
     decisions = _milestone_revocation_keys(projection, "decision_keys")
@@ -1781,10 +1788,12 @@ def _milestone_revocation_decision_keys(
     try:
         rows = connection.execute(
             """SELECT decision_key FROM shadow_order_decision_lineage
-                 WHERE order_key IN (SELECT value FROM json_each(?))""",
+                 WHERE order_key IN (
+                     SELECT jsonb_array_elements_text(CAST(? AS jsonb))
+                 )""",
             (json.dumps(sorted(orders)),),
         ).fetchall()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         # An unreadable lineage relation cannot authorize a possibly affected
         # strategy decision on a configured governance surface.
         try:
@@ -1792,14 +1801,14 @@ def _milestone_revocation_decision_keys(
                 str(row[0])
                 for row in connection.execute("SELECT decision_key FROM strategy_decisions")
             }
-        except sqlite3.Error:
+        except SQLAlchemyError:
             return decisions
     decisions.update(str(row[0]) for row in rows)
     return decisions
 
 
 def _odds_analysis(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     timeline: list[dict[str, Any]],
     *,
@@ -1826,7 +1835,8 @@ def _odds_analysis(
                     """SELECT EXISTS(
                            SELECT 1 FROM odds_transport_observations
                             WHERE raybet_match_id=? AND source='direct'
-                              AND julianday(observed_at)<=julianday(?)
+                              AND live_text_timestamp_utc(observed_at)<=
+                                  CAST(? AS timestamptz)
                        )""",
                     (raybet_match_id, now.isoformat()),
                 ).fetchone()[0]
@@ -1837,13 +1847,14 @@ def _odds_analysis(
                     """SELECT EXISTS(
                            SELECT 1 FROM odds_snapshots
                             WHERE raybet_match_id=?
-                              AND julianday(received_at)<=julianday(?)
+                              AND live_text_timestamp_utc(received_at)<=
+                                  CAST(? AS timestamptz)
                        )""",
                     (raybet_match_id, now.isoformat()),
                 ).fetchone()[0]
             )
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return _analysis_section("unavailable", "odds_schema_missing")
         raise
     if observed:
@@ -1853,7 +1864,7 @@ def _odds_analysis(
 
 
 def _trusted_live_context(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     now: datetime,
 ) -> dict[str, Any]:
@@ -1868,8 +1879,8 @@ def _trusted_live_context(
                 ORDER BY map_number DESC, anchored_at DESC LIMIT 1""",
             (raybet_match_id,),
         ).fetchone()
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return {"status": "unavailable", "reason": "vision_schema_missing"}
         raise
     if anchor is None:
@@ -1907,7 +1918,8 @@ def _trusted_live_context(
                   AND observation.map_number=?
                   AND observation.confirmed=1
                   AND observation.screen_state='game'
-                  AND julianday(observation.captured_at)<=julianday(?)
+                  AND live_text_timestamp_utc(observation.captured_at)<=
+                      CAST(? AS timestamptz)
                   AND NOT EXISTS (
                       SELECT 1 FROM vision_observation_invalidations AS invalidation
                        WHERE invalidation.raybet_match_id=observation.raybet_match_id
@@ -1918,8 +1930,8 @@ def _trusted_live_context(
                       SELECT 1 FROM vision_draft_conflicts AS conflict
                        WHERE conflict.raybet_match_id=observation.raybet_match_id
                          AND conflict.map_number=observation.map_number
-                         AND julianday(conflict.captured_at)<=
-                             julianday(observation.captured_at)
+                         AND live_text_timestamp_utc(conflict.captured_at)<=
+                             live_text_timestamp_utc(observation.captured_at)
                   )
                 ORDER BY observation.captured_at DESC,
                          observation.source_frame_ref DESC
@@ -1931,8 +1943,8 @@ def _trusted_live_context(
                 _MAX_TRUSTED_VISION_CANDIDATES + 1,
             ),
         ).fetchall()
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return {"status": "unavailable", "reason": "vision_schema_missing"}
         raise
     observation = next(
@@ -1989,7 +2001,7 @@ def _vision_analysis(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def _lineup_analysis(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     context: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2164,7 +2176,7 @@ def _rosh_player_identity(
 
 
 def _trusted_mapping(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     map_number: int,
     now: datetime,
@@ -2180,8 +2192,8 @@ def _trusted_mapping(
                 _MAX_STRICT_MAPPING_CANDIDATES + 1,
             ),
         ).fetchall()
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return {"status": "unavailable", "reason": "strict_mapping_schema_missing"}
         raise
     if not rows:
@@ -2220,7 +2232,7 @@ def _trusted_mapping(
 
 
 def _persisted_lineup_curve(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -2246,8 +2258,8 @@ def _persisted_lineup_curve(
                 ORDER BY first_usable_at DESC, curve_key DESC""",
             (raybet_match_id, map_number, mapping_id),
         ).fetchall()
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return _analysis_section("unavailable", "lineup_curve_schema_missing")
         raise
     causal = []
@@ -2300,8 +2312,8 @@ def _persisted_lineup_curve(
                 WHERE curve_key=? ORDER BY horizon_minutes""",
             (row["curve_key"],),
         ).fetchall()
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return _analysis_section("unavailable", "lineup_curve_schema_missing")
         raise
     if revisions is None or not landmarks:
@@ -2438,7 +2450,7 @@ def _five_hero_ids(value: object) -> tuple[int, ...] | None:
 
 
 def _strategy_analysis(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     _readiness: dict[str, Any],
     *,
@@ -2504,16 +2516,17 @@ def _strategy_analysis(
            AND anchor.status='conflict'
            AND (
                anchor.conflict_at IS NULL
-               OR julianday(anchor.conflict_at) IS NULL
-               OR julianday(anchor.conflict_at)<=julianday(decision.decided_at)
+               OR live_text_timestamp_utc(anchor.conflict_at) IS NULL
+               OR live_text_timestamp_utc(anchor.conflict_at)<=
+                  live_text_timestamp_utc(decision.decided_at)
                OR EXISTS (
                    SELECT 1 FROM vision_draft_conflicts AS conflict
                     WHERE conflict.raybet_match_id=anchor.raybet_match_id
                       AND conflict.map_number=anchor.map_number
                       AND (
-                          julianday(conflict.captured_at) IS NULL
-                          OR julianday(conflict.captured_at)<=
-                             julianday(decision.decided_at)
+                          live_text_timestamp_utc(conflict.captured_at) IS NULL
+                          OR live_text_timestamp_utc(conflict.captured_at)<=
+                             live_text_timestamp_utc(decision.decided_at)
                       )
                )
            )
@@ -2534,9 +2547,10 @@ def _strategy_analysis(
                    AS _draft_conflicted
           FROM strategy_decisions AS decision
          WHERE decision.raybet_match_id=?
-           AND julianday(decision.decided_at)<=julianday(?)
+           AND live_text_timestamp_utc(decision.decided_at)<=
+               CAST(? AS timestamptz)
            AND (
-               ? IS NULL
+               CAST(? AS text) IS NULL
                OR decision.decided_at < ?
                OR (
                    decision.decided_at = ?
@@ -2647,8 +2661,8 @@ def _strategy_analysis(
                     1,
                 ),
             ).fetchone() is not None
-    except sqlite3.Error as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return _analysis_section("unavailable", "strategy_schema_missing")
         raise
     has_more = len(decisions_desc) > _MAX_DETAIL_DECISIONS or scan_limit_exceeded
@@ -2675,8 +2689,8 @@ def _strategy_analysis(
 
 
 def _public_strategy_decision(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    connection: PostgresSession,
+    row: DatabaseRow,
 ) -> dict[str, Any] | None:
     base = _strategy_base_values(row)
     if base is None:
@@ -2844,7 +2858,7 @@ def _public_strategy_decision(
     }
 
 
-def _strategy_base_values(row: sqlite3.Row) -> dict[str, Any] | None:
+def _strategy_base_values(row: DatabaseRow) -> dict[str, Any] | None:
     map_number = row["map_number"]
     eligible = row["eligible"]
     if type(map_number) is not int or map_number <= 0:
@@ -3088,7 +3102,7 @@ def _valid_draft_authority(authority: dict[str, Any]) -> bool:
 
 
 def _valid_strategy_inputs(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     inputs: Any,
     *,
     strategy_version: str,
@@ -3705,7 +3719,7 @@ def _valid_vision_authority(
 
 
 def _authority_object(
-    row: sqlite3.Row,
+    row: DatabaseRow,
     prefix: str,
     fields: tuple[str, ...],
 ) -> dict[str, Any]:
@@ -3845,12 +3859,12 @@ def _finite_number_greater_than(value: object, lower: float) -> bool:
 
 
 def _latest_strategy_decision(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime,
     governance: Mapping[str, object],
-) -> sqlite3.Row | None:
+) -> DatabaseRow | None:
     required_relations = {
         "strategy_decisions": {
             "decision_key",
@@ -3888,9 +3902,11 @@ def _latest_strategy_decision(
                       market_probability, edge, eligible, reason, strategy_version
                  FROM strategy_decisions AS decision
                 WHERE decision.raybet_match_id=?
-                  AND julianday(decision.decided_at)<=julianday(?)
+                  AND live_text_timestamp_utc(decision.decided_at)<=
+                      CAST(? AS timestamptz)
                   AND NOT EXISTS (
-                      SELECT 1 FROM json_each(?) AS revoked
+                      SELECT 1
+                        FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS revoked(value)
                        WHERE revoked.value=decision.decision_key
                   )
                   AND NOT EXISTS (
@@ -3911,10 +3927,14 @@ def _latest_strategy_decision(
                          AND anchor.status='conflict'
                          AND (
                                anchor.conflict_at IS NULL
-                               OR julianday(anchor.conflict_at) IS NULL
-                               OR julianday(decision.decided_at) IS NULL
-                               OR julianday(anchor.conflict_at)<=
-                                  julianday(decision.decided_at)
+                               OR live_text_timestamp_utc(
+                                      anchor.conflict_at
+                                  ) IS NULL
+                               OR live_text_timestamp_utc(
+                                      decision.decided_at
+                                  ) IS NULL
+                               OR live_text_timestamp_utc(anchor.conflict_at)<=
+                                  live_text_timestamp_utc(decision.decided_at)
                                OR EXISTS (
                                     SELECT 1
                                       FROM vision_draft_conflicts AS conflict
@@ -3922,9 +3942,14 @@ def _latest_strategy_decision(
                                            anchor.raybet_match_id
                                        AND conflict.map_number=anchor.map_number
                                        AND (
-                                             julianday(conflict.captured_at) IS NULL
-                                             OR julianday(conflict.captured_at)<=
-                                                julianday(decision.decided_at)
+                                             live_text_timestamp_utc(
+                                                 conflict.captured_at
+                                             ) IS NULL
+                                             OR live_text_timestamp_utc(
+                                                    conflict.captured_at
+                                                )<=live_text_timestamp_utc(
+                                                    decision.decided_at
+                                                )
                                        )
                                )
                          )
@@ -3932,14 +3957,14 @@ def _latest_strategy_decision(
                 ORDER BY decision.decided_at DESC LIMIT 1""",
             (raybet_match_id, now.isoformat(), json.dumps(isolated)),
         ).fetchone()
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return None
         raise
 
 
 def _vision_timeline(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime | None = None,
@@ -3957,7 +3982,7 @@ def _vision_timeline(
 
 
 def valid_vision_frame_observation(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     frame_ref: str,
     *,
@@ -3974,7 +3999,7 @@ def valid_vision_frame_observation(
 
 
 def valid_capture_frame_observation(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     frame_ref: str,
     *,
@@ -3990,12 +4015,12 @@ def valid_capture_frame_observation(
 
 
 def _latest_capture_row(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime,
     source_frame_ref: str | None = None,
-) -> sqlite3.Row | None:
+) -> DatabaseRow | None:
     frame_filter = (
         "AND observation.source_frame_ref=?" if source_frame_ref is not None else ""
     )
@@ -4022,8 +4047,11 @@ def _latest_capture_row(
                    AND frame.content_sha256=observation.source_frame_sha256
                    AND frame.byte_length=observation.source_frame_bytes
                  WHERE observation.raybet_match_id=?
-                   AND julianday(observation.captured_at) IS NOT NULL
-                   AND julianday(observation.captured_at)<=julianday(?)
+                   AND live_text_timestamp_utc(
+                           observation.captured_at
+                       ) IS NOT NULL
+                   AND live_text_timestamp_utc(observation.captured_at)<=
+                       CAST(? AS timestamptz)
                    AND observation.source_frame_ref=
                        ? || frame.content_sha256
                    AND NOT EXISTS (
@@ -4041,18 +4069,18 @@ def _latest_capture_row(
                  LIMIT 1""",
             (*params[:2], VISION_FRAME_REF_PREFIX, *params[2:]),
         ).fetchone()
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return None
         raise
 
 
 def _latest_valid_vision_row(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime,
-) -> sqlite3.Row | None:
+) -> DatabaseRow | None:
     rows = _valid_vision_rows(
         connection,
         raybet_match_id,
@@ -4063,13 +4091,13 @@ def _latest_valid_vision_row(
 
 
 def _valid_vision_rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime,
     max_points: int,
     source_frame_ref: str | None = None,
-) -> list[sqlite3.Row]:
+) -> list[DatabaseRow]:
     if type(max_points) is not int or max_points <= 0:
         raise ValueError("max_points must be a positive integer")
     limit = min(max_points, _MAX_VISION_TIMELINE_POINTS)
@@ -4114,16 +4142,25 @@ def _valid_vision_rows(
                                    observation.source_frame_sha256
                                AND frame.byte_length=observation.source_frame_bytes
                              WHERE observation.raybet_match_id=?
-                               AND julianday(observation.captured_at) IS NOT NULL
-                               AND julianday(observation.captured_at)<=julianday(?)
+                               AND live_text_timestamp_utc(
+                                       observation.captured_at
+                                   ) IS NOT NULL
+                               AND live_text_timestamp_utc(
+                                       observation.captured_at
+                                   )<=CAST(? AS timestamptz)
                                AND anchor.status IN ('anchored', 'conflict')
                                AND (
                                     anchor.status='anchored'
                                     OR (
                                         anchor.conflict_at IS NOT NULL
-                                        AND julianday(anchor.conflict_at) IS NOT NULL
-                                        AND julianday(anchor.conflict_at)>
-                                            julianday(observation.captured_at)
+                                        AND live_text_timestamp_utc(
+                                                anchor.conflict_at
+                                            ) IS NOT NULL
+                                        AND live_text_timestamp_utc(
+                                                anchor.conflict_at
+                                            )>live_text_timestamp_utc(
+                                                observation.captured_at
+                                            )
                                     )
                                )
                                AND NOT EXISTS (
@@ -4143,9 +4180,14 @@ def _valid_vision_rows(
                                            observation.raybet_match_id
                                        AND conflict.map_number=observation.map_number
                                        AND (
-                                            julianday(conflict.captured_at) IS NULL
-                                            OR julianday(conflict.captured_at)<=
-                                               julianday(observation.captured_at)
+                                            live_text_timestamp_utc(
+                                                conflict.captured_at
+                                            ) IS NULL
+                                            OR live_text_timestamp_utc(
+                                                   conflict.captured_at
+                                               )<=live_text_timestamp_utc(
+                                                   observation.captured_at
+                                               )
                                        )
                                )
                                {frame_filter}
@@ -4157,13 +4199,13 @@ def _valid_vision_rows(
                 (VISION_FRAME_REF_PREFIX, *params),
             ).fetchall()
         )
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return []
         raise
 
 
-def _vision_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
+def _vision_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
     point = dict(row)
     digest = point.pop("_frame_digest", None)
     if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -4178,7 +4220,7 @@ def _vision_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
     return point
 
 
-def _capture_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
+def _capture_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
     point = dict(row)
     digest = point.pop("_frame_digest", None)
     point["strategy_authority"] = False
@@ -4195,7 +4237,7 @@ def _capture_point(row: sqlite3.Row, raybet_match_id: str) -> dict[str, Any]:
 
 
 def _freshness(
-    row: sqlite3.Row | None,
+    row: DatabaseRow | None,
     now: datetime,
     *,
     warning: float,
@@ -4219,7 +4261,7 @@ def _lifecycle(
     provider_status: str,
     scheduled_at: object,
     updated_at: object,
-    latest_vision: sqlite3.Row | None,
+    latest_vision: DatabaseRow | None,
     vision_readiness: dict[str, Any],
     *,
     checked_at: datetime,
@@ -4291,7 +4333,7 @@ def _ended_schedule_is_trustworthy(
 
 
 def _latest_odds_activity(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     *,
     now: datetime,
@@ -4310,7 +4352,7 @@ def _latest_odds_activity(
             """SELECT observed_at
                  FROM odds_transport_observations
                 WHERE raybet_match_id=? AND source='direct'
-                  AND julianday(observed_at)<=julianday(?)
+                  AND live_text_timestamp_utc(observed_at)<=CAST(? AS timestamptz)
                 ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
             (raybet_match_id, now.isoformat()),
         )
@@ -4320,7 +4362,7 @@ def _latest_odds_activity(
         """SELECT received_at
              FROM odds_snapshots
             WHERE raybet_match_id=?
-              AND julianday(received_at)<=julianday(?)
+              AND live_text_timestamp_utc(received_at)<=CAST(? AS timestamptz)
             ORDER BY received_at DESC, id DESC LIMIT 1""",
         (raybet_match_id, now.isoformat()),
     )
@@ -4406,7 +4448,7 @@ def _aware_utc(value: datetime) -> datetime:
 
 
 def _has_transport_observations(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
 ) -> bool:
     """Return any-source membership, which blocks unsafe legacy fallback."""
@@ -4424,27 +4466,33 @@ def _has_transport_observations(
 
 
 def _relation_columns(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     relation: str,
 ) -> frozenset[str] | None:
     if re.fullmatch(r"[A-Za-z0-9_]+", relation) is None:
-        raise ValueError("invalid SQLite relation name")
+        raise ValueError("invalid PostgreSQL relation name")
     exists = connection.execute(
-        """SELECT 1 FROM sqlite_master
-            WHERE type IN ('table', 'view') AND name=?""",
+        """SELECT 1
+             FROM pg_class AS relation
+             JOIN pg_namespace AS namespace
+               ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema()
+              AND relation.relkind IN ('r', 'p', 'v')
+              AND relation.relname=?""",
         (relation,),
     ).fetchone()
     if exists is None:
         return None
-    try:
-        rows = connection.execute(f'PRAGMA table_info("{relation}")').fetchall()
-    except sqlite3.Error:
-        return frozenset()
-    return frozenset(str(row[1]) for row in rows)
+    rows = connection.execute(
+        """SELECT column_name FROM information_schema.columns
+            WHERE table_schema=current_schema() AND table_name=?""",
+        (relation,),
+    ).fetchall()
+    return frozenset(str(row[0]) for row in rows)
 
 
 def _relation_has_columns(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     relation: str,
     required: set[str] | frozenset[str],
 ) -> bool:
@@ -4453,33 +4501,33 @@ def _relation_has_columns(
 
 
 def _rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     query: str,
     params: tuple[Any, ...] = (),
-) -> list[sqlite3.Row]:
+) -> list[DatabaseRow]:
     try:
         return list(connection.execute(query, params).fetchall())
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return []
         raise
 
 
 def _latest_row(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     query: str,
     params: tuple[Any, ...],
-) -> sqlite3.Row | None:
+) -> DatabaseRow | None:
     try:
         return connection.execute(query, params).fetchone()
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return None
         raise
 
 
 def _scalar(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     query: str,
     params: tuple[Any, ...] = (),
     *,
@@ -4487,19 +4535,25 @@ def _scalar(
 ) -> Any:
     try:
         row = connection.execute(query, params).fetchone()
-    except sqlite3.OperationalError as error:
-        if classify_sqlite_error(error) == "schema_missing":
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return default
         raise
     return row[0] if row is not None else default
 
 
-def _latest_value(connection: sqlite3.Connection, table: str, column: str) -> Any:
+def _latest_value(connection: PostgresSession, table: str, column: str) -> Any:
     return _scalar(
         connection,
         f"SELECT {column} FROM {table} ORDER BY {column} DESC LIMIT 1",
         default=None,
     )
+
+
+def _is_schema_missing_error(error: SQLAlchemyError) -> bool:
+    cause = getattr(error, "orig", error)
+    sqlstate = getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
+    return sqlstate in {"42P01", "42703"}
 
 
 def _json_object(value: object) -> dict[str, Any]:

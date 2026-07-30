@@ -1,6 +1,6 @@
 """Feature engine entry point.
 
-Reads raw match data from data/dota2.db, extracts features for every match,
+Reads raw match data from PostgreSQL, extracts features for every match,
 and writes the resulting DataFrames to data/features/*.parquet and
 corresponding materialized tables in the database.
 
@@ -9,11 +9,12 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import pandas as pd
 import yaml
+
+from database.engine import require_database_url
 
 from .db_reader import (
     read_matches,
@@ -43,9 +44,9 @@ def _load_config() -> dict:
     return {}
 
 
-def run(db_path: str, features_dir: str) -> None:
-    print(f"Reading matches from {db_path} ...")
-    matches_df = read_matches(db_path)
+def run(database_url: str, features_dir: str) -> None:
+    print("Reading matches from PostgreSQL ...")
+    matches_df = read_matches(database_url)
     if matches_df.empty:
         print("No matches found in database.")
         return
@@ -55,16 +56,18 @@ def run(db_path: str, features_dir: str) -> None:
 
     # Read all auxiliary data in bulk
     print("Loading auxiliary data ...")
-    players_df = read_players(db_path, match_ids)
-    picks_df = read_picks_bans(db_path, match_ids)
-    gold_df = read_gold_advantage(db_path, match_ids)
-    xp_df = read_xp_advantage(db_path, match_ids)
-    obj_df = read_objectives(db_path, match_ids)
-    tf_df = read_teamfights(db_path, match_ids)
+    players_df = read_players(database_url, match_ids)
+    picks_df = read_picks_bans(database_url, match_ids)
+    gold_df = read_gold_advantage(database_url, match_ids)
+    xp_df = read_xp_advantage(database_url, match_ids)
+    obj_df = read_objectives(database_url, match_ids)
+    tf_df = read_teamfights(database_url, match_ids)
 
     # teamfight_players needs teamfight IDs
     tf_ids = tf_df["id"].tolist() if len(tf_df) > 0 else []
-    tfp_df = read_teamfight_players(db_path, tf_ids) if tf_ids else pd.DataFrame()
+    tfp_df = (
+        read_teamfight_players(database_url, tf_ids) if tf_ids else pd.DataFrame()
+    )
 
     # Group by match_id for fast per-match lookups
     players_by_match = dict(list(players_df.groupby("match_id"))) if len(players_df) > 0 else {}
@@ -133,7 +136,7 @@ def run(db_path: str, features_dir: str) -> None:
 
     # Compute aggregated features (team rolling, hero patch, H2H)
     print("Computing aggregated features ...")
-    mf, tf, hf = compute_and_merge_aggregates(mf, tf, hf, db_path)
+    mf, tf, hf = compute_and_merge_aggregates(mf, tf, hf, database_url)
 
     # Write outputs
     print(f"Writing to {features_dir}/ ...")
@@ -152,34 +155,34 @@ def run(db_path: str, features_dir: str) -> None:
     print(f"  draft_features.parquet — {len(df)} rows")
 
     # Write materialized tables to DB
-    print(f"Writing materialized tables to {db_path} ...")
-    to_db_materialized(mf, "match_feature_cache", db_path)
-    to_db_materialized(tf, "team_feature_cache", db_path)
-    to_db_materialized(hf, "hero_feature_cache", db_path)
-    to_db_materialized(df, "draft_feature_cache", db_path)
+    print("Writing materialized tables to PostgreSQL ...")
+    to_db_materialized(mf, "match_feature_cache", database_url)
+    to_db_materialized(tf, "team_feature_cache", database_url)
+    to_db_materialized(hf, "hero_feature_cache", database_url)
+    to_db_materialized(df, "draft_feature_cache", database_url)
     print("Done.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Feature engine")
     parser.add_argument("--force", action="store_true", help="Force rebuild")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     # The pipeline always rewrites its outputs; keep --force for CLI compatibility.
-    parser.parse_args()
+    args = parser.parse_args()
 
     config = _load_config()
-    db_path = config.get("database", "data/dota2.db")
     features_dir = config.get("features_dir", "data/features")
 
     # Resolve relative paths from the features/ directory (where config.yaml lives)
     features_pkg = Path(__file__).resolve().parent
-    db_path = str(features_pkg / db_path)
     features_dir = str(features_pkg / features_dir)
-
-    if not Path(db_path).exists():
-        print(f"Database not found: {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    run(db_path, features_dir)
+    database_url = require_database_url(
+        args.database_url or config.get("database_url")
+    )
+    run(database_url, features_dir)
 
 
 if __name__ == "__main__":

@@ -33,10 +33,6 @@ from .raybet import (
     RayBetClient,
 )
 from .sanitize import sanitize_raybet_payload, verified_public_stream_url
-from .service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
 from .storage import LiveBettingStore
 from .strict_eligibility import (
     RAYBET_MATCH_NON_HEAD_TO_HEAD,
@@ -495,8 +491,10 @@ def _prematch_collection_due(
                AND payload_kind='provider_response'
                AND disposition='audit_only'
                AND reason='prematch_observed'
-               AND julianday(observed_at)>=julianday(?)
-               AND julianday(observed_at)<julianday(?)
+               AND live_text_timestamp_utc(observed_at)>=
+                   live_text_timestamp_utc(?)
+               AND live_text_timestamp_utc(observed_at)<
+                   live_text_timestamp_utc(?)
              LIMIT 1""",
         (match_id, window_start.isoformat(), scheduled_at.isoformat()),
     ).fetchone()
@@ -821,12 +819,10 @@ def collect_completed_once(
 
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
-    db_path = Path(args.database).resolve()
-    args.database = db_path
     args.raw_dir = (
         Path(args.raw_dir).resolve()
         if args.raw_dir is not None
-        else db_path.parent / "live_betting" / "raw-v2"
+        else ROOT / "data" / "live_betting" / "raw-v2"
     )
     return args
 
@@ -834,12 +830,10 @@ def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
 def run(args: argparse.Namespace) -> int:
     load_dotenv()
     args = resolve_data_paths(args)
-    db_path = args.database
-    db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_dir = args.raw_dir
 
     with LiveBettingStore(
-        db_path, raw_archive_root=raw_dir
+        args.database_url, raw_archive_root=raw_dir
     ) as store, RayBetClient() as client:
         if not getattr(args, "schema_prepared", False):
             store.init_schema()
@@ -1084,7 +1078,10 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument(
         "--raw-dir",
         type=Path,
@@ -1109,5 +1106,4 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     arguments = parse_args()
-    with database_writer_authority(arguments.database):
-        raise SystemExit(run(arguments))
+    raise SystemExit(run(arguments))

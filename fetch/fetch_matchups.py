@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import logging
 import os
-import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,10 +18,7 @@ import yaml
 
 from .client import OpenDotaClient
 from .db import Database
-from live_betting.service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
+from database.engine import require_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +28,6 @@ CONFIG_PATH = Path(__file__).parent / "config.yaml"
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
-
-
-def resolve_db_path(cfg: dict) -> str:
-    raw: str = cfg.get("database", "../data/dota2.db")
-    if os.path.isabs(raw):
-        return raw
-    return str((Path(__file__).parent / raw).resolve())
 
 
 _HERO_MATCHUP_SQL = """SELECT
@@ -82,7 +71,6 @@ async def fetch_matchups_explorer(
     from the public dataset (typically 500+ games per opponent pair).
     """
     conn = db.connect()
-    conn.row_factory = sqlite3.Row
     heroes = conn.execute(
         "SELECT hero_id, localized_name FROM heroes ORDER BY hero_id"
     ).fetchall()
@@ -155,7 +143,6 @@ async def fetch_matchups_endpoint(
     per opponent pair vs ~500).
     """
     conn = db.connect()
-    conn.row_factory = sqlite3.Row
     heroes = conn.execute(
         "SELECT hero_id, localized_name FROM heroes ORDER BY hero_id"
     ).fetchall()
@@ -214,10 +201,9 @@ async def run(
     cfg: dict,
     force: bool,
     source: str,
-    database_path: str | Path | None = None,
+    database_url: str | None = None,
 ) -> None:
-    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
-    db = Database(db_path)
+    db = Database(require_database_url(database_url or cfg.get("database_url")))
     db.connect()
     db.init_db()
 
@@ -249,7 +235,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch hero matchup data from OpenDota"
     )
-    add_single_database_argument(parser)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument(
         "--force", action="store_true", help="Re-fetch even if already in DB"
     )
@@ -263,9 +252,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    database = Path(args.database or resolve_db_path(cfg)).resolve()
-    with database_writer_authority(database):
-        asyncio.run(run(cfg, args.force, args.source, database))
+    asyncio.run(run(cfg, args.force, args.source, args.database_url))
 
 
 if __name__ == "__main__":

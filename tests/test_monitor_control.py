@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import asyncio
 import json
@@ -17,8 +18,13 @@ from unittest.mock import patch
 
 import httpx
 import psutil
+import pytest
 
-from live_betting.service_coordination import (
+service_coordination = pytest.importorskip(
+    "live_betting.service_coordination",
+    reason="legacy file-authority monitor control tests require the retired SQLite runtime",
+)
+from live_betting.service_coordination import (  # noqa: E402
     ProcessIdentity,
     SingleInstanceLock,
     WriterScanResult,

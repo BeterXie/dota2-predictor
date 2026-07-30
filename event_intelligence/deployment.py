@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
+
+from database.session import PostgresSession
 
 from .backtest import (
     BACKTEST_VERSION,
@@ -102,7 +103,7 @@ def _parse_utc(value: object) -> datetime | None:
 
 
 def _actual_result_availability(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> dict[int, datetime]:
     rows = connection.execute(
         """SELECT status.match_id, artifact.first_usable_at,
@@ -128,7 +129,7 @@ def _actual_result_availability(
 
 
 def _training_rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     training_cutoff: datetime,
 ) -> tuple[tuple[DraftTrainingRow, ...], tuple[str, ...]]:
     corpus = load_draft_corpus(
@@ -179,7 +180,7 @@ def _training_rows(
 
 
 def assert_draft_models_match_database(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     models: Iterable[DraftModelArtifact],
     *,
     training_cutoff: datetime,
@@ -193,10 +194,7 @@ def assert_draft_models_match_database(
     if tuple(row.horizon_minutes for row in ordered) != tuple(HORIZONS):
         raise ValueError("database model replay requires all five horizons")
 
-    owns_snapshot = not connection.in_transaction
-    if owns_snapshot:
-        connection.execute("BEGIN")
-    try:
+    def verify() -> None:
         training_rows, feature_names = _training_rows(connection, cutoff)
         schema = FeatureSchema.from_names(feature_names)
         for model in ordered:
@@ -218,16 +216,15 @@ def assert_draft_models_match_database(
                 raise ValueError(
                     "model artifact does not match the authoritative database corpus"
                 )
-        if owns_snapshot:
-            connection.commit()
-    except BaseException:
-        if owns_snapshot and connection.in_transaction:
-            connection.rollback()
-        raise
+    if connection.in_transaction:
+        verify()
+    else:
+        with connection.transaction():
+            verify()
 
 
 def _current_calibration_samples(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     training_cutoff: datetime,
 ) -> dict[int, tuple[CalibrationSample, ...]]:
     scopes = current_derived_scopes(connection)
@@ -330,7 +327,7 @@ def split_calibration_samples(
 
 
 def build_frozen_draft_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     training_cutoff: datetime,
     min_samples: int = DEFAULT_MIN_SAMPLES,
@@ -405,7 +402,7 @@ def build_frozen_draft_deployment(
 
 
 def load_prospective_history(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> tuple[DraftMapEvidence, ...]:
     """Load only historical facts whose real archive availability is known."""
 
@@ -431,7 +428,7 @@ def load_prospective_history(
 
 
 def load_bounded_prospective_history(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     max_rows: int,
     max_bytes: int,

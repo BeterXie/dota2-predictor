@@ -3,7 +3,9 @@
 from pathlib import Path
 
 import pandas as pd
-from shared.sqlite import connect as connect_sqlite
+from sqlalchemy import text
+
+from database.engine import build_engine
 
 
 _PARQUET_DTYPE_MAP = {
@@ -137,20 +139,37 @@ def to_parquet(df: pd.DataFrame, name: str, features_dir: str) -> None:
 
 
 def to_db_materialized(
-    df: pd.DataFrame, table_name: str, db_path: str
+    df: pd.DataFrame, table_name: str, database_url: str | None
 ) -> None:
-    """Write a feature DataFrame into a materialized table in SQLite.
+    """Replace one Alembic-managed PostgreSQL feature cache atomically.
 
     Args:
         df: DataFrame with feature data.
         table_name: Target table name (e.g. 'match_feature_cache').
-        db_path: Path to the SQLite database.
+        database_url: PostgreSQL URL; defaults to ``DATABASE_URL``.
     """
+    allowed_tables = {
+        "match_feature_cache",
+        "team_feature_cache",
+        "hero_feature_cache",
+        "draft_feature_cache",
+    }
+    if table_name not in allowed_tables:
+        raise ValueError(f"unsupported feature cache table: {table_name}")
     # "match_feature_cache" -> "match_features", etc.
     feature_name = table_name.replace("_feature_cache", "_features")
     typed_df = _apply_dtypes(df, feature_name)
-    conn = connect_sqlite(db_path)
+    engine = build_engine(database_url)
     try:
-        typed_df.to_sql(table_name, conn, if_exists="replace", index=False)
+        with engine.begin() as connection:
+            connection.execute(text(f'DELETE FROM "{table_name}"'))
+            if not typed_df.empty:
+                typed_df.to_sql(
+                    table_name,
+                    connection,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                )
     finally:
-        conn.close()
+        engine.dispose()

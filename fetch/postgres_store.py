@@ -114,66 +114,75 @@ class CoreMatchStore:
     def insert_match(self, match: dict) -> None:
         """Replace one match and all of its children atomically."""
 
-        match_id = match["match_id"]
         with self.engine.begin() as connection:
-            self._delete_match_children(connection, match_id)
+            self.insert_match_with_connection(connection, match)
 
-            for side in ("radiant", "dire"):
-                team = parse_team_info(match, side)
-                if team:
-                    self._upsert_team(connection, team)
+        logger.info("Inserted match %d.", match["match_id"])
 
-            league = parse_league_info(match)
-            if league:
-                self._upsert_league(connection, league)
+    def insert_match_with_connection(
+        self,
+        connection: Connection,
+        match: dict,
+    ) -> None:
+        """Replace one match inside the caller's existing transaction."""
 
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO matches (
-                        match_id, radiant_team_id, dire_team_id, radiant_win, duration,
-                        game_mode, lobby_type, start_time, first_blood_time, leagueid,
-                        series_id, series_type, patch, region, radiant_score, dire_score,
-                        stomp, comeback, tower_status_radiant, tower_status_dire,
-                        barracks_status_radiant, barracks_status_dire
-                    ) VALUES (
-                        :match_id, :radiant_team_id, :dire_team_id, :radiant_win, :duration,
-                        :game_mode, :lobby_type, :start_time, :first_blood_time, :leagueid,
-                        :series_id, :series_type, :patch, :region, :radiant_score, :dire_score,
-                        :stomp, :comeback, :tower_status_radiant, :tower_status_dire,
-                        :barracks_status_radiant, :barracks_status_dire
-                    )
-                    ON CONFLICT (match_id) DO UPDATE SET
-                        radiant_team_id = EXCLUDED.radiant_team_id,
-                        dire_team_id = EXCLUDED.dire_team_id,
-                        radiant_win = EXCLUDED.radiant_win,
-                        duration = EXCLUDED.duration,
-                        game_mode = EXCLUDED.game_mode,
-                        lobby_type = EXCLUDED.lobby_type,
-                        start_time = EXCLUDED.start_time,
-                        first_blood_time = EXCLUDED.first_blood_time,
-                        leagueid = EXCLUDED.leagueid,
-                        series_id = EXCLUDED.series_id,
-                        series_type = EXCLUDED.series_type,
-                        patch = EXCLUDED.patch,
-                        region = EXCLUDED.region,
-                        radiant_score = EXCLUDED.radiant_score,
-                        dire_score = EXCLUDED.dire_score,
-                        stomp = EXCLUDED.stomp,
-                        comeback = EXCLUDED.comeback,
-                        tower_status_radiant = EXCLUDED.tower_status_radiant,
-                        tower_status_dire = EXCLUDED.tower_status_dire,
-                        barracks_status_radiant = EXCLUDED.barracks_status_radiant,
-                        barracks_status_dire = EXCLUDED.barracks_status_dire,
-                        fetched_at = CURRENT_TIMESTAMP
-                    """
-                ),
-                parse_match_basic(match),
-            )
+        match_id = match["match_id"]
+        self._delete_match_children(connection, match_id)
 
-            self._insert_match_children(connection, match)
+        for side in ("radiant", "dire"):
+            team = parse_team_info(match, side)
+            if team:
+                self._upsert_team(connection, team)
 
-        logger.info("Inserted match %d.", match_id)
+        league = parse_league_info(match)
+        if league:
+            self._upsert_league(connection, league)
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO matches (
+                    match_id, radiant_team_id, dire_team_id, radiant_win, duration,
+                    game_mode, lobby_type, start_time, first_blood_time, leagueid,
+                    series_id, series_type, patch, region, radiant_score, dire_score,
+                    stomp, comeback, tower_status_radiant, tower_status_dire,
+                    barracks_status_radiant, barracks_status_dire
+                ) VALUES (
+                    :match_id, :radiant_team_id, :dire_team_id, :radiant_win, :duration,
+                    :game_mode, :lobby_type, :start_time, :first_blood_time, :leagueid,
+                    :series_id, :series_type, :patch, :region, :radiant_score, :dire_score,
+                    :stomp, :comeback, :tower_status_radiant, :tower_status_dire,
+                    :barracks_status_radiant, :barracks_status_dire
+                )
+                ON CONFLICT (match_id) DO UPDATE SET
+                    radiant_team_id = EXCLUDED.radiant_team_id,
+                    dire_team_id = EXCLUDED.dire_team_id,
+                    radiant_win = EXCLUDED.radiant_win,
+                    duration = EXCLUDED.duration,
+                    game_mode = EXCLUDED.game_mode,
+                    lobby_type = EXCLUDED.lobby_type,
+                    start_time = EXCLUDED.start_time,
+                    first_blood_time = EXCLUDED.first_blood_time,
+                    leagueid = EXCLUDED.leagueid,
+                    series_id = EXCLUDED.series_id,
+                    series_type = EXCLUDED.series_type,
+                    patch = EXCLUDED.patch,
+                    region = EXCLUDED.region,
+                    radiant_score = EXCLUDED.radiant_score,
+                    dire_score = EXCLUDED.dire_score,
+                    stomp = EXCLUDED.stomp,
+                    comeback = EXCLUDED.comeback,
+                    tower_status_radiant = EXCLUDED.tower_status_radiant,
+                    tower_status_dire = EXCLUDED.tower_status_dire,
+                    barracks_status_radiant = EXCLUDED.barracks_status_radiant,
+                    barracks_status_dire = EXCLUDED.barracks_status_dire,
+                    fetched_at = CURRENT_TIMESTAMP
+                """
+            ),
+            parse_match_basic(match),
+        )
+
+        self._insert_match_children(connection, match)
 
     @staticmethod
     def _upsert_team(connection: Connection, team: dict) -> None:

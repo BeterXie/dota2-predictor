@@ -1,5 +1,3 @@
-database: "../data/dota2.db"
-
 leagues: [19696, 19101]
 teams: []
 specific_matches: []

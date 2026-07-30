@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import math
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
 
 from .comeback import _select_rosh_minute_score
 from .draft_authority import authority_from_row, draft_landmark_authority_matches
@@ -81,7 +84,7 @@ def _sha(value: object) -> bool:
 
 
 def _profile_authority_complete(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: Mapping[str, Any],
     inputs: Mapping[str, Any],
 ) -> bool:
@@ -210,7 +213,7 @@ def _profile_authority_complete(
 
 
 def _rosh_authority_complete(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: Mapping[str, Any],
     inputs: Mapping[str, Any],
 ) -> bool:
@@ -260,7 +263,7 @@ def _rosh_authority_complete(
 
 
 def _transport_authority_complete(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: Mapping[str, Any],
     inputs: Mapping[str, Any],
 ) -> bool:
@@ -391,7 +394,7 @@ def _transport_authority_complete(
 
 
 def _previous_vision_complete(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: Mapping[str, Any],
     inputs: Mapping[str, Any],
 ) -> bool:
@@ -448,7 +451,7 @@ def _previous_vision_complete(
 
 
 def _current_authority_complete(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: Mapping[str, Any],
     inputs: Mapping[str, Any],
 ) -> bool:
@@ -534,7 +537,7 @@ def _current_authority_complete(
 
 
 def verify_m1_qualifying_rejection(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     decision_key: str,
 ) -> M1Verification:
     try:
@@ -542,11 +545,11 @@ def verify_m1_qualifying_rejection(
             "SELECT * FROM strategy_decisions WHERE decision_key=?",
             (decision_key,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return _result(decision_key, False, "strategy_schema_unavailable")
     if row_value is None:
         return _result(decision_key, False, "strategy_decision_missing")
-    row = dict(row_value)
+    row = {key: row_value[key] for key in row_value.keys()}
     if int(row["eligible"]) == 1:
         return _result(decision_key, False, "eligible_decision_not_rejection", row=row)
     if str(row["reason"]) not in QUALIFYING_REJECTION_REASONS:
@@ -585,7 +588,7 @@ def verify_m1_qualifying_rejection(
                 LIMIT 1""",
             (decision_key, decision_key),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return _result(decision_key, False, "authority_schema_unavailable", row=row, replay=replay)
     if conflict is not None:
         return _result(decision_key, False, "authority_conflict", row=row, replay=replay)

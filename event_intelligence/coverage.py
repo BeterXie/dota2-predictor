@@ -4,25 +4,26 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from database.session import PostgresSession
+
 from .ingest import MATCH_PROCESSOR_VERSION
 from .incremental import ROLE_VERSION, SCORE_VERSION
+from .storage import ALEMBIC_HEAD, IntelligenceStorage
 from .team_profiles import PROFILE_VERSION
 from .team_states import LABEL_VERSION
-from shared.sqlite import connect
 
 
 UTC = timezone.utc
 
 
 def build_coverage_report(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
-    database: Path,
+    database: str,
     generated_at: datetime,
     include_integrity: bool = False,
 ) -> dict[str, Any]:
@@ -34,9 +35,12 @@ def build_coverage_report(
                   registry.expected_map_count, registry.observed_map_count,
                   registry.public_map_count, registry.reconciliation_status,
                   COUNT(eligible.match_id) AS formal_maps,
-                  SUM(eligible.player_readiness='ready') AS player_ready,
-                  SUM(eligible.state_readiness='ready') AS state_ready,
-                  SUM(eligible.draft_readiness='ready') AS draft_ready
+                  SUM(CASE WHEN eligible.player_readiness='ready' THEN 1 ELSE 0 END)
+                    AS player_ready,
+                  SUM(CASE WHEN eligible.state_readiness='ready' THEN 1 ELSE 0 END)
+                    AS state_ready,
+                  SUM(CASE WHEN eligible.draft_readiness='ready' THEN 1 ELSE 0 END)
+                    AS draft_ready
              FROM event_registry AS registry
              LEFT JOIN formal_map_eligibility AS eligible
                ON eligible.event_id=registry.event_id
@@ -68,7 +72,7 @@ def build_coverage_report(
         events.append(value)
 
     report: dict[str, Any] = {
-        "database": str(database.resolve()),
+        "database": database,
         "generated_at": generated_at.isoformat(),
         "versions": {
             "role_assignment": ROLE_VERSION,
@@ -95,7 +99,7 @@ def build_coverage_report(
         "ranking_eligible_scores": connection.execute(
             """SELECT COUNT(*) FROM player_map_scores
                 WHERE score_version=?
-                  AND json_extract(explanation_json, '$.ranking_eligible')=1""",
+                  AND explanation_json::jsonb ->> 'ranking_eligible'='true'""",
             (SCORE_VERSION,),
         ).fetchone()[0],
         "current_team_states": connection.execute(
@@ -151,33 +155,44 @@ def build_coverage_report(
         ],
     }
     if include_integrity:
-        report["integrity_check"] = connection.execute(
-            "PRAGMA integrity_check"
-        ).fetchone()[0]
-        report["foreign_key_errors"] = len(
-            connection.execute("PRAGMA foreign_key_check").fetchall()
+        revision = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        invalid_constraints = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM pg_constraint WHERE NOT convalidated"
+            ).fetchone()[0]
         )
+        report["integrity_check"] = (
+            "ok"
+            if revision is not None
+            and str(revision[0]) == ALEMBIC_HEAD
+            and invalid_constraints == 0
+            else "failed"
+        )
+        report["schema_revision"] = None if revision is None else str(revision[0])
+        report["invalid_constraints"] = invalid_constraints
     return report
 
 
 def write_coverage_report(
-    database: Path,
+    database_url: str | None,
     output: Path,
     *,
     generated_at: datetime | None = None,
     include_integrity: bool = False,
 ) -> dict[str, Any]:
-    database = database.resolve()
-    connection = connect(database, read_only=True, row_factory=sqlite3.Row)
+    storage = IntelligenceStorage(database_url)
     try:
+        storage.init_schema(seed_events=False)
         report = build_coverage_report(
-            connection,
-            database=database,
+            storage.connection,
+            database=str(storage.engine.url.database),
             generated_at=generated_at or datetime.now(UTC),
             include_integrity=include_integrity,
         )
     finally:
-        connection.close()
+        storage.close()
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")

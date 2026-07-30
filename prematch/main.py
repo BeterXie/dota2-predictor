@@ -17,7 +17,8 @@ import sys
 from pathlib import Path
 
 import yaml
-from shared.sqlite import connect as connect_sqlite
+
+from shared.queries import connect
 
 from .scorer import predict_match
 
@@ -57,8 +58,8 @@ def _parse_hero_list(raw: str, side: str) -> list[int]:
         sys.exit(1)
 
 
-def _validate_team_exists(db_path: str, team_id: int) -> None:
-    conn = connect_sqlite(db_path, read_only=True)
+def _validate_team_exists(database_url: str, team_id: int) -> None:
+    conn = connect(database_url)
     try:
         row = conn.execute(
             "SELECT 1 FROM matches WHERE radiant_team_id = ? OR dire_team_id = ? LIMIT 1",
@@ -80,14 +81,14 @@ def _run_scorer(
     league_id: int,
     radiant_heroes: list[int],
     dire_heroes: list[int],
-    db_path: str,
+    database_url: str,
     predictions_dir: str,
     weights: dict[str, float] | None = None,
 ) -> None:
     """Run prediction using the heuristic scoring system."""
     print("Computing prediction scores from hero matchups, team form, H2H...")
     result = predict_match(
-        db_path,
+        database_url,
         radiant_id,
         dire_id,
         radiant_heroes,
@@ -128,7 +129,7 @@ def _run_scorer(
     }
 
     output = format_output(prediction, radiant_id, dire_id, league_id,
-                           {"timestamp": "scorer", "metrics": {}}, db_path)
+                           {"timestamp": "scorer", "metrics": {}}, database_url)
     file_path = save_prediction(output, predictions_dir)
 
     print(f"\n  Prediction saved to {file_path}")
@@ -173,7 +174,7 @@ def _run_ml(
     league_id: int,
     radiant_heroes: list[int],
     dire_heroes: list[int],
-    db_path: str,
+    database_url: str,
     models_dir: str,
     predictions_dir: str,
 ) -> None:
@@ -189,7 +190,7 @@ def _run_ml(
     features = build_prematch_features(
         radiant_id, dire_id, league_id,
         radiant_heroes, dire_heroes,
-        db_path, feature_names,
+        database_url, feature_names,
     )
 
     result = predict(bundle, features)
@@ -204,7 +205,9 @@ def _run_ml(
                   f"direction={f['direction']}")
 
     from predict.output import format_output, save_prediction, _sanitize
-    output = format_output(result, radiant_id, dire_id, league_id, bundle, db_path)
+    output = format_output(
+        result, radiant_id, dire_id, league_id, bundle, database_url
+    )
     file_path = save_prediction(output, predictions_dir)
     print(f"\nPrediction saved to {file_path}")
     print(json.dumps(_sanitize(output), indent=2, ensure_ascii=False))
@@ -233,6 +236,10 @@ def main():
         "--weights", type=str, default=None,
         help="Custom weights: hero_matchup,team_form,draft_profile,player_skill,early_game (comma-sep)",
     )
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     args = parser.parse_args()
 
     radiant_heroes = _parse_hero_list(args.radiant_heroes, "radiant")
@@ -241,13 +248,13 @@ def main():
     config = _load_config()
     pkg_dir = Path(__file__).resolve().parent
 
-    db_path = str(pkg_dir / config.get("database", "../data/dota2.db"))
+    from database.engine import require_database_url
+
+    database_url = require_database_url(
+        args.database_url or config.get("database_url")
+    )
     models_dir = str(pkg_dir / config.get("models_dir", "../data/models"))
     predictions_dir = str(pkg_dir / config.get("predictions_dir", "../data/predictions"))
-
-    if not Path(db_path).exists():
-        print(f"Database not found: {db_path}", file=sys.stderr)
-        sys.exit(1)
 
     if args.ml:
         if not Path(models_dir, "prematch_latest.pkl").exists():
@@ -259,7 +266,7 @@ def main():
             sys.exit(1)
         _run_ml(args.radiant, args.dire, args.league,
                 radiant_heroes, dire_heroes,
-                db_path, models_dir, predictions_dir)
+                database_url, models_dir, predictions_dir)
     else:
         try:
             custom_weights = _parse_weights(args.weights) if args.weights else None
@@ -267,7 +274,7 @@ def main():
             parser.error(str(exc))
         _run_scorer(args.radiant, args.dire, args.league,
                     radiant_heroes, dire_heroes,
-                    db_path, predictions_dir, custom_weights)
+                    database_url, predictions_dir, custom_weights)
 
 
 if __name__ == "__main__":

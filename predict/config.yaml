@@ -1,3 +1,2 @@
-database: "../data/dota2.db"
 models_dir: "../data/models"
 predictions_dir: "../data/predictions"

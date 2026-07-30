@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import math
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from .models import Market
 from .vision_frame_registry import verify_bound_order_vision_frame
@@ -55,15 +58,21 @@ class SettlementAuthorityError(ValueError):
         super().__init__(reason)
 
 
-def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
-    """Return a table's columns without turning a legacy schema into authority."""
+def _table_columns(connection: PostgresSession, table: str) -> set[str]:
+    """Return a PostgreSQL table's columns without mutating its schema."""
 
     try:
         return {
-            str(row[1])
-            for row in connection.execute(f'PRAGMA table_info("{table}")')
+            str(row[0])
+            for row in connection.execute(
+                """SELECT column_name
+                     FROM information_schema.columns
+                    WHERE table_schema=current_schema() AND table_name=?
+                    ORDER BY ordinal_position""",
+                (table,),
+            )
         }
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return set()
 
 
@@ -89,7 +98,7 @@ def _authority_float(value: Any, reason: str, *, minimum: float) -> float:
 
 
 def _source_evidence(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -104,7 +113,7 @@ def _source_evidence(
     first_usable_at: datetime,
     filled_at: datetime | None,
     strict_mapping_id: int,
-) -> dict[str, sqlite3.Row]:
+) -> dict[str, DatabaseRow]:
     evidence_columns = _table_columns(connection, "settlement_result_evidence")
     if not evidence_columns:
         raise SettlementAuthorityError("settlement_source_evidence_schema_missing")
@@ -204,7 +213,7 @@ def _source_evidence(
 
 
 def resolve_authoritative_settlement(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
 ) -> AuthoritativeSettlement:
     """Resolve one formal settlement entirely from immutable database facts."""
@@ -324,7 +333,7 @@ def resolve_authoritative_settlement(
                     order["signal_transport_at"],
                 ),
             ).fetchone()
-        except sqlite3.Error as error:
+        except SQLAlchemyError as error:
             raise SettlementAuthorityError(
                 "settlement_order_market_source_invalid"
             ) from error
@@ -332,7 +341,7 @@ def resolve_authoritative_settlement(
             raise SettlementAuthorityError("settlement_order_market_source_invalid")
     try:
         verify_bound_order_vision_frame(connection, order_key)
-    except (RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+    except (RuntimeError, TypeError, ValueError, SQLAlchemyError) as error:
         raise SettlementAuthorityError(
             "settlement_vision_frame_authority_invalid"
         ) from error
@@ -618,7 +627,7 @@ def _authority_snapshot_values(
 
 
 def persist_authoritative_settlement_snapshot(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     authority: AuthoritativeSettlement,
 ) -> bool:
     """Persist the exact inputs used by a new formal settlement."""
@@ -634,8 +643,9 @@ def persist_authoritative_settlement_snapshot(
             values.append(authority.reconciliation_updated_at.isoformat())
     placeholders = ", ".join("?" for _ in insert_fields)
     cursor = connection.execute(
-        f"INSERT OR IGNORE INTO settlement_authority "
-        f"({', '.join(insert_fields)}) VALUES ({placeholders})",
+        f"INSERT INTO settlement_authority "
+        f"({', '.join(insert_fields)}) VALUES ({placeholders}) "
+        "ON CONFLICT DO NOTHING",
         tuple(values),
     )
     if cursor.rowcount == 1:
@@ -651,7 +661,7 @@ def persist_authoritative_settlement_snapshot(
 
 
 def record_settlement_authority_review(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
     reason: str,
     *,
@@ -666,11 +676,16 @@ def record_settlement_authority_review(
     if not required.issubset(columns):
         return False
     cursor = connection.execute(
-        """INSERT OR IGNORE INTO settlement_authority_audit
+        """INSERT INTO settlement_authority_audit
            (order_key, status, reason, actor, recorded_at)
-           VALUES (?, 'manual_review', ?, ?,
-                   strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
-        (order_key, safe_reason, safe_actor),
+           VALUES (?, 'manual_review', ?, ?, ?)
+           ON CONFLICT DO NOTHING""",
+        (
+            order_key,
+            safe_reason,
+            safe_actor,
+            datetime.now(timezone.utc).isoformat(),
+        ),
     )
     return cursor.rowcount == 1
 
@@ -712,7 +727,7 @@ def settle_authoritative_order(store: Any, order_key: str) -> bool:
 
 
 def persisted_settlement_authority_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
 ) -> str | None:
     """Revalidate a persisted formal settlement and its immutable snapshot."""
@@ -721,7 +736,7 @@ def persisted_settlement_authority_reason(
         authority = resolve_authoritative_settlement(connection, order_key)
     except SettlementAuthorityError as error:
         return error.reason
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return "settlement_authority_unavailable"
     try:
         settlement = connection.execute(
@@ -730,7 +745,7 @@ def persisted_settlement_authority_reason(
                  FROM settlements WHERE order_key=?""",
             (order_key,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return "settlement_ledger_schema_missing"
     if settlement is None:
         return "settlement_ledger_missing"
@@ -770,7 +785,7 @@ def persisted_settlement_authority_reason(
                  FROM settlement_authority WHERE order_key=?""",
             (order_key,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return "settlement_authority_schema_missing"
     if snapshot is None:
         return "settlement_authority_missing"

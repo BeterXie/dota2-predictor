@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import sqlite3
 import threading
 from collections import Counter
 from typing import Any, Collection
+
+from database.session import DatabaseRow, PostgresSession
 
 from .backtest import (
     BACKTEST_VERSION,
@@ -35,19 +36,15 @@ _DRAFT_METRICS_LOCK = threading.Lock()
 _DRAFT_METRICS_CACHE: tuple[str, tuple[dict[str, Any], ...]] | None = None
 
 
-def build_intelligence_report(connection: sqlite3.Connection) -> dict[str, Any]:
+def build_intelligence_report(connection: PostgresSession) -> dict[str, Any]:
     """Summarize strict coverage without combining reconstructed/prospective rows."""
-    owns_transaction = not connection.in_transaction
-    if owns_transaction:
-        connection.execute("BEGIN")
-    try:
+    if connection.in_transaction:
         return _build_intelligence_report(connection)
-    finally:
-        if owns_transaction:
-            connection.rollback()
+    with connection.transaction():
+        return _build_intelligence_report(connection)
 
 
-def _build_intelligence_report(connection: sqlite3.Connection) -> dict[str, Any]:
+def _build_intelligence_report(connection: PostgresSession) -> dict[str, Any]:
     scopes = current_derived_scopes(connection)
     score_versions = _group(connection, "player_map_scores", "score_version")
     draft_rows = _draft_rows(connection, scopes.draft_predictions)
@@ -102,20 +99,14 @@ def _build_intelligence_report(connection: sqlite3.Connection) -> dict[str, Any]
     }
 
 
-def _count(connection: sqlite3.Connection, table: str) -> int:
-    try:
-        return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-    except sqlite3.OperationalError:
-        return 0
+def _count(connection: PostgresSession, table: str) -> int:
+    return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
-def _group(connection: sqlite3.Connection, table: str, column: str) -> dict[str, int]:
-    try:
-        rows = connection.execute(
-            f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column}"
-        ).fetchall()
-    except sqlite3.Error:
-        return {}
+def _group(connection: PostgresSession, table: str, column: str) -> dict[str, int]:
+    rows = connection.execute(
+        f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column}"
+    ).fetchall()
     return {str(row[0]): int(row[1]) for row in rows}
 
 
@@ -124,41 +115,29 @@ def _scope_payload(match_ids: Collection[object]) -> str:
 
 
 def _draft_rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     prediction_keys: Collection[tuple[str, int]],
 ) -> list[dict[str, Any]]:
     if not prediction_keys:
         return []
-    status_columns = {
-        str(row[1])
-        for row in connection.execute(
-            'PRAGMA table_info("match_ingest_status")'
-        ).fetchall()
-    }
-    series_expression = (
-        "status.series_id" if "series_id" in status_columns else "NULL"
-    )
-    try:
-        rows = connection.execute(
-            f"""SELECT run.run_id,
-                      json_extract(run.configuration_json, '$.score_version'),
+    rows = connection.execute(
+            """SELECT run.run_id,
+                      run.configuration_json::jsonb ->> 'score_version',
                       run.model_version,
-                      json_extract(run.configuration_json, '$.backtest_version'),
-                      json_extract(run.configuration_json, '$.feature_version'),
+                      run.configuration_json::jsonb ->> 'backtest_version',
+                      run.configuration_json::jsonb ->> 'feature_version',
                       run.model_kind, run.horizon_minutes,
                       run.availability_mode, run.status, prediction.status,
                       prediction.probability, prediction.eventual_radiant_win,
-                      prediction.match_id, {series_expression}, status.event_id,
+                      prediction.match_id, status.series_id, status.event_id,
                       prediction.input_snapshot_hash
                  FROM draft_predictions AS prediction
                  JOIN draft_model_runs AS run ON run.run_id=prediction.run_id
                  JOIN match_ingest_status AS status
                    ON status.match_id=prediction.match_id
                 ORDER BY 2, 3, 4, 5, 6, 7, 8, prediction.match_id,
-                         run.run_id""",
+                         run.run_id"""
         ).fetchall()
-    except sqlite3.Error:
-        return []
     allowed = set(prediction_keys)
     return [
         {
@@ -192,29 +171,26 @@ def _is_score_family(value: object) -> bool:
 
 
 def _player_rankings(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int],
 ) -> list[dict[str, Any]]:
     if not match_ids:
         return []
-    try:
-        rows = connection.execute(
+    rows = connection.execute(
             """SELECT account_id, position, COUNT(*) AS maps,
                       AVG(execution_score) AS execution_score,
                       AVG(result_adjusted_score) AS result_adjusted_score,
                       AVG(coverage) AS coverage,
                       AVG(role_confidence) AS role_confidence
                  FROM player_map_scores AS score
-                 JOIN json_each(?) AS current_scope
-                   ON CAST(current_scope.value AS INTEGER)=score.match_id
+                 JOIN jsonb_array_elements_text(CAST(? AS jsonb)) AS current_scope(value)
+                   ON CAST(current_scope.value AS BIGINT)=score.match_id
                 WHERE score_version=? AND account_id IS NOT NULL
-                  AND json_extract(explanation_json, '$.ranking_eligible')=1
+                  AND explanation_json::jsonb ->> 'ranking_eligible'='true'
                 GROUP BY account_id, position
                 ORDER BY execution_score DESC, maps DESC, account_id, position""",
             (_scope_payload(match_ids), CURRENT_SCORE_VERSION),
         ).fetchall()
-    except sqlite3.Error:
-        return []
     return [
         {
             "account_id": int(row[0]),
@@ -270,14 +246,13 @@ def _profile_payload(field: str, value: object, default: Any) -> Any:
 
 
 def _current_team_profiles(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     scopes: CurrentDerivedScopes,
 ) -> list[dict[str, Any]]:
     if not scopes.valid_profile_cutoffs:
         return []
     state_hashes = current_state_input_hashes(connection, scopes)
-    try:
-        rows = connection.execute(
+    rows = connection.execute(
             """SELECT profile.team_id, profile.profile_cutoff,
                       profile.profile_version,
                       profile.opportunity_counts_json,
@@ -287,16 +262,14 @@ def _current_team_profiles(
                       profile.effective_sample_size,
                       profile.input_hash, profile.created_at
                  FROM team_style_profiles AS profile
-                 JOIN json_each(?) AS current_cutoff
-                   ON CAST(current_cutoff.value AS TEXT)=profile.profile_cutoff
+                 JOIN jsonb_array_elements_text(CAST(? AS jsonb)) AS current_cutoff(value)
+                   ON current_cutoff.value=profile.profile_cutoff
                 WHERE profile.profile_version=?
                 ORDER BY profile.team_id, profile.profile_cutoff DESC,
                          profile.profile_id DESC""",
             (_scope_payload(scopes.valid_profile_cutoffs), PROFILE_VERSION),
         ).fetchall()
-    except sqlite3.Error:
-        return []
-    selected: dict[int, sqlite3.Row | tuple[object, ...]] = {}
+    selected: dict[int, DatabaseRow] = {}
     for row in rows:
         team_id = int(row[0])
         if team_id in selected:
@@ -325,23 +298,20 @@ def _current_team_profiles(
 
 
 def _team_state_distribution(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int],
 ) -> dict[str, int]:
     if not match_ids:
         return {}
-    try:
-        rows = connection.execute(
+    rows = connection.execute(
             """SELECT label, COUNT(*)
                  FROM team_map_states AS state
-                 JOIN json_each(?) AS current_scope
-                   ON CAST(current_scope.value AS INTEGER)=state.match_id
+                 JOIN jsonb_array_elements_text(CAST(? AS jsonb)) AS current_scope(value)
+                   ON CAST(current_scope.value AS BIGINT)=state.match_id
                 WHERE label_version=?
                 GROUP BY label ORDER BY label""",
             (_scope_payload(match_ids), LABEL_VERSION),
         ).fetchall()
-    except sqlite3.Error:
-        return {}
     return {str(row[0]): int(row[1]) for row in rows}
 
 

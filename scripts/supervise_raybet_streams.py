@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from shared.sqlite import connect as connect_sqlite  # noqa: E402
+from database.engine import require_database_url  # noqa: E402
 from live_betting.browser_contract import (  # noqa: E402
     DOTA2_GAME_ID,
     RAYBET_ORIGINS,
@@ -25,15 +26,8 @@ from live_betting.browser_contract import (  # noqa: E402
 from live_betting.health import record_health  # noqa: E402
 from live_betting.raybet_state import raybet_match_is_live  # noqa: E402
 from live_betting.sanitize import stored_public_stream_url  # noqa: E402
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    bind_manager_child_authority,
-    database_writer_authority,
-    delegated_writer_process_environment,
-    managed_child_command,
-    service_data_paths,
-    terminate_subprocess_tree,
-)
+from live_betting.process_control import terminate_subprocess_tree  # noqa: E402
+from live_betting.storage import LiveBettingStore  # noqa: E402
 from live_betting.vision_retention import prune_vision_evidence  # noqa: E402
 
 OUTPUT_MAX_AGE = timedelta(seconds=90)
@@ -72,15 +66,15 @@ class WatcherRetryState:
 
 
 def record_supervisor_health(
-    database: Path,
+    database_url: str,
     status: str,
     *,
     active_matches: int,
     error: str | None = None,
     details: Mapping[str, object] | None = None,
 ) -> None:
-    connection = connect_sqlite(database)
-    try:
+    with LiveBettingStore(database_url) as store:
+        connection = store.connection
         now = datetime.now(timezone.utc)
         health_details = {"active_watchers": active_matches}
         health_details.update(details or {})
@@ -94,9 +88,6 @@ def record_supervisor_health(
             error=error,
             details=health_details,
         )
-        connection.commit()
-    finally:
-        connection.close()
 
 
 def _output_signature(path: Path) -> OutputSignature | None:
@@ -395,11 +386,11 @@ def _exact_dota_live_payload(raw_json: object, match_id: str) -> bool:
 
 
 def active_match_evidence(
-    database: Path, *, now: datetime | None = None
+    database_url: str, *, now: datetime | None = None
 ) -> dict[str, str]:
     """Select exact live Dota rows; stream evidence labels but does not gate probes."""
-    connection = connect_sqlite(database, read_only=True)
-    try:
+    with LiveBettingStore(database_url) as store:
+        connection = store.connection
         rows = connection.execute(
             """SELECT matches.raybet_match_id, matches.status,
                       matches.updated_at, matches.live_url, matches.raw_json,
@@ -417,7 +408,7 @@ def active_match_evidence(
                              AND events.payload_artifact_hash IS NOT NULL
                              AND events.page_origin IN (?, ?, ?, ?)
                              AND events.source_path IN (?, ?, ?, ?)
-                           ORDER BY julianday(events.captured_at) DESC,
+                           ORDER BY live_text_timestamp_utc(events.captured_at) DESC,
                                     events.event_id DESC
                            LIMIT 1
                       ) AS video_captured_at
@@ -428,8 +419,6 @@ def active_match_evidence(
                 *sorted(VIDEO_SOURCE_PATHS),
             ),
         ).fetchall()
-    finally:
-        connection.close()
     evidence: dict[str, str] = {}
     for row in rows:
         match_id = str(row[0])
@@ -447,18 +436,18 @@ def active_match_evidence(
     return dict(sorted(evidence.items()))
 
 
-def active_matches(database: Path, *, now: datetime | None = None) -> list[str]:
-    return list(active_match_evidence(database, now=now))
+def active_matches(database_url: str, *, now: datetime | None = None) -> list[str]:
+    return list(active_match_evidence(database_url, now=now))
 
 
 def run_evidence_retention(
-    database: Path,
+    database_url: str,
     evidence_dir: Path,
     active_match_ids: set[str],
 ) -> dict[str, object]:
     """Apply the fixed policy while excluding every currently active match."""
     return prune_vision_evidence(
-        database,
+        database_url,
         evidence_dir,
         excluded_match_ids=active_match_ids,
         dry_run=False,
@@ -466,18 +455,18 @@ def run_evidence_retention(
 
 
 def watcher_command(
-    database: Path,
+    database_url: str,
     match_id: str,
     output_dir: Path,
     evidence_dir: Path,
 ) -> list[str]:
-    return managed_child_command([
+    return [
         sys.executable,
         str(ROOT / "scripts" / "watch_raybet_stream.py"),
         "--match-id",
         match_id,
-        "--database",
-        str(database.resolve()),
+        "--database-url",
+        database_url,
         "--output",
         str(output_dir / f"{match_id}.jsonl"),
         "--evidence-dir",
@@ -487,11 +476,11 @@ def watcher_command(
         "--evidence-interval",
         "30",
         "--refresh-url",
-    ])
+    ]
 
 
 def spawn_watcher(
-    database: Path,
+    database_url: str,
     command: list[str],
     stdout: object,
     stderr: object,
@@ -500,25 +489,20 @@ def spawn_watcher(
 ) -> tuple[subprocess.Popen, object]:
     """Spawn one exact watcher without making the child reacquire root locks."""
 
-    command = managed_child_command(command)
-    authority_context = delegated_writer_process_environment(
-        database,
-        role="vision_watcher",
-        command=command,
-    )
+    del database_url
+    authority_context = nullcontext()
     authority_entered = True
     try:
-        child_environment = authority_context.__enter__()
+        authority_context.__enter__()
         process = subprocess.Popen(
             command,
             cwd=ROOT,
             stdout=stdout,
             stderr=stderr,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=child_environment,
+            env=None,
         )
         try:
-            bind_manager_child_authority(child_environment, process)
             if register is not None:
                 register(process, authority_context)
         except BaseException as bind_error:
@@ -651,29 +635,31 @@ def startable_matches(
 
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
-    paths = service_data_paths(args.database)
-    args.database = paths.database
+    root = ROOT / "data" / "live_betting"
     args.output_dir = (
         args.output_dir.resolve()
         if args.output_dir is not None
-        else paths.vision_observations
+        else root / "vision_observations"
     )
     args.evidence_dir = (
         args.evidence_dir.resolve()
         if args.evidence_dir is not None
-        else paths.vision_evidence
+        else root / "vision_evidence"
     )
     args.log_dir = (
         args.log_dir.resolve()
         if args.log_dir is not None
-        else paths.vision_logs
+        else root / "watcher_logs"
     )
     return args
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, required=True)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--log-dir", type=Path)
@@ -681,7 +667,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
-    return resolve_data_paths(parser.parse_args())
+    args = parser.parse_args()
+    args.database_url = require_database_url(args.database_url)
+    return resolve_data_paths(args)
 
 
 def _run_cli(args: argparse.Namespace) -> int:
@@ -699,7 +687,7 @@ def _run_cli(args: argparse.Namespace) -> int:
     try:
         while True:
             try:
-                evidence = active_match_evidence(args.database)
+                evidence = active_match_evidence(args.database_url)
                 active = set(evidence)
                 exited_output = {
                     match_id: (
@@ -758,13 +746,13 @@ def _run_cli(args: argparse.Namespace) -> int:
 
                     try:
                         command = watcher_command(
-                            args.database,
+                            args.database_url,
                             match_id,
                             args.output_dir,
                             args.evidence_dir,
                         )
                         process, authority_context = spawn_watcher(
-                            args.database,
+                            args.database_url,
                             command,
                             stdout,
                             stderr,
@@ -802,7 +790,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     last_retention_at = monotonic_now
                     try:
                         retention_details = run_evidence_retention(
-                            args.database, args.evidence_dir, active
+                            args.database_url, args.evidence_dir, active
                         )
                     except Exception as retention_error:
                         retention_details = {
@@ -827,7 +815,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                         status = "degraded"
                     error = error or "vision evidence retention failed"
                 record_supervisor_health(
-                    args.database,
+                    args.database_url,
                     status,
                     active_matches=int(details["running_watchers"]),
                     error=error,
@@ -838,7 +826,7 @@ def _run_cli(args: argparse.Namespace) -> int:
             except Exception as error:
                 try:
                     record_supervisor_health(
-                        args.database,
+                        args.database_url,
                         "unhealthy",
                         active_matches=len(children),
                         error=type(error).__name__,
@@ -853,7 +841,7 @@ def _run_cli(args: argparse.Namespace) -> int:
         reap_children(children, set(), child_authorities)
         try:
             record_supervisor_health(
-                args.database, "stopped", active_matches=0
+                args.database_url, "stopped", active_matches=0
             )
         except Exception:
             pass
@@ -861,8 +849,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = _parse_args()
-    with database_writer_authority(args.database):
-        return _run_cli(args)
+    return _run_cli(args)
 
 
 if __name__ == "__main__":

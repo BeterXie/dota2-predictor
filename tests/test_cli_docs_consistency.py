@@ -1,120 +1,100 @@
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ACTIVE_DATABASE_DOCS = (
+    ROOT / "README.md",
+    ROOT / "live_betting" / "README.md",
+    ROOT / "docs" / "monitoring-console-operations-manual.md",
+)
+RETIRED_SQLITE_COMMANDS = (
+    "scripts/database_cutover.py",
+    "scripts/database_bundle.py",
+    "scripts/backup_database.py",
+    "scripts/restore_database.py",
+    "scripts/compact_legacy_odds.py",
+)
 
 
-def test_documented_collector_commands_use_the_current_raw_root() -> None:
-    documents = (
-        ROOT / "README.md",
-        ROOT / "live_betting" / "README.md",
-        ROOT / "docs" / "monitoring-console-operations-manual.md",
+def _text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def test_active_runbooks_use_postgres_runtime_authority() -> None:
+    for document in ACTIVE_DATABASE_DOCS:
+        content = _text(document)
+        assert "DATABASE_URL" in content
+        assert "alembic upgrade head" in content
+        assert "--database data/dota2.db" not in content
+        assert "--database data\\dota2.db" not in content
+
+
+def test_active_runbooks_do_not_publish_retired_sqlite_operations() -> None:
+    for document in ACTIVE_DATABASE_DOCS:
+        content = _text(document)
+        for command in RETIRED_SQLITE_COMMANDS:
+            assert command not in content
+
+
+def test_runbooks_document_the_one_time_read_only_import() -> None:
+    for document in ACTIVE_DATABASE_DOCS:
+        content = _text(document)
+        assert "scripts/migrate_sqlite_to_postgres.py" in content.replace("\\", "/")
+        assert "--sqlite" in content
+        assert "--postgres" in content
+        assert "--dry-run" in content
+
+
+def test_runtime_entrypoints_publish_database_url_option() -> None:
+    commands = (
+        [sys.executable, "-m", "fetch.main", "--help"],
+        [sys.executable, "-m", "web.main", "--help"],
+        [sys.executable, "-m", "live_betting.monitor", "--help"],
+        [sys.executable, str(ROOT / "scripts" / "run_dota_shadow_service.py"), "--help"],
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "migrate_sqlite_to_postgres.py"),
+            "--help",
+        ],
     )
-    stale = re.compile(r"data[/\\]live_betting[/\\]raw(?!-v2)(?:[/\\]|\b)")
-    for document in documents:
-        text = document.read_text(encoding="utf-8")
-        assert "--raw-dir data/live_betting/raw-v2" in text
-        assert stale.search(text) is None
-
-
-def test_database_operations_runbook_covers_the_published_clis() -> None:
-    runbook = (ROOT / "live_betting" / "README.md").read_text(encoding="utf-8")
-    required = (
-        "scripts/database_cutover.py checkpoint",
-        "scripts/database_cutover.py verify-prepared",
-        "scripts/compact_legacy_odds.py",
-        "scripts/database_bundle.py create",
-        "scripts/database_bundle.py verify",
-        "scripts/database_bundle.py restore",
-        '--odds-raw-root (Join-Path $compactionDir "live_betting/raw-v2")',
-    )
-    for command in required:
-        assert command in runbook
-    assert "`M_c = 512 MiB`" in runbook
-    assert "`M_b = 512 MiB`" in runbook
-    assert "`5L + R + M_c`" in runbook
-    assert "`2L` for the work database" in runbook
-    assert "`2L` for the `VACUUM INTO` output" in runbook
-    assert "`L` for generated\n   raw artifacts" in runbook
-    assert "`C + A + M_b`" in runbook
-    assert "it is not a read-only verification command" in runbook
-    assert "--database`, then\n`DATABASE_PATH`, then `web/config.yaml`" in runbook
-
-
-def test_cutover_runbook_uses_one_candidate_database_for_every_process() -> None:
-    runbook = (ROOT / "live_betting" / "README.md").read_text(encoding="utf-8")
-    required = (
-        '$candidateDb = Join-Path $restoreDir "dota2.db"',
-        "python -m web.main --database $candidateDb",
-        "python scripts/run_dota_shadow_service.py",
-        "--database $candidateDb",
-        "--start-collector",
-        "--start-companion",
-        "--start-shadow",
-        "--start-vision",
-        "--start-mail",
-        "--start-strict-ingest",
-        "--start-postmatch",
-        "--start-draft-publisher",
-    )
-    for value in required:
-        assert value in runbook
-    assert "Web process and all workers must use `$candidateDb`" in runbook
-    assert "never run the old\nproduction database and the candidate database" in runbook
-
-
-def test_compactor_help_tracks_the_current_schema_instead_of_a_number() -> None:
-    completed = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "compact_legacy_odds.py"), "--help"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert "current live schema" in completed.stdout
-    assert re.search(r"prepared\s+v\d+", completed.stdout, re.IGNORECASE) is None
-
-
-def test_database_cutover_help_publishes_the_documented_commands() -> None:
-    command = ROOT / "scripts" / "database_cutover.py"
-    completed = subprocess.run(
-        [sys.executable, str(command), "--help"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert "checkpoint" in completed.stdout
-    assert "verify-prepared" in completed.stdout
-    for subcommand in ("checkpoint", "verify-prepared"):
-        help_result = subprocess.run(
-            [sys.executable, str(command), subcommand, "--help"],
+    for command in commands:
+        completed = subprocess.run(
+            command,
             cwd=ROOT,
             check=True,
             capture_output=True,
             text=True,
         )
-        assert "--database" in help_result.stdout
-
-
-def test_database_bundle_create_help_exposes_explicit_revision_adoption() -> None:
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "database_bundle.py"),
-            "create",
+        if command[-2:] == [
+            str(ROOT / "scripts" / "migrate_sqlite_to_postgres.py"),
             "--help",
-        ],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+        ]:
+            assert "--sqlite" in completed.stdout
+            assert "--postgres" in completed.stdout
+        else:
+            assert "--database-url" in completed.stdout
+            assert "--database " not in completed.stdout
 
-    assert "--resume" in completed.stdout
-    assert "--adopt-resume-from-git-commit" in completed.stdout
+
+def test_migration_readme_tracks_current_alembic_head() -> None:
+    content = _text(ROOT / "database" / "migrations" / "README.md")
+    assert "20260730_0017" in content
+    assert "PostgreSQL-only" in content
+    assert "does not create a SQLite backup" in content
+
+
+def test_supervisor_runbook_keeps_direct_only_start_flags() -> None:
+    content = _text(ROOT / "README.md")
+    for flag in (
+        "--start-collector",
+        "--start-vision",
+        "--start-shadow",
+        "--start-strict-ingest",
+        "--start-postmatch",
+        "--draft-deployment-key",
+    ):
+        assert flag in content

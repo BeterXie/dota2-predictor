@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-import sqlite3
 from dataclasses import dataclass
+
+from database.session import PostgresSession
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class PlayerForm:
 
 
 def build_player_form(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     account_ids: tuple[int, ...],
     as_of_start_time: int,
     *,

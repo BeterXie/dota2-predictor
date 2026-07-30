@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import math
-import sqlite3
 import threading
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from event_intelligence.backtest import (
     BACKTEST_VERSION,
@@ -78,23 +79,16 @@ PLAYER_PERFORMANCE_FIELDS = (
     "kda",
 )
 DRAFT_VERSION_PREDICATE = """run.model_version=?
-AND json_valid(run.configuration_json)
-AND CASE WHEN json_valid(run.configuration_json)
-         THEN json_extract(run.configuration_json, '$.backtest_version') END=?
-AND CASE WHEN json_valid(run.configuration_json)
-         THEN json_extract(run.configuration_json, '$.feature_version') END=?
+AND run.configuration_json::jsonb ->> 'backtest_version'=?
+AND run.configuration_json::jsonb ->> 'feature_version'=?
 AND (
     (run.availability_mode=?
-     AND CASE WHEN json_valid(run.configuration_json)
-              THEN json_extract(run.configuration_json, '$.assignment_version') END=?
-     AND CASE WHEN json_valid(run.configuration_json)
-              THEN json_extract(run.configuration_json, '$.score_version') END=?)
+     AND run.configuration_json::jsonb ->> 'assignment_version'=?
+     AND run.configuration_json::jsonb ->> 'score_version'=?)
     OR
     (run.availability_mode=?
-     AND CASE WHEN json_valid(run.configuration_json)
-              THEN json_extract(run.configuration_json, '$.assignment_version') END=?
-     AND CASE WHEN json_valid(run.configuration_json)
-              THEN json_extract(run.configuration_json, '$.score_version') END=?)
+     AND run.configuration_json::jsonb ->> 'assignment_version'=?
+     AND run.configuration_json::jsonb ->> 'score_version'=?)
 )"""
 PROSPECTIVE_ROLE_VERSION = PROSPECTIVE_ASSIGNMENT_VERSION
 DRAFT_COHORTS = (
@@ -116,50 +110,53 @@ _DRAFT_QUALITY_CACHE: tuple[str, tuple[dict[str, Any], ...]] | None = None
 
 
 @contextmanager
-def _database() -> Iterator[sqlite3.Connection]:
-    database = Path(queries.DB_PATH).resolve()
-    connection = sqlite3.connect(
-        f"file:{database.as_posix()}?mode=ro", uri=True
-    )
-    connection.row_factory = sqlite3.Row
+def _database() -> Iterator[PostgresSession]:
+    connection = queries.get_db()
     try:
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("BEGIN")
-        yield connection
+        with connection.transaction():
+            yield connection
     finally:
-        if connection.in_transaction:
-            connection.rollback()
         connection.close()
 
 
-def _relation_exists(connection: sqlite3.Connection, name: str) -> bool:
+def _relation_exists(connection: PostgresSession, name: str) -> bool:
     return connection.execute(
-        """SELECT 1 FROM sqlite_master
-             WHERE type IN ('table', 'view') AND name=?""",
+        """SELECT 1
+             FROM pg_class AS relation
+             JOIN pg_namespace AS namespace
+               ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema()
+              AND relation.relkind IN ('r', 'p', 'v')
+              AND relation.relname=?""",
         (name,),
     ).fetchone() is not None
 
 
-def _relation_columns(connection: sqlite3.Connection, name: str) -> set[str]:
+def _relation_columns(connection: PostgresSession, name: str) -> set[str]:
     if not _relation_exists(connection, name):
         return set()
-    try:
-        return {
-            str(row["name"])
-            for row in connection.execute(f'PRAGMA table_info("{name}")').fetchall()
-        }
-    except sqlite3.OperationalError:
-        return set()
+    return {
+        str(row[0])
+        for row in connection.execute(
+            """SELECT column_name FROM information_schema.columns
+                WHERE table_schema=current_schema() AND table_name=?""",
+            (name,),
+        ).fetchall()
+    }
 
 
-def _current_scopes(connection: sqlite3.Connection) -> CurrentDerivedScopes:
+def _is_schema_missing_error(error: SQLAlchemyError) -> bool:
+    cause = getattr(error, "orig", error)
+    sqlstate = getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
+    return sqlstate in {"42P01", "42703"}
+
+
+def _current_scopes(connection: PostgresSession) -> CurrentDerivedScopes:
     return current_derived_scopes(connection)
 
 
 def _targeted_scopes(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
 ) -> CurrentDerivedScopes:
     """Validate current derived lineage for one postmatch identity."""
@@ -171,7 +168,7 @@ def _targeted_scopes(
             "SELECT match_id FROM formal_map_eligibility WHERE match_id=?",
             (match_id,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return CurrentDerivedScopes(available=False)
     formal = frozenset({match_id}) if formal_row is not None else frozenset()
     if formal_row is None:
@@ -235,7 +232,7 @@ def _targeted_scopes(
         contexts = StrictDerivedPipeline._profile_context_hashes(
             connection, {event_id}
         )
-    except (KeyError, TypeError, ValueError, sqlite3.Error):
+    except (KeyError, TypeError, ValueError, SQLAlchemyError):
         return CurrentDerivedScopes(available=True, formal=formal)
 
     lineage_current = (
@@ -286,7 +283,7 @@ def _targeted_scopes(
                 and int(scored[0]) == 10
                 and int(assigned[0]) == 10
             )
-        except (TypeError, ValueError, sqlite3.Error):
+        except (TypeError, ValueError, SQLAlchemyError):
             player_complete = False
 
     state_complete = False
@@ -302,7 +299,7 @@ def _targeted_scopes(
                 (match_id, LABEL_VERSION),
             ).fetchone()
             state_complete = state_count is not None and int(state_count[0]) == 2
-        except (TypeError, ValueError, sqlite3.Error):
+        except (TypeError, ValueError, SQLAlchemyError):
             state_complete = False
 
     state_eligible = row["state_readiness"] in {"ready", "unscorable"}
@@ -342,7 +339,7 @@ def _targeted_scopes(
 
 
 def _targeted_draft_prediction_keys(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
 ) -> frozenset[tuple[str, int]]:
     required = {
@@ -388,20 +385,21 @@ def _targeted_draft_prediction_keys(
                 WHERE validation.match_id=?
                   AND validation.validation_version=?
                   AND validation.dependency_revision<=lineage.dependency_revision
-                  AND strftime('%s', prediction.prediction_cutoff) IS NOT NULL
+                  AND live_text_timestamp_utc(prediction.prediction_cutoff) IS NOT NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM draft_lineage_changes AS change
                        WHERE change.dependency_revision>
                              validation.dependency_revision
                          AND (change.affected_from_unix IS NULL OR
-                              change.affected_from_unix<=CAST(
-                                  strftime('%s', prediction.prediction_cutoff)
-                                  AS INTEGER
-                              ))
+                              change.affected_from_unix<=CAST(EXTRACT(EPOCH FROM
+                                  live_text_timestamp_utc(
+                                      prediction.prediction_cutoff
+                                  )
+                              ) AS BIGINT))
                   )""",
             (match_id, DRAFT_VALIDATION_VERSION),
         ).fetchall()
-    except (TypeError, ValueError, sqlite3.Error):
+    except (TypeError, ValueError, SQLAlchemyError):
         return frozenset()
     return frozenset(
         (str(row[0]), int(row[1]))
@@ -419,8 +417,8 @@ def _scope_join(
     match_ids = getattr(scopes, readiness)
     payload = json.dumps(sorted(match_ids), separators=(",", ":"))
     return (
-        "JOIN json_each(?) AS current_scope "
-        f"ON CAST(current_scope.value AS INTEGER)={match_alias}.match_id",
+        "JOIN jsonb_array_elements_text(CAST(? AS jsonb)) AS current_scope(value) "
+        f"ON CAST(current_scope.value AS BIGINT)={match_alias}.match_id",
         (payload,),
     )
 
@@ -432,7 +430,8 @@ def _scope_condition(
 ) -> tuple[str, tuple[str, ...]]:
     payload = json.dumps(sorted(getattr(scopes, readiness)), separators=(",", ":"))
     return (
-        f"AND {expression} IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
+        f"AND {expression} IN (SELECT CAST(value AS BIGINT) "
+        "FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS scope(value))",
         (payload,),
     )
 
@@ -465,7 +464,7 @@ def _pagination(page: int, page_size: int, total: int) -> dict[str, int]:
     }
 
 
-def _state_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def _state_payload(row: DatabaseRow | dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
     payload.pop("state_id", None)
     payload.pop("input_hash", None)
@@ -477,7 +476,7 @@ def _state_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _compact_list_state(row: sqlite3.Row, prefix: str) -> dict[str, Any] | None:
+def _compact_list_state(row: DatabaseRow, prefix: str) -> dict[str, Any] | None:
     label = row[f"{prefix}_state_label"]
     if label is None:
         return None
@@ -494,7 +493,7 @@ def _compact_list_state(row: sqlite3.Row, prefix: str) -> dict[str, Any] | None:
 
 
 def _count(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     relation: str,
     *,
     expression: str = "*",
@@ -510,17 +509,17 @@ def _count(
             f"SELECT COUNT({expression}) FROM {relation} {join} {where}",
             (*join_params, *params),
         ).fetchone()
-    except sqlite3.OperationalError as error:
-        if "no such table" in str(error) or "no such column" in str(error):
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
             return 0
         raise
     return int(row[0]) if row else 0
 
 
 def _current_profile_rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     scopes: CurrentDerivedScopes,
-) -> list[sqlite3.Row]:
+) -> list[DatabaseRow]:
     profile_columns = _relation_columns(connection, "team_style_profiles")
     if (
         not scopes.valid_profile_cutoffs
@@ -536,24 +535,22 @@ def _current_profile_rows(
     cutoff_payload = json.dumps(
         sorted(scopes.valid_profile_cutoffs), separators=(",", ":")
     )
-    stable_order = (
-        "profile.profile_id DESC"
-        if "profile_id" in profile_columns
-        else "profile.rowid DESC"
-    )
+    stable_order = "profile.profile_id DESC"
     try:
         rows = connection.execute(
             f"""SELECT profile.* FROM team_style_profiles AS profile
-                JOIN json_each(?) AS cutoff
-                  ON CAST(cutoff.value AS TEXT)=profile.profile_cutoff
+                JOIN jsonb_array_elements_text(CAST(? AS jsonb)) AS cutoff(value)
+                  ON cutoff.value=profile.profile_cutoff
                WHERE profile.profile_version=?
                ORDER BY profile.team_id, profile.profile_cutoff DESC,
                         {stable_order}""",
             (cutoff_payload, PROFILE_VERSION),
         ).fetchall()
-    except sqlite3.Error:
-        return []
-    selected: dict[int, sqlite3.Row] = {}
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
+            return []
+        raise
+    selected: dict[int, DatabaseRow] = {}
     for row in rows:
         team_id = int(row["team_id"])
         if team_id in selected:
@@ -639,7 +636,7 @@ def _quality_payload(
 
 
 def _draft_quality_slices(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     scopes: CurrentDerivedScopes | None = None,
 ) -> list[dict[str, Any]]:
     global _DRAFT_QUALITY_CACHE
@@ -671,12 +668,10 @@ def _draft_quality_slices(
                            run.availability_mode, prediction.probability,
                            prediction.eventual_radiant_win, prediction.status,
                            prediction.match_id, {lineage_columns},
-                           json_extract(
-                               run.configuration_json, '$.assignment_version'
-                           ) AS assignment_version,
-                           json_extract(
-                               run.configuration_json, '$.score_version'
-                           ) AS score_version
+                           run.configuration_json::jsonb ->>
+                               'assignment_version' AS assignment_version,
+                           run.configuration_json::jsonb ->>
+                               'score_version' AS score_version
                      FROM draft_predictions AS prediction
                      JOIN draft_model_runs AS run ON run.run_id=prediction.run_id
                      {lineage_join}
@@ -685,8 +680,11 @@ def _draft_quality_slices(
                              run.availability_mode, prediction.match_id""",
                 DRAFT_VERSION_PARAMS,
             ).fetchall()
-        except sqlite3.OperationalError:
-            rows = []
+        except SQLAlchemyError as error:
+            if _is_schema_missing_error(error):
+                rows = []
+            else:
+                raise
         for raw in rows:
             row = dict(raw)
             if (str(row["run_id"]), int(row["match_id"])) not in (
@@ -814,8 +812,7 @@ def get_overview() -> dict[str, Any]:
                 join=player_join,
                 join_params=player_scope_params,
                 where=current_score_where
-                + " AND json_valid(explanation_json)"
-                + " AND json_extract(explanation_json, '$.ranking_eligible')=1",
+                + " AND explanation_json::jsonb ->> 'ranking_eligible'='true'",
                 params=(SCORE_VERSION,),
             ),
             "team_state_rows": _count(
@@ -1090,7 +1087,7 @@ def list_matches(
         return {"data": data, "pagination": _pagination(page, page_size, total)}
 
 
-def _match_row(connection: sqlite3.Connection, match_id: int) -> dict[str, Any] | None:
+def _match_row(connection: PostgresSession, match_id: int) -> dict[str, Any] | None:
     match_columns = _relation_columns(connection, "matches")
     if "match_id" not in match_columns:
         return None
@@ -1159,7 +1156,7 @@ def _match_row(connection: sqlite3.Connection, match_id: int) -> dict[str, Any] 
 
 
 def _match_states(
-    connection: sqlite3.Connection, match_id: int
+    connection: PostgresSession, match_id: int
 ) -> dict[str, dict[str, Any] | None]:
     result: dict[str, dict[str, Any] | None] = {"radiant": None, "dire": None}
     state_columns = _relation_columns(connection, "team_map_states")
@@ -1206,7 +1203,7 @@ def _match_states(
 
 
 def _match_performance(
-    connection: sqlite3.Connection, match_id: int
+    connection: PostgresSession, match_id: int
 ) -> list[dict[str, Any]]:
     match_player_columns = _relation_columns(connection, "match_players")
     if not {"match_id", "player_slot"}.issubset(match_player_columns):
@@ -1251,9 +1248,8 @@ def _match_performance(
         "hero.localized_name AS hero_name" if has_heroes else "NULL AS hero_name"
     )
     identity_column = (
-        "CASE WHEN json_valid(fact.facts_json) THEN "
-        "COALESCE(json_extract(fact.facts_json, '$.name'), "
-        "json_extract(fact.facts_json, '$.personaname')) END AS player_name"
+        "COALESCE(fact.facts_json::jsonb ->> 'name', "
+        "fact.facts_json::jsonb ->> 'personaname') AS player_name"
         if has_facts
         else "NULL AS player_name"
     )
@@ -1302,7 +1298,7 @@ def _match_performance(
 
 
 def _match_players(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
     performance_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1383,7 +1379,7 @@ def _match_players(
 
 
 def _match_rosh_lineup_score(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
 ) -> dict[str, Any]:
     missing = {
@@ -1403,7 +1399,7 @@ def _match_rosh_lineup_score(
                 ORDER BY player_slot""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return missing
     expected_slots = (*range(5), *range(128, 133))
     if len(rows) != 10 or tuple(row["player_slot"] for row in rows) != expected_slots:
@@ -1518,7 +1514,7 @@ def _match_rating(
 
 
 def _match_draft_predictions(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
     prediction_keys: frozenset[tuple[str, int]],
 ) -> list[dict[str, Any]]:
@@ -1532,12 +1528,10 @@ def _match_draft_predictions(
                       run.horizon_minutes,
                       run.availability_mode, run.training_cutoff,
                       run.status AS model_status,
-                      CASE WHEN json_valid(run.configuration_json) THEN
-                          json_extract(run.configuration_json, '$.assignment_version')
-                      END AS assignment_version,
-                      CASE WHEN json_valid(run.configuration_json) THEN
-                          json_extract(run.configuration_json, '$.score_version')
-                      END AS score_version,
+                      run.configuration_json::jsonb ->>
+                          'assignment_version' AS assignment_version,
+                      run.configuration_json::jsonb ->>
+                          'score_version' AS score_version,
                       prediction.prediction_cutoff, prediction.cutoff_source,
                       prediction.probability, prediction.uncertainty,
                       prediction.support, prediction.eventual_radiant_win,
@@ -1550,7 +1544,7 @@ def _match_draft_predictions(
                          run.availability_mode""",
             (match_id, *DRAFT_VERSION_PARAMS),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return []
     return [
         {key: value for key, value in dict(row).items() if key != "run_id"}
@@ -1560,7 +1554,7 @@ def _match_draft_predictions(
 
 
 def _match_detail_payload(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
     scopes: CurrentDerivedScopes,
 ) -> dict[str, Any] | None:
@@ -1697,7 +1691,7 @@ def _mapping_payload(mapping: StrictLiveMapMapping) -> dict[str, Any]:
     }
 
 
-def _reconciliation_payload(row: sqlite3.Row) -> dict[str, Any]:
+def _reconciliation_payload(row: DatabaseRow) -> dict[str, Any]:
     return {
         key: row[key]
         for key in (
@@ -1728,8 +1722,8 @@ def _aware_timestamp(value: Any) -> datetime | None:
 
 
 def _confirmed_evidence_reason(
-    connection: sqlite3.Connection,
-    reconciliation: sqlite3.Row,
+    connection: PostgresSession,
+    reconciliation: DatabaseRow,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -1861,7 +1855,7 @@ def _confirmed_evidence_reason(
 
 
 def _duplicate_link_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -1902,8 +1896,8 @@ def _duplicate_link_reason(
 
 
 def _confirmed_map_result_reason(
-    connection: sqlite3.Connection,
-    reconciliation: sqlite3.Row,
+    connection: PostgresSession,
+    reconciliation: DatabaseRow,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -1959,9 +1953,9 @@ def _confirmed_map_result_reason(
 
 
 def _opendota_identity_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     mapping: StrictLiveMapMapping,
-    reconciliation: sqlite3.Row,
+    reconciliation: DatabaseRow,
     *,
     map_number: int,
     scopes: CurrentDerivedScopes,
@@ -2041,7 +2035,7 @@ def _opendota_identity_reason(
 
 
 def _curve_rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     relation: str,
     match_id: int,
 ) -> list[dict[str, Any]]:
@@ -2156,7 +2150,7 @@ def _player_side(player_slot: Any) -> str | None:
 
 
 def _match_event_rows(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
     odds_timeline: list[dict[str, Any]],
     map_number: int,
@@ -2181,7 +2175,7 @@ def _match_event_rows(
         )
 
     objective_columns = _relation_columns(connection, "objectives")
-    objective_rows: list[sqlite3.Row] = []
+    objective_rows: list[DatabaseRow] = []
     if {"match_id", "time", "type"}.issubset(objective_columns):
         selected = [
             name if name in objective_columns else f"NULL AS {name}"
@@ -2218,7 +2212,7 @@ def _match_event_rows(
 
     teamfight_columns = _relation_columns(connection, "teamfights")
     teamfight_player_columns = _relation_columns(connection, "teamfight_players")
-    teamfight_rows: list[sqlite3.Row] = []
+    teamfight_rows: list[DatabaseRow] = []
     teamfights_available = {"id", "match_id", "start_time"}.issubset(
         teamfight_columns
     )
@@ -2284,7 +2278,7 @@ def _match_event_rows(
         )
 
     fact_columns = _relation_columns(connection, "player_map_facts")
-    latest_facts: list[sqlite3.Row] = []
+    latest_facts: list[DatabaseRow] = []
     if {"match_id", "player_slot", "facts_json"}.issubset(fact_columns):
         order = []
         if "created_at" in fact_columns:
@@ -2292,7 +2286,7 @@ def _match_event_rows(
         if "fact_id" in fact_columns:
             order.append("fact_id DESC")
         if not order:
-            order.append("rowid DESC")
+            order.append("fact_id DESC")
         optional = [
             name if name in fact_columns else f"NULL AS {name}"
             for name in ("account_id", "team_id")
@@ -2653,7 +2647,7 @@ def get_raybet_postmatch(
         return response
 
 
-def _player_identities(connection: sqlite3.Connection) -> dict[int, str]:
+def _player_identities(connection: PostgresSession) -> dict[int, str]:
     fact_columns = _relation_columns(connection, "player_map_facts")
     if not {"account_id", "facts_json"}.issubset(fact_columns):
         return {}
@@ -2663,11 +2657,11 @@ def _player_identities(connection: sqlite3.Connection) -> dict[int, str]:
     if "fact_id" in fact_columns:
         order_columns.append("fact_id DESC")
     if not order_columns:
-        order_columns.append("rowid DESC")
+        order_columns.append("fact_id DESC")
     rows = connection.execute(
         f"""SELECT account_id,
-                  COALESCE(json_extract(facts_json, '$.name'),
-                           json_extract(facts_json, '$.personaname')) AS player_name
+                  COALESCE(facts_json::jsonb ->> 'name',
+                           facts_json::jsonb ->> 'personaname') AS player_name
                  FROM (
                        SELECT account_id, facts_json,
                               ROW_NUMBER() OVER (
@@ -2675,7 +2669,7 @@ def _player_identities(connection: sqlite3.Connection) -> dict[int, str]:
                                   ORDER BY {', '.join(order_columns)}
                               ) AS identity_rank
                          FROM player_map_facts
-                        WHERE account_id IS NOT NULL AND json_valid(facts_json)
+                        WHERE account_id IS NOT NULL
                   )
             WHERE identity_rank=1"""
     ).fetchall()
@@ -2720,8 +2714,7 @@ def list_players(
             "score.account_id IS NOT NULL",
             "score.position BETWEEN 1 AND 5",
             "score.role_confidence>=0.7",
-            "json_valid(score.explanation_json)",
-            "json_extract(score.explanation_json, '$.ranking_eligible')=1",
+            "score.explanation_json::jsonb ->> 'ranking_eligible'='true'",
         ]
         params: list[Any] = [*scope_params, SCORE_VERSION]
         if position is not None:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import asyncio
 import sqlite3
@@ -8,7 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from live_betting.service_coordination import SingleInstanceLock
+service_coordination = pytest.importorskip(
+    "live_betting.service_coordination",
+    reason="legacy SQLite web file-authority tests are superseded by PostgreSQL API tests",
+)
+SingleInstanceLock = service_coordination.SingleInstanceLock
 from web import app as web_app
 from web import main as web_main
 from web import queries

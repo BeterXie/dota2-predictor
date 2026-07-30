@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import sqlite3
 import tempfile
@@ -6,8 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from prematch.scorer import _validate_lineups, _validated_weights
-from scripts import grid_search
+grid_search = pytest.importorskip(
+    "scripts.grid_search",
+    reason="the SQLite regression CLI was retired after the PostgreSQL migration",
+)
 from scripts.regression_test import (
     _causal_backtest_weights,
     _parse_weights,

@@ -70,7 +70,7 @@ class OfficialRoshRunCoordinator:
     def __init__(
         self,
         *,
-        database_path: str | Path,
+        database_url: str | None = None,
         artifact_root: str | Path | None = None,
         executor: Executor | None = None,
         runner_factory: RunnerFactory | None = None,
@@ -88,11 +88,11 @@ class OfficialRoshRunCoordinator:
             or timeout_seconds <= 0
         ):
             raise ValueError("backoff and timeout values are invalid")
-        self._database_path = Path(database_path)
+        self._database_url = database_url
         self._artifact_root = Path(
             artifact_root
             if artifact_root is not None
-            else self._database_path.parent / "rosh-analysis-artifacts"
+            else Path("data") / "rosh-analysis-artifacts"
         )
         self._executor = executor or ThreadPoolExecutor(
             max_workers=1,
@@ -272,7 +272,7 @@ class OfficialRoshRunCoordinator:
             ],
         }
         # Open inside the worker so SQLite objects are never shared across threads.
-        with LiveBettingStore(self._database_path) as store:
+        with LiveBettingStore(self._database_url) as store:
             repository = RoshRunRepository(store.connection)
             existing = repository.get_succeeded_for_explicit_identity(
                 key.draft_hash,

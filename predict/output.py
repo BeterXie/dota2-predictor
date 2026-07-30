@@ -2,13 +2,14 @@
 
 import json
 import math
-from shared.sqlite import connect as connect_sqlite
 from datetime import datetime, timezone
 from pathlib import Path
 
+from shared.queries import connect
 
-def _lookup_team_name(db_path: str, team_id: int) -> str | None:
-    conn = connect_sqlite(db_path, read_only=True)
+
+def _lookup_team_name(database_url: str | None, team_id: int) -> str | None:
+    conn = connect(database_url)
     try:
         row = conn.execute(
             "SELECT name FROM teams WHERE team_id = ?", (team_id,)
@@ -18,10 +19,10 @@ def _lookup_team_name(db_path: str, team_id: int) -> str | None:
         conn.close()
 
 
-def _lookup_league_name(db_path: str, league_id: int) -> str | None:
+def _lookup_league_name(database_url: str | None, league_id: int) -> str | None:
     if not league_id:
         return None
-    conn = connect_sqlite(db_path, read_only=True)
+    conn = connect(database_url)
     try:
         row = conn.execute(
             "SELECT name FROM leagues WHERE leagueid = ?", (league_id,)
@@ -54,7 +55,7 @@ def format_output(
     dire_id: int,
     league_id: int,
     bundle: dict,
-    db_path: str,
+    database_url: str | None,
 ) -> dict:
     """Assemble the final prediction output dict per DESIGN.md Module D."""
     now = datetime.now(timezone.utc)
@@ -68,15 +69,15 @@ def format_output(
         "match": {
             "radiant_team": {
                 "id": radiant_id,
-                "name": _lookup_team_name(db_path, radiant_id),
+                "name": _lookup_team_name(database_url, radiant_id),
             },
             "dire_team": {
                 "id": dire_id,
-                "name": _lookup_team_name(db_path, dire_id),
+                "name": _lookup_team_name(database_url, dire_id),
             },
             "league": {
                 "id": league_id,
-                "name": _lookup_league_name(db_path, league_id),
+                "name": _lookup_league_name(database_url, league_id),
             },
             "best_of": 3,
         },

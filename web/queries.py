@@ -1,35 +1,37 @@
 from __future__ import annotations
 
 import logging
-import os
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from shared.sqlite import connect as connect_sqlite
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.engine import build_engine, require_database_url
+from database.session import PostgresSession
 
 logger = logging.getLogger(__name__)
 
-# DB_PATH is the single runtime authority used by queries and prediction code.
-# web.main resolves CLI/environment/config precedence before calling init_db.
-_WEB_DIR = Path(__file__).resolve().parent
-_DEFAULT_DB = str(_WEB_DIR.parent / "data" / "dota2.db")
-DB_PATH = str(Path(os.environ.get("DATABASE_PATH", _DEFAULT_DB)).resolve())
+DATABASE_URL: str | None = None
+_ENGINE: Engine | None = None
 
 
-def init_db(db_path: str | None = None) -> None:
-    """Configure the database path. Call once at application startup."""
-    global DB_PATH
-    if db_path:
-        DB_PATH = str(Path(db_path).resolve())
+def init_db(database_url: str | None = None) -> None:
+    """Configure the PostgreSQL engine once at application startup."""
+    global DATABASE_URL, _ENGINE
+    configured = require_database_url(database_url)
+    if _ENGINE is not None:
+        _ENGINE.dispose()
+    DATABASE_URL = configured
+    _ENGINE = build_engine(configured)
 
 
-def get_db() -> sqlite3.Connection:
-    # Writers initialize WAL once.  Re-issuing PRAGMA journal_mode=WAL for
-    # every HTTP request takes a write lock and can starve reads while the
-    # collectors are ingesting a large database.
-    return connect_sqlite(DB_PATH, row_factory=sqlite3.Row, wal=False)
+def get_db() -> PostgresSession:
+    global DATABASE_URL, _ENGINE
+    if _ENGINE is None:
+        init_db()
+    assert _ENGINE is not None
+    return PostgresSession(_ENGINE)
 
 
 def _safe_execute(query: str, params: tuple = (), fetch: str = "all") -> Any:
@@ -49,7 +51,7 @@ def _safe_execute(query: str, params: tuple = (), fetch: str = "all") -> Any:
             row = cur.fetchone()
             conn.close()
             return row[0] if row else None
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         logger.warning("Query failed (table may not exist): %s", query[:80])
         return [] if fetch == "all" else None
 
@@ -277,7 +279,7 @@ def get_match_detail(match_id: int) -> dict | None:
 
         conn.close()
         return result
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         conn.close()
         return None
 
@@ -310,12 +312,12 @@ def get_team_profile(team_id: int) -> dict | None:
             SELECT
                 COUNT(*) AS total_matches,
                 SUM(CASE
-                    WHEN (m.radiant_team_id = ? AND m.radiant_win = 1)
-                      OR (m.dire_team_id = ? AND m.radiant_win = 0) THEN 1 ELSE 0
+                    WHEN (m.radiant_team_id = ? AND m.radiant_win IS TRUE)
+                      OR (m.dire_team_id = ? AND m.radiant_win IS FALSE) THEN 1 ELSE 0
                 END) AS wins,
                 SUM(CASE
-                    WHEN (m.radiant_team_id = ? AND m.radiant_win = 0)
-                      OR (m.dire_team_id = ? AND m.radiant_win = 1) THEN 1 ELSE 0
+                    WHEN (m.radiant_team_id = ? AND m.radiant_win IS FALSE)
+                      OR (m.dire_team_id = ? AND m.radiant_win IS TRUE) THEN 1 ELSE 0
                 END) AS losses,
                 AVG(m.duration) AS avg_duration
             FROM matches m
@@ -369,7 +371,7 @@ def get_team_profile(team_id: int) -> dict | None:
         result["recent_matches"] = [dict(r) for r in recent]
         conn.close()
         return result
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         conn.close()
         return None
 
@@ -446,12 +448,12 @@ def get_heroes() -> list[dict]:
         LEFT JOIN matches m ON mp.match_id = m.match_id
         LEFT JOIN (
             SELECT hero_id,
-                   COUNT(CASE WHEN is_pick = 1 THEN 1 END) AS pick_count,
-                   COUNT(CASE WHEN is_pick = 0 THEN 1 END) AS ban_count
+                   COUNT(CASE WHEN is_pick IS TRUE THEN 1 END) AS pick_count,
+                   COUNT(CASE WHEN is_pick IS FALSE THEN 1 END) AS ban_count
             FROM picks_bans
             GROUP BY hero_id
         ) pb_counts ON h.hero_id = pb_counts.hero_id
-        GROUP BY h.hero_id
+        GROUP BY h.hero_id, pb_counts.pick_count, pb_counts.ban_count
         ORDER BY match_count DESC, h.localized_name
     """, fetch="all")
 
@@ -521,8 +523,8 @@ def get_hero_detail(hero_id: int) -> dict | None:
         # Pick/ban counts
         pb_stats = conn.execute("""
             SELECT
-                COUNT(CASE WHEN is_pick = 1 THEN 1 END) AS pick_count,
-                COUNT(CASE WHEN is_pick = 0 THEN 1 END) AS ban_count
+                COUNT(CASE WHEN is_pick IS TRUE THEN 1 END) AS pick_count,
+                COUNT(CASE WHEN is_pick IS FALSE THEN 1 END) AS ban_count
             FROM picks_bans
             WHERE hero_id = ?
         """, (hero_id,)).fetchone()
@@ -548,7 +550,7 @@ def get_hero_detail(hero_id: int) -> dict | None:
 
         conn.close()
         return result
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         conn.close()
         return None
 
@@ -570,12 +572,12 @@ def get_head_to_head(team_a: int, team_b: int) -> dict:
             SELECT
                 COUNT(*) AS total_matches,
                 SUM(CASE
-                    WHEN (m.radiant_team_id = ? AND m.radiant_win = 1)
-                      OR (m.dire_team_id = ? AND m.radiant_win = 0) THEN 1 ELSE 0
+                    WHEN (m.radiant_team_id = ? AND m.radiant_win IS TRUE)
+                      OR (m.dire_team_id = ? AND m.radiant_win IS FALSE) THEN 1 ELSE 0
                 END) AS team_a_wins,
                 SUM(CASE
-                    WHEN (m.radiant_team_id = ? AND m.radiant_win = 1)
-                      OR (m.dire_team_id = ? AND m.radiant_win = 0) THEN 1 ELSE 0
+                    WHEN (m.radiant_team_id = ? AND m.radiant_win IS TRUE)
+                      OR (m.dire_team_id = ? AND m.radiant_win IS FALSE) THEN 1 ELSE 0
                 END) AS team_b_wins,
                 AVG(m.duration) AS avg_duration
             FROM matches m
@@ -612,7 +614,7 @@ def get_head_to_head(team_a: int, team_b: int) -> dict:
 
         conn.close()
         return result
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         conn.close()
         return {
             "team_a": {"team_id": team_a, "name": None, "tag": None, "logo_url": None},

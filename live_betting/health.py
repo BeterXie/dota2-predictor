@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
+
+from database.session import PostgresSession
 
 
 HEALTH_STATUSES = {"starting", "healthy", "degraded", "unhealthy", "stopped"}
 
 
 def record_health(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     component: str,
     status: str,
     *,
@@ -32,7 +31,7 @@ def record_health(
         dict(details or {}), sort_keys=True, separators=(",", ":"), default=str
     )
     now = heartbeat_at.astimezone(timezone.utc).isoformat()
-    with _transaction(connection):
+    with connection.transaction():
         connection.execute(
             """INSERT INTO service_health
                (component, status, last_heartbeat_at, last_success_at,
@@ -60,7 +59,7 @@ def record_health(
         )
 
 
-def read_health(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+def read_health(connection: PostgresSession) -> list[dict[str, Any]]:
     rows = connection.execute(
         "SELECT * FROM service_health ORDER BY component"
     ).fetchall()
@@ -83,30 +82,5 @@ def _safe_error(value: str | None) -> str | None:
     if value is None:
         return None
     return " ".join(str(value).split())[:500]
-
-
-@contextmanager
-def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
-    if connection.in_transaction:
-        name = f"health_{uuid.uuid4().hex}"
-        connection.execute(f"SAVEPOINT {name}")
-        try:
-            yield
-        except BaseException:
-            connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-            raise
-        else:
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-        return
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
-
 
 __all__ = ["HEALTH_STATUSES", "read_health", "record_health"]

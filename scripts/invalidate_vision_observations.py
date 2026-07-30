@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,16 +14,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
-from live_betting.database_protocol import online_backup  # noqa: E402
+from database.engine import require_database_url  # noqa: E402
+from database.session import DatabaseRow  # noqa: E402
 from live_betting.storage import LiveBettingStore  # noqa: E402
 from live_betting.vision_frame_registry import (  # noqa: E402
     verify_registered_vision_frame,
 )
-from shared.sqlite import connect as connect_sqlite  # noqa: E402
 
 
 UTC = timezone.utc
@@ -37,18 +32,11 @@ def _aware_timestamp(value: str) -> str:
     return parsed.astimezone(UTC).isoformat()
 
 
-def _online_backup(database: Path, destination: Path) -> None:
-    online_backup(database, destination)
-
-
-def _earliest_captured_at(rows: list[sqlite3.Row]) -> str | None:
+def _earliest_captured_at(rows: list[DatabaseRow]) -> str | None:
     """Return the earliest valid event-time cutoff for selected frames.
 
-    SQLite compares timestamp text lexically in the invalidation queries.  The
-    watcher normally stores canonical UTC ISO values, but an operator may be
-    repairing an older database with mixed offsets or malformed data.  A bad
-    timestamp must fail closed, so ``None`` deliberately asks the dependency
-    invalidator to treat every same-map dependent as affected.
+    A bad timestamp fails closed, so ``None`` asks the dependency invalidator
+    to treat every same-map dependent as affected.
     """
     parsed: list[datetime] = []
     for row in rows:
@@ -66,20 +54,17 @@ def _earliest_captured_at(rows: list[sqlite3.Row]) -> str | None:
 
 
 def invalidate(
-    database: Path,
+    database_url: str,
     *,
     match_id: str,
     map_number: int,
     clock_seconds: int | None,
     after: str,
     reason: str,
-    backup: Path,
     dry_run: bool = False,
-    reuse_backup: bool = False,
 ) -> int:
-    database = database.resolve()
-    rows: list[sqlite3.Row]
-    with LiveBettingStore(database) as store:
+    rows: list[DatabaseRow]
+    with LiveBettingStore(database_url) as store:
         clock_filter = (
             "AND game_clock_seconds=?" if clock_seconds is not None else ""
         )
@@ -91,29 +76,18 @@ def invalidate(
             f"""SELECT raybet_match_id, captured_at, source_frame_ref
                   FROM vision_observations
                  WHERE raybet_match_id=? AND map_number=?
-                   {clock_filter} AND captured_at>? AND confirmed=1
-                 ORDER BY captured_at, source_frame_ref""",
+                   {clock_filter}
+                   AND live_text_timestamp_utc(captured_at)>
+                       live_text_timestamp_utc(?)
+                   AND confirmed=1
+                 ORDER BY live_text_timestamp_utc(captured_at), source_frame_ref""",
             parameters,
         ).fetchall()
     if dry_run or not rows:
         return len(rows)
 
-    backup = backup.resolve()
-    if reuse_backup:
-        if not backup.is_file():
-            raise ValueError("reused backup does not exist")
-        verification = connect_sqlite(backup, read_only=True)
-        try:
-            if verification.execute(
-                "SELECT COUNT(*) FROM sqlite_master"
-            ).fetchone()[0] <= 0:
-                raise RuntimeError("reused backup has no schema")
-        finally:
-            verification.close()
-    else:
-        _online_backup(database, backup)
     invalidated_at = datetime.now(UTC).isoformat()
-    with LiveBettingStore(database) as store:
+    with LiveBettingStore(database_url) as store:
         store.init_schema()
         with store.transaction():
             for row in rows:
@@ -154,14 +128,14 @@ def invalidate(
 
 
 def freeze_draft_map(
-    database: Path,
+    database_url: str,
     *,
     match_id: str,
     map_number: int,
     reason: str,
 ) -> int:
     recorded_at = datetime.now(UTC).isoformat()
-    with LiveBettingStore(database.resolve()) as store:
+    with LiveBettingStore(database_url) as store:
         store.init_schema()
         rows = store.connection.execute(
             """SELECT observation.captured_at, observation.source_frame_ref,
@@ -182,7 +156,7 @@ def freeze_draft_map(
                   )""",
             (match_id, map_number),
         ).fetchall()
-        valid: list[tuple[sqlite3.Row, str, datetime]] = []
+        valid: list[tuple[DatabaseRow, str, datetime]] = []
         for row in rows:
             try:
                 verify_registered_vision_frame(
@@ -231,12 +205,13 @@ def freeze_draft_map(
         first, first_hash, _first_captured_at = valid[0]
         with store.transaction():
             store.connection.execute(
-                """INSERT OR IGNORE INTO vision_draft_anchors
+                """INSERT INTO vision_draft_anchors
                    (raybet_match_id, map_number, draft_hash,
                     radiant_hero_ids, dire_hero_ids, radiant_team_side,
                     team_side_anchored_at, team_side_source_frame_ref,
                     anchored_at, source_frame_ref, status, conflict_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'anchored', NULL)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'anchored', NULL)
+                   ON CONFLICT DO NOTHING""",
                 (
                     match_id,
                     map_number,
@@ -268,12 +243,13 @@ def freeze_draft_map(
                 )
             for row, draft_hash, _captured_at in valid:
                 store.connection.execute(
-                    """INSERT OR IGNORE INTO vision_draft_conflicts
+                    """INSERT INTO vision_draft_conflicts
                        (raybet_match_id, map_number, captured_at,
                         source_frame_ref, observed_draft_hash,
                         radiant_hero_ids, dire_hero_ids,
                         observed_radiant_team_side, reason, recorded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT DO NOTHING""",
                     (
                         match_id,
                         map_number,
@@ -306,14 +282,15 @@ def freeze_draft_map(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--match-id", required=True)
     parser.add_argument("--map-number", type=int, required=True)
     parser.add_argument("--clock-seconds", type=int)
     parser.add_argument("--after", type=_aware_timestamp, required=True)
     parser.add_argument("--reason", required=True)
-    parser.add_argument("--backup", type=Path, required=True)
-    parser.add_argument("--reuse-backup", action="store_true")
     parser.add_argument("--freeze-draft", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -321,28 +298,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    with database_writer_authority(args.database):
-        count = invalidate(
-            args.database,
+    database_url = require_database_url(args.database_url)
+    count = invalidate(
+            database_url,
             match_id=args.match_id,
             map_number=args.map_number,
             clock_seconds=args.clock_seconds,
             after=args.after,
             reason=args.reason,
-            backup=args.backup,
             dry_run=args.dry_run,
-            reuse_backup=args.reuse_backup,
         )
-        draft_rows = (
-            freeze_draft_map(
-                args.database,
-                match_id=args.match_id,
-                map_number=args.map_number,
-                reason=args.reason,
-            )
-            if args.freeze_draft and not args.dry_run
-            else 0
+    draft_rows = (
+        freeze_draft_map(
+            database_url,
+            match_id=args.match_id,
+            map_number=args.map_number,
+            reason=args.reason,
         )
+        if args.freeze_draft and not args.dry_run
+        else 0
+    )
     print(
         json.dumps(
             {

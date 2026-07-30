@@ -1,76 +1,57 @@
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-
 import pytest
 
 from fetch import main as fetch_main
-from live_betting.service_coordination import SingleInstanceLock
 
 
-def test_fetch_uses_explicit_database_and_holds_standard_lock(
-    tmp_path: Path,
+POSTGRES_URL = (
+    "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
+)
+
+
+def test_fetch_passes_explicit_postgres_url_to_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = tmp_path / "candidate.db"
-    sqlite3.connect(database).close()
-    observed: list[Path] = []
+    observed: list[tuple[dict[str, object], bool, int | None, str | None]] = []
 
     async def run(
-        _config: dict[str, object],
-        _force: bool,
-        _match_id: int | None,
-        database_path: str | Path | None = None,
+        config: dict[str, object],
+        force: bool,
+        match_id: int | None,
+        database_url: str | None = None,
     ) -> None:
-        assert database_path is not None
-        selected = Path(database_path).resolve()
-        observed.append(selected)
-        with pytest.raises(RuntimeError, match="already held"):
-            with SingleInstanceLock(selected.with_suffix(".service.lock")):
-                pass
+        observed.append((config, force, match_id, database_url))
 
-    monkeypatch.setattr(fetch_main, "load_config", lambda: {})
+    monkeypatch.setattr(fetch_main, "load_config", lambda: {"leagues": []})
     monkeypatch.setattr(fetch_main, "run", run)
 
-    fetch_main.main(["--database", str(database), "--match-id", "42"])
+    fetch_main.main(
+        ["--database-url", POSTGRES_URL, "--match-id", "42", "--force"]
+    )
 
-    assert observed == [database.resolve()]
-    with SingleInstanceLock(database.with_suffix(".service.lock")):
-        pass
+    assert observed == [({"leagues": []}, True, 42, POSTGRES_URL)]
 
 
-def test_fetch_rejects_supervisor_lock_before_running(
-    tmp_path: Path,
+def test_fetch_database_url_precedence_is_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = tmp_path / "locked.db"
-    sqlite3.connect(database).close()
-    called = False
+    environment_url = POSTGRES_URL.replace("dota2_predictor", "environment")
+    configured_url = POSTGRES_URL.replace("dota2_predictor", "configured")
+    explicit_url = POSTGRES_URL.replace("dota2_predictor", "explicit")
+    monkeypatch.setenv("DATABASE_URL", environment_url)
 
-    async def run(*_: object, **__: object) -> None:
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(fetch_main, "load_config", lambda: {})
-    monkeypatch.setattr(fetch_main, "run", run)
-
-    with SingleInstanceLock(database.with_suffix(".service.lock")):
-        with pytest.raises(RuntimeError, match="already held"):
-            fetch_main.main(["--database", str(database)])
-
-    assert not called
+    assert fetch_main.resolve_database_url(
+        {"database_url": configured_url}, explicit_url
+    ) == explicit_url
+    assert fetch_main.resolve_database_url(
+        {"database_url": configured_url}
+    ) == configured_url
+    assert fetch_main.resolve_database_url({}) == environment_url
 
 
-def test_fetch_rejects_duplicate_database_before_loading_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def load() -> dict[str, object]:
-        raise AssertionError("config loaded")
-
-    monkeypatch.setattr(fetch_main, "load_config", load)
-
-    with pytest.raises(SystemExit):
-        fetch_main.main(
-            ["--database=first.db", "--database", "second.db"]
+def test_fetch_rejects_sqlite_runtime_url() -> None:
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        fetch_main.resolve_database_url(
+            {"database_url": "sqlite:///data/dota2.db"}
         )

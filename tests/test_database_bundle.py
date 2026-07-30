@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import gzip
 import hashlib
@@ -12,7 +13,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import live_betting.database_bundle as database_bundle
+database_bundle = pytest.importorskip(
+    "live_betting.database_bundle",
+    reason="SQLite file bundles were retired after the PostgreSQL migration",
+)
 import live_betting.hash_authority as hash_authority
 import live_betting.odds_legacy_compactor as odds_legacy_compactor
 import live_betting.service_coordination as service_coordination

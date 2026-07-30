@@ -1,4 +1,4 @@
-"""SQLite persistence for live collection and shadow orders."""
+"""PostgreSQL persistence for live collection and shadow orders."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ import gzip
 import json
 import math
 import re
-import sqlite3
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -16,13 +14,18 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from database.engine import build_engine
+from database.session import DatabaseResult, DatabaseRow, PostgresSession
+
 from event_intelligence.raw_archive import (
     ArtifactReceipt,
     RawArchive,
     canonical_json_value_bytes,
     schema_fingerprint,
 )
-from shared.sqlite import execute_script
 
 from .draft_authority import (
     DraftLandmarkAuthority,
@@ -74,78 +77,10 @@ from .vision_frame_registry import (
 
 
 CURRENT_SCHEMA_VERSION = 12
+ALEMBIC_HEAD = "20260730_0017"
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 ROSH_LINEUP_CACHE_TTL = timedelta(minutes=15)
 ROSH_FETCH_MAX_DURATION = timedelta(minutes=10)
-
-_SHADOW_ORDER_STAKE_CHECK = re.compile(
-    r"\bstake\s+REAL\s+NOT\s+NULL\s+CHECK\s*\(\s*"
-    r"stake\s*>\s*0\.0\s+AND\s+stake\s*<=\s*1\.0\s*\)",
-    re.IGNORECASE,
-)
-_SHADOW_ORDER_COLUMNS = (
-    "order_key",
-    "raybet_match_id",
-    "strict_mapping_id",
-    "odds_id",
-    "market_key",
-    "signaled_at",
-    "model_probability",
-    "market_probability",
-    "signal_price",
-    "signal_transport_key",
-    "signal_transport_at",
-    "expires_at",
-    "signal_odds_group_id",
-    "signal_outcome_key",
-    "signal_identity_verified",
-    "stake",
-    "status",
-    "fill_price",
-    "filled_at",
-    "rejection_reason",
-    "draft_curve_key",
-    "draft_source_ref",
-    "draft_landmark_key",
-    "draft_landmark_horizon_minutes",
-    "draft_landmark_target",
-    "draft_landmark_radiant_probability",
-    "draft_landmark_quality",
-    "draft_landmark_uncertainty",
-    "draft_landmark_support",
-    "draft_radiant_team_side",
-    "draft_strict_mapping_id",
-    "draft_deployment_key",
-    "draft_target_snapshot_hash",
-    "draft_feature_hash",
-    "draft_model_hash",
-    "draft_calibration_hash",
-    "draft_model_version",
-    "draft_global_gate_ref",
-    "draft_input_snapshot_hash",
-    "draft_authority_revision",
-    "draft_dependency_revision",
-    "vision_raybet_match_id",
-    "vision_map_number",
-    "vision_captured_at",
-    "vision_source_frame_ref",
-    "vision_source_frame_sha256",
-    "vision_source_frame_bytes",
-    "vision_observed_game_clock_seconds",
-    "vision_aligned_game_clock_seconds",
-    "vision_is_paused",
-    "vision_radiant_hero_ids_json",
-    "vision_dire_hero_ids_json",
-    "vision_radiant_team_side",
-    "vision_clock_confidence",
-    "vision_draft_confidence",
-    "vision_screen_state",
-    "vision_confirmed",
-    "vision_transport_key",
-    "vision_transport_at",
-    "vision_alignment_method",
-    "vision_alignment_lag_seconds",
-)
 
 _SCORED_DECISION_CONTRIBUTION_KEYS = frozenset(
     {
@@ -166,16 +101,6 @@ _DIRECT_RESPONSE_ENDPOINTS = {
     "final_odds": "https://raybet.local/v2/odds",
 }
 
-
-def shadow_order_stake_schema_requires_rebuild(
-    connection: sqlite3.Connection,
-) -> bool:
-    row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='shadow_orders'"
-    ).fetchone()
-    if row is None:
-        return False
-    return _SHADOW_ORDER_STAKE_CHECK.search(str(row[0] or "")) is None
 
 _DRAFT_AUTHORITY_COLUMNS = (
     "draft_curve_key",
@@ -201,75 +126,6 @@ _DRAFT_AUTHORITY_COLUMNS = (
     "draft_dependency_revision",
 )
 
-_DRAFT_AUTHORITY_ADDITIONS = {
-    "draft_curve_key": "TEXT REFERENCES prospective_draft_curves(curve_key)",
-    "draft_source_ref": "TEXT",
-    "draft_landmark_key": (
-        "TEXT REFERENCES prospective_draft_landmarks(landmark_key)"
-    ),
-    "draft_landmark_horizon_minutes": (
-        "INTEGER CHECK (draft_landmark_horizon_minutes IS NULL OR "
-        "draft_landmark_horizon_minutes IN (10, 20, 30, 40, 50))"
-    ),
-    "draft_landmark_target": (
-        "TEXT CHECK (draft_landmark_target IS NULL OR "
-        "draft_landmark_target='radiant_win')"
-    ),
-    "draft_landmark_radiant_probability": (
-        "REAL CHECK (draft_landmark_radiant_probability IS NULL OR "
-        "draft_landmark_radiant_probability BETWEEN 0.0 AND 1.0)"
-    ),
-    "draft_landmark_quality": (
-        "REAL CHECK (draft_landmark_quality IS NULL OR "
-        "draft_landmark_quality BETWEEN 0.0 AND 1.0)"
-    ),
-    "draft_landmark_uncertainty": (
-        "REAL CHECK (draft_landmark_uncertainty IS NULL OR "
-        "draft_landmark_uncertainty BETWEEN 0.0 AND 0.5)"
-    ),
-    "draft_landmark_support": (
-        "INTEGER CHECK (draft_landmark_support IS NULL OR "
-        "draft_landmark_support>=100)"
-    ),
-    "draft_radiant_team_side": (
-        "TEXT CHECK (draft_radiant_team_side IS NULL OR "
-        "draft_radiant_team_side IN ('team_one', 'team_two'))"
-    ),
-    "draft_strict_mapping_id": (
-        "INTEGER CHECK (draft_strict_mapping_id IS NULL OR "
-        "draft_strict_mapping_id>0) "
-        "REFERENCES strict_live_map_mappings(mapping_id)"
-    ),
-    "draft_deployment_key": (
-        "TEXT REFERENCES draft_deployment_bundles(deployment_key)"
-    ),
-    "draft_target_snapshot_hash": (
-        "TEXT CHECK (draft_target_snapshot_hash IS NULL OR "
-        "length(draft_target_snapshot_hash)=64)"
-    ),
-    "draft_feature_hash": (
-        "TEXT CHECK (draft_feature_hash IS NULL OR length(draft_feature_hash)=64)"
-    ),
-    "draft_model_hash": "TEXT REFERENCES draft_model_artifacts(model_hash)",
-    "draft_calibration_hash": (
-        "TEXT REFERENCES draft_calibration_artifacts(calibration_hash)"
-    ),
-    "draft_model_version": "TEXT",
-    "draft_global_gate_ref": "TEXT",
-    "draft_input_snapshot_hash": (
-        "TEXT CHECK (draft_input_snapshot_hash IS NULL OR "
-        "length(draft_input_snapshot_hash)=64)"
-    ),
-    "draft_authority_revision": (
-        "INTEGER CHECK (draft_authority_revision IS NULL OR "
-        "draft_authority_revision>=1)"
-    ),
-    "draft_dependency_revision": (
-        "INTEGER CHECK (draft_dependency_revision IS NULL OR "
-        "draft_dependency_revision>=1)"
-    ),
-}
-
 _VISION_AUTHORITY_COLUMNS = (
     "vision_raybet_match_id",
     "vision_map_number",
@@ -292,69 +148,6 @@ _VISION_AUTHORITY_COLUMNS = (
     "vision_alignment_method",
     "vision_alignment_lag_seconds",
 )
-
-_VISION_AUTHORITY_ADDITIONS = {
-    "vision_raybet_match_id": "TEXT",
-    "vision_map_number": (
-        "INTEGER CHECK (vision_map_number IS NULL OR vision_map_number>0)"
-    ),
-    "vision_captured_at": "TEXT",
-    "vision_source_frame_ref": "TEXT",
-    "vision_source_frame_sha256": (
-        "TEXT CHECK (vision_source_frame_sha256 IS NULL OR "
-        "length(vision_source_frame_sha256)=64)"
-    ),
-    "vision_source_frame_bytes": (
-        "INTEGER CHECK (vision_source_frame_bytes IS NULL OR "
-        "vision_source_frame_bytes>0)"
-    ),
-    "vision_observed_game_clock_seconds": (
-        "INTEGER CHECK (vision_observed_game_clock_seconds IS NULL OR "
-        "vision_observed_game_clock_seconds>=0)"
-    ),
-    "vision_aligned_game_clock_seconds": (
-        "INTEGER CHECK (vision_aligned_game_clock_seconds IS NULL OR "
-        "vision_aligned_game_clock_seconds>=0)"
-    ),
-    "vision_is_paused": (
-        "INTEGER CHECK (vision_is_paused IS NULL OR vision_is_paused IN (0, 1))"
-    ),
-    "vision_radiant_hero_ids_json": (
-        "TEXT CHECK (vision_radiant_hero_ids_json IS NULL OR "
-        "json_valid(vision_radiant_hero_ids_json))"
-    ),
-    "vision_dire_hero_ids_json": (
-        "TEXT CHECK (vision_dire_hero_ids_json IS NULL OR "
-        "json_valid(vision_dire_hero_ids_json))"
-    ),
-    "vision_radiant_team_side": (
-        "TEXT CHECK (vision_radiant_team_side IS NULL OR "
-        "vision_radiant_team_side IN ('team_one', 'team_two'))"
-    ),
-    "vision_clock_confidence": (
-        "REAL CHECK (vision_clock_confidence IS NULL OR "
-        "vision_clock_confidence BETWEEN 0.0 AND 1.0)"
-    ),
-    "vision_draft_confidence": (
-        "REAL CHECK (vision_draft_confidence IS NULL OR "
-        "vision_draft_confidence BETWEEN 0.0 AND 1.0)"
-    ),
-    "vision_screen_state": "TEXT",
-    "vision_confirmed": (
-        "INTEGER CHECK (vision_confirmed IS NULL OR vision_confirmed IN (0, 1))"
-    ),
-    "vision_transport_key": "TEXT",
-    "vision_transport_at": "TEXT",
-    "vision_alignment_method": (
-        "TEXT CHECK (vision_alignment_method IS NULL OR "
-        "vision_alignment_method IN ('anchor', 'forward_projection'))"
-    ),
-    "vision_alignment_lag_seconds": (
-        "REAL CHECK (vision_alignment_lag_seconds IS NULL OR "
-        "vision_alignment_lag_seconds BETWEEN 0.0 AND 15.0)"
-    ),
-}
-
 
 @dataclass(frozen=True)
 class VisionDecisionAuthority:
@@ -484,7 +277,7 @@ def _contract_identity(value: Any) -> tuple[str, str, str] | None:
 
 
 def _load_odds_raw_artifact(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raw_archive_root: Path,
     artifact_hash: str,
 ) -> Any:
@@ -517,7 +310,7 @@ def _load_odds_raw_artifact(
 
 
 def read_browser_event_payload(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raw_archive_root: str | Path,
     event_id: str,
 ) -> dict[str, Any]:
@@ -588,7 +381,7 @@ def _vision_hero_ids(value: object) -> tuple[int, ...] | None:
     return heroes
 
 
-def _trusted_vision_row(row: sqlite3.Row) -> bool:
+def _trusted_vision_row(row: DatabaseRow) -> bool:
     radiant = _vision_hero_ids(row["radiant_hero_ids"])
     dire = _vision_hero_ids(row["dire_hero_ids"])
     if radiant is None or dire is None:
@@ -628,7 +421,7 @@ def _trusted_vision_row(row: sqlite3.Row) -> bool:
 
 
 def _vision_authority_from_decision_row(
-    row: sqlite3.Row,
+    row: DatabaseRow,
 ) -> VisionDecisionAuthority | None:
     if any(row[name] is None for name in _VISION_AUTHORITY_COLUMNS):
         return None
@@ -663,3487 +456,8 @@ def _vision_authority_from_decision_row(
         return None
 
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS live_schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS draft_lineage_revisions (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
-    artifact_revision INTEGER NOT NULL CHECK (artifact_revision >= 1),
-    updated_at TEXT NOT NULL
-);
-INSERT OR IGNORE INTO draft_lineage_revisions
-    (singleton, dependency_revision, artifact_revision, updated_at)
-VALUES (1, 1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-CREATE TABLE IF NOT EXISTS draft_authority_revisions (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
-    updated_at TEXT NOT NULL
-);
-INSERT OR IGNORE INTO draft_authority_revisions
-    (singleton, authority_revision, updated_at)
-VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-CREATE TABLE IF NOT EXISTS provider_matches (
-    provider TEXT NOT NULL,
-    provider_match_id TEXT NOT NULL,
-    tournament TEXT,
-    team_one TEXT,
-    team_two TEXT,
-    scheduled_at TEXT,
-    best_of INTEGER,
-    status TEXT,
-    raw_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (provider, provider_match_id)
-);
-CREATE TABLE IF NOT EXISTS raybet_matches (
-    raybet_match_id TEXT PRIMARY KEY,
-    tournament TEXT,
-    team_one TEXT,
-    team_two TEXT,
-    scheduled_at TEXT,
-    best_of INTEGER,
-    status TEXT,
-    live_url TEXT,
-    raw_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_raybet_matches_status_updated
-    ON raybet_matches(status, updated_at DESC, raybet_match_id DESC);
-CREATE INDEX IF NOT EXISTS idx_raybet_matches_updated
-    ON raybet_matches(updated_at DESC, raybet_match_id DESC);
-CREATE INDEX IF NOT EXISTS idx_raybet_matches_schedule_utc
-    ON raybet_matches(
-        (CASE
-            WHEN length(scheduled_at)=19
-             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-             AND strftime(
-                 '%Y-%m-%d %H:%M:%S',
-                 julianday(scheduled_at)
-             )=scheduled_at
-            THEN julianday(scheduled_at, '-8 hours')
-            WHEN length(scheduled_at)=25
-             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-             AND strftime(
-                 '%Y-%m-%dT%H:%M:%S+00:00',
-                 julianday(scheduled_at)
-             )=scheduled_at
-            THEN julianday(scheduled_at)
-            ELSE NULL
-         END),
-        raybet_match_id
-    );
-CREATE INDEX IF NOT EXISTS idx_raybet_matches_ended_schedule_review
-    ON raybet_matches(
-        (CASE
-            WHEN length(scheduled_at)=19
-             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-             AND strftime(
-                 '%Y-%m-%d %H:%M:%S',
-                 julianday(scheduled_at)
-             )=scheduled_at
-            THEN julianday(scheduled_at, '-8 hours')
-            WHEN length(scheduled_at)=25
-             AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-             AND strftime(
-                 '%Y-%m-%dT%H:%M:%S+00:00',
-                 julianday(scheduled_at)
-             )=scheduled_at
-            THEN julianday(scheduled_at)
-            ELSE NULL
-         END),
-        updated_at DESC,
-        raybet_match_id DESC
-    )
-    WHERE lower(status) IN
-        ('3', '5', 'closed', 'ended', 'finished', 'settled')
-      AND scheduled_at IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_raybet_matches_timeline
-    ON raybet_matches(
-        CAST(COALESCE(
-            (CASE
-                WHEN length(scheduled_at)=19
-                 AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-                 AND strftime(
-                     '%Y-%m-%d %H:%M:%S',
-                     julianday(scheduled_at)
-                 )=scheduled_at
-                THEN julianday(scheduled_at, '-8 hours')
-                WHEN length(scheduled_at)=25
-                 AND substr(scheduled_at, 1, 4) BETWEEN '1000' AND '9999'
-                 AND strftime(
-                     '%Y-%m-%dT%H:%M:%S+00:00',
-                     julianday(scheduled_at)
-                 )=scheduled_at
-                THEN julianday(scheduled_at)
-                ELSE NULL
-             END),
-            julianday(updated_at),
-            0
-        ) * 86400000 AS INTEGER) DESC,
-        raybet_match_id DESC
-    );
-CREATE TABLE IF NOT EXISTS match_links (
-    raybet_match_id TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    provider_match_id TEXT NOT NULL,
-    confidence REAL NOT NULL,
-    status TEXT NOT NULL,
-    reason TEXT,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (raybet_match_id, provider)
-);
-CREATE TABLE IF NOT EXISTS odds_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    raybet_match_id TEXT NOT NULL,
-    odds_id TEXT NOT NULL,
-    odds_group_id TEXT,
-    received_at TEXT NOT NULL,
-    price REAL NOT NULL,
-    status TEXT,
-    market_type TEXT NOT NULL,
-    period TEXT NOT NULL,
-    side TEXT,
-    line REAL,
-    outcome_key TEXT NOT NULL,
-    supported INTEGER NOT NULL,
-    last_update TEXT,
-    raw_json TEXT NOT NULL,
-    UNIQUE (raybet_match_id, odds_id, received_at)
-);
-CREATE INDEX IF NOT EXISTS idx_live_odds_match_time
-    ON odds_snapshots(raybet_match_id, received_at);
-CREATE TABLE IF NOT EXISTS odds_raw_artifacts (
-    artifact_hash TEXT PRIMARY KEY CHECK (length(artifact_hash)=64),
-    source TEXT NOT NULL CHECK (source='raybet'),
-    storage_path TEXT NOT NULL,
-    uncompressed_bytes INTEGER NOT NULL CHECK (uncompressed_bytes>=2),
-    compressed_bytes INTEGER NOT NULL CHECK (compressed_bytes>0),
-    schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint)=64)
-);
-CREATE TRIGGER IF NOT EXISTS odds_raw_artifacts_immutable_update
-BEFORE UPDATE ON odds_raw_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'odds raw artifact is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_raw_artifacts_immutable_delete
-BEFORE DELETE ON odds_raw_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'odds raw artifact is immutable');
-END;
-CREATE TABLE IF NOT EXISTS direct_response_audit (
-    audit_key TEXT PRIMARY KEY CHECK (length(audit_key)=64),
-    source TEXT NOT NULL CHECK (source='direct'),
-    response_kind TEXT NOT NULL CHECK (response_kind IN (
-        'live_match_list', 'completed_match_list', 'live_odds',
-        'completed_odds', 'final_odds'
-    )),
-    observed_at TEXT NOT NULL,
-    claimed_raybet_match_id TEXT,
-    observed_raybet_match_id TEXT,
-    endpoint TEXT NOT NULL CHECK (length(trim(endpoint))>0),
-    request_identity TEXT NOT NULL CHECK (length(trim(request_identity))>0),
-    http_status INTEGER CHECK (
-        http_status IS NULL OR http_status BETWEEN 100 AND 599
-    ),
-    provider_code INTEGER,
-    request_metadata_json TEXT NOT NULL DEFAULT '{}'
-        CHECK (json_valid(request_metadata_json)
-               AND json_type(request_metadata_json)='object'),
-    payload_kind TEXT NOT NULL DEFAULT 'provider_response'
-        CHECK (payload_kind IN (
-            'provider_response', 'request_failure', 'aggregate'
-        )),
-    sanitized INTEGER NOT NULL DEFAULT 1 CHECK (sanitized IN (0, 1)),
-    disposition TEXT NOT NULL CHECK (
-        disposition IN ('accepted', 'rejected', 'audit_only')
-    ),
-    reason TEXT NOT NULL,
-    artifact_hash TEXT NOT NULL REFERENCES odds_raw_artifacts(artifact_hash)
-);
-CREATE INDEX IF NOT EXISTS idx_direct_response_audit_kind_time
-    ON direct_response_audit(response_kind, observed_at);
-CREATE INDEX IF NOT EXISTS idx_direct_response_audit_match_time
-    ON direct_response_audit(claimed_raybet_match_id, observed_at);
-CREATE TRIGGER IF NOT EXISTS direct_response_audit_immutable_update
-BEFORE UPDATE ON direct_response_audit
-BEGIN
-    SELECT RAISE(ABORT, 'direct response audit is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS direct_response_audit_immutable_delete
-BEFORE DELETE ON direct_response_audit
-BEGIN
-    SELECT RAISE(ABORT, 'direct response audit is immutable');
-END;
-CREATE TABLE IF NOT EXISTS browser_events (
-    event_id TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL,
-    capture_session_id TEXT NOT NULL,
-    captured_at TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    transport TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    raybet_match_id TEXT,
-    game_id INTEGER,
-    page_origin TEXT NOT NULL,
-    page_path TEXT NOT NULL,
-    source_path TEXT NOT NULL,
-    payload_hash TEXT NOT NULL,
-    payload_bytes INTEGER NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_artifact_hash TEXT REFERENCES odds_raw_artifacts(artifact_hash),
-    payload_storage TEXT NOT NULL DEFAULT 'legacy_inline'
-        CHECK (payload_storage IN ('external', 'legacy_inline')),
-    capture_reason TEXT,
-    extension_version TEXT NOT NULL,
-    recognized INTEGER NOT NULL,
-    processing_status TEXT NOT NULL,
-    processing_reason TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_browser_events_match_time
-    ON browser_events(raybet_match_id, captured_at);
-CREATE INDEX IF NOT EXISTS idx_browser_events_type_time
-    ON browser_events(event_type, captured_at);
-CREATE TRIGGER IF NOT EXISTS browser_events_immutable
-BEFORE UPDATE ON browser_events
-WHEN OLD.event_id IS NOT NEW.event_id
-  OR OLD.schema_version IS NOT NEW.schema_version
-  OR OLD.capture_session_id IS NOT NEW.capture_session_id
-  OR OLD.captured_at IS NOT NEW.captured_at
-  OR OLD.received_at IS NOT NEW.received_at
-  OR OLD.transport IS NOT NEW.transport
-  OR OLD.event_type IS NOT NEW.event_type
-  OR OLD.raybet_match_id IS NOT NEW.raybet_match_id
-  OR OLD.game_id IS NOT NEW.game_id
-  OR OLD.page_origin IS NOT NEW.page_origin
-  OR OLD.page_path IS NOT NEW.page_path
-  OR OLD.source_path IS NOT NEW.source_path
-  OR OLD.payload_hash IS NOT NEW.payload_hash
-  OR OLD.payload_bytes IS NOT NEW.payload_bytes
-  OR OLD.payload_json IS NOT NEW.payload_json
-  OR OLD.payload_artifact_hash IS NOT NEW.payload_artifact_hash
-  OR OLD.payload_storage IS NOT NEW.payload_storage
-  OR OLD.capture_reason IS NOT NEW.capture_reason
-  OR OLD.extension_version IS NOT NEW.extension_version
-  OR OLD.recognized IS NOT NEW.recognized
-BEGIN
-    SELECT RAISE(ABORT, 'browser event payload is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS browser_events_require_external_payload
-BEFORE INSERT ON browser_events
-WHEN NEW.payload_storage!='external'
-  OR NEW.payload_artifact_hash IS NULL
-  OR NEW.payload_json!='{}'
-BEGIN
-    SELECT RAISE(ABORT, 'browser event external payload authority is required');
-END;
-CREATE TABLE IF NOT EXISTS odds_response_states (
-    response_state_hash TEXT PRIMARY KEY CHECK (length(response_state_hash)=64),
-    raybet_match_id TEXT NOT NULL,
-    normalized_state_hash TEXT NOT NULL CHECK (length(normalized_state_hash)=64),
-    normalized_state_hash_version INTEGER NOT NULL DEFAULT 1
-        CHECK (normalized_state_hash_version IN (1, 2)),
-    original_legacy_normalized_state_hash TEXT CHECK (
-        original_legacy_normalized_state_hash IS NULL OR
-        length(original_legacy_normalized_state_hash)=64
-    ),
-    outcome_count INTEGER NOT NULL CHECK (outcome_count>=0)
-);
-CREATE INDEX IF NOT EXISTS idx_odds_response_states_normalized
-    ON odds_response_states(raybet_match_id, normalized_state_hash);
-CREATE TRIGGER IF NOT EXISTS odds_response_states_immutable_update
-BEFORE UPDATE ON odds_response_states
-BEGIN
-    SELECT RAISE(ABORT, 'odds response state is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_response_states_immutable_delete
-BEFORE DELETE ON odds_response_states
-BEGIN
-    SELECT RAISE(ABORT, 'odds response state is immutable');
-END;
-CREATE TABLE IF NOT EXISTS odds_response_state_outcomes (
-    response_state_hash TEXT NOT NULL,
-    odds_id TEXT NOT NULL,
-    odds_group_id TEXT,
-    price REAL NOT NULL,
-    status TEXT,
-    market_type TEXT NOT NULL,
-    period TEXT NOT NULL,
-    side TEXT,
-    line REAL,
-    outcome_key TEXT NOT NULL,
-    supported INTEGER NOT NULL CHECK (supported IN (0, 1)),
-    last_update TEXT,
-    PRIMARY KEY (response_state_hash, odds_id),
-    FOREIGN KEY (response_state_hash)
-        REFERENCES odds_response_states(response_state_hash)
-);
-CREATE TRIGGER IF NOT EXISTS odds_response_state_outcomes_immutable_update
-BEFORE UPDATE ON odds_response_state_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'odds response state outcome is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_response_state_outcomes_immutable_delete
-BEFORE DELETE ON odds_response_state_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'odds response state outcome is immutable');
-END;
-CREATE TABLE IF NOT EXISTS odds_transport_observations (
-    observation_key TEXT PRIMARY KEY,
-    source TEXT NOT NULL CHECK (source IN ('direct', 'browser')),
-    source_event_id TEXT,
-    raybet_match_id TEXT NOT NULL,
-    observed_at TEXT NOT NULL,
-    normalized_state_hash TEXT NOT NULL,
-    normalized_state_hash_version INTEGER NOT NULL DEFAULT 1
-        CHECK (normalized_state_hash_version IN (1, 2)),
-    original_legacy_normalized_state_hash TEXT CHECK (
-        original_legacy_normalized_state_hash IS NULL OR
-        length(original_legacy_normalized_state_hash)=64
-    ),
-    response_state_hash TEXT,
-    response_artifact_hash TEXT,
-    timing_status TEXT NOT NULL,
-    processing_status TEXT NOT NULL,
-    normalized_change_count INTEGER NOT NULL,
-    FOREIGN KEY (source_event_id) REFERENCES browser_events(event_id),
-    FOREIGN KEY (response_state_hash)
-        REFERENCES odds_response_states(response_state_hash),
-    FOREIGN KEY (response_artifact_hash)
-        REFERENCES odds_raw_artifacts(artifact_hash)
-);
-CREATE INDEX IF NOT EXISTS idx_odds_transport_match_time
-    ON odds_transport_observations(raybet_match_id, observed_at);
-CREATE INDEX IF NOT EXISTS idx_odds_transport_hash_time
-    ON odds_transport_observations(normalized_state_hash, observed_at);
-CREATE TABLE IF NOT EXISTS raybet_match_odds_activity (
-    raybet_match_id TEXT PRIMARY KEY,
-    latest_odds_activity_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_raybet_match_odds_activity_time
-    ON raybet_match_odds_activity(
-        latest_odds_activity_at DESC,
-        raybet_match_id DESC
-    );
-CREATE TRIGGER IF NOT EXISTS raybet_match_activity_from_transport
-AFTER INSERT ON odds_transport_observations
-WHEN julianday(NEW.observed_at) IS NOT NULL
-BEGIN
-    INSERT INTO raybet_match_odds_activity
-        (raybet_match_id, latest_odds_activity_at)
-    VALUES (NEW.raybet_match_id, NEW.observed_at)
-    ON CONFLICT(raybet_match_id) DO UPDATE SET
-        latest_odds_activity_at=excluded.latest_odds_activity_at
-    WHERE julianday(excluded.latest_odds_activity_at)>
-          julianday(raybet_match_odds_activity.latest_odds_activity_at);
-END;
-CREATE TRIGGER IF NOT EXISTS raybet_match_activity_from_snapshot
-AFTER INSERT ON odds_snapshots
-WHEN julianday(NEW.received_at) IS NOT NULL
-BEGIN
-    INSERT INTO raybet_match_odds_activity
-        (raybet_match_id, latest_odds_activity_at)
-    VALUES (NEW.raybet_match_id, NEW.received_at)
-    ON CONFLICT(raybet_match_id) DO UPDATE SET
-        latest_odds_activity_at=excluded.latest_odds_activity_at
-    WHERE julianday(excluded.latest_odds_activity_at)>
-          julianday(raybet_match_odds_activity.latest_odds_activity_at);
-END;
-CREATE TRIGGER IF NOT EXISTS odds_transport_observations_guard_update
-BEFORE UPDATE ON odds_transport_observations
-WHEN OLD.observation_key IS NOT NEW.observation_key
-  OR OLD.source IS NOT NEW.source
-  OR OLD.source_event_id IS NOT NEW.source_event_id
-  OR OLD.raybet_match_id IS NOT NEW.raybet_match_id
-  OR OLD.observed_at IS NOT NEW.observed_at
-  OR OLD.normalized_state_hash IS NOT NEW.normalized_state_hash
-  OR OLD.normalized_state_hash_version IS NOT NEW.normalized_state_hash_version
-  OR OLD.original_legacy_normalized_state_hash
-       IS NOT NEW.original_legacy_normalized_state_hash
-  OR OLD.response_state_hash IS NOT NEW.response_state_hash
-  OR OLD.response_artifact_hash IS NOT NEW.response_artifact_hash
-  OR OLD.timing_status IS NOT NEW.timing_status
-  OR NOT (
-      (OLD.processing_status IS NEW.processing_status
-       AND OLD.normalized_change_count IS NEW.normalized_change_count)
-      OR (OLD.processing_status='processing'
-          AND NEW.processing_status='processed'
-          AND OLD.normalized_change_count=0
-          AND NEW.normalized_change_count>=0)
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'odds transport observation is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_transport_observations_require_v2_state
-BEFORE INSERT ON odds_transport_observations
-WHEN NEW.response_state_hash IS NULL
-  OR NEW.response_artifact_hash IS NULL
-  OR NEW.normalized_state_hash_version!=2
-  OR NEW.original_legacy_normalized_state_hash IS NOT NULL
-  OR NOT EXISTS (
-      SELECT 1 FROM odds_response_states AS state
-       WHERE state.response_state_hash=NEW.response_state_hash
-         AND state.raybet_match_id=NEW.raybet_match_id
-         AND state.normalized_state_hash=NEW.normalized_state_hash
-         AND state.normalized_state_hash_version=2
-         AND state.original_legacy_normalized_state_hash IS NULL
-  )
-  OR NOT EXISTS (
-      SELECT 1 FROM odds_raw_artifacts AS artifact
-       WHERE artifact.artifact_hash=NEW.response_artifact_hash
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'odds transport v2 response authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_transport_observations_immutable_delete
-BEFORE DELETE ON odds_transport_observations
-BEGIN
-    SELECT RAISE(ABORT, 'odds transport observation is immutable');
-END;
-CREATE TABLE IF NOT EXISTS odds_response_outcomes (
-    observation_key TEXT NOT NULL,
-    raybet_match_id TEXT NOT NULL,
-    odds_id TEXT NOT NULL,
-    odds_group_id TEXT,
-    received_at TEXT NOT NULL,
-    price REAL NOT NULL,
-    status TEXT,
-    market_type TEXT NOT NULL,
-    period TEXT NOT NULL,
-    side TEXT,
-    line REAL,
-    outcome_key TEXT NOT NULL,
-    supported INTEGER NOT NULL,
-    last_update TEXT,
-    raw_json TEXT NOT NULL,
-    PRIMARY KEY (observation_key, odds_id),
-    FOREIGN KEY (observation_key)
-        REFERENCES odds_transport_observations(observation_key)
-);
-CREATE INDEX IF NOT EXISTS idx_odds_response_match_outcome
-    ON odds_response_outcomes(raybet_match_id, odds_id, observation_key);
-CREATE TRIGGER IF NOT EXISTS odds_response_outcomes_legacy_insert_disabled
-BEFORE INSERT ON odds_response_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'legacy odds response outcome writes are disabled');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_response_outcomes_immutable_update
-BEFORE UPDATE ON odds_response_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'odds response outcome is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS odds_response_outcomes_immutable_delete
-BEFORE DELETE ON odds_response_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'odds response outcome is immutable');
-END;
-CREATE VIEW IF NOT EXISTS odds_response_outcomes_effective AS
-SELECT transport.observation_key AS observation_key,
-       transport.raybet_match_id AS raybet_match_id,
-       outcome.odds_id AS odds_id,
-       outcome.odds_group_id AS odds_group_id,
-       transport.observed_at AS received_at,
-       outcome.price AS price,
-       outcome.status AS status,
-       outcome.market_type AS market_type,
-       outcome.period AS period,
-       outcome.side AS side,
-       outcome.line AS line,
-       outcome.outcome_key AS outcome_key,
-       outcome.supported AS supported,
-       outcome.last_update AS last_update,
-       NULL AS raw_json,
-       transport.response_state_hash AS response_state_hash,
-       transport.response_artifact_hash AS response_artifact_hash,
-       'v2' AS storage_version
-  FROM odds_transport_observations AS transport
-  JOIN odds_response_states AS state
-    ON state.response_state_hash=transport.response_state_hash
-   AND state.raybet_match_id=transport.raybet_match_id
-   AND state.normalized_state_hash=transport.normalized_state_hash
-  JOIN odds_response_state_outcomes AS outcome
-    ON outcome.response_state_hash=state.response_state_hash
-UNION ALL
-SELECT legacy.observation_key, legacy.raybet_match_id, legacy.odds_id,
-       legacy.odds_group_id, legacy.received_at, legacy.price, legacy.status,
-       legacy.market_type, legacy.period, legacy.side, legacy.line,
-       legacy.outcome_key, legacy.supported, legacy.last_update,
-       legacy.raw_json, NULL, NULL, 'legacy'
-  FROM odds_response_outcomes AS legacy
-  JOIN odds_transport_observations AS transport
-    ON transport.observation_key=legacy.observation_key
- WHERE transport.response_state_hash IS NULL
-   AND transport.response_artifact_hash IS NULL;
-CREATE VIEW IF NOT EXISTS trusted_odds_winner_market_authority AS
-WITH complete_group AS (
-    SELECT outcome.observation_key,
-           outcome.raybet_match_id,
-           outcome.period,
-           outcome.odds_group_id,
-           outcome.response_state_hash,
-           outcome.response_artifact_hash,
-           MAX(CASE WHEN outcome.side='team_one' THEN outcome.odds_id END)
-               AS team_one_odds_id,
-           MAX(CASE WHEN outcome.side='team_two' THEN outcome.odds_id END)
-               AS team_two_odds_id,
-           MAX(CASE WHEN outcome.side='team_one' THEN outcome.price END)
-               AS team_one_price,
-           MAX(CASE WHEN outcome.side='team_two' THEN outcome.price END)
-               AS team_two_price
-      FROM odds_response_outcomes_effective AS outcome
-     WHERE outcome.storage_version='v2'
-       AND outcome.market_type='winner'
-       AND outcome.odds_group_id IS NOT NULL
-       AND trim(outcome.odds_group_id)!=''
-       AND outcome.response_state_hash IS NOT NULL
-       AND length(outcome.response_state_hash)=64
-       AND outcome.response_artifact_hash IS NOT NULL
-       AND length(outcome.response_artifact_hash)=64
-     GROUP BY outcome.observation_key, outcome.raybet_match_id,
-              outcome.period, outcome.odds_group_id,
-              outcome.response_state_hash, outcome.response_artifact_hash
-    HAVING COUNT(*)=2
-       AND COUNT(DISTINCT outcome.odds_id)=2
-       AND SUM(CASE WHEN outcome.side='team_one' THEN 1 ELSE 0 END)=1
-       AND SUM(CASE WHEN outcome.side='team_two' THEN 1 ELSE 0 END)=1
-       AND SUM(CASE WHEN outcome.outcome_key=outcome.side THEN 1 ELSE 0 END)=2
-       AND SUM(CASE WHEN outcome.supported=1 THEN 1 ELSE 0 END)=2
-       AND SUM(CASE
-                   WHEN lower(trim(CAST(outcome.status AS TEXT)))
-                        IN ('1', 'open', 'active', 'running')
-                   THEN 1 ELSE 0
-               END)=2
-       AND SUM(CASE
-                   WHEN typeof(outcome.price) IN ('integer', 'real')
-                    AND outcome.price>1.0
-                   THEN 1 ELSE 0
-               END)=2
-)
-SELECT market.observation_key,
-       market.raybet_match_id,
-       market.period,
-       market.odds_group_id,
-       market.response_state_hash,
-       market.response_artifact_hash,
-       CASE WHEN market.team_one_price>market.team_two_price
-            THEN 'team_one' ELSE 'team_two' END AS underdog_side,
-       CASE WHEN market.team_one_price>market.team_two_price
-            THEN market.team_one_odds_id ELSE market.team_two_odds_id END
-            AS underdog_odds_id,
-       CASE WHEN market.team_one_price>market.team_two_price
-            THEN market.team_one_price ELSE market.team_two_price END
-            AS underdog_price,
-       CASE WHEN market.team_one_price>market.team_two_price
-            THEN (1.0/market.team_one_price)/(
-                     (1.0/market.team_one_price)+(1.0/market.team_two_price)
-                 )
-            ELSE (1.0/market.team_two_price)/(
-                     (1.0/market.team_one_price)+(1.0/market.team_two_price)
-                 )
-       END AS underdog_probability
-  FROM complete_group AS market
- WHERE market.team_one_price!=market.team_two_price
-   AND (
-       SELECT COUNT(*)
-         FROM complete_group AS candidate
-        WHERE candidate.observation_key=market.observation_key
-          AND candidate.raybet_match_id=market.raybet_match_id
-          AND candidate.period=market.period
-   )=1;
-CREATE TABLE IF NOT EXISTS live_frames (
-    provider TEXT NOT NULL,
-    provider_match_id TEXT NOT NULL,
-    provider_game_id TEXT,
-    sequence TEXT NOT NULL DEFAULT '',
-    source_at TEXT,
-    received_at TEXT NOT NULL,
-    game_time INTEGER,
-    team_one_kills INTEGER,
-    team_two_kills INTEGER,
-    team_one_gold INTEGER,
-    team_two_gold INTEGER,
-    state TEXT,
-    raw_json TEXT NOT NULL,
-    PRIMARY KEY (provider, provider_match_id, provider_game_id, sequence)
-);
-CREATE TABLE IF NOT EXISTS live_events (
-    provider TEXT NOT NULL,
-    provider_event_id TEXT NOT NULL,
-    provider_match_id TEXT NOT NULL,
-    provider_game_id TEXT,
-    event_type TEXT NOT NULL,
-    source_at TEXT,
-    received_at TEXT NOT NULL,
-    game_time INTEGER,
-    team TEXT,
-    player TEXT,
-    value REAL,
-    raw_json TEXT NOT NULL,
-    PRIMARY KEY (provider, provider_event_id)
-);
-CREATE TABLE IF NOT EXISTS model_quotes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    raybet_match_id TEXT NOT NULL,
-    provider_game_id TEXT,
-    market_key TEXT NOT NULL,
-    model_probability REAL NOT NULL,
-    market_probability REAL NOT NULL,
-    edge REAL NOT NULL,
-    quoted_at TEXT NOT NULL,
-    strategy_version TEXT NOT NULL,
-    input_ref TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS shadow_orders (
-    order_key TEXT PRIMARY KEY,
-    raybet_match_id TEXT NOT NULL,
-    strict_mapping_id INTEGER,
-    odds_id TEXT NOT NULL,
-    market_key TEXT NOT NULL,
-    signaled_at TEXT NOT NULL,
-    model_probability REAL NOT NULL,
-    market_probability REAL NOT NULL,
-    signal_price REAL NOT NULL,
-    signal_transport_key TEXT NOT NULL,
-    signal_transport_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    signal_odds_group_id TEXT,
-    signal_outcome_key TEXT,
-    signal_identity_verified INTEGER NOT NULL
-        CHECK (signal_identity_verified IN (0, 1)),
-    stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0),
-    status TEXT NOT NULL,
-    fill_price REAL,
-    filled_at TEXT,
-    rejection_reason TEXT,
-    draft_curve_key TEXT REFERENCES prospective_draft_curves(curve_key),
-    draft_source_ref TEXT,
-    draft_landmark_key TEXT
-        REFERENCES prospective_draft_landmarks(landmark_key),
-    draft_landmark_horizon_minutes INTEGER CHECK (
-        draft_landmark_horizon_minutes IS NULL OR
-        draft_landmark_horizon_minutes IN (10, 20, 30, 40, 50)
-    ),
-    draft_landmark_target TEXT CHECK (
-        draft_landmark_target IS NULL OR draft_landmark_target='radiant_win'
-    ),
-    draft_landmark_radiant_probability REAL CHECK (
-        draft_landmark_radiant_probability IS NULL OR
-        draft_landmark_radiant_probability BETWEEN 0.0 AND 1.0
-    ),
-    draft_landmark_quality REAL CHECK (
-        draft_landmark_quality IS NULL OR
-        draft_landmark_quality BETWEEN 0.0 AND 1.0
-    ),
-    draft_landmark_uncertainty REAL CHECK (
-        draft_landmark_uncertainty IS NULL OR
-        draft_landmark_uncertainty BETWEEN 0.0 AND 0.5
-    ),
-    draft_landmark_support INTEGER CHECK (
-        draft_landmark_support IS NULL OR draft_landmark_support>=100
-    ),
-    draft_radiant_team_side TEXT CHECK (
-        draft_radiant_team_side IS NULL OR
-        draft_radiant_team_side IN ('team_one', 'team_two')
-    ),
-    draft_strict_mapping_id INTEGER CHECK (
-        draft_strict_mapping_id IS NULL OR draft_strict_mapping_id>0
-    ) REFERENCES strict_live_map_mappings(mapping_id),
-    draft_deployment_key TEXT
-        REFERENCES draft_deployment_bundles(deployment_key),
-    draft_target_snapshot_hash TEXT CHECK (
-        draft_target_snapshot_hash IS NULL OR
-        length(draft_target_snapshot_hash)=64
-    ),
-    draft_feature_hash TEXT CHECK (
-        draft_feature_hash IS NULL OR length(draft_feature_hash)=64
-    ),
-    draft_model_hash TEXT REFERENCES draft_model_artifacts(model_hash),
-    draft_calibration_hash TEXT
-        REFERENCES draft_calibration_artifacts(calibration_hash),
-    draft_model_version TEXT,
-    draft_global_gate_ref TEXT,
-    draft_input_snapshot_hash TEXT CHECK (
-        draft_input_snapshot_hash IS NULL OR
-        length(draft_input_snapshot_hash)=64
-    ),
-    draft_authority_revision INTEGER CHECK (
-        draft_authority_revision IS NULL OR draft_authority_revision>=1
-    ),
-    draft_dependency_revision INTEGER CHECK (
-        draft_dependency_revision IS NULL OR draft_dependency_revision>=1
-    ),
-    vision_raybet_match_id TEXT,
-    vision_map_number INTEGER CHECK (
-        vision_map_number IS NULL OR vision_map_number>0
-    ),
-    vision_captured_at TEXT,
-    vision_source_frame_ref TEXT,
-    vision_source_frame_sha256 TEXT CHECK (
-        vision_source_frame_sha256 IS NULL OR
-        length(vision_source_frame_sha256)=64
-    ),
-    vision_source_frame_bytes INTEGER CHECK (
-        vision_source_frame_bytes IS NULL OR vision_source_frame_bytes>0
-    ),
-    vision_observed_game_clock_seconds INTEGER CHECK (
-        vision_observed_game_clock_seconds IS NULL OR
-        vision_observed_game_clock_seconds>=0
-    ),
-    vision_aligned_game_clock_seconds INTEGER CHECK (
-        vision_aligned_game_clock_seconds IS NULL OR
-        vision_aligned_game_clock_seconds>=0
-    ),
-    vision_is_paused INTEGER CHECK (
-        vision_is_paused IS NULL OR vision_is_paused IN (0, 1)
-    ),
-    vision_radiant_hero_ids_json TEXT CHECK (
-        vision_radiant_hero_ids_json IS NULL OR
-        json_valid(vision_radiant_hero_ids_json)
-    ),
-    vision_dire_hero_ids_json TEXT CHECK (
-        vision_dire_hero_ids_json IS NULL OR
-        json_valid(vision_dire_hero_ids_json)
-    ),
-    vision_radiant_team_side TEXT CHECK (
-        vision_radiant_team_side IS NULL OR
-        vision_radiant_team_side IN ('team_one', 'team_two')
-    ),
-    vision_clock_confidence REAL CHECK (
-        vision_clock_confidence IS NULL OR
-        vision_clock_confidence BETWEEN 0.0 AND 1.0
-    ),
-    vision_draft_confidence REAL CHECK (
-        vision_draft_confidence IS NULL OR
-        vision_draft_confidence BETWEEN 0.0 AND 1.0
-    ),
-    vision_screen_state TEXT,
-    vision_confirmed INTEGER CHECK (
-        vision_confirmed IS NULL OR vision_confirmed IN (0, 1)
-    ),
-    vision_transport_key TEXT,
-    vision_transport_at TEXT,
-    vision_alignment_method TEXT CHECK (
-        vision_alignment_method IS NULL OR
-        vision_alignment_method IN ('anchor', 'forward_projection')
-    ),
-    vision_alignment_lag_seconds REAL CHECK (
-        vision_alignment_lag_seconds IS NULL OR
-        vision_alignment_lag_seconds BETWEEN 0.0 AND 15.0
-    )
-);
-CREATE TABLE IF NOT EXISTS shadow_order_decision_lineage (
-    order_key TEXT PRIMARY KEY,
-    decision_key TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-CREATE TRIGGER IF NOT EXISTS shadow_order_decision_lineage_immutable_update
-BEFORE UPDATE ON shadow_order_decision_lineage
-BEGIN
-    SELECT RAISE(ABORT, 'shadow order decision lineage is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS shadow_order_decision_lineage_immutable_delete
-BEFORE DELETE ON shadow_order_decision_lineage
-BEGIN
-    SELECT RAISE(ABORT, 'shadow order decision lineage is immutable');
-END;
-CREATE TABLE IF NOT EXISTS settlements (
-    order_key TEXT PRIMARY KEY,
-    result TEXT NOT NULL,
-    return_units REAL NOT NULL,
-    settled_at TEXT NOT NULL,
-    evidence_ref TEXT NOT NULL,
-    review_required INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS settlement_authority (
-    order_key TEXT PRIMARY KEY REFERENCES shadow_orders(order_key),
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number > 0),
-    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id > 0)
-        REFERENCES strict_live_map_mappings(mapping_id),
-    dota_match_id INTEGER NOT NULL CHECK (dota_match_id > 0),
-    winner_side TEXT NOT NULL CHECK (winner_side IN ('team_one', 'team_two')),
-    fill_price REAL NOT NULL CHECK (fill_price > 1.0),
-    stake_units REAL NOT NULL CHECK (stake_units > 0.0),
-    derived_result TEXT NOT NULL CHECK (derived_result IN ('win', 'loss')),
-    derived_return_units REAL NOT NULL CHECK (derived_return_units >= 0.0),
-    derived_return_amount REAL NOT NULL CHECK (derived_return_amount >= 0.0),
-    map_result_evidence_ref TEXT NOT NULL,
-    raybet_evidence_ref TEXT NOT NULL,
-    opendota_evidence_ref TEXT NOT NULL,
-    raybet_evidence_id INTEGER NOT NULL
-        REFERENCES settlement_result_evidence(evidence_id),
-    opendota_evidence_id INTEGER NOT NULL
-        REFERENCES settlement_result_evidence(evidence_id),
-    raybet_observed_at TEXT NOT NULL,
-    opendota_observed_at TEXT NOT NULL,
-    first_usable_at TEXT NOT NULL,
-    reconciliation_updated_at TEXT NOT NULL,
-    settled_at TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settlement_authority_audit (
-    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_key TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status='manual_review'),
-    reason TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    UNIQUE (order_key, status, reason, actor)
-);
-CREATE TABLE IF NOT EXISTS settlement_result_evidence (
-    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number > 0),
-    dota_match_id INTEGER,
-    source TEXT NOT NULL CHECK (source IN ('raybet', 'opendota')),
-    status TEXT NOT NULL CHECK (status IN ('confirmed', 'pending', 'conflict')),
-    winner_side TEXT CHECK (winner_side IN ('team_one', 'team_two')),
-    evidence_ref TEXT NOT NULL,
-    facts_json TEXT NOT NULL CHECK (json_valid(facts_json)),
-    observed_at TEXT NOT NULL,
-    first_usable_at TEXT,
-    raybet_audit_key TEXT REFERENCES direct_response_audit(audit_key),
-    raybet_transport_key TEXT
-        REFERENCES odds_transport_observations(observation_key),
-    raybet_response_state_hash TEXT
-        REFERENCES odds_response_states(response_state_hash),
-    raybet_response_artifact_hash TEXT
-        REFERENCES odds_raw_artifacts(artifact_hash),
-    opendota_artifact_id TEXT REFERENCES raw_source_artifacts(artifact_id),
-    opendota_observation_id TEXT
-        REFERENCES raw_source_observations(observation_id),
-    opendota_content_hash TEXT CHECK (
-        opendota_content_hash IS NULL OR length(opendota_content_hash)=64
-    ),
-    UNIQUE (raybet_match_id, map_number, source, evidence_ref)
-);
-CREATE INDEX IF NOT EXISTS idx_settlement_result_evidence_map
-    ON settlement_result_evidence(raybet_match_id, map_number, source, observed_at);
-CREATE TRIGGER IF NOT EXISTS settlement_result_evidence_no_update
-BEFORE UPDATE ON settlement_result_evidence
-BEGIN
-    SELECT RAISE(ABORT, 'settlement result evidence is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_result_evidence_no_delete
-BEFORE DELETE ON settlement_result_evidence
-BEGIN
-    SELECT RAISE(ABORT, 'settlement result evidence is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_result_evidence_authority_insert
-BEFORE INSERT ON settlement_result_evidence
-WHEN julianday(NEW.observed_at) IS NULL
-  OR julianday(NEW.first_usable_at) IS NULL
-  OR julianday(NEW.first_usable_at)<julianday(NEW.observed_at)
-  OR (
-      NEW.source='raybet'
-      AND (
-          NEW.raybet_audit_key IS NULL
-          OR NEW.raybet_response_artifact_hash IS NULL
-          OR NEW.opendota_artifact_id IS NOT NULL
-          OR NEW.opendota_observation_id IS NOT NULL
-          OR NEW.opendota_content_hash IS NOT NULL
-          OR julianday(NEW.first_usable_at)!=julianday(NEW.observed_at)
-          OR NOT EXISTS (
-              SELECT 1
-                FROM direct_response_audit AS audit
-                JOIN odds_raw_artifacts AS artifact
-                  ON artifact.artifact_hash=NEW.raybet_response_artifact_hash
-                 AND artifact.source='raybet'
-               WHERE audit.audit_key=NEW.raybet_audit_key
-                 AND audit.source='direct'
-                 AND audit.response_kind='final_odds'
-                 AND audit.claimed_raybet_match_id=NEW.raybet_match_id
-                 AND audit.observed_raybet_match_id=NEW.raybet_match_id
-                 AND audit.disposition IN ('accepted', 'audit_only')
-                 AND audit.observed_at=NEW.observed_at
-                 AND audit.artifact_hash=NEW.raybet_response_artifact_hash
-          )
-          OR NOT (
-              (
-                  NEW.raybet_transport_key IS NULL
-                  AND NEW.raybet_response_state_hash IS NULL
-              )
-              OR (
-                  NEW.raybet_transport_key IS NOT NULL
-                  AND NEW.raybet_response_state_hash IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                        FROM odds_transport_observations AS transport
-                        JOIN odds_response_states AS state
-                          ON state.response_state_hash=
-                             NEW.raybet_response_state_hash
-                         AND state.raybet_match_id=NEW.raybet_match_id
-                         AND state.normalized_state_hash=
-                             transport.normalized_state_hash
-                         AND state.normalized_state_hash_version=2
-                         AND state.original_legacy_normalized_state_hash IS NULL
-                       WHERE transport.observation_key=
-                             NEW.raybet_transport_key
-                         AND transport.source='direct'
-                         AND transport.raybet_match_id=NEW.raybet_match_id
-                         AND transport.observed_at=NEW.observed_at
-                         AND transport.response_state_hash=
-                             NEW.raybet_response_state_hash
-                         AND transport.response_artifact_hash=
-                             NEW.raybet_response_artifact_hash
-                         AND transport.normalized_state_hash_version=2
-                         AND transport.original_legacy_normalized_state_hash
-                             IS NULL
-                         AND transport.processing_status='processed'
-                  )
-              )
-          )
-      )
-  )
-  OR (
-      NEW.source='opendota'
-      AND (
-          NEW.opendota_artifact_id IS NULL
-          OR NEW.opendota_observation_id IS NULL
-          OR NEW.opendota_content_hash IS NULL
-          OR NEW.evidence_ref!='opendota:' || NEW.dota_match_id ||
-             ':sha256:' || NEW.opendota_content_hash
-          OR NEW.raybet_audit_key IS NOT NULL
-          OR NEW.raybet_transport_key IS NOT NULL
-          OR NEW.raybet_response_state_hash IS NOT NULL
-          OR NEW.raybet_response_artifact_hash IS NOT NULL
-          OR NOT EXISTS (
-              SELECT 1
-                FROM raw_source_observations AS observation
-                JOIN raw_source_artifacts AS artifact
-                  ON artifact.artifact_id=observation.artifact_id
-                 AND artifact.content_hash=observation.content_hash
-                 AND artifact.source=observation.source
-                 AND artifact.artifact_use=observation.artifact_use
-                 AND artifact.endpoint=observation.endpoint
-                 AND artifact.sanitized_request_identity=
-                     observation.sanitized_request_identity
-                 AND artifact.match_id=observation.match_id
-               WHERE observation.observation_id=NEW.opendota_observation_id
-                 AND observation.artifact_id=NEW.opendota_artifact_id
-                 AND observation.content_hash=NEW.opendota_content_hash
-                 AND observation.source='opendota'
-                 AND observation.artifact_use='primary'
-                 AND observation.match_id=NEW.dota_match_id
-                 AND observation.received_at=NEW.observed_at
-                 AND observation.first_usable_at=NEW.first_usable_at
-                 AND artifact.first_usable_at=NEW.first_usable_at
-          )
-      )
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'settlement source evidence authority is required');
-END;
-CREATE TABLE IF NOT EXISTS settlement_reconciliations (
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number > 0),
-    strict_mapping_id INTEGER CHECK (
-        strict_mapping_id IS NULL OR strict_mapping_id > 0
-    ) REFERENCES strict_live_map_mappings(mapping_id),
-    dota_match_id INTEGER NOT NULL,
-    raybet_winner_side TEXT CHECK (raybet_winner_side IN ('team_one', 'team_two')),
-    opendota_winner_side TEXT NOT NULL
-        CHECK (opendota_winner_side IN ('team_one', 'team_two')),
-    raybet_evidence_ref TEXT NOT NULL,
-    opendota_evidence_ref TEXT NOT NULL,
-    evidence_ref TEXT,
-    raybet_evidence_id INTEGER
-        REFERENCES settlement_result_evidence(evidence_id),
-    opendota_evidence_id INTEGER
-        REFERENCES settlement_result_evidence(evidence_id),
-    raybet_observed_at TEXT,
-    opendota_observed_at TEXT,
-    first_usable_at TEXT,
-    status TEXT NOT NULL
-        CHECK (status IN ('pending', 'confirmed', 'manual_review')),
-    reason TEXT NOT NULL,
-    first_observed_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (raybet_match_id, map_number)
-);
-CREATE INDEX IF NOT EXISTS idx_settlement_reconciliations_dota_match
-    ON settlement_reconciliations(dota_match_id);
-CREATE TRIGGER IF NOT EXISTS settlement_reconciliation_mapping_insert
-BEFORE INSERT ON settlement_reconciliations
-WHEN NEW.strict_mapping_id IS NULL
-  OR (
-    NEW.strict_mapping_id IS NOT NULL
-    AND NOT EXISTS (
-        SELECT 1 FROM strict_live_map_mappings AS mapping
-         WHERE mapping.mapping_id=NEW.strict_mapping_id
-           AND mapping.raybet_match_id=NEW.raybet_match_id
-           AND mapping.map_number=NEW.map_number
-    )
-  )
-  OR EXISTS (
-      SELECT 1 FROM settlement_reconciliations AS existing
-       WHERE existing.raybet_match_id=NEW.raybet_match_id
-         AND existing.map_number=NEW.map_number
-         AND existing.strict_mapping_id IS NOT NULL
-         AND existing.strict_mapping_id IS NOT NEW.strict_mapping_id
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'settlement reconciliation mapping authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_reconciliation_mapping_update
-BEFORE UPDATE OF raybet_match_id, map_number, strict_mapping_id
-ON settlement_reconciliations
-WHEN OLD.raybet_match_id IS NOT NEW.raybet_match_id
-  OR OLD.map_number IS NOT NEW.map_number
-  OR OLD.strict_mapping_id IS NOT NEW.strict_mapping_id
-BEGIN
-    SELECT RAISE(ABORT, 'settlement reconciliation mapping is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_reconciliation_authority_insert
-BEFORE INSERT ON settlement_reconciliations
-WHEN NEW.status='confirmed' AND (
-    NEW.evidence_ref IS NULL
-    OR NEW.evidence_ref!='settlement-reconciliation:' ||
-        NEW.raybet_match_id || ':map:' || NEW.map_number
-    OR NEW.raybet_evidence_id IS NULL
-    OR NEW.opendota_evidence_id IS NULL
-    OR julianday(NEW.raybet_observed_at) IS NULL
-    OR julianday(NEW.opendota_observed_at) IS NULL
-    OR julianday(NEW.first_usable_at) IS NULL
-    OR NOT EXISTS (
-        SELECT 1 FROM settlement_result_evidence AS raybet_evidence
-        JOIN settlement_result_evidence AS opendota_evidence
-          ON opendota_evidence.evidence_id=NEW.opendota_evidence_id
-         AND opendota_evidence.raybet_match_id=NEW.raybet_match_id
-         AND opendota_evidence.map_number=NEW.map_number
-         AND opendota_evidence.dota_match_id=NEW.dota_match_id
-         AND opendota_evidence.source='opendota'
-         AND opendota_evidence.status='confirmed'
-         AND opendota_evidence.winner_side=NEW.opendota_winner_side
-         AND opendota_evidence.evidence_ref=NEW.opendota_evidence_ref
-         AND opendota_evidence.observed_at=NEW.opendota_observed_at
-       WHERE raybet_evidence.evidence_id=NEW.raybet_evidence_id
-         AND raybet_evidence.raybet_match_id=NEW.raybet_match_id
-         AND raybet_evidence.map_number=NEW.map_number
-         AND raybet_evidence.dota_match_id=NEW.dota_match_id
-         AND raybet_evidence.source='raybet'
-         AND raybet_evidence.status='confirmed'
-         AND raybet_evidence.winner_side=NEW.raybet_winner_side
-         AND raybet_evidence.evidence_ref=NEW.raybet_evidence_ref
-         AND raybet_evidence.observed_at=NEW.raybet_observed_at
-         AND raybet_evidence.first_usable_at=NEW.raybet_observed_at
-         AND julianday(NEW.first_usable_at)=max(
-             julianday(raybet_evidence.first_usable_at),
-             julianday(opendota_evidence.first_usable_at)
-         )
-    )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'settlement reconciliation source authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_reconciliation_authority_update
-BEFORE UPDATE ON settlement_reconciliations
-WHEN OLD.status!='confirmed'
- AND NEW.status='confirmed'
- AND (
-    NEW.evidence_ref IS NULL
-    OR NEW.evidence_ref!='settlement-reconciliation:' ||
-        NEW.raybet_match_id || ':map:' || NEW.map_number
-    OR NEW.raybet_evidence_id IS NULL
-    OR NEW.opendota_evidence_id IS NULL
-    OR julianday(NEW.raybet_observed_at) IS NULL
-    OR julianday(NEW.opendota_observed_at) IS NULL
-    OR julianday(NEW.first_usable_at) IS NULL
-    OR NOT EXISTS (
-        SELECT 1 FROM settlement_result_evidence AS raybet_evidence
-        JOIN settlement_result_evidence AS opendota_evidence
-          ON opendota_evidence.evidence_id=NEW.opendota_evidence_id
-         AND opendota_evidence.raybet_match_id=NEW.raybet_match_id
-         AND opendota_evidence.map_number=NEW.map_number
-         AND opendota_evidence.dota_match_id=NEW.dota_match_id
-         AND opendota_evidence.source='opendota'
-         AND opendota_evidence.status='confirmed'
-         AND opendota_evidence.winner_side=NEW.opendota_winner_side
-         AND opendota_evidence.evidence_ref=NEW.opendota_evidence_ref
-         AND opendota_evidence.observed_at=NEW.opendota_observed_at
-       WHERE raybet_evidence.evidence_id=NEW.raybet_evidence_id
-         AND raybet_evidence.raybet_match_id=NEW.raybet_match_id
-         AND raybet_evidence.map_number=NEW.map_number
-         AND raybet_evidence.dota_match_id=NEW.dota_match_id
-         AND raybet_evidence.source='raybet'
-         AND raybet_evidence.status='confirmed'
-         AND raybet_evidence.winner_side=NEW.raybet_winner_side
-         AND raybet_evidence.evidence_ref=NEW.raybet_evidence_ref
-         AND raybet_evidence.observed_at=NEW.raybet_observed_at
-         AND raybet_evidence.first_usable_at=NEW.raybet_observed_at
-         AND julianday(NEW.first_usable_at)=max(
-             julianday(raybet_evidence.first_usable_at),
-             julianday(opendota_evidence.first_usable_at)
-         )
-    )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'settlement reconciliation source authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_reconciliation_confirmed_authority_immutable
-BEFORE UPDATE ON settlement_reconciliations
-WHEN OLD.status='confirmed' AND (
-    OLD.raybet_match_id IS NOT NEW.raybet_match_id
-    OR OLD.map_number IS NOT NEW.map_number
-    OR OLD.strict_mapping_id IS NOT NEW.strict_mapping_id
-    OR OLD.dota_match_id IS NOT NEW.dota_match_id
-    OR OLD.raybet_winner_side IS NOT NEW.raybet_winner_side
-    OR OLD.opendota_winner_side IS NOT NEW.opendota_winner_side
-    OR OLD.raybet_evidence_ref IS NOT NEW.raybet_evidence_ref
-    OR OLD.opendota_evidence_ref IS NOT NEW.opendota_evidence_ref
-    OR OLD.evidence_ref IS NOT NEW.evidence_ref
-    OR OLD.raybet_evidence_id IS NOT NEW.raybet_evidence_id
-    OR OLD.opendota_evidence_id IS NOT NEW.opendota_evidence_id
-    OR OLD.raybet_observed_at IS NOT NEW.raybet_observed_at
-    OR OLD.opendota_observed_at IS NOT NEW.opendota_observed_at
-    OR OLD.first_usable_at IS NOT NEW.first_usable_at
-    OR OLD.first_observed_at IS NOT NEW.first_observed_at
-)
-BEGIN
-    SELECT RAISE(ABORT, 'settlement reconciliation authority is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS settlement_reconciliation_manual_review_sticky
-BEFORE UPDATE ON settlement_reconciliations
-WHEN OLD.status='manual_review' AND NEW.status!='manual_review'
-BEGIN
-    SELECT RAISE(ABORT, 'settlement reconciliation manual review is immutable');
-END;
-CREATE TABLE IF NOT EXISTS notification_outbox (
-    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_key TEXT NOT NULL,
-    event_type TEXT NOT NULL CHECK (event_type IN
-        ('filled', 'settled', 'monitor_alert', 'monitor_recovery')),
-    channel TEXT NOT NULL DEFAULT 'email',
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'leased', 'sent', 'dead_letter')),
-    recipient TEXT NOT NULL,
-    message_id TEXT NOT NULL UNIQUE,
-    payload_json TEXT NOT NULL,
-    statistics_cutoff TEXT NOT NULL,
-    template_version TEXT NOT NULL,
-    lease_token TEXT,
-    lease_until TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-    next_attempt_at TEXT,
-    last_error TEXT,
-    sent_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (order_key, event_type, channel)
-);
-CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
-    ON notification_outbox(status, next_attempt_at, lease_until);
-CREATE TABLE IF NOT EXISTS notification_outbox_audit (
-    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    outbox_id INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS service_health (
-    component TEXT PRIMARY KEY,
-    status TEXT NOT NULL
-        CHECK (status IN ('starting', 'healthy', 'degraded', 'unhealthy', 'stopped')),
-    last_heartbeat_at TEXT,
-    last_success_at TEXT,
-    last_error_at TEXT,
-    last_error TEXT,
-    details_json TEXT NOT NULL DEFAULT '{}',
-    updated_at TEXT NOT NULL
-);
-CREATE TRIGGER IF NOT EXISTS notification_outbox_payload_immutable
-BEFORE UPDATE ON notification_outbox
-WHEN OLD.order_key IS NOT NEW.order_key
-  OR OLD.event_type IS NOT NEW.event_type
-  OR OLD.channel IS NOT NEW.channel
-  OR OLD.payload_json IS NOT NEW.payload_json
-  OR OLD.statistics_cutoff IS NOT NEW.statistics_cutoff
-  OR OLD.template_version IS NOT NEW.template_version
-  OR OLD.recipient IS NOT NEW.recipient
-  OR OLD.message_id IS NOT NEW.message_id
-BEGIN
-    SELECT RAISE(ABORT, 'notification outbox payload is immutable');
-END;
-CREATE TABLE IF NOT EXISTS collector_runs (
-    collector TEXT PRIMARY KEY,
-    last_success_at TEXT,
-    last_error_at TEXT,
-    last_error TEXT,
-    cursor TEXT,
-    gap_detected INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS vision_frame_artifacts (
-    frame_ref TEXT PRIMARY KEY,
-    content_sha256 TEXT NOT NULL UNIQUE CHECK (
-        length(content_sha256)=64
-        AND content_sha256=lower(content_sha256)
-        AND content_sha256 NOT GLOB '*[^0-9a-f]*'
-        AND frame_ref='vision-frame:sha256:' || content_sha256
-    ),
-    byte_length INTEGER NOT NULL CHECK (byte_length>0),
-    storage_path TEXT NOT NULL UNIQUE CHECK (storage_path!=''),
-    registered_at TEXT NOT NULL CHECK (julianday(registered_at) IS NOT NULL)
-);
-CREATE TABLE IF NOT EXISTS vision_frame_artifact_relocations (
-    relocation_id TEXT PRIMARY KEY CHECK (length(relocation_id)=64),
-    relocation_sequence INTEGER NOT NULL CHECK (relocation_sequence>0),
-    frame_ref TEXT NOT NULL REFERENCES vision_frame_artifacts(frame_ref),
-    content_sha256 TEXT NOT NULL CHECK (length(content_sha256)=64),
-    byte_length INTEGER NOT NULL CHECK (byte_length>0),
-    old_storage_path TEXT NOT NULL CHECK (old_storage_path!=''),
-    new_storage_path TEXT NOT NULL CHECK (new_storage_path!=''),
-    reason TEXT NOT NULL CHECK (reason!=''),
-    actor TEXT NOT NULL CHECK (actor!=''),
-    relocated_at TEXT NOT NULL CHECK (julianday(relocated_at) IS NOT NULL),
-    UNIQUE (frame_ref, relocation_sequence),
-    CHECK (old_storage_path!=new_storage_path)
-);
-CREATE TABLE IF NOT EXISTS vision_frame_artifact_retirements (
-    retirement_id TEXT PRIMARY KEY CHECK (length(retirement_id)=64),
-    frame_ref TEXT NOT NULL UNIQUE REFERENCES vision_frame_artifacts(frame_ref),
-    content_sha256 TEXT NOT NULL CHECK (length(content_sha256)=64),
-    byte_length INTEGER NOT NULL CHECK (byte_length>0),
-    storage_path TEXT NOT NULL CHECK (storage_path!=''),
-    reason TEXT NOT NULL CHECK (reason!=''),
-    actor TEXT NOT NULL CHECK (actor!=''),
-    retired_at TEXT NOT NULL CHECK (julianday(retired_at) IS NOT NULL)
-);
-CREATE TRIGGER IF NOT EXISTS vision_frame_artifacts_immutable_update
-BEFORE UPDATE ON vision_frame_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'vision frame registry is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_frame_artifacts_immutable_delete
-BEFORE DELETE ON vision_frame_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'vision frame registry is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_frame_relocations_immutable_update
-BEFORE UPDATE ON vision_frame_artifact_relocations
-BEGIN
-    SELECT RAISE(ABORT, 'vision frame relocation audit is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_frame_relocations_immutable_delete
-BEFORE DELETE ON vision_frame_artifact_relocations
-BEGIN
-    SELECT RAISE(ABORT, 'vision frame relocation audit is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_frame_retirements_immutable_update
-BEFORE UPDATE ON vision_frame_artifact_retirements
-BEGIN
-    SELECT RAISE(ABORT, 'vision frame retirement audit is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_frame_retirements_immutable_delete
-BEFORE DELETE ON vision_frame_artifact_retirements
-BEGIN
-    SELECT RAISE(ABORT, 'vision frame retirement audit is immutable');
-END;
-CREATE VIEW IF NOT EXISTS active_vision_frame_artifacts AS
-SELECT artifact.frame_ref, artifact.content_sha256, artifact.byte_length,
-       COALESCE(
-           (
-               SELECT relocation.new_storage_path
-                 FROM vision_frame_artifact_relocations AS relocation
-                WHERE relocation.frame_ref=artifact.frame_ref
-                ORDER BY relocation.relocation_sequence DESC LIMIT 1
-           ),
-           artifact.storage_path
-       ) AS storage_path,
-       artifact.registered_at
-  FROM vision_frame_artifacts AS artifact
- WHERE NOT EXISTS (
-       SELECT 1 FROM vision_frame_artifact_retirements AS retirement
-        WHERE retirement.frame_ref=artifact.frame_ref
- );
-CREATE TABLE IF NOT EXISTS vision_observations (
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER,
-    captured_at TEXT NOT NULL,
-    game_clock_seconds INTEGER,
-    is_paused INTEGER,
-    radiant_hero_ids TEXT NOT NULL,
-    dire_hero_ids TEXT NOT NULL,
-    radiant_team_side TEXT,
-    clock_confidence REAL NOT NULL,
-    draft_confidence REAL NOT NULL,
-    source_frame_ref TEXT NOT NULL,
-    source_frame_sha256 TEXT CHECK (
-        source_frame_sha256 IS NULL OR length(source_frame_sha256)=64
-    ),
-    source_frame_bytes INTEGER CHECK (
-        source_frame_bytes IS NULL OR source_frame_bytes>0
-    ),
-    screen_state TEXT NOT NULL,
-    confirmed INTEGER NOT NULL,
-    PRIMARY KEY (raybet_match_id, captured_at, source_frame_ref)
-);
-CREATE INDEX IF NOT EXISTS idx_vision_match_map_time
-    ON vision_observations(raybet_match_id, map_number, captured_at);
-CREATE INDEX IF NOT EXISTS idx_vision_confirmed_game_captured
-    ON vision_observations(captured_at DESC, raybet_match_id DESC)
-    WHERE confirmed=1 AND screen_state='game';
-CREATE TRIGGER IF NOT EXISTS vision_observation_frame_identity_immutable
-BEFORE UPDATE ON vision_observations
-WHEN OLD.source_frame_ref IS NOT NEW.source_frame_ref
-  OR OLD.source_frame_sha256 IS NOT NEW.source_frame_sha256
-  OR OLD.source_frame_bytes IS NOT NEW.source_frame_bytes
-BEGIN
-    SELECT RAISE(ABORT, 'vision observation frame identity is immutable');
-END;
-CREATE TABLE IF NOT EXISTS vision_observation_invalidations (
-    raybet_match_id TEXT NOT NULL,
-    captured_at TEXT NOT NULL,
-    source_frame_ref TEXT NOT NULL,
-    invalidated_at TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    PRIMARY KEY (raybet_match_id, captured_at, source_frame_ref),
-    FOREIGN KEY (raybet_match_id, captured_at, source_frame_ref)
-        REFERENCES vision_observations(
-            raybet_match_id, captured_at, source_frame_ref
-        )
-);
-CREATE TRIGGER IF NOT EXISTS vision_observation_invalidations_immutable_update
-BEFORE UPDATE ON vision_observation_invalidations
-BEGIN
-    SELECT RAISE(ABORT, 'vision invalidation audit is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_observation_invalidations_immutable_delete
-BEFORE DELETE ON vision_observation_invalidations
-BEGIN
-    SELECT RAISE(ABORT, 'vision invalidation audit is immutable');
-END;
-CREATE TABLE IF NOT EXISTS vision_draft_anchors (
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number > 0),
-    draft_hash TEXT NOT NULL CHECK (length(draft_hash) = 64),
-    radiant_hero_ids TEXT NOT NULL,
-    dire_hero_ids TEXT NOT NULL,
-    radiant_team_side TEXT CHECK (radiant_team_side IN ('team_one', 'team_two')),
-    team_side_anchored_at TEXT,
-    team_side_source_frame_ref TEXT,
-    anchored_at TEXT NOT NULL,
-    source_frame_ref TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('anchored', 'conflict')),
-    conflict_at TEXT,
-    PRIMARY KEY (raybet_match_id, map_number)
-);
-CREATE TABLE IF NOT EXISTS vision_draft_conflicts (
-    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL,
-    captured_at TEXT NOT NULL,
-    source_frame_ref TEXT NOT NULL,
-    observed_draft_hash TEXT NOT NULL CHECK (length(observed_draft_hash) = 64),
-    radiant_hero_ids TEXT NOT NULL,
-    dire_hero_ids TEXT NOT NULL,
-    observed_radiant_team_side TEXT
-        CHECK (observed_radiant_team_side IN ('team_one', 'team_two')),
-    reason TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    UNIQUE (raybet_match_id, map_number, captured_at, source_frame_ref),
-    FOREIGN KEY (raybet_match_id, map_number)
-        REFERENCES vision_draft_anchors(raybet_match_id, map_number)
-);
-CREATE TRIGGER IF NOT EXISTS vision_draft_conflicts_immutable_update
-BEFORE UPDATE ON vision_draft_conflicts
-BEGIN
-    SELECT RAISE(ABORT, 'vision draft conflict is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_draft_conflicts_immutable_delete
-BEFORE DELETE ON vision_draft_conflicts
-BEGIN
-    SELECT RAISE(ABORT, 'vision draft conflict is immutable');
-END;
-CREATE TABLE IF NOT EXISTS rosh_lineup_scores (
-    score_key TEXT PRIMARY KEY CHECK (length(score_key)=64),
-    draft_hash TEXT NOT NULL CHECK (length(draft_hash)=64),
-    player_identity_hash TEXT NOT NULL CHECK (length(player_identity_hash)=64),
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number>0),
-    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id>0)
-        REFERENCES strict_live_map_mappings(mapping_id),
-    radiant_hero_ids_json TEXT NOT NULL CHECK (
-        json_valid(radiant_hero_ids_json)
-        AND json_array_length(radiant_hero_ids_json)=5
-    ),
-    dire_hero_ids_json TEXT NOT NULL CHECK (
-        json_valid(dire_hero_ids_json)
-        AND json_array_length(dire_hero_ids_json)=5
-    ),
-    pure_lineup_score REAL NOT NULL CHECK (
-        typeof(pure_lineup_score) IN ('integer', 'real')
-    ),
-    player_adjusted_lineup_score REAL CHECK (
-        player_adjusted_lineup_score IS NULL OR
-        typeof(player_adjusted_lineup_score) IN ('integer', 'real')
-    ),
-    effective_lineup_score REAL NOT NULL CHECK (
-        typeof(effective_lineup_score) IN ('integer', 'real')
-    ),
-    scoring_mode TEXT NOT NULL CHECK (
-        scoring_mode IN ('pure', 'player_adjusted')
-    ),
-    player_coverage_count INTEGER NOT NULL CHECK (
-        player_coverage_count BETWEEN 0 AND 10
-    ),
-    stake_multiplier REAL NOT NULL CHECK (stake_multiplier IN (0.5, 1.0)),
-    formula_version TEXT NOT NULL CHECK (length(trim(formula_version))>0),
-    source_name TEXT NOT NULL CHECK (source_name='stratz'),
-    source_week INTEGER NOT NULL CHECK (source_week>0),
-    cache_week_start INTEGER NOT NULL CHECK (cache_week_start>0),
-    source_as_of TEXT NOT NULL,
-    evidence_json TEXT NOT NULL CHECK (
-        json_valid(evidence_json) AND json_type(evidence_json)='object'
-    ),
-    evidence_hash TEXT NOT NULL CHECK (length(evidence_hash)=64),
-    created_at TEXT NOT NULL,
-    CHECK (
-        (scoring_mode='player_adjusted'
-         AND player_coverage_count=10
-         AND player_adjusted_lineup_score IS NOT NULL
-         AND effective_lineup_score=player_adjusted_lineup_score
-         AND stake_multiplier=1.0)
-        OR
-        (scoring_mode='pure'
-         AND player_coverage_count<10
-         AND player_adjusted_lineup_score IS NULL
-         AND effective_lineup_score=pure_lineup_score
-         AND stake_multiplier=0.5)
-    )
-);
-CREATE INDEX IF NOT EXISTS idx_rosh_lineup_scores_cache
-    ON rosh_lineup_scores(
-        draft_hash, player_identity_hash, formula_version, cache_week_start,
-        created_at DESC, score_key DESC
-    );
-CREATE INDEX IF NOT EXISTS idx_rosh_lineup_scores_map
-    ON rosh_lineup_scores(
-        raybet_match_id, map_number, strict_mapping_id,
-        created_at DESC, score_key DESC
-    );
-CREATE TRIGGER IF NOT EXISTS rosh_lineup_scores_immutable_update
-BEFORE UPDATE ON rosh_lineup_scores
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh lineup score is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS rosh_lineup_scores_immutable_delete
-BEFORE DELETE ON rosh_lineup_scores
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh lineup score is immutable');
-END;
-CREATE TABLE IF NOT EXISTS rosh_analysis_runs (
-    run_id TEXT PRIMARY KEY CHECK (
-        length(run_id)=64 AND run_id NOT GLOB '*[^0-9a-f]*'
-    ),
-    status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
-    mode TEXT NOT NULL CHECK (mode IN ('historical_match', 'explicit_draft')),
-    match_id INTEGER,
-    date_time INTEGER NOT NULL CHECK (date_time>=0),
-    draft_hash TEXT NOT NULL CHECK (
-        length(draft_hash)=64 AND draft_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    draft_json TEXT NOT NULL CHECK (
-        json_valid(draft_json) AND json_type(draft_json)='object'
-    ),
-    rosh_profile_id TEXT NOT NULL CHECK (length(trim(rosh_profile_id))>0),
-    formula_version TEXT NOT NULL CHECK (length(trim(formula_version))>0),
-    request_profile_hash TEXT NOT NULL CHECK (
-        length(request_profile_hash)=64
-        AND request_profile_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    upstream_bundle_hash TEXT NOT NULL CHECK (
-        length(upstream_bundle_hash)=64
-        AND upstream_bundle_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    scorer_source_hash TEXT NOT NULL CHECK (
-        length(scorer_source_hash)=64
-        AND scorer_source_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    canonical_profile_hash TEXT NOT NULL CHECK (
-        length(canonical_profile_hash)=64
-        AND canonical_profile_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    serialization_version TEXT NOT NULL CHECK (
-        length(trim(serialization_version))>0
-    ),
-    request_hash TEXT NOT NULL CHECK (
-        length(request_hash)=64 AND request_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    request_manifest_json TEXT NOT NULL CHECK (
-        json_valid(request_manifest_json)
-        AND json_type(request_manifest_json)='object'
-    ),
-    response_manifest_json TEXT NOT NULL CHECK (
-        json_valid(response_manifest_json)
-        AND json_type(response_manifest_json)='array'
-    ),
-    radiant_team_score REAL,
-    dire_team_score REAL,
-    relative_advantage REAL,
-    result_json TEXT CHECK (
-        result_json IS NULL OR
-        (json_valid(result_json) AND json_type(result_json)='object')
-    ),
-    evidence_hash TEXT NOT NULL UNIQUE CHECK (
-        length(evidence_hash)=64 AND evidence_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    error_code TEXT,
-    collected_at TEXT NOT NULL CHECK (length(trim(collected_at))>0),
-    CHECK (
-        (mode='historical_match' AND match_id IS NOT NULL AND match_id>0)
-        OR (mode='explicit_draft' AND match_id IS NULL)
-    ),
-    CHECK (
-        (status='succeeded'
-         AND json_array_length(response_manifest_json)>0
-         AND typeof(radiant_team_score) IN ('integer', 'real')
-         AND radiant_team_score BETWEEN -1.0e308 AND 1.0e308
-         AND typeof(dire_team_score) IN ('integer', 'real')
-         AND dire_team_score BETWEEN -1.0e308 AND 1.0e308
-         AND typeof(relative_advantage) IN ('integer', 'real')
-         AND relative_advantage BETWEEN -1.0e308 AND 1.0e308
-         AND result_json IS NOT NULL AND error_code IS NULL)
-        OR
-        (status='failed' AND radiant_team_score IS NULL
-         AND dire_team_score IS NULL AND relative_advantage IS NULL
-         AND result_json IS NULL AND error_code IS NOT NULL
-         AND length(trim(error_code))>0)
-    )
-);
-CREATE INDEX IF NOT EXISTS idx_rosh_runs_match_profile
-    ON rosh_analysis_runs(match_id, rosh_profile_id, date_time);
-CREATE INDEX IF NOT EXISTS idx_rosh_runs_draft_profile
-    ON rosh_analysis_runs(draft_hash, rosh_profile_id, date_time);
-CREATE TRIGGER IF NOT EXISTS rosh_analysis_runs_immutable_update
-BEFORE UPDATE ON rosh_analysis_runs
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh analysis run is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS rosh_analysis_runs_immutable_delete
-BEFORE DELETE ON rosh_analysis_runs
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh analysis run is immutable');
-END;
-CREATE TABLE IF NOT EXISTS rosh_hero_scores (
-    run_id TEXT NOT NULL REFERENCES rosh_analysis_runs(run_id),
-    team_side TEXT NOT NULL CHECK (team_side IN ('RADIANT', 'DIRE')),
-    position_id INTEGER NOT NULL CHECK (position_id BETWEEN 1 AND 5),
-    hero_id INTEGER NOT NULL CHECK (hero_id>0),
-    raw_score REAL NOT NULL CHECK (
-        typeof(raw_score) IN ('integer', 'real')
-        AND raw_score BETWEEN -1.0e308 AND 1.0e308
-    ),
-    display_score REAL NOT NULL CHECK (
-        typeof(display_score) IN ('integer', 'real')
-        AND display_score BETWEEN -1.0e308 AND 1.0e308
-    ),
-    components_json TEXT NOT NULL CHECK (
-        json_valid(components_json) AND json_type(components_json)='object'
-    ),
-    PRIMARY KEY (run_id, team_side, position_id),
-    UNIQUE (run_id, hero_id)
-);
-CREATE TRIGGER IF NOT EXISTS rosh_hero_scores_succeeded_run_insert
-BEFORE INSERT ON rosh_hero_scores
-WHEN NOT EXISTS (
-    SELECT 1 FROM rosh_analysis_runs
-     WHERE run_id=NEW.run_id AND status='succeeded'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh hero score requires succeeded run');
-END;
-CREATE TRIGGER IF NOT EXISTS rosh_hero_scores_immutable_update
-BEFORE UPDATE ON rosh_hero_scores
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh hero score is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS rosh_hero_scores_immutable_delete
-BEFORE DELETE ON rosh_hero_scores
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh hero score is immutable');
-END;
-CREATE TABLE IF NOT EXISTS rosh_minute_points (
-    run_id TEXT NOT NULL REFERENCES rosh_analysis_runs(run_id),
-    minute INTEGER NOT NULL CHECK (minute>=0),
-    raw_score REAL NOT NULL CHECK (
-        typeof(raw_score) IN ('integer', 'real')
-        AND raw_score BETWEEN -1.0e308 AND 1.0e308
-    ),
-    display_score REAL NOT NULL CHECK (
-        typeof(display_score) IN ('integer', 'real')
-        AND display_score BETWEEN -1.0e308 AND 1.0e308
-    ),
-    radiant_time_delta REAL NOT NULL CHECK (
-        typeof(radiant_time_delta) IN ('integer', 'real')
-        AND radiant_time_delta BETWEEN -1.0e308 AND 1.0e308
-    ),
-    dire_time_delta REAL NOT NULL CHECK (
-        typeof(dire_time_delta) IN ('integer', 'real')
-        AND dire_time_delta BETWEEN -1.0e308 AND 1.0e308
-    ),
-    synergy_delta REAL NOT NULL CHECK (
-        typeof(synergy_delta) IN ('integer', 'real')
-        AND synergy_delta BETWEEN -1.0e308 AND 1.0e308
-    ),
-    source_audit_json TEXT NOT NULL CHECK (
-        json_valid(source_audit_json) AND json_type(source_audit_json)='object'
-    ),
-    PRIMARY KEY (run_id, minute)
-);
-CREATE TRIGGER IF NOT EXISTS rosh_minute_points_succeeded_run_insert
-BEFORE INSERT ON rosh_minute_points
-WHEN NOT EXISTS (
-    SELECT 1 FROM rosh_analysis_runs
-     WHERE run_id=NEW.run_id AND status='succeeded'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh minute point requires succeeded run');
-END;
-CREATE TRIGGER IF NOT EXISTS rosh_minute_points_immutable_update
-BEFORE UPDATE ON rosh_minute_points
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh minute point is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS rosh_minute_points_immutable_delete
-BEFORE DELETE ON rosh_minute_points
-BEGIN
-    SELECT RAISE(ABORT, 'Rosh minute point is immutable');
-END;
-CREATE TABLE IF NOT EXISTS official_rosh_shadow_evaluations (
-    evaluation_key TEXT PRIMARY KEY CHECK (
-        length(evaluation_key)=64
-        AND evaluation_key NOT GLOB '*[^0-9a-f]*'
-    ),
-    candidate_hash TEXT NOT NULL CHECK (
-        length(candidate_hash)=64
-        AND candidate_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    raybet_match_id TEXT NOT NULL CHECK (length(trim(raybet_match_id))>0),
-    map_number INTEGER NOT NULL CHECK (map_number>0),
-    decided_at TEXT NOT NULL CHECK (length(trim(decided_at))>0),
-    transport_key TEXT NOT NULL CHECK (length(trim(transport_key))>0),
-    observation_draft_hash TEXT NOT NULL CHECK (
-        length(observation_draft_hash)=64
-        AND observation_draft_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    source_run_id TEXT REFERENCES rosh_analysis_runs(run_id),
-    strategy_version TEXT NOT NULL CHECK (
-        strategy_version='comeback-shadow-v6-official-rosh-direction'
-    ),
-    status TEXT NOT NULL CHECK (status IN ('shadow_candidate', 'rejected')),
-    reason TEXT NOT NULL CHECK (length(trim(reason))>0),
-    record_json TEXT NOT NULL CHECK (
-        json_valid(record_json)
-        AND json_type(record_json)='object'
-        AND json_extract(record_json, '$.schema')=
-            'official-rosh-shadow-candidate/v1'
-        AND json_extract(record_json, '$.candidate_hash')=candidate_hash
-        AND json_extract(record_json, '$.strategy_version')=strategy_version
-        AND json_extract(record_json, '$.status')=status
-        AND json_extract(record_json, '$.reason')=reason
-        AND json_type(record_json, '$.calibration_artifact_ref')='null'
-        AND json_type(record_json, '$.calibrated_probability')='null'
-        AND json_type(record_json, '$.edge')='null'
-        AND json_type(record_json, '$.stake_multiplier')='null'
-        AND json_type(record_json, '$.paper_order')='null'
-        AND json_extract(record_json, '$.cohort.m3_c')=
-            'shadow_candidate_or_rejection'
-        AND json_type(record_json, '$.cohort.m3_e')='null'
-        AND (
-            (json_type(record_json, '$.rosh_direction_evidence')='null'
-             AND status='rejected')
-            OR
-            (json_type(record_json, '$.rosh_direction_evidence')='object'
-             AND json_extract(
-                    record_json,
-                    '$.rosh_direction_evidence.analysis_run_id'
-                 )=source_run_id
-             AND json_extract(
-                    record_json,
-                    '$.rosh_direction_evidence.draft_hash'
-                 )=observation_draft_hash)
-        )
-    )
-);
-CREATE INDEX IF NOT EXISTS idx_official_rosh_shadow_match_time
-    ON official_rosh_shadow_evaluations(
-        raybet_match_id, map_number, decided_at, strategy_version
-    );
-CREATE INDEX IF NOT EXISTS idx_official_rosh_shadow_draft
-    ON official_rosh_shadow_evaluations(
-        observation_draft_hash, decided_at, strategy_version
-    );
-CREATE TRIGGER IF NOT EXISTS official_rosh_shadow_evaluations_immutable_update
-BEFORE UPDATE ON official_rosh_shadow_evaluations
-BEGIN
-    SELECT RAISE(ABORT, 'official Rosh shadow evaluations are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS official_rosh_shadow_evaluations_immutable_delete
-BEFORE DELETE ON official_rosh_shadow_evaluations
-BEGIN
-    SELECT RAISE(ABORT, 'official Rosh shadow evaluations are immutable');
-END;
-CREATE TABLE IF NOT EXISTS vision_derived_invalidations (
-    dependent_type TEXT NOT NULL CHECK (dependent_type IN
-        ('odds_alignment', 'strategy_decision', 'research_prediction',
-         'shadow_order')),
-    dependent_key TEXT NOT NULL,
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL,
-    reason TEXT NOT NULL,
-    block_reason TEXT NOT NULL DEFAULT 'vision_draft_conflict',
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (dependent_type, dependent_key)
-);
-CREATE TRIGGER IF NOT EXISTS vision_derived_invalidations_immutable_update
-BEFORE UPDATE ON vision_derived_invalidations
-BEGIN
-    SELECT RAISE(ABORT, 'vision derived invalidation is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS vision_derived_invalidations_immutable_delete
-BEFORE DELETE ON vision_derived_invalidations
-BEGIN
-    SELECT RAISE(ABORT, 'vision derived invalidation is immutable');
-END;
-CREATE TABLE IF NOT EXISTS odds_alignments (
-    odds_snapshot_id INTEGER PRIMARY KEY,
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER,
-    game_clock_seconds INTEGER,
-    observation_captured_at TEXT,
-    method TEXT NOT NULL,
-    lag_seconds REAL,
-    usable INTEGER NOT NULL,
-    reason TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_alignment_match_map_time
-    ON odds_alignments(raybet_match_id, map_number, game_clock_seconds);
-CREATE TABLE IF NOT EXISTS strategy_decisions (
-    decision_key TEXT PRIMARY KEY,
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL,
-    decided_at TEXT NOT NULL,
-    underdog_side TEXT NOT NULL,
-    market_probability REAL NOT NULL,
-    model_probability REAL NOT NULL,
-    edge REAL NOT NULL,
-    data_quality REAL NOT NULL,
-    eligible INTEGER NOT NULL,
-    reason TEXT NOT NULL,
-    contributions_json TEXT NOT NULL,
-    input_ref TEXT NOT NULL,
-    strategy_version TEXT NOT NULL,
-    draft_curve_key TEXT REFERENCES prospective_draft_curves(curve_key),
-    draft_source_ref TEXT,
-    draft_landmark_key TEXT
-        REFERENCES prospective_draft_landmarks(landmark_key),
-    draft_landmark_horizon_minutes INTEGER CHECK (
-        draft_landmark_horizon_minutes IS NULL OR
-        draft_landmark_horizon_minutes IN (10, 20, 30, 40, 50)
-    ),
-    draft_landmark_target TEXT CHECK (
-        draft_landmark_target IS NULL OR draft_landmark_target='radiant_win'
-    ),
-    draft_landmark_radiant_probability REAL CHECK (
-        draft_landmark_radiant_probability IS NULL OR
-        draft_landmark_radiant_probability BETWEEN 0.0 AND 1.0
-    ),
-    draft_landmark_quality REAL CHECK (
-        draft_landmark_quality IS NULL OR
-        draft_landmark_quality BETWEEN 0.0 AND 1.0
-    ),
-    draft_landmark_uncertainty REAL CHECK (
-        draft_landmark_uncertainty IS NULL OR
-        draft_landmark_uncertainty BETWEEN 0.0 AND 0.5
-    ),
-    draft_landmark_support INTEGER CHECK (
-        draft_landmark_support IS NULL OR draft_landmark_support>=100
-    ),
-    draft_radiant_team_side TEXT CHECK (
-        draft_radiant_team_side IS NULL OR
-        draft_radiant_team_side IN ('team_one', 'team_two')
-    ),
-    draft_strict_mapping_id INTEGER CHECK (
-        draft_strict_mapping_id IS NULL OR draft_strict_mapping_id>0
-    ) REFERENCES strict_live_map_mappings(mapping_id),
-    draft_deployment_key TEXT
-        REFERENCES draft_deployment_bundles(deployment_key),
-    draft_target_snapshot_hash TEXT CHECK (
-        draft_target_snapshot_hash IS NULL OR
-        length(draft_target_snapshot_hash)=64
-    ),
-    draft_feature_hash TEXT CHECK (
-        draft_feature_hash IS NULL OR length(draft_feature_hash)=64
-    ),
-    draft_model_hash TEXT REFERENCES draft_model_artifacts(model_hash),
-    draft_calibration_hash TEXT
-        REFERENCES draft_calibration_artifacts(calibration_hash),
-    draft_model_version TEXT,
-    draft_global_gate_ref TEXT,
-    draft_input_snapshot_hash TEXT CHECK (
-        draft_input_snapshot_hash IS NULL OR
-        length(draft_input_snapshot_hash)=64
-    ),
-    draft_authority_revision INTEGER CHECK (
-        draft_authority_revision IS NULL OR draft_authority_revision>=1
-    ),
-    draft_dependency_revision INTEGER CHECK (
-        draft_dependency_revision IS NULL OR draft_dependency_revision>=1
-    ),
-    vision_raybet_match_id TEXT,
-    vision_map_number INTEGER CHECK (
-        vision_map_number IS NULL OR vision_map_number>0
-    ),
-    vision_captured_at TEXT,
-    vision_source_frame_ref TEXT,
-    vision_source_frame_sha256 TEXT CHECK (
-        vision_source_frame_sha256 IS NULL OR
-        length(vision_source_frame_sha256)=64
-    ),
-    vision_source_frame_bytes INTEGER CHECK (
-        vision_source_frame_bytes IS NULL OR vision_source_frame_bytes>0
-    ),
-    vision_observed_game_clock_seconds INTEGER CHECK (
-        vision_observed_game_clock_seconds IS NULL OR
-        vision_observed_game_clock_seconds>=0
-    ),
-    vision_aligned_game_clock_seconds INTEGER CHECK (
-        vision_aligned_game_clock_seconds IS NULL OR
-        vision_aligned_game_clock_seconds>=0
-    ),
-    vision_is_paused INTEGER CHECK (
-        vision_is_paused IS NULL OR vision_is_paused IN (0, 1)
-    ),
-    vision_radiant_hero_ids_json TEXT CHECK (
-        vision_radiant_hero_ids_json IS NULL OR
-        json_valid(vision_radiant_hero_ids_json)
-    ),
-    vision_dire_hero_ids_json TEXT CHECK (
-        vision_dire_hero_ids_json IS NULL OR
-        json_valid(vision_dire_hero_ids_json)
-    ),
-    vision_radiant_team_side TEXT CHECK (
-        vision_radiant_team_side IS NULL OR
-        vision_radiant_team_side IN ('team_one', 'team_two')
-    ),
-    vision_clock_confidence REAL CHECK (
-        vision_clock_confidence IS NULL OR
-        vision_clock_confidence BETWEEN 0.0 AND 1.0
-    ),
-    vision_draft_confidence REAL CHECK (
-        vision_draft_confidence IS NULL OR
-        vision_draft_confidence BETWEEN 0.0 AND 1.0
-    ),
-    vision_screen_state TEXT,
-    vision_confirmed INTEGER CHECK (
-        vision_confirmed IS NULL OR vision_confirmed IN (0, 1)
-    ),
-    vision_transport_key TEXT,
-    vision_transport_at TEXT,
-    vision_alignment_method TEXT CHECK (
-        vision_alignment_method IS NULL OR
-        vision_alignment_method IN ('anchor', 'forward_projection')
-    ),
-    vision_alignment_lag_seconds REAL CHECK (
-        vision_alignment_lag_seconds IS NULL OR
-        vision_alignment_lag_seconds BETWEEN 0.0 AND 15.0
-    )
-);
-CREATE TRIGGER IF NOT EXISTS strategy_decisions_immutable_update
-BEFORE UPDATE ON strategy_decisions
-BEGIN
-    SELECT RAISE(ABORT, 'strategy decisions are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS strategy_decisions_immutable_delete
-BEFORE DELETE ON strategy_decisions
-BEGIN
-    SELECT RAISE(ABORT, 'strategy decisions are immutable');
-END;
-CREATE TABLE IF NOT EXISTS draft_deployment_revisions (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    artifact_revision INTEGER NOT NULL CHECK (artifact_revision >= 1),
-    updated_at TEXT NOT NULL
-);
-INSERT OR IGNORE INTO draft_deployment_revisions
-    (singleton, artifact_revision, updated_at)
-VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-CREATE TABLE IF NOT EXISTS draft_model_artifacts (
-    model_hash TEXT PRIMARY KEY CHECK (length(model_hash)=64),
-    model_version TEXT NOT NULL,
-    model_kind TEXT NOT NULL CHECK (model_kind='pure_draft'),
-    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes IN (10, 20, 30, 40, 50)),
-    training_cutoff TEXT NOT NULL,
-    feature_schema_hash TEXT NOT NULL CHECK (length(feature_schema_hash)=64),
-    training_input_hash TEXT NOT NULL CHECK (length(training_input_hash)=64),
-    artifact_json TEXT NOT NULL CHECK (json_valid(artifact_json)),
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS draft_calibration_artifacts (
-    calibration_hash TEXT PRIMARY KEY CHECK (length(calibration_hash)=64),
-    model_hash TEXT NOT NULL CHECK (length(model_hash)=64),
-    calibration_version TEXT NOT NULL,
-    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes IN (10, 20, 30, 40, 50)),
-    evidence_mode TEXT NOT NULL CHECK (
-        evidence_mode IN ('reconstructed_walk_forward', 'prospective')
-    ),
-    support INTEGER NOT NULL CHECK (support >= 0),
-    artifact_json TEXT NOT NULL CHECK (json_valid(artifact_json)),
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS draft_deployment_bundles (
-    deployment_key TEXT PRIMARY KEY CHECK (length(deployment_key)=64),
-    model_hashes_json TEXT NOT NULL CHECK (json_valid(model_hashes_json)),
-    calibration_hashes_json TEXT NOT NULL CHECK (json_valid(calibration_hashes_json)),
-    training_cutoff TEXT NOT NULL,
-    dependency_fingerprint TEXT NOT NULL CHECK (length(dependency_fingerprint)=64),
-    dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
-    evidence_mode TEXT NOT NULL CHECK (
-        evidence_mode IN ('reconstructed_walk_forward', 'prospective')
-    ),
-    created_at TEXT NOT NULL
-);
-CREATE TRIGGER IF NOT EXISTS draft_deployment_bundle_authority_insert
-BEFORE INSERT ON draft_deployment_bundles
-WHEN json_type(NEW.model_hashes_json)!='object'
-  OR json_type(NEW.calibration_hashes_json)!='object'
-  OR (SELECT COUNT(*) FROM json_each(NEW.model_hashes_json))!=5
-  OR (SELECT COUNT(*) FROM json_each(NEW.calibration_hashes_json))!=5
-  OR (SELECT COUNT(DISTINCT key)
-        FROM json_each(NEW.model_hashes_json))!=5
-  OR (SELECT COUNT(DISTINCT key)
-        FROM json_each(NEW.calibration_hashes_json))!=5
-  OR EXISTS (
-      SELECT 1 FROM json_each(NEW.model_hashes_json) AS reference
-       WHERE reference.key NOT IN ('10', '20', '30', '40', '50')
-          OR reference.type!='text'
-  )
-  OR EXISTS (
-      SELECT 1 FROM json_each(NEW.calibration_hashes_json) AS reference
-       WHERE reference.key NOT IN ('10', '20', '30', '40', '50')
-          OR reference.type!='text'
-  )
-  OR EXISTS (
-      SELECT 1
-        FROM json_each(NEW.model_hashes_json) AS reference
-        LEFT JOIN draft_model_artifacts AS model
-          ON model.model_hash=reference.value
-         AND model.horizon_minutes=CAST(reference.key AS INTEGER)
-       WHERE model.model_hash IS NULL
-          OR model.training_cutoff!=NEW.training_cutoff
-          OR json_extract(model.artifact_json, '$.artifact_version')
-                IS NOT 'draft-model-artifact-v2'
-          OR json_type(model.artifact_json, '$.training_corpus') IS NOT 'array'
-          OR json_array_length(
-                 model.artifact_json, '$.training_corpus'
-             )!=json_extract(model.artifact_json, '$.support')
-  )
-  OR EXISTS (
-      SELECT 1
-        FROM json_each(NEW.calibration_hashes_json) AS reference
-        LEFT JOIN draft_calibration_artifacts AS calibration
-          ON calibration.calibration_hash=reference.value
-         AND calibration.horizon_minutes=CAST(reference.key AS INTEGER)
-       WHERE calibration.calibration_hash IS NULL
-          OR calibration.evidence_mode!=NEW.evidence_mode
-          OR calibration.model_hash!=json_extract(
-                 NEW.model_hashes_json,
-                 '$."' || reference.key || '"'
-             )
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'draft deployment bundle authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_model_artifacts_immutable_update
-BEFORE UPDATE ON draft_model_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'draft model artifact is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_model_artifacts_immutable_delete
-BEFORE DELETE ON draft_model_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'draft model artifact is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_calibration_artifacts_immutable_update
-BEFORE UPDATE ON draft_calibration_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'draft calibration artifact is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_calibration_artifacts_immutable_delete
-BEFORE DELETE ON draft_calibration_artifacts
-BEGIN
-    SELECT RAISE(ABORT, 'draft calibration artifact is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_bundles_immutable_update
-BEFORE UPDATE ON draft_deployment_bundles
-BEGIN
-    SELECT RAISE(ABORT, 'draft deployment bundle is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_bundles_immutable_delete
-BEFORE DELETE ON draft_deployment_bundles
-BEGIN
-    SELECT RAISE(ABORT, 'draft deployment bundle is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_model_insert
-AFTER INSERT ON draft_model_artifacts
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_model_update
-AFTER UPDATE ON draft_model_artifacts
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_model_delete
-AFTER DELETE ON draft_model_artifacts
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_calibration_insert
-AFTER INSERT ON draft_calibration_artifacts
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_calibration_update
-AFTER UPDATE ON draft_calibration_artifacts
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_calibration_delete
-AFTER DELETE ON draft_calibration_artifacts
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_bundle_insert
-AFTER INSERT ON draft_deployment_bundles
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_bundle_update
-AFTER UPDATE ON draft_deployment_bundles
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TRIGGER IF NOT EXISTS draft_deployment_revision_bundle_delete
-AFTER DELETE ON draft_deployment_bundles
-BEGIN
-    UPDATE draft_deployment_revisions
-       SET artifact_revision=artifact_revision+1,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE singleton=1;
-END;
-CREATE TABLE IF NOT EXISTS prospective_draft_curves (
-    curve_key TEXT PRIMARY KEY CHECK (length(curve_key)=64),
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number > 0),
-    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id > 0),
-    lineup_hash TEXT NOT NULL CHECK (length(lineup_hash)=64),
-    radiant_hero_ids_json TEXT NOT NULL,
-    dire_hero_ids_json TEXT NOT NULL,
-    prediction_cutoff TEXT NOT NULL,
-    first_usable_at TEXT NOT NULL,
-    availability_mode TEXT NOT NULL CHECK (availability_mode='prospective'),
-    created_at TEXT NOT NULL,
-    radiant_team_side TEXT CHECK (
-        radiant_team_side IS NULL OR radiant_team_side IN ('team_one', 'team_two')
-    ),
-    anchor_draft_hash TEXT CHECK (
-        anchor_draft_hash IS NULL OR length(anchor_draft_hash)=64
-    ),
-    anchor_source_frame_ref TEXT,
-    anchor_anchored_at TEXT,
-    anchor_team_side_source_frame_ref TEXT,
-    anchor_team_side_anchored_at TEXT,
-    deployment_key TEXT CHECK (
-        deployment_key IS NULL OR length(deployment_key)=64
-    ),
-    target_snapshot_hash TEXT CHECK (
-        target_snapshot_hash IS NULL OR length(target_snapshot_hash)=64
-    ),
-    feature_snapshot_json TEXT CHECK (
-        feature_snapshot_json IS NULL OR json_valid(feature_snapshot_json)
-    ),
-    feature_dependency_fingerprint TEXT CHECK (
-        feature_dependency_fingerprint IS NULL
-        OR length(feature_dependency_fingerprint)=64
-    ),
-    feature_dependency_revision INTEGER CHECK (
-        feature_dependency_revision IS NULL OR feature_dependency_revision >= 1
-    ),
-    UNIQUE (raybet_match_id, map_number, strict_mapping_id, lineup_hash,
-            first_usable_at, curve_key)
-);
-CREATE INDEX IF NOT EXISTS idx_prospective_draft_curve_target
-    ON prospective_draft_curves(
-        raybet_match_id, map_number, strict_mapping_id, lineup_hash,
-        first_usable_at
-    );
-CREATE TABLE IF NOT EXISTS prospective_draft_landmarks (
-    landmark_key TEXT PRIMARY KEY CHECK (length(landmark_key)=64),
-    curve_key TEXT NOT NULL REFERENCES prospective_draft_curves(curve_key),
-    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes IN (10, 20, 30, 40, 50)),
-    radiant_probability REAL NOT NULL CHECK (radiant_probability BETWEEN 0.0 AND 1.0),
-    scaling_edge REAL NOT NULL,
-    synergy_edge REAL NOT NULL,
-    quality REAL NOT NULL CHECK (quality BETWEEN 0.0 AND 1.0),
-    validation_status TEXT NOT NULL
-        CHECK (validation_status IN ('passed', 'failed', 'insufficient_evidence')),
-    support INTEGER NOT NULL CHECK (support >= 0),
-    calibration_ref TEXT NOT NULL,
-    input_refs_json TEXT NOT NULL,
-    uncertainty REAL CHECK (uncertainty IS NULL OR uncertainty BETWEEN 0.0 AND 0.5),
-    validation_reason TEXT,
-    feature_hash TEXT NOT NULL CHECK (length(feature_hash)=64),
-    model_hash TEXT NOT NULL CHECK (length(model_hash)=64),
-    calibration_hash TEXT NOT NULL CHECK (length(calibration_hash)=64),
-    global_calibration_passed INTEGER NOT NULL
-        CHECK (global_calibration_passed IN (0, 1)),
-    global_gate_ref TEXT NOT NULL,
-    model_version TEXT NOT NULL,
-    model_kind TEXT NOT NULL CHECK (model_kind='pure_draft'),
-    availability_mode TEXT NOT NULL CHECK (availability_mode='prospective'),
-    input_snapshot_hash TEXT NOT NULL CHECK (length(input_snapshot_hash)=64),
-    created_at TEXT NOT NULL,
-    raw_radiant_probability REAL CHECK (
-        raw_radiant_probability IS NULL OR
-        raw_radiant_probability BETWEEN 0.0 AND 1.0
-    ),
-    deployment_key TEXT CHECK (
-        deployment_key IS NULL OR length(deployment_key)=64
-    ),
-    model_input_hash TEXT CHECK (
-        model_input_hash IS NULL OR length(model_input_hash)=64
-    ),
-    raw_uncertainty REAL CHECK (
-        raw_uncertainty IS NULL OR raw_uncertainty BETWEEN 0.0 AND 0.5
-    ),
-    UNIQUE (curve_key, horizon_minutes)
-);
-CREATE TRIGGER IF NOT EXISTS prospective_draft_curve_authority_insert
-BEFORE INSERT ON prospective_draft_curves
-WHEN NEW.radiant_team_side IS NULL
-  OR NEW.anchor_draft_hash IS NULL
-  OR NEW.anchor_source_frame_ref IS NULL
-  OR NEW.anchor_source_frame_ref=''
-  OR NEW.anchor_anchored_at IS NULL
-  OR NEW.anchor_team_side_source_frame_ref IS NULL
-  OR NEW.anchor_team_side_source_frame_ref=''
-  OR NEW.anchor_team_side_anchored_at IS NULL
-  OR NEW.deployment_key IS NULL
-  OR NEW.target_snapshot_hash IS NULL
-  OR NEW.feature_snapshot_json IS NULL
-  OR NEW.feature_dependency_fingerprint IS NULL
-  OR NEW.feature_dependency_revision IS NULL
-  OR julianday(NEW.prediction_cutoff) IS NULL
-  OR julianday(NEW.first_usable_at) IS NULL
-  OR julianday(NEW.created_at) IS NULL
-  OR julianday(NEW.anchor_anchored_at) IS NULL
-  OR julianday(NEW.anchor_team_side_anchored_at) IS NULL
-  OR julianday(NEW.anchor_anchored_at)>julianday(NEW.prediction_cutoff)
-  OR julianday(NEW.anchor_team_side_anchored_at)>julianday(NEW.prediction_cutoff)
-  OR julianday(NEW.prediction_cutoff)>julianday(NEW.first_usable_at)
-  OR julianday(NEW.first_usable_at)>julianday(NEW.created_at)
-  OR NOT EXISTS (
-      SELECT 1 FROM draft_deployment_bundles AS deployment
-       WHERE deployment.deployment_key=NEW.deployment_key
-         AND julianday(deployment.created_at)<=julianday(NEW.prediction_cutoff)
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft curve authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_landmark_authority_insert
-BEFORE INSERT ON prospective_draft_landmarks
-WHEN NEW.raw_radiant_probability IS NULL
-  OR NEW.deployment_key IS NULL
-  OR NEW.model_input_hash IS NULL
-  OR NOT EXISTS (
-      SELECT 1 FROM prospective_draft_curves AS curve
-       WHERE curve.curve_key=NEW.curve_key
-         AND curve.deployment_key=NEW.deployment_key
-  )
-  OR NOT EXISTS (
-      SELECT 1 FROM draft_model_artifacts AS model
-       WHERE model.model_hash=NEW.model_hash
-         AND model.horizon_minutes=NEW.horizon_minutes
-         AND model.model_version=NEW.model_version
-         AND model.model_kind=NEW.model_kind
-         AND model.feature_schema_hash=NEW.feature_hash
-  )
-  OR NOT EXISTS (
-      SELECT 1 FROM draft_calibration_artifacts AS calibration
-       WHERE calibration.calibration_hash=NEW.calibration_hash
-         AND calibration.model_hash=NEW.model_hash
-         AND calibration.horizon_minutes=NEW.horizon_minutes
-         AND calibration.support=NEW.support
-  )
-  OR NOT EXISTS (
-      SELECT 1 FROM draft_deployment_bundles AS deployment
-       WHERE deployment.deployment_key=NEW.deployment_key
-         AND json_extract(
-             deployment.model_hashes_json,
-             '$."' || NEW.horizon_minutes || '"'
-         )=NEW.model_hash
-         AND json_extract(
-             deployment.calibration_hashes_json,
-             '$."' || NEW.horizon_minutes || '"'
-         )=NEW.calibration_hash
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft landmark authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_curves_immutable_update
-BEFORE UPDATE ON prospective_draft_curves
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft curve is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_curves_immutable_delete
-BEFORE DELETE ON prospective_draft_curves
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft curve is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_landmarks_immutable_update
-BEFORE UPDATE ON prospective_draft_landmarks
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft landmark is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_landmarks_immutable_delete
-BEFORE DELETE ON prospective_draft_landmarks
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft landmark is immutable');
-END;
-CREATE VIEW IF NOT EXISTS prospective_draft_landmark_authority AS
-SELECT curve.curve_key,
-       'prospective-draft:' || curve.curve_key AS source_ref,
-       curve.raybet_match_id,
-       curve.map_number,
-       curve.strict_mapping_id,
-       curve.radiant_hero_ids_json,
-       curve.dire_hero_ids_json,
-       curve.first_usable_at,
-       curve.radiant_team_side,
-       curve.deployment_key,
-       curve.target_snapshot_hash,
-       curve.feature_dependency_revision,
-       landmark.landmark_key,
-       landmark.horizon_minutes,
-       'radiant_win' AS landmark_target,
-       landmark.radiant_probability,
-       landmark.quality,
-       landmark.uncertainty,
-       landmark.support,
-       landmark.feature_hash,
-       landmark.model_hash,
-       landmark.calibration_hash,
-       landmark.model_version,
-       landmark.global_gate_ref,
-       landmark.input_snapshot_hash
-  FROM prospective_draft_curves AS curve
-  JOIN prospective_draft_landmarks AS landmark
-    ON landmark.curve_key=curve.curve_key
-  JOIN draft_model_artifacts AS model
-    ON model.model_hash=landmark.model_hash
-   AND model.model_version=landmark.model_version
-   AND model.model_kind='pure_draft'
-   AND model.horizon_minutes=landmark.horizon_minutes
-   AND model.feature_schema_hash=landmark.feature_hash
-  JOIN draft_calibration_artifacts AS calibration
-    ON calibration.calibration_hash=landmark.calibration_hash
-   AND calibration.model_hash=landmark.model_hash
-   AND calibration.horizon_minutes=landmark.horizon_minutes
-   AND calibration.support=landmark.support
-  JOIN draft_deployment_bundles AS deployment
-    ON deployment.deployment_key=curve.deployment_key
- WHERE curve.availability_mode='prospective'
-   AND landmark.validation_status='passed'
-   AND landmark.global_calibration_passed=1
-   AND landmark.model_kind='pure_draft'
-   AND landmark.availability_mode='prospective'
-   AND landmark.deployment_key=curve.deployment_key
-   AND json_extract(
-           deployment.model_hashes_json,
-           '$."' || landmark.horizon_minutes || '"'
-       )=landmark.model_hash
-   AND json_extract(
-           deployment.calibration_hashes_json,
-           '$."' || landmark.horizon_minutes || '"'
-       )=landmark.calibration_hash;
-CREATE VIEW IF NOT EXISTS trusted_vision_observation_authority AS
-SELECT observation.*
-  FROM vision_observations AS observation
-  JOIN active_vision_frame_artifacts AS frame
-    ON frame.frame_ref=observation.source_frame_ref
-   AND frame.content_sha256=observation.source_frame_sha256
-   AND frame.byte_length=observation.source_frame_bytes
- WHERE observation.confirmed=1
-   AND julianday(observation.captured_at) IS NOT NULL
-   AND observation.map_number IS NOT NULL
-   AND observation.map_number>0
-   AND typeof(observation.game_clock_seconds)='integer'
-   AND observation.game_clock_seconds>=0
-   AND observation.is_paused=0
-   AND observation.screen_state='game'
-   AND observation.source_frame_ref!=''
-   AND observation.radiant_team_side IN ('team_one', 'team_two')
-   AND typeof(observation.clock_confidence) IN ('integer', 'real')
-   AND observation.clock_confidence>=0.9
-   AND observation.clock_confidence<=1.0
-   AND typeof(observation.draft_confidence) IN ('integer', 'real')
-   AND observation.draft_confidence>=0.9
-   AND observation.draft_confidence<=1.0
-   AND json_valid(observation.radiant_hero_ids)
-   AND json_valid(observation.dire_hero_ids)
-   AND json_type(observation.radiant_hero_ids)='array'
-   AND json_type(observation.dire_hero_ids)='array'
-   AND json_array_length(observation.radiant_hero_ids)=5
-   AND json_array_length(observation.dire_hero_ids)=5
-   AND NOT EXISTS (
-       SELECT 1 FROM json_each(observation.radiant_hero_ids)
-        WHERE type!='integer' OR value<=0
-   )
-   AND NOT EXISTS (
-       SELECT 1 FROM json_each(observation.dire_hero_ids)
-        WHERE type!='integer' OR value<=0
-   )
-   AND (
-       SELECT COUNT(DISTINCT hero_id)
-         FROM (
-             SELECT value AS hero_id
-               FROM json_each(observation.radiant_hero_ids)
-             UNION ALL
-             SELECT value AS hero_id
-               FROM json_each(observation.dire_hero_ids)
-         )
-   )=10
-   AND NOT EXISTS (
-       SELECT 1 FROM vision_observation_invalidations AS invalidation
-        WHERE invalidation.raybet_match_id=observation.raybet_match_id
-          AND invalidation.captured_at=observation.captured_at
-          AND invalidation.source_frame_ref=observation.source_frame_ref
-   );
-CREATE TRIGGER IF NOT EXISTS strategy_decision_draft_authority_insert
-BEFORE INSERT ON strategy_decisions
-WHEN NEW.eligible=1 AND NOT EXISTS (
-    SELECT 1
-      FROM prospective_draft_landmark_authority AS authority
-      JOIN draft_authority_revisions AS revision ON revision.singleton=1
-      JOIN draft_lineage_revisions AS lineage ON lineage.singleton=1
-     WHERE authority.curve_key=NEW.draft_curve_key
-       AND authority.source_ref=NEW.draft_source_ref
-       AND authority.raybet_match_id=NEW.raybet_match_id
-       AND authority.map_number=NEW.map_number
-       AND authority.strict_mapping_id=NEW.draft_strict_mapping_id
-       AND julianday(authority.first_usable_at)<=julianday(NEW.decided_at)
-       AND authority.radiant_team_side=NEW.draft_radiant_team_side
-       AND authority.deployment_key=NEW.draft_deployment_key
-       AND authority.target_snapshot_hash=NEW.draft_target_snapshot_hash
-       AND authority.landmark_key=NEW.draft_landmark_key
-       AND authority.horizon_minutes=NEW.draft_landmark_horizon_minutes
-       AND authority.landmark_target=NEW.draft_landmark_target
-       AND authority.radiant_probability=
-           NEW.draft_landmark_radiant_probability
-       AND authority.quality=NEW.draft_landmark_quality
-       AND authority.uncertainty=NEW.draft_landmark_uncertainty
-       AND authority.support=NEW.draft_landmark_support
-       AND authority.feature_hash=NEW.draft_feature_hash
-       AND authority.model_hash=NEW.draft_model_hash
-       AND authority.calibration_hash=NEW.draft_calibration_hash
-       AND authority.model_version=NEW.draft_model_version
-       AND authority.global_gate_ref=NEW.draft_global_gate_ref
-       AND authority.input_snapshot_hash=NEW.draft_input_snapshot_hash
-       AND revision.authority_revision=NEW.draft_authority_revision
-       AND lineage.dependency_revision=NEW.draft_dependency_revision
-       AND authority.feature_dependency_revision=
-           NEW.draft_dependency_revision
-)
-BEGIN
-    SELECT RAISE(ABORT, 'eligible strategy decision draft authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS strategy_decision_vision_authority_insert
-BEFORE INSERT ON strategy_decisions
-WHEN NEW.eligible=1 AND NOT EXISTS (
-    SELECT 1
-      FROM trusted_vision_observation_authority AS vision
-      JOIN odds_transport_observations AS transport
-        ON transport.observation_key=NEW.vision_transport_key
-       AND transport.raybet_match_id=NEW.raybet_match_id
-       AND transport.observed_at=NEW.vision_transport_at
-       AND transport.timing_status='on_time'
-       AND transport.processing_status='processed'
-      JOIN trusted_odds_winner_market_authority AS market
-        ON market.observation_key=transport.observation_key
-       AND market.raybet_match_id=transport.raybet_match_id
-       AND market.period='map_' || NEW.map_number
-       AND market.response_state_hash=transport.response_state_hash
-       AND market.response_artifact_hash=transport.response_artifact_hash
-       AND market.underdog_side=NEW.underdog_side
-       AND abs(market.underdog_probability-NEW.market_probability)<=1.0e-12
-      JOIN prospective_draft_curves AS curve
-        ON curve.curve_key=NEW.draft_curve_key
-       AND curve.raybet_match_id=NEW.raybet_match_id
-       AND curve.map_number=NEW.map_number
-      JOIN vision_draft_anchors AS anchor
-        ON anchor.raybet_match_id=curve.raybet_match_id
-       AND anchor.map_number=curve.map_number
-       AND anchor.status='anchored'
-       AND anchor.draft_hash=curve.anchor_draft_hash
-       AND anchor.radiant_team_side=curve.radiant_team_side
-       AND anchor.anchored_at=curve.anchor_anchored_at
-       AND anchor.source_frame_ref=curve.anchor_source_frame_ref
-       AND anchor.team_side_anchored_at=curve.anchor_team_side_anchored_at
-       AND anchor.team_side_source_frame_ref=
-           curve.anchor_team_side_source_frame_ref
-      JOIN trusted_vision_observation_authority AS anchor_frame
-        ON anchor_frame.raybet_match_id=anchor.raybet_match_id
-       AND anchor_frame.map_number=anchor.map_number
-       AND anchor_frame.captured_at=anchor.anchored_at
-       AND anchor_frame.source_frame_ref=anchor.source_frame_ref
-      JOIN trusted_vision_observation_authority AS side_frame
-        ON side_frame.raybet_match_id=anchor.raybet_match_id
-       AND side_frame.map_number=anchor.map_number
-       AND side_frame.captured_at=anchor.team_side_anchored_at
-       AND side_frame.source_frame_ref=anchor.team_side_source_frame_ref
-     WHERE NEW.vision_raybet_match_id=NEW.raybet_match_id
-       AND NEW.vision_map_number=NEW.map_number
-       AND vision.raybet_match_id=NEW.vision_raybet_match_id
-       AND vision.map_number=NEW.vision_map_number
-       AND vision.captured_at=NEW.vision_captured_at
-       AND vision.source_frame_ref=NEW.vision_source_frame_ref
-       AND vision.source_frame_sha256=NEW.vision_source_frame_sha256
-       AND vision.source_frame_bytes=NEW.vision_source_frame_bytes
-       AND vision.game_clock_seconds=NEW.vision_observed_game_clock_seconds
-       AND vision.is_paused=NEW.vision_is_paused
-       AND json(vision.radiant_hero_ids)=
-           json(NEW.vision_radiant_hero_ids_json)
-       AND json(vision.dire_hero_ids)=json(NEW.vision_dire_hero_ids_json)
-       AND vision.radiant_team_side=NEW.vision_radiant_team_side
-       AND vision.clock_confidence=NEW.vision_clock_confidence
-       AND vision.draft_confidence=NEW.vision_draft_confidence
-       AND vision.screen_state=NEW.vision_screen_state
-       AND vision.confirmed=NEW.vision_confirmed
-       AND NEW.vision_confirmed=1
-       AND NEW.vision_is_paused=0
-       AND NEW.vision_screen_state='game'
-       AND julianday(NEW.vision_transport_at)=julianday(NEW.decided_at)
-       AND julianday(NEW.vision_captured_at)<=julianday(NEW.vision_transport_at)
-       AND NEW.vision_alignment_lag_seconds>=0.0
-       AND NEW.vision_alignment_lag_seconds<=15.0
-       AND abs(
-           NEW.vision_alignment_lag_seconds-
-           ((julianday(NEW.vision_transport_at)-
-             julianday(NEW.vision_captured_at))*86400.0)
-       )<=0.001
-       AND NEW.vision_aligned_game_clock_seconds=CAST(
-           NEW.vision_observed_game_clock_seconds+
-           NEW.vision_alignment_lag_seconds AS INTEGER
-       )
-       AND NEW.vision_alignment_method=CASE
-               WHEN NEW.vision_alignment_lag_seconds>=1.0
-               THEN 'forward_projection' ELSE 'anchor' END
-       AND json(curve.radiant_hero_ids_json)=
-           json(NEW.vision_radiant_hero_ids_json)
-       AND json(curve.dire_hero_ids_json)=json(NEW.vision_dire_hero_ids_json)
-       AND curve.radiant_team_side=NEW.vision_radiant_team_side
-       AND julianday(curve.first_usable_at)<=julianday(NEW.decided_at)
-       AND json(anchor.radiant_hero_ids)=json(curve.radiant_hero_ids_json)
-       AND json(anchor.dire_hero_ids)=json(curve.dire_hero_ids_json)
-       AND json(anchor_frame.radiant_hero_ids)=json(curve.radiant_hero_ids_json)
-       AND json(anchor_frame.dire_hero_ids)=json(curve.dire_hero_ids_json)
-       AND anchor_frame.radiant_team_side=curve.radiant_team_side
-       AND side_frame.radiant_team_side=curve.radiant_team_side
-       AND NOT EXISTS (
-           SELECT 1 FROM vision_observations AS later
-            WHERE later.raybet_match_id=vision.raybet_match_id
-              AND (
-                    julianday(later.captured_at) IS NULL
-                    OR (
-                        julianday(later.captured_at)<=
-                            julianday(NEW.vision_transport_at)
-                        AND julianday(later.captured_at)>=
-                            julianday(vision.captured_at)
-                        AND NOT (
-                            later.captured_at=vision.captured_at
-                            AND later.source_frame_ref=vision.source_frame_ref
-                        )
-                    )
-              )
-       )
-       AND NOT EXISTS (
-           SELECT 1 FROM vision_draft_conflicts AS conflict
-            WHERE conflict.raybet_match_id=curve.raybet_match_id
-              AND conflict.map_number=curve.map_number
-       )
-       AND NOT EXISTS (
-           SELECT 1 FROM vision_derived_invalidations AS invalidation
-            WHERE invalidation.dependent_type='strategy_decision'
-              AND invalidation.dependent_key=NEW.decision_key
-       )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'eligible strategy decision vision authority is required');
-END;
-CREATE VIEW IF NOT EXISTS verified_strategy_decision_vision_authority AS
-SELECT decision.decision_key
-  FROM strategy_decisions AS decision
-  JOIN trusted_vision_observation_authority AS vision
-    ON vision.raybet_match_id=decision.vision_raybet_match_id
-   AND vision.map_number=decision.vision_map_number
-   AND vision.captured_at=decision.vision_captured_at
-   AND vision.source_frame_ref=decision.vision_source_frame_ref
-   AND vision.source_frame_sha256=decision.vision_source_frame_sha256
-   AND vision.source_frame_bytes=decision.vision_source_frame_bytes
-   AND vision.game_clock_seconds=decision.vision_observed_game_clock_seconds
-   AND vision.is_paused=decision.vision_is_paused
-   AND json(vision.radiant_hero_ids)=
-       json(decision.vision_radiant_hero_ids_json)
-   AND json(vision.dire_hero_ids)=json(decision.vision_dire_hero_ids_json)
-   AND vision.radiant_team_side=decision.vision_radiant_team_side
-   AND vision.clock_confidence=decision.vision_clock_confidence
-   AND vision.draft_confidence=decision.vision_draft_confidence
-   AND vision.screen_state=decision.vision_screen_state
-   AND vision.confirmed=decision.vision_confirmed
-  JOIN odds_transport_observations AS transport
-    ON transport.observation_key=decision.vision_transport_key
-   AND transport.raybet_match_id=decision.raybet_match_id
-   AND transport.observed_at=decision.vision_transport_at
-   AND transport.timing_status='on_time'
-   AND transport.processing_status='processed'
-  JOIN trusted_odds_winner_market_authority AS market
-    ON market.observation_key=transport.observation_key
-   AND market.raybet_match_id=transport.raybet_match_id
-   AND market.period='map_' || decision.map_number
-   AND market.response_state_hash=transport.response_state_hash
-   AND market.response_artifact_hash=transport.response_artifact_hash
-   AND market.underdog_side=decision.underdog_side
-   AND abs(market.underdog_probability-decision.market_probability)<=1.0e-12
-  JOIN prospective_draft_curves AS curve
-    ON curve.curve_key=decision.draft_curve_key
-   AND curve.raybet_match_id=decision.raybet_match_id
-   AND curve.map_number=decision.map_number
-   AND json(curve.radiant_hero_ids_json)=
-       json(decision.vision_radiant_hero_ids_json)
-   AND json(curve.dire_hero_ids_json)=json(decision.vision_dire_hero_ids_json)
-   AND curve.radiant_team_side=decision.vision_radiant_team_side
-  JOIN vision_draft_anchors AS anchor
-    ON anchor.raybet_match_id=curve.raybet_match_id
-   AND anchor.map_number=curve.map_number
-   AND anchor.status IN ('anchored', 'conflict')
-   AND anchor.draft_hash=curve.anchor_draft_hash
-   AND anchor.radiant_team_side=curve.radiant_team_side
-   AND anchor.anchored_at=curve.anchor_anchored_at
-   AND anchor.source_frame_ref=curve.anchor_source_frame_ref
-   AND anchor.team_side_anchored_at=curve.anchor_team_side_anchored_at
-   AND anchor.team_side_source_frame_ref=curve.anchor_team_side_source_frame_ref
-  JOIN trusted_vision_observation_authority AS anchor_frame
-    ON anchor_frame.raybet_match_id=anchor.raybet_match_id
-   AND anchor_frame.map_number=anchor.map_number
-   AND anchor_frame.captured_at=anchor.anchored_at
-   AND anchor_frame.source_frame_ref=anchor.source_frame_ref
-  JOIN trusted_vision_observation_authority AS side_frame
-    ON side_frame.raybet_match_id=anchor.raybet_match_id
-   AND side_frame.map_number=anchor.map_number
-   AND side_frame.captured_at=anchor.team_side_anchored_at
-   AND side_frame.source_frame_ref=anchor.team_side_source_frame_ref
- WHERE decision.eligible=1
-   AND decision.vision_raybet_match_id=decision.raybet_match_id
-   AND decision.vision_map_number=decision.map_number
-   AND decision.vision_confirmed=1
-   AND decision.vision_is_paused=0
-   AND decision.vision_screen_state='game'
-   AND julianday(decision.vision_transport_at)=julianday(decision.decided_at)
-   AND julianday(decision.vision_captured_at)<=
-       julianday(decision.vision_transport_at)
-   AND decision.vision_alignment_lag_seconds BETWEEN 0.0 AND 15.0
-   AND abs(
-       decision.vision_alignment_lag_seconds-
-       ((julianday(decision.vision_transport_at)-
-         julianday(decision.vision_captured_at))*86400.0)
-   )<=0.001
-   AND decision.vision_aligned_game_clock_seconds=CAST(
-       decision.vision_observed_game_clock_seconds+
-       decision.vision_alignment_lag_seconds AS INTEGER
-   )
-   AND decision.vision_alignment_method=CASE
-           WHEN decision.vision_alignment_lag_seconds>=1.0
-           THEN 'forward_projection' ELSE 'anchor' END
-   AND julianday(curve.first_usable_at)<=julianday(decision.decided_at)
-   AND json(anchor.radiant_hero_ids)=json(curve.radiant_hero_ids_json)
-   AND json(anchor.dire_hero_ids)=json(curve.dire_hero_ids_json)
-   AND json(anchor_frame.radiant_hero_ids)=json(curve.radiant_hero_ids_json)
-   AND json(anchor_frame.dire_hero_ids)=json(curve.dire_hero_ids_json)
-   AND anchor_frame.radiant_team_side=curve.radiant_team_side
-   AND side_frame.radiant_team_side=curve.radiant_team_side
-   AND (
-       anchor.status='anchored'
-       OR (
-           julianday(anchor.conflict_at) IS NOT NULL
-           AND julianday(anchor.conflict_at)>
-               julianday(decision.vision_transport_at)
-       )
-   )
-   AND NOT EXISTS (
-       SELECT 1 FROM vision_observations AS later
-        WHERE later.raybet_match_id=vision.raybet_match_id
-          AND (
-                julianday(later.captured_at) IS NULL
-                OR (
-                    julianday(later.captured_at)<=
-                        julianday(decision.vision_transport_at)
-                    AND julianday(later.captured_at)>=
-                        julianday(vision.captured_at)
-                    AND NOT (
-                        later.captured_at=vision.captured_at
-                        AND later.source_frame_ref=vision.source_frame_ref
-                    )
-                )
-          )
-   )
-   AND NOT EXISTS (
-       SELECT 1 FROM vision_draft_conflicts AS conflict
-        WHERE conflict.raybet_match_id=curve.raybet_match_id
-          AND conflict.map_number=curve.map_number
-          AND (
-              julianday(conflict.captured_at) IS NULL
-              OR julianday(conflict.captured_at)<=
-                  julianday(decision.vision_transport_at)
-          )
-   )
-   AND NOT EXISTS (
-       SELECT 1 FROM vision_derived_invalidations AS invalidation
-        WHERE invalidation.dependent_type='strategy_decision'
-          AND invalidation.dependent_key=decision.decision_key
-   );
-CREATE TRIGGER IF NOT EXISTS shadow_order_draft_authority_insert
-BEFORE INSERT ON shadow_orders
-WHEN NOT EXISTS (
-    SELECT 1
-      FROM prospective_draft_landmark_authority AS authority
-      JOIN shadow_map_attempts AS attempt
-        ON attempt.order_key=NEW.order_key
-       AND attempt.raybet_match_id=NEW.raybet_match_id
-      JOIN draft_authority_revisions AS revision ON revision.singleton=1
-      JOIN draft_lineage_revisions AS lineage ON lineage.singleton=1
-     WHERE authority.curve_key=NEW.draft_curve_key
-       AND authority.source_ref=NEW.draft_source_ref
-       AND authority.raybet_match_id=NEW.raybet_match_id
-       AND authority.map_number=attempt.map_number
-       AND authority.strict_mapping_id=NEW.strict_mapping_id
-       AND authority.strict_mapping_id=NEW.draft_strict_mapping_id
-       AND julianday(authority.first_usable_at)<=
-           julianday(NEW.signal_transport_at)
-       AND authority.radiant_team_side=NEW.draft_radiant_team_side
-       AND authority.deployment_key=NEW.draft_deployment_key
-       AND authority.target_snapshot_hash=NEW.draft_target_snapshot_hash
-       AND authority.landmark_key=NEW.draft_landmark_key
-       AND authority.horizon_minutes=NEW.draft_landmark_horizon_minutes
-       AND authority.landmark_target=NEW.draft_landmark_target
-       AND authority.radiant_probability=
-           NEW.draft_landmark_radiant_probability
-       AND authority.quality=NEW.draft_landmark_quality
-       AND authority.uncertainty=NEW.draft_landmark_uncertainty
-       AND authority.support=NEW.draft_landmark_support
-       AND authority.feature_hash=NEW.draft_feature_hash
-       AND authority.model_hash=NEW.draft_model_hash
-       AND authority.calibration_hash=NEW.draft_calibration_hash
-       AND authority.model_version=NEW.draft_model_version
-       AND authority.global_gate_ref=NEW.draft_global_gate_ref
-       AND authority.input_snapshot_hash=NEW.draft_input_snapshot_hash
-       AND revision.authority_revision=NEW.draft_authority_revision
-       AND lineage.dependency_revision=NEW.draft_dependency_revision
-       AND authority.feature_dependency_revision=
-           NEW.draft_dependency_revision
-)
-BEGIN
-    SELECT RAISE(ABORT, 'shadow order draft authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS shadow_order_vision_authority_insert
-BEFORE INSERT ON shadow_orders
-WHEN NOT EXISTS (
-    SELECT 1
-      FROM shadow_order_decision_lineage AS lineage
-      JOIN strategy_decisions AS decision
-        ON decision.decision_key=lineage.decision_key
-       AND decision.eligible=1
-      JOIN verified_strategy_decision_vision_authority AS verified
-        ON verified.decision_key=decision.decision_key
-      JOIN trusted_odds_winner_market_authority AS market
-        ON market.observation_key=decision.vision_transport_key
-       AND market.raybet_match_id=decision.raybet_match_id
-       AND market.period='map_' || decision.map_number
-     WHERE lineage.order_key=NEW.order_key
-       AND NEW.raybet_match_id=decision.raybet_match_id
-       AND NEW.odds_id=market.underdog_odds_id
-       AND NEW.market_key='winner|' || market.period || '|' ||
-                          market.underdog_side || '|'
-       AND NEW.model_probability=decision.model_probability
-       AND abs(NEW.market_probability-market.underdog_probability)<=1.0e-12
-       AND NEW.signal_price=market.underdog_price
-       AND NEW.signal_odds_group_id=market.odds_group_id
-       AND NEW.signal_outcome_key=market.underdog_side
-       AND NEW.signal_outcome_key=decision.underdog_side
-       AND NEW.signal_transport_key=decision.vision_transport_key
-       AND NEW.signal_transport_at=decision.vision_transport_at
-       AND NEW.vision_raybet_match_id IS decision.vision_raybet_match_id
-       AND NEW.vision_map_number IS decision.vision_map_number
-       AND NEW.vision_captured_at IS decision.vision_captured_at
-       AND NEW.vision_source_frame_ref IS decision.vision_source_frame_ref
-       AND NEW.vision_source_frame_sha256 IS
-           decision.vision_source_frame_sha256
-       AND NEW.vision_source_frame_bytes IS decision.vision_source_frame_bytes
-       AND NEW.vision_observed_game_clock_seconds IS
-           decision.vision_observed_game_clock_seconds
-       AND NEW.vision_aligned_game_clock_seconds IS
-           decision.vision_aligned_game_clock_seconds
-       AND NEW.vision_is_paused IS decision.vision_is_paused
-       AND NEW.vision_radiant_hero_ids_json IS
-           decision.vision_radiant_hero_ids_json
-       AND NEW.vision_dire_hero_ids_json IS decision.vision_dire_hero_ids_json
-       AND NEW.vision_radiant_team_side IS decision.vision_radiant_team_side
-       AND NEW.vision_clock_confidence IS decision.vision_clock_confidence
-       AND NEW.vision_draft_confidence IS decision.vision_draft_confidence
-       AND NEW.vision_screen_state IS decision.vision_screen_state
-       AND NEW.vision_confirmed IS decision.vision_confirmed
-       AND NEW.vision_transport_key IS decision.vision_transport_key
-       AND NEW.vision_transport_at IS decision.vision_transport_at
-       AND NEW.vision_alignment_method IS decision.vision_alignment_method
-       AND NEW.vision_alignment_lag_seconds IS
-           decision.vision_alignment_lag_seconds
-       AND NOT EXISTS (
-           SELECT 1 FROM vision_derived_invalidations AS invalidation
-            WHERE (
-                    invalidation.dependent_type='strategy_decision'
-                    AND invalidation.dependent_key=decision.decision_key
-                  )
-               OR (
-                    invalidation.dependent_type='shadow_order'
-                    AND invalidation.dependent_key=NEW.order_key
-                  )
-       )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'shadow order vision authority is required');
-END;
-CREATE TABLE IF NOT EXISTS prospective_draft_outcomes (
-    curve_key TEXT PRIMARY KEY REFERENCES prospective_draft_curves(curve_key),
-    strict_mapping_id INTEGER NOT NULL CHECK (strict_mapping_id > 0),
-    dota_match_id INTEGER NOT NULL,
-    radiant_win INTEGER NOT NULL CHECK (radiant_win IN (0, 1)),
-    winner_side TEXT NOT NULL CHECK (winner_side IN ('team_one', 'team_two')),
-    evidence_ref TEXT NOT NULL,
-    evidence_hash TEXT NOT NULL CHECK (length(evidence_hash)=64),
-    settled_at TEXT NOT NULL,
-    first_usable_at TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TRIGGER IF NOT EXISTS prospective_draft_outcome_authority_insert
-BEFORE INSERT ON prospective_draft_outcomes
-WHEN NEW.first_usable_at IS NULL
-  OR julianday(NEW.first_usable_at) IS NULL
-  OR julianday(NEW.created_at) IS NULL
-  OR julianday(NEW.first_usable_at)>julianday(NEW.created_at)
-  OR NOT EXISTS (
-    SELECT 1
-      FROM prospective_draft_curves AS curve
-      JOIN map_results AS result
-        ON result.raybet_match_id=curve.raybet_match_id
-       AND result.map_number=curve.map_number
-       AND result.strict_mapping_id=curve.strict_mapping_id
-       AND result.dota_match_id=NEW.dota_match_id
-       AND result.winner_side=NEW.winner_side
-       AND result.evidence_ref=NEW.evidence_ref
-       AND result.settled_at=NEW.settled_at
-       AND julianday(NEW.first_usable_at)>=julianday(result.settled_at)
-      JOIN settlement_reconciliations AS reconciliation
-        ON reconciliation.raybet_match_id=curve.raybet_match_id
-       AND reconciliation.map_number=curve.map_number
-       AND reconciliation.strict_mapping_id=curve.strict_mapping_id
-       AND reconciliation.dota_match_id=NEW.dota_match_id
-       AND reconciliation.status='confirmed'
-       AND reconciliation.raybet_winner_side=NEW.winner_side
-       AND reconciliation.opendota_winner_side=NEW.winner_side
-       AND julianday(NEW.first_usable_at)>=
-           julianday(reconciliation.first_observed_at)
-     WHERE curve.curve_key=NEW.curve_key
-       AND curve.strict_mapping_id=NEW.strict_mapping_id
-       AND NEW.radiant_win=CASE
-               WHEN NEW.winner_side=curve.radiant_team_side THEN 1 ELSE 0 END
-       AND EXISTS (
-           SELECT 1 FROM settlement_result_evidence AS evidence
-            WHERE evidence.raybet_match_id=curve.raybet_match_id
-              AND evidence.map_number=curve.map_number
-              AND evidence.dota_match_id=NEW.dota_match_id
-              AND evidence.source='raybet'
-              AND evidence.status='confirmed'
-              AND evidence.winner_side=NEW.winner_side
-              AND evidence.evidence_ref=reconciliation.raybet_evidence_ref
-              AND julianday(NEW.first_usable_at)>=julianday(evidence.observed_at)
-       )
-       AND EXISTS (
-           SELECT 1 FROM settlement_result_evidence AS evidence
-            WHERE evidence.raybet_match_id=curve.raybet_match_id
-              AND evidence.map_number=curve.map_number
-              AND evidence.dota_match_id=NEW.dota_match_id
-              AND evidence.source='opendota'
-              AND evidence.status='confirmed'
-              AND evidence.winner_side=NEW.winner_side
-              AND evidence.evidence_ref=reconciliation.opendota_evidence_ref
-              AND julianday(NEW.first_usable_at)>=julianday(evidence.observed_at)
-       )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft outcome authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_outcomes_immutable_update
-BEFORE UPDATE ON prospective_draft_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft outcome is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS prospective_draft_outcomes_immutable_delete
-BEFORE DELETE ON prospective_draft_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'prospective draft outcome is immutable');
-END;
-CREATE TABLE IF NOT EXISTS shadow_map_attempts (
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL,
-    order_key TEXT NOT NULL UNIQUE,
-    status TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (raybet_match_id, map_number)
-);
-CREATE TABLE IF NOT EXISTS map_results (
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL,
-    strict_mapping_id INTEGER CHECK (
-        strict_mapping_id IS NULL OR strict_mapping_id > 0
-    ) REFERENCES strict_live_map_mappings(mapping_id),
-    dota_match_id INTEGER NOT NULL UNIQUE,
-    winner_side TEXT NOT NULL,
-    team_one_kills INTEGER,
-    team_two_kills INTEGER,
-    duration_seconds INTEGER,
-    evidence_ref TEXT NOT NULL,
-    reconciliation_ref TEXT,
-    raybet_evidence_id INTEGER
-        REFERENCES settlement_result_evidence(evidence_id),
-    opendota_evidence_id INTEGER
-        REFERENCES settlement_result_evidence(evidence_id),
-    raybet_evidence_ref TEXT,
-    opendota_evidence_ref TEXT,
-    raybet_observed_at TEXT,
-    opendota_observed_at TEXT,
-    first_usable_at TEXT,
-    settled_at TEXT NOT NULL,
-    PRIMARY KEY (raybet_match_id, map_number)
-);
-CREATE TRIGGER IF NOT EXISTS map_result_mapping_authority_insert
-BEFORE INSERT ON map_results
-WHEN NEW.strict_mapping_id IS NULL
-  OR NOT EXISTS (
-      SELECT 1 FROM settlement_reconciliations AS reconciliation
-      JOIN settlement_result_evidence AS raybet_evidence
-        ON raybet_evidence.evidence_id=reconciliation.raybet_evidence_id
-       AND raybet_evidence.source='raybet'
-       AND raybet_evidence.raybet_match_id=NEW.raybet_match_id
-       AND raybet_evidence.map_number=NEW.map_number
-       AND raybet_evidence.dota_match_id=NEW.dota_match_id
-       AND raybet_evidence.status='confirmed'
-       AND raybet_evidence.winner_side=NEW.winner_side
-       AND raybet_evidence.evidence_ref=reconciliation.raybet_evidence_ref
-       AND raybet_evidence.observed_at=reconciliation.raybet_observed_at
-       AND raybet_evidence.first_usable_at=reconciliation.raybet_observed_at
-      JOIN settlement_result_evidence AS opendota_evidence
-        ON opendota_evidence.evidence_id=reconciliation.opendota_evidence_id
-       AND opendota_evidence.source='opendota'
-       AND opendota_evidence.raybet_match_id=NEW.raybet_match_id
-       AND opendota_evidence.map_number=NEW.map_number
-       AND opendota_evidence.dota_match_id=NEW.dota_match_id
-       AND opendota_evidence.status='confirmed'
-       AND opendota_evidence.winner_side=NEW.winner_side
-       AND opendota_evidence.evidence_ref=reconciliation.opendota_evidence_ref
-       AND opendota_evidence.observed_at=reconciliation.opendota_observed_at
-       WHERE reconciliation.raybet_match_id=NEW.raybet_match_id
-         AND reconciliation.map_number=NEW.map_number
-         AND reconciliation.strict_mapping_id=NEW.strict_mapping_id
-         AND reconciliation.dota_match_id=NEW.dota_match_id
-         AND reconciliation.raybet_winner_side=NEW.winner_side
-         AND reconciliation.opendota_winner_side=NEW.winner_side
-         AND reconciliation.status='confirmed'
-         AND reconciliation.evidence_ref=
-             'settlement-reconciliation:' || NEW.raybet_match_id ||
-             ':map:' || NEW.map_number
-         AND NEW.evidence_ref=reconciliation.evidence_ref
-         AND NEW.reconciliation_ref=reconciliation.evidence_ref
-         AND NEW.raybet_evidence_id=reconciliation.raybet_evidence_id
-         AND NEW.opendota_evidence_id=reconciliation.opendota_evidence_id
-         AND NEW.raybet_evidence_ref=reconciliation.raybet_evidence_ref
-         AND NEW.opendota_evidence_ref=reconciliation.opendota_evidence_ref
-         AND NEW.raybet_observed_at=reconciliation.raybet_observed_at
-         AND NEW.opendota_observed_at=reconciliation.opendota_observed_at
-         AND NEW.first_usable_at=reconciliation.first_usable_at
-         AND julianday(NEW.first_usable_at)=max(
-             julianday(raybet_evidence.first_usable_at),
-             julianday(opendota_evidence.first_usable_at)
-         )
-         AND julianday(NEW.settled_at)=julianday(NEW.first_usable_at)
-  )
-BEGIN
-    SELECT RAISE(ABORT, 'map result mapping authority is required');
-END;
-CREATE TRIGGER IF NOT EXISTS map_results_no_update
-BEFORE UPDATE ON map_results
-BEGIN
-    SELECT RAISE(ABORT, 'map results are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS map_results_no_delete
-BEFORE DELETE ON map_results
-BEGIN
-    SELECT RAISE(ABORT, 'map results are immutable');
-END;
-CREATE TABLE IF NOT EXISTS research_live_predictions (
-    prediction_key TEXT PRIMARY KEY,
-    schema_version TEXT NOT NULL,
-    raybet_match_id TEXT NOT NULL,
-    map_number INTEGER NOT NULL CHECK (map_number BETWEEN 1 AND 10),
-    observed_at TEXT NOT NULL,
-    game_clock_seconds INTEGER NOT NULL CHECK (game_clock_seconds >= 0),
-    game_minute REAL NOT NULL CHECK (game_minute >= 0.0),
-    selected_side TEXT NOT NULL CHECK (selected_side IN ('team_one', 'team_two')),
-    market_probability REAL NOT NULL CHECK (market_probability BETWEEN 0.0 AND 1.0),
-    market_price REAL NOT NULL CHECK (market_price > 1.0),
-    raw_model_probability REAL
-        CHECK (raw_model_probability IS NULL OR raw_model_probability BETWEEN 0.0 AND 1.0),
-    feature_hash TEXT CHECK (feature_hash IS NULL OR length(feature_hash)=64),
-    model_hash TEXT CHECK (model_hash IS NULL OR length(model_hash)=64),
-    calibration_hash TEXT CHECK (calibration_hash IS NULL OR length(calibration_hash)=64),
-    transport_key TEXT NOT NULL REFERENCES odds_transport_observations(observation_key),
-    transport_hash TEXT NOT NULL CHECK (length(transport_hash)=64),
-    radiant_hero_ids_json TEXT NOT NULL,
-    dire_hero_ids_json TEXT NOT NULL,
-    radiant_team_side TEXT CHECK (radiant_team_side IN ('team_one', 'team_two')),
-    strict_mapping_id INTEGER NOT NULL,
-    clock_source TEXT NOT NULL CHECK (clock_source='vision'),
-    clock_trust TEXT NOT NULL CHECK (clock_trust='trusted_vision'),
-    manual_clock_event_id TEXT REFERENCES browser_events(event_id),
-    manual_clock_seconds INTEGER
-        CHECK (manual_clock_seconds IS NULL OR manual_clock_seconds >= 0),
-    manual_clock_trust TEXT NOT NULL
-        CHECK (manual_clock_trust IN ('not_observed', 'diagnostic_untrusted')),
-    manual_clock_validation TEXT NOT NULL,
-    actionability TEXT NOT NULL CHECK (actionability='research_only'),
-    gate_status TEXT NOT NULL CHECK (gate_status IN ('unavailable', 'failed', 'passed')),
-    gate_failures_json TEXT NOT NULL,
-    input_context_hash TEXT NOT NULL CHECK (length(input_context_hash)=64),
-    created_at TEXT NOT NULL,
-    draft_curve_key TEXT REFERENCES prospective_draft_curves(curve_key),
-    draft_source_ref TEXT,
-    draft_landmark_key TEXT
-        REFERENCES prospective_draft_landmarks(landmark_key),
-    draft_landmark_horizon_minutes INTEGER CHECK (
-        draft_landmark_horizon_minutes IS NULL OR
-        draft_landmark_horizon_minutes IN (10, 20, 30, 40, 50)
-    ),
-    draft_landmark_target TEXT CHECK (
-        draft_landmark_target IS NULL OR draft_landmark_target='radiant_win'
-    ),
-    draft_landmark_radiant_probability REAL CHECK (
-        draft_landmark_radiant_probability IS NULL OR
-        draft_landmark_radiant_probability BETWEEN 0.0 AND 1.0
-    ),
-    draft_landmark_quality REAL CHECK (
-        draft_landmark_quality IS NULL OR
-        draft_landmark_quality BETWEEN 0.0 AND 1.0
-    ),
-    draft_landmark_uncertainty REAL CHECK (
-        draft_landmark_uncertainty IS NULL OR
-        draft_landmark_uncertainty BETWEEN 0.0 AND 0.5
-    ),
-    draft_landmark_support INTEGER CHECK (
-        draft_landmark_support IS NULL OR draft_landmark_support>=100
-    ),
-    draft_radiant_team_side TEXT CHECK (
-        draft_radiant_team_side IS NULL OR
-        draft_radiant_team_side IN ('team_one', 'team_two')
-    ),
-    draft_strict_mapping_id INTEGER CHECK (
-        draft_strict_mapping_id IS NULL OR draft_strict_mapping_id>0
-    ) REFERENCES strict_live_map_mappings(mapping_id),
-    draft_deployment_key TEXT
-        REFERENCES draft_deployment_bundles(deployment_key),
-    draft_target_snapshot_hash TEXT CHECK (
-        draft_target_snapshot_hash IS NULL OR
-        length(draft_target_snapshot_hash)=64
-    ),
-    draft_feature_hash TEXT CHECK (
-        draft_feature_hash IS NULL OR length(draft_feature_hash)=64
-    ),
-    draft_model_hash TEXT REFERENCES draft_model_artifacts(model_hash),
-    draft_calibration_hash TEXT
-        REFERENCES draft_calibration_artifacts(calibration_hash),
-    draft_model_version TEXT,
-    draft_global_gate_ref TEXT,
-    draft_input_snapshot_hash TEXT CHECK (
-        draft_input_snapshot_hash IS NULL OR
-        length(draft_input_snapshot_hash)=64
-    ),
-    draft_authority_revision INTEGER CHECK (
-        draft_authority_revision IS NULL OR draft_authority_revision>=1
-    ),
-    draft_dependency_revision INTEGER CHECK (
-        draft_dependency_revision IS NULL OR draft_dependency_revision>=1
-    )
-);
-CREATE INDEX IF NOT EXISTS idx_research_prediction_match_time
-    ON research_live_predictions(raybet_match_id, map_number, observed_at);
-CREATE TRIGGER IF NOT EXISTS research_prediction_draft_authority_insert
-BEFORE INSERT ON research_live_predictions
-WHEN NEW.gate_status='passed' AND NOT EXISTS (
-    SELECT 1
-      FROM prospective_draft_landmark_authority AS authority
-      JOIN draft_authority_revisions AS revision ON revision.singleton=1
-      JOIN draft_lineage_revisions AS lineage ON lineage.singleton=1
-     WHERE authority.curve_key=NEW.draft_curve_key
-       AND authority.source_ref=NEW.draft_source_ref
-       AND authority.raybet_match_id=NEW.raybet_match_id
-       AND authority.map_number=NEW.map_number
-       AND authority.strict_mapping_id=NEW.strict_mapping_id
-       AND authority.strict_mapping_id=NEW.draft_strict_mapping_id
-       AND json(authority.radiant_hero_ids_json)=
-           json(NEW.radiant_hero_ids_json)
-       AND json(authority.dire_hero_ids_json)=json(NEW.dire_hero_ids_json)
-       AND julianday(authority.first_usable_at)<=julianday(NEW.observed_at)
-       AND authority.radiant_team_side=NEW.radiant_team_side
-       AND authority.radiant_team_side=NEW.draft_radiant_team_side
-       AND authority.deployment_key=NEW.draft_deployment_key
-       AND authority.target_snapshot_hash=NEW.draft_target_snapshot_hash
-       AND authority.landmark_key=NEW.draft_landmark_key
-       AND authority.horizon_minutes=NEW.draft_landmark_horizon_minutes
-       AND authority.landmark_target=NEW.draft_landmark_target
-       AND authority.radiant_probability=
-           NEW.draft_landmark_radiant_probability
-       AND authority.quality=NEW.draft_landmark_quality
-       AND authority.uncertainty=NEW.draft_landmark_uncertainty
-       AND authority.support=NEW.draft_landmark_support
-       AND authority.feature_hash=NEW.feature_hash
-       AND authority.feature_hash=NEW.draft_feature_hash
-       AND authority.model_hash=NEW.model_hash
-       AND authority.model_hash=NEW.draft_model_hash
-       AND authority.calibration_hash=NEW.calibration_hash
-       AND authority.calibration_hash=NEW.draft_calibration_hash
-       AND authority.model_version=NEW.draft_model_version
-       AND authority.global_gate_ref=NEW.draft_global_gate_ref
-       AND authority.input_snapshot_hash=NEW.draft_input_snapshot_hash
-       AND revision.authority_revision=NEW.draft_authority_revision
-       AND lineage.dependency_revision=NEW.draft_dependency_revision
-       AND authority.feature_dependency_revision=
-           NEW.draft_dependency_revision
-)
-BEGIN
-    SELECT RAISE(ABORT, 'passed research prediction draft authority is required');
-END;
-CREATE TABLE IF NOT EXISTS research_price_labels (
-    label_key TEXT PRIMARY KEY,
-    prediction_key TEXT NOT NULL UNIQUE
-        REFERENCES research_live_predictions(prediction_key),
-    transport_key TEXT NOT NULL REFERENCES odds_transport_observations(observation_key),
-    transport_hash TEXT NOT NULL CHECK (length(transport_hash)=64),
-    observed_at TEXT NOT NULL,
-    selected_side TEXT NOT NULL CHECK (selected_side IN ('team_one', 'team_two')),
-    price REAL NOT NULL CHECK (price > 1.0),
-    market_probability REAL NOT NULL CHECK (market_probability BETWEEN 0.0 AND 1.0),
-    seconds_after_prediction REAL NOT NULL CHECK (seconds_after_prediction > 0.0),
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_research_price_transport
-    ON research_price_labels(transport_key, observed_at);
-CREATE TRIGGER IF NOT EXISTS research_price_label_authority_insert
-BEFORE INSERT ON research_price_labels
-WHEN NOT EXISTS (
-    SELECT 1
-      FROM research_live_predictions AS prediction
-      JOIN odds_transport_observations AS transport
-        ON transport.observation_key=NEW.transport_key
-       AND transport.raybet_match_id=prediction.raybet_match_id
-       AND transport.observed_at=NEW.observed_at
-       AND transport.normalized_state_hash=NEW.transport_hash
-       AND transport.normalized_state_hash_version=2
-       AND transport.original_legacy_normalized_state_hash IS NULL
-       AND transport.response_state_hash IS NOT NULL
-       AND transport.response_artifact_hash IS NOT NULL
-       AND transport.timing_status='on_time'
-       AND transport.processing_status='processed'
-      JOIN trusted_odds_winner_market_authority AS market
-        ON market.observation_key=transport.observation_key
-       AND market.raybet_match_id=prediction.raybet_match_id
-       AND market.period='map_' || prediction.map_number
-       AND market.response_state_hash=transport.response_state_hash
-       AND market.response_artifact_hash=transport.response_artifact_hash
-       AND market.underdog_side=NEW.selected_side
-       AND market.underdog_price=NEW.price
-       AND abs(market.underdog_probability-NEW.market_probability)<=1e-12
-     WHERE prediction.prediction_key=NEW.prediction_key
-       AND prediction.selected_side=NEW.selected_side
-       AND julianday(prediction.observed_at)<julianday(NEW.observed_at)
-       AND abs(NEW.seconds_after_prediction-
-           (julianday(NEW.observed_at)-julianday(prediction.observed_at))*86400
-       )<=0.001
-)
-BEGIN
-    SELECT RAISE(ABORT, 'research price label authority is required');
-END;
-CREATE TABLE IF NOT EXISTS research_result_labels (
-    label_key TEXT PRIMARY KEY,
-    prediction_key TEXT NOT NULL UNIQUE
-        REFERENCES research_live_predictions(prediction_key),
-    winner_side TEXT NOT NULL CHECK (winner_side IN ('team_one', 'team_two')),
-    selected_side_win INTEGER NOT NULL CHECK (selected_side_win IN (0, 1)),
-    dota_match_id INTEGER NOT NULL,
-    evidence_ref TEXT NOT NULL,
-    strict_mapping_id INTEGER,
-    reconciliation_ref TEXT,
-    raybet_evidence_id INTEGER
-        REFERENCES settlement_result_evidence(evidence_id),
-    opendota_evidence_id INTEGER
-        REFERENCES settlement_result_evidence(evidence_id),
-    raybet_evidence_ref TEXT,
-    opendota_evidence_ref TEXT,
-    raybet_observed_at TEXT,
-    opendota_observed_at TEXT,
-    first_usable_at TEXT,
-    settled_at TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TRIGGER IF NOT EXISTS research_live_predictions_no_update
-BEFORE UPDATE ON research_live_predictions
-BEGIN
-    SELECT RAISE(ABORT, 'research prediction is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS research_live_predictions_no_delete
-BEFORE DELETE ON research_live_predictions
-BEGIN
-    SELECT RAISE(ABORT, 'research prediction is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS research_price_labels_no_update
-BEFORE UPDATE ON research_price_labels
-BEGIN
-    SELECT RAISE(ABORT, 'research price label is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS research_price_labels_no_delete
-BEFORE DELETE ON research_price_labels
-BEGIN
-    SELECT RAISE(ABORT, 'research price label is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS research_result_labels_no_update
-BEFORE UPDATE ON research_result_labels
-BEGIN
-    SELECT RAISE(ABORT, 'research result label is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS research_result_labels_no_delete
-BEFORE DELETE ON research_result_labels
-BEGIN
-    SELECT RAISE(ABORT, 'research result label is append-only');
-END;
-CREATE TRIGGER IF NOT EXISTS research_result_label_authority_insert
-BEFORE INSERT ON research_result_labels
-WHEN NOT EXISTS (
-    SELECT 1
-      FROM research_live_predictions AS prediction
-      JOIN map_results AS result
-        ON result.raybet_match_id=prediction.raybet_match_id
-       AND result.map_number=prediction.map_number
-       AND result.strict_mapping_id=prediction.strict_mapping_id
-      JOIN settlement_reconciliations AS reconciliation
-        ON reconciliation.raybet_match_id=result.raybet_match_id
-       AND reconciliation.map_number=result.map_number
-       AND reconciliation.strict_mapping_id=result.strict_mapping_id
-       AND reconciliation.dota_match_id=result.dota_match_id
-       AND reconciliation.status='confirmed'
-      JOIN settlement_result_evidence AS raybet_evidence
-        ON raybet_evidence.evidence_id=result.raybet_evidence_id
-       AND raybet_evidence.source='raybet'
-       AND raybet_evidence.status='confirmed'
-       AND raybet_evidence.winner_side=result.winner_side
-      JOIN settlement_result_evidence AS opendota_evidence
-        ON opendota_evidence.evidence_id=result.opendota_evidence_id
-       AND opendota_evidence.source='opendota'
-       AND opendota_evidence.status='confirmed'
-       AND opendota_evidence.winner_side=result.winner_side
-     WHERE prediction.prediction_key=NEW.prediction_key
-       AND NEW.winner_side=result.winner_side
-       AND NEW.selected_side_win=CASE
-           WHEN prediction.selected_side=result.winner_side THEN 1 ELSE 0 END
-       AND NEW.dota_match_id=result.dota_match_id
-       AND NEW.evidence_ref=result.evidence_ref
-       AND NEW.strict_mapping_id=result.strict_mapping_id
-       AND NEW.reconciliation_ref=result.reconciliation_ref
-       AND NEW.raybet_evidence_id=result.raybet_evidence_id
-       AND NEW.opendota_evidence_id=result.opendota_evidence_id
-       AND NEW.raybet_evidence_ref=result.raybet_evidence_ref
-       AND NEW.opendota_evidence_ref=result.opendota_evidence_ref
-       AND NEW.raybet_observed_at=result.raybet_observed_at
-       AND NEW.opendota_observed_at=result.opendota_observed_at
-       AND NEW.first_usable_at=result.first_usable_at
-       AND NEW.settled_at=result.settled_at
-       AND reconciliation.evidence_ref=result.reconciliation_ref
-       AND reconciliation.raybet_evidence_id=result.raybet_evidence_id
-       AND reconciliation.opendota_evidence_id=result.opendota_evidence_id
-       AND reconciliation.first_usable_at=result.first_usable_at
-       AND raybet_evidence.evidence_ref=result.raybet_evidence_ref
-       AND raybet_evidence.observed_at=result.raybet_observed_at
-       AND opendota_evidence.evidence_ref=result.opendota_evidence_ref
-       AND opendota_evidence.observed_at=result.opendota_observed_at
-       AND julianday(prediction.observed_at)<julianday(result.first_usable_at)
-)
-BEGIN
-    SELECT RAISE(ABORT, 'research result label authority is required');
-END;
-DROP TRIGGER IF EXISTS research_result_from_map_result;
-CREATE TRIGGER research_result_from_map_result
-AFTER INSERT ON map_results
-BEGIN
-    INSERT OR IGNORE INTO research_result_labels
-        (label_key, prediction_key, winner_side, selected_side_win,
-         dota_match_id, evidence_ref, strict_mapping_id, reconciliation_ref,
-         raybet_evidence_id, opendota_evidence_id, raybet_evidence_ref,
-         opendota_evidence_ref, raybet_observed_at, opendota_observed_at,
-         first_usable_at, settled_at, created_at)
-    SELECT prediction_key || ':result', prediction_key, NEW.winner_side,
-           CASE WHEN selected_side=NEW.winner_side THEN 1 ELSE 0 END,
-           NEW.dota_match_id, NEW.evidence_ref, NEW.strict_mapping_id,
-           NEW.reconciliation_ref, NEW.raybet_evidence_id,
-           NEW.opendota_evidence_id, NEW.raybet_evidence_ref,
-           NEW.opendota_evidence_ref, NEW.raybet_observed_at,
-           NEW.opendota_observed_at, NEW.first_usable_at,
-           NEW.settled_at, NEW.settled_at
-      FROM research_live_predictions
-     WHERE raybet_match_id=NEW.raybet_match_id AND map_number=NEW.map_number
-       AND strict_mapping_id=NEW.strict_mapping_id
-       AND julianday(observed_at) < julianday(NEW.settled_at);
-END;
-DROP TRIGGER IF EXISTS research_result_from_late_prediction;
-CREATE TRIGGER research_result_from_late_prediction
-AFTER INSERT ON research_live_predictions
-BEGIN
-    INSERT OR IGNORE INTO research_result_labels
-        (label_key, prediction_key, winner_side, selected_side_win,
-         dota_match_id, evidence_ref, strict_mapping_id, reconciliation_ref,
-         raybet_evidence_id, opendota_evidence_id, raybet_evidence_ref,
-         opendota_evidence_ref, raybet_observed_at, opendota_observed_at,
-         first_usable_at, settled_at, created_at)
-    SELECT NEW.prediction_key || ':result', NEW.prediction_key, result.winner_side,
-           CASE WHEN NEW.selected_side=result.winner_side THEN 1 ELSE 0 END,
-           result.dota_match_id, result.evidence_ref,
-           result.strict_mapping_id, result.reconciliation_ref,
-           result.raybet_evidence_id, result.opendota_evidence_id,
-           result.raybet_evidence_ref, result.opendota_evidence_ref,
-           result.raybet_observed_at, result.opendota_observed_at,
-           result.first_usable_at, result.settled_at, NEW.created_at
-      FROM map_results AS result
-     WHERE result.raybet_match_id=NEW.raybet_match_id
-       AND result.map_number=NEW.map_number
-       AND result.strict_mapping_id=NEW.strict_mapping_id
-       AND julianday(NEW.observed_at) < julianday(result.settled_at);
-END;
-"""
-
-
-_DRAFT_AUTHORITY_TABLES = (
-    "draft_model_artifacts",
-    "draft_calibration_artifacts",
-    "draft_deployment_bundles",
-    "prospective_draft_curves",
-    "prospective_draft_landmarks",
-    "prospective_draft_outcomes",
-    "map_results",
-    "settlement_reconciliations",
-    "settlement_result_evidence",
-    "vision_draft_anchors",
-    "vision_draft_conflicts",
-    "vision_observations",
-    "vision_observation_invalidations",
-    "strict_live_map_mappings",
-    "strict_live_automatic_evidence_approvals",
-    "strict_live_map_mapping_invalidations",
-    "strict_live_map_mapping_supersessions",
-    "raybet_matches",
-    "event_registry",
-    "teams",
-)
-
-_DRAFT_AUTHORITY_UPDATE_CONDITIONS = {
-    "raybet_matches": """
-        OLD.raybet_match_id IS NOT NEW.raybet_match_id
-        OR OLD.tournament IS NOT NEW.tournament
-        OR OLD.team_one IS NOT NEW.team_one
-        OR OLD.team_two IS NOT NEW.team_two
-        OR OLD.scheduled_at IS NOT NEW.scheduled_at
-        OR OLD.best_of IS NOT NEW.best_of
-        OR json_valid(OLD.raw_json) IS NOT json_valid(NEW.raw_json)
-        OR (
-            json_valid(OLD.raw_json)
-            AND json_valid(NEW.raw_json)
-            AND (
-                json_extract(OLD.raw_json, '$.id')
-                    IS NOT json_extract(NEW.raw_json, '$.id')
-                OR json_extract(OLD.raw_json, '$.game_id')
-                    IS NOT json_extract(NEW.raw_json, '$.game_id')
-                OR json_extract(OLD.raw_json, '$.tournament_name')
-                    IS NOT json_extract(NEW.raw_json, '$.tournament_name')
-                OR json_extract(OLD.raw_json, '$.start_time')
-                    IS NOT json_extract(NEW.raw_json, '$.start_time')
-                OR json_extract(OLD.raw_json, '$.round')
-                    IS NOT json_extract(NEW.raw_json, '$.round')
-                OR json_extract(OLD.raw_json, '$.stage')
-                    IS NOT json_extract(NEW.raw_json, '$.stage')
-                OR json_extract(OLD.raw_json, '$.team')
-                    IS NOT json_extract(NEW.raw_json, '$.team')
-            )
-        )
-    """,
-    "vision_draft_anchors": """
-        OLD.raybet_match_id IS NOT NEW.raybet_match_id
-        OR OLD.map_number IS NOT NEW.map_number
-        OR OLD.draft_hash IS NOT NEW.draft_hash
-        OR OLD.radiant_hero_ids IS NOT NEW.radiant_hero_ids
-        OR OLD.dire_hero_ids IS NOT NEW.dire_hero_ids
-        OR OLD.radiant_team_side IS NOT NEW.radiant_team_side
-        OR OLD.team_side_anchored_at IS NOT NEW.team_side_anchored_at
-        OR OLD.team_side_source_frame_ref IS NOT NEW.team_side_source_frame_ref
-        OR OLD.anchored_at IS NOT NEW.anchored_at
-        OR OLD.source_frame_ref IS NOT NEW.source_frame_ref
-        OR OLD.status IS NOT NEW.status
-        OR OLD.conflict_at IS NOT NEW.conflict_at
-    """,
-    "vision_observations": """
-        OLD.raybet_match_id IS NOT NEW.raybet_match_id
-        OR OLD.map_number IS NOT NEW.map_number
-        OR OLD.captured_at IS NOT NEW.captured_at
-        OR OLD.radiant_hero_ids IS NOT NEW.radiant_hero_ids
-        OR OLD.dire_hero_ids IS NOT NEW.dire_hero_ids
-        OR OLD.radiant_team_side IS NOT NEW.radiant_team_side
-        OR OLD.source_frame_ref IS NOT NEW.source_frame_ref
-        OR OLD.confirmed IS NOT NEW.confirmed
-    """,
-    "event_registry": """
-        OLD.event_id IS NOT NEW.event_id
-        OR OLD.canonical_name IS NOT NEW.canonical_name
-        OR OLD.tier IS NOT NEW.tier
-        OR OLD.prize_pool_usd IS NOT NEW.prize_pool_usd
-        OR OLD.main_event_start_at IS NOT NEW.main_event_start_at
-        OR OLD.main_event_end_at IS NOT NEW.main_event_end_at
-        OR OLD.official_evidence_urls_json IS NOT NEW.official_evidence_urls_json
-        OR OLD.evidence_status IS NOT NEW.evidence_status
-        OR OLD.scope IS NOT NEW.scope
-        OR OLD.approval_status IS NOT NEW.approval_status
-        OR OLD.approved_by IS NOT NEW.approved_by
-        OR OLD.approved_at IS NOT NEW.approved_at
-        OR OLD.included_stages_json IS NOT NEW.included_stages_json
-        OR OLD.excluded_categories_json IS NOT NEW.excluded_categories_json
-        OR OLD.include_internal_lcq IS NOT NEW.include_internal_lcq
-        OR OLD.excludes_qualifiers IS NOT NEW.excludes_qualifiers
-        OR OLD.excludes_division_2 IS NOT NEW.excludes_division_2
-        OR OLD.excludes_exhibitions IS NOT NEW.excludes_exhibitions
-        OR OLD.excludes_forfeits IS NOT NEW.excludes_forfeits
-        OR OLD.excludes_void_remakes IS NOT NEW.excludes_void_remakes
-    """,
-    "teams": """
-        OLD.team_id IS NOT NEW.team_id
-        OR OLD.name IS NOT NEW.name
-    """,
-}
-
-_DRAFT_AUTHORITY_OPERATIONS = {
-    "vision_observations": ("UPDATE", "DELETE"),
-}
-
-
-def init_draft_authority_revision_schema(connection: sqlite3.Connection) -> None:
-    """Install a targeted revision clock for cached live-draft authority checks."""
-
-    execute_script(
-        connection,
-        """
-        CREATE TABLE IF NOT EXISTS draft_lineage_revisions (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            dependency_revision INTEGER NOT NULL CHECK (dependency_revision >= 1),
-            artifact_revision INTEGER NOT NULL CHECK (artifact_revision >= 1),
-            updated_at TEXT NOT NULL
-        );
-        INSERT OR IGNORE INTO draft_lineage_revisions
-            (singleton, dependency_revision, artifact_revision, updated_at)
-        VALUES (1, 1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-        CREATE TABLE IF NOT EXISTS draft_authority_revisions (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            authority_revision INTEGER NOT NULL CHECK (authority_revision >= 1),
-            updated_at TEXT NOT NULL
-        );
-        INSERT OR IGNORE INTO draft_authority_revisions
-            (singleton, authority_revision, updated_at)
-        VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-        """
-    )
-    existing = {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-    }
-    for table in _DRAFT_AUTHORITY_TABLES:
-        if table not in existing:
-            continue
-        for operation in _DRAFT_AUTHORITY_OPERATIONS.get(
-            table,
-            ("INSERT", "UPDATE", "DELETE"),
-        ):
-            condition = (
-                _DRAFT_AUTHORITY_UPDATE_CONDITIONS.get(table)
-                if operation == "UPDATE"
-                else None
-            )
-            when = f"WHEN {condition}" if condition else ""
-            trigger = f"draft_authority_{table}_{operation.casefold()}"
-            connection.execute(
-                f'''CREATE TRIGGER IF NOT EXISTS "{trigger}"
-                    AFTER {operation} ON "{table}"
-                    {when}
-                    BEGIN
-                        UPDATE draft_authority_revisions
-                           SET authority_revision=authority_revision+1,
-                               updated_at=strftime(
-                                   '%Y-%m-%dT%H:%M:%fZ', 'now'
-                               )
-                         WHERE singleton=1;
-                    END'''
-            )
-
-
 def strict_mapping_context_block_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     strict_mapping_id: int,
     raybet_match_id: str,
@@ -4168,7 +482,7 @@ def strict_mapping_context_block_reason(
             map_number=map_number,
             transport_observed_at=transport_at,
         )
-    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+    except (SQLAlchemyError, TypeError, ValueError, OverflowError):
         return "strict_mapping_gate_unavailable"
     if not eligibility.eligible:
         if eligibility.reason in {
@@ -4188,7 +502,7 @@ def strict_mapping_context_block_reason(
 
 
 def strict_order_mapping_block_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
     *,
     require_order: bool = False,
@@ -4200,7 +514,7 @@ def strict_order_mapping_block_reason(
                  FROM shadow_orders WHERE order_key=?""",
             (order_key,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return "strict_mapping_gate_unavailable"
     if order is None:
         return "strict_mapping_unverified" if require_order else None
@@ -4219,7 +533,7 @@ def strict_order_mapping_block_reason(
                 LIMIT 1""",
             (order_key,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return "strict_mapping_gate_unavailable"
     if impacted is not None:
         return "strict_mapping_invalidated"
@@ -4321,7 +635,7 @@ def _valid_rosh_score_evidence(
 
 
 def query_rosh_lineup_score_for_trusted_draft(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -4373,11 +687,7 @@ def query_rosh_lineup_score_for_trusted_draft(
         anchor_row = anchor_cursor.fetchone()
         if anchor_row is None:
             return None
-        anchor = (
-            dict(anchor_row)
-            if isinstance(anchor_row, sqlite3.Row)
-            else dict(zip((item[0] for item in anchor_cursor.description), anchor_row))
-        )
+        anchor = anchor_row
         radiant_json = LiveBettingStore.json(list(radiant_hero_ids))
         dire_json = LiveBettingStore.json(list(dire_hero_ids))
         if (
@@ -4412,8 +722,9 @@ def query_rosh_lineup_score_for_trusted_draft(
                 """SELECT 1 FROM vision_draft_conflicts
                     WHERE raybet_match_id=? AND map_number=?
                       AND (
-                            julianday(captured_at) IS NULL
-                            OR julianday(captured_at)<=julianday(?)
+                            live_text_timestamp_utc(captured_at) IS NULL
+                            OR live_text_timestamp_utc(captured_at)<=
+                               CAST(? AS timestamptz)
                       )
                     LIMIT 1""",
                 (raybet_match_id, map_number, as_of.isoformat()),
@@ -4464,71 +775,46 @@ def query_rosh_lineup_score_for_trusted_draft(
                    AND strict_mapping_id=? AND draft_hash=?
                    {player_sql}
                    AND radiant_hero_ids_json=? AND dire_hero_ids_json=?
-                   AND julianday(source_as_of)<=julianday(?)
-                   AND julianday(created_at)<=julianday(?)
+                   AND live_text_timestamp_utc(source_as_of)<=
+                       CAST(? AS timestamptz)
+                   AND live_text_timestamp_utc(created_at)<=
+                       CAST(? AS timestamptz)
                    {formula_sql}
                  ORDER BY source_as_of DESC, created_at DESC, score_key DESC""",
             tuple(parameters),
         )
-        for raw_row in score_cursor.fetchall():
-            row = (
-                raw_row
-                if isinstance(raw_row, sqlite3.Row)
-                else dict(
-                    zip((item[0] for item in score_cursor.description), raw_row)
-                )
-            )
+        for row in score_cursor.fetchall():
             score = LiveBettingStore._rosh_score_from_row(row)
             if score is not None and score.source_as_of <= as_of:
                 return score
         return None
-    except (sqlite3.Error, TypeError, ValueError):
+    except (SQLAlchemyError, TypeError, ValueError):
         return None
 
 
 class LiveBettingStore:
     def __init__(
         self,
-        path: str | Path,
+        database_url: str | None = None,
         *,
-        connection: sqlite3.Connection | None = None,
+        engine: Engine | None = None,
         raw_archive_root: str | Path | None = None,
     ) -> None:
-        self.path = str(path)
-        self.connection = (
-            connection
-            if connection is not None
-            else sqlite3.connect(self.path, timeout=5.0)
-        )
-        self._owns_connection = connection is None
-        self._temporary_archive: tempfile.TemporaryDirectory[str] | None = None
+        if database_url is not None and engine is not None:
+            raise ValueError("database_url and engine are mutually exclusive")
+        self.engine = engine or build_engine(database_url)
+        self._owns_engine = engine is None
+        self.connection = PostgresSession(self.engine)
         if raw_archive_root is None:
-            if str(path) == ":memory:":
-                self._temporary_archive = tempfile.TemporaryDirectory(
-                    prefix="dota2-raybet-raw-"
-                )
-                raw_archive_root = self._temporary_archive.name
-            else:
-                raw_archive_root = Path(path).resolve().parent / "live_betting" / "raw-v2"
+            raw_archive_root = Path("data") / "live_betting" / "raw-v2"
         self.raw_archive_root = Path(raw_archive_root).resolve()
         self.raw_archive = RawArchive(self.raw_archive_root)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.execute("PRAGMA busy_timeout=5000")
-        journal_mode = str(
-            self.connection.execute("PRAGMA journal_mode").fetchone()[0]
-        ).lower()
-        if journal_mode != "wal":
-            self.connection.execute("PRAGMA journal_mode=WAL")
         self._transaction_depth = 0
-        self._savepoint_sequence = 0
 
     def close(self) -> None:
-        if self._owns_connection:
-            self.connection.close()
-        if self._temporary_archive is not None:
-            self._temporary_archive.cleanup()
-            self._temporary_archive = None
+        self.connection.close()
+        if self._owns_engine:
+            self.engine.dispose()
 
     def __enter__(self) -> "LiveBettingStore":
         return self
@@ -4539,1376 +825,26 @@ class LiveBettingStore:
     def init_schema(self, *, external_transaction: bool = False) -> None:
         if external_transaction and not self.connection.in_transaction:
             raise RuntimeError("external transaction is not active")
-        if shadow_order_stake_schema_requires_rebuild(self.connection):
-            foreign_keys_enabled = bool(
-                self.connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        revision = self.connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        if revision is None or str(revision[0]) != ALEMBIC_HEAD:
+            actual = None if revision is None else str(revision[0])
+            raise RuntimeError(
+                f"PostgreSQL schema revision {actual!r} is not {ALEMBIC_HEAD}"
             )
-            if not external_transaction or foreign_keys_enabled:
-                raise RuntimeError(
-                    "legacy shadow_orders stake schema must be migrated through "
-                    "prepare_database"
-                )
-        self._reject_future_schema()
-        self._migrate_odds_response_storage_fields()
-        self._migrate_prospective_draft_authority_fields()
-        self._migrate_draft_usage_authority_fields()
-        self._migrate_vision_frame_authority_fields()
-        self._migrate_postmatch_mapping_fields()
-        execute_script(
-            self.connection,
-            """DROP TRIGGER IF EXISTS shadow_orders_terminal_immutable;
-               DROP TRIGGER IF EXISTS shadow_orders_immutable_delete;
-               DROP TRIGGER IF EXISTS settlements_core_immutable;
-               DROP TRIGGER IF EXISTS settlements_immutable_delete;
-               DROP TRIGGER IF EXISTS settlement_authority_insert_guard;
-               DROP TRIGGER IF EXISTS settlement_authority_immutable_update;
-               DROP TRIGGER IF EXISTS settlement_authority_immutable_delete;
-               DROP TRIGGER IF EXISTS settlement_authority_audit_immutable_update;
-               DROP TRIGGER IF EXISTS settlement_authority_audit_immutable_delete;
-               DROP TRIGGER IF EXISTS settlements_authority_insert_guard;"""
-        )
-        execute_script(self.connection, SCHEMA_SQL)
-        from .strict_eligibility import init_strict_live_eligibility_schema
-
-        init_strict_live_eligibility_schema(
-            self.connection,
-            external_transaction=external_transaction,
-        )
-        self._migrate_shadow_order_signal_fields()
-        self._migrate_shadow_order_stake_constraint()
-        self._migrate_shadow_order_signal_fields()
-        self._migrate_monitor_match_activity()
-        self._migrate_settlement_authority_audit()
-        init_strict_live_eligibility_schema(
-            self.connection,
-            external_transaction=external_transaction,
-        )
-        self._migrate_vision_map_identity_fields()
-        self._migrate_vision_derived_invalidation_fields()
-        if not external_transaction:
-            self.connection.commit()
-        columns = {row[1] for row in self.connection.execute(
-            "PRAGMA table_info(vision_observations)"
-        )}
-        if "radiant_team_side" not in columns:
-            self.connection.execute(
-                "ALTER TABLE vision_observations ADD COLUMN radiant_team_side TEXT"
-            )
-        init_draft_authority_revision_schema(self.connection)
-        self._migrate_shadow_order_decision_lineage()
-        self._init_ledger_immutability_triggers()
-        self.connection.execute(
-            """INSERT OR IGNORE INTO live_schema_version (version, applied_at)
-               VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
-            (CURRENT_SCHEMA_VERSION,),
-        )
-        if not external_transaction:
-            self.connection.commit()
-
-    def _migrate_monitor_match_activity(self) -> None:
-        """Seed v9 activity state through existing per-match time indexes."""
-
-        row = self.connection.execute(
+        live_version = self.connection.execute(
             "SELECT MAX(version) FROM live_schema_version"
         ).fetchone()
-        previous_version = int(row[0]) if row and row[0] is not None else 0
-        if previous_version >= 9:
-            return
-        self.connection.execute("DELETE FROM raybet_match_odds_activity")
-        latest: dict[str, tuple[datetime, str]] = {}
-        for match in self.connection.execute(
-            "SELECT raybet_match_id FROM raybet_matches"
-        ).fetchall():
-            match_id = str(match["raybet_match_id"])
-            activity_rows = (
-                self.connection.execute(
-                    """SELECT MAX(observed_at) AS activity_at
-                         FROM odds_transport_observations
-                        WHERE raybet_match_id=?""",
-                    (match_id,),
-                ).fetchone(),
-                self.connection.execute(
-                    """SELECT MAX(received_at) AS activity_at
-                         FROM odds_snapshots
-                        WHERE raybet_match_id=?""",
-                    (match_id,),
-                ).fetchone(),
-            )
-            for activity in activity_rows:
-                if activity is None or activity["activity_at"] is None:
-                    continue
-                raw_time = str(activity["activity_at"])
-                try:
-                    parsed = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if parsed.tzinfo is None or parsed.utcoffset() is None:
-                    continue
-                parsed = parsed.astimezone(timezone.utc)
-                current = latest.get(match_id)
-                if current is None or parsed > current[0]:
-                    latest[match_id] = (parsed, raw_time)
-        self.connection.executemany(
-            """INSERT INTO raybet_match_odds_activity
-                   (raybet_match_id, latest_odds_activity_at)
-               VALUES (?, ?)
-               ON CONFLICT(raybet_match_id) DO UPDATE SET
-                   latest_odds_activity_at=excluded.latest_odds_activity_at
-               WHERE julianday(excluded.latest_odds_activity_at)>
-                     julianday(
-                         raybet_match_odds_activity.latest_odds_activity_at
-                     )""",
-            ((match_id, value[1]) for match_id, value in latest.items()),
-        )
-
-    def _migrate_settlement_authority_audit(self) -> None:
-        """Quarantine legacy ledgers without inventing settlement authority."""
-
-        self.connection.execute(
-            """UPDATE settlement_reconciliations
-                  SET status='manual_review',
-                      reason='legacy_source_authority_missing',
-                      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE status='confirmed'
-                  AND (
-                      evidence_ref IS NULL
-                      OR raybet_evidence_id IS NULL
-                      OR opendota_evidence_id IS NULL
-                      OR raybet_observed_at IS NULL
-                      OR opendota_observed_at IS NULL
-                      OR first_usable_at IS NULL
-                  )"""
-        )
-        self.connection.execute(
-            """UPDATE settlements SET review_required=1
-                WHERE order_key IN (
-                    SELECT attempt.order_key
-                      FROM shadow_map_attempts AS attempt
-                      JOIN settlement_reconciliations AS reconciliation
-                        ON reconciliation.raybet_match_id=
-                           attempt.raybet_match_id
-                       AND reconciliation.map_number=attempt.map_number
-                     WHERE reconciliation.status='manual_review'
-                       AND reconciliation.reason=
-                           'legacy_source_authority_missing'
-                )"""
-        )
-        self.connection.execute(
-            """INSERT OR IGNORE INTO settlement_authority_audit
-               (order_key, status, reason, actor, recorded_at)
-               SELECT settlement.order_key, 'manual_review',
-                      'legacy_settlement_authority_missing',
-                      'schema_migration',
-                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 FROM settlements AS settlement
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM settlement_authority AS authority
-                     WHERE authority.order_key=settlement.order_key
-                )"""
-        )
-
-    def _migrate_odds_response_storage_fields(self) -> None:
-        """Install additive v2 references without rewriting legacy outcomes."""
-
-        execute_script(
-            self.connection,
-            """
-            DROP VIEW IF EXISTS odds_response_outcomes_effective;
-            DROP TRIGGER IF EXISTS odds_transport_observations_guard_update;
-            DROP TRIGGER IF EXISTS odds_transport_observations_immutable_delete;
-            DROP TRIGGER IF EXISTS odds_transport_observations_require_v2_state;
-            DROP TRIGGER IF EXISTS browser_events_immutable;
-            DROP TRIGGER IF EXISTS browser_events_require_external_payload;
-            """,
-        )
-        columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(odds_transport_observations)"
-            )
-        }
-        additions = {
-            "normalized_state_hash_version": (
-                "INTEGER NOT NULL DEFAULT 1 "
-                "CHECK (normalized_state_hash_version IN (1, 2))"
-            ),
-            "original_legacy_normalized_state_hash": (
-                "TEXT CHECK (original_legacy_normalized_state_hash IS NULL OR "
-                "length(original_legacy_normalized_state_hash)=64)"
-            ),
-            "response_state_hash": (
-                "TEXT REFERENCES odds_response_states(response_state_hash)"
-            ),
-            "response_artifact_hash": (
-                "TEXT REFERENCES odds_raw_artifacts(artifact_hash)"
-            ),
-        }
-        for name, definition in additions.items():
-            if columns and name not in columns:
-                self.connection.execute(
-                    f"ALTER TABLE odds_transport_observations "
-                    f"ADD COLUMN {name} {definition}"
-                )
-        state_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(odds_response_states)"
-            )
-        }
-        state_additions = {
-            "normalized_state_hash_version": (
-                "INTEGER NOT NULL DEFAULT 1 "
-                "CHECK (normalized_state_hash_version IN (1, 2))"
-            ),
-            "original_legacy_normalized_state_hash": (
-                "TEXT CHECK (original_legacy_normalized_state_hash IS NULL OR "
-                "length(original_legacy_normalized_state_hash)=64)"
-            ),
-        }
-        for name, definition in state_additions.items():
-            if state_columns and name not in state_columns:
-                self.connection.execute(
-                    f"ALTER TABLE odds_response_states ADD COLUMN {name} {definition}"
-                )
-        browser_columns = {
-            str(row[1])
-            for row in self.connection.execute("PRAGMA table_info(browser_events)")
-        }
-        browser_additions = {
-            "payload_artifact_hash": (
-                "TEXT REFERENCES odds_raw_artifacts(artifact_hash)"
-            ),
-            "payload_storage": (
-                "TEXT NOT NULL DEFAULT 'legacy_inline' "
-                "CHECK (payload_storage IN ('external', 'legacy_inline'))"
-            ),
-        }
-        for name, definition in browser_additions.items():
-            if browser_columns and name not in browser_columns:
-                self.connection.execute(
-                    f"ALTER TABLE browser_events ADD COLUMN {name} {definition}"
-                )
-        direct_audit_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(direct_response_audit)"
-            )
-        }
-        direct_audit_additions = {
-            "endpoint": "TEXT NOT NULL DEFAULT 'https://raybet.local/legacy'",
-            "request_identity": (
-                "TEXT NOT NULL DEFAULT 'https://raybet.local/legacy'"
-            ),
-            "http_status": (
-                "INTEGER CHECK (http_status IS NULL OR "
-                "http_status BETWEEN 100 AND 599)"
-            ),
-            "provider_code": "INTEGER",
-            "request_metadata_json": (
-                "TEXT NOT NULL DEFAULT '{}' CHECK "
-                "(json_valid(request_metadata_json) AND "
-                "json_type(request_metadata_json)='object')"
-            ),
-            "payload_kind": (
-                "TEXT NOT NULL DEFAULT 'provider_response' CHECK "
-                "(payload_kind IN "
-                "('provider_response', 'request_failure', 'aggregate'))"
-            ),
-            "sanitized": (
-                "INTEGER NOT NULL DEFAULT 1 CHECK (sanitized IN (0, 1))"
-            ),
-        }
-        for name, definition in direct_audit_additions.items():
-            if direct_audit_columns and name not in direct_audit_columns:
-                self.connection.execute(
-                    f"ALTER TABLE direct_response_audit "
-                    f"ADD COLUMN {name} {definition}"
-                )
-
-    def _migrate_postmatch_mapping_fields(self) -> None:
-        """Add immutable mapping authority without inferring legacy identities."""
-
-        execute_script(
-            self.connection,
-            """
-            DROP TRIGGER IF EXISTS settlement_reconciliation_mapping_insert;
-            DROP TRIGGER IF EXISTS settlement_reconciliation_mapping_update;
-            DROP TRIGGER IF EXISTS settlement_reconciliation_authority_insert;
-            DROP TRIGGER IF EXISTS settlement_reconciliation_authority_update;
-            DROP TRIGGER IF EXISTS settlement_reconciliation_confirmed_authority_immutable;
-            DROP TRIGGER IF EXISTS settlement_reconciliation_manual_review_sticky;
-            DROP TRIGGER IF EXISTS settlement_result_evidence_authority_insert;
-            DROP TRIGGER IF EXISTS map_result_mapping_authority_insert;
-            DROP TRIGGER IF EXISTS map_results_no_update;
-            DROP TRIGGER IF EXISTS map_results_no_delete;
-            DROP TRIGGER IF EXISTS research_result_from_map_result;
-            DROP TRIGGER IF EXISTS research_result_from_late_prediction;
-            DROP TRIGGER IF EXISTS research_result_label_authority_insert;
-            DROP TRIGGER IF EXISTS research_price_label_authority_insert;
-            """
-        )
-        additions: dict[str, dict[str, str]] = {
-            "settlement_result_evidence": {
-                "first_usable_at": "TEXT",
-                "raybet_audit_key": (
-                    "TEXT REFERENCES direct_response_audit(audit_key)"
-                ),
-                "raybet_transport_key": (
-                    "TEXT REFERENCES odds_transport_observations(observation_key)"
-                ),
-                "raybet_response_state_hash": (
-                    "TEXT REFERENCES odds_response_states(response_state_hash)"
-                ),
-                "raybet_response_artifact_hash": (
-                    "TEXT REFERENCES odds_raw_artifacts(artifact_hash)"
-                ),
-                "opendota_artifact_id": (
-                    "TEXT REFERENCES raw_source_artifacts(artifact_id)"
-                ),
-                "opendota_observation_id": (
-                    "TEXT REFERENCES raw_source_observations(observation_id)"
-                ),
-                "opendota_content_hash": (
-                    "TEXT CHECK (opendota_content_hash IS NULL OR "
-                    "length(opendota_content_hash)=64)"
-                ),
-            },
-            "settlement_reconciliations": {
-                "strict_mapping_id": (
-                    "INTEGER CHECK (strict_mapping_id IS NULL OR "
-                    "strict_mapping_id > 0) "
-                    "REFERENCES strict_live_map_mappings(mapping_id)"
-                ),
-                "evidence_ref": "TEXT",
-                "raybet_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "opendota_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "raybet_observed_at": "TEXT",
-                "opendota_observed_at": "TEXT",
-                "first_usable_at": "TEXT",
-            },
-            "map_results": {
-                "strict_mapping_id": (
-                    "INTEGER CHECK (strict_mapping_id IS NULL OR "
-                    "strict_mapping_id > 0) "
-                    "REFERENCES strict_live_map_mappings(mapping_id)"
-                ),
-                "reconciliation_ref": "TEXT",
-                "raybet_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "opendota_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "raybet_evidence_ref": "TEXT",
-                "opendota_evidence_ref": "TEXT",
-                "raybet_observed_at": "TEXT",
-                "opendota_observed_at": "TEXT",
-                "first_usable_at": "TEXT",
-            },
-            "settlement_authority": {
-                "raybet_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "opendota_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "raybet_observed_at": "TEXT",
-                "opendota_observed_at": "TEXT",
-                "first_usable_at": "TEXT",
-            },
-            "research_result_labels": {
-                "strict_mapping_id": "INTEGER",
-                "reconciliation_ref": "TEXT",
-                "raybet_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "opendota_evidence_id": (
-                    "INTEGER REFERENCES settlement_result_evidence(evidence_id)"
-                ),
-                "raybet_evidence_ref": "TEXT",
-                "opendota_evidence_ref": "TEXT",
-                "raybet_observed_at": "TEXT",
-                "opendota_observed_at": "TEXT",
-                "first_usable_at": "TEXT",
-            },
-        }
-        for table, table_additions in additions.items():
-            columns = {
-                str(row[1])
-                for row in self.connection.execute(f"PRAGMA table_info({table})")
-            }
-            for name, definition in table_additions.items():
-                if columns and name not in columns:
-                    self.connection.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                    )
-
-    def _migrate_draft_usage_authority_fields(self) -> None:
-        """Add nullable exact authority columns; legacy rows remain audit-only."""
-
-        execute_script(
-            self.connection,
-            """
-            DROP TRIGGER IF EXISTS strategy_decision_draft_authority_insert;
-            DROP TRIGGER IF EXISTS shadow_order_draft_authority_insert;
-            DROP TRIGGER IF EXISTS strategy_decision_vision_authority_insert;
-            DROP TRIGGER IF EXISTS shadow_order_vision_authority_insert;
-            DROP TRIGGER IF EXISTS research_prediction_draft_authority_insert;
-            DROP VIEW IF EXISTS verified_strategy_decision_vision_authority;
-            DROP VIEW IF EXISTS trusted_odds_winner_market_authority;
-            DROP VIEW IF EXISTS prospective_draft_landmark_authority;
-            DROP VIEW IF EXISTS trusted_vision_observation_authority;
-            """,
-        )
-        for table in (
-            "strategy_decisions",
-            "shadow_orders",
-            "research_live_predictions",
-        ):
-            columns = {
-                str(row[1])
-                for row in self.connection.execute(f"PRAGMA table_info({table})")
-            }
-            if not columns:
-                continue
-            for name, definition in _DRAFT_AUTHORITY_ADDITIONS.items():
-                if name not in columns:
-                    self.connection.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                    )
-            if table != "research_live_predictions":
-                for name, definition in _VISION_AUTHORITY_ADDITIONS.items():
-                    if name not in columns:
-                        self.connection.execute(
-                            f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                        )
-
-    def _migrate_vision_frame_authority_fields(self) -> None:
-        """Add nullable frame identity fields without trusting legacy paths."""
-
-        columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(vision_observations)"
-            )
-        }
-        additions = {
-            "source_frame_sha256": (
-                "TEXT CHECK (source_frame_sha256 IS NULL OR "
-                "length(source_frame_sha256)=64)"
-            ),
-            "source_frame_bytes": (
-                "INTEGER CHECK (source_frame_bytes IS NULL OR "
-                "source_frame_bytes>0)"
-            ),
-        }
-        for name, definition in additions.items():
-            if columns and name not in columns:
-                self.connection.execute(
-                    f"ALTER TABLE vision_observations ADD COLUMN {name} {definition}"
-                )
-
-    def _migrate_prospective_draft_authority_fields(self) -> None:
-        """Add deployment lineage before authority triggers are compiled."""
-
-        curve_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(prospective_draft_curves)"
-            )
-        }
-        curve_additions = {
-            "radiant_team_side": (
-                "TEXT CHECK (radiant_team_side IS NULL OR "
-                "radiant_team_side IN ('team_one', 'team_two'))"
-            ),
-            "anchor_draft_hash": (
-                "TEXT CHECK (anchor_draft_hash IS NULL OR "
-                "length(anchor_draft_hash)=64)"
-            ),
-            "anchor_source_frame_ref": "TEXT",
-            "anchor_anchored_at": "TEXT",
-            "anchor_team_side_source_frame_ref": "TEXT",
-            "anchor_team_side_anchored_at": "TEXT",
-            "deployment_key": (
-                "TEXT CHECK (deployment_key IS NULL OR length(deployment_key)=64)"
-            ),
-            "target_snapshot_hash": (
-                "TEXT CHECK (target_snapshot_hash IS NULL OR "
-                "length(target_snapshot_hash)=64)"
-            ),
-            "feature_snapshot_json": (
-                "TEXT CHECK (feature_snapshot_json IS NULL OR "
-                "json_valid(feature_snapshot_json))"
-            ),
-            "feature_dependency_fingerprint": (
-                "TEXT CHECK (feature_dependency_fingerprint IS NULL OR "
-                "length(feature_dependency_fingerprint)=64)"
-            ),
-            "feature_dependency_revision": (
-                "INTEGER CHECK (feature_dependency_revision IS NULL OR "
-                "feature_dependency_revision>=1)"
-            ),
-        }
-        for name, definition in curve_additions.items():
-            if curve_columns and name not in curve_columns:
-                self.connection.execute(
-                    f"ALTER TABLE prospective_draft_curves ADD COLUMN {name} {definition}"
-                )
-
-        landmark_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(prospective_draft_landmarks)"
-            )
-        }
-        landmark_additions = {
-            "raw_radiant_probability": (
-                "REAL CHECK (raw_radiant_probability IS NULL OR "
-                "raw_radiant_probability BETWEEN 0.0 AND 1.0)"
-            ),
-            "deployment_key": (
-                "TEXT CHECK (deployment_key IS NULL OR length(deployment_key)=64)"
-            ),
-            "model_input_hash": (
-                "TEXT CHECK (model_input_hash IS NULL OR length(model_input_hash)=64)"
-            ),
-            "raw_uncertainty": (
-                "REAL CHECK (raw_uncertainty IS NULL OR "
-                "raw_uncertainty BETWEEN 0.0 AND 0.5)"
-            ),
-        }
-        for name, definition in landmark_additions.items():
-            if landmark_columns and name not in landmark_columns:
-                self.connection.execute(
-                    f"ALTER TABLE prospective_draft_landmarks "
-                    f"ADD COLUMN {name} {definition}"
-                )
-
-        outcome_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(prospective_draft_outcomes)"
-            )
-        }
-        if outcome_columns and "first_usable_at" not in outcome_columns:
-            self.connection.execute(
-                "ALTER TABLE prospective_draft_outcomes "
-                "ADD COLUMN first_usable_at TEXT"
-            )
-
-        # CREATE TRIGGER IF NOT EXISTS would retain the v5 definitions after
-        # the authority columns above are added. Recompile only the triggers
-        # whose predicates changed so migrated databases enforce the v6 gate.
-        execute_script(
-            self.connection,
-            """
-            DROP TRIGGER IF EXISTS prospective_draft_curve_authority_insert;
-            DROP TRIGGER IF EXISTS prospective_draft_outcome_authority_insert;
-            """
-        )
-
-    def _reject_future_schema(self) -> None:
-        exists = self.connection.execute(
-            """SELECT 1 FROM sqlite_master
-                 WHERE type='table' AND name='live_schema_version'"""
-        ).fetchone()
-        if exists is None:
-            return
-        row = self.connection.execute(
-            "SELECT MAX(version) FROM live_schema_version"
-        ).fetchone()
-        version = row[0] if row is not None else None
-        if version is not None and int(version) > CURRENT_SCHEMA_VERSION:
+        actual_live = None if live_version is None else live_version[0]
+        if actual_live is None or int(actual_live) != CURRENT_SCHEMA_VERSION:
             raise RuntimeError(
-                f"database live schema version {version} is newer than supported "
-                f"version {CURRENT_SCHEMA_VERSION}"
+                f"live schema version {actual_live!r} is not "
+                f"{CURRENT_SCHEMA_VERSION}"
             )
-
-    def _init_ledger_immutability_triggers(self) -> None:
-        execute_script(
-            self.connection,
-            """
-            CREATE TRIGGER shadow_orders_terminal_immutable
-            BEFORE UPDATE ON shadow_orders
-            WHEN NOT (
-                OLD.order_key IS NEW.order_key
-                AND OLD.raybet_match_id IS NEW.raybet_match_id
-                AND OLD.strict_mapping_id IS NEW.strict_mapping_id
-                AND OLD.odds_id IS NEW.odds_id
-                AND OLD.market_key IS NEW.market_key
-                AND OLD.signaled_at IS NEW.signaled_at
-                AND OLD.model_probability IS NEW.model_probability
-                AND OLD.market_probability IS NEW.market_probability
-                AND OLD.signal_price IS NEW.signal_price
-                AND OLD.signal_transport_key IS NEW.signal_transport_key
-                AND OLD.signal_transport_at IS NEW.signal_transport_at
-                AND OLD.expires_at IS NEW.expires_at
-                AND OLD.signal_odds_group_id IS NEW.signal_odds_group_id
-                AND OLD.signal_outcome_key IS NEW.signal_outcome_key
-                AND OLD.signal_identity_verified IS NEW.signal_identity_verified
-                AND OLD.stake IS NEW.stake
-                AND OLD.draft_curve_key IS NEW.draft_curve_key
-                AND OLD.draft_source_ref IS NEW.draft_source_ref
-                AND OLD.draft_landmark_key IS NEW.draft_landmark_key
-                AND OLD.draft_landmark_horizon_minutes IS
-                    NEW.draft_landmark_horizon_minutes
-                AND OLD.draft_landmark_target IS NEW.draft_landmark_target
-                AND OLD.draft_landmark_radiant_probability IS
-                    NEW.draft_landmark_radiant_probability
-                AND OLD.draft_landmark_quality IS NEW.draft_landmark_quality
-                AND OLD.draft_landmark_uncertainty IS
-                    NEW.draft_landmark_uncertainty
-                AND OLD.draft_landmark_support IS NEW.draft_landmark_support
-                AND OLD.draft_radiant_team_side IS NEW.draft_radiant_team_side
-                AND OLD.draft_strict_mapping_id IS NEW.draft_strict_mapping_id
-                AND OLD.draft_deployment_key IS NEW.draft_deployment_key
-                AND OLD.draft_target_snapshot_hash IS
-                    NEW.draft_target_snapshot_hash
-                AND OLD.draft_feature_hash IS NEW.draft_feature_hash
-                AND OLD.draft_model_hash IS NEW.draft_model_hash
-                AND OLD.draft_calibration_hash IS NEW.draft_calibration_hash
-                AND OLD.draft_model_version IS NEW.draft_model_version
-                AND OLD.draft_global_gate_ref IS NEW.draft_global_gate_ref
-                AND OLD.draft_input_snapshot_hash IS NEW.draft_input_snapshot_hash
-                AND OLD.draft_authority_revision IS NEW.draft_authority_revision
-                AND OLD.draft_dependency_revision IS NEW.draft_dependency_revision
-                AND OLD.vision_raybet_match_id IS NEW.vision_raybet_match_id
-                AND OLD.vision_map_number IS NEW.vision_map_number
-                AND OLD.vision_captured_at IS NEW.vision_captured_at
-                AND OLD.vision_source_frame_ref IS NEW.vision_source_frame_ref
-                AND OLD.vision_source_frame_sha256 IS
-                    NEW.vision_source_frame_sha256
-                AND OLD.vision_source_frame_bytes IS
-                    NEW.vision_source_frame_bytes
-                AND OLD.vision_observed_game_clock_seconds IS
-                    NEW.vision_observed_game_clock_seconds
-                AND OLD.vision_aligned_game_clock_seconds IS
-                    NEW.vision_aligned_game_clock_seconds
-                AND OLD.vision_is_paused IS NEW.vision_is_paused
-                AND OLD.vision_radiant_hero_ids_json IS
-                    NEW.vision_radiant_hero_ids_json
-                AND OLD.vision_dire_hero_ids_json IS
-                    NEW.vision_dire_hero_ids_json
-                AND OLD.vision_radiant_team_side IS NEW.vision_radiant_team_side
-                AND OLD.vision_clock_confidence IS NEW.vision_clock_confidence
-                AND OLD.vision_draft_confidence IS NEW.vision_draft_confidence
-                AND OLD.vision_screen_state IS NEW.vision_screen_state
-                AND OLD.vision_confirmed IS NEW.vision_confirmed
-                AND OLD.vision_transport_key IS NEW.vision_transport_key
-                AND OLD.vision_transport_at IS NEW.vision_transport_at
-                AND OLD.vision_alignment_method IS NEW.vision_alignment_method
-                AND OLD.vision_alignment_lag_seconds IS
-                    NEW.vision_alignment_lag_seconds
-                AND OLD.status='pending'
-                AND OLD.fill_price IS NULL
-                AND OLD.filled_at IS NULL
-                AND OLD.rejection_reason IS NULL
-                AND (
-                    (
-                        NEW.status='pending'
-                        AND NEW.fill_price IS NULL
-                        AND NEW.filled_at IS NULL
-                        AND NEW.rejection_reason IS NULL
-                    )
-                    OR (
-                        NEW.status='filled'
-                        AND typeof(NEW.fill_price) IN ('integer', 'real')
-                        AND NEW.fill_price>1.0
-                        AND NEW.filled_at IS NOT NULL
-                        AND NEW.filled_at!=''
-                        AND NEW.rejection_reason IS NULL
-                    )
-                    OR (
-                        NEW.status='rejected'
-                        AND NEW.fill_price IS NULL
-                        AND NEW.filled_at IS NULL
-                        AND NEW.rejection_reason IS NOT NULL
-                        AND NEW.rejection_reason!=''
-                    )
-                )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'shadow order terminal state is immutable');
-            END;
-            CREATE TRIGGER shadow_orders_immutable_delete
-            BEFORE DELETE ON shadow_orders
-            BEGIN
-                SELECT RAISE(ABORT, 'shadow orders are immutable');
-            END;
-            CREATE TRIGGER settlement_authority_insert_guard
-            BEFORE INSERT ON settlement_authority
-            WHEN NOT EXISTS (
-                SELECT 1
-                  FROM shadow_orders AS orders
-                  JOIN shadow_map_attempts AS attempt
-                    ON attempt.order_key=orders.order_key
-                   AND attempt.raybet_match_id=orders.raybet_match_id
-                  JOIN strict_live_map_mappings AS mapping
-                    ON mapping.mapping_id=orders.strict_mapping_id
-                   AND mapping.raybet_match_id=orders.raybet_match_id
-                   AND mapping.map_number=attempt.map_number
-                  JOIN settlement_reconciliations AS reconciliation
-                    ON reconciliation.raybet_match_id=orders.raybet_match_id
-                   AND reconciliation.map_number=attempt.map_number
-                   AND reconciliation.strict_mapping_id=orders.strict_mapping_id
-                   AND reconciliation.status='confirmed'
-                  JOIN map_results AS result
-                    ON result.raybet_match_id=orders.raybet_match_id
-                   AND result.map_number=attempt.map_number
-                   AND result.strict_mapping_id=orders.strict_mapping_id
-                   AND result.dota_match_id=reconciliation.dota_match_id
-                   AND result.winner_side=reconciliation.raybet_winner_side
-                   AND result.winner_side=reconciliation.opendota_winner_side
-                 WHERE orders.order_key=NEW.order_key
-                   AND orders.status='filled'
-                   AND attempt.status='filled'
-                   AND orders.filled_at IS NOT NULL
-                   AND julianday(orders.filled_at) IS NOT NULL
-                   AND julianday(result.settled_at) IS NOT NULL
-                   AND julianday(orders.filled_at)<julianday(result.settled_at)
-                   AND julianday(reconciliation.first_usable_at) IS NOT NULL
-                   AND julianday(reconciliation.updated_at) IS NOT NULL
-                   AND julianday(reconciliation.first_usable_at)=
-                       julianday(result.settled_at)
-                   AND julianday(reconciliation.updated_at)
-                         >=julianday(result.settled_at)
-                   AND orders.signal_outcome_key IN ('team_one', 'team_two')
-                   AND orders.market_key='winner|map_' || attempt.map_number ||
-                         '|' || orders.signal_outcome_key || '|'
-                   AND NEW.raybet_match_id=orders.raybet_match_id
-                   AND NEW.map_number=attempt.map_number
-                   AND NEW.strict_mapping_id=orders.strict_mapping_id
-                   AND NEW.dota_match_id=result.dota_match_id
-                   AND NEW.winner_side=result.winner_side
-                   AND NEW.fill_price=orders.fill_price
-                   AND NEW.stake_units=orders.stake
-                   AND NEW.derived_result=CASE
-                         WHEN orders.signal_outcome_key=result.winner_side
-                         THEN 'win' ELSE 'loss' END
-                   AND abs(NEW.derived_return_units-CASE
-                         WHEN orders.signal_outcome_key=result.winner_side
-                         THEN orders.fill_price ELSE 0.0 END)<=1e-12
-                   AND abs(NEW.derived_return_amount-
-                         NEW.derived_return_units*orders.stake)<=1e-12
-                   AND NEW.map_result_evidence_ref=result.evidence_ref
-                   AND result.evidence_ref='settlement-reconciliation:' ||
-                         orders.raybet_match_id || ':map:' || attempt.map_number
-                   AND result.reconciliation_ref=reconciliation.evidence_ref
-                   AND result.raybet_evidence_id=
-                       reconciliation.raybet_evidence_id
-                   AND result.opendota_evidence_id=
-                       reconciliation.opendota_evidence_id
-                   AND result.raybet_observed_at=
-                       reconciliation.raybet_observed_at
-                   AND result.opendota_observed_at=
-                       reconciliation.opendota_observed_at
-                   AND result.first_usable_at=reconciliation.first_usable_at
-                   AND NEW.raybet_evidence_ref=reconciliation.raybet_evidence_ref
-                   AND NEW.opendota_evidence_ref=
-                         reconciliation.opendota_evidence_ref
-                   AND NEW.raybet_evidence_id=reconciliation.raybet_evidence_id
-                   AND NEW.opendota_evidence_id=
-                       reconciliation.opendota_evidence_id
-                   AND NEW.raybet_observed_at=reconciliation.raybet_observed_at
-                   AND NEW.opendota_observed_at=
-                       reconciliation.opendota_observed_at
-                   AND NEW.first_usable_at=reconciliation.first_usable_at
-                   AND julianday(NEW.reconciliation_updated_at)=
-                       julianday(reconciliation.updated_at)
-                   AND julianday(NEW.settled_at)=julianday(result.settled_at)
-                   AND EXISTS (
-                       SELECT 1 FROM settlement_result_evidence AS evidence
-                        WHERE evidence.evidence_id=reconciliation.raybet_evidence_id
-                          AND evidence.raybet_match_id=orders.raybet_match_id
-                          AND evidence.map_number=attempt.map_number
-                          AND evidence.dota_match_id=result.dota_match_id
-                          AND evidence.source='raybet'
-                          AND evidence.status='confirmed'
-                          AND evidence.winner_side=result.winner_side
-                          AND evidence.evidence_ref=
-                              reconciliation.raybet_evidence_ref
-                          AND evidence.observed_at=
-                              reconciliation.raybet_observed_at
-                          AND evidence.first_usable_at=evidence.observed_at
-                          AND julianday(evidence.first_usable_at)>
-                              julianday(orders.filled_at)
-                          AND json_valid(evidence.facts_json)
-                          AND json_type(evidence.facts_json, '$.raybet_match_id')='text'
-                          AND json_type(evidence.facts_json, '$.map_number')='integer'
-                          AND json_type(evidence.facts_json, '$.strict_mapping_id')='integer'
-                          AND json_type(evidence.facts_json, '$.dota_match_id')='integer'
-                          AND json_type(evidence.facts_json, '$.winner_side')='text'
-                          AND (json_type(evidence.facts_json, '$.dota_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.dota_match_id'
-                               )=result.dota_match_id)
-                          AND (json_type(evidence.facts_json, '$.winner_side')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.winner_side'
-                               )=result.winner_side)
-                          AND (json_type(evidence.facts_json, '$.raybet_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.raybet_match_id'
-                               )=orders.raybet_match_id)
-                          AND (json_type(evidence.facts_json, '$.map_number')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.map_number'
-                               )=attempt.map_number)
-                          AND (json_type(evidence.facts_json,
-                                         '$.strict_mapping_id') IS NULL
-                               OR json_extract(
-                                   evidence.facts_json, '$.strict_mapping_id'
-                               )=orders.strict_mapping_id)
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM settlement_result_evidence AS evidence
-                        WHERE evidence.evidence_id=
-                              reconciliation.opendota_evidence_id
-                          AND evidence.raybet_match_id=orders.raybet_match_id
-                          AND evidence.map_number=attempt.map_number
-                          AND evidence.dota_match_id=result.dota_match_id
-                          AND evidence.source='opendota'
-                          AND evidence.status='confirmed'
-                          AND evidence.winner_side=result.winner_side
-                          AND evidence.evidence_ref=
-                              reconciliation.opendota_evidence_ref
-                          AND evidence.observed_at=
-                              reconciliation.opendota_observed_at
-                          AND julianday(evidence.first_usable_at)>
-                              julianday(orders.filled_at)
-                          AND json_valid(evidence.facts_json)
-                          AND json_type(evidence.facts_json, '$.raybet_match_id')='text'
-                          AND json_type(evidence.facts_json, '$.map_number')='integer'
-                          AND json_type(evidence.facts_json, '$.strict_mapping_id')='integer'
-                          AND json_type(evidence.facts_json, '$.dota_match_id')='integer'
-                          AND json_type(evidence.facts_json, '$.winner_side')='text'
-                          AND (json_type(evidence.facts_json, '$.dota_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.dota_match_id'
-                               )=result.dota_match_id)
-                          AND (json_type(evidence.facts_json, '$.winner_side')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.winner_side'
-                               )=result.winner_side)
-                          AND (json_type(evidence.facts_json, '$.raybet_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.raybet_match_id'
-                               )=orders.raybet_match_id)
-                          AND (json_type(evidence.facts_json, '$.map_number')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.map_number'
-                               )=attempt.map_number)
-                          AND (json_type(evidence.facts_json,
-                                         '$.strict_mapping_id') IS NULL
-                               OR json_extract(
-                                   evidence.facts_json, '$.strict_mapping_id'
-                               )=orders.strict_mapping_id)
-                   )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'settlement authority chain is required');
-            END;
-            CREATE TRIGGER settlement_authority_immutable_update
-            BEFORE UPDATE ON settlement_authority
-            BEGIN
-                SELECT RAISE(ABORT, 'settlement authority is immutable');
-            END;
-            CREATE TRIGGER settlement_authority_immutable_delete
-            BEFORE DELETE ON settlement_authority
-            BEGIN
-                SELECT RAISE(ABORT, 'settlement authority is immutable');
-            END;
-            CREATE TRIGGER settlement_authority_audit_immutable_update
-            BEFORE UPDATE ON settlement_authority_audit
-            BEGIN
-                SELECT RAISE(ABORT, 'settlement authority audit is immutable');
-            END;
-            CREATE TRIGGER settlement_authority_audit_immutable_delete
-            BEFORE DELETE ON settlement_authority_audit
-            BEGIN
-                SELECT RAISE(ABORT, 'settlement authority audit is immutable');
-            END;
-            CREATE TRIGGER settlements_authority_insert_guard
-            BEFORE INSERT ON settlements
-            WHEN NEW.review_required=0 AND NOT EXISTS (
-                SELECT 1
-                  FROM settlement_authority AS authority
-                  JOIN shadow_orders AS orders
-                    ON orders.order_key=authority.order_key
-                  JOIN shadow_map_attempts AS attempt
-                    ON attempt.order_key=orders.order_key
-                   AND attempt.raybet_match_id=authority.raybet_match_id
-                   AND attempt.map_number=authority.map_number
-                  JOIN settlement_reconciliations AS reconciliation
-                    ON reconciliation.raybet_match_id=authority.raybet_match_id
-                   AND reconciliation.map_number=authority.map_number
-                   AND reconciliation.strict_mapping_id=
-                       authority.strict_mapping_id
-                   AND reconciliation.dota_match_id=authority.dota_match_id
-                   AND reconciliation.raybet_winner_side=authority.winner_side
-                   AND reconciliation.opendota_winner_side=authority.winner_side
-                   AND reconciliation.raybet_evidence_ref=
-                       authority.raybet_evidence_ref
-                   AND reconciliation.opendota_evidence_ref=
-                       authority.opendota_evidence_ref
-                   AND reconciliation.raybet_evidence_id=
-                       authority.raybet_evidence_id
-                   AND reconciliation.opendota_evidence_id=
-                       authority.opendota_evidence_id
-                   AND reconciliation.raybet_observed_at=
-                       authority.raybet_observed_at
-                   AND reconciliation.opendota_observed_at=
-                       authority.opendota_observed_at
-                   AND reconciliation.first_usable_at=
-                       authority.first_usable_at
-                   AND julianday(reconciliation.updated_at)=
-                       julianday(authority.reconciliation_updated_at)
-                   AND reconciliation.status='confirmed'
-                  JOIN map_results AS result
-                    ON result.raybet_match_id=authority.raybet_match_id
-                   AND result.map_number=authority.map_number
-                   AND result.strict_mapping_id=authority.strict_mapping_id
-                   AND result.dota_match_id=authority.dota_match_id
-                   AND result.winner_side=authority.winner_side
-                   AND result.evidence_ref=authority.map_result_evidence_ref
-                   AND result.reconciliation_ref=reconciliation.evidence_ref
-                   AND result.raybet_evidence_id=authority.raybet_evidence_id
-                   AND result.opendota_evidence_id=authority.opendota_evidence_id
-                   AND result.raybet_observed_at=authority.raybet_observed_at
-                   AND result.opendota_observed_at=
-                       authority.opendota_observed_at
-                   AND result.first_usable_at=authority.first_usable_at
-                   AND julianday(result.settled_at)=julianday(authority.settled_at)
-                 WHERE authority.order_key=NEW.order_key
-                   AND orders.status='filled'
-                   AND attempt.status='filled'
-                   AND orders.raybet_match_id=authority.raybet_match_id
-                   AND orders.strict_mapping_id=authority.strict_mapping_id
-                   AND orders.fill_price=authority.fill_price
-                   AND orders.stake=authority.stake_units
-                   AND NEW.result=authority.derived_result
-                   AND abs(NEW.return_units-
-                       authority.derived_return_units)<=1e-12
-                   AND NEW.settled_at=authority.settled_at
-                   AND NEW.evidence_ref=authority.map_result_evidence_ref
-                   AND EXISTS (
-                       SELECT 1 FROM settlement_result_evidence AS evidence
-                        WHERE evidence.evidence_id=authority.raybet_evidence_id
-                          AND evidence.raybet_match_id=authority.raybet_match_id
-                          AND evidence.map_number=authority.map_number
-                          AND evidence.dota_match_id=authority.dota_match_id
-                          AND evidence.source='raybet'
-                          AND evidence.status='confirmed'
-                          AND evidence.winner_side=authority.winner_side
-                          AND evidence.evidence_ref=authority.raybet_evidence_ref
-                          AND evidence.observed_at=authority.raybet_observed_at
-                          AND evidence.first_usable_at=evidence.observed_at
-                          AND json_valid(evidence.facts_json)
-                          AND json_type(evidence.facts_json, '$.raybet_match_id')='text'
-                          AND json_type(evidence.facts_json, '$.map_number')='integer'
-                          AND json_type(evidence.facts_json, '$.strict_mapping_id')='integer'
-                          AND json_type(evidence.facts_json, '$.dota_match_id')='integer'
-                          AND json_type(evidence.facts_json, '$.winner_side')='text'
-                          AND (json_type(evidence.facts_json, '$.dota_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.dota_match_id'
-                               )=authority.dota_match_id)
-                          AND (json_type(evidence.facts_json, '$.winner_side')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.winner_side'
-                               )=authority.winner_side)
-                          AND (json_type(evidence.facts_json, '$.raybet_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.raybet_match_id'
-                               )=authority.raybet_match_id)
-                          AND (json_type(evidence.facts_json, '$.map_number')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.map_number'
-                               )=authority.map_number)
-                          AND (json_type(evidence.facts_json,
-                                         '$.strict_mapping_id') IS NULL
-                               OR json_extract(
-                                   evidence.facts_json, '$.strict_mapping_id'
-                               )=authority.strict_mapping_id)
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM settlement_result_evidence AS evidence
-                        WHERE evidence.evidence_id=authority.opendota_evidence_id
-                          AND evidence.raybet_match_id=authority.raybet_match_id
-                          AND evidence.map_number=authority.map_number
-                          AND evidence.dota_match_id=authority.dota_match_id
-                          AND evidence.source='opendota'
-                          AND evidence.status='confirmed'
-                          AND evidence.winner_side=authority.winner_side
-                          AND evidence.evidence_ref=authority.opendota_evidence_ref
-                          AND evidence.observed_at=authority.opendota_observed_at
-                          AND json_valid(evidence.facts_json)
-                          AND json_type(evidence.facts_json, '$.raybet_match_id')='text'
-                          AND json_type(evidence.facts_json, '$.map_number')='integer'
-                          AND json_type(evidence.facts_json, '$.strict_mapping_id')='integer'
-                          AND json_type(evidence.facts_json, '$.dota_match_id')='integer'
-                          AND json_type(evidence.facts_json, '$.winner_side')='text'
-                          AND (json_type(evidence.facts_json, '$.dota_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.dota_match_id'
-                               )=authority.dota_match_id)
-                          AND (json_type(evidence.facts_json, '$.winner_side')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.winner_side'
-                               )=authority.winner_side)
-                          AND (json_type(evidence.facts_json, '$.raybet_match_id')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.raybet_match_id'
-                               )=authority.raybet_match_id)
-                          AND (json_type(evidence.facts_json, '$.map_number')
-                               IS NULL OR json_extract(
-                                   evidence.facts_json, '$.map_number'
-                               )=authority.map_number)
-                          AND (json_type(evidence.facts_json,
-                                         '$.strict_mapping_id') IS NULL
-                               OR json_extract(
-                                   evidence.facts_json, '$.strict_mapping_id'
-                               )=authority.strict_mapping_id)
-                   )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'formal settlement authority is required');
-            END;
-            CREATE TRIGGER settlements_core_immutable
-            BEFORE UPDATE ON settlements
-            WHEN NOT (
-                OLD.order_key IS NEW.order_key
-                AND OLD.result IS NEW.result
-                AND OLD.return_units IS NEW.return_units
-                AND OLD.settled_at IS NEW.settled_at
-                AND OLD.evidence_ref IS NEW.evidence_ref
-                AND (
-                    OLD.review_required IS NEW.review_required
-                    OR (OLD.review_required=0 AND NEW.review_required=1)
-                )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'settlement core state is immutable');
-            END;
-            CREATE TRIGGER settlements_immutable_delete
-            BEFORE DELETE ON settlements
-            BEGIN
-                SELECT RAISE(ABORT, 'settlements are immutable');
-            END;
-            """
-        )
-
-    def _migrate_shadow_order_stake_constraint(self) -> None:
-        if not shadow_order_stake_schema_requires_rebuild(self.connection):
-            return
-        invalid_stake = self.connection.execute(
-            """SELECT 1 FROM shadow_orders
-                WHERE stake IS NULL
-                   OR typeof(stake) NOT IN ('integer', 'real')
-                   OR stake<=0.0 OR stake>1.0
-                LIMIT 1"""
-        ).fetchone()
-        if invalid_stake is not None:
-            raise RuntimeError(
-                "legacy shadow_orders stake values violate the current contract"
-            )
-        column_rows = tuple(
-            self.connection.execute("PRAGMA table_xinfo(shadow_orders)")
-        )
-        actual_columns = {str(row[1]) for row in column_rows}
-        expected_columns = set(_SHADOW_ORDER_COLUMNS)
-        if (
-            any(int(row[6]) != 0 for row in column_rows)
-            or actual_columns != expected_columns
-            or len(actual_columns) != len(_SHADOW_ORDER_COLUMNS)
-        ):
-            raise RuntimeError(
-                "legacy shadow_orders columns do not match the stake migration contract"
-            )
-        table_row = self.connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='shadow_orders'"
-        ).fetchone()
-        table_sql = "" if table_row is None else str(table_row[0] or "")
-        migration_sql, table_replacements = re.subn(
-            r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-            r"(?:\"shadow_orders\"|shadow_orders)(?=\s*\()",
-            "CREATE TABLE shadow_orders_stake_migration",
-            table_sql,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-        migration_sql, stake_replacements = re.subn(
-            r"\bstake\s+REAL\s+NOT\s+NULL(?=\s*,)",
-            "stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0)",
-            migration_sql,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-        if table_replacements != 1 or stake_replacements != 1:
-            raise RuntimeError(
-                "legacy shadow_orders stake schema cannot be repaired safely"
-            )
-
-        self.connection.execute("DROP TABLE IF EXISTS shadow_orders_stake_migration")
-        self.connection.execute(migration_sql)
-        columns_sql = ", ".join(f'"{name}"' for name in _SHADOW_ORDER_COLUMNS)
-        self.connection.execute(
-            f"""INSERT INTO shadow_orders_stake_migration ({columns_sql})
-                SELECT {columns_sql} FROM shadow_orders"""
-        )
-        self.connection.execute(
-            "DROP TRIGGER IF EXISTS settlement_result_evidence_authority_insert"
-        )
-        self.connection.execute("DROP TABLE shadow_orders")
-        self.connection.execute(
-            "ALTER TABLE shadow_orders_stake_migration RENAME TO shadow_orders"
-        )
-        execute_script(self.connection, SCHEMA_SQL)
-
-    def _migrate_shadow_order_signal_fields(self) -> None:
-        """Add strict signal identity to databases created by earlier versions."""
-        self.connection.execute(
-            "DROP TRIGGER IF EXISTS shadow_orders_signal_identity_immutable"
-        )
-        columns = {
-            str(row[1])
-            for row in self.connection.execute("PRAGMA table_info(shadow_orders)")
-        }
-        additive_columns = {
-            "strict_mapping_id": "INTEGER",
-            "signal_transport_key": "TEXT NOT NULL DEFAULT ''",
-            "signal_transport_at": "TEXT NOT NULL DEFAULT ''",
-            "expires_at": "TEXT NOT NULL DEFAULT ''",
-            "signal_odds_group_id": "TEXT",
-            "signal_outcome_key": "TEXT",
-            "signal_identity_verified": (
-                "INTEGER NOT NULL DEFAULT 0 "
-                "CHECK (signal_identity_verified IN (0, 1))"
-            ),
-        }
-        for name, definition in additive_columns.items():
-            if name not in columns:
-                self.connection.execute(
-                    f"ALTER TABLE shadow_orders ADD COLUMN {name} {definition}"
-                )
-
-        rows = self.connection.execute(
-            """SELECT order_key, raybet_match_id, signaled_at
-                 FROM shadow_orders
-                WHERE signal_transport_key IS NULL OR signal_transport_key=''
-                   OR signal_transport_at IS NULL OR signal_transport_at=''
-                   OR expires_at IS NULL OR expires_at=''"""
-        ).fetchall()
-        for row in rows:
-            signaled_at = datetime.fromisoformat(str(row["signaled_at"]))
-            signal_time = self._iso(signaled_at)
-            self.connection.execute(
-                """UPDATE shadow_orders
-                      SET signal_transport_key=?, signal_transport_at=?, expires_at=?
-                    WHERE order_key=?""",
-                (
-                    f"legacy:{row['order_key']}",
-                    signal_time,
-                    self._iso(signaled_at + timedelta(seconds=15)),
-                    str(row["order_key"]),
-                ),
-            )
-
-        identity_rows = self.connection.execute(
-            """SELECT order_key, raybet_match_id, odds_id, market_key,
-                      signal_price, signal_transport_key, signal_transport_at
-                 FROM shadow_orders
-                WHERE signal_identity_verified!=1
-                   OR signal_odds_group_id IS NULL OR signal_odds_group_id=''
-                   OR signal_outcome_key IS NULL OR signal_outcome_key=''"""
-        ).fetchall()
-        for row in identity_rows:
-            outcome = self.connection.execute(
-                """SELECT outcome.odds_group_id, outcome.outcome_key,
-                          outcome.price, outcome.status, outcome.supported,
-                          outcome.market_type, outcome.period, outcome.side,
-                          outcome.line
-                     FROM odds_response_outcomes_effective outcome
-                     JOIN odds_transport_observations transport
-                       ON transport.observation_key=outcome.observation_key
-                    WHERE outcome.observation_key=?
-                      AND outcome.raybet_match_id=? AND outcome.odds_id=?
-                      AND transport.observed_at=?
-                      AND transport.source='direct'
-                      AND transport.timing_status='on_time'
-                      AND transport.processing_status='processed'""",
-                (
-                    str(row["signal_transport_key"]),
-                    str(row["raybet_match_id"]),
-                    str(row["odds_id"]),
-                    str(row["signal_transport_at"]),
-                ),
-            ).fetchone()
-            identity_is_proven = (
-                outcome is not None
-                and bool(str(outcome["odds_group_id"] or ""))
-                and bool(str(outcome["outcome_key"]))
-                and float(outcome["price"]) == float(row["signal_price"])
-                and is_open(outcome["status"])
-                and bool(outcome["supported"])
-                and market_key(
-                    str(outcome["market_type"]),
-                    str(outcome["period"]),
-                    outcome["side"],
-                    outcome["line"],
-                )
-                == str(row["market_key"])
-            )
-            self.connection.execute(
-                """UPDATE shadow_orders
-                      SET signal_odds_group_id=?, signal_outcome_key=?,
-                          signal_identity_verified=?
-                    WHERE order_key=?""",
-                (
-                    outcome["odds_group_id"] if identity_is_proven else None,
-                    str(outcome["outcome_key"])
-                    if identity_is_proven
-                    else None,
-                    int(identity_is_proven),
-                    str(row["order_key"]),
-                ),
-            )
-
-        signal_columns = {
-            str(row[1]): (int(row[3]), row[4])
-            for row in self.connection.execute("PRAGMA table_info(shadow_orders)")
-            if str(row[1]) in additive_columns
-        }
-        expected_columns = {
-            "strict_mapping_id": (0, None),
-            "signal_transport_key": (1, None),
-            "signal_transport_at": (1, None),
-            "expires_at": (1, None),
-            "signal_odds_group_id": (0, None),
-            "signal_outcome_key": (0, None),
-            "signal_identity_verified": (1, None),
-        }
-        if signal_columns != expected_columns:
-            self.connection.execute("DROP TABLE IF EXISTS shadow_orders_strict_migration")
-            self.connection.execute(
-                """CREATE TABLE shadow_orders_strict_migration (
-                    order_key TEXT PRIMARY KEY,
-                    raybet_match_id TEXT NOT NULL,
-                    strict_mapping_id INTEGER,
-                    odds_id TEXT NOT NULL,
-                    market_key TEXT NOT NULL,
-                    signaled_at TEXT NOT NULL,
-                    model_probability REAL NOT NULL,
-                    market_probability REAL NOT NULL,
-                    signal_price REAL NOT NULL,
-                    signal_transport_key TEXT NOT NULL,
-                    signal_transport_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    signal_odds_group_id TEXT,
-                    signal_outcome_key TEXT,
-                    signal_identity_verified INTEGER NOT NULL
-                        CHECK (signal_identity_verified IN (0, 1)),
-                    stake REAL NOT NULL CHECK (stake>0.0 AND stake<=1.0),
-                    status TEXT NOT NULL,
-                    fill_price REAL,
-                    filled_at TEXT,
-                    rejection_reason TEXT
-                )"""
-            )
-            self.connection.execute(
-                """INSERT INTO shadow_orders_strict_migration
-                    (order_key, raybet_match_id, strict_mapping_id, odds_id,
-                     market_key, signaled_at,
-                     model_probability, market_probability, signal_price,
-                     signal_transport_key, signal_transport_at, expires_at,
-                     signal_odds_group_id, signal_outcome_key,
-                     signal_identity_verified, stake, status, fill_price,
-                     filled_at, rejection_reason)
-                    SELECT order_key, raybet_match_id, strict_mapping_id,
-                           odds_id, market_key, signaled_at,
-                           model_probability, market_probability,
-                           signal_price, signal_transport_key,
-                           signal_transport_at, expires_at,
-                           signal_odds_group_id, signal_outcome_key,
-                           signal_identity_verified, stake, status, fill_price,
-                           filled_at, rejection_reason
-                      FROM shadow_orders"""
-            )
-            self.connection.execute(
-                "DROP TRIGGER IF EXISTS settlement_result_evidence_authority_insert"
-            )
-            self.connection.execute("DROP TABLE shadow_orders")
-            self.connection.execute(
-                "ALTER TABLE shadow_orders_strict_migration RENAME TO shadow_orders"
-            )
-            # Rebuilding a legacy signal table drops additive authority columns
-            # and all triggers owned by that table. Restore nullable authority
-            # snapshots without inferring values for legacy rows, then recompile
-            # the current fail-closed schema.
-            self._migrate_draft_usage_authority_fields()
-            execute_script(self.connection, SCHEMA_SQL)
-
-        execute_script(
-            self.connection,
-            """
-            DROP TRIGGER IF EXISTS shadow_orders_require_signal_insert;
-            DROP TRIGGER IF EXISTS shadow_orders_require_signal_update;
-            DROP TRIGGER IF EXISTS shadow_orders_signal_identity_immutable;
-            CREATE TRIGGER IF NOT EXISTS shadow_orders_require_signal_insert
-            BEFORE INSERT ON shadow_orders
-            WHEN NEW.signal_transport_key IS NULL OR NEW.signal_transport_key=''
-              OR NEW.signal_transport_at IS NULL OR NEW.signal_transport_at=''
-              OR NEW.expires_at IS NULL OR NEW.expires_at=''
-              OR NEW.signal_identity_verified!=1
-              OR NEW.signal_odds_group_id IS NULL OR NEW.signal_odds_group_id=''
-              OR NEW.signal_outcome_key IS NULL OR NEW.signal_outcome_key=''
-            BEGIN
-                SELECT RAISE(ABORT, 'shadow order signal identity is required');
-            END;
-            CREATE TRIGGER IF NOT EXISTS shadow_orders_require_signal_update
-            BEFORE UPDATE ON shadow_orders
-            WHEN NEW.signal_transport_key IS NULL OR NEW.signal_transport_key=''
-              OR NEW.signal_transport_at IS NULL OR NEW.signal_transport_at=''
-              OR NEW.expires_at IS NULL OR NEW.expires_at=''
-            BEGIN
-                SELECT RAISE(ABORT, 'shadow order signal identity is required');
-            END;
-            CREATE TRIGGER shadow_orders_signal_identity_immutable
-            BEFORE UPDATE ON shadow_orders
-            WHEN OLD.raybet_match_id IS NOT NEW.raybet_match_id
-              OR OLD.strict_mapping_id IS NOT NEW.strict_mapping_id
-              OR OLD.odds_id IS NOT NEW.odds_id
-              OR OLD.market_key IS NOT NEW.market_key
-              OR OLD.signaled_at IS NOT NEW.signaled_at
-              OR OLD.signal_price IS NOT NEW.signal_price
-              OR OLD.signal_transport_key IS NOT NEW.signal_transport_key
-              OR OLD.signal_transport_at IS NOT NEW.signal_transport_at
-              OR OLD.expires_at IS NOT NEW.expires_at
-              OR OLD.signal_odds_group_id IS NOT NEW.signal_odds_group_id
-              OR OLD.signal_outcome_key IS NOT NEW.signal_outcome_key
-              OR OLD.signal_identity_verified IS NOT NEW.signal_identity_verified
-            BEGIN
-                SELECT RAISE(ABORT, 'shadow order signal identity is immutable');
-            END;
-            DROP TRIGGER IF EXISTS shadow_orders_require_strict_mapping_insert;
-            CREATE TRIGGER shadow_orders_require_strict_mapping_insert
-            BEFORE INSERT ON shadow_orders
-            WHEN NEW.strict_mapping_id IS NULL
-              OR typeof(NEW.strict_mapping_id)!='integer'
-              OR NEW.strict_mapping_id<=0
-            BEGIN
-                SELECT RAISE(ABORT, 'shadow order strict mapping is required');
-            END;
-            """
-        )
 
     @staticmethod
-    def _stored_shadow_order(row: sqlite3.Row) -> ShadowOrder:
+    def _stored_shadow_order(row: DatabaseRow) -> ShadowOrder:
         market_parts = str(row["market_key"]).split("|")
         if len(market_parts) != 4:
             raise ValueError("stored shadow market key is invalid")
@@ -5951,283 +887,15 @@ class LiveBettingStore:
             rejection_reason=row["rejection_reason"],
         )
 
-    def _restore_shadow_order_signal_identity_trigger(self) -> None:
-        execute_script(
-            self.connection,
-            """DROP TRIGGER IF EXISTS shadow_orders_signal_identity_immutable;
-               CREATE TRIGGER shadow_orders_signal_identity_immutable
-               BEFORE UPDATE ON shadow_orders
-               WHEN OLD.raybet_match_id IS NOT NEW.raybet_match_id
-                 OR OLD.strict_mapping_id IS NOT NEW.strict_mapping_id
-                 OR OLD.odds_id IS NOT NEW.odds_id
-                 OR OLD.market_key IS NOT NEW.market_key
-                 OR OLD.signaled_at IS NOT NEW.signaled_at
-                 OR OLD.signal_price IS NOT NEW.signal_price
-                 OR OLD.signal_transport_key IS NOT NEW.signal_transport_key
-                 OR OLD.signal_transport_at IS NOT NEW.signal_transport_at
-                 OR OLD.expires_at IS NOT NEW.expires_at
-                 OR OLD.signal_odds_group_id IS NOT NEW.signal_odds_group_id
-                 OR OLD.signal_outcome_key IS NOT NEW.signal_outcome_key
-                 OR OLD.signal_identity_verified IS NOT NEW.signal_identity_verified
-               BEGIN
-                   SELECT RAISE(ABORT, 'shadow order signal identity is immutable');
-               END;"""
-        )
-
-    def _migrate_shadow_order_decision_lineage(self) -> None:
-        """Backfill only uniquely proven lineage and quarantine everything else."""
-        rows = self.connection.execute(
-            """SELECT orders.*, attempt.map_number,
-                      lineage.decision_key AS recorded_decision_key
-                 FROM shadow_orders AS orders
-                 LEFT JOIN shadow_map_attempts AS attempt
-                   ON attempt.order_key=orders.order_key
-                 LEFT JOIN shadow_order_decision_lineage AS lineage
-                   ON lineage.order_key=orders.order_key
-                ORDER BY orders.order_key"""
-        ).fetchall()
-        quarantine_time = datetime.now(timezone.utc)
-        quarantined_at = quarantine_time.isoformat()
-        for row in rows:
-            map_number = int(row["map_number"] or 0)
-            strict_mapping_id = row["strict_mapping_id"]
-            expected_mapping_id = (
-                int(strict_mapping_id)
-                if type(strict_mapping_id) is int and int(strict_mapping_id) > 0
-                else None
-            )
-            try:
-                order = self._stored_shadow_order(row)
-                candidates = (
-                    self._matching_strategy_decision_candidates(
-                        order, map_number
-                    )
-                    if map_number > 0
-                    else []
-                )
-            except (TypeError, ValueError, OverflowError):
-                candidates = []
-            recorded_key = row["recorded_decision_key"]
-            proven = (
-                len(candidates) == 1
-                and (
-                    expected_mapping_id is None
-                    or expected_mapping_id == candidates[0][1]
-                )
-                and (
-                    recorded_key is None
-                    or str(recorded_key) == candidates[0][0]
-                )
-            )
-            if proven:
-                decision_key, mapping_id = candidates[0]
-                if expected_mapping_id is None:
-                    self.connection.execute(
-                        "DROP TRIGGER shadow_orders_signal_identity_immutable"
-                    )
-                    try:
-                        self.connection.execute(
-                            """UPDATE shadow_orders SET strict_mapping_id=?
-                                WHERE order_key=?""",
-                            (mapping_id, str(row["order_key"])),
-                        )
-                    finally:
-                        self._restore_shadow_order_signal_identity_trigger()
-                if recorded_key is None:
-                    self.connection.execute(
-                        """INSERT INTO shadow_order_decision_lineage
-                           (order_key, decision_key, recorded_at)
-                           VALUES (?, ?, ?)""",
-                        (
-                            str(row["order_key"]),
-                            decision_key,
-                            str(row["signaled_at"]),
-                        ),
-                    )
-                continue
-
-            order_key = str(row["order_key"])
-            if str(row["status"]) == "pending":
-                self.connection.execute(
-                    """UPDATE shadow_orders
-                          SET status='rejected', fill_price=NULL, filled_at=NULL,
-                              rejection_reason='decision_lineage_unavailable'
-                        WHERE order_key=? AND status='pending'""",
-                    (order_key,),
-                )
-                self.connection.execute(
-                    """UPDATE shadow_map_attempts
-                          SET status='rejected' WHERE order_key=? AND status='pending'""",
-                    (order_key,),
-                )
-            self.connection.execute(
-                """INSERT OR IGNORE INTO vision_derived_invalidations
-                   (dependent_type, dependent_key, raybet_match_id, map_number,
-                    reason, block_reason, recorded_at)
-                   VALUES ('shadow_order', ?, ?, ?, ?, ?, ?)""",
-                (
-                    order_key,
-                    str(row["raybet_match_id"]),
-                    map_number,
-                    "schema_v4_decision_lineage_unavailable",
-                    "decision_lineage_unavailable",
-                    quarantined_at,
-                ),
-            )
-            self.connection.execute(
-                "UPDATE settlements SET review_required=1 WHERE order_key=?",
-                (order_key,),
-            )
-            outbox_rows = self.connection.execute(
-                """SELECT outbox_id FROM notification_outbox
-                    WHERE order_key=? AND status IN ('pending', 'leased')""",
-                (order_key,),
-            ).fetchall()
-            for outbox_row in outbox_rows:
-                outbox_id = int(outbox_row["outbox_id"])
-                self.quarantine_notification(
-                    outbox_id=outbox_id,
-                    reason="decision_lineage_unavailable",
-                    actor="schema_v4_migration",
-                    now=quarantine_time,
-                )
-
-    def _migrate_vision_map_identity_fields(self) -> None:
-        """Add team-side identity without guessing values for legacy anchors."""
-        self.connection.execute(
-            "DROP TRIGGER IF EXISTS vision_draft_anchor_identity_immutable"
-        )
-        self.connection.execute(
-            "DROP TRIGGER IF EXISTS vision_draft_anchor_insert_valid"
-        )
-        anchor_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(vision_draft_anchors)"
-            )
-        }
-        anchor_additions = {
-            "radiant_team_side": (
-                "TEXT CHECK (radiant_team_side IN ('team_one', 'team_two'))"
-            ),
-            "team_side_anchored_at": "TEXT",
-            "team_side_source_frame_ref": "TEXT",
-        }
-        for name, definition in anchor_additions.items():
-            if name not in anchor_columns:
-                self.connection.execute(
-                    f"ALTER TABLE vision_draft_anchors ADD COLUMN {name} {definition}"
-                )
-
-        conflict_columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(vision_draft_conflicts)"
-            )
-        }
-        if "observed_radiant_team_side" not in conflict_columns:
-            self.connection.execute(
-                """ALTER TABLE vision_draft_conflicts
-                   ADD COLUMN observed_radiant_team_side TEXT
-                   CHECK (observed_radiant_team_side IN ('team_one', 'team_two'))"""
-            )
-
-        execute_script(
-            self.connection,
-            """
-            CREATE TRIGGER vision_draft_anchor_insert_valid
-            BEFORE INSERT ON vision_draft_anchors
-            WHEN NEW.status!='anchored'
-              OR NEW.conflict_at IS NOT NULL
-              OR (
-                    NEW.radiant_team_side IS NULL
-                    AND (
-                        NEW.team_side_anchored_at IS NOT NULL
-                        OR NEW.team_side_source_frame_ref IS NOT NULL
-                    )
-              )
-              OR (
-                    NEW.radiant_team_side IS NOT NULL
-                    AND (
-                        NEW.team_side_anchored_at IS NULL
-                        OR NEW.team_side_source_frame_ref IS NULL
-                        OR NEW.team_side_source_frame_ref=''
-                    )
-              )
-            BEGIN
-                SELECT RAISE(ABORT, 'vision draft anchor identity is invalid');
-            END;
-
-            CREATE TRIGGER vision_draft_anchor_identity_immutable
-            BEFORE UPDATE ON vision_draft_anchors
-            WHEN NOT (
-                (
-                    OLD.status='anchored'
-                    AND NEW.status='conflict'
-                    AND OLD.raybet_match_id IS NEW.raybet_match_id
-                    AND OLD.map_number IS NEW.map_number
-                    AND OLD.draft_hash IS NEW.draft_hash
-                    AND OLD.radiant_hero_ids IS NEW.radiant_hero_ids
-                    AND OLD.dire_hero_ids IS NEW.dire_hero_ids
-                    AND OLD.radiant_team_side IS NEW.radiant_team_side
-                    AND OLD.team_side_anchored_at IS NEW.team_side_anchored_at
-                    AND OLD.team_side_source_frame_ref
-                        IS NEW.team_side_source_frame_ref
-                    AND OLD.anchored_at IS NEW.anchored_at
-                    AND OLD.source_frame_ref IS NEW.source_frame_ref
-                    AND OLD.conflict_at IS NULL
-                    AND NEW.conflict_at IS NOT NULL
-                )
-                OR
-                (
-                    OLD.status='anchored'
-                    AND NEW.status='anchored'
-                    AND OLD.raybet_match_id IS NEW.raybet_match_id
-                    AND OLD.map_number IS NEW.map_number
-                    AND OLD.draft_hash IS NEW.draft_hash
-                    AND OLD.radiant_hero_ids IS NEW.radiant_hero_ids
-                    AND OLD.dire_hero_ids IS NEW.dire_hero_ids
-                    AND OLD.radiant_team_side IS NULL
-                    AND (
-                        NEW.radiant_team_side IS 'team_one'
-                        OR NEW.radiant_team_side IS 'team_two'
-                    )
-                    AND OLD.team_side_anchored_at IS NULL
-                    AND NEW.team_side_anchored_at IS NOT NULL
-                    AND OLD.team_side_source_frame_ref IS NULL
-                    AND NEW.team_side_source_frame_ref IS NOT NULL
-                    AND NEW.team_side_source_frame_ref!=''
-                    AND OLD.anchored_at IS NEW.anchored_at
-                    AND OLD.source_frame_ref IS NEW.source_frame_ref
-                    AND OLD.conflict_at IS NEW.conflict_at
-                )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'vision draft anchor is immutable');
-            END;
-            """
-        )
-
-    def _migrate_vision_derived_invalidation_fields(self) -> None:
-        """Add a stable gate code to invalidation rows from older schemas."""
-        columns = {
-            str(row[1])
-            for row in self.connection.execute(
-                "PRAGMA table_info(vision_derived_invalidations)"
-            )
-        }
-        if "block_reason" not in columns:
-            self.connection.execute(
-                """ALTER TABLE vision_derived_invalidations
-                   ADD COLUMN block_reason TEXT NOT NULL
-                   DEFAULT 'vision_draft_conflict'"""
-            )
-
     @staticmethod
     def json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
-    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+    def execute(
+        self,
+        sql: str,
+        parameters: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> DatabaseResult:
         try:
             cursor = self.connection.execute(sql, parameters)
         except Exception:
@@ -6241,32 +909,12 @@ class LiveBettingStore:
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """Commit a unit of work atomically while supporting nested callers."""
-        if self._transaction_depth:
-            self._savepoint_sequence += 1
-            name = f"transaction_{self._savepoint_sequence}"
-            with self.savepoint(name):
-                self._transaction_depth += 1
-                try:
-                    yield
-                finally:
-                    self._transaction_depth -= 1
-            return
-
-        self.connection.execute("BEGIN IMMEDIATE")
-        self._transaction_depth = 1
-        try:
-            yield
-        except Exception:
-            self.connection.rollback()
-            raise
-        else:
+        with self.connection.transaction():
+            self._transaction_depth += 1
             try:
-                self.connection.commit()
-            except Exception:
-                self.connection.rollback()
-                raise
-        finally:
-            self._transaction_depth = 0
+                yield
+            finally:
+                self._transaction_depth -= 1
 
     @contextmanager
     def savepoint(self, name: str) -> Iterator[None]:
@@ -6275,15 +923,8 @@ class LiveBettingStore:
             raise RuntimeError("savepoint requires an active transaction")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError("invalid savepoint name")
-        self.connection.execute(f"SAVEPOINT {name}")
-        try:
+        with self.connection.transaction():
             yield
-        except Exception:
-            self.connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            self.connection.execute(f"RELEASE SAVEPOINT {name}")
-            raise
-        else:
-            self.connection.execute(f"RELEASE SAVEPOINT {name}")
 
     @staticmethod
     def _event_value(event: Mapping[str, Any] | Any, name: str, default: Any = None) -> Any:
@@ -6325,7 +966,7 @@ class LiveBettingStore:
                     ORDER BY conflict_id""",
                 (raybet_match_id, map_number),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             return True, None
         if anchor is None:
             return (True, None) if rows else (False, None)
@@ -6389,62 +1030,8 @@ class LiveBettingStore:
             return None
         return parsed.astimezone(timezone.utc), str(source_frame_ref)
 
-    def _restore_vision_anchor_identity_trigger(self) -> None:
-        """Reinstall the immutable-anchor guard after an internal rebase."""
-        self.connection.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS vision_draft_anchor_identity_immutable
-            BEFORE UPDATE ON vision_draft_anchors
-            WHEN NOT (
-                (
-                    OLD.status='anchored'
-                    AND NEW.status='conflict'
-                    AND OLD.raybet_match_id IS NEW.raybet_match_id
-                    AND OLD.map_number IS NEW.map_number
-                    AND OLD.draft_hash IS NEW.draft_hash
-                    AND OLD.radiant_hero_ids IS NEW.radiant_hero_ids
-                    AND OLD.dire_hero_ids IS NEW.dire_hero_ids
-                    AND OLD.radiant_team_side IS NEW.radiant_team_side
-                    AND OLD.team_side_anchored_at IS NEW.team_side_anchored_at
-                    AND OLD.team_side_source_frame_ref
-                        IS NEW.team_side_source_frame_ref
-                    AND OLD.anchored_at IS NEW.anchored_at
-                    AND OLD.source_frame_ref IS NEW.source_frame_ref
-                    AND OLD.conflict_at IS NULL
-                    AND NEW.conflict_at IS NOT NULL
-                )
-                OR
-                (
-                    OLD.status='anchored'
-                    AND NEW.status='anchored'
-                    AND OLD.raybet_match_id IS NEW.raybet_match_id
-                    AND OLD.map_number IS NEW.map_number
-                    AND OLD.draft_hash IS NEW.draft_hash
-                    AND OLD.radiant_hero_ids IS NEW.radiant_hero_ids
-                    AND OLD.dire_hero_ids IS NEW.dire_hero_ids
-                    AND OLD.radiant_team_side IS NULL
-                    AND (
-                        NEW.radiant_team_side IS 'team_one'
-                        OR NEW.radiant_team_side IS 'team_two'
-                    )
-                    AND OLD.team_side_anchored_at IS NULL
-                    AND NEW.team_side_anchored_at IS NOT NULL
-                    AND OLD.team_side_source_frame_ref IS NULL
-                    AND NEW.team_side_source_frame_ref IS NOT NULL
-                    AND NEW.team_side_source_frame_ref!=''
-                    AND OLD.anchored_at IS NEW.anchored_at
-                    AND OLD.source_frame_ref IS NEW.source_frame_ref
-                    AND OLD.conflict_at IS NEW.conflict_at
-                )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'vision draft anchor is immutable');
-            END;
-            """
-        )
-
     def _rebuild_vision_draft_anchor(
-        self, observation: Any, anchor: sqlite3.Row,
+        self, observation: Any, anchor: DatabaseRow,
     ) -> bool:
         """Rebuild a draft anchor in deterministic browser event-time order.
 
@@ -6623,12 +1210,13 @@ class LiveBettingStore:
         has_conflict = conflict_cutoff is not None
         for candidate in conflict_candidates:
             self.connection.execute(
-                """INSERT OR IGNORE INTO vision_draft_conflicts
+                """INSERT INTO vision_draft_conflicts
                    (raybet_match_id, map_number, captured_at,
                     source_frame_ref, observed_draft_hash,
                     radiant_hero_ids, dire_hero_ids,
                     observed_radiant_team_side, reason, recorded_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
                 (
                     match_id,
                     map_number,
@@ -6657,12 +1245,13 @@ class LiveBettingStore:
                 ):
                     continue
                 self.connection.execute(
-                    """INSERT OR IGNORE INTO vision_draft_conflicts
+                    """INSERT INTO vision_draft_conflicts
                        (raybet_match_id, map_number, captured_at,
                         source_frame_ref, observed_draft_hash,
                         radiant_hero_ids, dire_hero_ids,
                         observed_radiant_team_side, reason, recorded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT DO NOTHING""",
                     (
                         match_id,
                         map_number,
@@ -6681,32 +1270,34 @@ class LiveBettingStore:
         side_ref = side_source["source_frame_ref"] if side_source else None
         status = "conflict" if has_conflict else "anchored"
         conflict_at = conflict_cutoff.isoformat() if conflict_cutoff else None
-        self.connection.execute("DROP TRIGGER IF EXISTS vision_draft_anchor_identity_immutable")
-        try:
-            self.connection.execute(
-                """UPDATE vision_draft_anchors
-                      SET draft_hash=?, radiant_hero_ids=?, dire_hero_ids=?,
-                          radiant_team_side=?, team_side_anchored_at=?,
-                          team_side_source_frame_ref=?, anchored_at=?,
-                          source_frame_ref=?, status=?, conflict_at=?
-                    WHERE raybet_match_id=? AND map_number=?""",
-                (
-                    canonical["draft_hash"],
-                    canonical["radiant_json"],
-                    canonical["dire_json"],
-                    canonical_side,
-                    side_time,
-                    side_ref,
-                    canonical["captured_at"].isoformat(),
-                    canonical["source_frame_ref"],
-                    status,
-                    conflict_at,
-                    match_id,
-                    map_number,
-                ),
-            )
-        finally:
-            self._restore_vision_anchor_identity_trigger()
+        self.connection.execute(
+            "SET LOCAL dota2.allow_vision_anchor_rebuild = 'on'"
+        )
+        self.connection.execute(
+            """UPDATE vision_draft_anchors
+                  SET draft_hash=?, radiant_hero_ids=?, dire_hero_ids=?,
+                      radiant_team_side=?, team_side_anchored_at=?,
+                      team_side_source_frame_ref=?, anchored_at=?,
+                      source_frame_ref=?, status=?, conflict_at=?
+                WHERE raybet_match_id=? AND map_number=?""",
+            (
+                canonical["draft_hash"],
+                canonical["radiant_json"],
+                canonical["dire_json"],
+                canonical_side,
+                side_time,
+                side_ref,
+                canonical["captured_at"].isoformat(),
+                canonical["source_frame_ref"],
+                status,
+                conflict_at,
+                match_id,
+                map_number,
+            ),
+        )
+        self.connection.execute(
+            "SET LOCAL dota2.allow_vision_anchor_rebuild = 'off'"
+        )
 
         for row in self.connection.execute(
             """SELECT captured_at, source_frame_ref, radiant_hero_ids,
@@ -7002,18 +1593,21 @@ class LiveBettingStore:
             return None
         if self.connection.execute(
             """SELECT 1 FROM vision_observations
-                WHERE raybet_match_id=? AND julianday(captured_at) IS NULL
+                WHERE raybet_match_id=?
+                  AND live_text_timestamp_utc(captured_at) IS NULL
                 LIMIT 1""",
             (decision_match_id,),
         ).fetchone() is not None:
             return None
         latest = self.connection.execute(
             """SELECT captured_at, source_frame_ref,
-                      julianday(captured_at) AS captured_instant
+                      live_text_timestamp_utc(captured_at) AS captured_instant
                  FROM vision_observations
                 WHERE raybet_match_id=?
-                  AND julianday(captured_at)<=julianday(?)
-                ORDER BY julianday(captured_at) DESC, captured_at DESC,
+                  AND live_text_timestamp_utc(captured_at)<=
+                      CAST(? AS timestamptz)
+                ORDER BY live_text_timestamp_utc(captured_at) DESC,
+                         captured_at DESC,
                          source_frame_ref
                 LIMIT 2""",
             (decision_match_id, transport_at.isoformat()),
@@ -7211,7 +1805,7 @@ class LiveBettingStore:
             return "vision_authority_unverifiable"
         try:
             verify_bound_order_vision_frame(self.connection, order_key)
-        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        except (RuntimeError, TypeError, ValueError, SQLAlchemyError):
             return "vision_frame_integrity_failed"
         if (
             str(order_row["signal_transport_key"])
@@ -7307,7 +1901,7 @@ class LiveBettingStore:
                       AND observation.map_number=?""",
                 (raybet_match_id, map_number),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             # A missing or unreadable audit table cannot prove that the
             # lineage is clean.  All causal writers must fail closed until
             # schema repair/migration has completed.
@@ -7348,7 +1942,8 @@ class LiveBettingStore:
                     WHERE observation.raybet_match_id=?
                       AND observation.map_number=?
                       AND observation.confirmed=1
-                      AND julianday(observation.captured_at)<=julianday(?)
+                       AND observation.captured_at::timestamptz<=
+                           CAST(? AS timestamptz)
                       AND NOT EXISTS (
                            SELECT 1
                              FROM vision_observation_invalidations AS invalidation
@@ -7359,7 +1954,7 @@ class LiveBettingStore:
                     ORDER BY observation.captured_at DESC""",
                 (raybet_match_id, map_number, target.isoformat()),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             return True
         for row in valid_rows:
             try:
@@ -7382,7 +1977,7 @@ class LiveBettingStore:
                     LIMIT 1""",
                 (order_key,),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             # Legacy databases may not have the stable gate-code column yet.
             # The row itself is still a durable invalidation, so preserve the
             # conservative draft-conflict fence until migration runs.
@@ -7394,7 +1989,7 @@ class LiveBettingStore:
                         LIMIT 1""",
                     (order_key,),
                 ).fetchone()
-            except sqlite3.OperationalError:
+            except SQLAlchemyError:
                 return "vision_draft_conflict"
             return "vision_draft_conflict" if row is not None else None
         if row is None:
@@ -7416,7 +2011,7 @@ class LiveBettingStore:
                     WHERE orders.order_key=?""",
                 (order_key,),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             return "vision_draft_conflict"
         if row is not None:
             if self._vision_observation_invalidated_at_or_before(
@@ -7522,11 +2117,11 @@ class LiveBettingStore:
               best_of=excluded.best_of, status=excluded.status,
               live_url=excluded.live_url, raw_json=excluded.raw_json,
               updated_at=excluded.updated_at
-            WHERE julianday(excluded.updated_at) IS NOT NULL
+            WHERE excluded.updated_at::timestamptz IS NOT NULL
               AND (
-                    julianday(raybet_matches.updated_at) IS NULL
-                    OR julianday(excluded.updated_at) >=
-                       julianday(raybet_matches.updated_at)
+                    raybet_matches.updated_at::timestamptz IS NULL
+                    OR excluded.updated_at::timestamptz >=
+                       raybet_matches.updated_at::timestamptz
               )""",
             (
                 str(safe_row.get("id")),
@@ -7559,10 +2154,11 @@ class LiveBettingStore:
             else None
         )
         cursor = self.execute(
-            """INSERT OR IGNORE INTO raybet_matches
+            """INSERT INTO raybet_matches
             (raybet_match_id, tournament, team_one, team_two, scheduled_at, best_of,
              status, live_url, raw_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+             ON CONFLICT DO NOTHING""",
             (
                 str(safe_row.get("id")),
                 str(safe_row.get("tournament_name") or ""),
@@ -7677,13 +2273,14 @@ class LiveBettingStore:
             )
         self._register_raw_artifact(raw_artifact)
         cursor = self.execute(
-            """INSERT OR IGNORE INTO browser_events
+            """INSERT INTO browser_events
             (event_id, schema_version, capture_session_id, captured_at, received_at,
              transport, event_type, raybet_match_id, game_id, page_origin, page_path,
              source_path, payload_hash, payload_bytes, payload_json,
              payload_artifact_hash, payload_storage, capture_reason,
              extension_version, recognized, processing_status, processing_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING""",
             (
                 str(self._event_value(event, "event_id")),
                 int(self._event_value(event, "schema_version")),
@@ -7800,13 +2397,14 @@ class LiveBettingStore:
         original_legacy_normalized_state_hash: str | None = None,
     ) -> bool:
         cursor = self.execute(
-            """INSERT OR IGNORE INTO odds_transport_observations
+            """INSERT INTO odds_transport_observations
             (observation_key, source, source_event_id, raybet_match_id, observed_at,
              normalized_state_hash, normalized_state_hash_version,
              original_legacy_normalized_state_hash, response_state_hash,
              response_artifact_hash, timing_status, processing_status,
              normalized_change_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING""",
             (
                 observation_key,
                 source,
@@ -8201,10 +2799,11 @@ class LiveBettingStore:
             )
         relative_path = receipt.path.resolve().relative_to(self.raw_archive_root)
         self.execute(
-            """INSERT OR IGNORE INTO odds_raw_artifacts
+            """INSERT INTO odds_raw_artifacts
                (artifact_hash, source, storage_path, uncompressed_bytes,
                 compressed_bytes, schema_fingerprint)
-               VALUES (?, 'raybet', ?, ?, ?, ?)""",
+               VALUES (?, 'raybet', ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
             (
                 receipt.content_sha256,
                 relative_path.as_posix(),
@@ -8331,13 +2930,14 @@ class LiveBettingStore:
         with self.transaction():
             self._register_raw_artifact(receipt)
             self.execute(
-                """INSERT OR IGNORE INTO direct_response_audit
+                """INSERT INTO direct_response_audit
                    (audit_key, source, response_kind, observed_at,
                     claimed_raybet_match_id, observed_raybet_match_id,
                     endpoint, request_identity, http_status, provider_code,
                     request_metadata_json, payload_kind, sanitized,
                     disposition, reason, artifact_hash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
                 values,
             )
             existing = self.connection.execute(
@@ -8486,7 +3086,7 @@ class LiveBettingStore:
             """SELECT response_state_hash FROM odds_response_states
                 WHERE raybet_match_id=? AND normalized_state_hash=?
                   AND normalized_state_hash_version=?
-                  AND original_legacy_normalized_state_hash IS ?""",
+                  AND original_legacy_normalized_state_hash IS NOT DISTINCT FROM ?""",
             (
                 raybet_match_id,
                 normalized_state_hash,
@@ -8499,11 +3099,12 @@ class LiveBettingStore:
                 "normalized state hash maps to a different response manifest"
             )
         self.execute(
-            """INSERT OR IGNORE INTO odds_response_states
+            """INSERT INTO odds_response_states
                (response_state_hash, raybet_match_id, normalized_state_hash,
                 normalized_state_hash_version,
                 original_legacy_normalized_state_hash, outcome_count)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
             (
                 state_hash,
                 raybet_match_id,
@@ -8515,11 +3116,12 @@ class LiveBettingStore:
         )
         for outcome in outcomes:
             self.execute(
-                """INSERT OR IGNORE INTO odds_response_state_outcomes
+                """INSERT INTO odds_response_state_outcomes
                    (response_state_hash, odds_id, odds_group_id, price, status,
                     market_type, period, side, line, outcome_key, supported,
                     last_update)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT DO NOTHING""",
                 (state_hash, *outcome),
             )
         state = self.connection.execute(
@@ -8623,10 +3225,11 @@ class LiveBettingStore:
         if previous and tuple(previous) == current:
             return False
         cursor = self.execute(
-            """INSERT OR IGNORE INTO odds_snapshots
+            """INSERT INTO odds_snapshots
             (raybet_match_id, odds_id, odds_group_id, received_at, price, status,
              market_type, period, side, line, outcome_key, supported, last_update, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING""",
             (snapshot.raybet_match_id, snapshot.odds_id, snapshot.odds_group_id,
               self._iso(snapshot.received_at), snapshot.price, str(snapshot.status),
              market.market_type, market.period, market.side, market.line,
@@ -8635,7 +3238,7 @@ class LiveBettingStore:
         )
         return cursor.rowcount == 1
 
-    def next_fill_candidate(self, order: ShadowOrder) -> sqlite3.Row | None:
+    def next_fill_candidate(self, order: ShadowOrder) -> DatabaseRow | None:
         """Return the target outcome only from the first eligible response."""
         return self.connection.execute(
             """WITH successor AS (
@@ -8944,7 +3547,7 @@ class LiveBettingStore:
             return resolved
 
     @staticmethod
-    def _response_snapshot(row: sqlite3.Row) -> OddsSnapshot:
+    def _response_snapshot(row: DatabaseRow) -> OddsSnapshot:
         market = Market(
             str(row["market_type"]),
             str(row["period"]),
@@ -8971,8 +3574,9 @@ class LiveBettingStore:
 
     def insert_frame(self, frame: LiveFrame) -> None:
         self.execute(
-            """INSERT OR IGNORE INTO live_frames VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO live_frames VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING""",
             (frame.provider, frame.provider_match_id, frame.provider_game_id,
              frame.sequence or "", frame.source_at.isoformat() if frame.source_at else None,
              frame.received_at.isoformat(), frame.game_time, frame.team_one_kills,
@@ -8982,8 +3586,9 @@ class LiveBettingStore:
 
     def insert_event(self, event: LiveEvent) -> None:
         self.execute(
-            """INSERT OR IGNORE INTO live_events VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO live_events VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING""",
             (event.provider, event.provider_event_id, event.provider_match_id,
              event.provider_game_id, event.event_type,
              event.source_at.isoformat() if event.source_at else None,
@@ -8992,7 +3597,7 @@ class LiveBettingStore:
         )
 
     @staticmethod
-    def _rosh_score_from_row(row: sqlite3.Row) -> RoshLineupScore | None:
+    def _rosh_score_from_row(row: DatabaseRow) -> RoshLineupScore | None:
         from .stratz_rosh_client import canonical_evidence_hash
 
         try:
@@ -9201,9 +3806,9 @@ class LiveBettingStore:
                 WHERE draft_hash=? AND player_identity_hash=?
                   AND formula_version=?
                   AND cache_week_start=?
-                  AND julianday(source_as_of)>=julianday(?)
-                  AND julianday(source_as_of)<=julianday(?)
-                  AND julianday(created_at)<=julianday(?)
+                  AND live_text_timestamp_utc(source_as_of)>=CAST(? AS timestamptz)
+                  AND live_text_timestamp_utc(source_as_of)<=CAST(? AS timestamptz)
+                  AND live_text_timestamp_utc(created_at)<=CAST(? AS timestamptz)
                 ORDER BY source_as_of DESC, created_at DESC, score_key DESC""",
             (
                 draft_hash,
@@ -9374,7 +3979,7 @@ class LiveBettingStore:
         )
         score_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         self.execute(
-            """INSERT OR IGNORE INTO rosh_lineup_scores
+            """INSERT INTO rosh_lineup_scores
                (score_key, draft_hash, player_identity_hash,
                 raybet_match_id, map_number,
                 strict_mapping_id, radiant_hero_ids_json,
@@ -9384,7 +3989,8 @@ class LiveBettingStore:
                 formula_version, source_name, source_week, cache_week_start,
                 source_as_of, evidence_json, evidence_hash, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?)""",
+                       ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
             (
                 score_key,
                 draft_hash,
@@ -9530,12 +4136,13 @@ class LiveBettingStore:
                         observation, anchor
                     )
             cursor = self.connection.execute(
-                """INSERT OR IGNORE INTO vision_observations
+                """INSERT INTO vision_observations
                 (raybet_match_id, map_number, captured_at, game_clock_seconds,
                  is_paused, radiant_hero_ids, dire_hero_ids, radiant_team_side,
                  clock_confidence, draft_confidence, source_frame_ref,
                  source_frame_sha256, source_frame_bytes, screen_state,
-                 confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 confirmed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT DO NOTHING""",
                 (
                     observation.raybet_match_id,
                     observation.map_number,
@@ -9585,11 +4192,16 @@ class LiveBettingStore:
                     WHERE alignment.raybet_match_id=?
                       AND alignment.map_number=?
                       AND (
-                            julianday(?) IS NULL
-                            OR julianday(snapshot.received_at) IS NULL
-                            OR julianday(snapshot.received_at)>=julianday(?)
-                            OR julianday(alignment.observation_captured_at) IS NULL
-                            OR julianday(alignment.observation_captured_at)>=julianday(?)
+                            CAST(? AS timestamptz) IS NULL
+                            OR live_text_timestamp_utc(snapshot.received_at) IS NULL
+                            OR live_text_timestamp_utc(snapshot.received_at)>=
+                               CAST(? AS timestamptz)
+                            OR live_text_timestamp_utc(
+                                   alignment.observation_captured_at
+                               ) IS NULL
+                            OR live_text_timestamp_utc(
+                                   alignment.observation_captured_at
+                               )>=CAST(? AS timestamptz)
                       )""",
             ),
             (
@@ -9597,9 +4209,10 @@ class LiveBettingStore:
                 """SELECT decision_key FROM strategy_decisions
                     WHERE raybet_match_id=? AND map_number=?
                       AND (
-                            julianday(?) IS NULL
-                            OR julianday(decided_at) IS NULL
-                            OR julianday(decided_at)>=julianday(?)
+                            CAST(? AS timestamptz) IS NULL
+                            OR live_text_timestamp_utc(decided_at) IS NULL
+                            OR live_text_timestamp_utc(decided_at)>=
+                               CAST(? AS timestamptz)
                       )""",
             ),
             (
@@ -9607,9 +4220,10 @@ class LiveBettingStore:
                 """SELECT prediction_key FROM research_live_predictions
                     WHERE raybet_match_id=? AND map_number=?
                       AND (
-                            julianday(?) IS NULL
-                            OR julianday(observed_at) IS NULL
-                            OR julianday(observed_at)>=julianday(?)
+                            CAST(? AS timestamptz) IS NULL
+                            OR live_text_timestamp_utc(observed_at) IS NULL
+                            OR live_text_timestamp_utc(observed_at)>=
+                               CAST(? AS timestamptz)
                       )""",
             ),
         )
@@ -9623,16 +4237,17 @@ class LiveBettingStore:
                         else (raybet_match_id, map_number, conflict_at, conflict_at)
                     ),
                 ).fetchall()
-            except sqlite3.OperationalError:
+            except SQLAlchemyError:
                 if dependent_type == "strategy_decision":
                     raise
                 continue
             self.connection.executemany(
-                """INSERT OR IGNORE INTO vision_derived_invalidations
+                """INSERT INTO vision_derived_invalidations
                    (dependent_type, dependent_key, raybet_match_id, map_number,
                     reason, block_reason, recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT DO NOTHING""",
+                [
                     (
                         dependent_type,
                         str(row[0]),
@@ -9643,7 +4258,7 @@ class LiveBettingStore:
                         recorded_at,
                     )
                     for row in rows
-                ),
+                ],
             )
         rows = self.connection.execute(
             """SELECT orders.order_key
@@ -9652,19 +4267,24 @@ class LiveBettingStore:
                    ON attempt.order_key=orders.order_key
                 WHERE attempt.raybet_match_id=? AND attempt.map_number=?
                   AND (
-                        julianday(?) IS NULL
-                        OR julianday(orders.signal_transport_at) IS NULL
-                        OR julianday(orders.signal_transport_at)>=julianday(?)
+                        CAST(? AS timestamptz) IS NULL
+                        OR live_text_timestamp_utc(
+                               orders.signal_transport_at
+                           ) IS NULL
+                        OR live_text_timestamp_utc(
+                               orders.signal_transport_at
+                           )>=CAST(? AS timestamptz)
                   )""",
             (raybet_match_id, map_number, conflict_at, conflict_at),
         ).fetchall()
         order_keys = [str(row[0]) for row in rows]
         self.connection.executemany(
-            """INSERT OR IGNORE INTO vision_derived_invalidations
+            """INSERT INTO vision_derived_invalidations
                (dependent_type, dependent_key, raybet_match_id, map_number,
                 reason, block_reason, recorded_at)
-                VALUES ('shadow_order', ?, ?, ?, ?, ?, ?)""",
-            (
+                VALUES ('shadow_order', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING""",
+            [
                 (
                     order_key,
                     raybet_match_id,
@@ -9674,7 +4294,7 @@ class LiveBettingStore:
                     recorded_at,
                 )
                 for order_key in order_keys
-            ),
+            ],
         )
         for order_key in order_keys:
             self.connection.execute(
@@ -9746,9 +4366,13 @@ class LiveBettingStore:
                    ON attempt.order_key=orders.order_key
                 WHERE attempt.raybet_match_id=? AND attempt.map_number=?
                   AND (
-                        julianday(?) IS NULL
-                        OR julianday(settlement.settled_at) IS NULL
-                        OR julianday(settlement.settled_at)>=julianday(?)
+                        CAST(? AS timestamptz) IS NULL
+                        OR live_text_timestamp_utc(
+                               settlement.settled_at
+                           ) IS NULL
+                        OR live_text_timestamp_utc(
+                               settlement.settled_at
+                           )>=CAST(? AS timestamptz)
                   )""",
             (raybet_match_id, map_number, conflict_at, conflict_at),
         ).fetchall()
@@ -9782,9 +4406,10 @@ class LiveBettingStore:
                       updated_at=?
                 WHERE raybet_match_id=? AND map_number=?
                   AND (
-                        julianday(?) IS NULL
-                        OR julianday(first_observed_at) IS NULL
-                        OR julianday(first_observed_at)>=julianday(?)
+                        CAST(? AS timestamptz) IS NULL
+                        OR live_text_timestamp_utc(first_observed_at) IS NULL
+                        OR live_text_timestamp_utc(first_observed_at)>=
+                           CAST(? AS timestamptz)
                   )""",
             (recorded_at, raybet_match_id, map_number, conflict_at, conflict_at),
         )
@@ -10280,7 +4905,8 @@ class LiveBettingStore:
         status: str, created_at: datetime,
     ) -> bool:
         cursor = self.execute(
-            """INSERT OR IGNORE INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO shadow_map_attempts VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
             (raybet_match_id, map_number, order_key, status, created_at.isoformat()),
         )
         return cursor.rowcount == 1
@@ -10453,7 +5079,7 @@ class LiveBettingStore:
                     order.market_probability,
                 ),
             ).fetchall()
-        except sqlite3.Error:
+        except SQLAlchemyError:
             return []
         matches: list[tuple[str, int]] = []
         for row in rows:
@@ -10646,8 +5272,9 @@ class LiveBettingStore:
             ):
                 return False
             reserved = self.connection.execute(
-                """INSERT OR IGNORE INTO shadow_map_attempts
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO shadow_map_attempts
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
                 (order.raybet_match_id, map_number, order.order_key,
                  order.status, order.signaled_at.isoformat()),
             )
@@ -10719,14 +5346,15 @@ class LiveBettingStore:
         ):
             return False
         cursor = self.execute(
-            """INSERT OR IGNORE INTO map_results
+            """INSERT INTO map_results
                (raybet_match_id, map_number, strict_mapping_id, dota_match_id,
                 winner_side, team_one_kills, team_two_kills, duration_seconds,
                 evidence_ref, reconciliation_ref, raybet_evidence_id,
                 opendota_evidence_id, raybet_evidence_ref,
                 opendota_evidence_ref, raybet_observed_at,
                 opendota_observed_at, first_usable_at, settled_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
             (
                 result.raybet_match_id,
                 result.map_number,
@@ -10966,7 +5594,7 @@ class LiveBettingStore:
             TypeError,
             ValueError,
             json.JSONDecodeError,
-            sqlite3.Error,
+            SQLAlchemyError,
         ):
             return False
         return True
@@ -10997,7 +5625,7 @@ class LiveBettingStore:
         opendota_artifact_id: str | None,
         opendota_observation_id: str | None,
         opendota_content_hash: str | None,
-    ) -> sqlite3.Row:
+    ) -> DatabaseRow:
         """Persist both source facts and a sticky fail-closed resolution."""
         if type(strict_mapping_id) is not int or strict_mapping_id <= 0:
             raise ValueError("strict_mapping_id must be a positive integer")
@@ -11221,7 +5849,7 @@ class LiveBettingStore:
                     with self.transaction():
                         for values in evidence_rows:
                             self.connection.execute(
-                                """INSERT OR IGNORE INTO settlement_result_evidence
+                                """INSERT INTO settlement_result_evidence
                                    (raybet_match_id, map_number, dota_match_id,
                                     source, status, winner_side, evidence_ref,
                                     facts_json, observed_at, first_usable_at,
@@ -11232,7 +5860,8 @@ class LiveBettingStore:
                                     opendota_observation_id,
                                     opendota_content_hash)
                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                           ?, ?, ?, ?)""",
+                                           ?, ?, ?, ?)
+                                   ON CONFLICT DO NOTHING""",
                                 (raybet_match_id, map_number, dota_match_id, *values),
                             )
                             source = str(values[0])
@@ -11261,7 +5890,7 @@ class LiveBettingStore:
                                     "settlement evidence reference was reused"
                                 )
                             evidence_ids[source] = int(persisted["evidence_id"])
-                except (sqlite3.IntegrityError, ValueError):
+                except (IntegrityError, ValueError):
                     evidence_ids.clear()
                     source_authority_complete = False
                     status, reason = "manual_review", "source_authority_invalid"
@@ -11536,7 +6165,7 @@ class LiveBettingStore:
                         actor="settlement_writer",
                     )
                     return False
-                except sqlite3.Error:
+                except SQLAlchemyError:
                     record_settlement_authority_review(
                         self.connection,
                         order_key,
@@ -11601,7 +6230,7 @@ class LiveBettingStore:
                         persist_authoritative_settlement_snapshot(
                             self.connection, authority
                         )
-                    except (SettlementAuthorityError, sqlite3.IntegrityError) as error:
+                    except (SettlementAuthorityError, IntegrityError) as error:
                         reason = (
                             error.reason
                             if isinstance(error, SettlementAuthorityError)
@@ -11618,7 +6247,8 @@ class LiveBettingStore:
                     result = authority.result
                     return_units = authority.return_units
             cursor = self.connection.execute(
-                """INSERT OR IGNORE INTO settlements VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO settlements VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
                 (order_key, result, return_units, settled_at.isoformat(), evidence_ref,
                  int(review_required)),
             )

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator, Mapping, Sequence, TYPE_CHECKING
+
+from database.session import DatabaseRow
 
 from .models import (
     ApprovalStatus,
@@ -120,21 +121,16 @@ APPROVED_EVENT_SEEDS: tuple[dict[str, Any], ...] = (
 class EventRegistry:
     """Queries only approved rows; discovery remains in an isolated table."""
 
-    def __init__(self, storage: "IntelligenceStorage" | sqlite3.Connection) -> None:
-        if isinstance(storage, sqlite3.Connection):
-            self.storage: IntelligenceStorage | None = None
-            self.connection = storage
-            self.connection.row_factory = sqlite3.Row
-        else:
-            self.storage = storage
-            self.connection = storage.connection
+    def __init__(self, storage: "IntelligenceStorage") -> None:
+        self.storage = storage
+        self.connection = storage.connection
 
     def seed_approved_events(self) -> None:
         with self._transaction():
             self._migrate_known_seed_corrections()
             for seed in APPROVED_EVENT_SEEDS:
                 self.connection.execute(
-                    """INSERT OR IGNORE INTO event_registry
+                    """INSERT INTO event_registry
                     (event_id, canonical_name, tier, prize_pool_usd,
                      main_event_start_at, main_event_end_at, opendota_league_id,
                      secondary_provider_ids_json, official_evidence_urls_json,
@@ -148,7 +144,8 @@ class EventRegistry:
                      excludes_void_remakes, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, 'manually_audited', ?,
                             'formal_main_event', 'approved', 'manual_event_audit', ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 1, 1, ?, ?)""",
+                            ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 1, 1, ?, ?)
+                    ON CONFLICT (event_id) DO NOTHING""",
                     (
                         seed["event_id"],
                         seed["canonical_name"],
@@ -345,11 +342,7 @@ class EventRegistry:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        if self.storage is not None:
-            with self.storage.transaction():
-                yield
-            return
-        with self.connection:
+        with self.storage.transaction():
             yield
 
     @staticmethod
@@ -369,7 +362,7 @@ class EventRegistry:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
     @classmethod
-    def _registered_event(cls, row: sqlite3.Row) -> RegisteredEvent:
+    def _registered_event(cls, row: DatabaseRow) -> RegisteredEvent:
         secondary = json.loads(row["secondary_provider_ids_json"])
         return RegisteredEvent(
             event_id=str(row["event_id"]),
@@ -404,7 +397,7 @@ class EventRegistry:
         )
 
     @classmethod
-    def _candidate(cls, row: sqlite3.Row) -> EventCandidate:
+    def _candidate(cls, row: DatabaseRow) -> EventCandidate:
         audit_status = row["audit_status"]
         approval = (
             ApprovalStatus.APPROVED

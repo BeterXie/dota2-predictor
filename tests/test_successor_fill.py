@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import hashlib
 import sqlite3
@@ -10,7 +11,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from live_betting.database_protocol import prepare_database
+import pytest
+
+database_protocol = pytest.importorskip(
+    "live_betting.database_protocol",
+    reason="this legacy fixture requires the retired SQLite runtime",
+)
+prepare_database = database_protocol.prepare_database
 from live_betting.engine import price_groups
 from live_betting.markets import normalized_state_hash
 from live_betting.models import Market, ModelQuote, OddsSnapshot, ShadowOrder

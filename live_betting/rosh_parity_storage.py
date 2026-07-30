@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import math
 import re
-import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
+
+from database.session import DatabaseRow, PostgresSession
 
 
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
@@ -516,43 +517,20 @@ def _content_projection(stored: StoredRoshRun) -> dict[str, Any]:
 class RoshRunRepository:
     """Validate and atomically retain immutable terminal R.O.S.H. runs."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(self, connection: PostgresSession) -> None:
         self.connection = connection
-        self._savepoint_sequence = 0
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        if self.connection.in_transaction:
-            self._savepoint_sequence += 1
-            name = f"rosh_run_repository_{self._savepoint_sequence}"
-            self.connection.execute(f"SAVEPOINT {name}")
-            try:
-                yield
-            except BaseException:
-                self.connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-                self.connection.execute(f"RELEASE SAVEPOINT {name}")
-                raise
-            else:
-                self.connection.execute(f"RELEASE SAVEPOINT {name}")
-            return
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
+        with self.connection.transaction():
             yield
-        except BaseException:
-            self.connection.rollback()
-            raise
-        else:
-            self.connection.commit()
 
     def _checkpoint(self, stage: str, index: int | None = None) -> None:
         """Fault-injection seam used by atomicity tests."""
 
     @staticmethod
-    def _row(cursor: sqlite3.Cursor, row: object) -> dict[str, Any]:
-        if isinstance(row, sqlite3.Row):
-            return dict(row)
-        assert cursor.description is not None
-        return dict(zip((str(item[0]) for item in cursor.description), row, strict=True))
+    def _row(row: DatabaseRow) -> dict[str, Any]:
+        return dict(row)
 
     def get(self, run_id: str) -> StoredRoshRun | None:
         _hash(run_id, "run_id")
@@ -562,7 +540,7 @@ class RoshRunRepository:
         raw = cursor.fetchone()
         if raw is None:
             return None
-        row = self._row(cursor, raw)
+        row = self._row(raw)
         hero_cursor = self.connection.execute(
             """SELECT * FROM rosh_hero_scores WHERE run_id=?
                ORDER BY CASE team_side WHEN 'RADIANT' THEN 0 ELSE 1 END,
@@ -578,7 +556,7 @@ class RoshRunRepository:
                 display_score=float(item["display_score"]),
                 components=json.loads(str(item["components_json"])),
             )
-            for item in (self._row(hero_cursor, raw_hero) for raw_hero in hero_cursor)
+            for item in (self._row(raw_hero) for raw_hero in hero_cursor)
         )
         minute_cursor = self.connection.execute(
             "SELECT * FROM rosh_minute_points WHERE run_id=? ORDER BY minute",
@@ -594,7 +572,7 @@ class RoshRunRepository:
                 synergy_delta=float(item["synergy_delta"]),
                 source_audit=json.loads(str(item["source_audit_json"])),
             )
-            for item in (self._row(minute_cursor, raw_minute) for raw_minute in minute_cursor)
+            for item in (self._row(raw_minute) for raw_minute in minute_cursor)
         )
         run = RoshRunRecord(
             run_id=str(row["run_id"]),
@@ -665,8 +643,9 @@ class RoshRunRepository:
                 WHERE status='succeeded'
                   AND draft_hash=?
                   AND rosh_profile_id=?
-                  AND julianday(collected_at)<=julianday(?)
-                ORDER BY julianday(collected_at) DESC, date_time DESC, run_id DESC
+                  AND live_text_timestamp_utc(collected_at)<=CAST(? AS timestamptz)
+                ORDER BY live_text_timestamp_utc(collected_at) DESC,
+                         date_time DESC, run_id DESC
                 LIMIT 1""",
             (draft_hash, rosh_profile_id, cutoff),
         ).fetchone()
@@ -697,7 +676,7 @@ class RoshRunRepository:
                   AND rosh_profile_id=?
                   AND canonical_profile_hash=?
                   AND date_time=?
-                ORDER BY julianday(collected_at) DESC, run_id DESC
+                ORDER BY live_text_timestamp_utc(collected_at) DESC, run_id DESC
                 LIMIT 1""",
             (
                 draft_hash,

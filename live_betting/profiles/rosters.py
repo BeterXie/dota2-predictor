@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import sqlite3
+from database.session import PostgresSession
 
 
 def latest_roster(
-    connection: sqlite3.Connection, team_id: int, as_of_start_time: int
+    connection: PostgresSession, team_id: int, as_of_start_time: int
 ) -> tuple[int, ...]:
     row = connection.execute(
         """SELECT m.match_id FROM matches m

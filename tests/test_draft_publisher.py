@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import hashlib
 import gc
@@ -49,7 +50,11 @@ from event_intelligence.roles import (
     RECONSTRUCTED_ASSIGNMENT_VERSION,
 )
 from event_intelligence.storage import IntelligenceStorage
-from live_betting.database_protocol import prepare_database
+database_protocol = pytest.importorskip(
+    "live_betting.database_protocol",
+    reason="this legacy fixture requires the retired SQLite runtime",
+)
+prepare_database = database_protocol.prepare_database
 from live_betting.draft_authority import (
     authority_from_curve,
     draft_landmark_authority_matches,

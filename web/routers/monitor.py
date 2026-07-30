@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import time
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from live_betting.vision_frame_registry import (
     read_registered_vision_frame_bytes,
     vision_frame_ref,
 )
-from shared.sqlite import classify_sqlite_error
+from database.session import PostgresSession
 from live_betting.milestone_revocation import (
     MilestoneRevocationConfig,
     load_milestone_revocation_projection,
@@ -40,7 +40,7 @@ def _revocation_config(request: Request) -> MilestoneRevocationConfig | None:
 
 def _verify_revocation_configuration(
     request: Request,
-    connection: sqlite3.Connection | None = None,
+    connection: PostgresSession | None = None,
 ) -> MilestoneRevocationConfig | None:
     config = _revocation_config(request)
     if config is None:
@@ -141,18 +141,16 @@ def match_detail(
                 max_points=max_points,
                 revocation_config=_revocation_config(request),
             )
-        except sqlite3.Error as error:
-            kind = classify_sqlite_error(error)
-            if kind == "busy":
-                raise HTTPException(
-                    status_code=503,
-                    detail="Monitor database is busy",
-                    headers={"Retry-After": "1"},
-                ) from None
-            if kind == "schema_missing":
+        except SQLAlchemyError as error:
+            if _sqlstate(error) in {"42P01", "42703"}:
                 raise HTTPException(
                     status_code=503,
                     detail="Monitor database schema is unavailable",
+                ) from None
+            if isinstance(error, DBAPIError) and error.connection_invalidated:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Monitor database is unavailable",
                 ) from None
             raise
     finally:
@@ -198,7 +196,7 @@ def vision_frame(
                 raybet_match_id,
                 frame_ref,
             )
-        except sqlite3.Error:
+        except SQLAlchemyError:
             raise HTTPException(
                 status_code=409,
                 detail="Vision frame authority is unavailable",
@@ -211,7 +209,7 @@ def vision_frame(
                 frame_ref,
                 expected_sha256=frame_digest,
             )
-        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        except (RuntimeError, TypeError, ValueError, SQLAlchemyError):
             raise HTTPException(
                 status_code=409,
                 detail="Vision frame integrity check failed",
@@ -250,7 +248,7 @@ def capture_frame(
                 raybet_match_id,
                 frame_ref,
             )
-        except sqlite3.Error:
+        except SQLAlchemyError:
             raise HTTPException(
                 status_code=409,
                 detail="Capture frame authority is unavailable",
@@ -263,7 +261,7 @@ def capture_frame(
                 frame_ref,
                 expected_sha256=frame_digest,
             )
-        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        except (RuntimeError, TypeError, ValueError, SQLAlchemyError):
             raise HTTPException(
                 status_code=409,
                 detail="Capture frame integrity check failed",
@@ -322,3 +320,8 @@ async def events(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _sqlstate(error: SQLAlchemyError) -> str | None:
+    cause = getattr(error, "orig", error)
+    return getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)

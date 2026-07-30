@@ -14,10 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
+from database.engine import require_database_url  # noqa: E402
 from event_intelligence.backtest import (  # noqa: E402
     report_as_dict,
     run_strict_draft_backtest,
@@ -27,6 +24,7 @@ from event_intelligence.draft_model import (  # noqa: E402
     DEFAULT_L2_REGULARIZATION,
     DEFAULT_MIN_SAMPLES,
 )
+from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 
 
 def _minimum_samples(value: str) -> int:
@@ -45,7 +43,10 @@ def _positive_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument(
         "--availability-mode",
         choices=tuple(mode.value for mode in AvailabilityMode),
@@ -73,9 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    with database_writer_authority(args.database):
+    with IntelligenceStorage(require_database_url(args.database_url)) as storage:
+        storage.init_schema()
         report = run_strict_draft_backtest(
-            args.database,
+            storage,
             availability_mode=AvailabilityMode(args.availability_mode),
             assignment_version=args.assignment_version,
             dry_run=args.dry_run,

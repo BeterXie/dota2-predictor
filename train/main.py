@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from database.engine import require_database_url
+
 from .dataset import build_training_data, split_train_test
 from .evaluate import evaluate, print_report
 from .model import cross_validate, save_model, train
@@ -39,17 +41,17 @@ def main() -> None:
 
     features_dir = _resolve_path(config["features_dir"])
     models_dir = _resolve_path(config["models_dir"])
-    db_path = _resolve_path(config["database"])
+    database_url = require_database_url(config.get("database_url"))
     model_params = config["model"]["params"]
     training_cfg = config["training"]
 
     print(f"Features dir: {features_dir}")
     print(f"Models dir:   {models_dir}")
-    print(f"Database:     {db_path}")
+    print("Database:     PostgreSQL")
 
     # Build training matrix
     X, y, feature_names, start_times, imputer = build_training_data(
-        features_dir, db_path
+        features_dir, database_url
     )
     print(f"\nTraining matrix: {X.shape[0]} matches x {X.shape[1]} features")
     print(f"Target distribution: {y.sum()} radiant wins / {len(y) - y.sum()} dire wins")

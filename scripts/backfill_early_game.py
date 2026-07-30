@@ -24,11 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fetch.client import OpenDotaClient
 from fetch.parser import parse_players
 from fetch.db import Database
-from live_betting.service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
-from shared.sqlite import connect as connect_sqlite
+from database.engine import require_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -40,25 +36,14 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def resolve_db_path(cfg: dict) -> str:
-    raw: str = cfg.get("database", "../data/dota2.db")
-    if os.path.isabs(raw):
-        return raw
-    # Config is relative to fetch/ directory
-    config_dir = CONFIG_PATH.parent
-    return str((config_dir / raw).resolve())
-
-
-def get_pending_matches(db_path: str, limit: int | None = None) -> list[int]:
+def get_pending_matches(db: Database, limit: int | None = None) -> list[int]:
     """Get match IDs that need early-game backfill."""
-    conn = connect_sqlite(db_path, read_only=True)
+    conn = db.connect()
     rows = conn.execute(
         """SELECT match_id FROM matches
            WHERE EXISTS (SELECT 1 FROM match_players mp WHERE mp.match_id = matches.match_id)
            ORDER BY match_id"""
     ).fetchall()
-    conn.close()
-
     match_ids = [r[0] for r in rows]
     logger.info("Found %d total matches.", len(match_ids))
 
@@ -69,45 +54,55 @@ def get_pending_matches(db_path: str, limit: int | None = None) -> list[int]:
     return match_ids
 
 
-def update_player_early_game(db_path: str, match_id: int, players: list[dict]) -> int:
+def update_player_early_game(
+    db: Database, match_id: int, players: list[dict]
+) -> int:
     """Update existing match_players rows with early-game fields."""
-    conn = connect_sqlite(db_path)
+    conn = db.connect()
     updated = 0
-    for p in players:
-        conn.execute(
-            """UPDATE match_players SET
-                gold_10min = ?, lh_10min = ?, xp_10min = ?,
-                kills_10min = ?, deaths_10min = ?, assists_10min = ?,
-                obs_placed_10min = ?, sen_placed_10min = ?,
-                lane_efficiency = ?, lane_role = ?, is_roaming = ?, kda = ?,
-                observer_kills_10min = ?, sentry_kills_10min = ?
-               WHERE match_id = ? AND player_slot = ?""",
-            (
-                p.get("gold_10min"), p.get("lh_10min"), p.get("xp_10min"),
-                p.get("kills_10min"), p.get("deaths_10min"), p.get("assists_10min"),
-                p.get("obs_placed_10min"), p.get("sen_placed_10min"),
-                p.get("lane_efficiency"), p.get("lane_role"), p.get("is_roaming"), p.get("kda"),
-                p.get("observer_kills_10min"), p.get("sentry_kills_10min"),
-                match_id, p["player_slot"],
-            ),
-        )
-        updated += conn.execute("SELECT changes()").fetchone()[0]
-    conn.commit()
-    conn.close()
+    with conn.transaction():
+        for player in players:
+            result = conn.execute(
+                """UPDATE match_players SET
+                    gold_10min=?, lh_10min=?, xp_10min=?,
+                    kills_10min=?, deaths_10min=?, assists_10min=?,
+                    obs_placed_10min=?, sen_placed_10min=?,
+                    lane_efficiency=?, lane_role=?, is_roaming=?, kda=?,
+                    observer_kills_10min=?, sentry_kills_10min=?
+                   WHERE match_id=? AND player_slot=?""",
+                (
+                    player.get("gold_10min"),
+                    player.get("lh_10min"),
+                    player.get("xp_10min"),
+                    player.get("kills_10min"),
+                    player.get("deaths_10min"),
+                    player.get("assists_10min"),
+                    player.get("obs_placed_10min"),
+                    player.get("sen_placed_10min"),
+                    player.get("lane_efficiency"),
+                    player.get("lane_role"),
+                    player.get("is_roaming"),
+                    player.get("kda"),
+                    player.get("observer_kills_10min"),
+                    player.get("sentry_kills_10min"),
+                    match_id,
+                    player["player_slot"],
+                ),
+            )
+            updated += max(0, result.rowcount)
     return updated
 
 
 async def backfill(
     cfg: dict,
     limit: int | None = None,
-    database_path: str | Path | None = None,
+    database_url: str | None = None,
 ) -> None:
-    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
-    db = Database(db_path)
+    db = Database(require_database_url(database_url or cfg.get("database_url")))
     db.connect()
     db.init_db()
 
-    match_ids = get_pending_matches(db_path, limit)
+    match_ids = get_pending_matches(db, limit)
     if not match_ids:
         logger.info("No matches to backfill.")
         return
@@ -129,7 +124,7 @@ async def backfill(
                 continue
 
             players = parse_players(data)
-            updated = update_player_early_game(db_path, mid, players)
+            updated = update_player_early_game(db, mid, players)
 
             # Summary of what we got
             sample = players[0] if players else {}
@@ -146,12 +141,11 @@ async def backfill(
             fail += 1
 
     await client.close()
-    db.close()
 
     logger.info("Backfill complete: %d success, %d failed.", success, fail)
 
     # Stats
-    conn = connect_sqlite(db_path, read_only=True)
+    conn = db.connect()
     total_players = conn.execute("SELECT COUNT(*) FROM match_players").fetchone()[0]
     with_10min = conn.execute(
         "SELECT COUNT(*) FROM match_players WHERE gold_10min IS NOT NULL"
@@ -163,7 +157,7 @@ async def backfill(
         "DB stats: %d/%d players have 10-min data, %d have ward data.",
         with_10min, total_players, with_wards,
     )
-    conn.close()
+    db.close()
 
 
 def main() -> None:
@@ -176,15 +170,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Backfill early-game stats from OpenDota match details"
     )
-    add_single_database_argument(parser)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of matches to process")
     args = parser.parse_args()
 
     cfg = load_config()
-    database = Path(args.database or resolve_db_path(cfg)).resolve()
-    with database_writer_authority(database):
-        asyncio.run(backfill(cfg, args.limit, database))
+    asyncio.run(backfill(cfg, args.limit, args.database_url))
 
 
 if __name__ == "__main__":

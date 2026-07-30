@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from contracts.live_observation import ComebackState, LiveObservation  # noqa: E402
+from database.engine import require_database_url  # noqa: E402
 from live_betting.direct_response_audit import (  # noqa: E402
     DirectResponseContext,
     DirectResponseDecision,
@@ -34,17 +35,11 @@ from live_betting.raybet_state import (  # noqa: E402
 )
 from live_betting.raybet import BASE_URL, RayBetClient  # noqa: E402
 from live_betting.sanitize import stored_public_stream_url  # noqa: E402
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-    service_data_paths,
-)
 from live_betting.storage import LiveBettingStore  # noqa: E402
 from live_betting.vision_frame_registry import (  # noqa: E402
     VisionFrameReceipt,
     publish_vision_frame_bytes,
 )
-from shared.sqlite import connect as connect_sqlite  # noqa: E402
 from vision.hero_recognizer import (  # noqa: E402
     DraftReading,
     DraftTracker,
@@ -189,7 +184,7 @@ def _manual_map_number(payload: object, best_of: int | None) -> int | None:
 
 
 def _fresh_stream_payload(
-    database: Path, match_id: str
+    database_url: str, match_id: str
 ) -> tuple[str, dict[str, object]]:
     endpoint = f"{BASE_URL}/odds"
     request_identity = f"{endpoint}?match_id={match_id}"
@@ -218,7 +213,7 @@ def _fresh_stream_payload(
             observed_raybet_match_id=match_id,
         )
 
-    with LiveBettingStore(database) as store, RayBetClient() as client:
+    with LiveBettingStore(database_url) as store, RayBetClient() as client:
         return audited_direct_request(
             store,
             fetch=lambda: client.match_odds_response(match_id),
@@ -232,25 +227,23 @@ def _fresh_stream_payload(
 
 
 def match_source(
-    database: Path,
+    database_url: str,
     match_id: str,
     map_override: int | None = None,
     *,
     refresh_url: bool = False,
 ) -> tuple[str, int]:
-    connection = connect_sqlite(database, read_only=True)
-    try:
+    with LiveBettingStore(database_url) as store:
+        connection = store.connection
         row = connection.execute(
             "SELECT live_url, raw_json, best_of, status FROM raybet_matches "
             "WHERE raybet_match_id=?",
             (match_id,),
         ).fetchone()
-    finally:
-        connection.close()
     if not row or (not row[0] and not refresh_url):
         raise ValueError(f"no live_url found for RayBet match {match_id}")
     if refresh_url:
-        url, payload = _fresh_stream_payload(database, match_id)
+        url, payload = _fresh_stream_payload(database_url, match_id)
     else:
         stored_url = stored_public_stream_url(row[0], row[1])
         if stored_url is None:
@@ -291,7 +284,7 @@ def match_source(
 def resolve_source(
     *,
     url: str | None,
-    database: Path | None,
+    database_url: str,
     match_id: str,
     map_number: int | None,
     refresh_url: bool = False,
@@ -302,29 +295,25 @@ def resolve_source(
         if map_number < 1 or map_number > 10:
             raise ValueError("map number must be between 1 and 10")
         return _validate_stream_url(url, description="explicit stream URL"), map_number
-    if database:
-        resolved_url, resolved_map = match_source(
-            database,
-            match_id,
-            map_override=map_number,
-            refresh_url=refresh_url,
-        )
-        return _validate_stream_url(resolved_url), resolved_map
-    raise ValueError("provide --url or --database")
+    resolved_url, resolved_map = match_source(
+        database_url,
+        match_id,
+        map_override=map_number,
+        refresh_url=refresh_url,
+    )
+    return _validate_stream_url(resolved_url), resolved_map
 
 
 def match_is_complete(
-    database: Path, match_id: str, *, now: datetime | None = None
+    database_url: str, match_id: str, *, now: datetime | None = None
 ) -> bool:
-    connection = connect_sqlite(database, read_only=True)
-    try:
+    with LiveBettingStore(database_url) as store:
+        connection = store.connection
         row = connection.execute(
             "SELECT status, updated_at FROM raybet_matches WHERE raybet_match_id=?",
             (match_id,),
         ).fetchone()
         return not row or not raybet_match_is_live(row[0], row[1], now=now)
-    finally:
-        connection.close()
 
 
 def completion_check_due(sample_count: int) -> bool:
@@ -506,18 +495,12 @@ def _write_capture_heartbeat(
 
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
-    if args.database is not None:
-        args.database = Path(args.database).resolve()
+    root = ROOT / "data" / "live_betting"
     if args.output is None or args.evidence_dir is None:
-        if args.database is None:
-            raise ValueError(
-                "--database is required when --output or --evidence-dir is omitted"
-            )
-        paths = service_data_paths(args.database)
         if args.output is None:
-            args.output = paths.vision_observations / f"{args.match_id}.jsonl"
+            args.output = root / "vision_observations" / f"{args.match_id}.jsonl"
         if args.evidence_dir is None:
-            args.evidence_dir = paths.vision_evidence
+            args.evidence_dir = root / "vision_evidence"
     args.output = Path(args.output).resolve()
     args.evidence_dir = Path(args.evidence_dir).resolve()
     return args
@@ -527,7 +510,10 @@ def _parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--match-id", required=True)
     parser.add_argument("--url")
-    add_single_database_argument(parser)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--map-number", type=int)
     parser.add_argument("--radiant-side", choices=("team_one", "team_two"))
     parser.add_argument("--output", type=Path)
@@ -539,9 +525,10 @@ def _parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser.add_argument(
         "--refresh-url",
         action="store_true",
-        help="fetch an ephemeral signed stream URL instead of reading it from SQLite",
+        help="fetch an ephemeral signed stream URL instead of using the stored value",
     )
     args = parser.parse_args()
+    args.database_url = require_database_url(args.database_url)
     try:
         args = resolve_data_paths(args)
     except ValueError as error:
@@ -554,7 +541,7 @@ def _run_cli(args: argparse.Namespace) -> int:
     try:
         url, map_number = resolve_source(
             url=args.url,
-            database=args.database,
+            database_url=args.database_url,
             match_id=args.match_id,
             map_number=args.map_number,
             refresh_url=args.refresh_url,
@@ -572,8 +559,10 @@ def _run_cli(args: argparse.Namespace) -> int:
     advantage_tracker = NetWorthAdvantageTracker()
     draft_tracker = DraftTracker()
     side_reader = None
-    if args.database and not args.radiant_side:
-        side_reader = TeamSideRecognizer.from_database(args.database, args.match_id)
+    if not args.radiant_side:
+        side_reader = TeamSideRecognizer.from_database(
+            args.database_url, args.match_id
+        )
     side_tracker = TeamSideTracker()
     writer = ObservationWriter(output)
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -592,9 +581,8 @@ def _run_cli(args: argparse.Namespace) -> int:
         ):
             sample_count += 1
             if (
-                args.database
-                and completion_check_due(sample_count)
-                and match_is_complete(args.database, args.match_id)
+                completion_check_due(sample_count)
+                and match_is_complete(args.database_url, args.match_id)
             ):
                 break
             hud = hud_reader.read(frame.image)
@@ -794,10 +782,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 def main() -> int:
     parser, args = _parse_args()
     try:
-        if args.database is None:
-            return _run_cli(args)
-        with database_writer_authority(args.database):
-            return _run_cli(args)
+        return _run_cli(args)
     except Exception as error:
         failure = (
             error

@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Mapping, Sequence
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 
 STRICT_MAPPING_VERSION = "strict-live-map-v3"
@@ -59,317 +62,6 @@ def classify_raybet_match_format(payload: Mapping[str, Any]) -> str:
     except ValueError:
         return RAYBET_MATCH_FORMAT_UNKNOWN
     return RAYBET_MATCH_HEAD_TO_HEAD
-
-
-_TABLE_STATEMENTS = (
-    """CREATE TABLE IF NOT EXISTS strict_live_map_mappings (
-        mapping_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        raybet_match_id TEXT NOT NULL,
-        map_number INTEGER NOT NULL CHECK (map_number > 0),
-        event_id TEXT NOT NULL REFERENCES event_registry(event_id),
-        team_one_id INTEGER NOT NULL CHECK (team_one_id > 0),
-        team_two_id INTEGER NOT NULL CHECK (team_two_id > 0),
-        canonical_team_one_id INTEGER NOT NULL CHECK (canonical_team_one_id > 0),
-        canonical_team_one_name TEXT NOT NULL,
-        canonical_team_two_id INTEGER NOT NULL CHECK (canonical_team_two_id > 0),
-        canonical_team_two_name TEXT NOT NULL,
-        canonical_identity_json TEXT NOT NULL,
-        canonical_identity_hash TEXT NOT NULL
-            CHECK (length(canonical_identity_hash) = 64),
-        crosswalk_evidence_json TEXT NOT NULL,
-        crosswalk_evidence_hash TEXT NOT NULL
-            CHECK (length(crosswalk_evidence_hash) = 64),
-        stage_scope TEXT NOT NULL
-            CHECK (stage_scope IN ('main_event', 'internal_lcq')),
-        scheduled_at_utc TEXT NOT NULL,
-        raybet_best_of INTEGER NOT NULL CHECK (raybet_best_of > 0),
-        raybet_identity_json TEXT NOT NULL,
-        raybet_identity_hash TEXT NOT NULL
-            CHECK (length(raybet_identity_hash) = 64),
-        raybet_metadata_updated_at TEXT NOT NULL,
-        source TEXT NOT NULL,
-        evidence_json TEXT NOT NULL,
-        evidence_hash TEXT NOT NULL CHECK (length(evidence_hash) = 64),
-        mapping_version TEXT NOT NULL,
-        acceptance_mode TEXT NOT NULL DEFAULT 'manual_exact'
-            CHECK (acceptance_mode IN ('manual_exact', 'automatic_exact')),
-        automatic_approval_id INTEGER
-            REFERENCES strict_live_automatic_evidence_approvals(approval_id),
-        accepted_by TEXT NOT NULL,
-        accepted_at TEXT NOT NULL,
-        recorded_at TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        CHECK (team_one_id != team_two_id),
-        CHECK (canonical_team_one_id != canonical_team_two_id),
-        CHECK (map_number <= raybet_best_of)
-    )""",
-    """CREATE TABLE IF NOT EXISTS strict_live_map_mapping_audit (
-        audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        raybet_match_id TEXT NOT NULL,
-        map_number INTEGER NOT NULL CHECK (map_number > 0),
-        proposed_event_id TEXT,
-        proposed_team_one_id INTEGER,
-        proposed_team_two_id INTEGER,
-        proposed_canonical_team_one_id INTEGER,
-        proposed_canonical_team_two_id INTEGER,
-        match_method TEXT NOT NULL
-            CHECK (match_method IN
-                   ('manual_exact', 'automatic_exact', 'candidate', 'fuzzy')),
-        decision TEXT NOT NULL
-            CHECK (decision IN
-                   ('accepted', 'idempotent', 'audit_only', 'conflict', 'rejected')),
-        reason TEXT NOT NULL,
-        source TEXT NOT NULL,
-        evidence_json TEXT NOT NULL,
-        evidence_hash TEXT NOT NULL CHECK (length(evidence_hash) = 64),
-        mapping_version TEXT NOT NULL,
-        actor TEXT,
-        observed_at TEXT NOT NULL,
-        recorded_at TEXT NOT NULL,
-        raybet_identity_hash TEXT,
-        raybet_metadata_updated_at TEXT,
-        canonical_identity_hash TEXT,
-        crosswalk_evidence_hash TEXT,
-        mapping_id INTEGER REFERENCES strict_live_map_mappings(mapping_id),
-        CHECK (
-            (match_method IN ('candidate', 'fuzzy') AND decision = 'audit_only')
-            OR (match_method IN ('manual_exact', 'automatic_exact')
-                AND decision != 'audit_only')
-        )
-    )""",
-    """CREATE TABLE IF NOT EXISTS strict_live_automatic_evidence_approvals (
-        approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_mapping_id INTEGER NOT NULL UNIQUE
-            REFERENCES strict_live_map_mappings(mapping_id),
-        raybet_match_id TEXT NOT NULL,
-        event_id TEXT NOT NULL,
-        team_one_id INTEGER NOT NULL,
-        team_two_id INTEGER NOT NULL,
-        canonical_team_one_id INTEGER NOT NULL,
-        canonical_team_two_id INTEGER NOT NULL,
-        raybet_identity_hash TEXT NOT NULL CHECK (length(raybet_identity_hash)=64),
-        canonical_identity_hash TEXT NOT NULL CHECK (length(canonical_identity_hash)=64),
-        crosswalk_evidence_hash TEXT NOT NULL CHECK (length(crosswalk_evidence_hash)=64),
-        evidence_hash TEXT NOT NULL CHECK (length(evidence_hash)=64),
-        approved_by TEXT NOT NULL,
-        approved_at TEXT NOT NULL,
-        recorded_at TEXT NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS strict_live_map_mapping_invalidations (
-        invalidation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        mapping_id INTEGER NOT NULL UNIQUE
-            REFERENCES strict_live_map_mappings(mapping_id),
-        reason TEXT NOT NULL,
-        invalidated_by TEXT NOT NULL,
-        invalidated_at TEXT NOT NULL,
-        recorded_at TEXT NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS strict_live_map_mapping_supersessions (
-        supersession_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        previous_mapping_id INTEGER NOT NULL UNIQUE
-            REFERENCES strict_live_map_mappings(mapping_id),
-        replacement_mapping_id INTEGER NOT NULL UNIQUE
-            REFERENCES strict_live_map_mappings(mapping_id),
-        recorded_at TEXT NOT NULL,
-        CHECK (previous_mapping_id != replacement_mapping_id)
-    )""",
-    """CREATE TABLE IF NOT EXISTS strict_live_mapping_impacts (
-        impact_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        mapping_id INTEGER NOT NULL REFERENCES strict_live_map_mappings(mapping_id),
-        invalidation_id INTEGER NOT NULL
-            REFERENCES strict_live_map_mapping_invalidations(invalidation_id),
-        dependent_type TEXT NOT NULL CHECK (dependent_type IN
-            ('strategy_decision', 'research_prediction', 'shadow_order')),
-        dependent_key TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        recorded_at TEXT NOT NULL,
-        UNIQUE (mapping_id, dependent_type, dependent_key)
-    )""",
-)
-
-_MAPPING_ADDITIVE_COLUMNS = {
-    "canonical_team_one_id": "INTEGER",
-    "canonical_team_one_name": "TEXT",
-    "canonical_team_two_id": "INTEGER",
-    "canonical_team_two_name": "TEXT",
-    "canonical_identity_json": "TEXT",
-    "canonical_identity_hash": "TEXT",
-    "crosswalk_evidence_json": "TEXT",
-    "crosswalk_evidence_hash": "TEXT",
-    "stage_scope": "TEXT",
-    "scheduled_at_utc": "TEXT",
-    "raybet_best_of": "INTEGER",
-    "raybet_identity_json": "TEXT",
-    "raybet_identity_hash": "TEXT",
-    "raybet_metadata_updated_at": "TEXT",
-    "recorded_at": "TEXT",
-    "automatic_approval_id": "INTEGER",
-}
-
-_AUDIT_ADDITIVE_COLUMNS = {
-    "proposed_canonical_team_one_id": "INTEGER",
-    "proposed_canonical_team_two_id": "INTEGER",
-    "recorded_at": "TEXT",
-    "raybet_identity_hash": "TEXT",
-    "raybet_metadata_updated_at": "TEXT",
-    "canonical_identity_hash": "TEXT",
-    "crosswalk_evidence_hash": "TEXT",
-}
-
-_INDEX_TRIGGER_STATEMENTS = (
-    """CREATE INDEX IF NOT EXISTS idx_strict_live_mapping_event
-       ON strict_live_map_mappings(event_id, recorded_at)""",
-    """CREATE INDEX IF NOT EXISTS idx_strict_live_mapping_key
-       ON strict_live_map_mappings(raybet_match_id, map_number, mapping_id)""",
-    """CREATE INDEX IF NOT EXISTS idx_strict_live_mapping_audit_key
-       ON strict_live_map_mapping_audit(raybet_match_id, map_number, recorded_at)""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_map_mappings_no_update
-       BEFORE UPDATE ON strict_live_map_mappings
-       BEGIN
-           SELECT RAISE(ABORT, 'accepted strict live mappings are immutable');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_map_mappings_no_delete
-       BEFORE DELETE ON strict_live_map_mappings
-       BEGIN
-           SELECT RAISE(ABORT, 'accepted strict live mappings cannot be deleted');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_audit_no_update
-       BEFORE UPDATE ON strict_live_map_mapping_audit
-       BEGIN
-           SELECT RAISE(ABORT, 'strict live mapping audit rows are immutable');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_audit_no_delete
-       BEFORE DELETE ON strict_live_map_mapping_audit
-       BEGIN
-           SELECT RAISE(ABORT, 'strict live mapping audit rows cannot be deleted');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_automatic_approval_no_update
-       BEFORE UPDATE ON strict_live_automatic_evidence_approvals
-       BEGIN
-           SELECT RAISE(ABORT, 'strict automatic evidence approvals are immutable');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_automatic_approval_no_delete
-       BEFORE DELETE ON strict_live_automatic_evidence_approvals
-       BEGIN
-           SELECT RAISE(ABORT, 'strict automatic evidence approvals cannot be deleted');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_invalidation_no_update
-       BEFORE UPDATE ON strict_live_map_mapping_invalidations
-       BEGIN
-           SELECT RAISE(ABORT, 'strict mapping invalidations are immutable');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_invalidation_no_delete
-       BEFORE DELETE ON strict_live_map_mapping_invalidations
-       BEGIN
-           SELECT RAISE(ABORT, 'strict mapping invalidations cannot be deleted');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_supersession_no_update
-       BEFORE UPDATE ON strict_live_map_mapping_supersessions
-       BEGIN
-           SELECT RAISE(ABORT, 'strict mapping supersessions are immutable');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_supersession_no_delete
-       BEFORE DELETE ON strict_live_map_mapping_supersessions
-       BEGIN
-           SELECT RAISE(ABORT, 'strict mapping supersessions cannot be deleted');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_impacts_no_update
-       BEFORE UPDATE ON strict_live_mapping_impacts
-       BEGIN
-           SELECT RAISE(ABORT, 'strict mapping impacts are immutable');
-       END""",
-    """CREATE TRIGGER IF NOT EXISTS strict_live_mapping_impacts_no_delete
-       BEFORE DELETE ON strict_live_mapping_impacts
-       BEGIN
-           SELECT RAISE(ABORT, 'strict mapping impacts cannot be deleted');
-       END""",
-)
-
-_DEPENDENT_IMPACT_TRIGGERS = {
-    "strategy_decisions": """CREATE TRIGGER strict_live_strategy_impact_after_insert
-       AFTER INSERT ON strategy_decisions
-       WHEN json_valid(NEW.contributions_json)
-       BEGIN
-           INSERT OR IGNORE INTO strict_live_mapping_impacts
-               (mapping_id, invalidation_id, dependent_type, dependent_key,
-                reason, recorded_at)
-           SELECT CAST(json_extract(
-                      NEW.contributions_json,
-                      '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
-                  ) AS INTEGER),
-                  cause.invalidation_id, 'strategy_decision', NEW.decision_key,
-                  cause.reason, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             FROM (
-                 SELECT invalidation.invalidation_id, invalidation.reason
-                   FROM strict_live_map_mapping_invalidations AS invalidation
-                  WHERE invalidation.mapping_id=CAST(json_extract(
-                            NEW.contributions_json,
-                            '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
-                        ) AS INTEGER)
-                 UNION ALL
-                 SELECT invalidation.invalidation_id, invalidation.reason
-                   FROM strict_live_map_mappings AS mapping
-                   JOIN strict_live_automatic_evidence_approvals AS approval
-                     ON approval.approval_id=mapping.automatic_approval_id
-                   JOIN strict_live_map_mapping_invalidations AS invalidation
-                     ON invalidation.mapping_id=approval.source_mapping_id
-                  WHERE mapping.mapping_id=CAST(json_extract(
-                            NEW.contributions_json,
-                            '$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id'
-                        ) AS INTEGER)
-                 LIMIT 1
-             ) AS cause;
-       END""",
-    "research_live_predictions": """CREATE TRIGGER strict_live_research_impact_after_insert
-       AFTER INSERT ON research_live_predictions
-       BEGIN
-           INSERT OR IGNORE INTO strict_live_mapping_impacts
-               (mapping_id, invalidation_id, dependent_type, dependent_key,
-                reason, recorded_at)
-           SELECT NEW.strict_mapping_id, cause.invalidation_id,
-                  'research_prediction', NEW.prediction_key, cause.reason,
-                  strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             FROM (
-                 SELECT invalidation.invalidation_id, invalidation.reason
-                   FROM strict_live_map_mapping_invalidations AS invalidation
-                  WHERE invalidation.mapping_id=NEW.strict_mapping_id
-                 UNION ALL
-                 SELECT invalidation.invalidation_id, invalidation.reason
-                   FROM strict_live_map_mappings AS mapping
-                   JOIN strict_live_automatic_evidence_approvals AS approval
-                     ON approval.approval_id=mapping.automatic_approval_id
-                   JOIN strict_live_map_mapping_invalidations AS invalidation
-                     ON invalidation.mapping_id=approval.source_mapping_id
-                  WHERE mapping.mapping_id=NEW.strict_mapping_id
-                 LIMIT 1
-             ) AS cause;
-       END""",
-    "shadow_orders": """CREATE TRIGGER strict_live_shadow_impact_after_insert
-       AFTER INSERT ON shadow_orders
-       WHEN NEW.strict_mapping_id IS NOT NULL
-       BEGIN
-           INSERT OR IGNORE INTO strict_live_mapping_impacts
-               (mapping_id, invalidation_id, dependent_type, dependent_key,
-                reason, recorded_at)
-           SELECT NEW.strict_mapping_id, cause.invalidation_id,
-                  'shadow_order', NEW.order_key, cause.reason,
-                  strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             FROM (
-                 SELECT invalidation.invalidation_id, invalidation.reason
-                   FROM strict_live_map_mapping_invalidations AS invalidation
-                  WHERE invalidation.mapping_id=NEW.strict_mapping_id
-                 UNION ALL
-                 SELECT invalidation.invalidation_id, invalidation.reason
-                   FROM strict_live_map_mappings AS mapping
-                   JOIN strict_live_automatic_evidence_approvals AS approval
-                     ON approval.approval_id=mapping.automatic_approval_id
-                   JOIN strict_live_map_mapping_invalidations AS invalidation
-                     ON invalidation.mapping_id=approval.source_mapping_id
-                  WHERE mapping.mapping_id=NEW.strict_mapping_id
-                 LIMIT 1
-             ) AS cause;
-       END""",
-}
 
 
 class StrictMappingError(ValueError):
@@ -528,176 +220,47 @@ class StrictLiveEligibility:
 
 
 def init_strict_live_eligibility_schema(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     external_transaction: bool = False,
 ) -> None:
-    """Install the additive schema without modifying existing accepted rows."""
-    _migrate_exact_mapping_tables(
-        connection,
-        external_transaction=external_transaction,
-    )
-    with _write_transaction(connection):
-        for statement in _TABLE_STATEMENTS:
-            connection.execute(statement)
-        _add_missing_columns(
-            connection, "strict_live_map_mappings", _MAPPING_ADDITIVE_COLUMNS
+    """Verify the Alembic-managed strict mapping schema."""
+    if external_transaction and not connection.in_transaction:
+        raise RuntimeError("external strict mapping transaction is not active")
+    required = {
+        "strict_live_map_mappings",
+        "strict_live_map_mapping_audit",
+        "strict_live_automatic_evidence_approvals",
+        "strict_live_map_mapping_invalidations",
+        "strict_live_mapping_impacts",
+    }
+    existing = {
+        str(row[0])
+        for row in connection.execute(
+            """SELECT table_name FROM information_schema.tables
+                WHERE table_schema=current_schema()
+                  AND table_type='BASE TABLE'"""
         )
-        _add_missing_columns(
-            connection, "strict_live_map_mapping_audit", _AUDIT_ADDITIVE_COLUMNS
+    }
+    missing = sorted(required - existing)
+    if missing:
+        raise RuntimeError(
+            "strict mapping schema is missing; run alembic upgrade head: "
+            + ", ".join(missing)
         )
-        for statement in _INDEX_TRIGGER_STATEMENTS:
-            connection.execute(statement)
-        for table, statement in _DEPENDENT_IMPACT_TRIGGERS.items():
-            if not _table_exists(connection, table):
-                continue
-            if table == "shadow_orders" and not _table_has_column(
-                connection, table, "strict_mapping_id"
-            ):
-                continue
-            trigger = {
-                "strategy_decisions": "strict_live_strategy_impact_after_insert",
-                "research_live_predictions": "strict_live_research_impact_after_insert",
-                "shadow_orders": "strict_live_shadow_impact_after_insert",
-            }[table]
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            connection.execute(statement)
-
-
-def _migrate_exact_mapping_tables(
-    connection: sqlite3.Connection,
-    *,
-    external_transaction: bool = False,
-) -> None:
-    """Rebuild the two v3 CHECK/UNIQUE constrained tables without changing rows."""
-    if not strict_live_mapping_schema_requires_rebuild(connection):
-        return
-    audit_exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strict_live_map_mapping_audit'"
-    ).fetchone() is not None
-    with _exact_mapping_rebuild_transaction(
-        connection,
-        external_transaction=external_transaction,
-    ):
-        for trigger in (
-            "strict_live_map_mappings_no_update",
-            "strict_live_map_mappings_no_delete",
-            "strict_live_mapping_audit_no_update",
-            "strict_live_mapping_audit_no_delete",
-        ):
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        connection.execute("DROP TABLE IF EXISTS strict_live_map_mappings_v4")
-        connection.execute(
-            _TABLE_STATEMENTS[0].replace(
-                "CREATE TABLE IF NOT EXISTS strict_live_map_mappings",
-                "CREATE TABLE strict_live_map_mappings_v4",
-                1,
-            )
-        )
-        mapping_columns = (
-            "mapping_id, raybet_match_id, map_number, event_id, team_one_id, "
-            "team_two_id, canonical_team_one_id, canonical_team_one_name, "
-            "canonical_team_two_id, canonical_team_two_name, canonical_identity_json, "
-            "canonical_identity_hash, crosswalk_evidence_json, crosswalk_evidence_hash, "
-            "stage_scope, scheduled_at_utc, raybet_best_of, raybet_identity_json, "
-            "raybet_identity_hash, raybet_metadata_updated_at, source, evidence_json, "
-            "evidence_hash, mapping_version, acceptance_mode, accepted_by, accepted_at, "
-            "recorded_at, created_at"
-        )
-        connection.execute(
-            f"""INSERT INTO strict_live_map_mappings_v4 ({mapping_columns}, automatic_approval_id)
-                SELECT {mapping_columns}, NULL FROM strict_live_map_mappings"""
-        )
-
-        if audit_exists:
-            connection.execute("DROP TABLE IF EXISTS strict_live_map_mapping_audit_v4")
-            connection.execute(
-                _TABLE_STATEMENTS[1].replace(
-                    "CREATE TABLE IF NOT EXISTS strict_live_map_mapping_audit",
-                    "CREATE TABLE strict_live_map_mapping_audit_v4",
-                    1,
-                )
-            )
-            audit_columns = (
-                "audit_id, raybet_match_id, map_number, proposed_event_id, "
-                "proposed_team_one_id, proposed_team_two_id, "
-                "proposed_canonical_team_one_id, proposed_canonical_team_two_id, "
-                "match_method, decision, reason, source, evidence_json, evidence_hash, "
-                "mapping_version, actor, observed_at, recorded_at, raybet_identity_hash, "
-                "raybet_metadata_updated_at, canonical_identity_hash, "
-                "crosswalk_evidence_hash, mapping_id"
-            )
-            connection.execute(
-                f"""INSERT INTO strict_live_map_mapping_audit_v4 ({audit_columns})
-                    SELECT {audit_columns} FROM strict_live_map_mapping_audit"""
-            )
-            connection.execute("DROP TABLE strict_live_map_mapping_audit")
-        connection.execute("DROP TABLE strict_live_map_mappings")
-        connection.execute(
-            "ALTER TABLE strict_live_map_mappings_v4 RENAME TO strict_live_map_mappings"
-        )
-        if audit_exists:
-            connection.execute(
-                "ALTER TABLE strict_live_map_mapping_audit_v4 "
-                "RENAME TO strict_live_map_mapping_audit"
-            )
 
 
 def strict_live_mapping_schema_requires_rebuild(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> bool:
-    """Return whether the pre-v4 exact-mapping tables need an FK-off rebuild."""
+    """PostgreSQL mappings are versioned by Alembic and never rebuilt in place."""
 
-    mapping_sql_row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='strict_live_map_mappings'"
-    ).fetchone()
-    if mapping_sql_row is None:
-        return False
-    mapping_sql = str(mapping_sql_row[0] or "")
-    return not (
-        "automatic_exact" in mapping_sql
-        and "UNIQUE (raybet_match_id, map_number)" not in mapping_sql
-    )
-
-
-@contextmanager
-def _exact_mapping_rebuild_transaction(
-    connection: sqlite3.Connection,
-    *,
-    external_transaction: bool,
-) -> Iterator[None]:
-    if external_transaction:
-        if not connection.in_transaction:
-            raise StrictMappingError(
-                "strict_mapping_schema_migration_requires_external_transaction"
-            )
-        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
-            raise StrictMappingError(
-                "strict_mapping_schema_migration_requires_foreign_keys_off"
-            )
-        yield
-        return
-
-    if connection.in_transaction:
-        raise StrictMappingError(
-            "strict_mapping_schema_migration_requires_clean_transaction"
-        )
-    foreign_keys = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
-    connection.execute("PRAGMA foreign_keys=OFF")
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        yield
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
-    finally:
-        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+    init_strict_live_eligibility_schema(connection)
+    return False
 
 
 def accept_strict_live_map_mapping(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -896,7 +459,7 @@ def accept_strict_live_map_mapping(
 
 
 def approve_automatic_exact_evidence(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     source_mapping_id: int,
     approved_by: str,
@@ -953,7 +516,9 @@ def approve_automatic_exact_evidence(
                 raybet_identity_hash, canonical_identity_hash,
                 crosswalk_evidence_hash, evidence_hash, approved_by, approved_at,
                 recorded_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(source_mapping_id) DO NOTHING
+               RETURNING approval_id""",
             (
                 mapping.mapping_id,
                 mapping.raybet_match_id,
@@ -971,11 +536,22 @@ def approve_automatic_exact_evidence(
                 recorded_at.isoformat(),
             ),
         )
-        return int(cursor.lastrowid)
+        inserted = cursor.fetchone()
+        if inserted is not None:
+            return int(inserted[0])
+        existing = connection.execute(
+            """SELECT approval_id
+                 FROM strict_live_automatic_evidence_approvals
+                WHERE source_mapping_id=?""",
+            (mapping.mapping_id,),
+        ).fetchone()
+        if existing is None:
+            raise RuntimeError("automatic approval insert was not persisted")
+        return int(existing[0])
 
 
 def get_strict_live_map_mapping(
-    connection: sqlite3.Connection, mapping_id: int
+    connection: PostgresSession, mapping_id: int
 ) -> StrictLiveMapMapping | None:
     """Load one immutable mapping by identity, including invalidated history."""
     row = _mapping_row_by_id(
@@ -990,7 +566,7 @@ def get_strict_live_map_mapping(
 
 
 def invalidate_strict_live_map_mapping(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     mapping_id: int,
     reason: str,
@@ -1030,7 +606,9 @@ def invalidate_strict_live_map_mapping(
         cursor = connection.execute(
             """INSERT INTO strict_live_map_mapping_invalidations
                (mapping_id, reason, invalidated_by, invalidated_at, recorded_at)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(mapping_id) DO NOTHING
+               RETURNING invalidation_id""",
             (
                 mapping_id,
                 reason,
@@ -1039,7 +617,19 @@ def invalidate_strict_live_map_mapping(
                 recorded_at.isoformat(),
             ),
         )
-        invalidation_id = int(cursor.lastrowid)
+        inserted = cursor.fetchone()
+        if inserted is None:
+            existing = connection.execute(
+                """SELECT invalidation_id
+                     FROM strict_live_map_mapping_invalidations
+                    WHERE mapping_id=?""",
+                (mapping_id,),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("mapping invalidation insert was not persisted")
+            invalidation_id = int(existing[0])
+        else:
+            invalidation_id = int(inserted[0])
         _record_mapping_impacts(
             connection,
             mapping=mapping,
@@ -1067,7 +657,7 @@ def invalidate_strict_live_map_mapping(
 
 
 def record_strict_live_mapping_candidate(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -1140,7 +730,7 @@ def record_strict_live_mapping_candidate(
 
 
 def query_strict_live_eligibility(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -1159,7 +749,7 @@ def query_strict_live_eligibility(
 
     try:
         rows = _mapping_rows(connection, clean_match_id, map_number)
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _ineligible(
             "strict_mapping_schema_missing", clean_match_id, map_number, transport_at
         )
@@ -1205,7 +795,7 @@ def query_strict_live_eligibility(
         )
     try:
         identity = _read_raybet_identity(connection, clean_match_id)
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _ineligible(
             "raybet_metadata_schema_missing",
             clean_match_id,
@@ -1228,7 +818,7 @@ def query_strict_live_eligibility(
             mapping.canonical_team_one_id,
             mapping.canonical_team_two_id,
         )
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _ineligible(
             "canonical_teams_schema_missing",
             clean_match_id,
@@ -1248,7 +838,7 @@ def query_strict_live_eligibility(
 
     try:
         event = _read_event_policy(connection, mapping.event_id)
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _ineligible(
             "event_registry_schema_missing",
             clean_match_id,
@@ -1310,7 +900,7 @@ check_strict_live_eligibility = query_strict_live_eligibility
 
 
 def query_strict_mapping_snapshot(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     mapping_id: int,
     observed_at: datetime,
@@ -1325,7 +915,7 @@ def query_strict_mapping_snapshot(
         return _ineligible("invalid_transport_time", "", 0, None)
     try:
         row = _mapping_row_by_id(connection, mapping_id)
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _ineligible("strict_mapping_schema_missing", "", 0, cutoff)
     if row is None:
         return _ineligible("accepted_mapping_missing", "", 0, cutoff)
@@ -1407,7 +997,7 @@ def query_strict_mapping_snapshot(
                 WHERE mapping_id=?""",
             (mapping_id,),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _ineligible(
             "strict_mapping_schema_missing",
             mapping.raybet_match_id,
@@ -1457,7 +1047,7 @@ def query_strict_mapping_snapshot(
 
 
 def _read_raybet_identity(
-    connection: sqlite3.Connection, raybet_match_id: str
+    connection: PostgresSession, raybet_match_id: str
 ) -> _RayBetIdentity:
     row = connection.execute(
         """SELECT tournament, team_one, team_two, scheduled_at, best_of,
@@ -1549,7 +1139,7 @@ def _read_raybet_identity(
 
 
 def _read_canonical_identity(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     team_one_id: int,
     team_two_id: int,
 ) -> _CanonicalIdentity:
@@ -1560,7 +1150,7 @@ def _read_canonical_identity(
             "SELECT team_id, name FROM teams WHERE team_id IN (?, ?)",
             (team_one_id, team_two_id),
         ).fetchall()
-    except sqlite3.OperationalError as error:
+    except SQLAlchemyError as error:
         raise _FailClosed("canonical_teams_schema_missing") from error
     by_id: dict[int, str] = {}
     for row in rows:
@@ -1587,7 +1177,7 @@ def _read_canonical_identity(
 
 
 def _read_event_policy(
-    connection: sqlite3.Connection, event_id: str
+    connection: PostgresSession, event_id: str
 ) -> _EventPolicy:
     row = connection.execute(
         """SELECT canonical_name, scope, approval_status, evidence_status, tier,
@@ -1765,7 +1355,7 @@ def _validate_crosswalk_evidence(
 
 
 def _automatic_approval_id(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     values: Mapping[str, Any],
     as_of: datetime,
 ) -> int:
@@ -1824,7 +1414,7 @@ def _automatic_approval_id(
 
 
 def _record_mapping_impacts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     mapping: StrictLiveMapMapping,
     invalidation_id: int,
@@ -1879,10 +1469,11 @@ def _record_mapping_impacts(
             ).fetchall()
         )
     connection.executemany(
-        """INSERT OR IGNORE INTO strict_live_mapping_impacts
+        """INSERT INTO strict_live_mapping_impacts
            (mapping_id, invalidation_id, dependent_type, dependent_key, reason,
-            recorded_at) VALUES (?, ?, ?, ?, ?, ?)""",
-        (
+            recorded_at) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT DO NOTHING""",
+        [
             (
                 mapping.mapping_id,
                 invalidation_id,
@@ -1892,12 +1483,12 @@ def _record_mapping_impacts(
                 recorded_at.isoformat(),
             )
             for dependent_type, dependent_key in sorted(dependents)
-        ),
+        ],
     )
 
 
 def _quarantine_mapping_order_dependents(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     invalidation_id: int,
     recorded_at: datetime,
@@ -1983,7 +1574,7 @@ def _quarantine_mapping_order_dependents(
 
 
 def _automatic_mappings_for_source(
-    connection: sqlite3.Connection, source_mapping_id: int
+    connection: PostgresSession, source_mapping_id: int
 ) -> tuple[StrictLiveMapMapping, ...]:
     rows = connection.execute(
         f"""SELECT {_MAPPING_COLUMNS}
@@ -2001,28 +1592,38 @@ def _automatic_mappings_for_source(
     return tuple(_mapping_from_row(row) for row in rows)
 
 
-def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+def _table_exists(connection: PostgresSession, table: str) -> bool:
     return connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        """SELECT 1 FROM information_schema.tables
+            WHERE table_schema=current_schema() AND table_name=?
+              AND table_type='BASE TABLE'""",
+        (table,),
     ).fetchone() is not None
 
 
 def _table_has_column(
-    connection: sqlite3.Connection, table: str, column: str
+    connection: PostgresSession, table: str, column: str
 ) -> bool:
-    return any(
-        str(row[1]) == column
-        for row in connection.execute(f"PRAGMA table_info({table})")
-    )
+    return connection.execute(
+        """SELECT 1 FROM information_schema.columns
+            WHERE table_schema=current_schema()
+              AND table_name=? AND column_name=?""",
+        (table, column),
+    ).fetchone() is not None
 
 
 def _table_has_columns(
-    connection: sqlite3.Connection, table: str, columns: set[str]
+    connection: PostgresSession, table: str, columns: set[str]
 ) -> bool:
     if not _table_exists(connection, table):
         return False
     existing = {
-        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+        str(row[0])
+        for row in connection.execute(
+            """SELECT column_name FROM information_schema.columns
+                WHERE table_schema=current_schema() AND table_name=?""",
+            (table,),
+        )
     }
     return columns <= existing
 
@@ -2040,7 +1641,7 @@ def _mapping_causal_reason(
 
 
 def _automatic_mapping_approval_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     mapping: StrictLiveMapMapping,
     transport_at: datetime,
 ) -> str | None:
@@ -2098,7 +1699,7 @@ def _automatic_mapping_approval_reason(
 
 
 def _historical_automatic_mapping_approval_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     mapping: StrictLiveMapMapping,
     transport_at: datetime,
 ) -> str | None:
@@ -2129,7 +1730,7 @@ def _historical_automatic_mapping_approval_reason(
                   AND source.acceptance_mode='manual_exact'""",
             (mapping.automatic_approval_id,),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return "strict_mapping_schema_missing"
     if row is None:
         return "automatic_exact_approval_missing"
@@ -2320,16 +1921,16 @@ _MAPPING_SELECT = f"""SELECT {_MAPPING_COLUMNS}
 
 
 def _mapping_rows(
-    connection: sqlite3.Connection, raybet_match_id: str, map_number: int
-) -> Sequence[sqlite3.Row | tuple[Any, ...]]:
+    connection: PostgresSession, raybet_match_id: str, map_number: int
+) -> Sequence[DatabaseRow | tuple[Any, ...]]:
     return connection.execute(
         _MAPPING_SELECT, (raybet_match_id, map_number)
     ).fetchall()
 
 
 def _mapping_row_by_id(
-    connection: sqlite3.Connection, mapping_id: int
-) -> sqlite3.Row | tuple[Any, ...] | None:
+    connection: PostgresSession, mapping_id: int
+) -> DatabaseRow | tuple[Any, ...] | None:
     return connection.execute(
         f"""SELECT {_MAPPING_COLUMNS}
               FROM strict_live_map_mappings AS m WHERE m.mapping_id=?""",
@@ -2338,8 +1939,8 @@ def _mapping_row_by_id(
 
 
 def _latest_invalidated_mapping_row(
-    connection: sqlite3.Connection, raybet_match_id: str, map_number: int
-) -> sqlite3.Row | tuple[Any, ...] | None:
+    connection: PostgresSession, raybet_match_id: str, map_number: int
+) -> DatabaseRow | tuple[Any, ...] | None:
     return connection.execute(
         f"""SELECT {_MAPPING_COLUMNS}
               FROM strict_live_map_mappings AS m
@@ -2352,13 +1953,15 @@ def _latest_invalidated_mapping_row(
 
 
 def _latest_invalidated_mapping_id(
-    connection: sqlite3.Connection, raybet_match_id: str, map_number: int
+    connection: PostgresSession, raybet_match_id: str, map_number: int
 ) -> int | None:
     row = _latest_invalidated_mapping_row(connection, raybet_match_id, map_number)
     return int(_value(row, 0, "mapping_id")) if row is not None else None
 
 
-def _mapping_from_row(row: sqlite3.Row | tuple[Any, ...]) -> StrictLiveMapMapping:
+def _mapping_from_row(
+    row: DatabaseRow | tuple[Any, ...],
+) -> StrictLiveMapMapping:
     required = (
         (6, "canonical_team_one_id"),
         (7, "canonical_team_one_name"),
@@ -2463,7 +2066,7 @@ def _mapping_from_values(
     )
 
 
-def _insert_mapping(connection: sqlite3.Connection, values: Mapping[str, Any]) -> int:
+def _insert_mapping(connection: PostgresSession, values: Mapping[str, Any]) -> int:
     cursor = connection.execute(
         """INSERT INTO strict_live_map_mappings
            (raybet_match_id, map_number, event_id, team_one_id, team_two_id,
@@ -2478,7 +2081,8 @@ def _insert_mapping(connection: sqlite3.Connection, values: Mapping[str, Any]) -
              accepted_by, accepted_at, recorded_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           RETURNING mapping_id""",
         (
             values["raybet_match_id"],
             values["map_number"],
@@ -2511,11 +2115,14 @@ def _insert_mapping(connection: sqlite3.Connection, values: Mapping[str, Any]) -
             values["recorded_at_iso"],
         ),
     )
-    return int(cursor.lastrowid)
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("strict mapping insert did not return an identity")
+    return int(row[0])
 
 
 def _insert_audit(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     values: Mapping[str, Any],
     decision: str,
     reason: str,
@@ -2534,7 +2141,8 @@ def _insert_audit(
             mapping_version, actor, observed_at, recorded_at,
             raybet_identity_hash, raybet_metadata_updated_at,
             canonical_identity_hash, crosswalk_evidence_hash, mapping_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           RETURNING audit_id""",
         (
             values["raybet_match_id"],
             values["map_number"],
@@ -2560,7 +2168,10 @@ def _insert_audit(
             mapping_id,
         ),
     )
-    return int(cursor.lastrowid)
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("strict mapping audit insert did not return an identity")
+    return int(row[0])
 
 
 def _validated_mapping_values(**raw: Any) -> dict[str, Any]:
@@ -2608,7 +2219,7 @@ def _validated_mapping_values(**raw: Any) -> dict[str, Any]:
 
 
 def _is_same_mapping_value(
-    row: sqlite3.Row | tuple[Any, ...], values: Mapping[str, Any]
+    row: DatabaseRow | tuple[Any, ...], values: Mapping[str, Any]
 ) -> bool:
     return (
         str(_value(row, 3, "event_id")) == values["event_id"]
@@ -2669,7 +2280,7 @@ def _json_string_tuple(value: Any) -> tuple[str, ...]:
 
 
 def _row_text(
-    row: sqlite3.Row | tuple[Any, ...], index: int, name: str, reason: str
+    row: DatabaseRow | tuple[Any, ...], index: int, name: str, reason: str
 ) -> str:
     value = _value(row, index, name)
     if not isinstance(value, str) or not value.strip():
@@ -2707,8 +2318,8 @@ def _parse_timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _value(row: sqlite3.Row | tuple[Any, ...], index: int, name: str) -> Any:
-    return row[name] if isinstance(row, sqlite3.Row) else row[index]
+def _value(row: DatabaseRow | tuple[Any, ...], index: int, name: str) -> Any:
+    return row[name] if isinstance(row, DatabaseRow) else row[index]
 
 
 def _ineligible(
@@ -2728,41 +2339,14 @@ def _ineligible(
     )
 
 
-def _add_missing_columns(
-    connection: sqlite3.Connection, table: str, columns: Mapping[str, str]
-) -> None:
-    existing = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
-    for name, declaration in columns.items():
-        if name not in existing:
-            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
-
-
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 @contextmanager
-def _write_transaction(connection: sqlite3.Connection) -> Iterator[None]:
-    if connection.in_transaction:
-        savepoint = "strict_live_eligibility_write"
-        connection.execute(f"SAVEPOINT {savepoint}")
-        try:
-            yield
-        except BaseException:
-            connection.execute(f"ROLLBACK TO {savepoint}")
-            connection.execute(f"RELEASE {savepoint}")
-            raise
-        else:
-            connection.execute(f"RELEASE {savepoint}")
-        return
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+def _write_transaction(connection: PostgresSession) -> Iterator[None]:
+    with connection.transaction():
         yield
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
 
 
 __all__ = [

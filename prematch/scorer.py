@@ -7,11 +7,14 @@ Each sub-score is in [-1, 1] (positive = radiant favoured).
 Weights are dynamically adjusted when data is missing.
 """
 
-import sqlite3
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
-from shared.sqlite import connect as connect_sqlite
+
+from database.engine import build_engine
+from database.session import PostgresSession
 
 # Default weights when all data is available
 _DEFAULT_WEIGHTS = {
@@ -33,8 +36,15 @@ _DRAFT_DIMENSION_WEIGHTS = {
 }
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    return connect_sqlite(db_path, read_only=True, row_factory=sqlite3.Row)
+@contextmanager
+def _connect(database_url: str | None) -> Iterator[PostgresSession]:
+    engine = build_engine(database_url)
+    connection = PostgresSession(engine)
+    try:
+        yield connection
+    finally:
+        connection.close()
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +370,8 @@ def _team_overall_stats(db_path: str, team_id: int) -> dict[str, float]:
             """SELECT
                  COUNT(*) AS total,
                  SUM(CASE
-                   WHEN (radiant_team_id = ? AND radiant_win = 1)
-                     OR (dire_team_id = ? AND radiant_win = 0) THEN 1 ELSE 0
+                   WHEN (radiant_team_id = ? AND radiant_win IS TRUE)
+                     OR (dire_team_id = ? AND radiant_win IS FALSE) THEN 1 ELSE 0
                  END) AS wins
                FROM matches
                WHERE radiant_team_id = ? OR dire_team_id = ?""",
@@ -589,8 +599,9 @@ def _player_historical_stats(
                     AVG(1.0 * mp.assists) as avg_a,
                     AVG(1.0 * mp.gold_per_min) as avg_gpm,
                     SUM(CASE
-                        WHEN (mp.is_radiant = 1 AND m.radiant_win = 1)
-                          OR (mp.is_radiant = 0 AND m.radiant_win = 0) THEN 1 ELSE 0
+                        WHEN (mp.is_radiant IS TRUE AND m.radiant_win IS TRUE)
+                          OR (mp.is_radiant IS FALSE AND m.radiant_win IS FALSE)
+                        THEN 1 ELSE 0
                     END) as wins
                 FROM match_players mp
                 JOIN matches m ON mp.match_id = m.match_id
@@ -605,8 +616,9 @@ def _player_historical_stats(
                     AVG(1.0 * mp.assists) as avg_a,
                     AVG(1.0 * mp.gold_per_min) as avg_gpm,
                     SUM(CASE
-                        WHEN (mp.is_radiant = 1 AND m.radiant_win = 1)
-                          OR (mp.is_radiant = 0 AND m.radiant_win = 0) THEN 1 ELSE 0
+                        WHEN (mp.is_radiant IS TRUE AND m.radiant_win IS TRUE)
+                          OR (mp.is_radiant IS FALSE AND m.radiant_win IS FALSE)
+                        THEN 1 ELSE 0
                     END) as wins
                 FROM match_players mp
                 JOIN matches m ON mp.match_id = m.match_id

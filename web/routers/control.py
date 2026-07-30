@@ -93,7 +93,6 @@ def create_session(request: Request, response: Response) -> dict[str, object]:
     try:
         components = control_service.statuses(
             connection,
-            database_path=Path(queries.DB_PATH),
         )
     finally:
         connection.close()
@@ -122,7 +121,6 @@ def components(
         return {
             "components": control_service.statuses(
                 connection,
-                database_path=Path(queries.DB_PATH),
             )
         }
     finally:
@@ -150,7 +148,6 @@ def control_component(
     try:
         result = control_service.execute(
             connection,
-            database_path=Path(queries.DB_PATH),
             component=component,
             action=action,
             request_id=payload.request_id,

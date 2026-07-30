@@ -1,11 +1,15 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import os
 from pathlib import Path
 
 import pytest
 
-import live_betting.hash_authority as hash_authority
+hash_authority = pytest.importorskip(
+    "live_betting.hash_authority",
+    reason="file hash authority was retired with SQLite file operations",
+)
 from live_betting.database_bundle import _publish_directory, _replace_and_fsync
 from live_betting.hash_authority import (
     file_hash_authority_scope,

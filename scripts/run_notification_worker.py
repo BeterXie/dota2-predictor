@@ -21,10 +21,6 @@ from live_betting.notifications import (  # noqa: E402
     mark_sent,
 )
 from live_betting.health import record_health  # noqa: E402
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
 from live_betting.smtp_delivery import (  # noqa: E402
     SMTPConfig,
     SMTPConfigurationError,
@@ -109,7 +105,7 @@ def run_once(store: LiveBettingStore, config: SMTPConfig) -> dict[str, object]:
 
 
 def _run_cli(args: argparse.Namespace) -> int:
-    with LiveBettingStore(args.database) as store:
+    with LiveBettingStore(args.database_url) as store:
         if not getattr(args, "schema_prepared", False):
             store.init_schema()
         try:
@@ -181,15 +177,17 @@ def _run_cli(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
     args = parser.parse_args()
-    with database_writer_authority(args.database):
-        return _run_cli(args)
+    return _run_cli(args)
 
 
 if __name__ == "__main__":

@@ -4,19 +4,46 @@ Consolidates duplicated implementations of team rolling stats, H2H records,
 team historical averages, and hero patch statistics.
 """
 
-import sqlite3
-
 import numpy as np
 import pandas as pd
-from shared.sqlite import configure_connection
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from database.engine import build_engine
+from database.session import PostgresSession, _bind_parameters
 
 _WINDOW_SIZES: tuple[int, ...] = (10, 20, 50)
 
 
-def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    return configure_connection(conn)
+class QuerySession(PostgresSession):
+    """Short-lived PostgreSQL session that owns its query engine."""
+
+    def __init__(self, engine: Engine) -> None:
+        super().__init__(engine)
+
+    def __enter__(self) -> "QuerySession":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        super().close()
+        self.engine.dispose()
+
+
+def connect(database_url: str | None) -> QuerySession:
+    return QuerySession(build_engine(database_url))
+
+
+def _read_sql_query(
+    query: str,
+    connection: QuerySession,
+    parameters: list[object],
+) -> pd.DataFrame:
+    statement, bound = _bind_parameters(query, parameters)
+    with connection.engine.connect() as sql_connection:
+        return pd.read_sql_query(text(statement), sql_connection, params=bound)
 
 
 def safe_float(value) -> float:
@@ -58,14 +85,14 @@ def compute_team_rolling(
             time_filter = "AND m.start_time < ?"
             params.append(before_time)
 
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             f"""
             SELECT
                 m.match_id, m.start_time,
                 CASE WHEN m.radiant_team_id = ? THEN 1 ELSE 0 END AS is_radiant,
                 CASE
-                    WHEN m.radiant_team_id = ? AND m.radiant_win = 1 THEN 1
-                    WHEN m.dire_team_id  = ? AND m.radiant_win = 0 THEN 1
+                    WHEN m.radiant_team_id = ? AND m.radiant_win IS TRUE THEN 1
+                    WHEN m.dire_team_id  = ? AND m.radiant_win IS FALSE THEN 1
                     ELSE 0
                 END AS win,
                 COALESCE(ps.avg_gpm, 0) AS avg_gpm,
@@ -81,7 +108,7 @@ def compute_team_rolling(
                 FROM match_players
                 GROUP BY match_id, is_radiant
             ) ps ON ps.match_id = m.match_id
-                AND ps.is_radiant = (CASE WHEN m.radiant_team_id = ? THEN 1 ELSE 0 END)
+                AND ps.is_radiant = (m.radiant_team_id = ?)
             LEFT JOIN gold_advantage ga
                 ON ga.match_id = m.match_id AND ga.time_min = 10
             WHERE (m.radiant_team_id = ? OR m.dire_team_id = ?)
@@ -89,7 +116,7 @@ def compute_team_rolling(
             ORDER BY m.start_time DESC
             """,
             conn,
-            params=[team_id, team_id, team_id, team_id, team_id, team_id, team_id]
+            [team_id, team_id, team_id, team_id, team_id, team_id, team_id]
             + ([before_time] if before_time is not None else []),
         )
 
@@ -169,7 +196,7 @@ def compute_team_historical_averages(
     """Compute per-match team stat averages over the team's recent matches."""
     conn = connect(db_path)
     try:
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             """
             SELECT
                 mp.match_id,
@@ -192,7 +219,7 @@ def compute_team_historical_averages(
             LIMIT ?
             """,
             conn,
-            params=[team_id, n_matches],
+            [team_id, n_matches],
         )
     finally:
         conn.close()
@@ -282,7 +309,8 @@ def compute_hero_patch_stats(
             SELECT COUNT(DISTINCT pb.match_id)
             FROM picks_bans pb
             JOIN matches m ON m.match_id = pb.match_id
-            WHERE pb.hero_id = ? AND pb.is_pick = 0 AND m.patch = ? {time_filter}
+            WHERE pb.hero_id = ? AND pb.is_pick IS FALSE
+              AND m.patch = ? {time_filter}
             """,
             [hero_id] + params,
         ).fetchone()[0]
@@ -294,8 +322,8 @@ def compute_hero_patch_stats(
             JOIN matches m ON m.match_id = mp.match_id
             WHERE mp.hero_id = ? AND m.patch = ? {time_filter}
               AND (
-                (mp.is_radiant = 1 AND m.radiant_win = 1)
-                OR (mp.is_radiant = 0 AND m.radiant_win = 0)
+                (mp.is_radiant IS TRUE AND m.radiant_win IS TRUE)
+                OR (mp.is_radiant IS FALSE AND m.radiant_win IS FALSE)
               )
             """,
             [hero_id] + params,

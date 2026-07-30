@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
+
+from database.session import PostgresSession
 
 from live_betting.stratz_rosh_client import (
     ROSH_FORMULA_VERSION,
@@ -29,7 +30,7 @@ class HistoricalRoshIdentityError(ValueError):
 
 
 class HistoricalRoshStorage(Protocol):
-    connection: sqlite3.Connection
+    connection: PostgresSession
 
     def insert_historical_rosh_lineup_score(self, **values: Any) -> Any: ...
 
@@ -64,7 +65,7 @@ class HistoricalRoshBackfillReport:
 
 
 ExistingScoreQuery = Callable[
-    [sqlite3.Connection, OpenDotaHistoricalMatch, str],
+    [PostgresSession, OpenDotaHistoricalMatch, str],
     object | None,
 ]
 Sleep = Callable[[float], None]
@@ -81,7 +82,7 @@ PersistScore = Callable[
 
 
 def load_formal_match_ids(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     match_id: int | None = None,
 ) -> tuple[int, ...]:
@@ -104,7 +105,7 @@ def load_formal_match_ids(
 
 
 def load_opendota_historical_match(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
 ) -> OpenDotaHistoricalMatch:
     rows = connection.execute(
@@ -240,7 +241,7 @@ def verify_historical_rosh_identity(
 
 
 def _default_existing_query(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     local: OpenDotaHistoricalMatch,
     formula_version: str,
 ) -> object | None:
@@ -259,7 +260,7 @@ def _default_existing_query(
 
 
 def load_existing_historical_rosh_score(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: int,
     *,
     formula_version: str = ROSH_FORMULA_VERSION,
@@ -269,7 +270,7 @@ def load_existing_historical_rosh_score(
 
 
 def existing_historical_rosh_score_for_identity(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     match_id: int,
     formula_version: str,

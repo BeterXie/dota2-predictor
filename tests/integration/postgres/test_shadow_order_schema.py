@@ -147,6 +147,12 @@ def _insert_pending_order(connection, order_key: str) -> None:
     curve_key = _hash("curve")
     target_snapshot_hash = _hash("target")
     input_snapshot_hash = _hash("input-snapshot")
+    dependency_revision = connection.execute(
+        text(
+            "SELECT dependency_revision FROM draft_lineage_revisions "
+            "WHERE singleton = 1"
+        )
+    ).scalar_one()
     connection.execute(
         text(
             """
@@ -167,7 +173,8 @@ def _insert_pending_order(connection, order_key: str) -> None:
                 'prospective', '2026-07-02T00:01:00Z', 'team_one',
                 :anchor_hash, :anchor_frame_ref, '2026-07-02T00:00:00Z',
                 :anchor_frame_ref, '2026-07-02T00:00:00Z', :deployment_key,
-                :target_snapshot_hash, '{}', :dependency_fingerprint, 1
+                :target_snapshot_hash, '{}', :dependency_fingerprint,
+                :dependency_revision
             )
             """
         ),
@@ -180,6 +187,7 @@ def _insert_pending_order(connection, order_key: str) -> None:
             "deployment_key": deployment_key,
             "target_snapshot_hash": target_snapshot_hash,
             "dependency_fingerprint": _hash("dependency"),
+            "dependency_revision": dependency_revision,
         },
     )
     landmark_key = _hash("landmark-10")
@@ -316,12 +324,6 @@ def _insert_pending_order(connection, order_key: str) -> None:
     authority_revision = connection.execute(
         text(
             "SELECT authority_revision FROM draft_authority_revisions "
-            "WHERE singleton = 1"
-        )
-    ).scalar_one()
-    dependency_revision = connection.execute(
-        text(
-            "SELECT dependency_revision FROM draft_lineage_revisions "
             "WHERE singleton = 1"
         )
     ).scalar_one()

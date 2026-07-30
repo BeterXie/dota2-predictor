@@ -7,27 +7,23 @@ import json
 import math
 import os
 import re
-import sqlite3
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.engine import require_database_url
 from .browser_origin import SlidingWindowRateLimiter, is_extension_origin
 from .browser_contract import BrowserEvent, find_forbidden_batch_key
 from .browser_ingest import BrowserEventIngestor
-from .service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
 from .storage import LiveBettingStore
 
 
-ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
 PORT = 8765
 MAX_BODY_BYTES = 1024 * 1024
@@ -49,7 +45,7 @@ EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 @dataclass(frozen=True)
 class CompanionConfig:
-    database: Path = ROOT / "data" / "dota2.db"
+    database_url: str | None = None
     extension_origin: str = DEFAULT_EXTENSION_ORIGIN
     report_url: str | None = None
 
@@ -207,8 +203,7 @@ def create_app(
     stats = RuntimeStats()
 
     if initialize_schema:
-        config.database.parent.mkdir(parents=True, exist_ok=True)
-        with LiveBettingStore(config.database) as store:
+        with LiveBettingStore(config.database_url) as store:
             store.init_schema()
 
     app = FastAPI(
@@ -272,7 +267,7 @@ def create_app(
         duplicate_count = 0
         rejection_count = 0
         try:
-            with LiveBettingStore(config.database) as store:
+            with LiveBettingStore(config.database_url) as store:
                 for item in raw_batch:
                     event_id = _safe_event_id(item)
                     try:
@@ -304,7 +299,7 @@ def create_app(
                         "processing_status": result.processing_status,
                         "reason": result.reason,
                     })
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             stats.add(rejections=1)
             return _error("database_unavailable", 503)
         stats.add(duplicates=duplicate_count, rejections=rejection_count)
@@ -330,7 +325,7 @@ def create_app(
         if type(status_body) is not dict or status_body != {}:
             stats.add(rejections=1)
             return _error("invalid_status_body", 400)
-        with LiveBettingStore(config.database) as store:
+        with LiveBettingStore(config.database_url) as store:
             latest = store.connection.execute(
                 "SELECT MAX(received_at) FROM browser_events"
             ).fetchone()[0]
@@ -349,7 +344,8 @@ def create_app(
                     WHERE component='shadow_worker'
                       AND status IN ('healthy', 'degraded')
                       AND last_heartbeat_at IS NOT NULL
-                      AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 <= 90
+                      AND live_text_timestamp_utc(last_heartbeat_at)>=
+                          CURRENT_TIMESTAMP - INTERVAL '90 seconds'
                     LIMIT 1"""
             ).fetchone() is not None
         duplicates, rejections = stats.snapshot()
@@ -373,7 +369,10 @@ def create_app(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=CompanionConfig().database)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--extension-origin", default=DEFAULT_EXTENSION_ORIGIN)
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument(
@@ -384,7 +383,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _run_cli(args: argparse.Namespace, config: CompanionConfig) -> int:
     if not getattr(args, "schema_prepared", False):
-        with LiveBettingStore(config.database) as database:
+        with LiveBettingStore(config.database_url) as database:
             database.init_schema()
     if args.check_config:
         print(json.dumps({
@@ -402,9 +401,11 @@ def _run_cli(args: argparse.Namespace, config: CompanionConfig) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    config = CompanionConfig(database=args.database, extension_origin=args.extension_origin)
-    with database_writer_authority(config.database):
-        return _run_cli(args, config)
+    config = CompanionConfig(
+        database_url=require_database_url(args.database_url),
+        extension_origin=args.extension_origin,
+    )
+    return _run_cli(args, config)
 
 
 if __name__ == "__main__":

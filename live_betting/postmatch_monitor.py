@@ -7,14 +7,17 @@ import asyncio
 import hashlib
 import json
 import logging
-import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
+
 from fetch.client import OpenDotaClient
-from fetch.db import Database
-from event_intelligence.ingest_adapters import SQLiteIngestAdapter
+from fetch.postgres_store import CoreMatchStore
+from event_intelligence.ingest_adapters import PostgresIngestAdapter
 from event_intelligence.raw_archive import (
     ArtifactReceipt,
     RawArchive,
@@ -31,10 +34,6 @@ from .direct_response_audit import (
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
 from .raybet import BASE_URL, RayBetClient, RayBetMapFinal, parse_raybet_map_final
-from .service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
 from .settlement import (
     SettlementAuthorityError,
     reconcile_map_winners,
@@ -130,7 +129,7 @@ def _draft_identity(
 
 
 def _vision_drafts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: str,
     *,
     causal_cutoffs: dict[int, datetime] | None = None,
@@ -153,7 +152,7 @@ def _vision_drafts(
                 WHERE raybet_match_id=?""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return {}
 
     try:
@@ -164,9 +163,9 @@ def _vision_drafts(
                 WHERE raybet_match_id=?""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return {}
-    conflict_rows: dict[int, list[sqlite3.Row]] = {}
+    conflict_rows: dict[int, list[DatabaseRow]] = {}
     for conflict in all_conflicts:
         conflict_rows.setdefault(int(conflict["map_number"]), []).append(conflict)
     for row in rows:
@@ -256,7 +255,7 @@ def _vision_drafts(
                       AND observation.map_number=?""",
                 (match_id, map_number),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             return {}
         invalidated_at: list[datetime] = []
         invalidation_time_damaged = False
@@ -512,7 +511,7 @@ def _latest_exact_raybet_final(
                 ORDER BY observed_at DESC, audit_key DESC""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         final_audits = []
     for audit in final_audits:
         audit_key = str(audit["audit_key"])
@@ -593,7 +592,7 @@ def _latest_exact_raybet_final(
                          transport.observation_key DESC""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return None
     for row in rows:
         observation_key = str(row["observation_key"])
@@ -748,7 +747,7 @@ def _winner_order_rows(
     map_number: int,
     *,
     include_conflicted: bool = False,
-) -> list[sqlite3.Row]:
+) -> list[DatabaseRow]:
     rows = store.connection.execute(
         """SELECT o.order_key, o.odds_id, o.market_key, o.fill_price,
                   o.signal_transport_at
@@ -790,7 +789,7 @@ def _causal_draft_cutoffs(
                 WHERE attempt.raybet_match_id=? AND orders.status='filled'""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         rows = []
     output: dict[int, datetime] = {}
     for row in rows:
@@ -799,7 +798,7 @@ def _causal_draft_cutoffs(
             continue
         try:
             blocked = store.order_block_reason(str(row["order_key"]))
-        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
             blocked = "causal_lineage_unverifiable"
         if blocked is not None:
             continue
@@ -815,7 +814,7 @@ def _causal_draft_cutoffs(
                 WHERE raybet_match_id=?""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         prediction_rows = []
     for row in prediction_rows:
         map_number = int(row["map_number"])
@@ -829,7 +828,7 @@ def _causal_draft_cutoffs(
                       AND dependent_key=? LIMIT 1""",
                 (prediction_key,),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             continue
         if invalidated is not None:
             continue
@@ -845,7 +844,7 @@ def _causal_draft_cutoffs(
                 map_number=map_number,
                 transport_observed_at=cutoff,
             )
-        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
             continue
         if (
             not eligibility.eligible
@@ -863,7 +862,7 @@ def _causal_draft_cutoffs(
                 WHERE raybet_match_id=?""",
             (match_id,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         decision_rows = []
     for row in decision_rows:
         map_number = int(row["map_number"])
@@ -876,7 +875,7 @@ def _causal_draft_cutoffs(
                       AND dependent_key=? LIMIT 1""",
                 (str(row["decision_key"]),),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             continue
         if invalidated is not None:
             continue
@@ -897,7 +896,7 @@ def _causal_draft_cutoffs(
                 transport_observed_at=cutoff,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError,
-                sqlite3.Error, OverflowError):
+                SQLAlchemyError, OverflowError):
             continue
         if (
             not eligibility.eligible
@@ -912,7 +911,7 @@ def _causal_draft_cutoffs(
 class _ReadOnlyCausalStore(LiveBettingStore):
     """Bind the worker's read-only causal gates to an existing web snapshot."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(self, connection: PostgresSession) -> None:
         self.connection = connection
 
 
@@ -936,7 +935,7 @@ def _causal_vision_drafts(
 
 
 def has_trusted_confirmed_draft(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     raybet_match_id: str,
     map_number: int,
 ) -> bool:
@@ -944,7 +943,7 @@ def has_trusted_confirmed_draft(
     store = _ReadOnlyCausalStore(connection)
     try:
         drafts = _causal_vision_drafts(store, raybet_match_id, {map_number})
-    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+    except (SQLAlchemyError, TypeError, ValueError, OverflowError):
         return False
     return bool(drafts.get(map_number))
 
@@ -952,7 +951,7 @@ def has_trusted_confirmed_draft(
 def _settle_winner_orders(
     store: LiveBettingStore,
     result: StoredMapResult,
-    rows: list[sqlite3.Row] | None = None,
+    rows: list[DatabaseRow] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     rows = rows if rows is not None else _winner_order_rows(
         store, result.raybet_match_id, result.map_number
@@ -997,7 +996,7 @@ def _reconcile_and_settle(
                 map_number=result.map_number,
                 transport_observed_at=result.settled_at,
             )
-        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
             eligibility = None
         if (
             eligibility is None
@@ -1325,7 +1324,7 @@ async def label_once(
                 map_number=map_number,
                 transport_observed_at=preflight_at,
             )
-        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
             eligibility = None
         if (
             eligibility is None
@@ -1355,7 +1354,7 @@ async def label_once(
             "SELECT opendota_league_id FROM event_registry WHERE event_id=?",
             (event_id,),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         event = None
     if (
         event is None
@@ -1592,19 +1591,20 @@ async def label_once(
 
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
-    database = Path(args.database).resolve()
-    args.database = database
     args.archive_root = (
         Path(args.archive_root).resolve()
         if args.archive_root is not None
-        else database.parent / "raw-sources"
+        else ROOT / "data" / "raw-sources"
     )
     return args
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--match-id")
     parser.add_argument("--team-id", type=int)
     parser.add_argument("--team-side", choices=("team_one", "team_two"))
@@ -1626,19 +1626,17 @@ def main() -> int:
         client = OpenDotaClient(rate_limit=30)
         raybet_client = RayBetClient()
         try:
-            with LiveBettingStore(args.database) as store:
+            with LiveBettingStore(args.database_url) as store:
                 if not getattr(args, "schema_prepared", False):
                     store.init_schema()
-                intelligence_storage = IntelligenceStorage(
-                    args.database, connection=store.connection
-                )
+                intelligence_storage = IntelligenceStorage(engine=store.engine)
                 if not getattr(args, "schema_prepared", False):
                     intelligence_storage.init_schema()
-                    Database(connection=store.connection).init_db()
                 registry = EventRegistry(intelligence_storage)
-                ingest_store = SQLiteIngestAdapter(
-                    intelligence_storage, registry,
-                    Database(connection=store.connection),
+                ingest_store = PostgresIngestAdapter(
+                    intelligence_storage,
+                    registry,
+                    CoreMatchStore(engine=store.engine),
                 )
                 raw_archive = RawArchive(
                     args.archive_root,
@@ -1731,8 +1729,7 @@ def main() -> int:
             await client.close()
             raybet_client.close()
 
-    with database_writer_authority(args.database):
-        return asyncio.run(run())
+    return asyncio.run(run())
 
 
 if __name__ == "__main__":

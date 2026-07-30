@@ -19,10 +19,7 @@ import yaml
 
 from .client import OpenDotaClient
 from .db import Database
-from live_betting.service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
+from database.engine import require_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +40,6 @@ BENCHMARK_METRICS = [
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
-
-
-def resolve_db_path(cfg: dict) -> str:
-    raw: str = cfg.get("database", "../data/dota2.db")
-    if os.path.isabs(raw):
-        return raw
-    return str((Path(__file__).parent / raw).resolve())
 
 
 def compute_win_rate_curve(durations: list[dict]) -> dict[str, float]:
@@ -183,19 +173,6 @@ async def compute_scaling_scores(db: Database, hero_ids: list[int]) -> None:
     """Compute and store early/mid/late WR and scaling_score into a summary table."""
     conn = db.connect()
 
-    # Ensure the summary columns exist in heroes table
-    summary_cols = [
-        "ALTER TABLE heroes ADD COLUMN early_wr REAL DEFAULT 0.5",
-        "ALTER TABLE heroes ADD COLUMN mid_wr REAL DEFAULT 0.5",
-        "ALTER TABLE heroes ADD COLUMN late_wr REAL DEFAULT 0.5",
-        "ALTER TABLE heroes ADD COLUMN scaling_score REAL DEFAULT 0.0",
-    ]
-    for sql in summary_cols:
-        try:
-            conn.execute(sql)
-        except Exception:
-            pass
-
     for hero_id in hero_ids:
         rows = conn.execute(
             "SELECT duration_min, games_played, wins FROM hero_duration_stats WHERE hero_id = ?",
@@ -219,10 +196,9 @@ async def compute_scaling_scores(db: Database, hero_ids: list[int]) -> None:
 async def run(
     cfg: dict,
     force: bool,
-    database_path: str | Path | None = None,
+    database_url: str | None = None,
 ) -> None:
-    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
-    db = Database(db_path)
+    db = Database(require_database_url(database_url or cfg.get("database_url")))
     db.connect()
     db.init_db()
 
@@ -282,16 +258,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch hero meta statistics from OpenDota API"
     )
-    add_single_database_argument(parser)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument(
         "--force", action="store_true", help="Re-fetch even if already in DB"
     )
     args = parser.parse_args()
 
     cfg = load_config()
-    database = Path(args.database or resolve_db_path(cfg)).resolve()
-    with database_writer_authority(database):
-        asyncio.run(run(cfg, args.force, database))
+    asyncio.run(run(cfg, args.force, args.database_url))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,6 @@ Usage:
 import argparse
 import logging
 import os
-import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -20,10 +19,7 @@ import yaml
 from curl_cffi import requests as cffi_requests
 
 from .db import Database
-from live_betting.service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
+from database.engine import require_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +70,6 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def resolve_db_path(cfg: dict) -> str:
-    raw: str = cfg.get("database", "../data/dota2.db")
-    if os.path.isabs(raw):
-        return raw
-    return str((Path(__file__).parent / raw).resolve())
-
-
 def _flatten_matchups(hero_id: int, data: dict) -> list[dict]:
     """Convert Stratz heroVsHeroMatchup response to DB row format.
 
@@ -113,7 +102,6 @@ def fetch_matchups_stratz(
 ) -> tuple[int, int]:
     """Fetch hero matchup data from Stratz for all heroes."""
     conn = db.connect()
-    conn.row_factory = sqlite3.Row
     heroes = conn.execute(
         "SELECT hero_id, localized_name FROM heroes ORDER BY hero_id"
     ).fetchall()
@@ -202,11 +190,10 @@ def fetch_matchups_stratz(
 def run(
     token: str,
     force: bool,
-    database_path: str | Path | None = None,
+    database_url: str | None = None,
 ) -> None:
     cfg = load_config()
-    db_path = str(Path(database_path).resolve()) if database_path else resolve_db_path(cfg)
-    db = Database(db_path)
+    db = Database(require_database_url(database_url or cfg.get("database_url")))
     db.connect()
     db.init_db()
 
@@ -230,7 +217,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch hero matchup data from Stratz GraphQL API"
     )
-    add_single_database_argument(parser)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument(
         "--force", action="store_true", help="Re-fetch even if already in DB"
     )
@@ -251,10 +241,7 @@ def main() -> None:
             "(STRATZ_TOKEN is deprecated)."
         )
 
-    cfg = load_config()
-    database = Path(args.database or resolve_db_path(cfg)).resolve()
-    with database_writer_authority(database):
-        run(args.token, args.force, database)
+    run(args.token, args.force, args.database_url)
 
 
 if __name__ == "__main__":

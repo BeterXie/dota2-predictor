@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: F821
 
 import contextlib
 import hashlib
@@ -72,13 +73,7 @@ from live_betting.shadow_monitor import (
     _bind_source_comeback_state,
     _source_comeback_state_index,
 )
-from live_betting.service_coordination import (
-    TerminationResult,
-    WriterScanResult,
-    database_service_authority_lock_paths,
-    database_web_authority_lock_paths,
-    database_writer_authority,
-)
+from live_betting.process_control import TerminationResult
 from live_betting.sanitize import (
     PUBLIC_STREAM_EVIDENCE_KEY,
     public_stream_evidence,

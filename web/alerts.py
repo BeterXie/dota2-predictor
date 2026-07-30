@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
-import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
 
 from live_betting.notifications import (
     EVENT_MONITOR_ALERT,
@@ -79,8 +82,8 @@ _PAPER_SIGNAL_QUERY = """
            orders.signal_price, orders.signaled_at
      FROM shadow_orders AS orders
      WHERE orders.status='pending'
-       AND julianday(orders.signaled_at) IS NOT NULL
-       AND julianday(orders.signal_transport_at) IS NOT NULL
+       AND live_text_timestamp_utc(orders.signaled_at) IS NOT NULL
+       AND live_text_timestamp_utc(orders.signal_transport_at) IS NOT NULL
        AND NOT EXISTS (
              SELECT 1 FROM strict_live_mapping_impacts AS impact
               WHERE impact.dependent_type='shadow_order'
@@ -103,9 +106,9 @@ _PAPER_SIGNAL_QUERY = """
                       ON source.mapping_id=approval.source_mapping_id
                    WHERE mapping.mapping_id=orders.strict_mapping_id
                      AND mapping.raybet_match_id=orders.raybet_match_id
-                     AND julianday(mapping.accepted_at) IS NOT NULL
-                     AND julianday(mapping.accepted_at)<=
-                         julianday(orders.signal_transport_at)
+                     AND live_text_timestamp_utc(mapping.accepted_at) IS NOT NULL
+                     AND live_text_timestamp_utc(mapping.accepted_at)<=
+                         live_text_timestamp_utc(orders.signal_transport_at)
                      AND direct.invalidation_id IS NULL
                      AND source.invalidation_id IS NULL
                      AND mapping.acceptance_mode IN
@@ -114,9 +117,13 @@ _PAPER_SIGNAL_QUERY = """
                            mapping.acceptance_mode='manual_exact'
                            OR (
                                 approval.approval_id IS NOT NULL
-                                AND julianday(approval.approved_at) IS NOT NULL
-                                AND julianday(approval.approved_at)<=
-                                    julianday(orders.signal_transport_at)
+                                AND live_text_timestamp_utc(
+                                        approval.approved_at
+                                    ) IS NOT NULL
+                                AND live_text_timestamp_utc(approval.approved_at)<=
+                                    live_text_timestamp_utc(
+                                        orders.signal_transport_at
+                                    )
                            )
                      )
              )
@@ -134,17 +141,17 @@ _PAPER_SIGNAL_QUERY = """
                 AND anchor.map_number=attempt.map_number
               WHERE attempt.order_key=orders.order_key
                 AND anchor.source_frame_ref!=''
-                AND julianday(anchor.anchored_at) IS NOT NULL
-                AND julianday(anchor.anchored_at)<=
-                    julianday(orders.signal_transport_at)
+                AND live_text_timestamp_utc(anchor.anchored_at) IS NOT NULL
+                AND live_text_timestamp_utc(anchor.anchored_at)<=
+                    live_text_timestamp_utc(orders.signal_transport_at)
                 AND (
                       anchor.status='anchored'
                       OR (
                            anchor.status='conflict'
                            AND anchor.conflict_at IS NOT NULL
-                           AND julianday(anchor.conflict_at) IS NOT NULL
-                           AND julianday(anchor.conflict_at)>
-                               julianday(orders.signal_transport_at)
+                           AND live_text_timestamp_utc(anchor.conflict_at) IS NOT NULL
+                           AND live_text_timestamp_utc(anchor.conflict_at)>
+                               live_text_timestamp_utc(orders.signal_transport_at)
                            AND NOT EXISTS (
                                 SELECT 1
                                   FROM vision_draft_conflicts AS conflict
@@ -152,9 +159,14 @@ _PAPER_SIGNAL_QUERY = """
                                        anchor.raybet_match_id
                                    AND conflict.map_number=anchor.map_number
                                    AND (
-                                         julianday(conflict.captured_at) IS NULL
-                                         OR julianday(conflict.captured_at)<=
-                                            julianday(orders.signal_transport_at)
+                                         live_text_timestamp_utc(
+                                             conflict.captured_at
+                                         ) IS NULL
+                                         OR live_text_timestamp_utc(
+                                                conflict.captured_at
+                                            )<=live_text_timestamp_utc(
+                                                orders.signal_transport_at
+                                            )
                                    )
                            )
                       )
@@ -164,7 +176,7 @@ _PAPER_SIGNAL_QUERY = """
 
 
 def reconcile_alerts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     now: datetime | None = None,
     grace_seconds: int = 30,
@@ -181,8 +193,7 @@ def reconcile_alerts(
         else os.environ.get("DOTA2_ALERT_EMAIL_RECIPIENT", "").strip()
     )
     now_iso = now.isoformat()
-    connection.execute("BEGIN IMMEDIATE")
-    with connection:
+    with connection.transaction():
         (
             conditions,
             operational_health_available,
@@ -269,7 +280,8 @@ def reconcile_alerts(
                 """INSERT INTO monitor_alert_incidents
                    (dedupe_key, episode, category, severity, title, body, status,
                     first_detected_at, opened_at, last_detected_at, source_json)
-                   VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                    RETURNING incident_id""",
                 (
                     dedupe_key,
                     episode,
@@ -283,7 +295,10 @@ def reconcile_alerts(
                     _json(condition["source"]),
                 ),
             )
-            incident_id = int(cursor.lastrowid)
+            inserted = cursor.fetchone()
+            if inserted is None:
+                raise RuntimeError("alert incident insert did not return an identity")
+            incident_id = int(inserted[0])
             _audit(connection, incident_id, "opened", "system", condition["body"], now)
             _enqueue_email(
                 connection,
@@ -358,7 +373,7 @@ def reconcile_alerts(
     return active_alerts(connection)
 
 
-def active_alerts(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+def active_alerts(connection: PostgresSession) -> list[dict[str, Any]]:
     try:
         rows = connection.execute(
             """SELECT incident_id, dedupe_key, episode, category, severity, title,
@@ -369,7 +384,7 @@ def active_alerts(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                          CASE severity WHEN 'critical' THEN 0 ELSE 1 END,
                          opened_at DESC"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return []
     return [
         {
@@ -393,7 +408,7 @@ def active_alerts(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def acknowledge_alert(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     incident_id: int,
     actor: str,
@@ -425,7 +440,7 @@ def acknowledge_alert(
 
 
 def _conditions(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     health: Sequence[Mapping[str, Any]] | None,
 ) -> tuple[dict[str, dict[str, Any]], bool, bool]:
     operational_health_available = True
@@ -445,7 +460,7 @@ def _conditions(
                 }
                 for row in rows
             ]
-        except sqlite3.Error as exc:
+        except SQLAlchemyError as exc:
             health = []
             operational_health_available = False
             operational_contract_failure = _operational_health_contract_failure(
@@ -479,7 +494,7 @@ def _conditions(
 
 
 def _operational_health_contract_failure(
-    error: sqlite3.Error,
+    error: SQLAlchemyError,
 ) -> dict[str, dict[str, Any]]:
     issue = f"{type(error).__name__}: {error}"
     return {
@@ -513,11 +528,11 @@ def _alert_source_is_available(
 
 
 def _paper_signal_conditions(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> tuple[dict[str, dict[str, Any]], bool]:
     try:
         schema_issues = _paper_signal_schema_issues(connection)
-    except sqlite3.Error as exc:
+    except SQLAlchemyError as exc:
         return (
             _paper_signal_contract_failure(
                 "schema_inspection_failed",
@@ -533,7 +548,7 @@ def _paper_signal_conditions(
 
     try:
         rows = connection.execute(_PAPER_SIGNAL_QUERY).fetchall()
-    except sqlite3.Error as exc:
+    except SQLAlchemyError as exc:
         return (
             _paper_signal_contract_failure(
                 "query_failed",
@@ -598,21 +613,28 @@ def _alert_source(value: Any, dedupe_key: str) -> dict[str, Any]:
     return {"dedupe_key": dedupe_key}
 
 
-def _paper_signal_schema_issues(connection: sqlite3.Connection) -> list[str]:
+def _paper_signal_schema_issues(connection: PostgresSession) -> list[str]:
     issues: list[str] = []
     for relation, required_columns in _PAPER_SIGNAL_REQUIRED_COLUMNS.items():
         relation_row = connection.execute(
-            """SELECT type FROM sqlite_master
-                 WHERE type IN ('table', 'view') AND name=?""",
+            """SELECT relation.relkind
+                 FROM pg_class AS relation
+                 JOIN pg_namespace AS namespace
+                   ON namespace.oid=relation.relnamespace
+                WHERE namespace.nspname=current_schema()
+                  AND relation.relkind IN ('r', 'p', 'v')
+                  AND relation.relname=?""",
             (relation,),
         ).fetchone()
         if relation_row is None:
             issues.append(f"missing_relation:{relation}")
             continue
         columns = {
-            str(row[1])
+            str(row[0])
             for row in connection.execute(
-                f'PRAGMA table_info("{relation}")'
+                """SELECT column_name FROM information_schema.columns
+                    WHERE table_schema=current_schema() AND table_name=?""",
+                (relation,),
             ).fetchall()
         }
         for column in sorted(required_columns - columns):
@@ -656,7 +678,7 @@ def _paper_signal_price(value: Any) -> float:
 
 
 def _enqueue_email(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     incident_id: int,
     event_type: str,
@@ -693,7 +715,7 @@ def _enqueue_email(
 
 
 def _audit(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     incident_id: int,
     action: str,
     actor: str,

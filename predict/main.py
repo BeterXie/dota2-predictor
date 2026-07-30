@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 
 import yaml
-from shared.sqlite import connect as connect_sqlite
+
+from shared.queries import connect
 
 from .feature_builder import build_features
 from .output import _sanitize, format_output, save_prediction
@@ -25,8 +26,8 @@ def _load_config() -> dict:
     return {}
 
 
-def _validate_team_exists(db_path: str, team_id: int) -> None:
-    conn = connect_sqlite(db_path, read_only=True)
+def _validate_team_exists(database_url: str, team_id: int) -> None:
+    conn = connect(database_url)
     try:
         row = conn.execute("SELECT 1 FROM matches WHERE radiant_team_id = ? OR dire_team_id = ? LIMIT 1",
                            (team_id, team_id)).fetchone()
@@ -41,7 +42,7 @@ def run(
     radiant_id: int,
     dire_id: int,
     league_id: int,
-    db_path: str,
+    database_url: str,
     models_dir: str,
     predictions_dir: str,
 ) -> None:
@@ -49,8 +50,8 @@ def run(
         print("Error: radiant and dire teams must be different.", file=sys.stderr)
         sys.exit(1)
 
-    _validate_team_exists(db_path, radiant_id)
-    _validate_team_exists(db_path, dire_id)
+    _validate_team_exists(database_url, radiant_id)
+    _validate_team_exists(database_url, dire_id)
 
     print(f"Loading model from {models_dir} ...")
     bundle = load_model(models_dir)
@@ -59,7 +60,9 @@ def run(
     print(f"Model expects {len(feature_names)} features (version {bundle.get('timestamp', '?')}).")
 
     print(f"Building feature vector for radiant={radiant_id} dire={dire_id} ...")
-    features = build_features(radiant_id, dire_id, league_id, db_path, feature_names)
+    features = build_features(
+        radiant_id, dire_id, league_id, database_url, feature_names
+    )
 
     print("Running prediction ...")
     result = predict(bundle, features)
@@ -72,7 +75,9 @@ def run(
         for f in result["top_factors"]:
             print(f"  {f['factor']:40s} impact={f['impact']:.4f}  direction={f['direction']}")
 
-    output = format_output(result, radiant_id, dire_id, league_id, bundle, db_path)
+    output = format_output(
+        result, radiant_id, dire_id, league_id, bundle, database_url
+    )
     file_path = save_prediction(output, predictions_dir)
 
     print(f"\nPrediction saved to {file_path}")
@@ -92,18 +97,23 @@ def main():
     parser.add_argument(
         "--league", type=int, default=0, help="League ID (optional)"
     )
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     args = parser.parse_args()
 
     config = _load_config()
     pkg_dir = Path(__file__).resolve().parent
 
-    db_path = str(pkg_dir / config.get("database", "../data/dota2.db"))
+    from database.engine import require_database_url
+
+    database_url = require_database_url(
+        args.database_url or config.get("database_url")
+    )
     models_dir = str(pkg_dir / config.get("models_dir", "../data/models"))
     predictions_dir = str(pkg_dir / config.get("predictions_dir", "../data/predictions"))
 
-    if not Path(db_path).exists():
-        print(f"Database not found: {db_path}", file=sys.stderr)
-        sys.exit(1)
     if not Path(models_dir, "prematch_latest.pkl").exists():
         print(
             f"Pre-match model not found: {Path(models_dir) / 'prematch_latest.pkl'}\n"
@@ -112,7 +122,14 @@ def main():
         )
         sys.exit(1)
 
-    run(args.radiant, args.dire, args.league, db_path, models_dir, predictions_dir)
+    run(
+        args.radiant,
+        args.dire,
+        args.league,
+        database_url,
+        models_dir,
+        predictions_dir,
+    )
 
 
 if __name__ == "__main__":

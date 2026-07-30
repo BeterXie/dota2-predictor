@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Mapping
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from .settlement import (
     persisted_settlement_authority_reason,
@@ -106,7 +109,7 @@ def simulation_payload(event_type: str, values: Mapping[str, Any]) -> dict[str, 
 
 
 def filled_order_payload(
-    connection: sqlite3.Connection, order_key: str
+    connection: PostgresSession, order_key: str
 ) -> dict[str, Any]:
     """Build an immutable, human-auditable entry notification payload."""
     order = connection.execute(
@@ -154,7 +157,7 @@ def filled_order_payload(
         raise ValueError("notification order lineage is unavailable")
     try:
         verify_bound_order_vision_frame(connection, order_key)
-    except (RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+    except (RuntimeError, TypeError, ValueError, SQLAlchemyError) as error:
         raise ValueError("notification vision frame authority is invalid") from error
     event_name = None
     if order["event_id"] and _table_has_column(
@@ -268,8 +271,8 @@ def filled_order_payload(
 
 
 def _formal_payload_is_complete(
-    order: sqlite3.Row,
-    decision: sqlite3.Row | None,
+    order: DatabaseRow,
+    decision: DatabaseRow | None,
     inputs: Mapping[str, Any],
     fill_transport_key: Any,
 ) -> bool:
@@ -312,7 +315,7 @@ def _formal_payload_is_complete(
 
 
 def settled_order_payload(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
     *,
     result: str,
@@ -350,7 +353,7 @@ def settled_order_payload(
 
 
 def _stored_entry_payload(
-    connection: sqlite3.Connection, order_key: str
+    connection: PostgresSession, order_key: str
 ) -> dict[str, Any] | None:
     row = connection.execute(
         """SELECT payload_json, template_version FROM notification_outbox
@@ -389,8 +392,8 @@ def _stored_entry_payload(
 
 
 def _decision_lineage(
-    connection: sqlite3.Connection, order: sqlite3.Row
-) -> tuple[sqlite3.Row | None, dict[str, Any], dict[str, Any], str]:
+    connection: PostgresSession, order: DatabaseRow
+) -> tuple[DatabaseRow | None, dict[str, Any], dict[str, Any], str]:
     try:
         candidates = connection.execute(
             """SELECT * FROM strategy_decisions
@@ -410,11 +413,11 @@ def _decision_lineage(
                 order["required_decision_key"],
             ),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return None, {}, {}, "unresolved"
     if not candidates:
         return None, {}, {}, "unresolved"
-    verified: list[tuple[sqlite3.Row, dict[str, Any], dict[str, Any]]] = []
+    verified: list[tuple[DatabaseRow, dict[str, Any], dict[str, Any]]] = []
     for candidate in candidates:
         identity = "|".join(
             (
@@ -456,7 +459,7 @@ def _decision_lineage(
 
 
 def decision_lineage_block_reason(
-    connection: sqlite3.Connection, order_key: str
+    connection: PostgresSession, order_key: str
 ) -> str | None:
     """Require one immutable marker resolving to one exact eligible decision."""
     try:
@@ -471,7 +474,7 @@ def decision_lineage_block_reason(
                 WHERE orders.order_key=?""",
             (order_key,),
         ).fetchone()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return "decision_lineage_unavailable"
     if order is None or order["required_decision_key"] is None:
         return "decision_lineage_unavailable"
@@ -482,13 +485,14 @@ def decision_lineage_block_reason(
 
 
 def _cumulative_shadow_statistics(
-    connection: sqlite3.Connection, cutoff: datetime
+    connection: PostgresSession, cutoff: datetime
 ) -> dict[str, float | int]:
     cutoff_iso = _iso(cutoff)
     try:
         filled_rows = connection.execute(
             """SELECT order_key FROM shadow_orders
-                WHERE status='filled' AND julianday(filled_at)<=julianday(?)""",
+                WHERE status='filled'
+                  AND live_text_timestamp_utc(filled_at)<=CAST(? AS timestamptz)""",
             (cutoff_iso,),
         ).fetchall()
         settled_rows = connection.execute(
@@ -497,10 +501,11 @@ def _cumulative_shadow_statistics(
                  JOIN shadow_orders AS orders
                    ON orders.order_key=settlement.order_key
                 WHERE orders.status='filled' AND settlement.review_required=0
-                  AND julianday(settlement.settled_at)<=julianday(?)""",
+                  AND live_text_timestamp_utc(settlement.settled_at)<=
+                      CAST(? AS timestamptz)""",
             (cutoff_iso,),
         ).fetchall()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return _empty_shadow_statistics()
     filled = [
         row
@@ -528,11 +533,11 @@ def _cumulative_shadow_statistics(
 
 
 def _order_excluded_from_statistics(
-    connection: sqlite3.Connection, order_key: str
+    connection: PostgresSession, order_key: str
 ) -> bool:
     try:
         strict_reason = _strict_mapping_block_reason(connection, order_key)
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return True
     if strict_reason is not None:
         return True
@@ -545,7 +550,7 @@ def _order_excluded_from_statistics(
         return invalidated is not None or _draft_conflict_for_order(
             connection, order_key
         )
-    except sqlite3.Error:
+    except SQLAlchemyError:
         # Legacy databases without every audit table cannot prove an order is
         # eligible for cumulative reporting.  Exclude it without blocking the
         # settlement transaction or inventing optimistic statistics.
@@ -575,17 +580,22 @@ def _finite_number(value: Any) -> bool:
     )
 
 
-def _table_has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
+def _table_has_column(
+    connection: PostgresSession, table: str, column: str
+) -> bool:
     return (
         connection.execute(
-            "SELECT 1 FROM pragma_table_info(?) WHERE name=?", (table, column)
+            """SELECT 1 FROM information_schema.columns
+                WHERE table_schema=current_schema()
+                  AND table_name=? AND column_name=?""",
+            (table, column),
         ).fetchone()
         is not None
     )
 
 
 def enqueue(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     order_key: str,
     event_type: str,
@@ -628,7 +638,7 @@ def enqueue(
         if event_type in {EVENT_FILLED, EVENT_SETTLED}:
             try:
                 verify_bound_order_vision_frame(connection, order_key)
-            except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+            except (RuntimeError, TypeError, ValueError, SQLAlchemyError):
                 return False
             if _strict_mapping_block_reason(connection, order_key) is not None:
                 return False
@@ -639,7 +649,7 @@ def enqueue(
                         LIMIT 1""",
                     (order_key,),
                 ).fetchone()
-            except sqlite3.OperationalError:
+            except SQLAlchemyError:
                 blocked = connection.execute(
                     """SELECT 1 FROM vision_derived_invalidations
                         WHERE dependent_type='shadow_order' AND dependent_key=?
@@ -685,14 +695,14 @@ def enqueue(
 
 
 def _formal_notification_block_reason(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    connection: PostgresSession,
+    row: DatabaseRow,
     order_key: str,
 ) -> str | None:
     event_type = str(row["event_type"])
     try:
         verify_bound_order_vision_frame(connection, order_key)
-    except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+    except (RuntimeError, TypeError, ValueError, SQLAlchemyError):
         return "vision_frame_integrity_failed"
     if str(row["template_version"]) != TEMPLATE_VERSION:
         return "formal_notification_template_unsupported"
@@ -725,7 +735,7 @@ def _formal_notification_block_reason(
             return authority_reason
         try:
             baseline = _stored_entry_payload(connection, order_key)
-        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        except (SQLAlchemyError, TypeError, ValueError, json.JSONDecodeError):
             return "formal_notification_decision_lineage_unavailable"
         if baseline is None:
             return "formal_notification_decision_lineage_unavailable"
@@ -733,14 +743,14 @@ def _formal_notification_block_reason(
             current_baseline = filled_order_payload(connection, order_key)
         except (TypeError, ValueError, json.JSONDecodeError):
             return "formal_notification_lineage_mismatch"
-        except sqlite3.Error:
+        except SQLAlchemyError:
             return "formal_notification_decision_lineage_unavailable"
         if baseline != current_baseline:
             return "formal_notification_lineage_mismatch"
     else:
         try:
             baseline = filled_order_payload(connection, order_key)
-        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        except (SQLAlchemyError, TypeError, ValueError, json.JSONDecodeError):
             return "formal_notification_decision_lineage_unavailable"
     for key, value in baseline.items():
         if key not in {"event_type", "template_version"} and payload.get(key) != value:
@@ -793,7 +803,9 @@ def _formal_notification_block_reason(
     return None
 
 
-def _blocked_reason(connection: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+def _blocked_reason(
+    connection: PostgresSession, row: DatabaseRow
+) -> str | None:
     """Return a sticky reason when a claimed event is no longer deliverable."""
     try:
         quarantine_prefix = "quarantine_intent:"
@@ -824,7 +836,7 @@ def _blocked_reason(connection: sqlite3.Connection, row: sqlite3.Row) -> str | N
                     LIMIT 1""",
                 (order_key,),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             # Databases created before stable gate codes remain draft-safe.
             legacy_invalidation = True
             invalidated = connection.execute(
@@ -860,12 +872,12 @@ def _blocked_reason(connection: sqlite3.Connection, row: sqlite3.Row) -> str | N
             lineage_reason = decision_lineage_block_reason(connection, order_key)
             if lineage_reason is not None:
                 return lineage_reason
-    except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+    except (SQLAlchemyError, TypeError, ValueError, json.JSONDecodeError):
         return "notification_gate_unavailable"
     return None
 
 
-def _notification_order_identity(row: sqlite3.Row) -> tuple[str, bool]:
+def _notification_order_identity(row: DatabaseRow) -> tuple[str, bool]:
     event_type = str(row["event_type"])
     stored_order_key = str(row["order_key"])
     if event_type in {EVENT_FILLED, EVENT_SETTLED}:
@@ -885,7 +897,7 @@ def _notification_order_identity(row: sqlite3.Row) -> tuple[str, bool]:
 
 
 def _strict_mapping_block_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
     *,
     require_order: bool = False,
@@ -898,7 +910,9 @@ def _strict_mapping_block_reason(
     )
 
 
-def _draft_conflict_for_order(connection: sqlite3.Connection, order_key: str) -> bool:
+def _draft_conflict_for_order(
+    connection: PostgresSession, order_key: str
+) -> bool:
     """Return whether an order belongs to a map with ambiguous draft identity."""
     return (
         connection.execute(
@@ -912,18 +926,25 @@ def _draft_conflict_for_order(connection: sqlite3.Connection, order_key: str) ->
             WHERE orders.order_key=? AND anchor.status='conflict'
               AND (
                     anchor.conflict_at IS NULL
-                    OR julianday(anchor.conflict_at) IS NULL
-                    OR julianday(orders.signal_transport_at) IS NULL
-                    OR julianday(anchor.conflict_at)
-                         <= julianday(orders.signal_transport_at)
+                    OR live_text_timestamp_utc(anchor.conflict_at) IS NULL
+                    OR live_text_timestamp_utc(
+                           orders.signal_transport_at
+                       ) IS NULL
+                    OR live_text_timestamp_utc(anchor.conflict_at)
+                         <= live_text_timestamp_utc(orders.signal_transport_at)
                     OR EXISTS (
                          SELECT 1 FROM vision_draft_conflicts AS conflict
                           WHERE conflict.raybet_match_id=anchor.raybet_match_id
                             AND conflict.map_number=anchor.map_number
                             AND (
-                                  julianday(conflict.captured_at) IS NULL
-                                  OR julianday(conflict.captured_at)
-                                       <= julianday(orders.signal_transport_at)
+                                  live_text_timestamp_utc(
+                                      conflict.captured_at
+                                  ) IS NULL
+                                  OR live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     ) <= live_text_timestamp_utc(
+                                         orders.signal_transport_at
+                                     )
                             )
                     )
               )
@@ -935,7 +956,7 @@ def _draft_conflict_for_order(connection: sqlite3.Connection, order_key: str) ->
 
 
 def _suppress_locked(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     outbox_id: int,
     reason: str,
     *,
@@ -957,7 +978,7 @@ def _suppress_locked(
 
 
 def quarantine_outbox(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     outbox_id: int,
     reason: str,
@@ -1009,7 +1030,7 @@ def quarantine_outbox(
 
 
 def claim(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     now: datetime | None = None,
     lease_seconds: int = 300,
@@ -1025,10 +1046,13 @@ def claim(
             row = connection.execute(
                 """SELECT * FROM notification_outbox
                     WHERE ((status='pending' AND next_attempt_at IS NOT NULL
-                            AND next_attempt_at<=?)
+                            AND live_text_timestamp_utc(next_attempt_at)<=
+                                CAST(? AS timestamptz))
                        OR (status='leased' AND lease_until IS NOT NULL
-                            AND lease_until<=?))
-                    ORDER BY next_attempt_at, outbox_id LIMIT 1""",
+                            AND live_text_timestamp_utc(lease_until)<=
+                                CAST(? AS timestamptz)))
+                    ORDER BY live_text_timestamp_utc(next_attempt_at), outbox_id
+                    LIMIT 1 FOR UPDATE SKIP LOCKED""",
                 (_iso(now), _iso(now)),
             ).fetchone()
             if row is None:
@@ -1043,7 +1067,8 @@ def claim(
                       attempt_count=attempt_count+1, updated_at=?
                 WHERE outbox_id=?
                   AND (status='pending' OR
-                       (status='leased' AND lease_until<=?))""",
+                       (status='leased' AND live_text_timestamp_utc(lease_until)<=
+                           CAST(? AS timestamptz)))""",
             (token, _iso(lease_until), _iso(now), int(row["outbox_id"]), _iso(now)),
         )
         if changed.rowcount != 1:
@@ -1056,7 +1081,7 @@ def claim(
 
 
 def mark_sent(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     outbox_id: int,
     lease_token: str,
@@ -1111,7 +1136,7 @@ def mark_sent(
 
 
 def ensure_sendable(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     outbox_id: int,
     lease_token: str,
@@ -1123,7 +1148,9 @@ def ensure_sendable(
         row = connection.execute(
             """SELECT * FROM notification_outbox
                 WHERE outbox_id=? AND status='leased' AND lease_token=?
-                  AND lease_until IS NOT NULL AND lease_until>?""",
+                  AND lease_until IS NOT NULL
+                  AND live_text_timestamp_utc(lease_until)>
+                      CAST(? AS timestamptz)""",
             (outbox_id, lease_token, _iso(now)),
         ).fetchone()
         if row is None:
@@ -1136,7 +1163,7 @@ def ensure_sendable(
 
 
 def mark_failure(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     outbox_id: int,
     lease_token: str,
@@ -1189,7 +1216,7 @@ def mark_failure(
 
 
 def requeue_dead_letter(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     outbox_id: int,
     actor: str,
@@ -1234,7 +1261,7 @@ def requeue_dead_letter(
         return True
 
 
-def _row(row: sqlite3.Row) -> OutboxRecord:
+def _row(row: DatabaseRow) -> OutboxRecord:
     return OutboxRecord(
         outbox_id=int(row["outbox_id"]),
         order_key=str(row["order_key"]),
@@ -1257,27 +1284,9 @@ def _row(row: sqlite3.Row) -> OutboxRecord:
 
 
 @contextmanager
-def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
-    if connection.in_transaction:
-        name = f"notification_{uuid.uuid4().hex}"
-        connection.execute(f"SAVEPOINT {name}")
-        try:
-            yield
-        except BaseException:
-            connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-            raise
-        else:
-            connection.execute(f"RELEASE SAVEPOINT {name}")
-        return
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+def _transaction(connection: PostgresSession) -> Iterator[None]:
+    with connection.transaction():
         yield
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
 
 
 def _iso(value: datetime) -> str:

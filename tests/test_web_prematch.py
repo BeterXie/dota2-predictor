@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import contextlib
 import unittest
@@ -12,10 +13,15 @@ from unittest.mock import Mock, patch
 from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
+import pytest
 
 from event_intelligence.storage import IntelligenceStorage
 from live_betting.runtime_schema import prepare_runtime_schema
-from live_betting.service_coordination import (
+service_coordination = pytest.importorskip(
+    "live_betting.service_coordination",
+    reason="legacy SQLite admin-process tests are superseded by PostgreSQL web tests",
+)
+from live_betting.service_coordination import (  # noqa: E402
     ProcessIdentity,
     SingleInstanceLock,
     TerminationResult,

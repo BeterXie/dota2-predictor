@@ -11,10 +11,13 @@ import hashlib
 import json
 import math
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from event_intelligence.draft_artifacts import (
     DraftCalibrationArtifact,
@@ -235,7 +238,7 @@ class DraftCurve:
 
 
 def build_draft_curve(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     radiant_heroes: tuple[int, ...],
     dire_heroes: tuple[int, ...],
     as_of_start_time: int,
@@ -266,7 +269,7 @@ def build_draft_curve(
         return _unavailable(as_of_start_time, "prospective_draft_target_missing")
     try:
         authority_before = _draft_authority_generation(connection)
-    except (sqlite3.Error, TypeError, ValueError):
+    except (SQLAlchemyError, TypeError, ValueError):
         return _unavailable(as_of_start_time, "prospective_draft_authority_missing")
 
     lineup_hash = _lineup_hash(radiant_heroes, dire_heroes)
@@ -287,7 +290,7 @@ def build_draft_curve(
                   AND lineup_hash=?""",
             (*target, lineup_hash),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _unavailable(as_of_start_time, "validated_live_draft_prediction_missing")
     if not curves:
         return _unavailable(as_of_start_time, "validated_live_draft_prediction_missing")
@@ -397,7 +400,7 @@ def build_draft_curve(
             )
             for item in landmarks
         )
-    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError):
+    except (json.JSONDecodeError, SQLAlchemyError, TypeError, ValueError):
         return _unavailable(as_of_start_time, "prospective_draft_artifact_invalid")
     if not points:
         return _unavailable(as_of_start_time, "prospective_draft_landmarks_missing")
@@ -407,7 +410,7 @@ def build_draft_curve(
             connection,
             str(row[17]),
         )
-    except (sqlite3.Error, TypeError, ValueError):
+    except (SQLAlchemyError, TypeError, ValueError):
         return _unavailable(as_of_start_time, "prospective_draft_authority_missing")
     if (
         authority_after[1:] != authority_before[1:]
@@ -471,7 +474,7 @@ def _utc_timestamp(value: object) -> datetime:
 
 @lru_cache(maxsize=1)
 def _cached_history(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     dependency_revision: int,
 ):
     if dependency_revision < 1:
@@ -503,7 +506,7 @@ def _curve_identity_matches(
 
 
 def _curve_feature_snapshot(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: object,
     *,
     target: tuple[str, int, int],
@@ -585,7 +588,7 @@ def _curve_feature_snapshot(
                 WHERE deployment_key=?""",
             (deployment_key,),
         ).fetchone()
-    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError):
+    except (json.JSONDecodeError, SQLAlchemyError, TypeError, ValueError):
         return None
     expected_anchor_hash = hashlib.sha256(
         json.dumps(
@@ -658,7 +661,7 @@ def _curve_feature_snapshot(
             history=history,
         )
         after = _draft_authority_generation(connection)
-    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError):
+    except (json.JSONDecodeError, SQLAlchemyError, TypeError, ValueError):
         return None
     if (
         after[1:] != before[1:]
@@ -671,7 +674,7 @@ def _curve_feature_snapshot(
 
 
 def _curve_authority_matches(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: object,
     *,
     target: tuple[str, int, int],
@@ -692,7 +695,7 @@ def _curve_authority_matches(
     )
 
 
-def _curve_row_by_key(connection: sqlite3.Connection, curve_key: str):
+def _curve_row_by_key(connection: PostgresSession, curve_key: str) -> DatabaseRow | None:
     return connection.execute(
         """SELECT curve_key, raybet_match_id, map_number, strict_mapping_id,
                   lineup_hash, radiant_hero_ids_json, dire_hero_ids_json,
@@ -712,7 +715,7 @@ def _curve_row_by_key(connection: sqlite3.Connection, curve_key: str):
 
 @lru_cache(maxsize=1024)
 def _cached_curve_authority_matches_by_key(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     curve_key: str,
     authority_revision: int,
     dependency_revision: int,
@@ -739,7 +742,7 @@ def _cached_curve_authority_matches_by_key(
 
 
 def prospective_curve_authority_matches(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     curve_key: str,
 ) -> bool:
     try:
@@ -751,13 +754,13 @@ def prospective_curve_authority_matches(
             before[2],
         )
         after = _draft_authority_generation(connection)
-    except (sqlite3.Error, TypeError, ValueError):
+    except (SQLAlchemyError, TypeError, ValueError):
         return False
     return after[1:] == before[1:] and result
 
 
 def _curve_feature_snapshot_by_key(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     curve_key: str,
 ) -> DraftFeatureSnapshot | None:
     try:
@@ -776,7 +779,7 @@ def _curve_feature_snapshot_by_key(
             dire_heroes=dire_heroes,
         )
         after = _draft_authority_generation(connection)
-    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError):
+    except (json.JSONDecodeError, SQLAlchemyError, TypeError, ValueError):
         return None
     if after[1:] != before[1:]:
         return None
@@ -809,7 +812,7 @@ def _cached_calibration(artifact_json: str) -> DraftCalibrationArtifact:
 
 
 def _verify_prospective_calibration_evidence(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     calibration: DraftCalibrationArtifact,
 ) -> bool:
     if calibration.evidence_mode != "prospective":
@@ -951,11 +954,11 @@ def _verify_prospective_calibration_evidence(
                                 AND conflict.map_number=earlier.map_number
                          )
                          AND (
-                             julianday(earlier.first_usable_at)<
-                                 julianday(curve.first_usable_at)
+                             live_text_timestamp_utc(earlier.first_usable_at)<
+                                 live_text_timestamp_utc(curve.first_usable_at)
                              OR (
-                                 julianday(earlier.first_usable_at)=
-                                     julianday(curve.first_usable_at)
+                                 live_text_timestamp_utc(earlier.first_usable_at)=
+                                     live_text_timestamp_utc(curve.first_usable_at)
                                  AND earlier.curve_key<curve.curve_key
                              )
                          )
@@ -1066,24 +1069,26 @@ def _verify_prospective_calibration_evidence(
 
 
 def _draft_authority_generation(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> tuple[int, int, int]:
-    data_version_row = connection.execute("PRAGMA data_version").fetchone()
-    authority_row = connection.execute(
-        """SELECT authority_revision FROM draft_authority_revisions
-            WHERE singleton=1"""
+    row = connection.execute(
+        """SELECT deployment.artifact_revision,
+                  authority.authority_revision,
+                  lineage.dependency_revision
+             FROM draft_deployment_revisions AS deployment
+             JOIN draft_authority_revisions AS authority
+               ON authority.singleton=deployment.singleton
+             JOIN draft_lineage_revisions AS lineage
+               ON lineage.singleton=deployment.singleton
+            WHERE deployment.singleton=1"""
     ).fetchone()
-    dependency_row = connection.execute(
-        """SELECT dependency_revision FROM draft_lineage_revisions
-            WHERE singleton=1"""
-    ).fetchone()
-    if data_version_row is None or authority_row is None or dependency_row is None:
+    if row is None:
         raise ValueError("draft authority revision is unavailable")
-    return int(data_version_row[0]), int(authority_row[0]), int(dependency_row[0])
+    return int(row[0]), int(row[1]), int(row[2])
 
 
 def _draft_deployment_generation(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment_key: str,
 ) -> tuple[int, tuple[int, ...]]:
     row = connection.execute(
@@ -1146,7 +1151,7 @@ def _draft_deployment_generation(
 
 @lru_cache(maxsize=64)
 def _cached_live_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment_key: str,
     artifact_revision: int,
     dependency_generation: tuple[int, ...],
@@ -1163,7 +1168,7 @@ def _cached_live_frozen_deployment(
 
 
 def _live_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment_key: str,
 ) -> FrozenDraftDeployment:
     before = _draft_deployment_generation(connection, deployment_key)
@@ -1188,7 +1193,7 @@ def _live_frozen_deployment(
 
 @lru_cache(maxsize=256)
 def _cached_prospective_calibration_evidence_matches(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     calibration_hash: str,
     calibration: DraftCalibrationArtifact,
     authority_revision: int,
@@ -1200,7 +1205,7 @@ def _cached_prospective_calibration_evidence_matches(
 
 
 def _prospective_calibration_evidence_matches(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     calibration: DraftCalibrationArtifact,
 ) -> bool:
     if calibration.evidence_mode != "prospective":
@@ -1215,7 +1220,7 @@ def _prospective_calibration_evidence_matches(
             before[2],
         )
         after = _draft_authority_generation(connection)
-    except (sqlite3.Error, TypeError, ValueError):
+    except (SQLAlchemyError, TypeError, ValueError):
         return False
     # data_version may advance for unrelated odds or health writes. Relevant
     # mutations atomically advance one of the two targeted revisions instead.
@@ -1225,7 +1230,7 @@ def _prospective_calibration_evidence_matches(
 
 
 def _draft_point_from_row(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     row: object,
     *,
     deployment: FrozenDraftDeployment,

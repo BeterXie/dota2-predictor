@@ -6,22 +6,19 @@ import argparse
 import json
 import math
 import re
-import sqlite3
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Collection, Sequence
 
+from database.session import PostgresSession
+
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
 from event_intelligence.raw_archive import canonical_json_bytes  # noqa: E402
 from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 from event_intelligence.team_profiles import (  # noqa: E402
@@ -38,7 +35,6 @@ from event_intelligence.team_states import (  # noqa: E402
     TeamObjective,
     build_team_map_states,
 )
-from fetch.db import Database  # noqa: E402
 
 
 UTC = timezone.utc
@@ -83,7 +79,7 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _load_strict_maps(connection: sqlite3.Connection) -> tuple[StrictMap, ...]:
+def _load_strict_maps(connection: PostgresSession) -> tuple[StrictMap, ...]:
     rows = connection.execute(
         """SELECT f.match_id, f.event_id, m.start_time, m.duration,
                   m.radiant_win, m.radiant_team_id, m.dire_team_id, m.patch,
@@ -148,7 +144,7 @@ def _load_strict_maps(connection: sqlite3.Connection) -> tuple[StrictMap, ...]:
 
 
 def _gold_curve(
-    connection: sqlite3.Connection, match: StrictMap
+    connection: PostgresSession, match: StrictMap
 ) -> tuple[int | float | None, ...] | None:
     rows = connection.execute(
         """SELECT time_min, value FROM gold_advantage
@@ -266,7 +262,7 @@ def _deduplicated_roshans(
 
 
 def _objectives(
-    connection: sqlite3.Connection, match: StrictMap
+    connection: PostgresSession, match: StrictMap
 ) -> tuple[TeamObjective, ...] | None:
     if not match.objective_source_complete:
         return None
@@ -351,7 +347,7 @@ def _opponent_strength(
 
 
 def _roster(
-    connection: sqlite3.Connection, match_id: int, team_id: int, side: Side
+    connection: PostgresSession, match_id: int, team_id: int, side: Side
 ) -> tuple[int, ...]:
     rows = connection.execute(
         """SELECT DISTINCT account_id FROM match_players
@@ -368,7 +364,7 @@ def _json(value: Any) -> str:
 
 
 def _persist_state(
-    connection: sqlite3.Connection, state: TeamMapState, created_at: str
+    connection: PostgresSession, state: TeamMapState, created_at: str
 ) -> None:
     conversion = asdict(state.objective_conversion)
     crossings = [asdict(value) for value in state.crossings]
@@ -426,7 +422,7 @@ def _persist_state(
 
 
 def _persist_profile(
-    connection: sqlite3.Connection, profile: TeamStyleProfile, created_at: str
+    connection: PostgresSession, profile: TeamStyleProfile, created_at: str
 ) -> None:
     weighting = {
         "availability_mode": profile.availability_mode.value,
@@ -462,7 +458,7 @@ def _persist_profile(
 
 
 def build_strict_profiles(
-    database: Path,
+    storage: IntelligenceStorage,
     cutoff: datetime,
     *,
     match_ids: Collection[int] | None = None,
@@ -470,12 +466,10 @@ def build_strict_profiles(
     if cutoff.tzinfo is None or cutoff.utcoffset() is None:
         raise ValueError("cutoff must be timezone-aware")
     cutoff = cutoff.astimezone(UTC)
-    storage = IntelligenceStorage(database)
-    try:
-        storage.init_schema()
-        Database(connection=storage.connection).init_db()
-        connection = storage.connection
-        maps = _load_strict_maps(connection)
+    storage.init_schema(seed_events=False)
+    connection = storage.connection
+    maps = _load_strict_maps(connection)
+    with connection.transaction():
         selected_ids = None if match_ids is None else {int(value) for value in match_ids}
         available_ids = {match.match_id for match in maps}
         missing_ids = set() if selected_ids is None else selected_ids - available_ids
@@ -579,15 +573,13 @@ def build_strict_profiles(
                 )
                 _persist_profile(connection, profile, created_at)
                 profiles.append(profile)
-        return BuildReport(
-            formal_maps=len(maps),
-            state_rows=state_count,
-            unscorable_state_rows=unscorable_count,
-            profile_rows=len(profiles),
-            cutoff=cutoff.isoformat(),
-        )
-    finally:
-        storage.close()
+    return BuildReport(
+        formal_maps=len(maps),
+        state_rows=state_count,
+        unscorable_state_rows=unscorable_count,
+        profile_rows=len(profiles),
+        cutoff=cutoff.isoformat(),
+    )
 
 
 def _cutoff(value: str) -> datetime:
@@ -599,7 +591,7 @@ def _cutoff(value: str) -> datetime:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument("--database-url", help="PostgreSQL URL (default: DATABASE_URL)")
     parser.add_argument(
         "--cutoff",
         type=_cutoff,
@@ -611,11 +603,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    with database_writer_authority(args.database):
+    storage = IntelligenceStorage(args.database_url)
+    try:
+        storage.init_schema(seed_events=False)
         report = build_strict_profiles(
-            args.database,
+            storage,
             args.cutoff or datetime.now(UTC),
         )
+    finally:
+        storage.close()
     print(json.dumps(asdict(report), sort_keys=True))
     return 0
 

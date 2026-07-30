@@ -8,8 +8,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from shared.sqlite import connect as connect_sqlite
+from sqlalchemy import bindparam, text
 from sklearn.impute import SimpleImputer
+
+from database.engine import build_engine
 
 
 def _read_parquet(path: str) -> pd.DataFrame:
@@ -148,7 +150,7 @@ def _aggregate_draft_features(draft_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_training_data(
     features_dir: str,
-    db_path: str,
+    database_url: str | None,
 ) -> tuple[pd.DataFrame, pd.Series, list[str], pd.Series]:
     """Read, join, and impute all feature tables.
 
@@ -186,7 +188,7 @@ def build_training_data(
             X = X.join(side_df.drop(columns=overlap), how="left")
 
     # Get start_time from database
-    start_times = _get_start_times(db_path, X.index.tolist())
+    start_times = _get_start_times(database_url, X.index.tolist())
 
     # Store feature names before imputation
     feature_names = list(X.columns)
@@ -217,21 +219,25 @@ def build_training_data(
     return X_imputed, y, feature_names, start_times, imputer
 
 
-def _get_start_times(db_path: str, match_ids: list[int]) -> pd.Series:
+def _get_start_times(database_url: str | None, match_ids: list[int]) -> pd.Series:
     """Fetch match start_times from the database."""
-    conn = connect_sqlite(db_path, read_only=True)
+    if not match_ids:
+        return pd.Series(dtype="int64", name="start_time")
+    engine = build_engine(database_url)
     try:
-        placeholders = ",".join("?" for _ in match_ids)
-        rows = conn.execute(
-            f"SELECT match_id, start_time FROM matches WHERE match_id IN ({placeholders})",
-            match_ids,
-        ).fetchall()
+        statement = text(
+            "SELECT match_id, start_time FROM matches WHERE match_id IN :match_ids"
+        ).bindparams(bindparam("match_ids", expanding=True))
+        with engine.connect() as connection:
+            rows = connection.execute(
+                statement, {"match_ids": match_ids}
+            ).fetchall()
         return pd.Series(
             {r[0]: r[1] for r in rows},
             name="start_time",
         )
     finally:
-        conn.close()
+        engine.dispose()
 
 
 def split_train_test(

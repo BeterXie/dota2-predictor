@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import math
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -203,7 +206,7 @@ def authority_from_row(
 
 
 def draft_landmark_authority_matches(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     authority: DraftLandmarkAuthority,
     *,
     raybet_match_id: str,
@@ -267,7 +270,7 @@ def draft_landmark_authority_matches(
         first_usable = _utc(row[6])
         created = _utc(row[7])
         as_of = observed_at.astimezone(timezone.utc)
-    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError):
+    except (json.JSONDecodeError, SQLAlchemyError, TypeError, ValueError):
         return False
     exact = (
         (str(row[0]), int(row[1]), int(row[2]))
@@ -325,7 +328,7 @@ def draft_landmark_authority_matches(
                        ON lineage.singleton=authority.singleton
                     WHERE authority.singleton=1"""
             ).fetchone()
-        except sqlite3.Error:
+        except SQLAlchemyError:
             return False
         if revisions is None or tuple(revisions) != (
             authority.authority_revision,
@@ -339,7 +342,7 @@ def draft_landmark_authority_matches(
             return prospective_curve_authority_matches(
                 connection, authority.curve_key
             )
-        except (ImportError, sqlite3.Error, TypeError, ValueError):
+        except (ImportError, SQLAlchemyError, TypeError, ValueError):
             return False
     return True
 

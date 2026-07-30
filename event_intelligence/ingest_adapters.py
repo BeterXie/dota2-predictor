@@ -1,17 +1,17 @@
-"""Concrete registry and SQLite ports for strict event ingestion."""
+"""Concrete registry and PostgreSQL ports for strict event ingestion."""
 
 from __future__ import annotations
 
 import copy
 import json
 import re
-import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from fetch.db import Database
+from database.session import DatabaseRow
+from fetch.postgres_store import CoreMatchStore
 
 from .facts import CompletedMatchFacts, ComponentStatus
 from .ingest import (
@@ -87,7 +87,7 @@ def _artifact_id(source: str, content_hash: str) -> str:
 
 
 @dataclass(frozen=True)
-class SQLiteIngestStatus:
+class PostgresIngestStatus:
     event_id: str
     match_id: int
     attempt_count: int
@@ -159,20 +159,20 @@ class RegistryIngestAdapter:
         return ScopeDecision(True, "approved_registry_scope")
 
 
-class SQLiteIngestAdapter:
+class PostgresIngestAdapter:
     """Persist ingest state and normalize accepted versions in one transaction."""
 
     def __init__(
         self,
         storage: IntelligenceStorage,
         registry: EventRegistry,
-        legacy_database: Database | None = None,
+        core_match_store: CoreMatchStore | None = None,
     ) -> None:
         self.storage = storage
         self.connection = storage.connection
         self.registry = registry
         self.registry_port = RegistryIngestAdapter(registry)
-        self.legacy_database = legacy_database or Database(connection=self.connection)
+        self.core_match_store = core_match_store or CoreMatchStore(engine=storage.engine)
 
     def record_discovered_match(
         self,
@@ -213,11 +213,12 @@ class SQLiteIngestAdapter:
             if existing is not None and str(existing["event_id"]) != event.event_id:
                 raise ValueError(f"match {match_id} already belongs to another event")
             cursor = self.connection.execute(
-                """INSERT OR IGNORE INTO match_ingest_status
+                """INSERT INTO match_ingest_status
                    (match_id, event_id, start_time, series_id, stage_scope,
                     stage_in_scope, has_valid_result, is_exhibition, is_forfeit,
                     is_void_remake, discovered_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 1, 0, 0, 0, 0, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, 1, 0, 0, 0, 0, ?, ?)
+                   ON CONFLICT (match_id) DO NOTHING""",
                 (
                     match_id,
                     event.event_id,
@@ -311,7 +312,7 @@ class SQLiteIngestAdapter:
         ).fetchall()
         return tuple(int(row["match_id"]) for row in rows)
 
-    def get_ingest_status(self, match_id: int) -> SQLiteIngestStatus | None:
+    def get_ingest_status(self, match_id: int) -> PostgresIngestStatus | None:
         row = self.connection.execute(
             """SELECT event_id, match_id, retry_count, detailed_parse_state,
                       next_retry_at, latest_raw_content_hash, start_time,
@@ -322,7 +323,7 @@ class SQLiteIngestAdapter:
         if row is None:
             return None
         missing = tuple(str(value) for value in json.loads(row["missing_fields_json"]))
-        return SQLiteIngestStatus(
+        return PostgresIngestStatus(
             event_id=str(row["event_id"]),
             match_id=int(row["match_id"]),
             attempt_count=int(row["retry_count"]),
@@ -473,7 +474,7 @@ class SQLiteIngestAdapter:
                            next_retry_at=?, last_attempt_at=?, last_error=NULL, updated_at=?
                        WHERE match_id=?""",
                     (
-                        int(bool(values["detail_complete"])),
+                        bool(values["detail_complete"]),
                         _iso(values.get("next_retry_at")),  # type: ignore[arg-type]
                         _iso(values["attempted_at"]),  # type: ignore[arg-type]
                         _iso(values["attempted_at"]),  # type: ignore[arg-type]
@@ -503,8 +504,8 @@ class SQLiteIngestAdapter:
                            last_error=?, next_retry_at=?, last_attempt_at=?, updated_at=?
                        WHERE match_id=?""",
                     (
-                        int(correction),
-                        int(bool(values["detail_complete"])),
+                        correction,
+                        bool(values["detail_complete"]),
                         "content_correction_pending" if correction else "less_complete_raw_version",
                         _iso(values.get("next_retry_at")),  # type: ignore[arg-type]
                         _iso(values["attempted_at"]),  # type: ignore[arg-type]
@@ -545,10 +546,13 @@ class SQLiteIngestAdapter:
                 }
             )
             self.connection.executemany(
-                "INSERT OR IGNORE INTO heroes (hero_id) VALUES (?)",
-                ((hero_id,) for hero_id in hero_ids),
+                "INSERT INTO heroes (hero_id) VALUES (?) ON CONFLICT (hero_id) DO NOTHING",
+                [(hero_id,) for hero_id in hero_ids],
             )
-            self.legacy_database.insert_match(copy.deepcopy(dict(payload)), commit=False)
+            self.core_match_store.insert_match_with_connection(
+                self.connection.active_connection,
+                copy.deepcopy(dict(payload)),
+            )
             self._insert_exact_player_facts(
                 facts,
                 artifact_key,
@@ -579,7 +583,7 @@ class SQLiteIngestAdapter:
                     artifact_key,
                     content_hash,
                     processor_version,
-                    int(bool(values["detail_complete"])),
+                    bool(values["detail_complete"]),
                     _iso(values.get("next_retry_at")),  # type: ignore[arg-type]
                     _iso(values["attempted_at"]),  # type: ignore[arg-type]
                     _iso(first_usable_at),  # type: ignore[arg-type]
@@ -600,7 +604,7 @@ class SQLiteIngestAdapter:
 
     def _accept_version(
         self,
-        current: sqlite3.Row,
+        current: DatabaseRow,
         facts: object,
         incoming_missing: tuple[str, ...],
         artifact_unchanged: bool,
@@ -659,11 +663,12 @@ class SQLiteIngestAdapter:
             missing = tuple(key for key, value in values.items() if value is None)
             coverage = (len(values) - len(missing)) / len(values)
             self.connection.execute(
-                """INSERT OR IGNORE INTO player_map_facts
+                """INSERT INTO player_map_facts
                    (match_id, player_slot, account_id, team_id, hero_id, is_radiant,
                     facts_json, missing_fields_json, coverage, source_artifact_id,
                     source_content_hash, fact_version, first_usable_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (match_id, player_slot, fact_version) DO NOTHING""",
                 (
                     facts.match_id,
                     player.player_slot,
@@ -1029,8 +1034,8 @@ class SQLiteIngestAdapter:
 
     def _table_exists(self, name: str) -> bool:
         return self.connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-        ).fetchone() is not None
+            "SELECT to_regclass(?)", (name,)
+        ).fetchone()[0] is not None
 
     @staticmethod
     def _json(value: object) -> str:
@@ -1041,3 +1046,8 @@ class SQLiteIngestAdapter:
             sort_keys=True,
             default=lambda item: item.value if hasattr(item, "value") else str(item),
         )
+
+
+# Transitional import aliases; both names use PostgreSQL exclusively.
+SQLiteIngestStatus = PostgresIngestStatus
+SQLiteIngestAdapter = PostgresIngestAdapter

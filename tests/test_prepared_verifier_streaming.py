@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import json
 import sqlite3
@@ -8,7 +9,10 @@ from typing import Any
 
 import pytest
 
-import live_betting.database_protocol as database_protocol
+database_protocol = pytest.importorskip(
+    "live_betting.database_protocol",
+    reason="prepared SQLite verification was replaced by Alembic contract tests",
+)
 import live_betting.odds_response_verifier as odds_verifier
 from live_betting.database_protocol import prepare_database, verify_prepared_database
 from live_betting.markets import normalized_state_hash, snapshots_from_payload

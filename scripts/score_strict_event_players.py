@@ -7,22 +7,19 @@ import gzip
 import hashlib
 import json
 import math
-import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Collection, Iterable, Mapping, Sequence
 
+from database.session import PostgresSession
+
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
 from event_intelligence.benchmarks import (  # noqa: E402
     BENCHMARK_VERSION,
     BenchmarkObservation,
@@ -38,6 +35,7 @@ from event_intelligence.player_scoring import (  # noqa: E402
     transform_player_metrics,
 )
 from event_intelligence.raw_archive import canonical_json_bytes  # noqa: E402
+from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 
 
 UTC = timezone.utc
@@ -138,7 +136,7 @@ def _artifact_payload(path: Path, expected_hash: str) -> dict[str, Any]:
 
 
 def _resolve_assignment_version(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     requested: str | None,
     *,
     match_id: int | None,
@@ -173,9 +171,8 @@ def _resolve_assignment_version(
 
 
 def load_strict_maps(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
-    database_path: Path,
     match_id: int | None = None,
     assignment_version: str | None = None,
 ) -> tuple[StrictMap, ...]:
@@ -232,7 +229,7 @@ def load_strict_maps(
             raise ValueError("player_map_facts.facts_json must contain an object")
         artifact_path = Path(row["storage_path"])
         if not artifact_path.is_absolute():
-            artifact_path = database_path.resolve().parent / artifact_path
+            artifact_path = artifact_path.resolve()
         value = StrictPlayerFact(
             match_id=int(row["match_id"]),
             player_slot=int(row["player_slot"]),
@@ -701,16 +698,14 @@ def _json(value: object) -> str:
 
 
 def persist_scores(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     rows: Sequence[ScoredRow],
     *,
     dry_run: bool,
 ) -> tuple[int, int, int]:
     inserted = updated = unchanged = 0
     now = datetime.now(UTC).isoformat()
-    if not dry_run:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         for row in rows:
             score = row.score
             existing = connection.execute(
@@ -805,17 +800,11 @@ def persist_scores(
                     now,
                 ),
             )
-        if not dry_run:
-            connection.commit()
-    except BaseException:
-        if not dry_run:
-            connection.rollback()
-        raise
     return inserted, updated, unchanged
 
 
 def run_scoring(
-    database: Path,
+    storage: IntelligenceStorage,
     *,
     dry_run: bool = False,
     match_id: int | None = None,
@@ -826,21 +815,13 @@ def run_scoring(
     if match_id is not None and match_ids is not None:
         raise ValueError("match_id and match_ids are mutually exclusive")
     selected_ids = None if match_ids is None else {int(value) for value in match_ids}
-    database = database.resolve()
-    if dry_run:
-        connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
-    else:
-        connection = sqlite3.connect(database)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=5000")
-    try:
+    connection = storage.connection
+    with connection.transaction():
         resolved_assignment_version = _resolve_assignment_version(
             connection, assignment_version, match_id=match_id
         )
         games = load_strict_maps(
             connection,
-            database_path=database,
             assignment_version=resolved_assignment_version,
         )
         available_ids = {game.match_id for game in games}
@@ -857,21 +838,19 @@ def run_scoring(
             target_match_id=match_id,
             target_match_ids=selected_ids,
         )
-        inserted, updated, unchanged = persist_scores(
-            connection, scores, dry_run=dry_run
-        )
-        return ScoreReport(
-            score_version_for_role(resolved_assignment_version),
-            BENCHMARK_VERSION,
-            dry_run,
-            len(games) if requested_ids is None else len(requested_ids),
-            len(scores),
-            inserted,
-            updated,
-            unchanged,
-        )
-    finally:
-        connection.close()
+    inserted, updated, unchanged = persist_scores(
+        connection, scores, dry_run=dry_run
+    )
+    return ScoreReport(
+        score_version_for_role(resolved_assignment_version),
+        BENCHMARK_VERSION,
+        dry_run,
+        len(games) if requested_ids is None else len(requested_ids),
+        len(scores),
+        inserted,
+        updated,
+        unchanged,
+    )
 
 
 def _positive_int(value: str) -> int:
@@ -883,7 +862,7 @@ def _positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument("--database-url", help="PostgreSQL URL (default: DATABASE_URL)")
     parser.add_argument("--match", type=_positive_int, help="one formal match ID")
     parser.add_argument("--assignment-version", help="pin observed-position version")
     parser.add_argument("--min-samples", type=_positive_int, default=5)
@@ -893,14 +872,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    with database_writer_authority(args.database):
+    storage = IntelligenceStorage(args.database_url)
+    try:
+        storage.init_schema(seed_events=False)
         report = run_scoring(
-            args.database,
+            storage,
             dry_run=args.dry_run,
             match_id=args.match,
             assignment_version=args.assignment_version,
             min_samples=args.min_samples,
         )
+    finally:
+        storage.close()
     print(_json(report.__dict__))
     return 0
 

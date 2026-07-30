@@ -8,18 +8,20 @@ import json
 import math
 import os
 import re
-import sqlite3
 import sys
-import tempfile
 import time
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import psutil
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+
+from database.engine import build_engine, require_database_url
+from database.session import DatabaseRow, PostgresSession
 
 from event_intelligence.backtest import (
     HORIZONS,
@@ -63,25 +65,17 @@ from event_intelligence.draft_model import (
 )
 from event_intelligence.models import RolePurpose
 from event_intelligence.roles import RoleSource
-from shared.sqlite import connect
-
-from .database_protocol import verify_prepared_database
 from .draft_evidence import (
     draft_dependency_snapshot_reason,
     prospective_outcome_authority,
 )
 from .health import record_health
-from .service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
 from .storage import LiveBettingStore
 from .strict_eligibility import StrictLiveMapMapping, query_strict_live_eligibility
 from .vision import VisionObservation
 from .vision_frame_registry import verify_registered_vision_frame
 
 
-ROOT = Path(__file__).resolve().parents[1]
 PUBLISHER_VERSION = "prospective-draft-publisher-v2"
 PUBLISHER_COMPONENT = "draft_publisher_worker"
 LINEUP_ROLE_VERSION = "live-unknown-role-v1"
@@ -258,54 +252,37 @@ def _publisher_process_details() -> dict[str, object]:
 
 
 @contextmanager
-def publisher_singleton_lock(database: Path) -> Iterator[None]:
-    """Hold one OS-released lock for the publisher process lifetime."""
+def publisher_singleton_lock(database_url: str) -> Iterator[None]:
+    """Hold one PostgreSQL advisory lock for the publisher process lifetime."""
 
-    resolved = database.resolve()
+    resolved_url = require_database_url(database_url)
+    digest = hashlib.sha256(
+        f"draft-publisher:{resolved_url}".encode("utf-8")
+    ).hexdigest()
+    lock_key = int(digest[:16], 16)
+    if lock_key >= 2**63:
+        lock_key -= 2**64
+    engine = build_engine(resolved_url)
+    connection = engine.connect()
     try:
-        stat = resolved.stat()
-    except FileNotFoundError:
-        identity = f"path:{os.path.normcase(str(resolved))}"
-    else:
-        identity = f"file:{stat.st_dev}:{stat.st_ino}"
-    lock_name = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    lock_path = (
-        Path(tempfile.gettempdir())
-        / "dota2-predictor-publisher-locks"
-        / f"{lock_name}.lock"
-    )
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+b")
-    handle.seek(0, os.SEEK_END)
-    if handle.tell() == 0:
-        handle.write(b"\0")
-        handle.flush()
-    handle.seek(0)
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as error:
-        handle.close()
-        raise RuntimeError("draft publisher is already running for this database") from error
-    try:
+        acquired = bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            ).scalar_one()
+        )
+        if not acquired:
+            raise RuntimeError("draft publisher is already running for this database")
         yield
     finally:
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        try:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+        finally:
+            connection.close()
+            engine.dispose()
 
 
 @dataclass(frozen=True)
@@ -417,7 +394,7 @@ def _deployment_identity(
 
 
 def _deployment_training_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment: FrozenDraftDeployment,
 ) -> str | None:
     return draft_dependency_snapshot_reason(
@@ -456,7 +433,7 @@ def _expected_calibration_row(
 
 
 def persist_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment: FrozenDraftDeployment,
     *,
     created_at: datetime,
@@ -492,7 +469,7 @@ def persist_frozen_deployment(
     if canonical_hash(identity) != deployment.deployment_key:
         raise ValueError("deployment key does not match its artifacts")
 
-    connection.execute("BEGIN IMMEDIATE")
+    connection.begin()
     try:
         dependency_reason = _deployment_training_reason(connection, deployment)
         if dependency_reason is not None:
@@ -665,7 +642,7 @@ def _hash_map(value: object, field: str) -> dict[int, str]:
 
 
 def _load_frozen_deployment_snapshot(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment_key: str | None,
     *,
     verify_authoritative_corpus: bool = True,
@@ -679,7 +656,8 @@ def _load_frozen_deployment_snapshot(
                       dependency_fingerprint, dependency_revision,
                       evidence_mode, created_at
                  FROM draft_deployment_bundles
-                ORDER BY julianday(created_at) DESC, deployment_key DESC
+                ORDER BY live_text_timestamp_utc(created_at) DESC,
+                         deployment_key DESC
                 LIMIT 1"""
         ).fetchone()
     else:
@@ -814,7 +792,7 @@ def _validate_deployment_key(deployment_key: str) -> str:
 
 
 def _assert_runtime_artifact_limits(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     model_hashes: Mapping[int, str],
     calibration_hashes: Mapping[int, str],
@@ -847,7 +825,7 @@ def _assert_runtime_artifact_limits(
 
 
 def _bounded_runtime_lineage_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment: FrozenDraftDeployment,
 ) -> tuple[int, str | None]:
     row = connection.execute(
@@ -890,7 +868,7 @@ def _bounded_runtime_lineage_reason(
 
 
 def _runtime_input_reasons(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     deployment: FrozenDraftDeployment,
     history: ProspectiveHistorySnapshot,
 ) -> tuple[str | None, str | None]:
@@ -907,7 +885,7 @@ def _runtime_input_reasons(
 
 
 def _runtime_deployment_generation(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> tuple[int, int]:
     artifact = connection.execute(
         """SELECT artifact_revision FROM draft_deployment_revisions
@@ -925,7 +903,7 @@ def _runtime_deployment_generation(
 
 
 def _runtime_pinned_deployment_generation(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> tuple[int, int]:
     artifact = connection.execute(
         """SELECT artifact_revision FROM draft_deployment_revisions
@@ -943,7 +921,7 @@ def _runtime_pinned_deployment_generation(
 
 
 def load_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     deployment_key: str,
 ) -> FrozenDraftDeployment | None:
@@ -952,7 +930,7 @@ def load_frozen_deployment(
     deployment_key = _validate_deployment_key(deployment_key)
     owns_snapshot = not connection.in_transaction
     if owns_snapshot:
-        connection.execute("BEGIN")
+        connection.begin()
     try:
         deployment = _load_frozen_deployment_snapshot(connection, deployment_key)
         if owns_snapshot:
@@ -965,11 +943,11 @@ def load_frozen_deployment(
 
 
 def load_latest_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> FrozenDraftDeployment | None:
     owns_snapshot = not connection.in_transaction
     if owns_snapshot:
-        connection.execute("BEGIN")
+        connection.begin()
     try:
         deployment = _load_frozen_deployment_snapshot(connection, None)
         if owns_snapshot:
@@ -982,7 +960,7 @@ def load_latest_frozen_deployment(
 
 
 def load_pinned_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     deployment_key: str,
 ) -> FrozenDraftDeployment | None:
@@ -991,7 +969,7 @@ def load_pinned_frozen_deployment(
     deployment_key = _validate_deployment_key(deployment_key)
     if connection.in_transaction:
         raise RuntimeError("pinned deployment load requires a fresh connection")
-    connection.execute("BEGIN")
+    connection.begin()
     try:
         loaded_generation = _runtime_pinned_deployment_generation(connection)
         deployment = _load_frozen_deployment_snapshot(
@@ -1046,7 +1024,7 @@ def _heroes(value: object, field: str) -> tuple[int, ...]:
     return tuple(payload)
 
 
-def _anchor_from_row(row: sqlite3.Row | Sequence[object]) -> DraftAnchor:
+def _anchor_from_row(row: DatabaseRow | Sequence[object]) -> DraftAnchor:
     radiant = _heroes(row[3], "radiant heroes")
     dire = _heroes(row[4], "dire heroes")
     if set(radiant) & set(dire):
@@ -1080,7 +1058,7 @@ def _anchor_from_row(row: sqlite3.Row | Sequence[object]) -> DraftAnchor:
     return anchor
 
 
-def ready_draft_anchors(connection: sqlite3.Connection) -> tuple[DraftAnchor, ...]:
+def ready_draft_anchors(connection: PostgresSession) -> tuple[DraftAnchor, ...]:
     rows = connection.execute(
         """SELECT anchor.raybet_match_id, anchor.map_number,
                   anchor.draft_hash, anchor.radiant_hero_ids,
@@ -1164,7 +1142,7 @@ def _unknown_player(
     )
 
 
-def _latest_patch(connection: sqlite3.Connection, cutoff: datetime) -> int | None:
+def _latest_patch(connection: PostgresSession, cutoff: datetime) -> int | None:
     try:
         row = connection.execute(
             """SELECT match.patch
@@ -1179,9 +1157,11 @@ def _latest_patch(connection: sqlite3.Connection, cutoff: datetime) -> int | Non
                   AND match.start_time IS NOT NULL
                   AND match.start_time<=?
                   AND status.first_usable_at IS NOT NULL
-                  AND julianday(status.first_usable_at)<=julianday(?)
+                  AND live_text_timestamp_utc(status.first_usable_at)<=
+                      CAST(? AS timestamptz)
                   AND artifact.first_usable_at IS NOT NULL
-                  AND julianday(artifact.first_usable_at)<=julianday(?)
+                  AND live_text_timestamp_utc(artifact.first_usable_at)<=
+                      CAST(? AS timestamptz)
                 ORDER BY match.start_time DESC, match.match_id DESC LIMIT 1""",
             (
                 int(cutoff.timestamp()),
@@ -1189,13 +1169,13 @@ def _latest_patch(connection: sqlite3.Connection, cutoff: datetime) -> int | Non
                 cutoff.isoformat(),
             ),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return None
     return None if row is None else int(row[0])
 
 
 def build_live_draft_target(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     anchor: DraftAnchor,
     mapping: StrictLiveMapMapping,
     cutoff: datetime,
@@ -1281,7 +1261,7 @@ def _curve_key(
 
 
 def _existing_curve(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     anchor: DraftAnchor,
     mapping_id: int,
     deployment_key: str,
@@ -1318,7 +1298,7 @@ def _existing_curve(
 
 
 def draft_anchor_frames_are_authoritative(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     anchor: DraftAnchor,
 ) -> bool:
     refs = {
@@ -1416,7 +1396,7 @@ def draft_anchor_frames_are_authoritative(
 
 
 def publish_anchor_curve(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     anchor: DraftAnchor,
     deployment: FrozenDraftDeployment,
@@ -1589,7 +1569,7 @@ def publish_anchor_curve(
         f"draft-history-fingerprint:{history.dependency_fingerprint}",
     ]
 
-    connection.execute("BEGIN IMMEDIATE")
+    connection.begin()
     try:
         deployment_reason, history_reason = _runtime_input_reasons(
             connection,
@@ -1763,7 +1743,7 @@ def publish_anchor_curve(
 
 
 def append_prospective_outcomes(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     created_at: datetime,
 ) -> int:
@@ -1794,7 +1774,8 @@ def append_prospective_outcomes(
              LEFT JOIN prospective_draft_outcomes AS outcome
                ON outcome.curve_key=curve.curve_key
             WHERE outcome.curve_key IS NULL
-              AND julianday(curve.first_usable_at)<julianday(result.settled_at)
+              AND live_text_timestamp_utc(curve.first_usable_at)<
+                  live_text_timestamp_utc(result.settled_at)
             ORDER BY result.settled_at, curve.curve_key"""
     ).fetchall()
     inserted = 0
@@ -1878,11 +1859,12 @@ def append_prospective_outcomes(
             continue
         first_usable_at = max(now, *availability_times)
         cursor = connection.execute(
-            """INSERT OR IGNORE INTO prospective_draft_outcomes
+            """INSERT INTO prospective_draft_outcomes
                (curve_key, strict_mapping_id, dota_match_id, radiant_win,
                 winner_side, evidence_ref, evidence_hash, settled_at,
                 first_usable_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
             (
                 str(row[0]),
                 int(row[3]),
@@ -1902,7 +1884,7 @@ def append_prospective_outcomes(
 
 
 def _prospective_calibration_samples(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     model_hash: str,
     horizon_minutes: int,
@@ -1974,7 +1956,8 @@ def _prospective_calibration_samples(
                ON invalidation.mapping_id=mapping.mapping_id
             WHERE invalidation.mapping_id IS NULL
               AND landmark.raw_radiant_probability IS NOT NULL
-              AND julianday(curve.first_usable_at)<julianday(outcome.settled_at)
+              AND live_text_timestamp_utc(curve.first_usable_at)<
+                  live_text_timestamp_utc(outcome.settled_at)
               AND NOT EXISTS (
                   SELECT 1 FROM vision_draft_conflicts AS conflict
                    WHERE conflict.raybet_match_id=curve.raybet_match_id
@@ -2003,11 +1986,11 @@ def _prospective_calibration_samples(
                             AND conflict.map_number=earlier.map_number
                      )
                      AND (
-                         julianday(earlier.first_usable_at)<
-                             julianday(curve.first_usable_at)
+                          live_text_timestamp_utc(earlier.first_usable_at)<
+                              live_text_timestamp_utc(curve.first_usable_at)
                          OR (
-                             julianday(earlier.first_usable_at)=
-                                 julianday(curve.first_usable_at)
+                              live_text_timestamp_utc(earlier.first_usable_at)=
+                                  live_text_timestamp_utc(curve.first_usable_at)
                              AND earlier.curve_key<curve.curve_key
                          )
                      )
@@ -2071,7 +2054,7 @@ def _prospective_calibration_samples(
 
 
 def build_prospective_calibration_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     current: FrozenDraftDeployment,
 ) -> FrozenDraftDeployment | None:
     """Recalibrate one frozen model family from exact prospective outcomes."""
@@ -2122,7 +2105,7 @@ def build_prospective_calibration_deployment(
 
 
 def publish_cycle(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     deployment: FrozenDraftDeployment,
     history: ProspectiveHistorySnapshot,
@@ -2151,18 +2134,16 @@ def publish_cycle(
     )
 
 
-def _build_and_persist(database: Path, now: datetime) -> FrozenDraftDeployment:
-    reader = connect(database, read_only=True, row_factory=sqlite3.Row)
-    try:
-        reader.execute("BEGIN")
-        deployment = build_frozen_draft_deployment(
-            reader,
-            training_cutoff=now,
-        )
-        reader.rollback()
-    finally:
-        reader.close()
-    with LiveBettingStore(database) as store:
+def _build_and_persist(database_url: str, now: datetime) -> FrozenDraftDeployment:
+    with LiveBettingStore(database_url) as store:
+        store.connection.begin()
+        try:
+            deployment = build_frozen_draft_deployment(
+                store.connection,
+                training_cutoff=now,
+            )
+        finally:
+            store.connection.rollback()
         persist_frozen_deployment(
             store.connection,
             deployment,
@@ -2172,7 +2153,7 @@ def _build_and_persist(database: Path, now: datetime) -> FrozenDraftDeployment:
 
 
 def audited_rebase_frozen_deployment(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     old_deployment_key: str,
     created_at: datetime,
@@ -2182,7 +2163,7 @@ def audited_rebase_frozen_deployment(
     old_deployment_key = _validate_deployment_key(old_deployment_key)
     if connection.in_transaction:
         raise RuntimeError("audited deployment rebase requires a fresh connection")
-    connection.execute("BEGIN")
+    connection.begin()
     try:
         old = _load_frozen_deployment_snapshot(
             connection,
@@ -2230,28 +2211,20 @@ def audited_rebase_frozen_deployment(
 
 
 def _load_history(
-    database: Path,
+    database_url: str,
     *,
     timeout_seconds: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> ProspectiveHistorySnapshot:
-    reader = connect(database, read_only=True, row_factory=sqlite3.Row)
+    store = LiveBettingStore(database_url)
+    reader = store.connection
     deadline = None
     timed_out = False
     if timeout_seconds is not None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
-            reader.close()
+            store.close()
             raise ValueError("history load timeout must be positive")
         deadline = monotonic() + timeout_seconds
-
-        def interrupt_expired_query() -> int:
-            nonlocal timed_out
-            if monotonic() >= deadline:
-                timed_out = True
-                return 1
-            return 0
-
-        reader.set_progress_handler(interrupt_expired_query, 1_000)
 
     def require_time_remaining() -> None:
         nonlocal timed_out
@@ -2260,7 +2233,12 @@ def _load_history(
             raise _HistoryLoadTimeoutError("history_load_timeout")
 
     try:
-        reader.execute("BEGIN")
+        reader.begin()
+        if timeout_seconds is not None:
+            reader.execute(
+                "SELECT set_config('statement_timeout', ?, true)",
+                (f"{max(1, int(timeout_seconds * 1000))}ms",),
+            )
         loaded_generation = _runtime_deployment_generation(reader)
         revision_row = reader.execute(
             """SELECT dependency_revision FROM draft_lineage_revisions
@@ -2295,41 +2273,44 @@ def _load_history(
         return history_snapshot
     except DraftDependencyLimitError as error:
         raise _HistoryLoadLimitError("history_load_limit_exceeded") from error
-    except sqlite3.OperationalError as error:
-        if timed_out:
+    except DBAPIError as error:
+        cause = getattr(error, "orig", error)
+        sqlstate = getattr(cause, "sqlstate", None) or getattr(
+            cause, "pgcode", None
+        )
+        if timed_out or sqlstate == "57014":
             raise _HistoryLoadTimeoutError("history_load_timeout") from error
         raise
     finally:
-        if deadline is not None:
-            reader.set_progress_handler(None, 0)
         try:
             if reader.in_transaction:
                 reader.rollback()
         finally:
-            reader.close()
+            store.close()
 
 
 def _load_history_with_timeout(
-    database: Path,
+    database_url: str,
     *,
     timeout_seconds: float,
 ) -> ProspectiveHistorySnapshot:
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
         raise ValueError("history load timeout must be positive")
-    return _load_history(database, timeout_seconds=timeout_seconds)
+    return _load_history(database_url, timeout_seconds=timeout_seconds)
 
 
 def _refresh_dependency_inputs(
-    database: Path,
+    database_url: str,
     deployment: FrozenDraftDeployment,
     history: ProspectiveHistorySnapshot,
     *,
     now: datetime,
 ) -> tuple[FrozenDraftDeployment, ProspectiveHistorySnapshot]:
     del now
-    reader = connect(database, read_only=True, row_factory=sqlite3.Row)
+    store = LiveBettingStore(database_url)
+    reader = store.connection
     try:
-        reader.execute("BEGIN")
+        reader.begin()
         loaded_generation = _runtime_deployment_generation(reader)
         deployment_reason, history_reason = _runtime_input_reasons(
             reader,
@@ -2348,14 +2329,14 @@ def _refresh_dependency_inputs(
                 f"draft history lineage is stale: {history_reason}"
             )
         refreshed = _load_history_with_timeout(
-            database,
+            database_url,
             timeout_seconds=HISTORY_LOAD_TIMEOUT_SECONDS,
         )
         if _runtime_deployment_generation(reader) != loaded_generation:
             raise _FrozenDeploymentLineageError(
                 "draft history generation changed during runtime refresh"
             )
-        reader.execute("BEGIN")
+        reader.begin()
         deployment_reason, history_reason = _runtime_input_reasons(
             reader,
             deployment,
@@ -2365,7 +2346,7 @@ def _refresh_dependency_inputs(
     finally:
         if reader.in_transaction:
             reader.rollback()
-        reader.close()
+        store.close()
     if deployment_reason is not None:
         raise _FrozenDeploymentLineageError(
             f"draft deployment lineage is stale: {deployment_reason}"
@@ -2378,7 +2359,7 @@ def _refresh_dependency_inputs(
 
 
 def _record_cycle_health(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     status: str,
     now: datetime,
@@ -2425,14 +2406,14 @@ def _record_cycle_health(
 
 
 def _record_database_health(
-    database: Path,
+    database_url: str,
     *,
     status: str,
     phase: str,
     error: str | None = None,
     failure: Mapping[str, object] | None = None,
 ) -> None:
-    with LiveBettingStore(database) as store:
+    with LiveBettingStore(database_url) as store:
         _record_cycle_health(
             store.connection,
             status=status,
@@ -2444,7 +2425,7 @@ def _record_database_health(
 
 
 def _run_publisher_locked(
-    database: Path,
+    database_url: str,
     *,
     once: bool,
     interval_seconds: float,
@@ -2458,7 +2439,7 @@ def _run_publisher_locked(
             return 2
         try:
             old_key = _validate_deployment_key(rebase_deployment_key)
-            with LiveBettingStore(database) as store:
+            with LiveBettingStore(database_url) as store:
                 deployment, inserted = audited_rebase_frozen_deployment(
                     store.connection,
                     old_deployment_key=old_key,
@@ -2499,23 +2480,25 @@ def _run_publisher_locked(
     if rebuild_artifacts:
         if not once:
             _record_database_health(
-                database,
+                database_url,
                 status="unhealthy",
                 phase="offline_rebuild",
                 error="offline_rebuild_requires_once",
             )
             return 2
         _record_database_health(
-            database,
+            database_url,
             status="starting",
             phase="offline_rebuild",
         )
         try:
-            deployment = _build_and_persist(database, datetime.now(timezone.utc))
+            deployment = _build_and_persist(
+                database_url, datetime.now(timezone.utc)
+            )
         except Exception as error:
             failure = _safe_offline_rebuild_failure(error)
             _record_database_health(
-                database,
+                database_url,
                 status="unhealthy",
                 phase="offline_rebuild",
                 error="offline_rebuild_failed",
@@ -2535,7 +2518,7 @@ def _run_publisher_locked(
             )
             return 2
         _record_database_health(
-            database,
+            database_url,
             status="healthy",
             phase="offline_rebuild_complete",
         )
@@ -2556,7 +2539,7 @@ def _run_publisher_locked(
         return 0
     if deployment_key is None:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_deployment",
             error="deployment_pin_missing",
@@ -2566,26 +2549,26 @@ def _run_publisher_locked(
         deployment_key = _validate_deployment_key(deployment_key)
     except ValueError:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_deployment",
             error="deployment_pin_invalid",
         )
         return 2
     _record_database_health(
-        database,
+        database_url,
         status="starting",
         phase="loading_deployment",
     )
     try:
-        with LiveBettingStore(database) as store:
+        with LiveBettingStore(database_url) as store:
             deployment = load_pinned_frozen_deployment(
                 store.connection,
                 deployment_key=deployment_key,
             )
     except _FrozenDeploymentLineageError:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_deployment",
             error="frozen_deployment_lineage_invalid",
@@ -2593,7 +2576,7 @@ def _run_publisher_locked(
         return 2
     except ValueError:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_deployment",
             error="frozen_deployment_invalid",
@@ -2601,7 +2584,7 @@ def _run_publisher_locked(
         return 2
     except Exception:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_deployment",
             error="frozen_deployment_load_failed",
@@ -2609,25 +2592,25 @@ def _run_publisher_locked(
         return 2
     if deployment is None:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_deployment",
             error="frozen_deployment_missing",
         )
         return 2
     _record_database_health(
-        database,
+        database_url,
         status="starting",
         phase="loading_history",
     )
     try:
         history = _load_history_with_timeout(
-            database,
+            database_url,
             timeout_seconds=history_timeout_seconds,
         )
     except _HistoryLoadLimitError:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_history",
             error="history_load_limit_exceeded",
@@ -2635,7 +2618,7 @@ def _run_publisher_locked(
         return 2
     except _HistoryLoadTimeoutError:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_history",
             error="history_load_timeout",
@@ -2643,7 +2626,7 @@ def _run_publisher_locked(
         return 2
     except Exception:
         _record_database_health(
-            database,
+            database_url,
             status="unhealthy",
             phase="loading_history",
             error="history_load_failed",
@@ -2654,13 +2637,13 @@ def _run_publisher_locked(
         try:
             previous_history = history
             deployment, history = _refresh_dependency_inputs(
-                database,
+                database_url,
                 deployment,
                 history,
                 now=cycle_at,
             )
             history_refreshed = history is not previous_history
-            with LiveBettingStore(database) as store:
+            with LiveBettingStore(database_url) as store:
                 report = publish_cycle(
                     store.connection,
                     deployment=deployment,
@@ -2695,7 +2678,7 @@ def _run_publisher_locked(
             )
         except _FrozenDeploymentLineageError:
             _record_database_health(
-                database,
+                database_url,
                 status="unhealthy",
                 phase="loading_deployment",
                 error="frozen_deployment_lineage_invalid",
@@ -2703,7 +2686,7 @@ def _run_publisher_locked(
             return 2
         except Exception as error:
             message = f"{type(error).__name__}: {' '.join(str(error).split())[:500]}"
-            with LiveBettingStore(database) as store:
+            with LiveBettingStore(database_url) as store:
                 _record_cycle_health(
                     store.connection,
                     status="degraded",
@@ -2718,7 +2701,7 @@ def _run_publisher_locked(
 
 
 def run_publisher(
-    database: Path,
+    database_url: str,
     *,
     once: bool,
     interval_seconds: float,
@@ -2726,9 +2709,9 @@ def run_publisher(
     deployment_key: str | None = None,
     rebase_deployment_key: str | None = None,
 ) -> int:
-    with publisher_singleton_lock(database):
+    with publisher_singleton_lock(database_url):
         return _run_publisher_locked(
-            database,
+            database_url,
             once=once,
             interval_seconds=interval_seconds,
             rebuild_artifacts=rebuild_artifacts,
@@ -2739,12 +2722,14 @@ def run_publisher(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--rebuild-artifacts", action="store_true")
     parser.add_argument("--rebase-deployment-key")
-    parser.add_argument("--schema-prepared", action="store_true")
     parser.add_argument("--deployment-key")
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval <= 0.0:
@@ -2777,24 +2762,17 @@ def main() -> int:
             parser.error(
                 "--deployment-key is required and must be a lowercase SHA-256 digest"
             )
-    database = args.database.resolve()
-    with database_writer_authority(
-        database,
-        require_manager_child=bool(args.schema_prepared),
-    ):
-        if args.rebase_deployment_key is not None:
-            verify_prepared_database(database)
-        elif not args.schema_prepared:
-            with LiveBettingStore(database) as store:
-                store.init_schema()
-        return run_publisher(
-            database,
-            once=args.once,
-            interval_seconds=float(args.interval),
-            rebuild_artifacts=bool(args.rebuild_artifacts),
-            deployment_key=args.deployment_key,
-            rebase_deployment_key=args.rebase_deployment_key,
-        )
+    database_url = require_database_url(args.database_url)
+    with LiveBettingStore(database_url) as store:
+        store.init_schema()
+    return run_publisher(
+        database_url,
+        once=args.once,
+        interval_seconds=float(args.interval),
+        rebuild_artifacts=bool(args.rebuild_artifacts),
+        deployment_key=args.deployment_key,
+        rebase_deployment_key=args.rebase_deployment_key,
+    )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,6 @@ import gzip
 import hashlib
 import json
 import math
-import sqlite3
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -15,15 +14,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Collection, Mapping, Sequence
 
+from database.session import PostgresSession
+
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
 from event_intelligence.roles import (  # noqa: E402
     HistoricalPositionEvidence,
     PROSPECTIVE_ASSIGNMENT_VERSION,
@@ -33,6 +30,7 @@ from event_intelligence.roles import (  # noqa: E402
     assign_expected_positions,
     assign_observed_positions,
 )
+from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 
 
 UTC = timezone.utc
@@ -152,7 +150,7 @@ def _role_evidence(
 
 
 def load_strict_maps(
-    connection: sqlite3.Connection, *, database_path: Path
+    connection: PostgresSession,
 ) -> tuple[StrictRoleMap, ...]:
     rows = connection.execute(
         """SELECT f.match_id, f.player_slot, f.account_id, f.team_id, f.is_radiant,
@@ -185,7 +183,7 @@ def load_strict_maps(
         first_usable_at = _utc(row["first_usable_at"], "first_usable_at")
         path = Path(row["storage_path"])
         if not path.is_absolute():
-            path = database_path.resolve().parent / path
+            path = path.resolve()
         artifact = (path, str(row["source_content_hash"]))
         current = artifacts.setdefault(int(row["match_id"]), artifact)
         if current != artifact:
@@ -358,27 +356,19 @@ def build_assignments(
 
 
 def persist_assignments(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     rows: Sequence[PersistedAssignment],
     *,
     dry_run: bool,
     preserve_existing: bool = False,
-    database_path: Path | None = None,
     required_dependency_fingerprint: str | None = None,
     required_certification_authorities: Mapping[int, object] | None = None,
 ) -> tuple[int, int, int]:
     inserted = updated = unchanged = 0
     now = datetime.now(UTC).isoformat()
-    if not dry_run:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         if required_dependency_fingerprint is not None:
-            if database_path is None:
-                raise ValueError("database_path is required for dependency validation")
-            current_games = load_strict_maps(
-                connection,
-                database_path=database_path,
-            )
+            current_games = load_strict_maps(connection)
             if (
                 strict_role_dependency_fingerprint(current_games)
                 != required_dependency_fingerprint
@@ -463,17 +453,11 @@ def persist_assignments(
                     now,
                 ),
             )
-        if not dry_run:
-            connection.commit()
-    except BaseException:
-        if not dry_run:
-            connection.rollback()
-        raise
     return inserted, updated, unchanged
 
 
 def run_assignment(
-    database: Path,
+    storage: IntelligenceStorage,
     *,
     dry_run: bool = False,
     match_id: int | None = None,
@@ -485,17 +469,9 @@ def run_assignment(
     if match_id is not None and match_ids is not None:
         raise ValueError("match_id and match_ids are mutually exclusive")
     selected_ids = None if match_ids is None else {int(value) for value in match_ids}
-    database = database.resolve()
-    connection = sqlite3.connect(
-        f"file:{database.as_posix()}?mode=ro" if dry_run else database,
-        uri=dry_run,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=5000")
-    try:
-        connection.execute("BEGIN")
-        games = load_strict_maps(connection, database_path=database)
+    connection = storage.connection
+    with connection.transaction():
+        games = load_strict_maps(connection)
         available_ids = {game.match_id for game in games}
         requested_ids = {match_id} if match_id is not None else selected_ids
         missing_ids = set() if requested_ids is None else requested_ids - available_ids
@@ -523,31 +499,25 @@ def run_assignment(
             match_id=match_id,
             match_ids=selected_ids,
         )
-        connection.rollback()
-        inserted, updated, unchanged = persist_assignments(
-            connection,
-            rows,
-            dry_run=dry_run,
-            preserve_existing=preserve_existing,
-            database_path=database,
-            required_dependency_fingerprint=dependency_fingerprint,
-            required_certification_authorities=required_certification_authorities,
-        )
-        return AssignmentReport(
-            ASSIGNMENT_VERSIONS[availability_mode],
-            availability_mode.value,
-            dry_run,
-            len(games),
-            len(games) if requested_ids is None else len(requested_ids),
-            len(rows),
-            inserted,
-            updated,
-            unchanged,
-        )
-    finally:
-        if connection.in_transaction:
-            connection.rollback()
-        connection.close()
+    inserted, updated, unchanged = persist_assignments(
+        connection,
+        rows,
+        dry_run=dry_run,
+        preserve_existing=preserve_existing,
+        required_dependency_fingerprint=dependency_fingerprint,
+        required_certification_authorities=required_certification_authorities,
+    )
+    return AssignmentReport(
+        ASSIGNMENT_VERSIONS[availability_mode],
+        availability_mode.value,
+        dry_run,
+        len(games),
+        len(games) if requested_ids is None else len(requested_ids),
+        len(rows),
+        inserted,
+        updated,
+        unchanged,
+    )
 
 
 def _positive_int(value: str) -> int:
@@ -559,7 +529,7 @@ def _positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument("--database-url", help="PostgreSQL URL (default: DATABASE_URL)")
     parser.add_argument("--match", type=_positive_int, help="one formal match ID")
     parser.add_argument("--dry-run", action="store_true", help="compute without writes")
     parser.add_argument(
@@ -573,13 +543,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    with database_writer_authority(args.database):
+    storage = IntelligenceStorage(args.database_url)
+    try:
+        storage.init_schema(seed_events=False)
         report = run_assignment(
-            args.database,
+            storage,
             dry_run=args.dry_run,
             match_id=args.match,
             availability_mode=AvailabilityMode(args.availability_mode),
         )
+    finally:
+        storage.close()
     print(json.dumps(report.__dict__, sort_keys=True))
     return 0
 

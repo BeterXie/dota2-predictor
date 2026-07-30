@@ -11,17 +11,17 @@ from typing import Mapping, Sequence
 import uvicorn
 import yaml
 
-from live_betting.database_protocol import verify_prepared_database
-from live_betting.milestone_revocation import MilestoneRevocationConfig
-from live_betting.service_coordination import (
-    add_single_database_argument,
-    service_data_paths,
-)
+from database.engine import require_database_url
+from live_betting.runtime_schema import verify_runtime_schema
+from live_betting.storage import LiveBettingStore
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -40,84 +40,23 @@ def _load_config(path: Path) -> dict[str, object]:
     return value
 
 
-def resolve_database_path(
-    cli_database: Path | None,
+def resolve_database_url(
+    cli_database_url: str | None,
     config: Mapping[str, object],
     config_path: Path,
     environment: Mapping[str, str],
-) -> tuple[Path, str]:
-    """Resolve the one runtime database authority by documented precedence."""
+) -> tuple[str, str]:
+    """Resolve the one PostgreSQL runtime authority by documented precedence."""
 
-    if cli_database is not None:
-        return cli_database.resolve(), "cli"
-    configured_environment = environment.get("DATABASE_PATH")
+    if cli_database_url is not None:
+        return require_database_url(cli_database_url), "cli"
+    configured_environment = environment.get("DATABASE_URL")
     if configured_environment:
-        return Path(configured_environment).resolve(), "environment"
-    configured_file = config.get("database")
+        return require_database_url(configured_environment), "environment"
+    configured_file = config.get("database_url")
     if configured_file:
-        configured_path = Path(str(configured_file))
-        if not configured_path.is_absolute():
-            configured_path = config_path.resolve().parent / configured_path
-        return configured_path.resolve(), "config"
-    return (Path(__file__).resolve().parents[1] / "data" / "dota2.db"), "default"
-
-
-def _configured_path(value: object, config_path: Path, label: str) -> Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"milestone revocation {label} path is required")
-    path = Path(value)
-    if not path.is_absolute():
-        path = config_path.resolve().parent / path
-    return path.resolve()
-
-
-def resolve_milestone_revocation_config(
-    config: Mapping[str, object],
-    config_path: Path,
-    runtime_database: Path,
-) -> MilestoneRevocationConfig | None:
-    value = config.get("milestone_revocation")
-    if value is None:
-        return None
-    if not isinstance(value, dict) or set(value) != {
-        "ledger",
-        "database",
-        "raw_root",
-        "anchor",
-        "pair_baseline_manifest",
-    }:
-        raise ValueError("milestone revocation configuration is incomplete")
-    anchor = value["anchor"]
-    pair = value["pair_baseline_manifest"]
-    if (
-        not isinstance(anchor, dict)
-        or set(anchor) != {"path", "sha256"}
-        or not isinstance(pair, dict)
-        or set(pair) != {"path", "sha256"}
-    ):
-        raise ValueError("milestone revocation external evidence configuration is incomplete")
-    configured_database = _configured_path(value["database"], config_path, "database")
-    if configured_database != runtime_database.resolve():
-        raise ValueError("milestone revocation database differs from runtime database")
-    for label, digest in (
-        ("anchor", anchor["sha256"]),
-        ("pair baseline manifest", pair["sha256"]),
-    ):
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise ValueError(f"milestone revocation {label} SHA-256 is invalid")
-    return MilestoneRevocationConfig(
-        root=_configured_path(value["ledger"], config_path, "ledger"),
-        database_path=configured_database,
-        raw_root=_configured_path(value["raw_root"], config_path, "raw root"),
-        expected_anchor=_configured_path(anchor["path"], config_path, "anchor"),
-        expected_anchor_hash=str(anchor["sha256"]),
-        pair_manifest=_configured_path(pair["path"], config_path, "pair baseline manifest"),
-        expected_pair_manifest_hash=str(pair["sha256"]),
-    )
+        return require_database_url(str(configured_file)), "config"
+    return require_database_url(None, environ=environment), "environment"
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -138,28 +77,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     port = server_cfg.get("port", 8000)
     reload = server_cfg.get("reload", False)
 
-    database, source = resolve_database_path(
-        args.database,
+    database_url, source = resolve_database_url(
+        args.database_url,
         config,
         config_path,
         os.environ,
     )
-    paths = service_data_paths(database)
-    verify_prepared_database(
-        paths.database,
-        odds_raw_root=paths.odds_raw_root,
-    )
-    # The environment handoff keeps uvicorn reload children on this same path.
-    os.environ["DATABASE_PATH"] = str(database)
+    os.environ["DATABASE_URL"] = database_url
     from . import queries
-    queries.init_db(str(database))
+    queries.init_db(database_url)
+    with LiveBettingStore(database_url) as store:
+        store.init_schema()
+        verify_runtime_schema(store.connection)
     from .app import app, configure_milestone_revocation
-    revocation_config = resolve_milestone_revocation_config(
-        config, config_path, database
-    )
-    configure_milestone_revocation(app, revocation_config)
+    revocation_config = None
+    configure_milestone_revocation(app, None)
     logging.getLogger("web").info(
-        "Database path (%s): %s", source, queries.DB_PATH
+        "PostgreSQL database configured from %s", source
     )
 
     if reload and revocation_config is not None:

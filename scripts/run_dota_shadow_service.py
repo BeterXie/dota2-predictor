@@ -1,54 +1,35 @@
-"""Single-instance supervisor for local Dota shadow components."""
+"""Supervise the local Dota shadow components on PostgreSQL."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
-import sqlite3
+import signal
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
-from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-import psutil
+from sqlalchemy import text
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from database.engine import build_engine, require_database_url  # noqa: E402
 from event_intelligence.report import build_intelligence_report  # noqa: E402
 from live_betting.browser_companion import PROTOCOL_VERSION  # noqa: E402
-from live_betting.database_protocol import (  # noqa: E402
-    prepare_database,
-    verify_prepared_database,
-)
 from live_betting.health import record_health  # noqa: E402
 from live_betting.report import build_report  # noqa: E402
-from live_betting.service_coordination import (  # noqa: E402
-    DatabaseFileIdentity,
+from live_betting.process_control import (  # noqa: E402
     MARKET_SOURCE_POLICY,
-    ProcessIdentity,
-    SingleInstanceLock,
-    TerminationResult,
-    WriterScanResult,
-    add_single_database_argument,
-    bind_manager_child_authority,
-    database_service_authority_lock_paths,
-    manager_child_authority,
-    manager_child_process_environment,
-    managed_child_command,
-    require_unique_database_file,
-    resolve_process_identity,
-    scan_managed_writers,
-    service_data_paths,
     terminate_subprocess_tree,
 )
 from live_betting.smtp_delivery import (  # noqa: E402
@@ -59,26 +40,9 @@ from live_betting.storage import LiveBettingStore  # noqa: E402
 from web.alerts import reconcile_alerts  # noqa: E402
 
 
-WORKER_COMPONENTS = {
-    "raybet": "raybet_worker",
-    "shadow": "shadow_worker",
-    "mail": "mail_worker",
-    "vision": "vision_worker",
-    "strict_ingest": "strict_ingest_worker",
-    "postmatch": "postmatch_worker",
-    "draft_publisher": "draft_publisher_worker",
-    "historical_rosh": "historical_rosh_worker",
-}
-ACTIVE_COMMANDS = {
-    "raybet": "collector",
-    "shadow": "shadow",
-    "mail": "mail",
-    "vision": "vision",
-    "strict_ingest": "strict_ingest",
-    "postmatch": "postmatch",
-    "draft_publisher": "draft_publisher",
-    "historical_rosh": "historical_rosh",
-}
+COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
+SERVICE_LOCK_KEY = "dota2-predictor:shadow-service"
+CHILD_RESTART_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 WORKER_MAX_AGE = {
     "raybet": timedelta(seconds=45),
     "shadow": timedelta(seconds=45),
@@ -89,85 +53,25 @@ WORKER_MAX_AGE = {
     "draft_publisher": timedelta(minutes=15),
     "historical_rosh": timedelta(minutes=15),
 }
-COLLECTOR_MAX_AGE = timedelta(seconds=60)
-DATABASE_AUDIT_MAX_AGE = timedelta(minutes=15)
-DATABASE_FAILURE_RECHECK = timedelta(seconds=60)
-LOCK_CONTENTION_RETRY_MIN_SECONDS = 0.05
-CHILD_RESTART_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
-CHILD_STABLE_RESET_SECONDS = 60.0
-DRAFT_PUBLISHER_WEDGE_STARTUP_GRACE_SECONDS = 60.0
-COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
-_DATABASE_HEALTH_CACHE: dict[
-    str,
-    tuple[datetime, tuple[str, str | None, dict[str, Any]]],
-] = {}
-_DATABASE_AUDIT_THREADS: dict[str, threading.Thread] = {}
-_DATABASE_AUDIT_LOCK = threading.Lock()
+WORKER_COMPONENTS = {
+    "raybet": "raybet_worker",
+    "shadow": "shadow_worker",
+    "mail": "mail_worker",
+    "vision": "vision_worker",
+    "strict_ingest": "strict_ingest_worker",
+    "postmatch": "postmatch_worker",
+    "draft_publisher": "draft_publisher_worker",
+    "historical_rosh": "historical_rosh_worker",
+}
 
 
 @dataclass
-class _ChildRestartState:
-    consecutive_failures: int = 0
-    next_restart_at: float = 0.0
-    started_at: float | None = None
-    last_exit_code: int | None = None
-    observed_exit_handle: Any | None = None
-
-
-def _schedule_child_restart(
-    state: _ChildRestartState,
-    *,
-    failed_at: float,
-    exit_code: int | None,
-) -> None:
-    state.consecutive_failures += 1
-    delay = CHILD_RESTART_DELAYS_SECONDS[
-        min(state.consecutive_failures - 1, len(CHILD_RESTART_DELAYS_SECONDS) - 1)
-    ]
-    state.next_restart_at = failed_at + delay
-    state.started_at = None
-    state.last_exit_code = exit_code
-
-
-def _restart_sleep_seconds(
-    restart_states: Mapping[str, _ChildRestartState],
-    interval: float,
-    *,
-    monotonic: Callable[[], float] = time.monotonic,
-) -> float:
-    delay = max(interval, LOCK_CONTENTION_RETRY_MIN_SECONDS)
-    now = monotonic()
-    if any(
-        state.started_at is None
-        and 0.0 < state.next_restart_at <= now
-        for state in restart_states.values()
-    ):
-        return 0.0
-    pending = [
-        state.next_restart_at - now
-        for state in restart_states.values()
-        if state.next_restart_at > now
-    ]
-    if pending:
-        delay = min(delay, min(pending))
-    return max(delay, LOCK_CONTENTION_RETRY_MIN_SECONDS)
-
-
-def _transient_sqlite_lock_kind(error: sqlite3.OperationalError) -> str | None:
-    code = getattr(error, "sqlite_errorcode", None)
-    if type(code) is int:
-        primary = code & 0xFF
-        if primary == sqlite3.SQLITE_BUSY:
-            return "SQLITE_BUSY"
-        if primary == sqlite3.SQLITE_LOCKED:
-            return "SQLITE_LOCKED"
-        return None
-    message = " ".join(str(error).split()).casefold()
-    if message == "database is locked":
-        return "SQLITE_BUSY"
-    if message in {"database table is locked", "database schema is locked"}:
-        return "SQLITE_LOCKED"
-    return None
+class _Child:
+    process: subprocess.Popen[Any]
+    stdout: Any
+    stderr: Any
+    failures: int = 0
+    restart_at: float = 0.0
 
 
 def _write_service_report(report_path: Path, result: Mapping[str, Any]) -> None:
@@ -178,86 +82,6 @@ def _write_service_report(report_path: Path, result: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, report_path)
-
-
-def _generate_service_report(database: Path, report_path: Path) -> None:
-    """Build a report on a connection owned by the calling thread."""
-    with LiveBettingStore(database) as store:
-        result = {
-            "market_source_policy": MARKET_SOURCE_POLICY,
-            "capabilities": _service_capabilities(store.connection),
-            "shadow": build_report(store.connection),
-            "intelligence": build_intelligence_report(store.connection),
-        }
-    _write_service_report(report_path, result)
-
-
-class _ReportWorker:
-    """Run at most one report build without blocking supervisor heartbeats."""
-
-    def __init__(
-        self,
-        database: Path,
-        report_path: Path,
-        *,
-        report_interval: float = 300.0,
-        monotonic: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.database = database
-        self.report_path = report_path
-        self.report_interval = report_interval
-        self._monotonic = monotonic
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._last_finished_at: float | None = None
-        self.last_error: str | None = None
-
-    def start_if_idle(self) -> bool:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return False
-            if (
-                self._last_finished_at is not None
-                and self._monotonic() - self._last_finished_at
-                < self.report_interval
-            ):
-                return False
-            self._thread = threading.Thread(
-                target=self._run,
-                name="service-report",
-                daemon=True,
-            )
-            self._thread.start()
-            return True
-
-    def wait(self, timeout: float | None = None) -> bool:
-        with self._lock:
-            thread = self._thread
-        if thread is None:
-            return True
-        thread.join(timeout)
-        return not thread.is_alive()
-
-    def _run(self) -> None:
-        try:
-            _generate_service_report(self.database, self.report_path)
-        except Exception as error:
-            message = " ".join(str(error).split())[:500]
-            self.last_error = f"{type(error).__name__}: {message}"
-            print(
-                json.dumps({
-                    "status": "report_error",
-                    "error_type": type(error).__name__,
-                    "error": message,
-                }, ensure_ascii=False),
-                file=sys.stderr,
-                flush=True,
-            )
-        else:
-            self.last_error = None
-        finally:
-            with self._lock:
-                self._last_finished_at = self._monotonic()
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -272,332 +96,26 @@ def _parse_time(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _worker_health(
-    connection: Any,
-    component: str,
-    now: datetime,
-    active_components: set[str],
-) -> tuple[str, dict[str, Any]]:
-    worker_component = WORKER_COMPONENTS[component]
-    row = connection.execute(
-        "SELECT * FROM service_health WHERE component=?",
-        (worker_component,),
-    ).fetchone()
-    if row is None:
-        return (
-            "starting" if ACTIVE_COMMANDS[component] in active_components else "stopped",
-            {"worker_component": worker_component, "reason": "awaiting_heartbeat"},
-        )
-    try:
-        details = json.loads(str(row["details_json"]))
-    except (TypeError, ValueError):
-        details = {}
-    heartbeat = _parse_time(row["last_heartbeat_at"])
-    if heartbeat is None:
-        return "unhealthy", {
-            "worker_component": worker_component,
-            "reason": "invalid_heartbeat",
-        }
-    age = max(0.0, (now - heartbeat).total_seconds())
-    limit = WORKER_MAX_AGE[component].total_seconds()
-    status = str(row["status"])
-    if age > limit * 2:
-        status = "unhealthy"
-        reason = "heartbeat_expired"
-    elif age > limit:
-        status = "degraded"
-        reason = "heartbeat_stale"
-    elif status == "healthy":
-        reason = "worker_heartbeat_fresh"
-    else:
-        reason = str(row["last_error"] or f"worker_status_{status}")
-    return status, {
-        "worker_component": worker_component,
-        "worker_status": str(row["status"]),
-        "worker_heartbeat_at": heartbeat.isoformat(),
-        "heartbeat_age_seconds": round(age, 3),
-        "worker_details": details,
-        "reason": reason,
-    }
-
-
-def _draft_publisher_heartbeat_expired(
-    database: Path,
-    *,
-    expected_identities: tuple[ProcessIdentity, ...],
-    child_runtime_seconds: float,
-    now: datetime | None = None,
-) -> bool | None:
-    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(
-            f"file:{database.resolve().as_posix()}?mode=ro",
-            uri=True,
-            timeout=0.05,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("PRAGMA busy_timeout=50")
-        row = connection.execute(
-            "SELECT last_heartbeat_at, details_json FROM service_health "
-            "WHERE component=?",
-            (WORKER_COMPONENTS["draft_publisher"],),
-        ).fetchone()
-    except sqlite3.OperationalError as error:
-        if _transient_sqlite_lock_kind(error) is not None:
-            return None
-        raise
-    finally:
-        if connection is not None:
-            connection.close()
-    hard_limit = WORKER_MAX_AGE["draft_publisher"].total_seconds() * 2
-    child_hard_expired = child_runtime_seconds > hard_limit
-    if row is None:
-        return child_hard_expired
-    try:
-        details = json.loads(str(row["details_json"]))
-    except (TypeError, ValueError):
-        details = None
-    health_identity = _publisher_health_identity(details)
-    if health_identity is None or health_identity not in expected_identities:
-        return child_hard_expired
-    heartbeat = _parse_time(row["last_heartbeat_at"])
-    if heartbeat is None:
-        return child_hard_expired
-    return max(0.0, (checked_at - heartbeat).total_seconds()) > hard_limit
-
-
-def _publisher_process_generation(identity: ProcessIdentity) -> str:
-    return f"{identity.pid}:{identity.created_at:.9f}"
-
-
-def _publisher_health_identity(details: object) -> ProcessIdentity | None:
-    if not isinstance(details, dict):
-        return None
-    pid = details.get("process_pid")
-    created_at = details.get("process_created_at")
-    generation = details.get("process_generation")
-    if (
-        type(pid) is not int
-        or pid <= 0
-        or not isinstance(created_at, (int, float))
-        or isinstance(created_at, bool)
-        or not math.isfinite(float(created_at))
-        or float(created_at) <= 0.0
-    ):
-        return None
-    identity = ProcessIdentity(pid, float(created_at))
-    if generation != _publisher_process_generation(identity):
-        return None
-    return identity
-
-
 def _database_health(connection: Any) -> tuple[str, str | None, dict[str, Any]]:
-    integrity = [
-        str(row[0])
-        for row in connection.execute("PRAGMA quick_check").fetchall()
-    ]
-    foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
-    details = {
-        "integrity": "ok" if integrity == ["ok"] else integrity[:20],
-        "foreign_key_issues": len(foreign_key_issues),
-    }
-    if integrity != ["ok"]:
-        return "unhealthy", "integrity_check_failed", details
-    if foreign_key_issues:
-        return "unhealthy", "foreign_key_check_failed", details
-    return "healthy", None, details
-
-
-def _run_database_audit(database_key: str, database: Path) -> None:
-    try:
-        connection = sqlite3.connect(
-            f"{database.resolve().as_uri()}?mode=ro",
-            uri=True,
-            timeout=1.0,
-        )
-        try:
-            connection.execute("PRAGMA busy_timeout=1000")
-            result = _database_health(connection)
-        finally:
-            connection.close()
-    except Exception as error:
-        message = " ".join(str(error).split())[:500]
-        result = (
-            "unhealthy",
-            "database_audit_failed",
-            {
-                "integrity": "unknown",
-                "foreign_key_issues": None,
-                "audit_error": f"{type(error).__name__}: {message}",
-            },
-        )
-    checked_at = datetime.now(timezone.utc)
-    with _DATABASE_AUDIT_LOCK:
-        _DATABASE_HEALTH_CACHE[database_key] = (checked_at, result)
-        if _DATABASE_AUDIT_THREADS.get(database_key) is threading.current_thread():
-            del _DATABASE_AUDIT_THREADS[database_key]
-
-
-def _start_database_audit(database_key: str, database: Path) -> None:
-    with _DATABASE_AUDIT_LOCK:
-        thread = _DATABASE_AUDIT_THREADS.get(database_key)
-        if thread is not None and thread.is_alive():
-            return
-        thread = threading.Thread(
-            target=_run_database_audit,
-            args=(database_key, database),
-            name="service-database-audit",
-            daemon=True,
-        )
-        _DATABASE_AUDIT_THREADS[database_key] = thread
-        thread.start()
-
-
-def _periodic_database_health(
-    connection: Any,
-    now: datetime,
-    *,
-    background: bool = False,
-) -> tuple[str, str | None, dict[str, Any]]:
-    database_row = connection.execute(
-        "PRAGMA database_list"
-    ).fetchone()
-    database_name = str(database_row[2]) if database_row and database_row[2] else ""
-    database_key = database_name or str(id(connection))
-    with _DATABASE_AUDIT_LOCK:
-        cached = _DATABASE_HEALTH_CACHE.get(database_key)
-    if cached is not None:
-        checked_at, result = cached
-        max_age = (
-            DATABASE_AUDIT_MAX_AGE
-            if result[0] == "healthy"
-            else DATABASE_FAILURE_RECHECK
-        )
-        age = max(0.0, (now - checked_at).total_seconds())
-        if age <= max_age.total_seconds():
-            status, reason, details = result
-            return status, reason, {
-                **details,
-                "audit_checked_at": checked_at.isoformat(),
-                "audit_age_seconds": round(age, 3),
-                "audit_cached": True,
-            }
-    if background and database_name:
-        _start_database_audit(database_key, Path(database_name))
-        if cached is not None:
-            checked_at, result = cached
-            status, reason, details = result
-            age = max(0.0, (now - checked_at).total_seconds())
-            return status, reason, {
-                **details,
-                "audit_checked_at": checked_at.isoformat(),
-                "audit_age_seconds": round(age, 3),
-                "audit_cached": True,
-                "audit_stale": True,
-                "audit_refreshing": True,
-            }
-        return "starting", "database_audit_pending", {
-            "integrity": "pending",
-            "foreign_key_issues": None,
-            "audit_checked_at": None,
-            "audit_age_seconds": None,
-            "audit_cached": False,
-            "audit_refreshing": True,
-        }
-    result = _database_health(connection)
-    with _DATABASE_AUDIT_LOCK:
-        _DATABASE_HEALTH_CACHE[database_key] = (now, result)
-    status, reason, details = result
-    return status, reason, {
-        **details,
-        "audit_checked_at": now.isoformat(),
-        "audit_age_seconds": 0.0,
-        "audit_cached": False,
-    }
-
-
-def _collector_health(
-    connection: Any,
-    worker_status: str,
-    now: datetime,
-    details: dict[str, Any],
-) -> tuple[str, str]:
-    if worker_status in {"stopped", "starting", "degraded", "unhealthy"}:
-        return worker_status, str(details.get("reason", "worker_unavailable"))
     row = connection.execute(
-        """SELECT last_success_at, last_error_at, last_error, gap_detected
-             FROM collector_runs WHERE collector='raybet'"""
+        """SELECT current_database(), pg_is_in_recovery(),
+                  (SELECT COUNT(*)
+                     FROM pg_constraint
+                    WHERE contype='f' AND NOT convalidated)"""
     ).fetchone()
-    if row is None or not row["last_success_at"]:
-        return "degraded", "no_successful_collection_yet"
-    success_at = _parse_time(row["last_success_at"])
-    if success_at is None:
-        return "unhealthy", "invalid_collection_timestamp"
-    age = max(0.0, (now - success_at).total_seconds())
-    details["last_success_at"] = success_at.isoformat()
-    details["collection_age_seconds"] = round(age, 3)
-    if bool(row["gap_detected"]):
-        return "degraded", "collection_gap_detected"
-    error_at = _parse_time(row["last_error_at"])
-    if error_at is not None and error_at >= success_at:
-        return "degraded", "recent_collection_error"
-    if age > COLLECTOR_MAX_AGE.total_seconds() * 2:
-        return "unhealthy", "collection_stale"
-    if age > COLLECTOR_MAX_AGE.total_seconds():
-        return "degraded", "collection_delayed"
-    return "healthy", "collection_fresh"
-
-
-def _probe_companion() -> Mapping[str, Any]:
-    with urllib.request.urlopen(COMPANION_HEALTH_URL, timeout=1.0) as response:
-        if response.status != 200:
-            raise RuntimeError(f"companion health returned HTTP {response.status}")
-        payload = json.loads(response.read())
-    if not isinstance(payload, dict):
-        raise RuntimeError("companion health returned a non-object")
-    return payload
-
-
-def _companion_health(
-    active: bool,
-    probe: Callable[[], Mapping[str, Any]],
-    *,
-    initial: bool = False,
-) -> tuple[str, str, dict[str, Any]]:
-    capability = {
-        "configured": active,
-        "role": "optional_diagnostic",
-        "readiness_impact": "none",
-        "market_source_policy": MARKET_SOURCE_POLICY,
-    }
-    if not active:
-        return "stopped", "not_started_by_supervisor", {
-            **capability,
-            "reason": "not_started_by_supervisor",
-        }
-    try:
-        payload = dict(probe())
-    except Exception as error:
-        return (
-            "starting" if initial else "unhealthy",
-            "awaiting_companion_health" if initial else "companion_unreachable",
-            {
-                **capability,
-                "error_type": type(error).__name__,
-            },
-        )
+    if row is None:
+        return "unhealthy", "database_probe_failed", {}
     details = {
-        **capability,
-        "protocol_version": payload.get("protocol_version"),
-        "service_state": payload.get("state"),
+        "backend": "postgresql",
+        "database": str(row[0]),
+        "in_recovery": bool(row[1]),
+        "unvalidated_foreign_keys": int(row[2]),
     }
-    if payload.get("protocol_version") != PROTOCOL_VERSION:
-        return "unhealthy", "companion_protocol_mismatch", details
-    if payload.get("state") != "ok":
-        return "degraded", "companion_not_ready", details
-    return "healthy", "companion_reachable", details
+    if details["in_recovery"]:
+        return "unhealthy", "database_is_read_only_replica", details
+    if details["unvalidated_foreign_keys"]:
+        return "unhealthy", "foreign_key_validation_incomplete", details
+    return "healthy", None, details
 
 
 def _record_component(
@@ -607,12 +125,10 @@ def _record_component(
     now: datetime,
     *,
     reason: str | None,
-    details: dict[str, Any],
+    details: Mapping[str, Any],
     informational: bool = False,
 ) -> None:
-    is_error = (
-        not informational and status in {"degraded", "unhealthy", "stopped"}
-    )
+    is_error = status in {"degraded", "unhealthy"} and not informational
     record_health(
         connection,
         component,
@@ -621,8 +137,81 @@ def _record_component(
         success_at=now if status == "healthy" else None,
         error_at=now if is_error else None,
         error=reason if is_error else None,
-        details={"source": "supervisor", **details},
+        details={"source": "supervisor", **dict(details)},
     )
+
+
+def _worker_health(
+    connection: Any,
+    component: str,
+    now: datetime,
+    active_components: set[str],
+) -> tuple[str, dict[str, Any]]:
+    worker = WORKER_COMPONENTS[component]
+    row = connection.execute(
+        "SELECT status, last_heartbeat_at, last_error, details_json "
+        "FROM service_health WHERE component=?",
+        (worker,),
+    ).fetchone()
+    if row is None:
+        status = "starting" if component in active_components else "stopped"
+        return status, {"worker_component": worker, "reason": "awaiting_heartbeat"}
+    heartbeat = _parse_time(row["last_heartbeat_at"])
+    if heartbeat is None:
+        return "unhealthy", {"worker_component": worker, "reason": "invalid_heartbeat"}
+    age = max(0.0, (now - heartbeat).total_seconds())
+    limit = WORKER_MAX_AGE[component].total_seconds()
+    try:
+        worker_details = json.loads(str(row["details_json"] or "{}"))
+    except (TypeError, ValueError):
+        worker_details = {}
+    if age > limit * 2:
+        status, reason = "unhealthy", "heartbeat_expired"
+    elif age > limit:
+        status, reason = "degraded", "heartbeat_stale"
+    else:
+        status = str(row["status"])
+        reason = str(row["last_error"] or f"worker_status_{status}")
+    return status, {
+        "worker_component": worker,
+        "worker_heartbeat_at": heartbeat.isoformat(),
+        "heartbeat_age_seconds": round(age, 3),
+        "worker_details": worker_details,
+        "reason": reason,
+    }
+
+
+def _probe_companion() -> Mapping[str, Any]:
+    with urllib.request.urlopen(COMPANION_HEALTH_URL, timeout=1.0) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("companion health payload is invalid")
+    return payload
+
+
+def _companion_health(
+    active: bool,
+    probe: Callable[[], Mapping[str, Any]],
+) -> tuple[str, str, dict[str, Any]]:
+    if not active:
+        return "stopped", "not_started_by_supervisor", {"required": False}
+    try:
+        payload = probe()
+    except Exception as error:
+        return "degraded", "companion_probe_failed", {
+            "required": False,
+            "error_type": type(error).__name__,
+        }
+    protocol = payload.get("protocol_version")
+    if protocol != PROTOCOL_VERSION:
+        return "degraded", "companion_protocol_mismatch", {
+            "required": False,
+            "protocol_version": protocol,
+        }
+    return "healthy", "companion_available", {
+        "required": False,
+        "protocol_version": protocol,
+    }
 
 
 def _service_capabilities(connection: Any) -> dict[str, dict[str, Any]]:
@@ -653,7 +242,7 @@ def _service_capabilities(connection: Any) -> dict[str, dict[str, Any]]:
 
 
 def service_once(
-    database: Path,
+    database_url: str,
     report_path: Path | None = None,
     *,
     active_components: set[str] | None = None,
@@ -662,13 +251,13 @@ def service_once(
     health_only: bool = False,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
-    active_components = set(active_components or ())
-    with LiveBettingStore(database) as store:
+    active = set(active_components or ())
+    with LiveBettingStore(database_url) as store:
         if initialize_schema:
             store.init_schema()
         connection = store.connection
-        database_status, database_reason, database_details = _periodic_database_health(
-            connection, now, background=health_only
+        database_status, database_reason, database_details = _database_health(
+            connection
         )
         _record_component(
             connection,
@@ -678,97 +267,8 @@ def service_once(
             reason=database_reason,
             details=database_details,
         )
-        raybet_worker_status, raybet_details = _worker_health(
-            connection, "raybet", now, active_components
-        )
-        raybet_status, raybet_reason = _collector_health(
-            connection, raybet_worker_status, now, raybet_details
-        )
-        _record_component(
-            connection,
-            "raybet",
-            raybet_status,
-            now,
-            reason=raybet_reason,
-            details=raybet_details,
-        )
-
-        shadow_status, shadow_details = _worker_health(
-            connection, "shadow", now, active_components
-        )
-        pending = int(connection.execute(
-            "SELECT COUNT(*) FROM shadow_orders WHERE status='pending'"
-        ).fetchone()[0])
-        shadow_details["pending_orders"] = pending
-        _record_component(
-            connection,
-            "shadow",
-            shadow_status,
-            now,
-            reason=str(shadow_details.get("reason", "worker_unavailable")),
-            details=shadow_details,
-        )
-
-        try:
-            SMTPConfig.from_environment()
-            smtp_configured = True
-        except SMTPConfigurationError:
-            smtp_configured = False
-        mail_worker_status, mail_details = _worker_health(
-            connection, "mail", now, active_components
-        )
-        dead_letters = int(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox WHERE status='dead_letter'"
-        ).fetchone()[0])
-        pending_notifications = int(connection.execute(
-            """SELECT COUNT(*) FROM notification_outbox
-                WHERE status='pending' AND next_attempt_at IS NOT NULL
-                  AND next_attempt_at<=?""",
-            (now.isoformat(),),
-        ).fetchone()[0])
-        expired_leases = int(connection.execute(
-            """SELECT COUNT(*) FROM notification_outbox
-                WHERE status='leased' AND lease_until IS NOT NULL
-                  AND lease_until<=?""",
-            (now.isoformat(),),
-        ).fetchone()[0])
-        mail_details.update({
-            "smtp_configured": smtp_configured,
-            "dead_letters": dead_letters,
-            "pending_due": pending_notifications,
-            "expired_leases": expired_leases,
-        })
-        if not smtp_configured:
-            mail_status, mail_error = "degraded", "configuration_missing"
-        elif mail_worker_status == "unhealthy":
-            mail_status = "unhealthy"
-            mail_error = str(mail_details.get("reason", "worker_unavailable"))
-        elif mail_worker_status == "healthy" and (
-            dead_letters or pending_notifications or expired_leases
-        ):
-            mail_status, mail_error = "degraded", "notification_backlog_or_dead_letter"
-        else:
-            mail_status = mail_worker_status
-            mail_error = str(mail_details.get("reason", "worker_unavailable"))
-        _record_component(
-            connection,
-            "mail",
-            mail_status,
-            now,
-            reason=mail_error,
-            details=mail_details,
-        )
-
-        for component in (
-            "vision",
-            "strict_ingest",
-            "postmatch",
-            "draft_publisher",
-            "historical_rosh",
-        ):
-            status, details = _worker_health(
-                connection, component, now, active_components
-            )
+        for component in WORKER_COMPONENTS:
+            status, details = _worker_health(connection, component, now, active)
             _record_component(
                 connection,
                 component,
@@ -778,16 +278,33 @@ def service_once(
                 details=details,
             )
 
-        previous_companion = connection.execute(
-            "SELECT status FROM service_health WHERE component='companion'"
+        pending = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM shadow_orders WHERE status='pending'"
+            ).fetchone()[0]
+        )
+        try:
+            SMTPConfig.from_environment()
+            smtp_configured = True
+        except SMTPConfigurationError:
+            smtp_configured = False
+        mail_row = connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE status='dead_letter'"
         ).fetchone()
+        _record_component(
+            connection,
+            "mail_delivery",
+            "healthy" if smtp_configured and int(mail_row[0]) == 0 else "degraded",
+            now,
+            reason=None if smtp_configured else "configuration_missing",
+            details={
+                "smtp_configured": smtp_configured,
+                "dead_letters": int(mail_row[0]),
+            },
+        )
         companion_status, companion_reason, companion_details = _companion_health(
-            "companion" in active_components,
+            "companion" in active,
             companion_probe,
-            initial=(
-                previous_companion is None
-                or str(previous_companion["status"]) == "stopped"
-            ),
         )
         _record_component(
             connection,
@@ -796,46 +313,92 @@ def service_once(
             now,
             reason=companion_reason,
             details=companion_details,
-            informational=("companion" not in active_components),
+            informational="companion" not in active,
         )
         reconcile_alerts(connection, now=now)
         if health_only:
             return {"pending_orders": pending}
-        report = build_report(connection)
-        intelligence = build_intelligence_report(connection)
         result = {
             "market_source_policy": MARKET_SOURCE_POLICY,
             "capabilities": _service_capabilities(connection),
-            "shadow": report,
-            "intelligence": intelligence,
+            "shadow": build_report(connection),
+            "intelligence": build_intelligence_report(connection),
         }
-        if report_path:
-            _write_service_report(report_path, result)
-        return result
+    if report_path is not None:
+        _write_service_report(report_path, result)
+    return result
+
+
+class _ReportWorker:
+    def __init__(
+        self,
+        database_url: str,
+        report_path: Path,
+        *,
+        report_interval: float = 300.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.database_url = database_url
+        self.report_path = report_path
+        self.report_interval = report_interval
+        self._monotonic = monotonic
+        self._thread: threading.Thread | None = None
+        self._last_finished_at: float | None = None
+        self.last_error: str | None = None
+
+    def start_if_idle(self) -> bool:
+        if self._thread is not None and self._thread.is_alive():
+            return False
+        if (
+            self._last_finished_at is not None
+            and self._monotonic() - self._last_finished_at < self.report_interval
+        ):
+            return False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self._thread is None:
+            return True
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _run(self) -> None:
+        try:
+            service_once(self.database_url, self.report_path)
+        except Exception as error:
+            self.last_error = f"{type(error).__name__}: {error}"
+        else:
+            self.last_error = None
+        finally:
+            self._last_finished_at = self._monotonic()
+
+
+def _data_paths() -> dict[str, Path]:
+    root = ROOT / "data" / "live_betting"
+    return {
+        "raw": root / "raw-v2",
+        "observations": root / "vision_observations",
+        "evidence": root / "vision_evidence",
+        "vision_logs": root / "watcher_logs",
+        "managed_logs": root / "logs" / "managed",
+        "source_archive": ROOT / "data" / "raw-sources",
+        "coverage": ROOT / "data" / "reports" / "strict_event_coverage_latest.json",
+    }
 
 
 def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
-    commands: dict[str, list[str]] = {}
+    paths = _data_paths()
     python = sys.executable
-    paths = service_data_paths(args.database)
-    database = str(paths.database)
-    publisher_requested = bool(
-        getattr(args, "start_draft_publisher", False) or args.start_shadow
-    )
-    historical_rosh_requested = not bool(
-        getattr(args, "once", False)
-        or getattr(args, "disable_historical_rosh", False)
-    )
-    deployment_key = getattr(args, "draft_deployment_key", None)
+    commands: dict[str, list[str]] = {}
     if args.start_collector:
         commands["collector"] = [
             python,
             "-m",
             "live_betting.monitor",
-            "--database",
-            database,
             "--raw-dir",
-            str(paths.odds_raw_root),
+            str(paths["raw"]),
             "--schema-prepared",
         ]
     if args.start_companion:
@@ -843,719 +406,172 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             python,
             "-m",
             "live_betting.browser_companion",
-            "--database",
-            database,
             "--schema-prepared",
         ]
     if args.start_shadow:
-        requested_vision = getattr(args, "vision_jsonl", None)
-        if (
-            requested_vision is not None
-            and requested_vision.resolve() != paths.vision_observations
-        ):
-            raise ValueError(
-                "--vision-jsonl must equal <database-dir>/live_betting/"
-                "live_observations"
-            )
         commands["shadow"] = [
             python,
-            "scripts/run_comeback_shadow.py",
-            "--database",
-            database,
+            "-m",
+            "live_betting.shadow_monitor",
             "--vision-jsonl",
-            str(paths.vision_observations),
+            str(paths["observations"]),
             "--schema-prepared",
         ]
-    if getattr(args, "start_vision", False):
+    if args.start_vision:
         commands["vision"] = [
             python,
             "scripts/supervise_raybet_streams.py",
-            "--database",
-            database,
             "--output-dir",
-            str(paths.vision_observations),
+            str(paths["observations"]),
             "--evidence-dir",
-            str(paths.vision_evidence),
+            str(paths["evidence"]),
             "--log-dir",
-            str(paths.vision_logs),
+            str(paths["vision_logs"]),
             "--schema-prepared",
         ]
     if args.start_mail:
         commands["mail"] = [
             python,
             "scripts/run_notification_worker.py",
-            "--database",
-            database,
             "--schema-prepared",
         ]
     if args.start_strict_ingest:
         commands["strict_ingest"] = [
             python,
             "scripts/run_strict_event_ingest.py",
-            "--database",
-            database,
             "--archive-root",
-            str(paths.source_archive_root),
+            str(paths["source_archive"]),
             "--coverage-report",
-            str(paths.strict_coverage_report),
+            str(paths["coverage"]),
             "--schema-prepared",
         ]
     if args.start_postmatch:
         commands["postmatch"] = [
             python,
-            "scripts/run_postmatch_labeler.py",
-            "--database",
-            database,
+            "-m",
+            "live_betting.postmatch_monitor",
             "--all",
             "--archive-root",
-            str(paths.source_archive_root),
+            str(paths["source_archive"]),
             "--schema-prepared",
         ]
-    if publisher_requested:
+    if args.start_draft_publisher or args.start_shadow:
+        deployment_key = args.draft_deployment_key
         if (
             not isinstance(deployment_key, str)
             or len(deployment_key) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in deployment_key
-            )
+            or any(character not in "0123456789abcdef" for character in deployment_key)
         ):
             raise ValueError(
-                "--draft-deployment-key is required when the draft publisher is "
-                "enabled and must be a lowercase SHA-256 digest"
+                "--draft-deployment-key must be a lowercase SHA-256 when the "
+                "draft publisher is enabled"
             )
         commands["draft_publisher"] = [
             python,
             "-m",
             "live_betting.draft_publisher",
-            "--database",
-            database,
-            "--schema-prepared",
             "--deployment-key",
             deployment_key,
         ]
-    if historical_rosh_requested:
+    if not args.once and not args.disable_historical_rosh:
         commands["historical_rosh"] = [
             python,
             "scripts/run_historical_rosh_worker.py",
-            "--database",
-            database,
             "--schema-prepared",
         ]
-    return {
-        name: managed_child_command(command)
-        for name, command in commands.items()
-    }
+    return commands
 
 
-def _capture_subprocess_tree_identities(
-    process_handle: Any,
-    *,
-    process_factory: Callable[[int], Any] = psutil.Process,
-    max_passes: int = 8,
-) -> tuple[ProcessIdentity, ...]:
-    if process_handle.poll() is not None:
-        raise RuntimeError("direct child exited before subtree capture")
-    root = process_factory(int(process_handle.pid))
-    root_identity = ProcessIdentity(int(root.pid), float(root.create_time()))
-    previous: tuple[ProcessIdentity, ...] | None = None
-    for _ in range(max_passes):
-        if process_handle.poll() is not None:
-            raise RuntimeError("direct child exited during subtree capture")
-        if float(root.create_time()) != root_identity.created_at:
-            raise RuntimeError("direct child identity changed during subtree capture")
-        identities = {root_identity}
-        unstable = False
-        try:
-            descendants = root.children(recursive=True)
-        except psutil.NoSuchProcess:
-            previous = None
-            continue
-        for child in descendants:
-            try:
-                if (
-                    not child.is_running()
-                    or child.status() == psutil.STATUS_ZOMBIE
-                ):
-                    unstable = True
-                    break
-                identities.add(
-                    ProcessIdentity(int(child.pid), float(child.create_time()))
-                )
-            except psutil.NoSuchProcess:
-                unstable = True
-                break
-        if unstable:
-            previous = None
-            continue
-        current = tuple(sorted(identities))
-        if current == previous:
-            if process_handle.poll() is not None:
-                raise RuntimeError("direct child exited after subtree capture")
-            return current
-        previous = current
-    raise RuntimeError("healthy child subtree did not stabilize")
-
-
-def _healthy_subtree_identities(
-    children: Mapping[str, Any],
-    *,
-    process_factory: Callable[[int], Any] = psutil.Process,
-) -> tuple[ProcessIdentity, ...]:
-    _, identities = _healthy_subtree_snapshot(
-        children,
-        process_factory=process_factory,
-    )
-    return identities
-
-
-def _healthy_subtree_snapshot(
-    children: Mapping[str, Any],
-    *,
-    process_factory: Callable[[int], Any] = psutil.Process,
-) -> tuple[tuple[ProcessIdentity, ...], tuple[ProcessIdentity, ...]]:
-    roots: set[ProcessIdentity] = set()
-    identities: set[ProcessIdentity] = set()
-    for process_handle in children.values():
-        if process_handle.poll() is not None:
-            continue
-        try:
-            subtree = _capture_subprocess_tree_identities(
-                process_handle,
-                process_factory=process_factory,
-            )
-        except Exception:
-            if process_handle.poll() is not None:
-                continue
-            raise
-        root_pid = int(process_handle.pid)
-        root_identity = next(
-            (identity for identity in subtree if identity.pid == root_pid),
-            None,
-        )
-        if root_identity is None:
-            raise RuntimeError("healthy child root is absent from subtree capture")
-        roots.add(root_identity)
-        identities.update(subtree)
-    return tuple(sorted(roots)), tuple(sorted(identities))
-
-
-def _replacement_authority_gate(
-    children: Mapping[str, Any],
-    database: Path,
-    database_identity: DatabaseFileIdentity,
-    *,
-    process_factory: Callable[[int], Any] = psutil.Process,
-    writer_scanner: Callable[..., WriterScanResult] | None = None,
-    max_passes: int = 8,
-) -> TerminationResult:
-    if max_passes <= 0:
-        raise ValueError("writer gate max passes must be positive")
-    writer_scanner = writer_scanner or scan_managed_writers
+def _spawn_child(
+    name: str,
+    command: list[str],
+    database_url: str,
+    log_dir: Path,
+) -> _Child:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout = (log_dir / f"{name}.stdout.log").open("a", encoding="utf-8")
+    stderr = (log_dir / f"{name}.stderr.log").open("a", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["DATABASE_URL"] = database_url
     try:
-        require_unique_database_file(
-            database,
-            expected_identity=database_identity,
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        baseline_roots, baseline = _healthy_subtree_snapshot(
-            children,
-            process_factory=process_factory,
-        )
-        initial_roots = set(baseline_roots)
-        for _ in range(max_passes):
-            scan = writer_scanner(database, allowed_identities=baseline)
-            if scan.unverifiable_pids:
-                return TerminationResult(
-                    False,
-                    "writer_scan_unverifiable:"
-                    + ",".join(str(pid) for pid in scan.unverifiable_pids),
-                )
-            current_roots, current = _healthy_subtree_snapshot(
-                children,
-                process_factory=process_factory,
-            )
-            require_unique_database_file(
-                database,
-                expected_identity=database_identity,
-            )
-            baseline_root_set = set(baseline_roots)
-            current_root_set = set(current_roots)
-            if (
-                current_root_set - initial_roots
-                or current_root_set - baseline_root_set
-            ):
-                return TerminationResult(
-                    False,
-                    "healthy_roots_changed_during_writer_gate",
-                )
-            baseline_set = set(baseline)
-            current_set = set(current)
-            added_descendants = (
-                current_set - baseline_set - current_root_set
-            )
-            conflicts = tuple(
-                item for item in scan.conflicts if item not in added_descendants
-            )
-            if conflicts:
-                return TerminationResult(
-                    False,
-                    "orphan_writer_conflict:"
-                    + ",".join(str(item.pid) for item in conflicts),
-                )
-            removed = baseline_set - current_set
-            removed_roots = baseline_root_set - current_root_set
-            for removed_identity in sorted(removed | removed_roots):
-                alive, _, resolve_error = resolve_process_identity(
-                    removed_identity,
-                    process_factory,
-                )
-                if resolve_error is not None:
-                    raise RuntimeError(
-                        "removed process identity is unverifiable:"
-                        f"{removed_identity.pid}:{resolve_error}"
-                    )
-                if alive:
-                    detail = (
-                        "healthy_roots_changed_during_writer_gate"
-                        if removed_identity in removed_roots
-                        else "healthy_subtree_changed_during_writer_gate"
-                    )
-                    return TerminationResult(False, detail)
-            if current_roots == baseline_roots and current == baseline:
-                return TerminationResult(True)
-            baseline_roots = current_roots
-            baseline = current
-    except Exception as error:
-        return TerminationResult(
-            False,
-            f"replacement_authority_unverifiable:{type(error).__name__}:{error}",
-        )
-    return TerminationResult(
-        False,
-        "healthy_subtree_did_not_stabilize_during_writer_gate",
-    )
+    except BaseException:
+        stdout.close()
+        stderr.close()
+        raise
+    return _Child(process=process, stdout=stdout, stderr=stderr)
 
 
-def _shutdown_children_under_authority(
-    children: Mapping[str, Any],
-    database: Path,
-    database_identity: DatabaseFileIdentity,
-    *,
-    terminator: Callable[..., TerminationResult] | None = None,
-    writer_scanner: Callable[..., WriterScanResult] | None = None,
-    retry_hook: Callable[[int, str], bool] | None = None,
-    sleeper: Callable[[float], None] = time.sleep,
-) -> TerminationResult:
-    terminator = terminator or terminate_subprocess_tree
-    writer_scanner = writer_scanner or scan_managed_writers
-    attempt = 0
-    while True:
-        attempt += 1
-        termination_details: list[str] = []
-        cleanup_details: list[str] = []
-        for name, child in children.items():
-            try:
-                result = terminator(child)
-            except Exception as error:
-                termination_details.append(
-                    f"termination_unproven:{name}:"
-                    f"{type(error).__name__}:{error}"
-                )
-            else:
-                if not result.ok:
-                    termination_details.append(
-                        f"termination_unproven:{name}:{result.detail}"
-                    )
-            try:
-                _close_child_authority(child)
-            except Exception as error:
-                cleanup_details.append(
-                    f"{name}:authority_cleanup:{type(error).__name__}:{error}"
-                )
-        authority_details: list[str] = list(cleanup_details)
-        try:
-            require_unique_database_file(
-                database,
-                expected_identity=database_identity,
-            )
-            scan = writer_scanner(database, allowed_identities=())
-            if scan.unverifiable_pids:
-                authority_details.append(
-                    "writer_scan_unverifiable:"
-                    + ",".join(str(pid) for pid in scan.unverifiable_pids)
-                )
-            if scan.conflicts:
-                authority_details.append(
-                    "writer_conflicts:"
-                    + ",".join(str(item.pid) for item in scan.conflicts)
-                )
-            require_unique_database_file(
-                database,
-                expected_identity=database_identity,
-            )
-        except Exception as error:
-            authority_details.append(
-                f"database_authority_unverifiable:{type(error).__name__}:{error}"
-            )
-        if not termination_details and not authority_details:
-            detail = f"shutdown_proven_after_attempt:{attempt}"
-            return TerminationResult(True, detail)
-        detail = ";".join(
-            dict.fromkeys([*termination_details, *authority_details])
-        )
-        if retry_hook is not None and not retry_hook(attempt, detail):
-            return TerminationResult(False, f"quarantined:{attempt}:{detail}")
-        print(
-            json.dumps(
-                {
-                    "status": "quarantined",
-                    "attempt": attempt,
-                    "detail": detail,
-                },
-                ensure_ascii=False,
-            ),
-            file=sys.stderr,
-            flush=True,
-        )
-        sleeper(min(5.0, 0.25 * (2 ** min(attempt - 1, 5))))
-
-
-_CHILD_AUTHORITY_ATTRIBUTE = "_dota2_manager_authority_context"
-_CHILD_AUTHORITY_CLEANUP_ERROR_ATTRIBUTE = (
-    "_dota2_manager_authority_cleanup_error"
-)
-
-
-class _ManagedChildHandle:
-    """Keep a spawned process and its exact marker context inseparable."""
-
-    def __init__(self, authority_context: Any) -> None:
-        self._process_handle: Any | None = None
-        setattr(self, _CHILD_AUTHORITY_ATTRIBUTE, authority_context)
-        setattr(self, _CHILD_AUTHORITY_CLEANUP_ERROR_ATTRIBUTE, None)
-
-    def bind(self, process_handle: Any) -> None:
-        if self._process_handle is not None:
-            raise RuntimeError("managed child process is already bound")
-        self._process_handle = process_handle
-
-    def poll(self) -> int | None:
-        if self._process_handle is None:
-            return 1
-        return self._process_handle.poll()
-
-    def __getattr__(self, name: str) -> Any:
-        process_handle = self._process_handle
-        if process_handle is None:
-            raise AttributeError(name)
-        return getattr(process_handle, name)
-
-
-def _close_child_authority(process_handle: Any) -> None:
-    try:
-        namespace = vars(process_handle)
-    except TypeError:
-        return
-    cleanup_error = namespace.get(_CHILD_AUTHORITY_CLEANUP_ERROR_ATTRIBUTE)
-    if cleanup_error is not None:
-        raise RuntimeError(
-            "manager child authority cleanup is quarantined: "
-            f"{cleanup_error}"
-        )
-    authority = namespace.get(_CHILD_AUTHORITY_ATTRIBUTE)
-    if authority is None:
-        return
-    try:
-        authority.__exit__(None, None, None)
-    except BaseException as error:
-        detail = f"{type(error).__name__}:{error}"
-        namespace[_CHILD_AUTHORITY_CLEANUP_ERROR_ATTRIBUTE] = detail
-        raise RuntimeError(
-            f"manager child authority cleanup failed: {detail}"
-        ) from error
-    namespace[_CHILD_AUTHORITY_ATTRIBUTE] = None
-
-
-def _child_authority_role(name: str) -> str:
-    return "vision_supervisor" if name == "vision" else name
-
-
-def _reconcile_managed_children(
-    children: dict[str, Any],
+def _reconcile_children(
+    children: dict[str, _Child],
     commands: Mapping[str, list[str]],
-    database: Path,
-    database_identity: DatabaseFileIdentity,
-    restart_states: dict[str, _ChildRestartState] | None = None,
-    *,
-    monotonic: Callable[[], float] = time.monotonic,
-    authority_gate: Callable[..., TerminationResult] | None = None,
-    popen_factory: Callable[..., Any] | None = None,
-    process_factory: Callable[[int], Any] = psutil.Process,
-) -> TerminationResult:
-    states = restart_states if restart_states is not None else {}
-    now = monotonic()
-    authority_gate = authority_gate or _replacement_authority_gate
-    pending: dict[str, list[str]] = {}
-    newly_exited: list[tuple[str, Any, _ChildRestartState, int]] = []
+    database_url: str,
+    log_dir: Path,
+) -> None:
+    now = time.monotonic()
+    for name in tuple(children):
+        child = children[name]
+        code = child.process.poll()
+        if name not in commands:
+            terminate_subprocess_tree(child.process)
+            if child.stdout is not None:
+                child.stdout.close()
+            if child.stderr is not None:
+                child.stderr.close()
+            del children[name]
+        elif code is not None and child.stdout is not None:
+            child.stdout.close()
+            child.stderr.close()
+            failures = child.failures + 1
+            delay = CHILD_RESTART_DELAYS_SECONDS[
+                min(failures - 1, len(CHILD_RESTART_DELAYS_SECONDS) - 1)
+            ]
+            del children[name]
+            replacement = _Child(
+                process=child.process,
+                stdout=None,
+                stderr=None,
+                failures=failures,
+                restart_at=now + delay,
+            )
+            children[name] = replacement
     for name, command in commands.items():
-        state = states.setdefault(name, _ChildRestartState())
         child = children.get(name)
-        if child is None:
-            if now >= state.next_restart_at:
-                pending[name] = command
+        if child is not None and child.process.poll() is None:
             continue
-        exit_code = child.poll()
-        if exit_code is None:
-            if state.started_at is None:
-                state.started_at = now
-            elif now - state.started_at >= CHILD_STABLE_RESET_SECONDS:
-                state.consecutive_failures = 0
-                state.last_exit_code = None
+        if child is not None and now < child.restart_at:
             continue
-        if state.observed_exit_handle is not child:
-            newly_exited.append((name, child, state, int(exit_code)))
-            continue
-        if now >= state.next_restart_at:
-            pending[name] = command
-
-    publisher = children.get("draft_publisher")
-    publisher_state = states.get("draft_publisher")
-    publisher_wedged = False
-    if (
-        publisher is not None
-        and publisher_state is not None
-        and publisher.poll() is None
-        and publisher_state.started_at is not None
-        and now - publisher_state.started_at
-        >= DRAFT_PUBLISHER_WEDGE_STARTUP_GRACE_SECONDS
-    ):
-        try:
-            publisher_identities = _capture_subprocess_tree_identities(
-                publisher,
-                process_factory=process_factory,
-            )
-        except (psutil.Error, RuntimeError):
-            publisher_identities = ()
-        if publisher_identities:
-            publisher_wedged = _draft_publisher_heartbeat_expired(
-                database,
-                expected_identities=publisher_identities,
-                child_runtime_seconds=now - publisher_state.started_at,
-            ) is True
-    if publisher_wedged:
-        gate = authority_gate(children, database, database_identity)
-        if not gate.ok:
-            return gate
-        termination = terminate_subprocess_tree(
-            publisher,
-            process_factory=process_factory,
-        )
-        if not termination.ok:
-            return TerminationResult(
-                False,
-                "wedged_child_termination_unproven:draft_publisher:"
-                f"{termination.detail}",
-            )
-        try:
-            _close_child_authority(publisher)
-        except Exception as error:
-            return TerminationResult(
-                False,
-                "wedged_child_authority_cleanup_failed:draft_publisher:"
-                f"{type(error).__name__}:{error}",
-            )
-        children.pop("draft_publisher", None)
-        _schedule_child_restart(
-            publisher_state,
-            failed_at=now,
-            exit_code=None,
-        )
-        publisher_state.observed_exit_handle = None
-
-    gate_checked = False
-    if newly_exited:
-        gate = authority_gate(children, database, database_identity)
-        if not gate.ok:
-            return gate
-        gate_checked = True
-        for name, child, state, exit_code in newly_exited:
-            try:
-                _close_child_authority(child)
-            except Exception as error:
-                return TerminationResult(
-                    False,
-                    f"child_authority_cleanup_failed:{name}:"
-                    f"{type(error).__name__}:{error}",
-                )
-            if (
-                state.started_at is not None
-                and now - state.started_at >= CHILD_STABLE_RESET_SECONDS
-            ):
-                state.consecutive_failures = 0
-            _schedule_child_restart(
-                state,
-                failed_at=now,
-                exit_code=exit_code,
-            )
-            state.observed_exit_handle = child
-    if not pending:
-        return TerminationResult(True)
-    if not gate_checked:
-        gate = authority_gate(children, database, database_identity)
-        if not gate.ok:
-            return gate
-    popen_factory = popen_factory or subprocess.Popen
-    for name, command in pending.items():
-        previous = children.get(name)
-        if previous is not None:
-            try:
-                _close_child_authority(previous)
-            except Exception as error:
-                return TerminationResult(
-                    False,
-                    f"child_authority_cleanup_failed:{name}:"
-                    f"{type(error).__name__}:{error}",
-                )
-        authority_context = manager_child_authority(
-            database,
-            role=_child_authority_role(name),
-            command=command,
-            delegate_roles=("vision_watcher",) if name == "vision" else (),
-            held_locks=database_service_authority_lock_paths(database),
-        )
-        managed_child = _ManagedChildHandle(authority_context)
-        children[name] = managed_child
-        process_handle: Any | None = None
-        try:
-            authority = authority_context.__enter__()
-        except BaseException as authority_error:
-            try:
-                _close_child_authority(managed_child)
-            except BaseException as cleanup_error:
-                children[name] = managed_child
-                if not isinstance(authority_error, Exception):
-                    raise authority_error
-                return TerminationResult(
-                    False,
-                    f"child_authority_enter_failed:{name}:"
-                    f"{type(authority_error).__name__}:{authority_error};"
-                    f"child_authority_cleanup_failed:{name}:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}",
-                )
-            children.pop(name, None)
-            if not isinstance(authority_error, Exception):
-                raise
-            return TerminationResult(
-                False,
-                f"child_authority_enter_failed:{name}:"
-                f"{type(authority_error).__name__}:{authority_error}",
-            )
-        try:
-            process_handle = popen_factory(
-                command,
-                cwd=ROOT,
-                creationflags=(
-                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                ),
-                env=manager_child_process_environment(authority),
-            )
-            managed_child.bind(process_handle)
-        except BaseException as spawn_error:
-            if process_handle is not None:
-                if managed_child._process_handle is None:
-                    managed_child._process_handle = process_handle
-                termination = terminate_subprocess_tree(
-                    managed_child,
-                    process_factory=process_factory,
-                )
-                if not termination.ok:
-                    children[name] = managed_child
-                    if not isinstance(spawn_error, Exception):
-                        raise
-                    return TerminationResult(
-                        False,
-                        f"child_spawn_failed:{name}:"
-                        f"{type(spawn_error).__name__};"
-                        f"termination_unproven:{name}:{termination.detail}",
-                    )
-            try:
-                _close_child_authority(managed_child)
-            except BaseException as cleanup_error:
-                children[name] = managed_child
-                if not isinstance(spawn_error, Exception):
-                    raise spawn_error
-                return TerminationResult(
-                    False,
-                    f"child_spawn_failed:{name}:"
-                    f"{type(spawn_error).__name__};"
-                    f"child_authority_cleanup_failed:{name}:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}",
-                )
-            children.pop(name, None)
-            if not isinstance(spawn_error, OSError):
-                raise
-            _schedule_child_restart(
-                states[name],
-                failed_at=now,
-                exit_code=None,
-            )
-            states[name].observed_exit_handle = None
-            continue
-        try:
-            bind_manager_child_authority(
-                authority,
-                process_handle,
-                process_factory=process_factory,
-            )
-        except BaseException as bind_error:
-            termination = terminate_subprocess_tree(
-                managed_child,
-                process_factory=process_factory,
-            )
-            if not termination.ok:
-                if not isinstance(bind_error, Exception):
-                    raise
-                return TerminationResult(
-                    False,
-                    f"child_authority_bind_failed:{name}:"
-                    f"{type(bind_error).__name__}:{bind_error};"
-                    f"termination_unproven:{name}:{termination.detail}",
-                )
-            try:
-                _close_child_authority(managed_child)
-            except BaseException as cleanup_error:
-                if not isinstance(bind_error, Exception):
-                    raise bind_error
-                return TerminationResult(
-                    False,
-                    f"child_authority_bind_failed:{name}:"
-                    f"{type(bind_error).__name__}:{bind_error};"
-                    f"child_authority_cleanup_failed:{name}:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}",
-                )
-            children.pop(name, None)
-            if not isinstance(bind_error, Exception):
-                raise
-            return TerminationResult(
-                False,
-                f"child_authority_bind_failed:{name}:"
-                f"{type(bind_error).__name__}:{bind_error}",
-            )
-        state = states[name]
-        state.next_restart_at = 0.0
-        state.started_at = monotonic()
-        state.observed_exit_handle = None
-    return TerminationResult(True)
+        failures = 0 if child is None else child.failures
+        spawned = _spawn_child(name, command, database_url, log_dir)
+        spawned.failures = failures
+        children[name] = spawned
 
 
-def main() -> int:
+def _shutdown_children(children: dict[str, _Child]) -> None:
+    for child in children.values():
+        if child.process.poll() is None:
+            terminate_subprocess_tree(child.process)
+        if child.stdout is not None:
+            child.stdout.close()
+        if child.stderr is not None:
+            child.stderr.close()
+    children.clear()
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(
-        parser,
-        default=ROOT / "data" / "dota2.db",
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
     )
     parser.add_argument("--report", type=Path)
-    parser.add_argument("--lock", type=Path)
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--start-collector", action="store_true")
@@ -1566,234 +582,93 @@ def main() -> int:
     parser.add_argument("--start-strict-ingest", action="store_true")
     parser.add_argument("--start-postmatch", action="store_true")
     parser.add_argument("--start-draft-publisher", action="store_true")
-    parser.add_argument(
-        "--disable-historical-rosh",
-        action="store_true",
-        help="disable the historical Rosh backfill worker",
-    )
-    parser.add_argument(
-        "--draft-deployment-key",
-        help=(
-            "externally pinned frozen draft deployment SHA-256; required "
-            "when the draft publisher is enabled"
-        ),
-    )
-    parser.add_argument(
-        "--backup-dir",
-        type=Path,
-        help=(
-            "migration backup directory; defaults to <database-dir>/backups "
-            "and may be placed on another volume"
-        ),
-    )
-    parser.add_argument(
-        "--migrate",
-        action="store_true",
-        help=(
-            "verify current schema read-only, or take a backup before "
-            "migration/repair"
-        ),
-    )
-    parser.add_argument("--vision-jsonl", type=Path)
+    parser.add_argument("--disable-historical-rosh", action="store_true")
+    parser.add_argument("--draft-deployment-key")
+    return parser
+
+
+def main() -> int:
+    parser = _parser()
     args = parser.parse_args()
-    args.database = args.database.resolve()
-    if args.report is None:
-        args.report = args.database.parent / "live_betting" / "service_report.json"
-    authority_lock_paths = database_service_authority_lock_paths(args.database)
-    additional_lock_path = args.lock.resolve() if args.lock is not None else None
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
+    database_url = require_database_url(args.database_url)
+    report = args.report or ROOT / "data" / "live_betting" / "service_report.json"
     try:
         commands = _commands(args)
     except ValueError as error:
         parser.error(str(error))
-    children: dict[str, Any] = {}
-    restart_states: dict[str, _ChildRestartState] = {}
-    report_worker: _ReportWorker | None = None
-    children_shutdown = False
-    initial_database_identity = require_unique_database_file(
-        args.database,
-        allow_missing=True,
+
+    with LiveBettingStore(database_url) as store:
+        store.init_schema()
+
+    engine = build_engine(database_url)
+    lock_connection = engine.connect()
+    acquired = bool(
+        lock_connection.execute(
+            text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
+            {"key": SERVICE_LOCK_KEY},
+        ).scalar_one()
     )
-    database_identity: DatabaseFileIdentity | None = None
-    with ExitStack() as locks:
-        for authority_lock_path in authority_lock_paths:
-            locks.enter_context(SingleInstanceLock(authority_lock_path))
-        if (
-            additional_lock_path is not None
-            and additional_lock_path not in set(authority_lock_paths)
-        ):
-            locks.enter_context(SingleInstanceLock(additional_lock_path))
-        try:
-            locked_database_identity = require_unique_database_file(
-                args.database,
-                expected_identity=initial_database_identity,
-                allow_missing=initial_database_identity is None,
+    if not acquired:
+        lock_connection.close()
+        engine.dispose()
+        raise RuntimeError("another shadow service supervisor is already running")
+
+    stopped = threading.Event()
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stopped.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    children: dict[str, _Child] = {}
+    report_worker = _ReportWorker(database_url, report)
+    try:
+        while not stopped.is_set():
+            _reconcile_children(
+                children,
+                commands,
+                database_url,
+                _data_paths()["managed_logs"],
             )
-            if locked_database_identity != initial_database_identity:
-                raise RuntimeError(
-                    "database file identity changed before service lock"
-                )
-            writer_scan = scan_managed_writers(args.database)
-            if writer_scan.unverifiable_pids:
-                raise RuntimeError(
-                    "managed writer scan could not verify PIDs: "
-                    + ",".join(str(pid) for pid in writer_scan.unverifiable_pids)
-                )
-            if writer_scan.conflicts:
-                raise RuntimeError(
-                    "managed writers already target this database: "
-                    + ",".join(
-                        str(identity.pid) for identity in writer_scan.conflicts
-                    )
-                )
-            preparation = (
-                prepare_database(
-                    args.database,
-                    args.backup_dir or args.database.parent / "backups",
-                    supervisor_process_lock_held=True,
-                    odds_raw_root=(
-                        args.database.resolve().parent / "live_betting" / "raw-v2"
-                    ),
-                )
-                if args.migrate
-                else verify_prepared_database(args.database)
+            result = service_once(
+                database_url,
+                report if args.once else None,
+                active_components=set(commands),
+                initialize_schema=False,
+                health_only=not args.once,
             )
-            database_identity = require_unique_database_file(
-                args.database,
-                expected_identity=locked_database_identity,
-            )
-            assert database_identity is not None
-            report_worker = (
-                None if args.once else _ReportWorker(args.database, args.report)
-            )
-            while True:
-                try:
-                    require_unique_database_file(
-                        args.database,
-                        expected_identity=database_identity,
-                    )
-                except Exception as error:
-                    shutdown = _shutdown_children_under_authority(
-                        children,
-                        args.database,
-                        database_identity,
-                    )
-                    if not shutdown.ok:
-                        raise RuntimeError(
-                            "database authority shutdown remains quarantined: "
-                            f"{shutdown.detail}"
-                        ) from error
-                    children.clear()
-                    children_shutdown = True
-                    raise RuntimeError(
-                        f"database authority failed: {type(error).__name__}: {error}"
-                    ) from error
-                reconciliation = _reconcile_managed_children(
-                    children,
-                    commands,
-                    args.database,
-                    database_identity,
-                    restart_states,
-                )
-                if not reconciliation.ok:
-                    print(
-                        json.dumps(
-                            {
-                                "status": "quarantined",
-                                "detail": reconciliation.detail,
-                            },
-                            ensure_ascii=False,
+            if not args.once:
+                report_worker.start_if_idle()
+            print(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "database": "postgresql",
+                        "components": sorted(commands),
+                        "pending": (
+                            result["pending_orders"]
+                            if not args.once
+                            else result["shadow"]["orders"]["signals"]
                         ),
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    shutdown = _shutdown_children_under_authority(
-                        children,
-                        args.database,
-                        database_identity,
-                    )
-                    if not shutdown.ok:
-                        raise RuntimeError(
-                            "managed child authority shutdown remains quarantined: "
-                            f"{shutdown.detail}"
-                        )
-                    children.clear()
-                    children_shutdown = True
-                    raise RuntimeError(
-                        "managed child authority failed: "
-                        f"{reconciliation.detail}"
-                    )
-                require_unique_database_file(
-                    args.database,
-                    expected_identity=database_identity,
-                )
-                try:
-                    result = service_once(
-                        args.database,
-                        args.report if args.once else None,
-                        active_components=set(commands),
-                        initialize_schema=False,
-                        health_only=report_worker is not None,
-                    )
-                except sqlite3.OperationalError as error:
-                    lock_kind = _transient_sqlite_lock_kind(error)
-                    if lock_kind is None:
-                        raise
-                    print(
-                        json.dumps(
-                            {
-                                "status": "degraded",
-                                "detail": "database_lock_contention",
-                                "sqlite_result": lock_kind,
-                            },
-                            ensure_ascii=False,
-                        ),
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    time.sleep(
-                        _restart_sleep_seconds(restart_states, args.interval)
-                    )
-                    continue
-                if report_worker is not None:
-                    report_worker.start_if_idle()
-                print(json.dumps({"status": "ok", "components": list(commands),
-                                  "pending": (
-                                      result["pending_orders"]
-                                      if report_worker is not None
-                                      else result["shadow"]["orders"]["signals"]
-                                  ),
-                                  "backup": (
-                                      str(preparation.backup)
-                                      if preparation.backup is not None
-                                      else None
-                                  ),
-                                  "schema_versions": {
-                                      "live": preparation.live_schema_version,
-                                      "intelligence": (
-                                          preparation.intelligence_schema_version
-                                      ),
-                                      "runtime": preparation.runtime_schema_version,
-                                  }},
-                                 ensure_ascii=False))
-                if args.once:
-                    break
-                time.sleep(_restart_sleep_seconds(restart_states, args.interval))
-        finally:
-            if report_worker is not None:
-                report_worker.wait()
-            shutdown = (
-                _shutdown_children_under_authority(
-                    children,
-                    args.database,
-                    database_identity,
-                )
-                if database_identity is not None and not children_shutdown
-                else TerminationResult(not children, "database_identity_unavailable")
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
             )
-            if not shutdown.ok:
-                raise RuntimeError(
-                    f"supervisor child shutdown incomplete: {shutdown.detail}"
-                )
+            if args.once:
+                break
+            stopped.wait(args.interval)
+    finally:
+        report_worker.wait()
+        _shutdown_children(children)
+        lock_connection.execute(
+            text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+            {"key": SERVICE_LOCK_KEY},
+        )
+        lock_connection.close()
+        engine.dispose()
     return 0
 
 

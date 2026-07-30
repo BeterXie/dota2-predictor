@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
 
 
 _STRICT_READ_SCHEMA = {
@@ -76,7 +79,7 @@ class StrictReadGate:
 
 
 def strict_read_gate(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     mapping_id_sql: str,
     raybet_match_id_sql: str,
@@ -107,9 +110,7 @@ def strict_read_gate(
             unverifiable_sql="1",
         )
 
-    mapping_id_valid = (
-        f"(typeof({mapping_id_sql})='integer' AND ({mapping_id_sql})>0)"
-    )
+    mapping_id_valid = f"(({mapping_id_sql}) IS NOT NULL AND ({mapping_id_sql})>0)"
     impact = (
         "EXISTS ("
         "SELECT 1 FROM strict_live_mapping_impacts AS strict_impact "
@@ -172,14 +173,16 @@ def strict_read_gate(
            AND {mapping_accepted_aware}
            AND {mapping_recorded_aware}
            AND {metadata_aware}
-           AND julianday(strict_mapping.accepted_at)<=julianday({signal_at_sql})
-           AND julianday(strict_mapping.recorded_at)<=julianday({signal_at_sql})
-           AND julianday(strict_mapping.raybet_metadata_updated_at)
-               <=julianday({signal_at_sql})
-           AND julianday(strict_mapping.accepted_at)
-               <=julianday(strict_mapping.recorded_at)
-           AND julianday(strict_mapping.raybet_metadata_updated_at)
-               <=julianday(strict_mapping.recorded_at)
+           AND live_text_timestamp_utc(strict_mapping.accepted_at)
+               <=live_text_timestamp_utc({signal_at_sql})
+           AND live_text_timestamp_utc(strict_mapping.recorded_at)
+               <=live_text_timestamp_utc({signal_at_sql})
+           AND live_text_timestamp_utc(strict_mapping.raybet_metadata_updated_at)
+               <=live_text_timestamp_utc({signal_at_sql})
+           AND live_text_timestamp_utc(strict_mapping.accepted_at)
+               <=live_text_timestamp_utc(strict_mapping.recorded_at)
+           AND live_text_timestamp_utc(strict_mapping.raybet_metadata_updated_at)
+               <=live_text_timestamp_utc(strict_mapping.recorded_at)
            AND ({event_policy_sql})
            AND (
                 (strict_mapping.acceptance_mode='manual_exact'
@@ -209,23 +212,24 @@ def strict_read_gate(
                  AND strict_approval.evidence_hash=strict_mapping.evidence_hash
                  AND {approval_approved_aware}
                  AND {approval_recorded_aware}
-                 AND julianday(strict_approval.approved_at)
-                     <=julianday({signal_at_sql})
-                 AND julianday(strict_approval.recorded_at)
-                     <=julianday({signal_at_sql})
-                 AND julianday(strict_approval.approved_at)
-                     <=julianday(strict_approval.recorded_at)
-                 AND julianday(strict_approval.recorded_at)
-                     <=julianday(strict_mapping.accepted_at)
+                 AND live_text_timestamp_utc(strict_approval.approved_at)
+                     <=live_text_timestamp_utc({signal_at_sql})
+                 AND live_text_timestamp_utc(strict_approval.recorded_at)
+                     <=live_text_timestamp_utc({signal_at_sql})
+                 AND live_text_timestamp_utc(strict_approval.approved_at)
+                     <=live_text_timestamp_utc(strict_approval.recorded_at)
+                 AND live_text_timestamp_utc(strict_approval.recorded_at)
+                     <=live_text_timestamp_utc(strict_mapping.accepted_at)
                  AND {source_accepted_aware}
                  AND {source_recorded_aware}
                  AND {source_metadata_aware}
-                 AND julianday(strict_source.accepted_at)
-                     <=julianday(strict_approval.recorded_at)
-                 AND julianday(strict_source.recorded_at)
-                     <=julianday(strict_approval.recorded_at)
-                 AND julianday(strict_source.raybet_metadata_updated_at)
-                     <=julianday(strict_approval.recorded_at))
+                 AND live_text_timestamp_utc(strict_source.accepted_at)
+                     <=live_text_timestamp_utc(strict_approval.recorded_at)
+                 AND live_text_timestamp_utc(strict_source.recorded_at)
+                     <=live_text_timestamp_utc(strict_approval.recorded_at)
+                 AND live_text_timestamp_utc(
+                         strict_source.raybet_metadata_updated_at
+                     )<=live_text_timestamp_utc(strict_approval.recorded_at))
            )
     )"""
     verified = f"(({mapping_id_valid}) AND ({valid_mapping}))"
@@ -246,7 +250,7 @@ def strict_read_gate(
 
 
 def table_has_columns(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     table: str,
     columns: frozenset[str] | set[str],
 ) -> bool:
@@ -254,9 +258,14 @@ def table_has_columns(
 
     try:
         existing = {
-            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+            str(row[0])
+            for row in connection.execute(
+                """SELECT column_name FROM information_schema.columns
+                    WHERE table_schema=current_schema() AND table_name=?""",
+                (table,),
+            )
         }
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return False
     return bool(existing) and set(columns).issubset(existing)
 
@@ -265,14 +274,12 @@ def _aware_timestamp_sql(value_sql: str) -> str:
     """Match the timezone-aware ISO contract before SQLite date coercion."""
 
     return (
-        f"(typeof({value_sql})='text' AND julianday({value_sql}) IS NOT NULL "
-        f"AND (({value_sql}) GLOB '*Z' "
-        f"OR ({value_sql}) GLOB '*[+-][0-9][0-9]:[0-9][0-9]'))"
+        f"(live_text_timestamp_utc({value_sql}) IS NOT NULL)"
     )
 
 
 def _event_policy_sql(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     mapping_id_sql: str,
     signal_at_sql: str,
@@ -317,28 +324,30 @@ def _event_policy_sql(
            AND strict_event.approval_status='approved'
            AND strict_event.evidence_status='manually_audited'
            AND strict_event.tier='tier_1'
-           AND typeof(strict_event.prize_pool_usd) IN ('integer', 'real')
            AND strict_event.prize_pool_usd>=1000000
-           AND typeof(strict_event.approved_by)='text'
            AND length(trim(strict_event.approved_by))>0
            AND {_aware_timestamp_sql('strict_event.approved_at')}
-           AND julianday(strict_event.approved_at)<=julianday({signal_at_sql})
+           AND live_text_timestamp_utc(strict_event.approved_at)
+               <=live_text_timestamp_utc({signal_at_sql})
            AND {_aware_timestamp_sql('strict_event.main_event_start_at')}
            AND {_aware_timestamp_sql('strict_event.main_event_end_at')}
-           AND julianday(strict_event.main_event_start_at)
-               <=julianday(strict_event.main_event_end_at)
-           AND json_valid(strict_event.official_evidence_urls_json)
-           AND json_array_length(strict_event.official_evidence_urls_json)>0
-           AND json_valid(strict_event.included_stages_json)
-           AND json_array_length(strict_event.included_stages_json)>0
+           AND live_text_timestamp_utc(strict_event.main_event_start_at)
+               <=live_text_timestamp_utc(strict_event.main_event_end_at)
+           AND jsonb_typeof(strict_event.official_evidence_urls_json::jsonb)='array'
+           AND jsonb_array_length(strict_event.official_evidence_urls_json::jsonb)>0
+           AND jsonb_typeof(strict_event.included_stages_json::jsonb)='array'
+           AND jsonb_array_length(strict_event.included_stages_json::jsonb)>0
            AND EXISTS (
-               SELECT 1 FROM json_each(strict_event.included_stages_json)
-                WHERE value=strict_event_mapping.stage_scope
+               SELECT 1
+                 FROM jsonb_array_elements_text(
+                          strict_event.included_stages_json::jsonb
+                      ) AS included_stage(value)
+                WHERE included_stage.value=strict_event_mapping.stage_scope
            )
            AND strict_event_mapping.scheduled_at_utc IS NOT NULL
-           AND julianday(strict_event_mapping.scheduled_at_utc)
-               BETWEEN julianday(strict_event.main_event_start_at)
-                   AND julianday(strict_event.main_event_end_at)
+           AND live_text_timestamp_utc(strict_event_mapping.scheduled_at_utc)
+               BETWEEN live_text_timestamp_utc(strict_event.main_event_start_at)
+                   AND live_text_timestamp_utc(strict_event.main_event_end_at)
            AND strict_event.excludes_qualifiers=1
            AND strict_event.excludes_division_2=1
            AND strict_event.excludes_exhibitions=1
@@ -347,15 +356,17 @@ def _event_policy_sql(
     )"""
 
 
-def _strict_schema_reasons(connection: sqlite3.Connection) -> tuple[str, ...]:
+def _strict_schema_reasons(connection: PostgresSession) -> tuple[str, ...]:
     reasons: list[str] = []
     for table, required_columns in _STRICT_READ_SCHEMA.items():
         try:
             exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                """SELECT 1 FROM information_schema.tables
+                    WHERE table_schema=current_schema() AND table_name=?
+                      AND table_type='BASE TABLE'""",
                 (table,),
             ).fetchone()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             return ("strict_mapping_schema_inspection_failed",)
         if exists is None:
             reasons.append(f"{table}_table_missing")

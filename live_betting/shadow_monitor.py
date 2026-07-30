@@ -6,13 +6,16 @@ import argparse
 import json
 import logging
 import os
-import sqlite3
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from event_intelligence.benchmarks import BENCHMARK_VERSION
 from event_intelligence.incremental import (
@@ -46,10 +49,6 @@ from .official_rosh_run import OfficialRoshRunCoordinator, OfficialRoshRunKey
 from .rosh_evidence import official_rosh_draft_hash
 from .rosh_parity_storage import RoshRunRepository
 from .shadow_strategy import ComebackShadowStrategy
-from .service_coordination import (
-    add_single_database_argument,
-    database_writer_authority,
-)
 from .storage import LiveBettingStore
 from .stratz_rosh_client import (
     FetchedRoshLineupScore,
@@ -219,7 +218,7 @@ class _VersionedPlayerForm(PlayerForm):
     cutoff: str = ""
 
 
-def _snapshot(row: sqlite3.Row) -> OddsSnapshot:
+def _snapshot(row: DatabaseRow) -> OddsSnapshot:
     market = Market(
         str(row["market_type"]), str(row["period"]), row["side"], row["line"],
         str(row["outcome_key"]), bool(row["supported"]),
@@ -233,7 +232,7 @@ def _snapshot(row: sqlite3.Row) -> OddsSnapshot:
 
 
 def latest_market_state(
-    connection: sqlite3.Connection, match_id: str, map_number: int,
+    connection: PostgresSession, match_id: str, map_number: int,
     *, as_of: datetime | None = None,
 ) -> list[OddsSnapshot]:
     as_of = as_of or datetime.now(timezone.utc)
@@ -266,7 +265,7 @@ def latest_market_state(
             if row.market.market_type != "winner" or row.odds_id in winner_ids]
 
 
-def _observation(row: sqlite3.Row) -> VisionObservation:
+def _observation(row: DatabaseRow) -> VisionObservation:
     stored_confirmed = (
         bool(row["confirmed"]) if "confirmed" in row.keys() else True
     )
@@ -404,7 +403,7 @@ def persist_alignments(
              ON a.odds_snapshot_id=o.id
            WHERE o.raybet_match_id=?
              AND a.odds_snapshot_id IS NULL
-             AND julianday(o.received_at)<=julianday(?)
+             AND live_text_timestamp_utc(o.received_at)<=CAST(? AS timestamptz)
            ORDER BY o.received_at, o.id LIMIT 2000""",
         (match_id, cutoff),
     ).fetchall()
@@ -414,22 +413,27 @@ def persist_alignments(
                ON anchor.raybet_match_id=observation.raybet_match_id
               AND anchor.map_number=observation.map_number
             WHERE observation.raybet_match_id=?
-              AND julianday(observation.captured_at)<=julianday(?)
+              AND live_text_timestamp_utc(observation.captured_at)<=CAST(? AS timestamptz)
               AND (
                     observation.map_number IS NULL
                     OR anchor.status='anchored'
                     OR (
                         anchor.status='conflict'
                         AND anchor.conflict_at IS NOT NULL
-                        AND julianday(anchor.conflict_at) IS NOT NULL
-                        AND julianday(anchor.conflict_at)>julianday(?)
+                        AND live_text_timestamp_utc(anchor.conflict_at) IS NOT NULL
+                        AND live_text_timestamp_utc(anchor.conflict_at)>
+                            CAST(? AS timestamptz)
                         AND NOT EXISTS (
                             SELECT 1 FROM vision_draft_conflicts AS conflict
                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                AND conflict.map_number=anchor.map_number
                                AND (
-                                     julianday(conflict.captured_at) IS NULL
-                                     OR julianday(conflict.captured_at)<=julianday(?)
+                                     live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     ) IS NULL
+                                     OR live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     )<=CAST(? AS timestamptz)
                                )
                         )
                     )
@@ -462,15 +466,21 @@ def _parse_utc(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+def _table_exists(connection: PostgresSession, table: str) -> bool:
     return connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        """SELECT 1
+             FROM pg_class AS relation
+             JOIN pg_namespace AS namespace
+               ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema()
+              AND relation.relkind IN ('r', 'p', 'v')
+              AND relation.relname=?""",
         (table,),
     ).fetchone() is not None
 
 
 def _latest_versioned_style(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     team_id: int,
     cutoff: datetime,
     *,
@@ -494,7 +504,7 @@ def _latest_versioned_style(
                ORDER BY profile_cutoff DESC, created_at DESC, profile_id DESC""",
             tuple(parameters),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _neutral_style()
     for row in rows:
         try:
@@ -549,7 +559,7 @@ def _latest_versioned_style(
 
 
 def _latest_completed_roster(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     team_id: int,
     cutoff_epoch: int,
 ) -> tuple[int, ...]:
@@ -575,7 +585,7 @@ def _latest_completed_roster(
                LIMIT 1""",
             (team_id, team_id, cutoff_epoch, cutoff_iso),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return ()
     if row is None:
         return ()
@@ -596,7 +606,7 @@ def _latest_completed_roster(
 
 
 def _versioned_player_form(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     account_ids: tuple[int, ...],
     cutoff: datetime,
     *,
@@ -666,7 +676,7 @@ def _versioned_player_form(
                 *lineage_parameters,
             ),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return _neutral_form()
     if not rows:
         return _neutral_form()
@@ -725,7 +735,7 @@ def _versioned_player_form(
 
 
 def _profiles(
-    connection: sqlite3.Connection, team_id: int | None, as_of: int
+    connection: PostgresSession, team_id: int | None, as_of: int
 ) -> tuple[TeamStyleProfile, PlayerForm]:
     if team_id is None:
         return _neutral_style(), _neutral_form()
@@ -742,7 +752,7 @@ def _profiles(
             valid_profile_cutoffs = scopes.valid_profile_cutoffs
             allowed_match_ids = scopes.player
             state_hashes = current_state_input_hashes(connection, scopes)
-        except (KeyError, TypeError, ValueError, sqlite3.Error):
+        except (KeyError, TypeError, ValueError, SQLAlchemyError):
             return _neutral_style(), _neutral_form()
     return (
         _latest_versioned_style(
@@ -798,7 +808,7 @@ def _profile_refs(
     return {"team_style": style_refs, "player_form": form_refs}
 
 
-def _shadow_order(row: sqlite3.Row) -> ShadowOrder:
+def _shadow_order(row: DatabaseRow) -> ShadowOrder:
     market_type, period, side, line = str(row["market_key"]).split("|", 3)
     outcome_key = str(row["signal_outcome_key"] or side)
     market = Market(
@@ -861,7 +871,7 @@ def _process_pending_order(
 
 
 def _transport_refs(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_id: str,
     as_of: datetime,
 ) -> list[TransportRef]:
@@ -884,7 +894,7 @@ def _transport_refs(
 
 
 def market_state_for_transport(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     transport: TransportRef,
     match_id: str,
     map_number: int,
@@ -897,7 +907,7 @@ def market_state_for_transport(
                WHERE observation_key=? AND raybet_match_id=? AND period=?""",
             (transport.observation_key, match_id, period),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return []
     return [_snapshot(row) for row in rows]
 
@@ -1133,7 +1143,7 @@ def _record_official_rosh_shadow_evaluation(
             observation_draft_hash=draft_hash,
             source_run_id=None if run is None else run.run.run_id,
         )
-    except (ProfileError, RuntimeError, ValueError, sqlite3.Error) as error:
+    except (ProfileError, RuntimeError, ValueError, SQLAlchemyError) as error:
         logger.error(
             "official Rosh v6 shadow evaluation failed closed (%s)",
             type(error).__name__,
@@ -1265,8 +1275,9 @@ def run_once(
                     OR (
                         anchor.status='conflict'
                         AND anchor.conflict_at IS NOT NULL
-                        AND julianday(anchor.conflict_at) IS NOT NULL
-                        AND julianday(anchor.conflict_at)>julianday(
+                        AND live_text_timestamp_utc(anchor.conflict_at) IS NOT NULL
+                        AND live_text_timestamp_utc(anchor.conflict_at)>
+                            live_text_timestamp_utc(
                             COALESCE(transport.observed_at, ?)
                         )
                         AND NOT EXISTS (
@@ -1274,15 +1285,20 @@ def run_once(
                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                AND conflict.map_number=anchor.map_number
                                AND (
-                                     julianday(conflict.captured_at) IS NULL
-                                     OR julianday(conflict.captured_at)<=julianday(
+                                     live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     ) IS NULL
+                                     OR live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     )<=live_text_timestamp_utc(
                                          COALESCE(transport.observed_at, ?)
                                      )
                                )
                         )
                     )
               )
-              AND julianday(observation.captured_at)<=julianday(?)
+              AND live_text_timestamp_utc(observation.captured_at)<=
+                  CAST(? AS timestamptz)
            ORDER BY observation.captured_at DESC LIMIT 1""",
         (
             run_at.isoformat(),
@@ -1314,15 +1330,20 @@ def run_once(
                     OR (
                         anchor.status='conflict'
                         AND anchor.conflict_at IS NOT NULL
-                        AND julianday(anchor.conflict_at) IS NOT NULL
-                        AND julianday(anchor.conflict_at)>julianday(?)
+                        AND live_text_timestamp_utc(anchor.conflict_at) IS NOT NULL
+                        AND live_text_timestamp_utc(anchor.conflict_at)>
+                            CAST(? AS timestamptz)
                         AND NOT EXISTS (
                             SELECT 1 FROM vision_draft_conflicts AS conflict
                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                AND conflict.map_number=anchor.map_number
                                AND (
-                                     julianday(conflict.captured_at) IS NULL
-                                     OR julianday(conflict.captured_at)<=julianday(?)
+                                     live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     ) IS NULL
+                                     OR live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     )<=CAST(? AS timestamptz)
                                )
                         )
                     )
@@ -1330,7 +1351,8 @@ def run_once(
             WHERE observation.raybet_match_id=?
               AND observation.confirmed=1
               AND observation.screen_state='game'
-              AND julianday(observation.captured_at)<=julianday(?)
+              AND live_text_timestamp_utc(observation.captured_at)<=
+                  CAST(? AS timestamptz)
            ORDER BY observation.captured_at DESC LIMIT 1""",
         (
             current_transport_at.isoformat(),
@@ -1396,22 +1418,28 @@ def run_once(
                ON anchor.raybet_match_id=observation.raybet_match_id
               AND anchor.map_number=observation.map_number
             WHERE observation.raybet_match_id=?
-              AND julianday(observation.captured_at)<=julianday(?)
+              AND live_text_timestamp_utc(observation.captured_at)<=
+                  CAST(? AS timestamptz)
               AND (
                     observation.map_number IS NULL
                     OR anchor.status='anchored'
                     OR (
                         anchor.status='conflict'
                         AND anchor.conflict_at IS NOT NULL
-                        AND julianday(anchor.conflict_at) IS NOT NULL
-                        AND julianday(anchor.conflict_at)>julianday(?)
+                        AND live_text_timestamp_utc(anchor.conflict_at) IS NOT NULL
+                        AND live_text_timestamp_utc(anchor.conflict_at)>
+                            CAST(? AS timestamptz)
                         AND NOT EXISTS (
                             SELECT 1 FROM vision_draft_conflicts AS conflict
                              WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                AND conflict.map_number=anchor.map_number
                                AND (
-                                     julianday(conflict.captured_at) IS NULL
-                                     OR julianday(conflict.captured_at)<=julianday(?)
+                                     live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     ) IS NULL
+                                     OR live_text_timestamp_utc(
+                                         conflict.captured_at
+                                     )<=CAST(? AS timestamptz)
                                )
                         )
                     )
@@ -1706,10 +1734,10 @@ def _run_cli(args: argparse.Namespace) -> int:
     strategy = ComebackShadowStrategy()
     player_identity_resolver = LivePlayerIdentityResolver()
     with (
-        LiveBettingStore(args.database) as store,
+        LiveBettingStore(args.database_url) as store,
         RoshFetchCoordinator() as rosh_fetch_coordinator,
         OfficialRoshRunCoordinator(
-            database_path=args.database,
+            database_url=args.database_url,
             artifact_root=os.environ.get(
                 "ROSH_ANALYSIS_ARTIFACTS_DIR",
                 str(ROOT / "data" / "rosh-analysis-artifacts"),
@@ -1777,7 +1805,10 @@ def _run_cli(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--vision-jsonl", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--once", action="store_true")
@@ -1785,8 +1816,7 @@ def main() -> int:
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
     args = parser.parse_args()
-    with database_writer_authority(args.database):
-        return _run_cli(args)
+    return _run_cli(args)
 
 
 if __name__ == "__main__":

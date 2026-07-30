@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import random
-import sqlite3
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -16,7 +15,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from shared.sqlite import connect
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.engine import build_engine, require_database_url
+from database.session import DatabaseRow, PostgresSession
 
 from .comeback import STRATEGY_VERSION as COMEBACK_ENTRY_STRATEGY_VERSION
 from .comeback_entry import ComebackEntryPolicy, decide_comeback_entry
@@ -32,7 +34,6 @@ from .milestone_revocation import (
     load_milestone_revocation_projection,
 )
 from .research import research_summary
-from .service_coordination import add_single_database_argument
 from .settlement import persisted_settlement_authority_reason
 from .strategy_contract import (
     OFFICIAL_ROSH_DIRECTION_STRATEGY_VERSION,
@@ -55,9 +56,6 @@ _COHORT_IDENTITY_FIELDS = (
     "global_gate_ref",
 )
 _BOOTSTRAP_ITERATIONS = 1_000
-_STRICT_MAPPING_JSON_PATH = (
-    "$.__inputs__.strict_live_eligibility.mapping_refs.strict_mapping_id"
-)
 _STRATIFICATION_DEFINITIONS = {
     "team": "selected canonical team from strict mapping refs",
     "odds_bucket": "signal decimal price",
@@ -132,8 +130,8 @@ class _EntryValidation:
 
 
 def _decision_draft_authority_valid(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    connection: PostgresSession,
+    row: DatabaseRow,
 ) -> bool:
     """Require every eligible decision to name a re-readable draft landmark."""
 
@@ -169,8 +167,8 @@ def _decision_draft_authority_valid(
 
 
 def _order_draft_authority_valid(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    connection: PostgresSession,
+    row: DatabaseRow,
 ) -> bool:
     """Require an order's immutable authority to match its persisted decision."""
 
@@ -208,13 +206,13 @@ def _order_draft_authority_valid(
             require_current_revisions=False,
             verify_curve=False,
         )
-    except (KeyError, TypeError, ValueError, sqlite3.Error):
+    except (KeyError, TypeError, ValueError, SQLAlchemyError):
         return False
 
 
 def _isolate_unverified_settlements(
-    connection: sqlite3.Connection,
-    rows: Sequence[sqlite3.Row],
+    connection: PostgresSession,
+    rows: Sequence[DatabaseRow],
 ) -> tuple[list[Mapping[str, object]], Counter[str]]:
     """Keep legacy orders visible while excluding unprovable result labels."""
 
@@ -255,7 +253,7 @@ def _revocation_keys(
 
 
 def _governance_lineage_statuses(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     projection: Mapping[str, object],
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Project explicit record lineage through persisted order/decision lineage."""
@@ -297,7 +295,7 @@ def _governance_lineage_statuses(
         rows = connection.execute(
             "SELECT order_key, decision_key FROM shadow_order_decision_lineage"
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         # A configured revocation with unreadable lineage cannot authorize any
         # potentially dependent decision/order surface.
         try:
@@ -305,7 +303,7 @@ def _governance_lineage_statuses(
                 merge(decisions, row[0], "review_required")
             for row in connection.execute("SELECT order_key FROM shadow_orders"):
                 merge(orders, row[0], "review_required")
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             pass
         return decisions, orders
     changed = True
@@ -363,7 +361,7 @@ def _add_decision_payload_exclusions(
 
 
 def _official_rosh_v6_shadow_summary(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> dict[str, object]:
     """Report v6 M3-C records separately from probability/order cohorts."""
 
@@ -416,7 +414,7 @@ def _official_rosh_v6_shadow_summary(
                  FROM official_rosh_shadow_evaluations
                 ORDER BY decided_at, evaluation_key"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return {**base, "status": "unavailable"}
 
     statuses: Counter[str] = Counter()
@@ -520,11 +518,10 @@ def _official_rosh_v6_shadow_summary(
 
 
 def build_report(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, object]:
-    connection.row_factory = sqlite3.Row
     governance = load_milestone_revocation_projection(
         config=revocation_config,
         connection=connection if revocation_config is not None else None,
@@ -537,17 +534,20 @@ def build_report(
     invalidation_available = _table_exists(
         connection, "vision_derived_invalidations"
     )
+    decision_mapping_text_sql = (
+        "decision.contributions_json::jsonb #>> "
+        "'{__inputs__,strict_live_eligibility,mapping_refs,strict_mapping_id}'"
+    )
     decision_mapping_id_sql = (
-        "CASE WHEN json_valid(decision.contributions_json) "
-        f"THEN json_extract(decision.contributions_json, '{_STRICT_MAPPING_JSON_PATH}') "
-        "ELSE NULL END"
+        f"CASE WHEN ({decision_mapping_text_sql}) ~ '^[1-9][0-9]*$' "
+        f"THEN CAST(({decision_mapping_text_sql}) AS BIGINT) ELSE NULL END"
     )
     decision_legacy_mapping_sql = (
-        "CASE WHEN json_valid(decision.contributions_json) THEN "
-        f"json_type(decision.contributions_json, '{_STRICT_MAPPING_JSON_PATH}') "
-        "IS NULL OR "
-        f"json_type(decision.contributions_json, '{_STRICT_MAPPING_JSON_PATH}')="
-        "'null' ELSE 0 END"
+        "decision.contributions_json::jsonb #> "
+        "'{__inputs__,strict_live_eligibility,mapping_refs,strict_mapping_id}' "
+        "IS NULL OR jsonb_typeof(decision.contributions_json::jsonb #> "
+        "'{__inputs__,strict_live_eligibility,mapping_refs,strict_mapping_id}')="
+        "'null'"
     )
     decision_strict_gate = strict_read_gate(
         connection,
@@ -581,7 +581,7 @@ def build_report(
             f"""SELECT decision.* FROM strategy_decisions AS decision
                  WHERE {direct_decision_filter}"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         payload_candidates = []
     for candidate in payload_candidates:
         failure = persisted_decision_projection_failure(dict(candidate))
@@ -601,23 +601,29 @@ def build_report(
                    AND anchor.status='conflict'
                    AND (
                          anchor.conflict_at IS NULL
-                         OR julianday(anchor.conflict_at) IS NULL
-                         OR julianday(decision.decided_at) IS NULL
-                         OR julianday(anchor.conflict_at)<=julianday(decision.decided_at)
+                         OR live_text_timestamp_utc(anchor.conflict_at) IS NULL
+                         OR live_text_timestamp_utc(decision.decided_at) IS NULL
+                         OR live_text_timestamp_utc(anchor.conflict_at)<=
+                            live_text_timestamp_utc(decision.decided_at)
                          OR EXISTS (
                               SELECT 1 FROM vision_draft_conflicts AS conflict
                                WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                  AND conflict.map_number=anchor.map_number
                                  AND (
-                                       julianday(conflict.captured_at) IS NULL
-                                       OR julianday(conflict.captured_at)
-                                            <=julianday(decision.decided_at)
+                                       live_text_timestamp_utc(
+                                           conflict.captured_at
+                                       ) IS NULL
+                                       OR live_text_timestamp_utc(
+                                           conflict.captured_at
+                                       )<=live_text_timestamp_utc(
+                                           decision.decided_at
+                                       )
                                  )
                          )
                    )
                 )"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         # A legacy/malformed draft schema must not release rows into metrics.
         decisions = connection.execute(
             f"""SELECT * FROM strategy_decisions AS decision
@@ -790,23 +796,29 @@ def build_report(
                    AND anchor.status='conflict'
                    AND (
                          anchor.conflict_at IS NULL
-                         OR julianday(anchor.conflict_at) IS NULL
-                         OR julianday(o.signal_transport_at) IS NULL
-                         OR julianday(anchor.conflict_at)<=julianday(o.signal_transport_at)
+                         OR live_text_timestamp_utc(anchor.conflict_at) IS NULL
+                         OR live_text_timestamp_utc(o.signal_transport_at) IS NULL
+                         OR live_text_timestamp_utc(anchor.conflict_at)<=
+                            live_text_timestamp_utc(o.signal_transport_at)
                          OR EXISTS (
                               SELECT 1 FROM vision_draft_conflicts AS conflict
                                WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                  AND conflict.map_number=anchor.map_number
                                  AND (
-                                       julianday(conflict.captured_at) IS NULL
-                                       OR julianday(conflict.captured_at)
-                                            <=julianday(o.signal_transport_at)
+                                       live_text_timestamp_utc(
+                                           conflict.captured_at
+                                       ) IS NULL
+                                       OR live_text_timestamp_utc(
+                                           conflict.captured_at
+                                       )<=live_text_timestamp_utc(
+                                           o.signal_transport_at
+                                       )
                                  )
                          )
                    )
                 )"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         orders = connection.execute(
             f"""SELECT o.*, attempt.map_number AS attempt_map_number,
                   settlement.result, settlement.return_units,
@@ -835,11 +847,12 @@ def build_report(
             linked_revoked_orders = connection.execute(
                 """SELECT lineage.order_key
                      FROM shadow_order_decision_lineage AS lineage
-                     JOIN json_each(?) AS revoked
+                     JOIN jsonb_array_elements_text(CAST(? AS jsonb))
+                          AS revoked(value)
                        ON revoked.value=lineage.decision_key""",
                 (json.dumps(sorted(isolated_decision_keys)),),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except SQLAlchemyError:
             # A configured revocation must not leave dependent orders scored
             # when their lineage relation cannot be read.
             isolated_order_keys.update(
@@ -929,13 +942,13 @@ def build_report(
                 "SELECT COUNT(*) FROM strict_live_map_mapping_audit"
             ).fetchone()[0]),
         }
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         strict_counts = {"accepted_mappings": 0, "mapping_audits": 0}
     try:
         m1_candidates = connection.execute(
             "SELECT decision_key FROM strategy_decisions ORDER BY decided_at, decision_key"
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         m1_candidates = []
     m1_strategy_contract_verifications = []
     revoked_milestones = set(governance.get("revoked_milestones", []))
@@ -1060,9 +1073,9 @@ def build_report(
 
 
 def _decision_index(
-    decisions: Sequence[sqlite3.Row],
-) -> dict[tuple[object, ...], list[sqlite3.Row]]:
-    index: dict[tuple[object, ...], list[sqlite3.Row]] = {}
+    decisions: Sequence[DatabaseRow],
+) -> dict[tuple[object, ...], list[DatabaseRow]]:
+    index: dict[tuple[object, ...], list[DatabaseRow]] = {}
     for row in decisions:
         key = (
             str(row["raybet_match_id"]),
@@ -1077,8 +1090,8 @@ def _decision_index(
 
 def _linked_decision(
     order: Mapping[str, object],
-    decision_index: Mapping[tuple[object, ...], list[sqlite3.Row]],
-) -> sqlite3.Row | None:
+    decision_index: Mapping[tuple[object, ...], list[DatabaseRow]],
+) -> DatabaseRow | None:
     key = (
         str(order["raybet_match_id"]),
         int(order["attempt_map_number"]),
@@ -1092,7 +1105,7 @@ def _linked_decision(
 
 def _scorable_orders(
     orders: Sequence[Mapping[str, object]],
-    decision_index: Mapping[tuple[object, ...], list[sqlite3.Row]],
+    decision_index: Mapping[tuple[object, ...], list[DatabaseRow]],
     entry_validations: Mapping[str, _EntryValidation],
 ) -> list[Mapping[str, object]]:
     output = []
@@ -1120,8 +1133,8 @@ def _scorable_orders(
 
 
 def _evaluation_cohorts(
-    orders: Sequence[sqlite3.Row],
-    decision_index: Mapping[tuple[object, ...], list[sqlite3.Row]],
+    orders: Sequence[DatabaseRow],
+    decision_index: Mapping[tuple[object, ...], list[DatabaseRow]],
     vision_quality: Mapping[tuple[str, str, str], float],
     entry_validations: Mapping[str, _EntryValidation],
 ) -> list[dict[str, object]]:
@@ -1275,7 +1288,7 @@ def _evaluation_cohorts(
     return output
 
 
-def _decision_context(decision: sqlite3.Row | None) -> _DecisionContext:
+def _decision_context(decision: DatabaseRow | None) -> _DecisionContext:
     identity: dict[str, object | None] = {
         field: None for field in _COHORT_IDENTITY_FIELDS
     }
@@ -1390,7 +1403,7 @@ def _finite_or_none(value: object) -> float | None:
 
 
 def _forward_entry_evaluation(
-    decisions: Sequence[sqlite3.Row],
+    decisions: Sequence[DatabaseRow],
     cohorts: Sequence[Mapping[str, object]],
     entry_validations: Mapping[str, _EntryValidation],
 ) -> dict[str, dict[str, object]]:
@@ -1471,7 +1484,7 @@ def _invalid_entry(reason: str) -> _EntryValidation:
     return _EntryValidation(False, invalid_reason=reason)
 
 
-def _validate_v4_entry(row: sqlite3.Row) -> _EntryValidation:
+def _validate_v4_entry(row: DatabaseRow) -> _EntryValidation:
     """Rebuild the persisted v4 entry decision from its own frozen policy."""
 
     try:
@@ -1799,7 +1812,7 @@ def _strict_team_label(strict: Mapping[str, object], side: str) -> str:
     return f"{team_id}:{name}"
 
 
-def _mapping_team_label(order: sqlite3.Row, side: str | None) -> str:
+def _mapping_team_label(order: DatabaseRow, side: str | None) -> str:
     if side not in {"team_one", "team_two"}:
         return "unknown"
     suffix = "one" if side == "team_one" else "two"
@@ -1811,8 +1824,8 @@ def _mapping_team_label(order: sqlite3.Row, side: str | None) -> str:
 
 
 def _vision_quality_index(
-    connection: sqlite3.Connection,
-    decisions: Sequence[sqlite3.Row],
+    connection: PostgresSession,
+    decisions: Sequence[DatabaseRow],
 ) -> dict[tuple[str, str, str], float]:
     requested = sorted({
         context.vision_key
@@ -1833,14 +1846,14 @@ def _vision_quality_index(
                       observation.source_frame_bytes,
                       observation.clock_confidence,
                       observation.draft_confidence
-                 FROM json_each(?) AS requested
+                 FROM jsonb_array_elements(CAST(? AS jsonb)) AS requested(value)
                  JOIN vision_observations AS observation
                    ON observation.raybet_match_id=
-                      json_extract(requested.value, '$.match')
+                       requested.value ->> 'match'
                   AND observation.captured_at=
-                      json_extract(requested.value, '$.captured_at')
+                       requested.value ->> 'captured_at'
                   AND observation.source_frame_ref=
-                      json_extract(requested.value, '$.frame_ref')
+                       requested.value ->> 'frame_ref'
                 WHERE observation.confirmed=1
                   AND NOT EXISTS (
                       SELECT 1 FROM vision_draft_anchors AS anchor
@@ -1849,17 +1862,22 @@ def _vision_quality_index(
                          AND anchor.status='conflict'
                          AND (
                                anchor.conflict_at IS NULL
-                               OR julianday(anchor.conflict_at) IS NULL
-                               OR julianday(anchor.conflict_at)<=
-                                  julianday(observation.captured_at)
+                               OR live_text_timestamp_utc(anchor.conflict_at) IS NULL
+                               OR live_text_timestamp_utc(anchor.conflict_at)<=
+                                  live_text_timestamp_utc(observation.captured_at)
                                OR EXISTS (
                                     SELECT 1 FROM vision_draft_conflicts AS conflict
                                      WHERE conflict.raybet_match_id=anchor.raybet_match_id
                                        AND conflict.map_number=anchor.map_number
                                        AND (
-                                             julianday(conflict.captured_at) IS NULL
-                                             OR julianday(conflict.captured_at)<=
-                                                julianday(observation.captured_at)
+                                             live_text_timestamp_utc(
+                                                 conflict.captured_at
+                                             ) IS NULL
+                                             OR live_text_timestamp_utc(
+                                                 conflict.captured_at
+                                             )<=live_text_timestamp_utc(
+                                                 observation.captured_at
+                                             )
                                        )
                                )
                          )
@@ -1872,7 +1890,7 @@ def _vision_quality_index(
                       )""",
             (payload,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return {}
     output = {}
     for row in rows:
@@ -1883,7 +1901,7 @@ def _vision_quality_index(
                 expected_sha256=str(row[3]),
                 expected_bytes=int(row[4]),
             )
-        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+        except (RuntimeError, TypeError, ValueError, SQLAlchemyError):
             continue
         clock = _finite_or_none(row[5])
         draft = _finite_or_none(row[6])
@@ -2472,27 +2490,32 @@ def _headline_stability_status(
 
 
 def _group_counts(
-    connection: sqlite3.Connection, table: str, column: str
+    connection: PostgresSession, table: str, column: str
 ) -> dict[str, int]:
     try:
         rows = connection.execute(
             f"SELECT {column}, COUNT(*) AS count FROM {table} GROUP BY {column}"
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return {}
     return {str(row[0]): int(row[1]) for row in rows}
 
 
-def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+def _table_exists(connection: PostgresSession, table: str) -> bool:
     return connection.execute(
-        """SELECT 1 FROM sqlite_master
-             WHERE type='table' AND name=?""",
+        """SELECT 1
+             FROM pg_class AS relation
+             JOIN pg_namespace AS namespace
+               ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema()
+              AND relation.relkind IN ('r', 'p', 'v')
+              AND relation.relname=?""",
         (table,),
     ).fetchone() is not None
 
 
 def _settlement_reconciliation_counts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> dict[str, int]:
     counts = {"pending": 0, "confirmed": 0, "manual_review": 0}
     try:
@@ -2501,7 +2524,7 @@ def _settlement_reconciliation_counts(
                  FROM settlement_reconciliations
                 GROUP BY status"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return counts
     for status, count in rows:
         if str(status) in counts:
@@ -2510,7 +2533,7 @@ def _settlement_reconciliation_counts(
 
 
 def _invalidated_count(
-    connection: sqlite3.Connection, dependent_type: str
+    connection: PostgresSession, dependent_type: str
 ) -> int | None:
     try:
         return int(
@@ -2520,12 +2543,12 @@ def _invalidated_count(
                 (dependent_type,),
             ).fetchone()[0]
         )
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return None
 
 
 def _decision_audit_counts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     included_decision_count: int,
     strict_gate: StrictReadGate,
@@ -2560,15 +2583,17 @@ def _decision_audit_counts(
         "AND anchor.status='conflict' "
         "AND ("
         "anchor.conflict_at IS NULL "
-        "OR julianday(anchor.conflict_at) IS NULL "
-        "OR julianday(decision.decided_at) IS NULL "
-        "OR julianday(anchor.conflict_at)<=julianday(decision.decided_at) "
+        "OR live_text_timestamp_utc(anchor.conflict_at) IS NULL "
+        "OR live_text_timestamp_utc(decision.decided_at) IS NULL "
+        "OR live_text_timestamp_utc(anchor.conflict_at)<="
+        "live_text_timestamp_utc(decision.decided_at) "
         "OR EXISTS ("
         "SELECT 1 FROM vision_draft_conflicts AS conflict "
         "WHERE conflict.raybet_match_id=anchor.raybet_match_id "
         "AND conflict.map_number=anchor.map_number "
-        "AND (julianday(conflict.captured_at) IS NULL "
-        "OR julianday(conflict.captured_at)<=julianday(decision.decided_at))"
+        "AND (live_text_timestamp_utc(conflict.captured_at) IS NULL "
+        "OR live_text_timestamp_utc(conflict.captured_at)<="
+        "live_text_timestamp_utc(decision.decided_at))"
         ")"
         ")"
         ")"
@@ -2620,7 +2645,7 @@ def _decision_audit_counts(
                        ), 0) AS excluded_decisions
                   FROM decision_audit"""
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         row = None
     if row is None:
         unknown_reasons.append("decision_audit_query_failed")
@@ -2673,7 +2698,7 @@ def _decision_audit_counts(
 
 
 def _order_audit_counts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     included_order_count: int,
     scored_order_count: int,
@@ -2719,15 +2744,17 @@ def _order_audit_counts(
         "AND anchor.status='conflict' "
         "AND ("
         "anchor.conflict_at IS NULL "
-        "OR julianday(anchor.conflict_at) IS NULL "
-        "OR julianday(o.signal_transport_at) IS NULL "
-        "OR julianday(anchor.conflict_at)<=julianday(o.signal_transport_at) "
+        "OR live_text_timestamp_utc(anchor.conflict_at) IS NULL "
+        "OR live_text_timestamp_utc(o.signal_transport_at) IS NULL "
+        "OR live_text_timestamp_utc(anchor.conflict_at)<="
+        "live_text_timestamp_utc(o.signal_transport_at) "
         "OR EXISTS ("
         "SELECT 1 FROM vision_draft_conflicts AS conflict "
         "WHERE conflict.raybet_match_id=anchor.raybet_match_id "
         "AND conflict.map_number=anchor.map_number "
-        "AND (julianday(conflict.captured_at) IS NULL "
-        "OR julianday(conflict.captured_at)<=julianday(o.signal_transport_at))"
+        "AND (live_text_timestamp_utc(conflict.captured_at) IS NULL "
+        "OR live_text_timestamp_utc(conflict.captured_at)<="
+        "live_text_timestamp_utc(o.signal_transport_at))"
         ")"
         ")"
         ")"
@@ -2783,7 +2810,7 @@ def _order_audit_counts(
                        ), 0) AS review_required_orders
                   FROM order_audit"""
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         row = None
     if row is None:
         unknown_reasons.append("order_audit_query_failed")
@@ -2858,50 +2885,22 @@ def _drawdown(rows: Sequence[Mapping[str, object]]) -> float:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, required=True)
-    parser.add_argument("--revocation-ledger", type=Path)
-    parser.add_argument("--raw-root", type=Path)
-    parser.add_argument("--revocation-anchor", type=Path)
-    parser.add_argument("--revocation-anchor-sha256")
-    parser.add_argument("--pair-baseline-manifest", type=Path)
-    parser.add_argument("--pair-baseline-manifest-sha256")
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
-    connection = connect(args.database, read_only=True)
+    engine = build_engine(require_database_url(args.database_url))
+    connection = PostgresSession(engine)
     try:
-        connection.execute("PRAGMA query_only=ON")
-        query_only = connection.execute("PRAGMA query_only").fetchone()
-        if query_only is None or int(query_only[0]) != 1:
-            raise RuntimeError("report connection did not enter query_only mode")
-        governance_fields = (
-            args.revocation_ledger,
-            args.raw_root,
-            args.revocation_anchor,
-            args.revocation_anchor_sha256,
-            args.pair_baseline_manifest,
-            args.pair_baseline_manifest_sha256,
-        )
-        if not any(value is not None for value in governance_fields):
-            report = build_report(connection)
-        else:
-            if any(value is None for value in governance_fields):
-                raise ValueError("revocation report configuration is incomplete")
-            report = build_report(
-                connection,
-                revocation_config=MilestoneRevocationConfig(
-                    root=args.revocation_ledger,
-                    database_path=args.database,
-                    raw_root=args.raw_root,
-                    expected_anchor=args.revocation_anchor,
-                    expected_anchor_hash=args.revocation_anchor_sha256,
-                    pair_manifest=args.pair_baseline_manifest,
-                    expected_pair_manifest_hash=(
-                        args.pair_baseline_manifest_sha256
-                    ),
-                ),
-            )
+        connection.begin()
+        connection.execute("SET TRANSACTION READ ONLY")
+        report = build_report(connection)
     finally:
+        connection.rollback()
         connection.close()
+        engine.dispose()
     content = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

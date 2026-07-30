@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import logging
-import sqlite3
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,15 +17,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from database.session import PostgresSession  # noqa: E402
 from event_intelligence.ingest import (  # noqa: E402
     StrictEventIngestor,
     completed_match_processing_result,
 )
 from event_intelligence.scheduler import IngestScheduler  # noqa: E402
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +51,7 @@ def _non_empty_text(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, default=ROOT / "data" / "dota2.db")
+    parser.add_argument("--database-url", help="PostgreSQL URL (default: DATABASE_URL)")
     parser.add_argument(
         "--archive-root",
         type=Path,
@@ -94,17 +90,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
-    database = Path(args.database).resolve()
-    args.database = database
     args.archive_root = (
         Path(args.archive_root).resolve()
         if args.archive_root is not None
-        else database.parent / "raw-sources"
+        else ROOT / "data" / "raw-sources"
     )
     args.coverage_report = (
         Path(args.coverage_report).resolve()
         if args.coverage_report is not None
-        else database.parent / "reports" / "strict_event_coverage_latest.json"
+        else ROOT / "data" / "reports" / "strict_event_coverage_latest.json"
     )
     return args
 
@@ -114,8 +108,8 @@ class Runtime:
     ingestor: StrictEventIngestor
     scheduler: IngestScheduler
     close_callbacks: tuple[Callable[[], object], ...] = ()
-    database: Path | None = None
-    health_connection: sqlite3.Connection | None = None
+    database_url: str | None = None
+    health_connection: PostgresSession | None = None
     derived_pipeline: object | None = None
     coverage_report: Path | None = None
 
@@ -133,29 +127,25 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
         from event_intelligence.opendota import OpenDotaAdapter
         from event_intelligence.raw_archive import RawArchive
         from event_intelligence.ingest_adapters import (
+            PostgresIngestAdapter,
             RegistryIngestAdapter,
-            SQLiteIngestAdapter,
         )
         from event_intelligence.registry import EventRegistry
         from event_intelligence.incremental import StrictDerivedPipeline
         from event_intelligence.storage import IntelligenceStorage
-        from fetch.db import Database
     except (ImportError, ModuleNotFoundError) as error:
         raise RuntimeError(
             "strict ingestion components are incomplete; install the event_intelligence "
             f"storage/registry/facts adapters ({error})"
         ) from error
 
-    storage = IntelligenceStorage(args.database)
+    storage = IntelligenceStorage(args.database_url)
     try:
         if not getattr(args, "schema_prepared", False):
             storage.init_schema()
-        legacy_database = Database(connection=storage.connection)
-        if not getattr(args, "schema_prepared", False):
-            legacy_database.init_db()
         registry_impl = EventRegistry(storage)
         registry = RegistryIngestAdapter(registry_impl)
-        store = SQLiteIngestAdapter(storage, registry_impl, legacy_database)
+        store = PostgresIngestAdapter(storage, registry_impl)
     except Exception:
         storage.close()
         raise
@@ -187,9 +177,9 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
         ingestor,
         scheduler,
         callbacks,
-        database=args.database.resolve(),
+        database_url=args.database_url,
         health_connection=storage.connection,
-        derived_pipeline=StrictDerivedPipeline(args.database),
+        derived_pipeline=StrictDerivedPipeline(storage),
         coverage_report=args.coverage_report,
     )
 
@@ -289,12 +279,12 @@ def _report_due(report: object, direct_one_shot: bool) -> bool:
 
 
 def _write_coverage(runtime: Runtime, generated_at: datetime) -> None:
-    if runtime.database is None or runtime.coverage_report is None:
+    if runtime.coverage_report is None:
         return
     from event_intelligence.coverage import write_coverage_report
 
     write_coverage_report(
-        runtime.database,
+        runtime.database_url,
         runtime.coverage_report,
         generated_at=generated_at,
     )
@@ -352,8 +342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         parser.error("--scheduler-once cannot be combined with direct one-shot filters")
     try:
-        with database_writer_authority(args.database):
-            return asyncio.run(run(args))
+        return asyncio.run(run(args))
     except KeyboardInterrupt:
         return 130
     except Exception as error:

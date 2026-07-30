@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-import sqlite3
 from dataclasses import dataclass
+
+from database.session import PostgresSession
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,7 @@ def _posterior(successes: int, opportunities: int, prior: float, strength: int =
 
 
 def build_team_style(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     team_id: int,
     as_of_start_time: int,
     *,

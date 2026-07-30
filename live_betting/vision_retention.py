@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-from shared.sqlite import connect as connect_sqlite
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
+
+from .storage import LiveBettingStore
 
 from .vision_frame_registry import (
     retire_vision_frame_artifact,
@@ -211,11 +214,13 @@ def _scan_files(root: Path) -> tuple[list[EvidenceFile], int]:
     return files, unsafe
 
 
-def _require_tables(connection: sqlite3.Connection) -> None:
+def _require_tables(connection: PostgresSession) -> None:
     present = {
         str(row[0])
         for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
+            """SELECT table_name
+                 FROM information_schema.tables
+                WHERE table_schema=current_schema()"""
         )
     }
     missing = sorted(_REQUIRED_TABLES - present)
@@ -226,7 +231,7 @@ def _require_tables(connection: sqlite3.Connection) -> None:
 
 
 def _registered_frame_paths(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     root: Path,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, tuple[str, int]]]:
     try:
@@ -301,7 +306,7 @@ def _add_reference_keys(
 
 
 def _causal_observation_refs(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     match_id: str,
     map_number: int,
@@ -315,8 +320,9 @@ def _causal_observation_refs(
     filters = [
         "raybet_match_id=?",
         "map_number=?",
-        "julianday(captured_at)<=julianday(?)",
-        "julianday(captured_at)>=julianday(?) - (? / 86400.0)",
+        "live_text_timestamp_utc(captured_at)<=live_text_timestamp_utc(?)",
+        "live_text_timestamp_utc(captured_at)>=live_text_timestamp_utc(?) "
+        "- (? * INTERVAL '1 second')",
     ]
     parameters: list[object] = [
         match_id,
@@ -339,7 +345,7 @@ def _causal_observation_refs(
         f"""SELECT captured_at, source_frame_ref
                FROM vision_observations
               WHERE {' AND '.join(filters)}
-              ORDER BY julianday(captured_at) DESC, captured_at DESC""",
+              ORDER BY live_text_timestamp_utc(captured_at) DESC, captured_at DESC""",
         parameters,
     ).fetchall()
     if rows:
@@ -355,7 +361,7 @@ def _causal_observation_refs(
 
 
 def _referenced_keys(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     root: Path,
     frame_paths: dict[str, str],
     frame_identities: dict[str, tuple[str, int]],
@@ -390,8 +396,13 @@ def _referenced_keys(
             ):
                 protected.add(frame_paths[frame_ref])
     curve_columns = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(prospective_draft_curves)")
+        str(row[0])
+        for row in connection.execute(
+            """SELECT column_name
+                 FROM information_schema.columns
+                WHERE table_schema=current_schema()
+                  AND table_name='prospective_draft_curves'"""
+        )
     }
     if "anchor_source_frame_ref" in curve_columns:
         _add_reference_keys(
@@ -486,7 +497,7 @@ def _parse_utc(value: object) -> datetime | None:
 
 
 def _observation_metadata(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     root: Path,
     available: set[str],
     frame_paths: dict[str, str],
@@ -498,7 +509,8 @@ def _observation_metadata(
         """SELECT raybet_match_id, map_number, captured_at,
                   game_clock_seconds, screen_state, source_frame_ref
              FROM vision_observations
-            ORDER BY julianday(captured_at), captured_at, source_frame_ref"""
+            ORDER BY live_text_timestamp_utc(captured_at), captured_at,
+                     source_frame_ref"""
     )
     for row in rows:
         key = _reference_key(row["source_frame_ref"], root, frame_paths)
@@ -557,7 +569,7 @@ def _safe_to_delete(candidate: EvidenceFile, root: Path) -> bool:
 
 
 def prune_vision_evidence(
-    database: Path,
+    database_url: str,
     evidence_root: Path,
     *,
     now: datetime | None = None,
@@ -578,10 +590,8 @@ def prune_vision_evidence(
     root = _resolve_root(Path(evidence_root))
     files, unsafe = _scan_files(root)
     available = {_path_key(item.path) for item in files}
-    connection = connect_sqlite(
-        Path(database), read_only=True, row_factory=sqlite3.Row
-    )
-    try:
+    with LiveBettingStore(database_url) as store, store.transaction():
+        connection = store.connection
         _require_tables(connection)
         frame_paths, registered_by_path, frame_identities = _registered_frame_paths(
             connection, root
@@ -592,8 +602,6 @@ def prune_vision_evidence(
         audit, captured_by_path, invalid_times = _observation_metadata(
             connection, root, available, frame_paths
         )
-    finally:
-        connection.close()
     referenced.update(invalid_times)
 
     excluded = {str(value) for value in excluded_match_ids}
@@ -639,7 +647,7 @@ def prune_vision_evidence(
     deleted_bytes = 0
     delete_errors = 0
     if not dry_run and unsafe == 0:
-        write_connection: sqlite3.Connection | None = None
+        write_store: LiveBettingStore | None = None
         try:
             for item in planned:
                 if not _safe_to_delete(item, root):
@@ -647,19 +655,17 @@ def prune_vision_evidence(
                     continue
                 frame_ref = registered_by_path.get(_path_key(item.path))
                 if frame_ref is not None:
-                    if write_connection is None:
-                        write_connection = connect_sqlite(
-                            Path(database), row_factory=sqlite3.Row
-                        )
+                    if write_store is None:
+                        write_store = LiveBettingStore(database_url)
                     try:
                         retire_vision_frame_artifact(
-                            write_connection,
+                            write_store.connection,
                             frame_ref,
                             reason="vision evidence retention",
                             actor="live_betting.vision_retention",
                             retired_at=current,
                         )
-                    except (RuntimeError, sqlite3.Error, ValueError):
+                    except (RuntimeError, SQLAlchemyError, ValueError):
                         unsafe += 1
                         continue
                     if not _safe_to_delete(item, root):
@@ -673,8 +679,8 @@ def prune_vision_evidence(
                     deleted_files += 1
                     deleted_bytes += item.size
         finally:
-            if write_connection is not None:
-                write_connection.close()
+            if write_store is not None:
+                write_store.close()
 
     return VisionRetentionResult(
         dry_run=dry_run,

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import datetime
 from functools import lru_cache
 from typing import Sequence
 
 from event_intelligence.backtest import draft_dependency_fingerprint
 from event_intelligence.draft_artifacts import canonical_hash
+from database.session import PostgresSession
 
 
 OutcomeEvidenceRow = tuple[str, str, str, str, str, str]
@@ -17,7 +17,7 @@ OutcomeEvidenceRow = tuple[str, str, str, str, str, str]
 
 @lru_cache(maxsize=32)
 def _cached_dependency_fingerprint(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     dependency_revision: int,
 ) -> str:
     if dependency_revision < 1:
@@ -26,7 +26,7 @@ def _cached_dependency_fingerprint(
 
 
 def draft_dependency_snapshot_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     expected_revision: int,
     expected_fingerprint: str,

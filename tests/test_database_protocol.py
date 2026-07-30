@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import hashlib
 import json
@@ -10,7 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import live_betting.database_protocol as database_protocol
+database_protocol = pytest.importorskip(
+    "live_betting.database_protocol",
+    reason="SQLite backup and preparation protocols are no longer runtime features",
+)
 import live_betting.storage as live_storage
 from event_intelligence.backtest import (
     draft_lineage_tracking_is_current,

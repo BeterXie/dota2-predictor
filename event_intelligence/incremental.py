@@ -5,18 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
-import sqlite3
-import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable, Collection, Iterator, Mapping
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
 
 from .benchmarks import BENCHMARK_VERSION
 from .player_scoring import score_version_for_role
 from .roles import PROSPECTIVE_ASSIGNMENT_VERSION, RECONSTRUCTED_ASSIGNMENT_VERSION
+from .storage import IntelligenceStorage
 from .team_profiles import PROFILE_VERSION
 from .team_states import LABEL_VERSION
 
@@ -24,19 +25,6 @@ from .team_states import LABEL_VERSION
 UTC = timezone.utc
 ROLE_VERSION = RECONSTRUCTED_ASSIGNMENT_VERSION
 SCORE_VERSION = score_version_for_role(ROLE_VERSION)
-
-
-# Web delivery readers repeatedly validate the same draft artifacts.  The
-# lineage revision pair is advanced by triggers whenever a dependency or
-# artifact row changes, so it is a stable, cheap invalidation token.  Keep
-# this cache strictly for query-only connections; writers must always rebuild
-# from their transaction snapshot.
-_DRAFT_ARTIFACT_CACHE_LOCK = threading.Lock()
-_DRAFT_ARTIFACT_CACHE: dict[
-    tuple[str, int, int],
-    dict[tuple[str, int], tuple[str, str]],
-] = {}
-_DRAFT_ARTIFACT_CACHE_MAX = 4
 
 
 @dataclass(frozen=True)
@@ -132,36 +120,25 @@ _PROFILE_CONTEXT_JSON_FIELDS = {
 }
 
 
-def _relation_columns(connection: sqlite3.Connection, name: str) -> set[str]:
-    exists = connection.execute(
-        """SELECT 1 FROM sqlite_master
-             WHERE type IN ('table', 'view') AND name=?""",
+def _relation_columns(connection: PostgresSession, name: str) -> set[str]:
+    rows = connection.execute(
+        """SELECT column_name
+             FROM information_schema.columns
+            WHERE table_schema=current_schema() AND table_name=?""",
         (name,),
-    ).fetchone()
-    if exists is None:
-        return set()
-    try:
-        return {
-            str(row[1])
-            for row in connection.execute(f'PRAGMA table_info("{name}")').fetchall()
-        }
-    except sqlite3.Error:
-        return set()
+    ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
-def current_derived_scopes(connection: sqlite3.Connection) -> CurrentDerivedScopes:
+def current_derived_scopes(connection: PostgresSession) -> CurrentDerivedScopes:
     """Return only lineage rows proven current against the formal registry."""
-    owns_read_snapshot = not connection.in_transaction
-    if owns_read_snapshot:
-        connection.execute("BEGIN")
-    try:
+    if connection.in_transaction:
         return _current_derived_scopes(connection)
-    finally:
-        if owns_read_snapshot and connection.in_transaction:
-            connection.rollback()
+    with connection.transaction():
+        return _current_derived_scopes(connection)
 
 
-def _current_derived_scopes(connection: sqlite3.Connection) -> CurrentDerivedScopes:
+def _current_derived_scopes(connection: PostgresSession) -> CurrentDerivedScopes:
     formal_columns = _relation_columns(connection, "formal_map_eligibility")
     if "match_id" not in formal_columns:
         return CurrentDerivedScopes(available=False)
@@ -172,7 +149,7 @@ def _current_derived_scopes(connection: sqlite3.Connection) -> CurrentDerivedSco
                 "SELECT match_id FROM formal_map_eligibility"
             ).fetchall()
         )
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return CurrentDerivedScopes(available=False)
 
     required = {
@@ -228,7 +205,7 @@ def _current_derived_scopes(connection: sqlite3.Connection) -> CurrentDerivedSco
         contexts = StrictDerivedPipeline._profile_context_hashes(
             connection, {str(row["event_id"]) for row in rows}
         )
-    except (KeyError, TypeError, ValueError, sqlite3.Error):
+    except (KeyError, TypeError, ValueError, SQLAlchemyError):
         return CurrentDerivedScopes(available=True, formal=formal)
 
     player_complete: set[int] = set()
@@ -266,7 +243,7 @@ def _current_derived_scopes(connection: sqlite3.Connection) -> CurrentDerivedSco
                 )
             }
             player_complete = scored & assigned
-        except sqlite3.Error:
+        except SQLAlchemyError:
             player_complete = set()
 
     state_complete: set[int] = set()
@@ -286,7 +263,7 @@ def _current_derived_scopes(connection: sqlite3.Connection) -> CurrentDerivedSco
                     (LABEL_VERSION,),
                 )
             }
-        except sqlite3.Error:
+        except SQLAlchemyError:
             state_complete = set()
 
     current: set[int] = set()
@@ -357,68 +334,18 @@ def _sha256_identity(value: object) -> str | None:
     return normalized
 
 
-def _read_only_draft_revision_key(
-    connection: sqlite3.Connection,
-) -> tuple[str, int, int] | None:
-    """Return a cache key only for a file-backed query-only snapshot."""
-    try:
-        if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
-            return None
-        database = connection.execute("PRAGMA database_list").fetchone()
-        path = str(database[2]) if database is not None else ""
-        if not path or path == ":memory:":
-            return None
-        try:
-            identity = os.stat(path)
-        except OSError:
-            return None
-        revision = connection.execute(
-            """SELECT dependency_revision, artifact_revision
-                 FROM draft_lineage_revisions
-                WHERE singleton=1"""
-        ).fetchone()
-        if revision is None:
-            return None
-        return (
-            f"{path}:{identity.st_dev}:{identity.st_ino}",
-            int(revision[0]),
-            int(revision[1]),
-        )
-    except (TypeError, ValueError, IndexError, OSError, sqlite3.Error):
-        return None
-
-
 def _draft_prediction_artifacts_for_read(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     loader: Callable[
-        [sqlite3.Connection], dict[tuple[str, int], tuple[str, str]]
+        [PostgresSession], dict[tuple[str, int], tuple[str, str]]
     ],
 ) -> dict[tuple[str, int], tuple[str, str]]:
-    """Reuse artifact fingerprints for an unchanged read-only lineage."""
-    key = _read_only_draft_revision_key(connection)
-    if key is None:
-        return loader(connection)
-    with _DRAFT_ARTIFACT_CACHE_LOCK:
-        cached = _DRAFT_ARTIFACT_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    artifacts = loader(connection)
-    with _DRAFT_ARTIFACT_CACHE_LOCK:
-        # Keep at most the newest token for a database and a small global cap
-        # so repeated test/database lifecycles cannot grow this process-wide
-        # cache without bound.
-        for stale_key in tuple(_DRAFT_ARTIFACT_CACHE):
-            if stale_key[0] == key[0] and stale_key != key:
-                del _DRAFT_ARTIFACT_CACHE[stale_key]
-        while len(_DRAFT_ARTIFACT_CACHE) >= _DRAFT_ARTIFACT_CACHE_MAX:
-            _DRAFT_ARTIFACT_CACHE.pop(next(iter(_DRAFT_ARTIFACT_CACHE)))
-        _DRAFT_ARTIFACT_CACHE[key] = artifacts
-    return artifacts
+    """Build artifact fingerprints from the current PostgreSQL snapshot."""
+    return loader(connection)
 
 
 def _current_draft_prediction_keys(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int],
 ) -> frozenset[tuple[str, int]]:
     """Return proofs unaffected by dependency changes at or before their cutoff."""
@@ -453,67 +380,59 @@ def _current_draft_prediction_keys(
         draft_lineage_tracking_is_current,
     )
 
-    owns_read_snapshot = not connection.in_transaction
-    try:
-        if owns_read_snapshot:
-            connection.execute("BEGIN")
+    def load() -> frozenset[tuple[str, int]]:
         if not draft_lineage_tracking_is_current(connection):
-            current = frozenset()
-        else:
-            artifacts = _draft_prediction_artifacts_for_read(
-                connection, draft_prediction_artifacts
-            )
-            rows = connection.execute(
-                """SELECT validation.run_id, validation.match_id,
-                          validation.input_snapshot_hash,
-                          validation.artifact_fingerprint
-                     FROM draft_prediction_validations AS validation
-                     JOIN draft_predictions AS prediction
-                       ON prediction.run_id=validation.run_id
-                      AND prediction.match_id=validation.match_id
-                      AND prediction.input_snapshot_hash=
-                          validation.input_snapshot_hash
-                     JOIN draft_lineage_revisions AS lineage
-                       ON lineage.singleton=1
-                    WHERE validation.validation_version=?
-                      AND validation.dependency_revision<=
-                          lineage.dependency_revision
-                      AND strftime('%s', prediction.prediction_cutoff) IS NOT NULL
-                      AND NOT EXISTS (
-                          SELECT 1 FROM draft_lineage_changes AS change
-                           WHERE change.dependency_revision>
-                                 validation.dependency_revision
-                             AND (change.affected_from_unix IS NULL OR
-                                  change.affected_from_unix<=CAST(
-                                      strftime('%s', prediction.prediction_cutoff)
-                                      AS INTEGER
-                                  ))
-                      )""",
-                (DRAFT_VALIDATION_VERSION,),
-            ).fetchall()
-            eligible = set(match_ids)
-            current = frozenset(
-                (str(row[0]), int(row[1]))
-                for row in rows
-                if int(row[1]) in eligible
-                and artifacts.get((str(row[0]), int(row[1])))
-                == (str(row[2]), str(row[3]))
-            )
-        if owns_read_snapshot:
-            connection.commit()
-        return current
-    except (TypeError, ValueError, sqlite3.Error):
-        if owns_read_snapshot and connection.in_transaction:
-            connection.rollback()
+            return frozenset()
+        artifacts = _draft_prediction_artifacts_for_read(
+            connection, draft_prediction_artifacts
+        )
+        rows = connection.execute(
+            """SELECT validation.run_id, validation.match_id,
+                      validation.input_snapshot_hash,
+                      validation.artifact_fingerprint
+                 FROM draft_prediction_validations AS validation
+                 JOIN draft_predictions AS prediction
+                   ON prediction.run_id=validation.run_id
+                  AND prediction.match_id=validation.match_id
+                  AND prediction.input_snapshot_hash=
+                      validation.input_snapshot_hash
+                 JOIN draft_lineage_revisions AS lineage
+                   ON lineage.singleton=1
+                WHERE validation.validation_version=?
+                  AND validation.dependency_revision<=
+                      lineage.dependency_revision
+                  AND prediction.prediction_cutoff IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM draft_lineage_changes AS change
+                       WHERE change.dependency_revision>
+                             validation.dependency_revision
+                         AND (change.affected_from_unix IS NULL OR
+                              change.affected_from_unix<=CAST(EXTRACT(EPOCH FROM
+                                  prediction.prediction_cutoff::timestamptz)
+                                  AS BIGINT))
+                  )""",
+            (DRAFT_VALIDATION_VERSION,),
+        ).fetchall()
+        eligible = set(match_ids)
+        return frozenset(
+            (str(row[0]), int(row[1]))
+            for row in rows
+            if int(row[1]) in eligible
+            and artifacts.get((str(row[0]), int(row[1])))
+            == (str(row[2]), str(row[3]))
+        )
+
+    try:
+        if connection.in_transaction:
+            return load()
+        with connection.transaction():
+            return load()
+    except (TypeError, ValueError, SQLAlchemyError):
         return frozenset()
-    except BaseException:
-        if owns_read_snapshot and connection.in_transaction:
-            connection.rollback()
-        raise
 
 
 def _rebuild_current_draft_prediction_keys(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int],
 ) -> frozenset[tuple[str, int]]:
     """Expensively rebuild prediction inputs for offline proof refresh."""
@@ -569,7 +488,7 @@ def _rebuild_current_draft_prediction_keys(
                  JOIN match_ingest_status AS status
                    ON status.match_id=prediction.match_id"""
         ).fetchall()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return frozenset()
 
     candidates: dict[tuple[str, str, int, float], set[tuple[str, int]]] = {}
@@ -638,7 +557,7 @@ def _rebuild_current_draft_prediction_keys(
     current: set[tuple[str, int]] = set()
     try:
         actual_artifacts = draft_prediction_artifacts(connection)
-    except (KeyError, TypeError, ValueError, sqlite3.Error):
+    except (KeyError, TypeError, ValueError, SQLAlchemyError):
         return frozenset()
     for (
         mode_value,
@@ -664,7 +583,7 @@ def _rebuild_current_draft_prediction_keys(
                 )
                 for row in rebuilt
             }
-        except (KeyError, TypeError, ValueError, sqlite3.Error):
+        except (KeyError, TypeError, ValueError, SQLAlchemyError):
             continue
         current.update(
             key
@@ -675,7 +594,7 @@ def _rebuild_current_draft_prediction_keys(
 
 
 def _maximum_prediction_cutoff_unix(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int],
 ) -> int | None:
     eligible = set(match_ids)
@@ -683,16 +602,16 @@ def _maximum_prediction_cutoff_unix(
         return None
     rows = connection.execute(
         """SELECT match_id,
-                  CAST(strftime('%s', prediction_cutoff) AS INTEGER)
+                  CAST(EXTRACT(EPOCH FROM prediction_cutoff::timestamptz) AS BIGINT)
              FROM draft_predictions
-            WHERE strftime('%s', prediction_cutoff) IS NOT NULL"""
+            WHERE prediction_cutoff IS NOT NULL"""
     ).fetchall()
     values = [int(row[1]) for row in rows if int(row[0]) in eligible]
     return max(values) if values else None
 
 
 def refresh_draft_prediction_validations(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int] | None = None,
 ) -> frozenset[tuple[str, int]]:
     """Rebuild and atomically publish proofs if dependencies stayed unchanged."""
@@ -707,8 +626,7 @@ def refresh_draft_prediction_validations(
     )
 
     ensure_draft_lineage_tracking(connection)
-    connection.execute("BEGIN")
-    try:
+    with connection.transaction():
         dependency_fingerprint = draft_dependency_fingerprint(connection)
         revision_row = connection.execute(
             """SELECT dependency_revision, artifact_revision
@@ -734,13 +652,8 @@ def refresh_draft_prediction_validations(
         validation_cutoff_unix = _maximum_prediction_cutoff_unix(
             connection, candidates
         )
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
 
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         if not draft_lineage_tracking_is_current(connection):
             raise RuntimeError(
                 "draft lineage tracking changed while validation was rebuilding"
@@ -748,7 +661,8 @@ def refresh_draft_prediction_validations(
         current_revision = connection.execute(
             """SELECT dependency_revision, artifact_revision
                  FROM draft_lineage_revisions
-                 WHERE singleton=1"""
+                 WHERE singleton=1
+                 FOR UPDATE"""
         ).fetchone()
         if current_revision is None:
             raise RuntimeError("draft lineage revisions are unavailable")
@@ -784,7 +698,7 @@ def refresh_draft_prediction_validations(
         else:
             connection.executemany(
                 "DELETE FROM draft_prediction_validations WHERE match_id=?",
-                ((match_id,) for match_id in sorted(candidates)),
+                [(match_id,) for match_id in sorted(candidates)],
             )
         connection.executemany(
             """INSERT INTO draft_prediction_validations
@@ -792,7 +706,7 @@ def refresh_draft_prediction_validations(
                 dependency_fingerprint, dependency_revision,
                 validation_version, validated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
+            [
                 (
                     run_id,
                     match_id,
@@ -804,17 +718,13 @@ def refresh_draft_prediction_validations(
                     now,
                 )
                 for run_id, match_id in sorted(current)
-            ),
+            ],
         )
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
     return current
 
 
 def current_state_input_hashes(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     scopes: CurrentDerivedScopes | None = None,
 ) -> dict[int, frozenset[str]]:
     scopes = scopes or current_derived_scopes(connection)
@@ -831,7 +741,7 @@ def current_state_input_hashes(
                 WHERE label_version=?""",
             (LABEL_VERSION,),
         ).fetchall()
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return {}
     for row in rows:
         match_id = int(row[0])
@@ -885,8 +795,8 @@ def profile_weighting_is_current(
 class StrictDerivedPipeline:
     """Complete only maps whose current source version lacks derived lineage."""
 
-    def __init__(self, database: Path) -> None:
-        self.database = database.resolve()
+    def __init__(self, storage: IntelligenceStorage) -> None:
+        self.storage = storage
 
     def run(
         self,
@@ -937,15 +847,9 @@ class StrictDerivedPipeline:
         if not pending:
             if retired:
                 with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    try:
+                    with connection.transaction():
                         self._verify_retired_ids(connection, retired)
                         self._delete_retired_statuses(connection, retired)
-                    except BaseException:
-                        connection.rollback()
-                        raise
-                    else:
-                        connection.commit()
             prospective_pending, prospective_rows = (
                 self._complete_pending_prospective_assignments()
             )
@@ -979,12 +883,12 @@ class StrictDerivedPipeline:
             from scripts.score_strict_event_players import run_scoring
 
             assignments = run_assignment(
-                self.database,
+                self.storage,
                 match_ids=player_ordered,
                 availability_mode=AvailabilityMode.RECONSTRUCTED_WALK_FORWARD,
             )
             scores = run_scoring(
-                self.database,
+                self.storage,
                 match_ids=player_ordered,
                 assignment_version=ROLE_VERSION,
             )
@@ -995,15 +899,14 @@ class StrictDerivedPipeline:
             from scripts.build_strict_team_profiles import build_strict_profiles
 
             profiles = build_strict_profiles(
-                self.database,
+                self.storage,
                 cutoff,
                 match_ids=state_ordered,
             )
             state_rows = profiles.state_rows
             profile_rows = profiles.profile_rows
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
+            with connection.transaction():
                 if self._all_eligible_ids(connection) != eligible_scope:
                     raise RuntimeError("formal eligible scope changed while deriving")
                 if self._all_player_ready_ids(connection) != player_scope:
@@ -1073,11 +976,6 @@ class StrictDerivedPipeline:
                             f"source version changed while deriving match {match_id}"
                         )
                 self._delete_retired_statuses(connection, retired)
-            except BaseException:
-                connection.rollback()
-                raise
-            else:
-                connection.commit()
         prospective_pending, prospective_rows = (
             self._complete_pending_prospective_assignments(ordered)
         )
@@ -1099,19 +997,18 @@ class StrictDerivedPipeline:
         match_ids: Collection[int] | None = None,
     ) -> tuple[int, int]:
         with self._connection() as connection:
-            connection.execute("BEGIN")
-            authorities = self._pending_prospective_authorities(
-                connection,
-                match_ids,
-            )
-            connection.rollback()
+            with connection.transaction():
+                authorities = self._pending_prospective_authorities(
+                    connection,
+                    match_ids,
+                )
         if not authorities:
             return 0, 0
 
         from scripts.assign_strict_event_roles import AvailabilityMode, run_assignment
 
         report = run_assignment(
-            self.database,
+            self.storage,
             match_ids=tuple(sorted(authorities)),
             availability_mode=AvailabilityMode.PROSPECTIVE,
             preserve_existing=True,
@@ -1122,7 +1019,7 @@ class StrictDerivedPipeline:
     @classmethod
     def _pending_prospective_authorities(
         cls,
-        connection: sqlite3.Connection,
+        connection: PostgresSession,
         match_ids: Collection[int] | None = None,
     ) -> dict[int, StrictCertificationAuthority]:
         selected = None if match_ids is None else {int(value) for value in match_ids}
@@ -1181,19 +1078,12 @@ class StrictDerivedPipeline:
         }
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
-        try:
-            yield connection
-        finally:
-            connection.close()
+    def _connection(self) -> Iterator[PostgresSession]:
+        yield self.storage.connection
 
     @staticmethod
     def _profile_context_hashes(
-        connection: sqlite3.Connection,
+        connection: PostgresSession,
         event_ids: Collection[str],
     ) -> dict[str, str]:
         if not event_ids:
@@ -1229,7 +1119,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _require_formal_ids(
-        connection: sqlite3.Connection, match_ids: Collection[int]
+        connection: PostgresSession, match_ids: Collection[int]
     ) -> None:
         if not match_ids:
             return
@@ -1249,11 +1139,11 @@ class StrictDerivedPipeline:
                 + ",".join(str(value) for value in sorted(missing))
             )
 
-    def _pending_ids(self, connection: sqlite3.Connection) -> set[int]:
+    def _pending_ids(self, connection: PostgresSession) -> set[int]:
         return self._pending_components(connection).all
 
     def _pending_components(
-        self, connection: sqlite3.Connection
+        self, connection: PostgresSession
     ) -> _PendingComponents:
         rows = connection.execute(
             """SELECT eligible.match_id, eligible.event_id,
@@ -1351,7 +1241,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _eligible_ids(
-        connection: sqlite3.Connection, match_ids: Collection[int]
+        connection: PostgresSession, match_ids: Collection[int]
     ) -> set[int]:
         if not match_ids:
             return set()
@@ -1369,7 +1259,7 @@ class StrictDerivedPipeline:
         }
 
     @staticmethod
-    def _all_eligible_ids(connection: sqlite3.Connection) -> set[int]:
+    def _all_eligible_ids(connection: PostgresSession) -> set[int]:
         return {
             int(row[0])
             for row in connection.execute(
@@ -1381,7 +1271,7 @@ class StrictDerivedPipeline:
         }
 
     @staticmethod
-    def _all_player_ready_ids(connection: sqlite3.Connection) -> set[int]:
+    def _all_player_ready_ids(connection: PostgresSession) -> set[int]:
         return {
             int(row[0])
             for row in connection.execute(
@@ -1391,7 +1281,7 @@ class StrictDerivedPipeline:
         }
 
     @staticmethod
-    def _all_profile_ready_ids(connection: sqlite3.Connection) -> set[int]:
+    def _all_profile_ready_ids(connection: PostgresSession) -> set[int]:
         return {
             int(row[0])
             for row in connection.execute(
@@ -1401,7 +1291,7 @@ class StrictDerivedPipeline:
         }
 
     @staticmethod
-    def _retired_ids(connection: sqlite3.Connection) -> set[int]:
+    def _retired_ids(connection: PostgresSession) -> set[int]:
         """Previously certified maps no longer admitted by the formal view."""
         return {
             int(row[0])
@@ -1416,7 +1306,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _verify_retired_ids(
-        connection: sqlite3.Connection, match_ids: Collection[int]
+        connection: PostgresSession, match_ids: Collection[int]
     ) -> None:
         if not match_ids:
             return
@@ -1437,7 +1327,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _delete_retired_statuses(
-        connection: sqlite3.Connection, match_ids: Collection[int]
+        connection: PostgresSession, match_ids: Collection[int]
     ) -> None:
         if not match_ids:
             return
@@ -1449,7 +1339,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _causal_successor_ids(
-        connection: sqlite3.Connection,
+        connection: PostgresSession,
         match_ids: Collection[int],
         *,
         component: str,
@@ -1488,7 +1378,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _source_snapshots(
-        connection: sqlite3.Connection, match_ids: Collection[int]
+        connection: PostgresSession, match_ids: Collection[int]
     ) -> dict[int, _SourceSnapshot]:
         if not match_ids:
             return {}
@@ -1529,7 +1419,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _verify_source_snapshots(
-        connection: sqlite3.Connection,
+        connection: PostgresSession,
         sources: Mapping[int, _SourceSnapshot],
     ) -> None:
         current = StrictDerivedPipeline._source_snapshots(connection, sources)
@@ -1564,7 +1454,7 @@ class StrictDerivedPipeline:
 
     @staticmethod
     def _verify_derived(
-        connection: sqlite3.Connection,
+        connection: PostgresSession,
         sources: Mapping[int, _SourceSnapshot],
         *,
         player_match_ids: Collection[int] | None = None,
@@ -1633,7 +1523,7 @@ class StrictDerivedPipeline:
 
 
 def strict_certification_authorities(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     match_ids: Collection[int],
 ) -> dict[int, StrictCertificationAuthority]:
     """Read the complete target certification authority in one snapshot."""

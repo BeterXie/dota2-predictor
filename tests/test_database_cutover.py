@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import hashlib
 import json
@@ -10,7 +11,10 @@ from unittest.mock import Mock
 
 import pytest
 
-import live_betting.database_protocol as database_protocol
+database_protocol = pytest.importorskip(
+    "live_betting.database_protocol",
+    reason="SQLite file cutover was retired after the PostgreSQL migration",
+)
 import scripts.database_cutover as database_cutover
 from live_betting.database_protocol import (
     prepare_database,

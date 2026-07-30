@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sqlite3
 import stat
 import uuid
 from collections.abc import Iterable, Mapping
@@ -13,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from database.session import PostgresSession
 
 
 VISION_FRAME_REF_PREFIX = "vision-frame:sha256:"
@@ -195,7 +196,7 @@ def publish_vision_frame_bytes(
         raise
 
 
-def _row(connection: sqlite3.Connection, frame_ref: str) -> tuple[Any, ...]:
+def _row(connection: PostgresSession, frame_ref: str) -> tuple[Any, ...]:
     row = connection.execute(
         """SELECT frame_ref, content_sha256, byte_length, storage_path,
                   registered_at
@@ -227,7 +228,7 @@ def vision_frame_retirement_id(payload: Mapping[str, Any]) -> str:
 
 
 def _effective_storage_path(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     frame_ref: str,
 ) -> tuple[tuple[Any, ...], Path]:
     artifact = _row(connection, frame_ref)
@@ -265,7 +266,7 @@ def _effective_storage_path(
     return artifact, Path(current)
 
 
-def _retired(connection: sqlite3.Connection, frame_ref: str) -> bool:
+def _retired(connection: PostgresSession, frame_ref: str) -> bool:
     row = connection.execute(
         """SELECT retirement_id, content_sha256, byte_length, storage_path,
                   reason, actor, retired_at
@@ -296,7 +297,7 @@ def _retired(connection: sqlite3.Connection, frame_ref: str) -> bool:
 
 
 def register_vision_frame_artifact(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     receipt: VisionFrameReceipt,
     *,
     registered_at: datetime,
@@ -314,9 +315,10 @@ def register_vision_frame_artifact(
         registered_at.astimezone(timezone.utc).isoformat(),
     )
     cursor = connection.execute(
-        """INSERT OR IGNORE INTO vision_frame_artifacts
+        """INSERT INTO vision_frame_artifacts
            (frame_ref, content_sha256, byte_length, storage_path, registered_at)
-           VALUES (?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT DO NOTHING""",
         values,
     )
     existing = _row(connection, actual.frame_ref)
@@ -328,7 +330,7 @@ def register_vision_frame_artifact(
 
 
 def verify_registered_vision_frame(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     frame_ref: str,
     *,
     expected_sha256: str | None = None,
@@ -353,7 +355,7 @@ def verify_registered_vision_frame(
 
 
 def read_registered_vision_frame_bytes(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     frame_ref: str,
     *,
     expected_sha256: str | None = None,
@@ -393,7 +395,7 @@ def read_registered_vision_frame_bytes(
 
 
 def verify_bound_order_vision_frame(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     order_key: str,
 ) -> VisionFrameReceipt:
     """Reverify the exact frame identity shared by an order and its decision."""
@@ -427,7 +429,7 @@ def verify_bound_order_vision_frame(
 
 
 def verify_vision_frame_registry(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     require_active_files: bool = True,
 ) -> int:
@@ -480,7 +482,7 @@ def _controlled_path(
 
 
 def relocate_vision_frame_artifacts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     replacements: Mapping[str, str | Path],
     *,
     allowed_new_roots: Iterable[str | Path],
@@ -551,8 +553,7 @@ def relocate_vision_frame_artifacts(
         )
     when = relocated_at.astimezone(timezone.utc).isoformat()
     relocation_ids: list[str] = []
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         for frame_ref, digest, size, old, new, sequence in planned:
             current_artifact, current_path = _effective_storage_path(
                 connection, frame_ref
@@ -595,15 +596,11 @@ def relocate_vision_frame_artifacts(
                 ),
             )
             relocation_ids.append(relocation_id)
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
     return tuple(relocation_ids)
 
 
 def retire_vision_frame_artifact(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     frame_ref: str,
     *,
     reason: str,
@@ -632,8 +629,7 @@ def retire_vision_frame_artifact(
         "retired_at": when,
     }
     retirement_id = vision_frame_retirement_id(payload)
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         verify_registered_vision_frame(
             connection,
             frame_ref,
@@ -656,10 +652,6 @@ def retire_vision_frame_artifact(
                 when,
             ),
         )
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
     return retirement_id
 
 

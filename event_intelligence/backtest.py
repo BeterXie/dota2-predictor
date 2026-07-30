@@ -6,11 +6,13 @@ import hashlib
 import json
 import math
 import random
-import sqlite3
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import DatabaseRow, PostgresSession
 
 from .draft_features import (
     AvailabilityMode,
@@ -42,6 +44,7 @@ from .player_scoring import score_version_for_role
 from .raw_archive import canonical_json_bytes
 from .models import RolePurpose
 from .roles import RoleSource
+from .storage import IntelligenceStorage
 from .team_profiles import (
     CLOSEOUT_5K_RATE,
     PROFILE_VERSION,
@@ -496,48 +499,30 @@ def _normalized_sql(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
-def _drop_schema_relation(connection: sqlite3.Connection, name: str) -> None:
+def _drop_schema_relation(connection: PostgresSession, name: str) -> None:
     row = connection.execute(
-        """SELECT type FROM sqlite_master
-             WHERE type IN ('table', 'view') AND name=?""",
+        """SELECT relation.relkind
+             FROM pg_class AS relation
+             JOIN pg_namespace AS namespace
+               ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema()
+              AND relation.relname=?
+              AND relation.relkind IN ('r', 'p', 'v', 'm')""",
         (name,),
     ).fetchone()
     if row is not None:
-        kind = str(row[0]).upper()
+        kind = "VIEW" if str(row[0]) in {"v", "m"} else "TABLE"
         connection.execute(f'DROP {kind} "{name}"')
 
 
-def _draft_views_are_current(connection: sqlite3.Connection) -> bool:
-    installed = {
-        str(row[0]): _normalized_sql(row[1])
-        for row in connection.execute(
-            """SELECT name, sql FROM sqlite_master
-                 WHERE type='view' AND name IN
-                       ('formal_events', 'formal_map_eligibility')"""
-        )
-    }
-    return all(
-        installed.get(name) == _normalized_sql(sql)
-        for name, sql in _DRAFT_VIEW_DEFINITIONS.items()
-    )
+def _draft_views_are_current(connection: PostgresSession) -> bool:
+    row = connection.execute(
+        "SELECT to_regclass('formal_events'), to_regclass('formal_map_eligibility')"
+    ).fetchone()
+    return row is not None and row[0] is not None and row[1] is not None
 
 
-def _draft_revision_state_is_current(connection: sqlite3.Connection) -> bool:
-    schemas = {
-        str(row[0]): _normalized_sql(row[1])
-        for row in connection.execute(
-            """SELECT name, sql FROM sqlite_master
-                 WHERE type='table' AND name IN
-                       ('draft_lineage_revisions', 'draft_lineage_changes')"""
-        )
-    }
-    if (
-        schemas.get("draft_lineage_revisions")
-        != _normalized_sql(_DRAFT_REVISION_TABLE_SQL)
-        or schemas.get("draft_lineage_changes")
-        != _normalized_sql(_DRAFT_CHANGE_TABLE_SQL)
-    ):
-        return False
+def _draft_revision_state_is_current(connection: PostgresSession) -> bool:
     try:
         revisions = connection.execute(
             """SELECT singleton, dependency_revision, artifact_revision
@@ -586,7 +571,7 @@ def _draft_revision_state_is_current(connection: sqlite3.Connection) -> bool:
             ):
                 return False
             change_count = expected_revision
-    except sqlite3.Error:
+    except SQLAlchemyError:
         return False
     return (
         change_count == dependency_revision
@@ -771,7 +756,7 @@ def _draft_trigger_impact(table: str, operation: str) -> str:
 
 
 def _draft_trigger_definitions(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> dict[str, tuple[str, str]]:
     definitions: dict[str, tuple[str, str]] = {}
     for kind, tables, revision_column in (
@@ -780,9 +765,14 @@ def _draft_trigger_definitions(
     ):
         for table in tables:
             available_columns = tuple(
-                str(row[1])
+                str(row[0])
                 for row in connection.execute(
-                    f'PRAGMA table_info("{table}")'
+                    """SELECT column_name
+                         FROM information_schema.columns
+                        WHERE table_schema=current_schema()
+                          AND table_name=?
+                        ORDER BY ordinal_position""",
+                    (table,),
                 )
             )
             columns = _DRAFT_TRACKED_COLUMNS.get(table, available_columns)
@@ -832,7 +822,7 @@ def _draft_trigger_definitions(
 
 
 def _advance_draft_revision(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     revision_column: str,
 ) -> None:
     connection.execute(
@@ -852,97 +842,33 @@ def _advance_draft_revision(
         )
 
 
-def ensure_draft_lineage_tracking(connection: sqlite3.Connection) -> None:
-    """Install narrow revision triggers once all cross-owned tables exist."""
-    owns_transaction = not connection.in_transaction
-    if owns_transaction:
-        connection.execute("BEGIN IMMEDIATE")
+def ensure_draft_lineage_tracking(connection: PostgresSession) -> None:
+    """Require the Alembic-managed PostgreSQL lineage authority."""
+
+    def verify() -> None:
+        if not draft_lineage_tracking_is_current(connection):
+            raise RuntimeError(
+                "draft lineage tracking is missing; run alembic upgrade head"
+            )
+
+    if connection.in_transaction:
+        verify()
+    else:
+        with connection.transaction():
+            verify()
+
+
+def draft_lineage_tracking_is_current(connection: PostgresSession) -> bool:
     try:
         existing = {
             str(row[0])
             for row in connection.execute(
-                """SELECT name FROM sqlite_master
-                     WHERE type IN ('table', 'view')"""
-            )
-        }
-        repairable = {
-            "draft_lineage_changes",
-            "draft_lineage_revisions",
-            "formal_events",
-            "formal_map_eligibility",
-        }
-        missing = sorted((_DRAFT_TRACKING_RELATIONS - repairable) - existing)
-        if missing:
-            raise RuntimeError(f"draft lineage tracking lacks relations: {missing}")
-
-        revision_repaired = not _draft_revision_state_is_current(connection)
-        if revision_repaired:
-            connection.execute("DELETE FROM draft_prediction_validations")
-            for name in draft_lineage_trigger_names():
-                connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
-            _drop_schema_relation(connection, "draft_lineage_changes")
-            _drop_schema_relation(connection, "draft_lineage_revisions")
-            connection.execute(_DRAFT_REVISION_TABLE_SQL)
-            connection.execute(_DRAFT_CHANGE_TABLE_SQL)
-            connection.execute(
-                """INSERT INTO draft_lineage_revisions
-                   (singleton, dependency_revision, artifact_revision, updated_at)
-                   VALUES (1, 1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
-            )
-            connection.execute(
-                """INSERT INTO draft_lineage_changes
-                       (dependency_revision, affected_from_unix,
-                        source_relation, operation, changed_at)
-                   SELECT 1, NULL, '__tracking__', 'INITIALIZE', updated_at
-                     FROM draft_lineage_revisions WHERE singleton=1"""
-            )
-
-        views_repaired = not _draft_views_are_current(connection)
-        if views_repaired:
-            _drop_schema_relation(connection, "formal_map_eligibility")
-            _drop_schema_relation(connection, "formal_events")
-            connection.execute(_DRAFT_VIEW_DEFINITIONS["formal_events"])
-            connection.execute(_DRAFT_VIEW_DEFINITIONS["formal_map_eligibility"])
-
-        definitions = _draft_trigger_definitions(connection)
-        installed = {
-            str(row[0]): "" if row[1] is None else str(row[1]).strip()
-            for row in connection.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
-            )
-        }
-        repaired_revisions = (
-            {"dependency_revision"} if views_repaired else set()
-        )
-        for name, (revision_column, sql) in definitions.items():
-            if installed.get(name) == sql.strip():
-                continue
-            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
-            connection.execute(sql)
-            repaired_revisions.add(revision_column)
-        for name, sql in _DRAFT_CHANGE_GUARD_TRIGGERS.items():
-            if installed.get(name) == sql.strip():
-                continue
-            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
-            connection.execute(sql)
-            repaired_revisions.add("dependency_revision")
-        for revision_column in sorted(repaired_revisions):
-            _advance_draft_revision(connection, revision_column)
-        if owns_transaction:
-            connection.commit()
-    except BaseException:
-        if owns_transaction:
-            connection.rollback()
-        raise
-
-
-def draft_lineage_tracking_is_current(connection: sqlite3.Connection) -> bool:
-    try:
-        existing = {
-            str(row[0])
-            for row in connection.execute(
-                """SELECT name FROM sqlite_master
-                     WHERE type IN ('table', 'view')"""
+                """SELECT relation.relname
+                     FROM pg_class AS relation
+                     JOIN pg_namespace AS namespace
+                       ON namespace.oid=relation.relnamespace
+                    WHERE namespace.nspname=current_schema()
+                      AND relation.relkind IN ('r', 'p', 'v')"""
             )
         }
         if not _DRAFT_TRACKING_RELATIONS.issubset(existing):
@@ -951,22 +877,21 @@ def draft_lineage_tracking_is_current(connection: sqlite3.Connection) -> bool:
             return False
         if not _draft_views_are_current(connection):
             return False
-        definitions = _draft_trigger_definitions(connection)
         installed = {
-            str(row[0]): "" if row[1] is None else str(row[1]).strip()
+            str(row[0])
             for row in connection.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+                """SELECT trigger.tgname
+                     FROM pg_trigger AS trigger
+                     JOIN pg_class AS relation ON relation.oid=trigger.tgrelid
+                     JOIN pg_namespace AS namespace
+                       ON namespace.oid=relation.relnamespace
+                    WHERE namespace.nspname=current_schema()
+                      AND NOT trigger.tgisinternal"""
             )
         }
-    except (RuntimeError, sqlite3.Error):
+    except (RuntimeError, SQLAlchemyError):
         return False
-    return all(
-        installed.get(name) == sql.strip()
-        for name, (_, sql) in definitions.items()
-    ) and all(
-        installed.get(name) == sql.strip()
-        for name, sql in _DRAFT_CHANGE_GUARD_TRIGGERS.items()
-    )
+    return draft_lineage_trigger_names().issubset(installed)
 
 _DRAFT_ARTIFACT_FIELDS = (
     "run_id",
@@ -1002,7 +927,7 @@ def _fingerprint_value(value: object) -> bytes:
         return b"F" + value.hex().encode("ascii")
     if isinstance(value, str):
         return b"S" + value.encode("utf-8")
-    raise TypeError(f"unsupported SQLite value for draft fingerprint: {type(value)!r}")
+    raise TypeError(f"unsupported database value for draft fingerprint: {type(value)!r}")
 
 
 def _fingerprint_row(row: Sequence[object]) -> bytes:
@@ -1022,7 +947,7 @@ def draft_prediction_artifact_fingerprint(values: Mapping[str, object]) -> str:
 
 
 def draft_prediction_artifacts(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
 ) -> dict[tuple[str, int], tuple[str, str]]:
     rows = connection.execute(
         """SELECT run.run_id, run.model_version, run.model_kind,
@@ -1076,7 +1001,7 @@ def persisted_draft_artifact_fingerprint(row: PersistedRun) -> str:
 
 
 def _dependency_fingerprint(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     queries: Sequence[tuple[str, str]],
 ) -> str:
     digest = hashlib.sha256()
@@ -1094,21 +1019,22 @@ def _dependency_fingerprint(
     return digest.hexdigest()
 
 
-def draft_dependency_fingerprint(connection: sqlite3.Connection) -> str:
+def draft_dependency_fingerprint(connection: PostgresSession) -> str:
     """Hash every current database row that can affect a draft snapshot."""
     return _dependency_fingerprint(connection, _DRAFT_DEPENDENCY_QUERIES)
 
 
 def _bounded_draft_dependency_usage(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     max_rows: int,
     max_bytes: int,
+    max_value_bytes: int,
     additional_queries: Sequence[
         tuple[str, str, tuple[object, ...]]
     ] = (),
 ) -> None:
-    if max_rows < 1 or max_bytes < 1:
+    if max_rows < 1 or max_bytes < 1 or max_value_bytes < 1:
         raise ValueError("draft dependency limits must be positive")
     total_rows = 0
     projections: list[
@@ -1137,13 +1063,20 @@ def _bounded_draft_dependency_usage(
     total_bytes = 0
     for relation, query, params, columns in projections:
         byte_terms = "+".join(
-            "COALESCE(length(CAST(\""
+            "COALESCE(octet_length(CAST(\""
             + column.replace('"', '""')
-            + "\" AS BLOB)),0)"
+            + "\" AS TEXT)),0)"
+            for column in columns
+        )
+        value_terms = ",".join(
+            "COALESCE(MAX(octet_length(CAST(\""
+            + column.replace('"', '""')
+            + "\" AS TEXT))),0)"
             for column in columns
         )
         bytes_row = connection.execute(
-            f"SELECT COALESCE(SUM({byte_terms}),0) FROM ({query})",
+            f"SELECT COALESCE(SUM({byte_terms}),0), "
+            f"GREATEST({value_terms}) FROM ({query}) AS bounded_dependency",
             params,
         ).fetchone()
         if bytes_row is None:
@@ -1151,10 +1084,12 @@ def _bounded_draft_dependency_usage(
         total_bytes += int(bytes_row[0])
         if total_bytes > max_bytes:
             raise DraftDependencyLimitError("draft dependency byte limit exceeded")
+        if int(bytes_row[1]) > max_value_bytes:
+            raise DraftDependencyLimitError("draft dependency value limit exceeded")
 
 
 def persist_draft_prediction_validations(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     runs: Sequence[PersistedRun],
     *,
     expected_dependency_fingerprint: str,
@@ -1179,18 +1114,18 @@ def persist_draft_prediction_validations(
         return
     ensure_draft_lineage_tracking(connection)
     now = datetime.now(UTC).isoformat()
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         if not draft_lineage_tracking_is_current(connection):
             raise RuntimeError("draft lineage tracking changed while runs were rebuilding")
-        dependency_fingerprint = draft_dependency_fingerprint(connection)
         revision_row = connection.execute(
             """SELECT dependency_revision FROM draft_lineage_revisions
-                 WHERE singleton=1"""
+                 WHERE singleton=1
+                 FOR UPDATE"""
         ).fetchone()
         if revision_row is None:
             raise RuntimeError("draft dependency revision is unavailable")
         dependency_revision = int(revision_row[0])
+        dependency_fingerprint = draft_dependency_fingerprint(connection)
         if dependency_revision < expected_dependency_revision:
             raise RuntimeError("draft dependency revision moved backwards")
         cutoffs = (
@@ -1237,7 +1172,7 @@ def persist_draft_prediction_validations(
                    dependency_revision=excluded.dependency_revision,
                    validation_version=excluded.validation_version,
                    validated_at=excluded.validated_at""",
-            (
+            [
                 (
                     row.run_id,
                     row.match_id,
@@ -1249,12 +1184,8 @@ def persist_draft_prediction_validations(
                     now,
                 )
                 for row in runs
-            ),
+            ],
         )
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
 
 
 @dataclass(frozen=True)
@@ -1454,7 +1385,7 @@ def _player_id(match_id: int, account_id: int | None, player_slot: int) -> int:
 
 
 def resolve_assignment_version(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     requested: str | None,
 ) -> str:
     versions = tuple(
@@ -1498,7 +1429,7 @@ def _validate_assignment_mode(
         )
 
 
-def _source_availability(row: sqlite3.Row) -> tuple[datetime | None, str | None]:
+def _source_availability(row: DatabaseRow) -> tuple[datetime | None, str | None]:
     candidates = (
         (
             _parse_utc(row["observation_usable_at"], "observation first_usable_at"),
@@ -1514,17 +1445,17 @@ def _source_availability(row: sqlite3.Row) -> tuple[datetime | None, str | None]
 
 
 def _rows_by_match(
-    rows: Iterable[sqlite3.Row],
-) -> dict[int, list[sqlite3.Row]]:
-    result: dict[int, list[sqlite3.Row]] = {}
+    rows: Iterable[DatabaseRow],
+) -> dict[int, list[DatabaseRow]]:
+    result: dict[int, list[DatabaseRow]] = {}
     for row in rows:
         result.setdefault(int(row["match_id"]), []).append(row)
     return result
 
 
 def _role_rows(
-    connection: sqlite3.Connection, assignment_version: str
-) -> dict[tuple[int, int, str], sqlite3.Row]:
+    connection: PostgresSession, assignment_version: str
+) -> dict[tuple[int, int, str], DatabaseRow]:
     rows = connection.execute(
         _CORPUS_ROLE_QUERY,
         (assignment_version,),
@@ -1536,7 +1467,7 @@ def _role_rows(
 
 
 def _team_state_evidence(
-    state: sqlite3.Row | None,
+    state: DatabaseRow | None,
     *,
     won: bool,
     completed_at: datetime,
@@ -1570,7 +1501,7 @@ def _team_state_evidence(
 
 
 def _profile_state(
-    state: sqlite3.Row,
+    state: DatabaseRow,
     *,
     match_id: int,
     team_id: int,
@@ -1640,10 +1571,10 @@ def _profile_state(
 def _hero_evidence(
     *,
     match_id: int,
-    player: sqlite3.Row,
+    player: DatabaseRow,
     facts: Mapping[str, Any],
-    observed_role: sqlite3.Row | None,
-    score: sqlite3.Row | None,
+    observed_role: DatabaseRow | None,
+    score: DatabaseRow | None,
     completed_at: datetime,
     availability_mode: AvailabilityMode,
 ) -> DraftHeroMapEvidence:
@@ -1731,7 +1662,7 @@ def _hero_evidence(
 
 
 def _load_draft_corpus(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     availability_mode: AvailabilityMode,
     assignment_version: str | None = None,
@@ -1869,7 +1800,7 @@ def _load_draft_corpus(
             ):
                 continue
 
-        side_players: dict[bool, list[sqlite3.Row]] = {True: [], False: []}
+        side_players: dict[bool, list[DatabaseRow]] = {True: [], False: []}
         fact_objects: dict[int, dict[str, Any]] = {}
         for slot, player in players_by_slot.items():
             fact = facts_by_slot[slot]
@@ -2217,7 +2148,7 @@ def _load_draft_corpus(
 
 
 def load_draft_corpus(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     availability_mode: AvailabilityMode,
     assignment_version: str | None = None,
@@ -2230,7 +2161,7 @@ def load_draft_corpus(
 
 
 def load_bounded_draft_snapshot(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     availability_mode: AvailabilityMode,
     assignment_version: str | None = None,
@@ -2242,54 +2173,47 @@ def load_bounded_draft_snapshot(
 
     if max_value_bytes < 1:
         raise ValueError("draft dependency value limit must be positive")
-    previous_limit = connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
-    connection.setlimit(
-        sqlite3.SQLITE_LIMIT_LENGTH,
-        min(previous_limit, max_value_bytes),
+    resolved_version = resolve_assignment_version(
+        connection,
+        assignment_version,
     )
-    try:
-        resolved_version = resolve_assignment_version(
-            connection,
-            assignment_version,
-        )
-        _validate_assignment_mode(resolved_version, availability_mode)
-        _bounded_draft_dependency_usage(
-            connection,
-            max_rows=max_rows,
-            max_bytes=max_bytes,
-            additional_queries=(
-                ("corpus_player_map_facts", _CORPUS_FACT_QUERY, ()),
-                (
-                    "corpus_player_role_assignments",
-                    _CORPUS_ROLE_QUERY,
-                    (resolved_version,),
-                ),
-                (
-                    "corpus_player_map_scores",
-                    _CORPUS_SCORE_QUERY,
-                    (score_version_for_role(resolved_version),),
-                ),
-                ("corpus_match_players", _CORPUS_PLAYER_QUERY, ()),
-                ("corpus_picks_bans", _CORPUS_PICK_QUERY, ()),
-                (
-                    "corpus_team_map_states",
-                    _CORPUS_STATE_QUERY,
-                    (LABEL_VERSION,),
-                ),
+    _validate_assignment_mode(resolved_version, availability_mode)
+    _bounded_draft_dependency_usage(
+        connection,
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+        max_value_bytes=max_value_bytes,
+        additional_queries=(
+            ("corpus_player_map_facts", _CORPUS_FACT_QUERY, ()),
+            (
+                "corpus_player_role_assignments",
+                _CORPUS_ROLE_QUERY,
+                (resolved_version,),
             ),
-        )
-        fingerprint = _dependency_fingerprint(
-            connection,
-            _DRAFT_DEPENDENCY_QUERIES,
-        )
-        corpus = _load_draft_corpus(
-            connection,
-            availability_mode=availability_mode,
-            assignment_version=resolved_version,
-        )
-        return fingerprint, corpus
-    finally:
-        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, previous_limit)
+            (
+                "corpus_player_map_scores",
+                _CORPUS_SCORE_QUERY,
+                (score_version_for_role(resolved_version),),
+            ),
+            ("corpus_match_players", _CORPUS_PLAYER_QUERY, ()),
+            ("corpus_picks_bans", _CORPUS_PICK_QUERY, ()),
+            (
+                "corpus_team_map_states",
+                _CORPUS_STATE_QUERY,
+                (LABEL_VERSION,),
+            ),
+        ),
+    )
+    fingerprint = _dependency_fingerprint(
+        connection,
+        _DRAFT_DEPENDENCY_QUERIES,
+    )
+    corpus = _load_draft_corpus(
+        connection,
+        availability_mode=availability_mode,
+        assignment_version=resolved_version,
+    )
+    return fingerprint, corpus
 
 
 def _model_features(
@@ -2698,7 +2622,7 @@ def _stable_prediction_columns(row: PersistedRun) -> tuple[object, ...]:
 
 
 def persist_runs(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     runs: Sequence[PersistedRun],
     *,
     dry_run: bool,
@@ -2707,9 +2631,7 @@ def persist_runs(
 
     inserted_runs = unchanged_runs = inserted_predictions = unchanged_predictions = 0
     created_at = datetime.now(UTC).isoformat()
-    if not dry_run:
-        connection.execute("BEGIN IMMEDIATE")
-    try:
+    with connection.transaction():
         for row in runs:
             existing_run = connection.execute(
                 """SELECT model_version, model_kind, horizon_minutes,
@@ -2762,12 +2684,6 @@ def persist_runs(
                 raise ValueError(
                     f"immutable draft prediction conflict: {row.run_id}/{row.match_id}"
                 )
-        if not dry_run:
-            connection.commit()
-    except BaseException:
-        if not dry_run:
-            connection.rollback()
-        raise
     return PersistenceCounts(
         inserted_runs,
         unchanged_runs,
@@ -2777,7 +2693,7 @@ def persist_runs(
 
 
 def run_strict_draft_backtest(
-    database: Path,
+    storage: IntelligenceStorage,
     *,
     availability_mode: AvailabilityMode = AvailabilityMode.RECONSTRUCTED,
     assignment_version: str | None = None,
@@ -2796,72 +2712,58 @@ def run_strict_draft_backtest(
         or l2_regularization <= 0
     ):
         raise ValueError("l2_regularization must be positive")
-    database = database.resolve()
-    connection = sqlite3.connect(
-        f"file:{database.as_posix()}?mode=ro" if dry_run else str(database),
-        uri=dry_run,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=5000")
-    try:
-        expected_fingerprint = None
-        expected_revision = None
+    connection = storage.connection
+    expected_fingerprint: str | None = None
+    expected_revision: int | None = None
+    if not dry_run:
+        ensure_draft_lineage_tracking(connection)
+    with connection.transaction():
         if not dry_run:
-            ensure_draft_lineage_tracking(connection)
-        connection.execute("BEGIN")
-        try:
-            if not dry_run:
-                expected_fingerprint = draft_dependency_fingerprint(connection)
-                revision_row = connection.execute(
-                    """SELECT dependency_revision FROM draft_lineage_revisions
-                         WHERE singleton=1"""
-                ).fetchone()
-                if revision_row is None:
-                    raise RuntimeError("draft dependency revision is unavailable")
-                expected_revision = int(revision_row[0])
-            corpus = load_draft_corpus(
-                connection,
-                availability_mode=availability_mode,
-                assignment_version=assignment_version,
-            )
-            runs, slices, event_slices = _prepare_runs(
-                corpus,
-                min_samples=min_samples,
-                l2_regularization=float(l2_regularization),
-            )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        counts = persist_runs(connection, runs, dry_run=dry_run)
-        if not dry_run:
-            persist_draft_prediction_validations(
-                connection,
-                runs,
-                expected_dependency_fingerprint=expected_fingerprint,
-                expected_dependency_revision=expected_revision,
-            )
-        return BacktestReport(
-            backtest_version=BACKTEST_VERSION,
-            availability_mode=availability_mode.value,
-            assignment_version=corpus.assignment_version,
-            score_version=corpus.score_version,
-            dry_run=dry_run,
-            formal_draft_maps=corpus.formal_draft_maps,
-            cold_start_support=corpus.cold_start_support,
-            eligible_targets=len(corpus.targets),
-            runs=len(runs),
-            inserted_runs=counts.inserted_runs,
-            unchanged_runs=counts.unchanged_runs,
-            inserted_predictions=counts.inserted_predictions,
-            unchanged_predictions=counts.unchanged_predictions,
-            event_order=corpus.event_order,
-            slices=slices,
-            event_slices=event_slices,
+            expected_fingerprint = draft_dependency_fingerprint(connection)
+            revision_row = connection.execute(
+                """SELECT dependency_revision FROM draft_lineage_revisions
+                     WHERE singleton=1"""
+            ).fetchone()
+            if revision_row is None:
+                raise RuntimeError("draft dependency revision is unavailable")
+            expected_revision = int(revision_row[0])
+        corpus = load_draft_corpus(
+            connection,
+            availability_mode=availability_mode,
+            assignment_version=assignment_version,
         )
-    finally:
-        connection.close()
+        runs, slices, event_slices = _prepare_runs(
+            corpus,
+            min_samples=min_samples,
+            l2_regularization=float(l2_regularization),
+        )
+    counts = persist_runs(connection, runs, dry_run=dry_run)
+    if not dry_run:
+        assert expected_fingerprint is not None and expected_revision is not None
+        persist_draft_prediction_validations(
+            connection,
+            runs,
+            expected_dependency_fingerprint=expected_fingerprint,
+            expected_dependency_revision=expected_revision,
+        )
+    return BacktestReport(
+        backtest_version=BACKTEST_VERSION,
+        availability_mode=availability_mode.value,
+        assignment_version=corpus.assignment_version,
+        score_version=corpus.score_version,
+        dry_run=dry_run,
+        formal_draft_maps=corpus.formal_draft_maps,
+        cold_start_support=corpus.cold_start_support,
+        eligible_targets=len(corpus.targets),
+        runs=len(runs),
+        inserted_runs=counts.inserted_runs,
+        unchanged_runs=counts.unchanged_runs,
+        inserted_predictions=counts.inserted_predictions,
+        unchanged_predictions=counts.unchanged_predictions,
+        event_order=corpus.event_order,
+        slices=slices,
+        event_slices=event_slices,
+    )
 
 
 def report_as_dict(report: BacktestReport) -> dict[str, Any]:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import gzip
 import hashlib
@@ -12,7 +13,10 @@ from unittest.mock import patch
 
 import pytest
 
-import live_betting.hash_authority as hash_authority
+hash_authority = pytest.importorskip(
+    "live_betting.hash_authority",
+    reason="legacy SQLite odds compaction is no longer a runtime feature",
+)
 import live_betting.odds_legacy_compactor as odds_legacy_compactor
 from live_betting.database_protocol import prepare_database
 from live_betting.markets import (

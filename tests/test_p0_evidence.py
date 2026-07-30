@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402, F401
 
 import json
 import os
@@ -9,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from scripts.p0_evidence import (
+p0_evidence = pytest.importorskip(
+    "scripts.p0_evidence",
+    reason="the SQLite P0 evidence workflow was retired",
+)
+from scripts.p0_evidence import (  # noqa: E402
     BASELINE_COMMON_TESTS,
     CRITICAL_TESTS,
     _classify_untracked,

@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urljoin
 
 import cv2
 import httpx
 import numpy as np
+from sqlalchemy.exc import SQLAlchemyError
 
+from database.session import PostgresSession
 from live_betting.raybet import SITE_URL
-from shared.sqlite import connect as connect_sqlite
+from live_betting.storage import LiveBettingStore
 from vision.image_features import compute_phash
 from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
 
@@ -51,7 +51,7 @@ def _silhouette(image: np.ndarray) -> np.ndarray:
 
 
 def _team_table_logos(
-    connection: sqlite3.Connection, team_names: tuple[str, str]
+    connection: PostgresSession, team_names: tuple[str, str]
 ) -> list[str | None]:
     rows = connection.execute(
         "SELECT name, tag, logo_url FROM teams WHERE logo_url IS NOT NULL AND logo_url != ''"
@@ -110,9 +110,11 @@ class TeamSideRecognizer:
         self.layout = layout
 
     @staticmethod
-    def from_database(database: Path, match_id: str) -> "TeamSideRecognizer | None":
-        connection = connect_sqlite(database, read_only=True)
-        try:
+    def from_database(
+        database_url: str, match_id: str
+    ) -> "TeamSideRecognizer | None":
+        with LiveBettingStore(database_url) as store:
+            connection = store.connection
             match = connection.execute(
                 "SELECT team_one, team_two, raw_json FROM raybet_matches "
                 "WHERE raybet_match_id=?",
@@ -123,7 +125,7 @@ class TeamSideRecognizer:
             team_names = (str(match[0] or ""), str(match[1] or ""))
             try:
                 table_urls = _team_table_logos(connection, team_names)
-            except sqlite3.OperationalError:
+            except SQLAlchemyError:
                 table_urls = [None, None]
             try:
                 raw_payload = json.loads(str(match[2] or "{}"))
@@ -138,8 +140,6 @@ class TeamSideRecognizer:
                 )
                 for index in range(2)
             ]
-        finally:
-            connection.close()
         if not all(candidates):
             return None
         images: list[np.ndarray] = []

@@ -6,11 +6,14 @@ import hashlib
 import json
 import math
 import re
-import sqlite3
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.session import PostgresSession
 
 from .engine import price_groups
 from .evaluation import brier_score, log_loss
@@ -157,7 +160,7 @@ class ResearchWriteResult:
 
 
 def manual_clock_evidence(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     *,
     raybet_match_id: str,
     map_number: int,
@@ -688,7 +691,7 @@ def _accuracy(rows: Sequence[tuple[float, int]]) -> float | None:
     ) / len(rows)
 
 
-def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
+def research_summary(connection: PostgresSession) -> dict[str, object]:
     """Build fail-closed coverage and accuracy metrics from research rows."""
 
     strict_gate = strict_read_gate(
@@ -734,15 +737,17 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         "AND anchor.map_number=prediction.map_number "
         "AND anchor.status='conflict' "
         "AND (anchor.conflict_at IS NULL "
-        "OR julianday(anchor.conflict_at) IS NULL "
-        "OR julianday(prediction.observed_at) IS NULL "
-        "OR julianday(anchor.conflict_at)<=julianday(prediction.observed_at) "
+        "OR live_text_timestamp_utc(anchor.conflict_at) IS NULL "
+        "OR live_text_timestamp_utc(prediction.observed_at) IS NULL "
+        "OR live_text_timestamp_utc(anchor.conflict_at)<="
+        "live_text_timestamp_utc(prediction.observed_at) "
         "OR EXISTS ("
         "SELECT 1 FROM vision_draft_conflicts AS conflict "
         "WHERE conflict.raybet_match_id=anchor.raybet_match_id "
         "AND conflict.map_number=anchor.map_number "
-        "AND (julianday(conflict.captured_at) IS NULL "
-        "OR julianday(conflict.captured_at)<=julianday(prediction.observed_at))"
+        "AND (live_text_timestamp_utc(conflict.captured_at) IS NULL "
+        "OR live_text_timestamp_utc(conflict.captured_at)<="
+        "live_text_timestamp_utc(prediction.observed_at))"
         "))))"
         if vision_available
         else "0"
@@ -807,12 +812,16 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         "AND curve.raybet_match_id=prediction.raybet_match_id "
         "AND curve.map_number=prediction.map_number "
         "AND curve.strict_mapping_id=prediction.strict_mapping_id "
-        "AND json(curve.radiant_hero_ids_json)=json(prediction.radiant_hero_ids_json) "
-        "AND json(curve.dire_hero_ids_json)=json(prediction.dire_hero_ids_json) "
+        "AND curve.radiant_hero_ids_json::jsonb="
+        "prediction.radiant_hero_ids_json::jsonb "
+        "AND curve.dire_hero_ids_json::jsonb="
+        "prediction.dire_hero_ids_json::jsonb "
         "AND curve.radiant_team_side=prediction.radiant_team_side "
         "AND curve.availability_mode='prospective' "
-        "AND julianday(curve.prediction_cutoff)<=julianday(curve.first_usable_at) "
-        "AND julianday(curve.first_usable_at)<=julianday(prediction.observed_at) "
+        "AND live_text_timestamp_utc(curve.prediction_cutoff)<="
+        "live_text_timestamp_utc(curve.first_usable_at) "
+        "AND live_text_timestamp_utc(curve.first_usable_at)<="
+        "live_text_timestamp_utc(prediction.observed_at) "
         "AND curve.deployment_key=prediction.draft_deployment_key "
         "AND curve.target_snapshot_hash=prediction.draft_target_snapshot_hash "
         "AND curve.feature_dependency_revision=prediction.draft_dependency_revision "
@@ -836,8 +845,10 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         "AND calibration.model_hash=prediction.draft_model_hash "
         "AND calibration.horizon_minutes=landmark.horizon_minutes "
         "AND calibration.support=landmark.support "
-        "AND json_extract(deployment.model_hashes_json,'$.'||landmark.horizon_minutes)=landmark.model_hash "
-        "AND json_extract(deployment.calibration_hashes_json,'$.'||landmark.horizon_minutes)=landmark.calibration_hash"
+        "AND deployment.model_hashes_json::jsonb ->> "
+        "CAST(landmark.horizon_minutes AS text)=landmark.model_hash "
+        "AND deployment.calibration_hashes_json::jsonb ->> "
+        "CAST(landmark.horizon_minutes AS text)=landmark.calibration_hash"
         ")))"
         if authority_available
         else "0"
@@ -875,7 +886,7 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
                             THEN 1 ELSE 0 END AS included
                   FROM research_live_predictions AS prediction"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         prediction_audit_rows = []
         prediction_unknown.append("research_prediction_audit_query_failed")
         raw_predictions = _safe_table_count(
@@ -933,7 +944,7 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
                   JOIN research_live_predictions AS prediction
                     ON prediction.prediction_key=label.prediction_key"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         price_audit_rows = []
         price_unknown.append("research_price_label_audit_query_failed")
         price_reason_counts = {
@@ -1097,9 +1108,10 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
         else "0"
     )
     temporal_valid_sql = (
-        "(julianday(prediction.observed_at) IS NOT NULL "
-        "AND julianday(label.settled_at) IS NOT NULL "
-        "AND julianday(prediction.observed_at)<julianday(label.settled_at))"
+        "(live_text_timestamp_utc(prediction.observed_at) IS NOT NULL "
+        "AND live_text_timestamp_utc(label.settled_at) IS NOT NULL "
+        "AND live_text_timestamp_utc(prediction.observed_at)<"
+        "live_text_timestamp_utc(label.settled_at))"
     )
     included_result_sql = (
         f"(({included_prediction_sql}) AND ({temporal_valid_sql}) "
@@ -1140,7 +1152,7 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
                   JOIN research_live_predictions AS prediction
                     ON prediction.prediction_key=label.prediction_key"""
         ).fetchall()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         result_audit_rows = []
         result_unknown.append("research_result_label_audit_query_failed")
         result_reason_counts = {
@@ -1307,16 +1319,22 @@ def research_summary(connection: sqlite3.Connection) -> dict[str, object]:
 
 
 def _required_schema_reason(
-    connection: sqlite3.Connection,
+    connection: PostgresSession,
     table: str,
     columns: set[str],
 ) -> str | None:
     try:
         exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            """SELECT 1
+                 FROM pg_class AS relation
+                 JOIN pg_namespace AS namespace
+                   ON namespace.oid=relation.relnamespace
+                WHERE namespace.nspname=current_schema()
+                  AND relation.relkind IN ('r', 'p', 'v')
+                  AND relation.relname=?""",
             (table,),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return f"{table}_schema_inspection_failed"
     if exists is None:
         return f"{table}_table_missing"
@@ -1326,11 +1344,11 @@ def _required_schema_reason(
 
 
 def _safe_table_count(
-    connection: sqlite3.Connection, table: str
+    connection: PostgresSession, table: str
 ) -> int | None:
     try:
         return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return None
 
 

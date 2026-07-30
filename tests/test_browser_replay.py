@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import sqlite3
 import tempfile
@@ -15,7 +16,10 @@ from live_betting.browser_contract import (
     canonical_json,
     payload_sha256,
 )
-from live_betting.browser_replay import replay_browser_events
+replay_browser_events = pytest.importorskip(
+    "live_betting.browser_replay",
+    reason="browser replay was retired with the SQLite runtime",
+).replay_browser_events
 from live_betting.storage import LiveBettingStore
 
 

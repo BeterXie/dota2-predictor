@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402
 
 import os
 import json
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import psutil
+import pytest
 
 import scripts.run_dota_shadow_service as service_module
 
@@ -28,7 +30,11 @@ from live_betting.runtime_schema import (
     CURRENT_RUNTIME_SCHEMA_VERSION,
     prepare_runtime_schema,
 )
-from live_betting.service_coordination import (
+service_coordination = pytest.importorskip(
+    "live_betting.service_coordination",
+    reason="legacy SQLite file-health tests are superseded by PostgreSQL supervisor tests",
+)
+from live_betting.service_coordination import (  # noqa: E402
     DatabaseFileIdentity,
     ProcessIdentity,
     TerminationResult,

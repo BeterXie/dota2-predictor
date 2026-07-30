@@ -6,7 +6,6 @@ import argparse
 import json
 import logging
 import signal
-import sqlite3
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -31,10 +30,7 @@ from event_intelligence.historical_rosh_backfill import (  # noqa: E402
 )
 from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 from live_betting.health import record_health  # noqa: E402
-from live_betting.service_coordination import (  # noqa: E402
-    add_single_database_argument,
-    database_writer_authority,
-)
+from database.engine import require_database_url  # noqa: E402
 from live_betting.stratz_rosh_client import (  # noqa: E402
     StratzRoshClient,
     StratzRoshError,
@@ -89,7 +85,10 @@ def _non_negative_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_single_database_argument(parser, required=True)
+    parser.add_argument(
+        "--database-url",
+        help="PostgreSQL URL (default: DATABASE_URL)",
+    )
     parser.add_argument("--batch-size", type=_positive_int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
         "--idle-seconds", type=_non_negative_float, default=DEFAULT_IDLE_SECONDS
@@ -115,25 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _open_read_connection(database: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(
-        f"file:{database.as_posix()}?mode=ro",
-        uri=True,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only=ON")
-    connection.execute("PRAGMA busy_timeout=5000")
-    return connection
-
-
-def _prepare_schema(database: Path) -> None:
-    with database_writer_authority(database):
-        with IntelligenceStorage(database) as storage:
-            storage.init_schema()
+def _prepare_schema(database_url: str) -> None:
+    with IntelligenceStorage(database_url) as storage:
+        storage.init_schema()
 
 
 def _record_worker_health(
-    database: Path,
+    database_url: str,
     status: str,
     heartbeat_at: datetime,
     *,
@@ -141,52 +128,48 @@ def _record_worker_health(
     error: str | None = None,
     details: Mapping[str, Any] | None = None,
 ) -> None:
-    with database_writer_authority(database):
-        with IntelligenceStorage(database) as storage:
-            record_health(
-                storage.connection,
-                COMPONENT,
-                status,
-                heartbeat_at=heartbeat_at,
-                success_at=heartbeat_at if successful else None,
-                error_at=(
-                    heartbeat_at
-                    if status in {"degraded", "unhealthy"}
-                    else None
-                ),
-                error=error,
-                details={"source": "worker", **dict(details or {})},
-            )
+    with IntelligenceStorage(database_url) as storage:
+        record_health(
+            storage.connection,
+            COMPONENT,
+            status,
+            heartbeat_at=heartbeat_at,
+            success_at=heartbeat_at if successful else None,
+            error_at=(
+                heartbeat_at if status in {"degraded", "unhealthy"} else None
+            ),
+            error=error,
+            details={"source": "worker", **dict(details or {})},
+        )
 
 
 def _persist_with_short_writer_authority(
-    database: Path,
+    database_url: str,
     _read_storage: object,
     match_id: int,
     identity: Mapping[str, Sequence[int]],
     score: object,
     created_at: datetime,
 ) -> bool:
-    with database_writer_authority(database):
-        with IntelligenceStorage(database) as writer:
-            existing = existing_historical_rosh_score_for_identity(
-                writer.connection,
-                match_id=match_id,
-                formula_version=score.formula_version,
-                identity=identity,
-            )
-            if historical_rosh_score_is_complete(
-                existing,
-                include_current_player_adjustment=True,
-            ):
-                return False
-            return persist_historical_rosh_score(
-                writer,
-                match_id,
-                identity,
-                score,
-                created_at,
-            )
+    with IntelligenceStorage(database_url) as writer:
+        existing = existing_historical_rosh_score_for_identity(
+            writer.connection,
+            match_id=match_id,
+            formula_version=score.formula_version,
+            identity=identity,
+        )
+        if historical_rosh_score_is_complete(
+            existing,
+            include_current_player_adjustment=True,
+        ):
+            return False
+        return persist_historical_rosh_score(
+            writer,
+            match_id,
+            identity,
+            score,
+            created_at,
+        )
 
 
 def _fair_due_ids(
@@ -244,7 +227,7 @@ def _default_emit(payload: Mapping[str, Any]) -> None:
 
 
 def run_worker(
-    database: Path,
+    database_url: str,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     idle_seconds: float = DEFAULT_IDLE_SECONDS,
@@ -258,21 +241,19 @@ def run_worker(
     token_resolver: Callable[[], str | None] = resolve_stratz_api_token,
     client_factory: ClientFactory | None = None,
     health_recorder: HealthRecorder | None = None,
-    read_connection_factory: Callable[[Path], sqlite3.Connection] = (
-        _open_read_connection
-    ),
+    read_storage_factory: Callable[[str], IntelligenceStorage] = IntelligenceStorage,
     backfill: Callable[..., HistoricalRoshBackfillReport] = (
         backfill_historical_rosh_scores
     ),
     emit: Emitter = _default_emit,
 ) -> int:
     """Run until stopped, keeping all external waits outside writer authority."""
-    database = database.resolve()
+    database_url = require_database_url(database_url)
     stopper = stop_event or threading.Event()
     now = clock or (lambda: datetime.now(timezone.utc))
     health = health_recorder or (
         lambda status, heartbeat_at, **kwargs: _record_worker_health(
-            database, status, heartbeat_at, **kwargs
+            database_url, status, heartbeat_at, **kwargs
         )
     )
     create_client = client_factory or (
@@ -318,9 +299,9 @@ def run_worker(
                         break
                     continue
 
-            connection = read_connection_factory(database)
+            read_storage = read_storage_factory(database_url)
+            connection = read_storage.connection
             try:
-                read_storage = type("ReadStorage", (), {"connection": connection})()
                 heartbeat = now().astimezone(timezone.utc)
                 match_ids = load_formal_match_ids(connection)
                 selected = _fair_due_ids(
@@ -393,7 +374,7 @@ def run_worker(
                             include_current_player_adjustment=True,
                             persist_score=lambda *args: (
                                 _persist_with_short_writer_authority(
-                                    database, *args
+                                    database_url, *args
                                 )
                             ),
                             max_attempts=max_attempts,
@@ -460,7 +441,7 @@ def run_worker(
                             details={"run_status": run_status, **payload},
                         )
             finally:
-                connection.close()
+                read_storage.close()
 
             if wait_seconds and stopper.wait(wait_seconds):
                 break
@@ -475,9 +456,9 @@ def run_worker(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    database = args.database.resolve()
+    database_url = require_database_url(args.database_url)
     if not args.schema_prepared:
-        _prepare_schema(database)
+        _prepare_schema(database_url)
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -486,7 +467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     return run_worker(
-        database,
+        database_url,
         batch_size=args.batch_size,
         idle_seconds=args.idle_seconds,
         error_backoff_seconds=args.error_backoff_seconds,
