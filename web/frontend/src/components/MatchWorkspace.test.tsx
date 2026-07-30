@@ -480,6 +480,44 @@ describe("MatchWorkspace", () => {
     expect(screen.getByLabelText("Radiant 阵容")).toBeInTheDocument();
   });
 
+  it("explains the latest valid decision transition on the current map", () => {
+    const analysis = matchAnalysis();
+    const previous = strategyDecision({
+      decision_key: "4".repeat(32),
+      input_ref: "5".repeat(24),
+      decided_at: "2026-07-16T12:01:00+00:00",
+    });
+    const current = strategyDecision({
+      decision_key: "6".repeat(32),
+      input_ref: "7".repeat(24),
+      decided_at: "2026-07-16T12:02:00+00:00",
+      eligible: 0,
+      reason: "edge_below_threshold",
+    });
+    analysis.strategy.data!.decisions = [previous, current];
+    analysis.strategy.data!.displayed_count = 2;
+    analysis.strategy.data!.scanned_count = 2;
+
+    render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:02:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    const delta = screen.getByLabelText("与上次判断相比");
+    expect(within(delta).getByText("判断原因发生变化，最终策略由合格变为拒绝。"))
+      .toBeInTheDocument();
+    expect(within(delta).getByText("策略合格")).toBeInTheDocument();
+    expect(within(delta).getByText("策略拒绝")).toBeInTheDocument();
+    expect(within(delta).getByText("全部策略门槛已通过")).toBeInTheDocument();
+    expect(within(delta).getByText("Edge 未达到最终阈值")).toBeInTheDocument();
+  });
+
   it("shows the prematch snapshot without treating it as live odds", () => {
     const upcoming: MatchDetail = {
       ...detail(0, "missing"),

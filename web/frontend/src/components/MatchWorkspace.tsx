@@ -54,6 +54,7 @@ import type {
 } from "../types";
 import { LifecycleBadge } from "./StatusBadge";
 import { PostmatchIntelligencePanel } from "./PostmatchIntelligencePanel";
+import { DecisionDeltaPanel } from "./live/DecisionDeltaPanel";
 import { LiveScoreboard } from "./live/LiveScoreboard";
 
 const RAYBET_PAGE_HOSTS = new Set(["ray086.com", "www.ray086.com"]);
@@ -416,6 +417,12 @@ function CurrentStrategyOverview({
           tone={verdictTone}
         />
       </div>
+      <DecisionDeltaPanel
+        decisions={decisions}
+        mapNumber={latest?.map_number}
+        teamOne={match.team_one}
+        teamTwo={match.team_two}
+      />
     </section>
   );
 }
