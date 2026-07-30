@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from database.engine import require_database_url
+
 # Add project root so we can import from train/
 _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
@@ -73,7 +75,7 @@ def main() -> None:
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    db_path = _resolve_path(config["database"])
+    database_url = require_database_url(config.get("database_url"))
     models_dir = _resolve_path(config["models_dir"])
 
     # Use train module's config for model params (shared config)
@@ -87,11 +89,11 @@ def main() -> None:
 
     print(f"Features dir: {features_dir}")
     print(f"Models dir:   {models_dir}")
-    print(f"Database:     {db_path}")
+    print("Database:     PostgreSQL")
 
     # Build full training matrix
     X, y, feature_names, start_times, imputer = build_training_data(
-        features_dir, db_path
+        features_dir, database_url
     )
     print(f"\nFull matrix: {X.shape[0]} matches x {X.shape[1]} features")
 
@@ -114,7 +116,7 @@ def main() -> None:
 
     # ---- Hero counter features (from OpenDota matchup data) ----------------
     match_ids = X_pm.index.tolist()
-    counter_df = build_counter_features_for_matches(db_path, match_ids)
+    counter_df = build_counter_features_for_matches(database_url, match_ids)
     counter_df = counter_df.reindex(X_pm.index).fillna(0.0)
 
     # Only keep counter features that are in PREMATCH_FEATURES

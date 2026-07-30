@@ -12,6 +12,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from sqlalchemy import text
 
 from shared.queries import (
     connect as _connect,
@@ -19,6 +20,12 @@ from shared.queries import (
 )
 
 _WINDOW_SIZES = (10, 20, 50)
+
+
+def _read_batch(connection, query: str) -> pd.DataFrame:
+    """Read a batch through SQLAlchemy, which Pandas can consume directly."""
+    with connection.engine.connect() as sql_connection:
+        return pd.read_sql_query(text(query), sql_connection)
 
 
 # ---------------------------------------------------------------------------
@@ -48,36 +55,36 @@ def compute_and_merge_aggregates(
     """
     # --- Load supporting data from DB ---------------------------------------
     with _connect(db_path) as conn:
-        raw_matches = pd.read_sql_query(
+        raw_matches = _read_batch(
+            conn,
             "SELECT match_id, radiant_team_id, dire_team_id, radiant_win, "
             "start_time, patch FROM matches WHERE start_time IS NOT NULL "
             "ORDER BY start_time",
-            conn,
         )
         # Per-match per-side player averages
-        player_avgs = pd.read_sql_query(
+        player_avgs = _read_batch(
+            conn,
             "SELECT match_id, is_radiant, "
             "AVG(gold_per_min * 1.0) AS avg_gpm, "
             "AVG(xp_per_min * 1.0) AS avg_xpm "
             "FROM match_players GROUP BY match_id, is_radiant",
-            conn,
         )
         # Gold advantage at 10 min
-        gold_10 = pd.read_sql_query(
-            "SELECT match_id, value FROM gold_advantage WHERE time_min = 10",
+        gold_10 = _read_batch(
             conn,
+            "SELECT match_id, value FROM gold_advantage WHERE time_min = 10",
         )
         # All picks
-        all_picks = pd.read_sql_query(
+        all_picks = _read_batch(
+            conn,
             "SELECT mp.match_id, mp.hero_id, mp.gold_per_min, mp.is_radiant "
             "FROM match_players mp",
-            conn,
         )
         # All bans
-        all_bans = pd.read_sql_query(
-            "SELECT pb.match_id, pb.hero_id "
-            "FROM picks_bans pb WHERE pb.is_pick = 0",
+        all_bans = _read_batch(
             conn,
+            "SELECT pb.match_id, pb.hero_id "
+            "FROM picks_bans pb WHERE pb.is_pick IS FALSE",
         )
 
     if raw_matches.empty:

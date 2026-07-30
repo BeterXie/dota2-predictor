@@ -214,7 +214,7 @@ def compute_team_historical_averages(
             FROM match_players mp
             JOIN matches m ON mp.match_id = m.match_id
             WHERE mp.team_id = ?
-            GROUP BY mp.match_id
+            GROUP BY mp.match_id, m.start_time
             ORDER BY m.start_time DESC
             LIMIT ?
             """,

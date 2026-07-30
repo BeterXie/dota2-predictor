@@ -45,6 +45,9 @@ python -m fetch.main
 python -m features.main
 python -m train.main
 
+# Build the pre-match model consumed by predict.main.
+python -m prematch.train
+
 # Generate a prematch prediction.
 python -m predict.main --radiant 9247354 --dire 10150538
 ```
