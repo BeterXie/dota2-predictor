@@ -1,3 +1,4 @@
+import { decisionReasonRequiresReview } from "./decisionSemantics";
 import type { MonitorMatch, ReadinessStatus, VisionPoint } from "./types";
 
 export type MatchDecisionAttention = "eligible" | "blocked" | "waiting" | "review";
@@ -62,7 +63,6 @@ export function getMatchAttentionState(match: MonitorMatch): MatchAttentionState
   const direction = decision?.underdog_side === "team_one"
     ? match.team_one
     : decision?.underdog_side === "team_two" ? match.team_two : null;
-  const reason = decision?.reason.toLocaleLowerCase("en-US") || "";
   const updatedAt = latestMatchUpdate(match);
   const decisionState = match.lifecycle === "upcoming"
     ? {
@@ -70,7 +70,7 @@ export function getMatchAttentionState(match: MonitorMatch): MatchAttentionState
         primaryLabel: "待开赛",
         primaryDetail: "尚未形成策略结论",
       }
-    : reason.includes("invalid") || reason.includes("mismatch")
+    : decision && decisionReasonRequiresReview(decision.reason)
       ? {
           decision: "review" as const,
           primaryLabel: "证据需复核",

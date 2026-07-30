@@ -11,6 +11,7 @@ import { CanvasRenderer } from "echarts/renderers";
 import ReactEChartsCore from "echarts-for-react/lib/core";
 import { useMemo } from "react";
 
+import { orderDecisionsChronologically } from "../decisionSemantics";
 import { formatClock, formatDateTime, formatPercent, parseTimestamp } from "../format";
 import {
   comparePeriods,
@@ -70,8 +71,8 @@ export function ProbabilityChart({
   );
   const mapNumber = mapNumberForPeriod(period) || 0;
   const selectedDecisions = useMemo(
-    () => decisions.filter(
-      (decision) => !mapNumber || decision.map_number === mapNumber,
+    () => orderDecisionsChronologically(
+      decisions.filter((decision) => !mapNumber || decision.map_number === mapNumber),
     ),
     [decisions, mapNumber],
   );

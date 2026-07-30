@@ -3024,6 +3024,14 @@ summary:focus-visible {
   white-space: nowrap;
 }
 
+.decision-delta-review {
+  background: rgba(255, 180, 0, 0.035);
+}
+
+.decision-delta-review .decision-delta-heading p {
+  color: var(--warning);
+}
+
 .decision-delta-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

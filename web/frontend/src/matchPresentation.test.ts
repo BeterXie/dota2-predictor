@@ -99,6 +99,9 @@ describe("match attention presentation", () => {
       healthLabel: "赔率过期",
       actionable: true,
     });
+    expect(getMatchAttentionState(match("manual-review", {
+      latest_decision: decision({ eligible: 0, reason: "manual_review_required" }),
+    })).decision).toBe("review");
   });
 
   it("treats first model or strategy output as waiting instead of degraded", () => {

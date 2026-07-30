@@ -2,6 +2,10 @@ import { ArrowRight } from "@phosphor-icons/react";
 import { useMemo, type ReactNode } from "react";
 
 import { formatDateTime, formatPercent } from "../../format";
+import {
+  decisionReasonRequiresReview,
+  selectLatestDecision,
+} from "../../decisionSemantics";
 import type { StrategyDecision } from "../../types";
 import {
   decisionReasonLabel,
@@ -12,21 +16,37 @@ import {
 
 interface DecisionDeltaPanelProps {
   decisions: StrategyDecision[];
-  mapNumber?: number | null;
   teamOne: string;
   teamTwo: string;
 }
 
 export function DecisionDeltaPanel({
   decisions,
-  mapNumber,
   teamOne,
   teamTwo,
 }: DecisionDeltaPanelProps) {
+  const current = useMemo(() => selectLatestDecision(decisions), [decisions]);
   const delta = useMemo(
-    () => latestDecisionDelta(decisions, mapNumber),
-    [decisions, mapNumber],
+    () => latestDecisionDelta(decisions),
+    [decisions],
   );
+  if (current && decisionReasonRequiresReview(current.reason)) {
+    return (
+      <section
+        aria-label="判断变化暂不可用"
+        className="decision-delta decision-delta-review"
+        role="status"
+      >
+        <div className="decision-delta-heading">
+          <div>
+            <h3>暂不比较判断变化</h3>
+            <p>最新判断证据需复核，暂不生成变化比较。</p>
+          </div>
+          <span>第 {current.map_number} 局 · {formatDateTime(current.decided_at)}</span>
+        </div>
+      </section>
+    );
+  }
   if (!delta) return null;
 
   const previousSide = sideLabel(delta.previous.underdog_side, teamOne, teamTwo);

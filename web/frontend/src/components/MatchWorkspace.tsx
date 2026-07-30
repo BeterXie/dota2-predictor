@@ -30,6 +30,11 @@ import {
   formatOdds,
   formatPercent,
 } from "../format";
+import {
+  decisionReasonRequiresReview,
+  orderDecisionsChronologically,
+  selectLatestDecision,
+} from "../decisionSemantics";
 import { getTrustedVision } from "../matchPresentation";
 import { comparePeriods, mapNumberForPeriod, resolvePeriod } from "../probability-period";
 import type {
@@ -287,8 +292,13 @@ function CurrentStrategyOverview({
   const strategy = normalizeStrategySection(
     sectionOrFallback(detail?.analysis?.strategy, error),
   );
-  const decisions = strategy.status === "available" ? strategy.data?.decisions || [] : [];
-  const latest = decisions[decisions.length - 1] || null;
+  const decisions = orderDecisionsChronologically(
+    strategy.status === "available" ? strategy.data?.decisions || [] : [],
+  );
+  const latest = selectLatestDecision(decisions);
+  const latestRequiresReview = latest
+    ? decisionReasonRequiresReview(latest.reason)
+    : false;
   const evidence = latest ? parseDecisionEvidence(latest) : null;
   const inputs = evidence && !evidence.invalidReason ? evidence.inputs : {};
   const visionInput = recordValue(inputs.vision);
@@ -300,7 +310,10 @@ function CurrentStrategyOverview({
   const entry = parseComebackEntry(inputs.comeback_entry, entryWindow);
   const v4 = latest?.strategy_version === COMEBACK_STRATEGY_V4;
   const malformedV4 = Boolean(v4 && (!comeback || !entryWindow || !entry));
-  const invalid = strategy.status === "review" || malformedV4 || Boolean(evidence?.invalidReason);
+  const invalid = strategy.status === "review"
+    || malformedV4
+    || latestRequiresReview
+    || Boolean(evidence?.invalidReason);
   const entryCandidate = entry?.eligible === true;
   const waitingForStart = !invalid && !latest && match.lifecycle === "upcoming";
 
@@ -319,6 +332,7 @@ function CurrentStrategyOverview({
   const primaryReason = latest?.reason || strategy.reason;
   const reasonText = waitingForStart
     ? "等待比赛开始并采集可信 HUD。"
+    : latestRequiresReview ? "最新判断证据需要复核，不能用于入场。"
     : strategyReasonText(primaryReason, strategy.status);
   const readiness = detail?.readiness || match.readiness;
   const dataTone = combineReadinessTone(
@@ -419,7 +433,6 @@ function CurrentStrategyOverview({
       </div>
       <DecisionDeltaPanel
         decisions={decisions}
-        mapNumber={latest?.map_number}
         teamOne={match.team_one}
         teamTwo={match.team_two}
       />
@@ -769,7 +782,9 @@ function DecisionTimeline({
     : null;
   const strategyData = section.status === "available" ? section.data : null;
   const legacy = !detail?.analysis && (detail?.decisions.length || 0) > 0;
-  const decisions = structuredDecisions || (legacy ? detail?.decisions : []) || [];
+  const decisions = orderDecisionsChronologically(
+    structuredDecisions || (legacy ? detail?.decisions : []) || [],
+  );
   const displayed = legacy ? decisions.slice(-12) : decisions;
   const latest = [...displayed].reverse();
 

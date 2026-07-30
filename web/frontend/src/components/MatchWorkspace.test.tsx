@@ -480,7 +480,7 @@ describe("MatchWorkspace", () => {
     expect(screen.getByLabelText("Radiant 阵容")).toBeInTheDocument();
   });
 
-  it("explains the latest valid decision transition on the current map", () => {
+  it("binds the hero and transition explanation to the chronological latest decision", () => {
     const analysis = matchAnalysis();
     const previous = strategyDecision({
       decision_key: "4".repeat(32),
@@ -494,7 +494,7 @@ describe("MatchWorkspace", () => {
       eligible: 0,
       reason: "edge_below_threshold",
     });
-    analysis.strategy.data!.decisions = [previous, current];
+    analysis.strategy.data!.decisions = [current, previous];
     analysis.strategy.data!.displayed_count = 2;
     analysis.strategy.data!.scanned_count = 2;
 
@@ -509,13 +509,58 @@ describe("MatchWorkspace", () => {
       />,
     );
 
+    expect(screen.getByRole("heading", { name: "当前策略拒绝" })).toBeInTheDocument();
     const delta = screen.getByLabelText("与上次判断相比");
-    expect(within(delta).getByText("判断原因发生变化，最终策略由合格变为拒绝。"))
+    expect(within(delta).getByText(
+      "模型 Edge 为 +4.2%，已低于最终阈值，因此最终策略由合格变为拒绝。",
+    ))
       .toBeInTheDocument();
     expect(within(delta).getByText("策略合格")).toBeInTheDocument();
     expect(within(delta).getByText("策略拒绝")).toBeInTheDocument();
     expect(within(delta).getByText("全部策略门槛已通过")).toBeInTheDocument();
     expect(within(delta).getByText("Edge 未达到最终阈值")).toBeInTheDocument();
+  });
+
+  it("does not present an older transition as current when the latest evidence needs review", () => {
+    const analysis = matchAnalysis();
+    const previous = strategyDecision({
+      decision_key: "4".repeat(32),
+      input_ref: "5".repeat(24),
+      decided_at: "2026-07-16T12:01:00+00:00",
+    });
+    const current = strategyDecision({
+      decision_key: "6".repeat(32),
+      input_ref: "7".repeat(24),
+      decided_at: "2026-07-16T12:02:00+00:00",
+      eligible: 0,
+      reason: "edge_below_threshold",
+    });
+    const review = strategyDecision({
+      decision_key: "8".repeat(32),
+      input_ref: "9".repeat(24),
+      decided_at: "2026-07-16T12:03:00+00:00",
+      eligible: 0,
+      reason: "evidence_invalid",
+    });
+    analysis.strategy.data!.decisions = [current, review, previous];
+    analysis.strategy.data!.displayed_count = 3;
+    analysis.strategy.data!.scanned_count = 3;
+
+    render(
+      <MatchWorkspace
+        detail={detailWithAnalysis(analysis)}
+        error={null}
+        loading={false}
+        match={match}
+        now={Date.parse("2026-07-16T12:03:05+00:00")}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "策略证据无效" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("与上次判断相比")).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "判断变化暂不可用" }))
+      .toHaveTextContent("最新判断证据需复核，暂不生成变化比较");
   });
 
   it("shows the prematch snapshot without treating it as live odds", () => {
