@@ -145,6 +145,27 @@ def test_mapping_schema_preserves_cyclic_authority_foreign_keys(
     }
     assert "strict_live_automatic_evidence_approvals" in mapping_targets
     assert "strict_live_map_mappings" in approval_targets
+    mapping_approval = next(
+        foreign_key
+        for foreign_key in inspector.get_foreign_keys("strict_live_map_mappings")
+        if foreign_key["referred_table"]
+        == "strict_live_automatic_evidence_approvals"
+    )
+    approval_mapping = next(
+        foreign_key
+        for foreign_key in inspector.get_foreign_keys(
+            "strict_live_automatic_evidence_approvals"
+        )
+        if foreign_key["referred_table"] == "strict_live_map_mappings"
+    )
+    assert mapping_approval["options"] == {
+        "deferrable": True,
+        "initially": "DEFERRED",
+    }
+    assert approval_mapping["options"] == {
+        "deferrable": True,
+        "initially": "DEFERRED",
+    }
 
 
 def test_accepted_mapping_and_invalidation_are_append_only(
