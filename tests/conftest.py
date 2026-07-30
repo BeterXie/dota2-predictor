@@ -74,6 +74,14 @@ LEGACY_SQLITE_MODULES = frozenset(
         "tests/test_winner_timeline_v2.py",
     }
 )
+LEGACY_SQLITE_MODULE_LIMIT = 60
+
+if len(LEGACY_SQLITE_MODULES) > LEGACY_SQLITE_MODULE_LIMIT:
+    raise RuntimeError(
+        "legacy_sqlite coverage boundary expanded: "
+        f"{len(LEGACY_SQLITE_MODULES)} modules > "
+        f"{LEGACY_SQLITE_MODULE_LIMIT} allowed"
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
