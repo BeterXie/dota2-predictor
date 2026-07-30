@@ -96,8 +96,24 @@ def test_core_migration_and_transaction_contract(postgres_database_url: str) -> 
             revision = connection.execute(
                 text("SELECT version_num FROM alembic_version"),
             ).scalar_one()
+            live_versions = list(
+                connection.execute(
+                    text("SELECT version FROM live_schema_version ORDER BY version")
+                ).scalars()
+            )
+            runtime_contract = connection.execute(
+                text(
+                    "SELECT version, contract_digest "
+                    "FROM runtime_schema_version"
+                )
+            ).one()
         assert count == 0
-        assert revision == "20260730_0011"
+        assert revision == "20260730_0012"
+        assert live_versions == [12]
+        assert runtime_contract == (
+            1,
+            "eb58ed6794cd39cdf4b9947a9132f2c2683cb20c769770586e3ca5c9f093beb9",
+        )
     finally:
         engine.dispose()
 

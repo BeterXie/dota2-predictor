@@ -115,7 +115,7 @@ def test_live_odds_schema_has_authority_views_and_indexes(
         ).scalar_one()
 
     assert authority_revision == 1
-    assert live_versions == []
+    assert live_versions == [12]
     assert local_time is True
 
 

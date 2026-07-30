@@ -470,6 +470,68 @@ def test_trusted_vision_requires_active_frame_and_no_invalidation(
             )
 
 
+def test_vision_draft_anchor_allows_only_declared_identity_transition(
+    postgres_engine: Engine,
+) -> None:
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO vision_draft_anchors (
+                    raybet_match_id, map_number, draft_hash,
+                    radiant_hero_ids, dire_hero_ids, anchored_at,
+                    source_frame_ref, status
+                ) VALUES (
+                    'anchor-match', 1, :draft_hash, '[1,2,3,4,5]',
+                    '[6,7,8,9,10]', '2026-07-30T00:00:00Z',
+                    'frame-1', 'anchored'
+                )
+                """
+            ),
+            {"draft_hash": _hash("anchor-draft")},
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE vision_draft_anchors
+                SET radiant_team_side = 'team_one',
+                    team_side_anchored_at = '2026-07-30T00:01:00Z',
+                    team_side_source_frame_ref = 'frame-2'
+                WHERE raybet_match_id = 'anchor-match' AND map_number = 1
+                """
+            )
+        )
+
+    with pytest.raises(DBAPIError, match="vision draft anchor is immutable"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE vision_draft_anchors SET draft_hash = :draft_hash "
+                    "WHERE raybet_match_id = 'anchor-match' AND map_number = 1"
+                ),
+                {"draft_hash": _hash("mutated-anchor-draft")},
+            )
+
+    with pytest.raises(DBAPIError, match="anchor identity is invalid"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO vision_draft_anchors (
+                        raybet_match_id, map_number, draft_hash,
+                        radiant_hero_ids, dire_hero_ids, anchored_at,
+                        source_frame_ref, status, conflict_at
+                    ) VALUES (
+                        'invalid-anchor-match', 1, :draft_hash,
+                        '[1,2,3,4,5]', '[6,7,8,9,10]',
+                        '2026-07-30T00:00:00Z', 'frame-3', 'conflict',
+                        '2026-07-30T00:01:00Z'
+                    )
+                    """
+                ),
+                {"draft_hash": _hash("invalid-anchor")},
+            )
+
 def _insert_rosh_run(connection, *, run_id: str, status: str) -> None:
     succeeded = status == "succeeded"
     connection.execute(
