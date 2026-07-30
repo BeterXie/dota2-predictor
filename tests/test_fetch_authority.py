@@ -1,68 +1,56 @@
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-
 import pytest
 
 from fetch import main as fetch_main
-from live_betting.service_coordination import SingleInstanceLock
 
 
-def test_fetch_uses_explicit_database_and_holds_standard_lock(
-    tmp_path: Path,
+def test_fetch_passes_explicit_postgres_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = tmp_path / "candidate.db"
-    sqlite3.connect(database).close()
-    observed: list[Path] = []
+    database_url = "postgresql+psycopg://dota2:test@localhost/dota2"
+    observed: list[str | None] = []
 
     async def run(
         _config: dict[str, object],
         _force: bool,
         _match_id: int | None,
-        database_path: str | Path | None = None,
+        selected_url: str | None = None,
     ) -> None:
-        assert database_path is not None
-        selected = Path(database_path).resolve()
-        observed.append(selected)
-        with pytest.raises(RuntimeError, match="already held"):
-            with SingleInstanceLock(selected.with_suffix(".service.lock")):
-                pass
+        observed.append(selected_url)
 
     monkeypatch.setattr(fetch_main, "load_config", lambda: {})
     monkeypatch.setattr(fetch_main, "run", run)
 
-    fetch_main.main(["--database", str(database), "--match-id", "42"])
+    fetch_main.main(
+        ["--database-url", database_url, "--match-id", "42"]
+    )
 
-    assert observed == [database.resolve()]
-    with SingleInstanceLock(database.with_suffix(".service.lock")):
-        pass
+    assert observed == [database_url]
 
 
-def test_fetch_rejects_supervisor_lock_before_running(
-    tmp_path: Path,
+def test_fetch_uses_database_url_environment_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = tmp_path / "locked.db"
-    sqlite3.connect(database).close()
-    called = False
+    observed: list[str | None] = []
 
-    async def run(*_: object, **__: object) -> None:
-        nonlocal called
-        called = True
+    async def run(
+        _config: dict[str, object],
+        _force: bool,
+        _match_id: int | None,
+        selected_url: str | None = None,
+    ) -> None:
+        observed.append(selected_url)
 
     monkeypatch.setattr(fetch_main, "load_config", lambda: {})
     monkeypatch.setattr(fetch_main, "run", run)
 
-    with SingleInstanceLock(database.with_suffix(".service.lock")):
-        with pytest.raises(RuntimeError, match="already held"):
-            fetch_main.main(["--database", str(database)])
+    fetch_main.main([])
 
-    assert not called
+    assert observed == [None]
 
 
-def test_fetch_rejects_duplicate_database_before_loading_config(
+def test_fetch_rejects_duplicate_database_url_before_loading_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def load() -> dict[str, object]:
@@ -72,5 +60,9 @@ def test_fetch_rejects_duplicate_database_before_loading_config(
 
     with pytest.raises(SystemExit):
         fetch_main.main(
-            ["--database=first.db", "--database", "second.db"]
+            [
+                "--database-url=postgresql+psycopg://first/db",
+                "--database-url",
+                "postgresql+psycopg://second/db",
+            ]
         )
