@@ -214,6 +214,72 @@ def test_monitor_runtime_contract_and_outbox_payload_are_enforced(
                 )
             )
 
+
+def test_settlement_chain_fails_closed_without_source_authority(
+    postgres_engine: Engine,
+) -> None:
+    with pytest.raises(DBAPIError, match="source evidence authority is required"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO settlement_result_evidence (
+                        raybet_match_id, map_number, dota_match_id, source,
+                        status, winner_side, evidence_ref, facts_json,
+                        observed_at, first_usable_at
+                    ) VALUES (
+                        'match-1', 1, 8904419709, 'raybet', 'confirmed',
+                        'team_one', 'unproven', '{}',
+                        '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z'
+                    )
+                    """
+                )
+            )
+
+    with pytest.raises(DBAPIError, match="reconciliation authority is required"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO settlement_reconciliations (
+                        raybet_match_id, map_number, dota_match_id,
+                        opendota_winner_side, raybet_evidence_ref,
+                        opendota_evidence_ref, status, reason,
+                        first_observed_at, updated_at
+                    ) VALUES (
+                        'match-1', 1, 8904419709, 'team_one',
+                        'raybet-ref', 'opendota-ref', 'pending', 'waiting',
+                        '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z'
+                    )
+                    """
+                )
+            )
+
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO settlements (
+                    order_key, result, return_units, settled_at,
+                    evidence_ref, review_required
+                ) VALUES (
+                    'manual-review-1', 'loss', 0.0,
+                    '2026-07-30T00:00:00Z', 'manual-review', 1
+                )
+                """
+            )
+        )
+
+    with pytest.raises(DBAPIError, match="settlement core state is immutable"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE settlements SET result = 'win' "
+                    "WHERE order_key = 'manual-review-1'"
+                )
+            )
+
+
 def test_trusted_vision_requires_active_frame_and_no_invalidation(
     postgres_engine: Engine,
 ) -> None:
