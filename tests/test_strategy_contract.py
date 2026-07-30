@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 import live_betting.strategy_contract as strategy_contract_module

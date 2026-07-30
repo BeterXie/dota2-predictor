@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from database.session import PostgresSession
 
@@ -91,3 +93,96 @@ def test_postgres_session_supports_explicit_begin_commit_and_rollback(
         assert connection.execute(
             text("SELECT COUNT(*) FROM heroes WHERE hero_id = 21")
         ).scalar_one() == 0
+
+
+def test_failed_implicit_write_releases_aborted_connection(postgres_engine) -> None:
+    session = PostgresSession(postgres_engine)
+    session.execute(
+        "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+        (30, "Lich"),
+    )
+    session.commit()
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+            (30, "Duplicate Lich"),
+        )
+
+    assert not session.in_transaction
+    assert session.execute(
+        "SELECT COUNT(*) FROM heroes WHERE hero_id = ?",
+        (30,),
+    ).scalar_one() == 1
+
+
+def test_failed_implicit_executemany_rolls_back_and_releases_connection(
+    postgres_engine,
+) -> None:
+    session = PostgresSession(postgres_engine)
+    session.execute(
+        "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+        (31, "Luna"),
+    )
+    session.commit()
+
+    with pytest.raises(IntegrityError):
+        session.executemany(
+            "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+            [(32, "Mirana"), (31, "Duplicate Luna"), (33, "Naga Siren")],
+        )
+
+    assert not session.in_transaction
+    assert session.execute(
+        "SELECT COUNT(*) FROM heroes WHERE hero_id IN (?, ?, ?)",
+        (31, 32, 33),
+    ).scalar_one() == 1
+
+
+def test_failed_explicit_transaction_is_rolled_back_by_context(
+    postgres_engine,
+) -> None:
+    session = PostgresSession(postgres_engine)
+    with pytest.raises(IntegrityError):
+        with session.transaction():
+            session.execute(
+                "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+                (40, "Zeus"),
+            )
+            session.execute(
+                "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+                (40, "Duplicate Zeus"),
+            )
+
+    assert session.execute(
+        "SELECT COUNT(*) FROM heroes WHERE hero_id = ?",
+        (40,),
+    ).scalar_one() == 0
+
+
+def test_failed_nested_transaction_rolls_back_only_savepoint(postgres_engine) -> None:
+    session = PostgresSession(postgres_engine)
+    with session.transaction():
+        session.execute(
+            "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+            (50, "Viper"),
+        )
+        with pytest.raises(IntegrityError):
+            with session.transaction():
+                session.execute(
+                    "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+                    (51, "Venomancer"),
+                )
+                session.execute(
+                    "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+                    (50, "Duplicate Viper"),
+                )
+        session.execute(
+            "INSERT INTO heroes (hero_id, localized_name) VALUES (?, ?)",
+            (52, "Riki"),
+        )
+
+    with postgres_engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM heroes WHERE hero_id IN (50, 51, 52)")
+        ).scalar_one() == 2

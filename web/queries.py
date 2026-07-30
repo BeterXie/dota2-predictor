@@ -35,25 +35,25 @@ def get_db() -> PostgresSession:
 
 
 def _safe_execute(query: str, params: tuple = (), fetch: str = "all") -> Any:
-    """Execute a query, returning []/None on missing tables."""
+    """Execute a query and close its session before returning or raising."""
+    conn = get_db()
     try:
-        conn = get_db()
         cur = conn.execute(query, params)
         if fetch == "all":
             rows = cur.fetchall()
-            conn.close()
             return [dict(r) for r in rows]
         elif fetch == "one":
             row = cur.fetchone()
-            conn.close()
             return dict(row) if row else None
         elif fetch == "value":
             row = cur.fetchone()
-            conn.close()
             return row[0] if row else None
+        raise ValueError(f"unsupported fetch mode: {fetch}")
     except SQLAlchemyError:
-        logger.warning("Query failed (table may not exist): %s", query[:80])
-        return [] if fetch == "all" else None
+        logger.exception("PostgreSQL query failed: %s", query[:80])
+        raise
+    finally:
+        conn.close()
 
 
 def _parse_date_to_ts(date_str: str) -> int:
@@ -240,7 +240,6 @@ def get_match_detail(match_id: int) -> dict | None:
         """, (match_id,)).fetchone()
 
         if not match:
-            conn.close()
             return None
 
         result = dict(match)
@@ -276,12 +275,12 @@ def get_match_detail(match_id: int) -> dict | None:
             WHERE match_id = ? ORDER BY time_min
         """, (match_id,)).fetchall()
         result["gold_advantage"] = [dict(g) for g in gold_adv]
-
-        conn.close()
         return result
     except SQLAlchemyError:
+        logger.exception("PostgreSQL match detail query failed: match_id=%s", match_id)
+        raise
+    finally:
         conn.close()
-        return None
 
 
 # --- Teams ---
@@ -302,7 +301,6 @@ def get_team_profile(team_id: int) -> dict | None:
     try:
         team = conn.execute("SELECT * FROM teams WHERE team_id = ?", (team_id,)).fetchone()
         if not team:
-            conn.close()
             return None
 
         result = dict(team)
@@ -369,11 +367,12 @@ def get_team_profile(team_id: int) -> dict | None:
         """, (team_id, team_id)).fetchall()
 
         result["recent_matches"] = [dict(r) for r in recent]
-        conn.close()
         return result
     except SQLAlchemyError:
+        logger.exception("PostgreSQL team profile query failed: team_id=%s", team_id)
+        raise
+    finally:
         conn.close()
-        return None
 
 
 def get_team_matches(team_id: int, page: int = 1, page_size: int = 20) -> tuple[list[dict], int]:
@@ -485,7 +484,6 @@ def get_hero_detail(hero_id: int) -> dict | None:
     try:
         hero = conn.execute("SELECT * FROM heroes WHERE hero_id = ?", (hero_id,)).fetchone()
         if not hero:
-            conn.close()
             return None
 
         result = dict(hero)
@@ -547,12 +545,12 @@ def get_hero_detail(hero_id: int) -> dict | None:
             LIMIT 20
         """, (hero_id,)).fetchall()
         result["recent_matches"] = [dict(r) for r in recent]
-
-        conn.close()
         return result
     except SQLAlchemyError:
+        logger.exception("PostgreSQL hero detail query failed: hero_id=%s", hero_id)
+        raise
+    finally:
         conn.close()
-        return None
 
 
 # --- Head-to-Head ---
@@ -611,15 +609,13 @@ def get_head_to_head(team_a: int, team_b: int) -> dict:
             LIMIT 20
         """, (team_a, team_b, team_b, team_a)).fetchall()
         result["recent_encounters"] = [dict(r) for r in recent]
-
-        conn.close()
         return result
     except SQLAlchemyError:
+        logger.exception(
+            "PostgreSQL head-to-head query failed: team_a=%s team_b=%s",
+            team_a,
+            team_b,
+        )
+        raise
+    finally:
         conn.close()
-        return {
-            "team_a": {"team_id": team_a, "name": None, "tag": None, "logo_url": None},
-            "team_b": {"team_id": team_b, "name": None, "tag": None, "logo_url": None},
-            "total_matches": 0, "team_a_wins": 0, "team_b_wins": 0,
-            "team_a_win_rate": 0.0, "avg_duration": 0.0,
-            "recent_encounters": [],
-        }

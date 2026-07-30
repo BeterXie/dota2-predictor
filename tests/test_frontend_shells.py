@@ -79,7 +79,7 @@ def test_monitor_console_exposes_runtime_safety_boundary() -> None:
     workspace = MATCH_WORKSPACE_TSX.read_text(encoding="utf-8")
 
     assert '<SafetyBoundaryBar snapshot={snapshot} />' in app
-    assert "PAPER ONLY" in app
+    assert "Paper Only" in app
     assert "不包含真实下注入口" in app
     assert "market_source_policy?: string" in types
     assert "capabilities?: Record<string, MonitorCapability>" in types
@@ -91,7 +91,7 @@ def test_monitor_console_integrates_stratz_rosh_prematch_workspace() -> None:
     app = APP_TSX.read_text(encoding="utf-8")
     prematch = PREMATCH_WORKSPACE_TSX.read_text(encoding="utf-8")
 
-    assert 'value="prematch">赛前预测</Tab>' in app
+    assert 'value="prematch">赛前分析</Tab>' in app
     assert 'window.location.pathname.replace(/\\/+$/, "") === "/prematch"' in app
     assert '<PrematchWorkspace />' in app
     assert "STRATZ Rosh" in prematch

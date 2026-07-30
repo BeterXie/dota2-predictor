@@ -130,9 +130,8 @@ class PostgresSession:
             )
             return DatabaseResult(rows=rows, rowcount=result.rowcount, columns=keys)
         except BaseException:
-            if transient:
-                connection.rollback()
-                connection.close()
+            if is_write:
+                self._discard_failed_implicit_connection(connection)
             raise
         finally:
             if transient:
@@ -153,11 +152,31 @@ class PostgresSession:
             if sql != first_sql:
                 raise ValueError("executemany produced inconsistent SQL")
             bound_rows.append(bound)
+        is_write = _WRITE_PREFIX.match(first_sql) is not None
+        transient = self._state.connection is None and not is_write
         connection = self._state.connection or self.engine.connect()
-        if self._state.connection is None:
+        if is_write and self._state.connection is None:
             self._state.connection = connection
-        result = connection.execute(text(first_sql), bound_rows)
-        return DatabaseResult(rows=(), rowcount=result.rowcount)
+        try:
+            result = connection.execute(text(first_sql), bound_rows)
+            return DatabaseResult(rows=(), rowcount=result.rowcount)
+        except BaseException:
+            if is_write:
+                self._discard_failed_implicit_connection(connection)
+            raise
+        finally:
+            if transient:
+                connection.rollback()
+                connection.close()
+
+    def _discard_failed_implicit_connection(self, connection: Connection) -> None:
+        if self._state.explicit_depth != 0 or self._state.connection is not connection:
+            return
+        try:
+            connection.rollback()
+        finally:
+            connection.close()
+            self._state.connection = None
 
     def commit(self) -> None:
         connection = self._state.connection
@@ -168,6 +187,7 @@ class PostgresSession:
         finally:
             connection.close()
             self._state.connection = None
+            self._state.explicit_depth = 0
 
     def begin(self) -> None:
         """Begin one DBAPI-style transaction for legacy Core call sites."""
@@ -177,6 +197,7 @@ class PostgresSession:
         connection = self.engine.connect()
         connection.begin()
         self._state.connection = connection
+        self._state.explicit_depth = 1
 
     def rollback(self) -> None:
         connection = self._state.connection
@@ -187,6 +208,7 @@ class PostgresSession:
         finally:
             connection.close()
             self._state.connection = None
+            self._state.explicit_depth = 0
 
     def close(self) -> None:
         self.rollback()

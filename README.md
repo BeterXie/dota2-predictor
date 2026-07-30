@@ -147,13 +147,19 @@ It does not create a SQLite backup.
 
 ```powershell
 $env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
+python -m ruff check .
+python -m pytest -q -m "not legacy_sqlite" --ignore=tests/integration/postgres
 python -m pytest tests/integration/postgres -q
-python -m ruff check database fetch scripts/migrate_sqlite_to_postgres.py tests/integration/postgres
 
 Set-Location web/frontend
 npm test
 npm run build
 ```
+
+Tests that still construct SQLite runtime files or exercise retired SQLite
+operations are explicitly marked `legacy_sqlite`. They remain discoverable and
+must be rewritten against the PostgreSQL integration harness before the marker
+is removed.
 
 Dogfood logs, screenshots, `*.tsbuildinfo`, and local import reports are
 generated evidence and must not be staged.
