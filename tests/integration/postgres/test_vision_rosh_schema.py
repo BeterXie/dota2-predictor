@@ -86,7 +86,56 @@ def test_vision_and_rosh_authority_tables_exist(postgres_engine: Engine) -> None
     assert {
         "active_vision_frame_artifacts",
         "trusted_vision_observation_authority",
+        "verified_strategy_decision_vision_authority",
     } <= set(inspector.get_view_names())
+
+
+def test_strategy_decision_is_immutable_and_eligible_rows_fail_closed(
+    postgres_engine: Engine,
+) -> None:
+    statement = text(
+        """
+        INSERT INTO strategy_decisions (
+            decision_key, raybet_match_id, map_number, decided_at,
+            underdog_side, market_probability, model_probability, edge,
+            data_quality, eligible, reason, contributions_json,
+            input_ref, strategy_version
+        ) VALUES (
+            :decision_key, 'match-1', 1, '2026-07-30T00:00:00Z',
+            'team_one', 0.48, 0.61, 0.13, 0.9, :eligible,
+            :reason, '{}', 'input-1', 'strategy-v1'
+        )
+        """
+    )
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            statement,
+            {
+                "decision_key": "decision-rejected",
+                "eligible": 0,
+                "reason": "edge_below_threshold",
+            },
+        )
+
+    with pytest.raises(DBAPIError, match="strategy decisions are immutable"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE strategy_decisions SET reason = 'mutated' "
+                    "WHERE decision_key = 'decision-rejected'"
+                )
+            )
+
+    with pytest.raises(DBAPIError, match="draft authority is required"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                statement,
+                {
+                    "decision_key": "decision-eligible-without-authority",
+                    "eligible": 1,
+                    "reason": "eligible",
+                },
+            )
 
 
 def test_trusted_vision_requires_active_frame_and_no_invalidation(
