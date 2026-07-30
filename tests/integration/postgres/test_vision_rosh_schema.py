@@ -280,6 +280,107 @@ def test_settlement_chain_fails_closed_without_source_authority(
             )
 
 
+def test_research_schema_fails_closed_without_declared_authority(
+    postgres_engine: Engine,
+) -> None:
+    inspector = inspect(postgres_engine)
+    assert {
+        "prospective_draft_outcomes",
+        "research_live_predictions",
+        "research_price_labels",
+        "research_result_labels",
+    } <= set(inspector.get_table_names())
+
+    with postgres_engine.connect() as connection:
+        trigger_names = set(
+            connection.execute(
+                text(
+                    "SELECT tgname FROM pg_trigger "
+                    "WHERE NOT tgisinternal AND tgname LIKE 'research_%' "
+                    "OR NOT tgisinternal AND tgname = "
+                    "'strict_live_research_impact_after_insert'"
+                )
+            ).scalars()
+        )
+    assert {
+        "research_prediction_draft_authority_insert",
+        "research_price_label_authority_insert",
+        "research_result_label_authority_insert",
+        "research_result_from_map_result",
+        "research_result_from_late_prediction",
+        "strict_live_research_impact_after_insert",
+    } <= trigger_names
+
+    with pytest.raises(DBAPIError, match="draft authority is required"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO research_live_predictions (
+                        prediction_key, schema_version, raybet_match_id,
+                        map_number, observed_at, game_clock_seconds,
+                        game_minute, selected_side, market_probability,
+                        market_price, transport_key, transport_hash,
+                        radiant_hero_ids_json, dire_hero_ids_json,
+                        strict_mapping_id, clock_source, clock_trust,
+                        manual_clock_trust, manual_clock_validation,
+                        actionability, gate_status, gate_failures_json,
+                        input_context_hash, created_at
+                    ) VALUES (
+                        'prediction-without-authority', 'v1', 'match-1', 1,
+                        '2026-07-30T00:00:00Z', 600, 10.0, 'team_one',
+                        0.45, 2.2, 'missing-transport', :transport_hash,
+                        '[1,2,3,4,5]', '[6,7,8,9,10]', 1, 'vision',
+                        'trusted_vision', 'not_observed', 'not_observed',
+                        'research_only', 'passed', '[]', :context_hash,
+                        '2026-07-30T00:00:00Z'
+                    )
+                    """
+                ),
+                {"transport_hash": "a" * 64, "context_hash": "b" * 64},
+            )
+
+    with pytest.raises(DBAPIError, match="price label authority is required"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO research_price_labels (
+                        label_key, prediction_key, transport_key,
+                        transport_hash, observed_at, selected_side, price,
+                        market_probability, seconds_after_prediction,
+                        created_at
+                    ) VALUES (
+                        'price-without-authority', 'missing-prediction',
+                        'missing-transport', :transport_hash,
+                        '2026-07-30T00:01:00Z', 'team_one', 2.2, 0.45,
+                        60.0, '2026-07-30T00:01:00Z'
+                    )
+                    """
+                ),
+                {"transport_hash": "a" * 64},
+            )
+
+    with pytest.raises(DBAPIError, match="result label authority is required"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO research_result_labels (
+                        label_key, prediction_key, winner_side,
+                        selected_side_win, dota_match_id, evidence_ref,
+                        settled_at, created_at
+                    ) VALUES (
+                        'result-without-authority', 'missing-prediction',
+                        'team_one', 1, 8904419709, 'missing-evidence',
+                        '2026-07-30T01:00:00Z',
+                        '2026-07-30T01:00:00Z'
+                    )
+                    """
+                )
+            )
+
+
 def test_trusted_vision_requires_active_frame_and_no_invalidation(
     postgres_engine: Engine,
 ) -> None:
