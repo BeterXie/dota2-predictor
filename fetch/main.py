@@ -15,8 +15,11 @@ from typing import Sequence
 import yaml
 
 from .client import OpenDotaClient
-from .postgres_store import CoreMatchStore
-from database.engine import advisory_lock
+from .db import Database
+from live_betting.service_coordination import (
+    add_single_database_argument,
+    database_writer_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,15 @@ def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
     return cfg
+
+
+def resolve_db_path(cfg: dict, database: str | Path | None = None) -> str:
+    if database is not None:
+        return str(Path(database).resolve())
+    raw: str = cfg.get("database", "../data/dota2.db")
+    if os.path.isabs(raw):
+        return raw
+    return str((Path(__file__).parent / raw).resolve())
 
 
 async def discover_matches(
@@ -88,7 +100,7 @@ async def discover_matches(
     return match_ids
 
 
-async def fetch_heroes(client: OpenDotaClient, db: CoreMatchStore) -> None:
+async def fetch_heroes(client: OpenDotaClient, db: Database) -> None:
     logger.info("Fetching hero list...")
     heroes = await client.get_heroes()
     db.insert_heroes(heroes)
@@ -96,7 +108,7 @@ async def fetch_heroes(client: OpenDotaClient, db: CoreMatchStore) -> None:
 
 async def fetch_matches(
     client: OpenDotaClient,
-    db: CoreMatchStore,
+    db: Database,
     match_ids: set[int],
     force: bool,
 ) -> tuple[int, int]:
@@ -133,34 +145,35 @@ async def run(
     cfg: dict,
     force: bool,
     single_match_id: int | None,
-    database_url: str | None = None,
+    database_path: str | Path | None = None,
 ) -> None:
-    db = CoreMatchStore(database_url)
+    db_path = resolve_db_path(cfg, database_path)
+    db = Database(db_path)
+    db.connect()
+    db.init_db()
 
     rate_limit = int(os.environ.get("OPENDOTA_RATE_LIMIT", "50"))
     client = OpenDotaClient(rate_limit=rate_limit)
 
     try:
-        with advisory_lock(db.engine, "fetch.main"):
-            if db.hero_count() == 0:
-                await fetch_heroes(client, db)
+        heroes_count = db.connect().execute(
+            "SELECT COUNT(*) FROM heroes"
+        ).fetchone()[0]
+        if heroes_count == 0:
+            await fetch_heroes(client, db)
 
-            if single_match_id is not None:
-                match_ids = {single_match_id}
-            else:
-                match_ids = await discover_matches(client, cfg)
+        if single_match_id is not None:
+            match_ids = {single_match_id}
+        else:
+            match_ids = await discover_matches(client, cfg)
 
-            if not match_ids:
-                logger.warning("No matches discovered. Check config.yaml leagues/teams.")
-                return
+        if not match_ids:
+            logger.warning("No matches discovered. Check config.yaml leagues/teams.")
+            return
 
-            logger.info("Discovered %d total match IDs to process.", len(match_ids))
-            fetched, skipped = await fetch_matches(client, db, match_ids, force)
-            logger.info(
-                "Done: %d fetched, %d skipped (already present).",
-                fetched,
-                skipped,
-            )
+        logger.info("Discovered %d total match IDs to process.", len(match_ids))
+        fetched, skipped = await fetch_matches(client, db, match_ids, force)
+        logger.info("Done: %d fetched, %d skipped (already present).", fetched, skipped)
     finally:
         await client.close()
         db.close()
@@ -176,19 +189,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Fetch Dota 2 match data from OpenDota")
     parser.add_argument("--force", action="store_true", help="Re-fetch even if already in DB")
     parser.add_argument("--match-id", type=int, default=None, help="Fetch a single match by ID")
-    parser.add_argument(
-        "--database-url",
-        action="append",
-        default=None,
-        help="PostgreSQL URL; defaults to DATABASE_URL",
-    )
+    add_single_database_argument(parser)
     args = parser.parse_args(argv)
-    if args.database_url is not None and len(args.database_url) != 1:
-        parser.error("--database-url may only be specified once")
-    database_url = None if args.database_url is None else args.database_url[0]
 
     cfg = load_config()
-    asyncio.run(run(cfg, args.force, args.match_id, database_url))
+    database = Path(resolve_db_path(cfg, args.database)).resolve()
+    with database_writer_authority(database):
+        asyncio.run(run(cfg, args.force, args.match_id, database))
 
 
 if __name__ == "__main__":

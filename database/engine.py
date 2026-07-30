@@ -7,7 +7,6 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine
-from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
 
@@ -50,30 +49,3 @@ def transaction(engine: Engine) -> Iterator[Connection]:
 
     with engine.begin() as connection:
         yield connection
-
-
-@contextmanager
-def advisory_lock(engine: Engine, name: str) -> Iterator[None]:
-    """Hold one PostgreSQL session advisory lock for a named runtime task."""
-
-    normalized = name.strip()
-    if not normalized:
-        raise ValueError("advisory lock name is required")
-    with engine.connect() as connection:
-        acquired = connection.execute(
-            text("SELECT pg_try_advisory_lock(hashtextextended(:name, 0))"),
-            {"name": normalized},
-        ).scalar_one()
-        if not acquired:
-            raise RuntimeError(f"database task lock is already held: {normalized}")
-        try:
-            yield
-        finally:
-            released = connection.execute(
-                text("SELECT pg_advisory_unlock(hashtextextended(:name, 0))"),
-                {"name": normalized},
-            ).scalar_one()
-            if not released:
-                raise RuntimeError(
-                    f"database task lock was not held at release: {normalized}"
-                )

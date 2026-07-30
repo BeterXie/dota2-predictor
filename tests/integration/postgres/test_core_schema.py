@@ -11,12 +11,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 
-from database.engine import (
-    advisory_lock,
-    build_engine,
-    require_database_url,
-    transaction,
-)
+from database.engine import build_engine, require_database_url, transaction
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -95,11 +90,6 @@ def test_core_migration_and_transaction_contract(postgres_database_url: str) -> 
                     {"hero_id": 1, "localized_name": "Anti-Mage"},
                 )
                 raise RuntimeError("force rollback")
-
-        with advisory_lock(engine, "integration.fetch"):
-            with pytest.raises(RuntimeError, match="already held"):
-                with advisory_lock(engine, "integration.fetch"):
-                    pass
 
         with engine.connect() as connection:
             count = connection.execute(text("SELECT COUNT(*) FROM heroes")).scalar_one()
