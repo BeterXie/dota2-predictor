@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import goldenAvailableAnalysis from "../../../../tests/fixtures/monitor-analysis-available.json";
 import goldenNoSignalAnalysis from "../../../../tests/fixtures/monitor-analysis-no-signal.json";
+import { formatDateTime } from "../format";
 import type {
   AnalysisSection,
   AnalysisSectionStatus,
@@ -596,7 +597,9 @@ describe("MatchWorkspace", () => {
     );
 
     expect(screen.getAllByText("赛前快照").length).toBeGreaterThan(0);
-    expect(screen.getByText(/赛前快照 .*20:04:01/)).toBeInTheDocument();
+    expect(screen.getByText(
+      `赛前快照 ${formatDateTime(upcoming.prematch_winner?.observed_at)}`,
+    )).toBeInTheDocument();
     expect(screen.getByText("1.65")).toBeInTheDocument();
     expect(screen.getByText("2.19")).toBeInTheDocument();
     expect(screen.getByText(/不进入实时策略/)).toBeInTheDocument();
