@@ -74,13 +74,21 @@ LEGACY_SQLITE_MODULES = frozenset(
         "tests/test_winner_timeline_v2.py",
     }
 )
-LEGACY_SQLITE_MODULE_LIMIT = 60
-
-if len(LEGACY_SQLITE_MODULES) > LEGACY_SQLITE_MODULE_LIMIT:
+LEGACY_SQLITE_MODULE_BUDGET = 60
+actual_legacy_sqlite_modules = len(LEGACY_SQLITE_MODULES)
+if actual_legacy_sqlite_modules != LEGACY_SQLITE_MODULE_BUDGET:
     raise RuntimeError(
-        "legacy_sqlite coverage boundary expanded: "
-        f"{len(LEGACY_SQLITE_MODULES)} modules > "
-        f"{LEGACY_SQLITE_MODULE_LIMIT} allowed"
+        "legacy_sqlite budget must match the current module set: "
+        f"{actual_legacy_sqlite_modules} modules != "
+        f"{LEGACY_SQLITE_MODULE_BUDGET} allowed"
+    )
+missing_legacy_sqlite_modules = sorted(
+    path for path in LEGACY_SQLITE_MODULES if not (ROOT / path).is_file()
+)
+if missing_legacy_sqlite_modules:
+    raise RuntimeError(
+        "legacy_sqlite contains missing test modules: "
+        + ", ".join(missing_legacy_sqlite_modules)
     )
 
 
