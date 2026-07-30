@@ -57,22 +57,33 @@ describe("match attention presentation", () => {
   it("maps live matches into the stable attention priority", () => {
     const matches = [
       match("review", { latest_decision: decision({ eligible: 1, reason: "rosh_profile_mismatch" }) }),
-      match("eligible", { latest_decision: decision({ eligible: 1, reason: "eligible" }) }),
-      match("degraded", {
+      match("eligible", {
+        latest_decision: decision({ eligible: 1, reason: "eligible" }),
         readiness: { ...ready, odds: { status: "stale" } },
+      }),
+      match("degraded", {
+        lifecycle: "degraded",
       }),
       match("blocked", { latest_decision: decision() }),
       match("waiting"),
       match("upcoming", { lifecycle: "upcoming" }),
     ];
 
-    expect(matches.map((item) => getMatchAttentionState(item).category)).toEqual([
+    expect(matches.map((item) => getMatchAttentionState(item).decision)).toEqual([
       "review",
       "eligible",
-      "degraded",
+      "waiting",
       "blocked",
       "waiting",
       "waiting",
+    ]);
+    expect(matches.map((item) => getMatchAttentionState(item).health)).toEqual([
+      "healthy",
+      "delayed",
+      "delayed",
+      "healthy",
+      "healthy",
+      "healthy",
     ]);
     expect(matches.map((item) => getMatchAttentionState(item).priority)).toEqual([
       0,
@@ -82,7 +93,49 @@ describe("match attention presentation", () => {
       4,
       5,
     ]);
-    expect(getMatchAttentionState(matches[2]).detail).toBe("赔率过期");
+    expect(getMatchAttentionState(matches[1])).toMatchObject({
+      primaryLabel: "策略合格",
+      primaryDetail: "关注 eligible one",
+      healthLabel: "赔率过期",
+      actionable: true,
+    });
+  });
+
+  it("treats first model or strategy output as waiting instead of degraded", () => {
+    const firstJudgmentPending = match("first-judgment", {
+      readiness: {
+        ...ready,
+        model: { status: "missing" },
+        strategy: { status: "missing" },
+      },
+    });
+    const oddsMissing = match("odds-missing", {
+      readiness: { ...ready, odds: { status: "missing" } },
+    });
+    const existingDecisionMissingModel = match("missing-after-decision", {
+      latest_decision: decision({ eligible: 1, reason: "eligible" }),
+      readiness: { ...ready, model: { status: "missing" } },
+    });
+
+    expect(getMatchAttentionState(firstJudgmentPending)).toMatchObject({
+      decision: "waiting",
+      health: "healthy",
+      primaryLabel: "等待判断",
+      healthLabel: null,
+      actionable: false,
+    });
+    expect(getMatchAttentionState(oddsMissing)).toMatchObject({
+      decision: "waiting",
+      health: "delayed",
+      healthLabel: "赔率缺失",
+      actionable: true,
+    });
+    expect(getMatchAttentionState(existingDecisionMissingModel)).toMatchObject({
+      decision: "eligible",
+      health: "delayed",
+      healthLabel: "模型缺失",
+      actionable: true,
+    });
   });
 
   it("defines the actionable filter without inventing unread or alert state", () => {

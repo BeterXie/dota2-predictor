@@ -12,9 +12,9 @@ import {
   getTrustedVision,
   matchesAttentionFilter,
   sortMatchesByAttention,
-  type MatchAttentionCategory,
   type MatchAttentionFilter,
   type MatchAttentionSort,
+  type MatchDecisionAttention,
 } from "../matchPresentation";
 import type { Lifecycle, MonitorMatch } from "../types";
 import { RelativeAge } from "./RelativeAge";
@@ -77,9 +77,9 @@ export function MatchRail({
   const attentionCounts = useMemo(() => new Map(
     attentionFilters.map(({ value }) => [
       value,
-      matches.filter((match) => matchesAttentionFilter(match, value)).length,
+      searched.filter((match) => matchesAttentionFilter(match, value)).length,
     ]),
-  ), [matches]);
+  ), [searched]);
   const filtered = useMemo(
     () => mode === "live"
       ? searched.filter((match) => matchesAttentionFilter(match, attentionFilter))
@@ -215,8 +215,17 @@ export function MatchRail({
                         <small>{progress}</small>
                       </div>
                       <div className="match-row-strategy">
-                        <strong className={attentionTone(strategy.category)}>{strategy.label}</strong>
-                        <span>{strategy.detail}</span>
+                        <div className="match-row-strategy-labels">
+                          <strong className={attentionTone(strategy.decision)}>
+                            {strategy.primaryLabel}
+                          </strong>
+                          {strategy.healthLabel && (
+                            <small className={`match-health-label ${strategy.health}`}>
+                              {strategy.healthLabel}
+                            </small>
+                          )}
+                        </div>
+                        <span>{strategy.primaryDetail}</span>
                       </div>
                       <div className="match-row-prices">
                         <span>{formatOdds(match.winner?.prices?.team_one)}</span>
@@ -279,10 +288,10 @@ function matchProgressLabel(match: MonitorMatch): string {
 }
 
 function attentionTone(
-  category: MatchAttentionCategory,
+  decision: MatchDecisionAttention,
 ): "positive" | "warning" | "neutral" | "critical" {
-  if (category === "review") return "critical";
-  if (category === "eligible") return "positive";
-  if (category === "degraded" || category === "blocked") return "warning";
+  if (decision === "review") return "critical";
+  if (decision === "eligible") return "positive";
+  if (decision === "blocked") return "warning";
   return "neutral";
 }

@@ -1,13 +1,17 @@
 import type { MonitorMatch, ReadinessStatus, VisionPoint } from "./types";
 
-export type MatchAttentionCategory = "review" | "eligible" | "degraded" | "blocked" | "waiting";
+export type MatchDecisionAttention = "eligible" | "blocked" | "waiting" | "review";
+export type MatchHealthAttention = "healthy" | "delayed" | "invalid";
 export type MatchAttentionFilter = "all" | "action" | "eligible" | "review" | "degraded" | "upcoming";
 export type MatchAttentionSort = "priority" | "updated" | "scheduled";
 
 export interface MatchAttentionState {
-  category: MatchAttentionCategory;
-  label: string;
-  detail: string;
+  decision: MatchDecisionAttention;
+  health: MatchHealthAttention;
+  primaryLabel: string;
+  primaryDetail: string;
+  healthLabel: string | null;
+  actionable: boolean;
   priority: number;
   updatedAt: string;
 }
@@ -37,15 +41,13 @@ const readinessLabels: Record<ReadinessStatus, string> = {
   unhealthy: "异常",
   stopped: "停止",
 };
-const degradedStatuses = new Set<ReadinessStatus>([
-  "delayed",
-  "stale",
-  "missing",
-  "unconfirmed",
-  "degraded",
-  "unhealthy",
-  "stopped",
-]);
+const healthRules: Record<keyof MonitorMatch["readiness"], Set<ReadinessStatus>> = {
+  odds: new Set(["delayed", "stale", "missing", "degraded", "unhealthy", "stopped"]),
+  mapping: new Set(["missing", "degraded", "unhealthy", "stopped"]),
+  vision: new Set(["delayed", "stale", "degraded", "unhealthy", "stopped"]),
+  model: new Set(["stale", "degraded", "unhealthy", "stopped"]),
+  strategy: new Set(["degraded", "unhealthy", "stopped"]),
+};
 
 export function getTrustedVision(match: MonitorMatch): VisionPoint | null {
   const vision = match.latest_vision;
@@ -61,84 +63,62 @@ export function getMatchAttentionState(match: MonitorMatch): MatchAttentionState
     ? match.team_one
     : decision?.underdog_side === "team_two" ? match.team_two : null;
   const reason = decision?.reason.toLocaleLowerCase("en-US") || "";
-  const invalidSource = readinessSources.find(
-    (source) => match.readiness[source].status === "invalid",
-  );
   const updatedAt = latestMatchUpdate(match);
-
-  if (reason.includes("invalid") || reason.includes("mismatch") || invalidSource) {
-    return {
-      category: "review",
-      label: "证据需复核",
-      detail: direction
-        ? `涉及 ${direction}`
-        : invalidSource ? `${sourceLabels[invalidSource]}证据无效` : "策略证据无效或版本不匹配",
-      priority: 0,
-      updatedAt,
-    };
-  }
-
-  if (match.lifecycle === "upcoming") {
-    return {
-      category: "waiting",
-      label: "待开赛",
-      detail: "尚未形成策略结论",
-      priority: 5,
-      updatedAt,
-    };
-  }
-
-  if (decision?.eligible === 1) {
-    return {
-      category: "eligible",
-      label: "策略合格",
-      detail: direction ? `关注 ${direction}` : "纸面候选已通过",
-      priority: 1,
-      updatedAt,
-    };
-  }
-
-  const degradedSource = readinessSources.find(
-    (source) => degradedStatuses.has(match.readiness[source].status),
+  const decisionState = match.lifecycle === "upcoming"
+    ? {
+        decision: "waiting" as const,
+        primaryLabel: "待开赛",
+        primaryDetail: "尚未形成策略结论",
+      }
+    : reason.includes("invalid") || reason.includes("mismatch")
+      ? {
+          decision: "review" as const,
+          primaryLabel: "证据需复核",
+          primaryDetail: direction ? `涉及 ${direction}` : "策略证据无效或版本不匹配",
+        }
+      : decision?.eligible === 1
+        ? {
+            decision: "eligible" as const,
+            primaryLabel: "策略合格",
+            primaryDetail: direction ? `关注 ${direction}` : "纸面候选已通过",
+          }
+        : decision
+          ? {
+              decision: "blocked" as const,
+              primaryLabel: "策略拒绝",
+              primaryDetail: direction ? `已拒绝 ${direction}` : "未达到策略条件",
+            }
+          : match.lifecycle === "ended"
+            ? {
+                decision: "waiting" as const,
+                primaryLabel: "比赛已结束",
+                primaryDetail: "查看历史赔率与策略记录",
+              }
+            : {
+                decision: "waiting" as const,
+                primaryLabel: "等待判断",
+                primaryDetail: "等待下一次可信输入",
+              };
+  const healthState = matchHealthState(match);
+  const inactive = match.lifecycle === "upcoming" || match.lifecycle === "ended";
+  const actionable = !inactive && (
+    decisionState.decision === "eligible"
+    || decisionState.decision === "review"
+    || healthState.health !== "healthy"
   );
-  if (match.lifecycle === "degraded" || (match.lifecycle === "live" && degradedSource)) {
-    const status = degradedSource ? match.readiness[degradedSource].status : null;
-    return {
-      category: "degraded",
-      label: "数据降级",
-      detail: degradedSource && status
-        ? `${sourceLabels[degradedSource]}${readinessLabels[status]}`
-        : "赛事数据处于降级状态",
-      priority: 2,
-      updatedAt,
-    };
-  }
-
-  if (decision) {
-    return {
-      category: "blocked",
-      label: "策略拒绝",
-      detail: direction ? `已拒绝 ${direction}` : "未达到策略条件",
-      priority: 3,
-      updatedAt,
-    };
-  }
-
-  if (match.lifecycle === "ended") {
-    return {
-      category: "waiting",
-      label: "比赛已结束",
-      detail: "查看历史赔率与策略记录",
-      priority: 6,
-      updatedAt,
-    };
-  }
+  const priority = match.lifecycle === "upcoming"
+    ? 5
+    : match.lifecycle === "ended" ? 6
+      : decisionState.decision === "review" || healthState.health === "invalid" ? 0
+        : decisionState.decision === "eligible" ? 1
+          : healthState.health === "delayed" ? 2
+            : decisionState.decision === "blocked" ? 3 : 4;
 
   return {
-    category: "waiting",
-    label: "等待判断",
-    detail: "等待下一次可信输入",
-    priority: 4,
+    ...decisionState,
+    ...healthState,
+    actionable,
+    priority,
     updatedAt,
   };
 }
@@ -149,11 +129,11 @@ export function matchesAttentionFilter(
 ): boolean {
   if (filter === "all") return true;
   if (filter === "upcoming") return match.lifecycle === "upcoming";
-  const category = getMatchAttentionState(match).category;
-  if (filter === "action") {
-    return category === "review" || category === "eligible" || category === "degraded";
-  }
-  return category === filter;
+  const state = getMatchAttentionState(match);
+  if (filter === "action") return state.actionable;
+  if (filter === "eligible") return state.decision === "eligible";
+  if (filter === "review") return state.decision === "review" || state.health === "invalid";
+  return state.health !== "healthy";
 }
 
 export function sortMatchesByAttention(
@@ -193,6 +173,49 @@ function latestMatchUpdate(match: MonitorMatch): string {
   return candidates.reduce((latest, candidate) => (
     timestamp(candidate) > timestamp(latest) ? candidate : latest
   ), candidates[0] || "");
+}
+
+function matchHealthState(match: MonitorMatch): Pick<
+  MatchAttentionState,
+  "health" | "healthLabel"
+> {
+  if (match.lifecycle === "upcoming" || match.lifecycle === "ended") {
+    return { health: "healthy", healthLabel: null };
+  }
+  const invalidSource = readinessSources.find(
+    (source) => match.readiness[source].status === "invalid",
+  );
+  if (invalidSource) {
+    return {
+      health: "invalid",
+      healthLabel: `${sourceLabels[invalidSource]}${readinessLabels.invalid}`,
+    };
+  }
+  const delayedSource = readinessSources.find((source) => (
+    healthRules[source].has(match.readiness[source].status)
+  ));
+  if (delayedSource) {
+    const status = match.readiness[delayedSource].status;
+    return {
+      health: "delayed",
+      healthLabel: `${sourceLabels[delayedSource]}${readinessLabels[status]}`,
+    };
+  }
+  const missingOutputSource = match.latest_decision
+    ? (["model", "strategy"] as const).find(
+        (source) => match.readiness[source].status === "missing",
+      )
+    : null;
+  if (missingOutputSource) {
+    return {
+      health: "delayed",
+      healthLabel: `${sourceLabels[missingOutputSource]}${readinessLabels.missing}`,
+    };
+  }
+  if (match.lifecycle === "degraded") {
+    return { health: "delayed", healthLabel: "赛事数据降级" };
+  }
+  return { health: "healthy", healthLabel: null };
 }
 
 function timestamp(value: string | null | undefined): number {

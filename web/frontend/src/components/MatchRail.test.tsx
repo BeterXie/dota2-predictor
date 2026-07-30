@@ -171,6 +171,32 @@ describe("MatchRail", () => {
     expect(screen.getByText("涉及 Radiant")).toBeInTheDocument();
   });
 
+  it("keeps an eligible decision visible alongside stale data health", () => {
+    const view = render(
+      <MatchRail
+        matches={[{
+          ...decisionMatch,
+          readiness: {
+            ...decisionMatch.readiness,
+            odds: { status: "stale" },
+          },
+        }]}
+        mode="live"
+        now={Date.parse("2026-07-16T12:00:05+00:00")}
+        onSelect={vi.fn()}
+        selectedId={null}
+        variant="page"
+      />,
+    );
+
+    expect(view.container.querySelector(".match-row-strategy strong"))
+      .toHaveTextContent("策略合格");
+    expect(screen.getByText("关注 Radiant")).toBeInTheDocument();
+    expect(screen.getByText("赔率过期")).toHaveClass("match-health-label", "delayed");
+    expect(screen.getByRole("button", { name: /策略合格 1/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /数据延迟 1/ })).toBeInTheDocument();
+  });
+
   it("labels a full history collection as a history list", () => {
     render(
       <MatchRail
@@ -243,6 +269,14 @@ describe("MatchRail", () => {
     expect(view.container.querySelectorAll(".match-row")).toHaveLength(3);
     expect(screen.queryByText("Waiting team")).not.toBeInTheDocument();
     expect(screen.queryByText("Upcoming team")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("搜索赛事"), {
+      target: { value: "Review" },
+    });
+    expect(screen.getByRole("button", { name: /全部 1/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /需处理 1/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /证据复核 1/ })).toBeInTheDocument();
+    expect(view.container.querySelectorAll(".match-row")).toHaveLength(1);
   });
 
   it("keeps the desktop rail body rendered and only toggles the mobile presentation", () => {

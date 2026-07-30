@@ -823,6 +823,14 @@ summary:focus-visible {
   gap: 4px;
 }
 
+.match-row-strategy-labels {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+}
+
 .match-row-strategy strong {
   width: max-content;
   max-width: 100%;
@@ -834,6 +842,22 @@ summary:focus-visible {
 .match-row-strategy strong.warning { color: var(--warning); }
 .match-row-strategy strong.critical { color: var(--critical); }
 .match-row-strategy strong.neutral { color: var(--text-muted); }
+
+.match-health-label {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.match-health-label.delayed { color: var(--warning); }
+.match-health-label.invalid { color: var(--critical); }
 
 .match-row-strategy span {
   color: var(--text-dim);
