@@ -87,7 +87,7 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
     assert before is not None
     with storage.connection.transaction():
         storage.connection.execute(
-            "UPDATE event_registry SET canonical_name=canonical_name "
+            "UPDATE event_registry SET canonical_name=canonical_name || ' Updated' "
             "WHERE event_id='ewc-dota2-2026'"
         )
         storage.connection.execute(
@@ -121,4 +121,119 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
     derived = StrictDerivedPipeline(storage).run()
     assert derived.pending_maps == 0
     assert derived.derived_maps == 0
+    storage.close()
+
+
+def test_draft_lineage_bounds_current_raw_observation_to_match_start(
+    postgres_engine,
+) -> None:
+    storage = IntelligenceStorage(engine=postgres_engine)
+    storage.init_schema(seed_events=True)
+    match_id = 9_920_001
+    start_time = 2_000_000_000
+    artifact_id = "opendota:" + "b" * 64
+    content_hash = "b" * 64
+    now = "2033-05-18T03:33:20+00:00"
+
+    before = storage.connection.execute(
+        "SELECT dependency_revision FROM draft_lineage_revisions WHERE singleton=1"
+    ).fetchone()
+    assert before is not None
+    with storage.connection.transaction():
+        storage.connection.execute(
+            """INSERT INTO raw_source_artifacts
+               (artifact_id, content_hash, source, artifact_use, endpoint,
+                sanitized_request_identity, storage_path, uncompressed_bytes,
+                compressed_bytes, source_at, received_at, first_usable_at,
+                schema_fingerprint, event_id, match_id, created_at)
+               VALUES (?, ?, 'opendota', 'primary', ?, ?, ?, 10, 10, ?, ?, ?,
+                       ?, 'ewc-dota2-2026', ?, ?)""",
+            (
+                artifact_id,
+                content_hash,
+                "https://api.opendota.com/api/matches/9920001",
+                "https://api.opendota.com/api/matches/9920001",
+                "C:/integration/raw/9920001.json.gz",
+                now,
+                now,
+                now,
+                "schema-v1",
+                match_id,
+                now,
+            ),
+        )
+        storage.connection.execute(
+            """INSERT INTO matches
+               (match_id, radiant_team_id, dire_team_id, radiant_win,
+                duration, start_time, leagueid)
+               VALUES (?, 1, 2, TRUE, 1800, ?, 19543)""",
+            (match_id, start_time),
+        )
+    unscoped = storage.connection.execute(
+        "SELECT dependency_revision FROM draft_lineage_revisions WHERE singleton=1"
+    ).fetchone()
+    assert unscoped is not None
+    assert int(unscoped[0]) == int(before[0])
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            """INSERT INTO match_ingest_status
+               (match_id, event_id, start_time, series_id, map_number,
+                stage_scope, stage_in_scope, has_valid_result, is_exhibition,
+                is_forfeit, is_void_remake, ingest_state, basic_result_state,
+                detailed_parse_state, cross_check_state, reconciliation_status,
+                missing_fields_json, latest_raw_artifact_id,
+                latest_raw_content_hash, normalizer_version,
+                raw_artifact_version, attempt_generation, retry_count,
+                first_usable_at, player_readiness, state_readiness,
+                draft_readiness, discovered_at, updated_at)
+               VALUES (?, 'ewc-dota2-2026', ?, 9920, 1, 'main_event', 1, 1,
+                       0, 0, 0, 'complete', 'ready', 'ready', 'ready',
+                       'reconciled', '[]', ?, ?, 'opendota-exact-v1', 1, 1, 0,
+                       ?, 'ready', 'ready', 'ready', ?, ?)""",
+            (
+                match_id,
+                start_time,
+                artifact_id,
+                content_hash,
+                now,
+                now,
+                now,
+            ),
+        )
+    scoped = storage.connection.execute(
+        "SELECT dependency_revision FROM draft_lineage_revisions WHERE singleton=1"
+    ).fetchone()
+    assert scoped is not None
+    assert int(scoped[0]) == int(before[0]) + 1
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            """INSERT INTO raw_source_observations
+               (observation_id, artifact_id, content_hash, source, artifact_use,
+                endpoint, sanitized_request_identity, source_at, received_at,
+                first_usable_at, schema_fingerprint, event_id, match_id,
+                http_status, created_at)
+               VALUES ('observation-9920001', ?, ?, 'opendota', 'primary', ?, ?,
+                       ?, ?, ?, ?, 'ewc-dota2-2026', ?, 200, ?)""",
+            (
+                artifact_id,
+                content_hash,
+                "https://api.opendota.com/api/matches/9920001",
+                "https://api.opendota.com/api/matches/9920001",
+                now,
+                now,
+                now,
+                "schema-v1",
+                match_id,
+                now,
+            ),
+        )
+    change = storage.connection.execute(
+        """SELECT affected_from_unix, source_relation, operation
+             FROM draft_lineage_changes
+            ORDER BY dependency_revision DESC LIMIT 1"""
+    ).fetchone()
+    assert change is not None
+    assert tuple(change) == (start_time, "raw_source_observations", "INSERT")
     storage.close()
