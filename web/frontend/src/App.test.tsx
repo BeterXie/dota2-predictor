@@ -98,8 +98,10 @@ vi.mock("./components/MatchRail", () => ({
   ),
 }));
 vi.mock("./components/MatchWorkspace", () => ({
-  MatchWorkspace: ({ replay }: { replay: boolean }) => (
-    <main>{replay ? "odds-replay" : "live-workspace"}</main>
+  MatchWorkspace: ({ csrfToken, replay }: { csrfToken?: string | null; replay: boolean }) => (
+    <main data-csrf-token={csrfToken || ""} data-testid="match-workspace">
+      {replay ? "odds-replay" : "live-workspace"}
+    </main>
   ),
 }));
 vi.mock("./components/PrematchWorkspace", () => ({
@@ -348,6 +350,19 @@ describe("App data recovery and ownership", () => {
     expect(screen.getByText("活动告警")).toBeInTheDocument();
     expect(screen.queryByText("opendota-postmatch")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "select-a" })).not.toBeInTheDocument();
+  });
+
+  it("establishes a control session for live draft mutations", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "select-a" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("match-workspace")).toHaveAttribute(
+        "data-csrf-token",
+        "csrf",
+      );
+    });
   });
 
   it("returns from a live detail to the list and supports direct detail links", async () => {

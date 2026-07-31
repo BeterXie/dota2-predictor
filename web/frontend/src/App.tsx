@@ -190,7 +190,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (view !== "operations") {
+    if (view !== "operations" && view !== "live") {
       setControlSession(null);
       setComponents([]);
       return;
@@ -987,6 +987,7 @@ export default function App() {
               <div className="view-loading" role="status">正在加载赛事详情</div>
             ) : (
               <MatchWorkspace
+                csrfToken={controlSession?.csrf_token || null}
                 detail={selectedDetail}
                 error={detailError}
                 loading={detailLoading}

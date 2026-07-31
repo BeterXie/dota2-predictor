@@ -65,6 +65,7 @@ from web import monitoring, queries
 from web.app import app
 from web.monitoring import (
     _current_winner,
+    _provider_current_map_number,
     build_monitor_snapshot,
     current_markets,
     derive_health,
@@ -104,6 +105,63 @@ def raw_odds_payload(rows: list[OddsSnapshot]) -> dict[str, object]:
             "odds": outcomes,
         }
     }
+
+
+def test_provider_current_map_does_not_regress_behind_settled_map() -> None:
+    payload = {
+        "id": 42,
+        "game_id": 151,
+        "team": [
+            {
+                "pos": 1,
+                "team_id": 11,
+                "score": {
+                    "r1": 1,
+                    "r2": 0,
+                    "manualControlData": {"currentIndex": 1},
+                },
+            },
+            {
+                "pos": 2,
+                "team_id": 22,
+                "score": {
+                    "r1": 0,
+                    "r2": 0,
+                    "manualControlData": {"currentIndex": 1},
+                },
+            },
+        ],
+        "odds": [
+            {
+                "odds_id": 101,
+                "odds_group_id": 10,
+                "match_stage": "r1",
+                "group_short_name": "Winner",
+                "tag": "win",
+                "team_id": 11,
+                "status": 5,
+                "win": 1,
+            },
+            {
+                "odds_id": 102,
+                "odds_group_id": 10,
+                "match_stage": "r1",
+                "group_short_name": "Winner",
+                "tag": "win",
+                "team_id": 22,
+                "status": 5,
+                "win": 0,
+            },
+        ],
+    }
+
+    assert _provider_current_map_number(
+        {
+            "raw_json": json.dumps(payload),
+            "best_of": 3,
+            "status": "2",
+        }
+    ) == 2
 
 
 class MonitoringDashboardTests(unittest.TestCase):

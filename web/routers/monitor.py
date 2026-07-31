@@ -4,8 +4,11 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Path, Query, Request
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Cookie, Header, HTTPException, Path, Query, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from live_betting.vision_frame_registry import (
@@ -17,12 +20,45 @@ from live_betting.milestone_revocation import (
     MilestoneRevocationConfig,
     load_milestone_revocation_projection,
 )
+from live_betting.live_match_state import (
+    DraftSlotInput,
+    append_live_game_snapshot,
+    save_live_draft_mapping,
+)
 
 from .. import intelligence, monitoring, queries
+from .control import _COOKIE_NAME
+from .mappings import _require_control
 
 
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
 _MISSING_REVOCATION_CONFIG = object()
+
+
+class DraftSlotRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    team_id: int = Field(gt=0)
+    side: str
+    position: int = Field(ge=1, le=5)
+    hero_id: int = Field(gt=0)
+    player_id: int | None = Field(default=None, gt=0)
+
+
+class SaveDraftMappingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    slots: list[DraftSlotRequest] = Field(min_length=10, max_length=10)
+    is_locked: bool = False
+    actor: str = Field(default="local-operator", min_length=1, max_length=100)
+
+
+class CorrectGameSnapshotRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    game_time_seconds: int = Field(ge=0)
+    radiant_networth: int = Field(ge=0)
+    dire_networth: int = Field(ge=0)
+    radiant_kills: int | None = Field(default=None, ge=0)
+    dire_kills: int | None = Field(default=None, ge=0)
+    actor: str = Field(default="local-operator", min_length=1, max_length=100)
 
 
 def _revocation_config(request: Request) -> MilestoneRevocationConfig | None:
@@ -158,6 +194,86 @@ def match_detail(
     if detail is None:
         raise HTTPException(status_code=404, detail="RayBet match not found")
     return detail
+
+
+@router.post("/matches/{raybet_match_id}/maps/{map_number}/draft-mapping")
+def save_draft_mapping(
+    raybet_match_id: str,
+    payload: SaveDraftMappingRequest,
+    request: Request,
+    map_number: int = Path(ge=1, le=5),
+    session_id: str | None = Cookie(default=None, alias=_COOKIE_NAME),
+    csrf_token: str | None = Header(default=None, alias="X-Monitor-CSRF"),
+) -> dict[str, object]:
+    _require_control(request, session_id, csrf_token)
+    connection = queries.get_db()
+    try:
+        if connection.execute(
+            "SELECT 1 FROM raybet_matches WHERE raybet_match_id=?",
+            (raybet_match_id,),
+        ).fetchone() is None:
+            raise HTTPException(status_code=404, detail="RayBet match not found")
+        try:
+            return save_live_draft_mapping(
+                connection,
+                raybet_match_id=raybet_match_id,
+                map_number=map_number,
+                slots=(
+                    DraftSlotInput(
+                        team_id=slot.team_id,
+                        side=slot.side,
+                        position=slot.position,
+                        hero_id=slot.hero_id,
+                        player_id=slot.player_id,
+                    )
+                    for slot in payload.slots
+                ),
+                is_locked=payload.is_locked,
+                actor=payload.actor,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        connection.close()
+
+
+@router.post("/matches/{raybet_match_id}/maps/{map_number}/game-snapshots")
+def correct_game_snapshot(
+    raybet_match_id: str,
+    payload: CorrectGameSnapshotRequest,
+    request: Request,
+    map_number: int = Path(ge=1, le=5),
+    session_id: str | None = Cookie(default=None, alias=_COOKIE_NAME),
+    csrf_token: str | None = Header(default=None, alias="X-Monitor-CSRF"),
+) -> dict[str, object]:
+    _require_control(request, session_id, csrf_token)
+    connection = queries.get_db()
+    try:
+        if connection.execute(
+            "SELECT 1 FROM raybet_matches WHERE raybet_match_id=?",
+            (raybet_match_id,),
+        ).fetchone() is None:
+            raise HTTPException(status_code=404, detail="RayBet match not found")
+        try:
+            return append_live_game_snapshot(
+                connection,
+                raybet_match_id=raybet_match_id,
+                map_number=map_number,
+                game_time_seconds=payload.game_time_seconds,
+                radiant_networth=payload.radiant_networth,
+                dire_networth=payload.dire_networth,
+                radiant_kills=payload.radiant_kills,
+                dire_kills=payload.dire_kills,
+                vision_confidence=1.0,
+                screenshot_path=None,
+                source="manual_correction",
+                captured_at=datetime.now(timezone.utc),
+                actor=payload.actor,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        connection.close()
 
 
 @router.get("/matches/{raybet_match_id}/maps/{map_number}/postmatch")

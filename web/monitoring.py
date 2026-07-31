@@ -23,7 +23,16 @@ from live_betting.draft_authority import (
     DraftLandmarkAuthority,
     draft_landmark_authority_matches,
 )
-from live_betting.raybet_state import raybet_match_is_live, raybet_odds_is_open
+from live_betting.live_match_state import (
+    latest_live_draft_mapping,
+    live_draft_context,
+    live_game_snapshots,
+)
+from live_betting.raybet_state import (
+    infer_current_map_number,
+    raybet_match_is_live,
+    raybet_odds_is_open,
+)
 from live_betting.milestone_revocation import (
     MilestoneRevocationConfig,
     load_milestone_revocation_projection,
@@ -527,6 +536,17 @@ def monitor_match_detail(
         raybet_match_id,
         now=checked_at,
     )
+    draft_mapping = latest_live_draft_mapping(connection, raybet_match_id)
+    draft_context = live_draft_context(
+        connection,
+        raybet_match_id,
+        as_of=checked_at,
+    )
+    game_snapshots = live_game_snapshots(
+        connection,
+        raybet_match_id,
+        limit=min(max_points, 1200),
+    )
     return {
         **summary,
         "milestone_governance": governance,
@@ -555,6 +575,10 @@ def monitor_match_detail(
             if latest_capture is not None
             else None
         ),
+        "draft_mapping": draft_mapping,
+        "draft_context": draft_context,
+        "game_snapshots": game_snapshots,
+        "latest_game_snapshot": game_snapshots[-1] if game_snapshots else None,
         "markets": current_markets(
             connection,
             raybet_match_id,
@@ -1379,8 +1403,6 @@ def _monitor_match(
 
     odds_readiness = _freshness(latest_odds, now, warning=15.0, stale=60.0)
     vision_readiness = _freshness(latest_vision, now, warning=20.0, stale=120.0)
-    if latest_vision and not bool(latest_vision["confirmed"]):
-        vision_readiness["status"] = "unconfirmed"
     decision_readiness = _freshness(latest_decision, now, warning=30.0, stale=120.0)
     shadow_health = health.get("shadow_worker", {"status": "stopped"})
     strategy_readiness = {
@@ -1397,8 +1419,32 @@ def _monitor_match(
         vision_readiness,
         checked_at=now,
     )
+    vision_map_number = (
+        int(latest_vision["map_number"])
+        if lifecycle in {"live", "degraded"}
+        and latest_vision is not None
+        and type(latest_vision["map_number"]) is int
+        and int(latest_vision["map_number"]) > 0
+        else None
+    )
+    provider_map_number = (
+        _provider_current_map_number(row)
+        if lifecycle in {"live", "degraded"}
+        else None
+    )
+    map_candidates = [
+        value
+        for value in (provider_map_number, vision_map_number)
+        if value is not None
+    ]
+    current_map_number = max(map_candidates) if map_candidates else None
     current_winner = _current_winner(
-        connection, match_id, provider_status=str(row["status"] or "")
+        connection,
+        match_id,
+        provider_status=str(row["status"] or ""),
+        preferred_period=(
+            f"map_{current_map_number}" if current_map_number is not None else None
+        ),
     )
     history_eligible = _history_eligible(
         lifecycle,
@@ -1426,6 +1472,7 @@ def _monitor_match(
         ),
         "lifecycle": lifecycle,
         "history_eligible": history_eligible,
+        "current_map_number": current_map_number,
         "winner": current_winner,
         "latest_vision": (
             _vision_point(latest_vision, match_id) if latest_vision else None
@@ -1439,6 +1486,44 @@ def _monitor_match(
             "strategy": strategy_readiness,
         },
     }
+
+
+def _provider_current_map_number(row: DatabaseRow) -> int | None:
+    try:
+        payload = json.loads(str(row["raw_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    best_of = row["best_of"]
+    if type(best_of) is not int or not 1 <= int(best_of) <= 5:
+        return None
+    indexes: set[int] = set()
+    for team in payload.get("team") or []:
+        if not isinstance(team, dict):
+            continue
+        score = team.get("score")
+        manual = score.get("manualControlData") if isinstance(score, dict) else None
+        raw_index = manual.get("currentIndex") if isinstance(manual, dict) else None
+        if raw_index is None or isinstance(raw_index, bool):
+            continue
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if str(index) != str(raw_index).strip() or not 1 <= index <= int(best_of):
+            continue
+        indexes.add(index)
+    manual_map = indexes.pop() if len(indexes) == 1 else None
+    if str(row["status"] or "") != "2":
+        return manual_map
+    try:
+        settled_map = infer_current_map_number(payload, int(best_of))
+    except ValueError:
+        return None
+    if settled_map is None:
+        return None
+    return max(value for value in (manual_map, settled_map) if value is not None)
 
 
 def _watch_link(
@@ -1581,6 +1666,7 @@ def _current_winner(
     provider_status: str,
     processing_status: str = "processed",
     transport_only: bool = False,
+    preferred_period: str | None = None,
 ) -> dict[str, Any] | None:
     transport_columns = _relation_columns(
         connection, "odds_transport_observations"
@@ -1719,9 +1805,24 @@ def _current_winner(
                 for quote in by_period[period][2].values()
             )
         ]
+    if preferred_period and preferred_period not in by_period:
+        return {
+            "observed_at": str(quotes[0]["received_at"]),
+            "period": preferred_period,
+            "complete": False,
+        }
+    if preferred_period in by_period and preferred_period not in eligible_periods:
+        observed_at, _response_key, _by_side = by_period[preferred_period]
+        return {
+            "observed_at": observed_at,
+            "period": preferred_period,
+            "complete": False,
+        }
     if not eligible_periods:
         return {"observed_at": str(quotes[0]["received_at"]), "complete": False}
-    if normalized_status in _UPCOMING_MATCH_STATUSES and "map_1" in eligible_periods:
+    if preferred_period in eligible_periods:
+        period = preferred_period
+    elif normalized_status in _UPCOMING_MATCH_STATUSES and "map_1" in eligible_periods:
         period = "map_1"
     elif normalized_status in _ENDED_MATCH_STATUSES:
         period = eligible_periods[-1]
@@ -4131,39 +4232,24 @@ def _valid_vision_rows(
                                        THEN frame.content_sha256
                                        ELSE NULL
                                    END AS _frame_digest
-                              FROM vision_observations AS observation
-                              JOIN vision_draft_anchors AS anchor
-                                ON anchor.raybet_match_id=
-                                   observation.raybet_match_id
-                               AND anchor.map_number=observation.map_number
-                              LEFT JOIN active_vision_frame_artifacts AS frame
+                               FROM vision_observations AS observation
+                               LEFT JOIN active_vision_frame_artifacts AS frame
                                 ON frame.frame_ref=observation.source_frame_ref
                                AND frame.content_sha256=
                                    observation.source_frame_sha256
                                AND frame.byte_length=observation.source_frame_bytes
-                             WHERE observation.raybet_match_id=?
+                              WHERE observation.raybet_match_id=?
+                                AND observation.map_number IS NOT NULL
+                                AND observation.game_clock_seconds IS NOT NULL
+                                AND observation.screen_state='game'
+                                AND observation.clock_confidence>=0.9
                                AND live_text_timestamp_utc(
                                        observation.captured_at
                                    ) IS NOT NULL
                                AND live_text_timestamp_utc(
                                        observation.captured_at
                                    )<=CAST(? AS timestamptz)
-                               AND anchor.status IN ('anchored', 'conflict')
-                               AND (
-                                    anchor.status='anchored'
-                                    OR (
-                                        anchor.conflict_at IS NOT NULL
-                                        AND live_text_timestamp_utc(
-                                                anchor.conflict_at
-                                            ) IS NOT NULL
-                                        AND live_text_timestamp_utc(
-                                                anchor.conflict_at
-                                            )>live_text_timestamp_utc(
-                                                observation.captured_at
-                                            )
-                                    )
-                               )
-                               AND NOT EXISTS (
+                                AND NOT EXISTS (
                                     SELECT 1
                                       FROM vision_observation_invalidations AS invalidation
                                      WHERE invalidation.raybet_match_id=
@@ -4172,23 +4258,6 @@ def _valid_vision_rows(
                                            observation.captured_at
                                        AND invalidation.source_frame_ref=
                                            observation.source_frame_ref
-                               )
-                               AND NOT EXISTS (
-                                    SELECT 1
-                                      FROM vision_draft_conflicts AS conflict
-                                     WHERE conflict.raybet_match_id=
-                                           observation.raybet_match_id
-                                       AND conflict.map_number=observation.map_number
-                                       AND (
-                                            live_text_timestamp_utc(
-                                                conflict.captured_at
-                                            ) IS NULL
-                                            OR live_text_timestamp_utc(
-                                                   conflict.captured_at
-                                               )<=live_text_timestamp_utc(
-                                                   observation.captured_at
-                                               )
-                                       )
                                )
                                {frame_filter}
                              ORDER BY observation.captured_at DESC,
@@ -4207,6 +4276,8 @@ def _valid_vision_rows(
 
 def _vision_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
     point = dict(row)
+    point["dynamic_state_authority"] = True
+    point["draft_authority"] = bool(point.get("confirmed"))
     digest = point.pop("_frame_digest", None)
     if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
         point["frame_digest"] = digest

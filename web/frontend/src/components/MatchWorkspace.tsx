@@ -61,6 +61,7 @@ import { LifecycleBadge } from "./StatusBadge";
 import { PostmatchIntelligencePanel } from "./PostmatchIntelligencePanel";
 import { DecisionDeltaPanel } from "./live/DecisionDeltaPanel";
 import { LiveScoreboard } from "./live/LiveScoreboard";
+import { LiveDataControls } from "./live/LiveDataControls";
 
 const RAYBET_PAGE_HOSTS = new Set(["ray086.com", "www.ray086.com"]);
 const RAYBET_PAGE_PREFIXES = ["/sports/esports", "/esports", "/dota2"];
@@ -105,6 +106,7 @@ interface MatchWorkspaceProps {
   error: string | null;
   now?: number;
   replay: boolean;
+  csrfToken?: string | null;
 }
 
 export function MatchWorkspace({
@@ -114,6 +116,7 @@ export function MatchWorkspace({
   error,
   now,
   replay,
+  csrfToken = null,
 }: MatchWorkspaceProps) {
   const [periodSelection, setPeriodSelection] = useState<{
     matchId: string;
@@ -130,7 +133,9 @@ export function MatchWorkspace({
   const activePeriod = resolvePeriod(
     periods,
     selectedPeriod,
-    detail?.winner?.period || match?.winner?.period || null,
+    detail?.current_map_number
+      ? `map_${detail.current_map_number}`
+      : detail?.winner?.period || match?.winner?.period || null,
     replay,
   );
 
@@ -204,13 +209,16 @@ export function MatchWorkspace({
           </div>
         )}
 
-        <CurrentStrategyOverview detail={detail} error={error} match={match} />
+          <CurrentStrategyOverview detail={detail} error={error} match={match} />
       </section>
 
       {loading && !detail ? (
         <WorkspaceSkeleton />
       ) : (
         <>
+          {!replay && detail && (
+            <LiveDataControls csrfToken={csrfToken} detail={detail} />
+          )}
           <section className={`workspace-section chart-section${hasChartTimeline ? "" : " is-empty"}`}>
             <div className="section-heading">
               <div>

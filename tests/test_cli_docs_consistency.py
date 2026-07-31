@@ -82,7 +82,7 @@ def test_runtime_entrypoints_publish_database_url_option() -> None:
 
 def test_migration_readme_tracks_current_alembic_head() -> None:
     content = _text(ROOT / "database" / "migrations" / "README.md")
-    assert "20260801_0019" in content
+    assert "20260801_0020" in content
     assert "PostgreSQL-only" in content
     assert "does not create a SQLite backup" in content
 

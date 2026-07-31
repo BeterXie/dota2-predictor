@@ -8,6 +8,9 @@ import type {
   IntelligenceOverview,
   IntelligencePlayerPage,
   IntelligenceTeamPage,
+  LiveDraftMapping,
+  LiveDraftSlot,
+  LiveGameSnapshot,
   MappingRecord,
   MatchDetail,
   MonitorHistoryPage,
@@ -84,6 +87,40 @@ export function fetchMatchDetail(
   return getJson<MatchDetail>(
     `${MONITOR_API}/matches/${encodeURIComponent(matchId)}`,
     signal,
+  );
+}
+
+export function saveLiveDraftMapping(
+  matchId: string,
+  mapNumber: number,
+  slots: LiveDraftSlot[],
+  isLocked: boolean,
+  csrfToken: string,
+): Promise<LiveDraftMapping> {
+  return mutateJson<LiveDraftMapping>(
+    `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/draft-mapping`,
+    csrfToken,
+    { slots, is_locked: isLocked, actor: "local-operator" },
+  );
+}
+
+export function correctLiveGameSnapshot(
+  matchId: string,
+  mapNumber: number,
+  values: Pick<
+    LiveGameSnapshot,
+    | "game_time_seconds"
+    | "radiant_networth"
+    | "dire_networth"
+    | "radiant_kills"
+    | "dire_kills"
+  >,
+  csrfToken: string,
+): Promise<LiveGameSnapshot> {
+  return mutateJson<LiveGameSnapshot>(
+    `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/game-snapshots`,
+    csrfToken,
+    { ...values, actor: "local-operator" },
   );
 }
 

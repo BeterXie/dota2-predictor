@@ -53,7 +53,9 @@ const healthRules: Record<keyof MonitorMatch["readiness"], Set<ReadinessStatus>>
 export function getTrustedVision(match: MonitorMatch): VisionPoint | null {
   const vision = match.latest_vision;
   const status = match.readiness.vision.status;
-  return vision?.confirmed === 1 && (status === "ready" || status === "delayed")
+  const dynamicAuthority = vision?.dynamic_state_authority === true
+    || vision?.confirmed === 1;
+  return dynamicAuthority && (status === "ready" || status === "delayed")
     ? vision
     : null;
 }

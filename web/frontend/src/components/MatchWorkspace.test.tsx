@@ -48,8 +48,19 @@ vi.mock("@fluentui/react-components", () => ({
   SkeletonItem: () => <div />,
 }));
 vi.mock("./ProbabilityChart", () => ({
-  ProbabilityChart: ({ onPeriodChange }: { onPeriodChange: (value: string) => void }) => (
-    <button onClick={() => onPeriodChange("map_1")}>probability-chart</button>
+  ProbabilityChart: ({
+    onPeriodChange,
+    selectedPeriod,
+  }: {
+    onPeriodChange: (value: string) => void;
+    selectedPeriod: string | null;
+  }) => (
+    <button
+      data-selected-period={selectedPeriod}
+      onClick={() => onPeriodChange("map_1")}
+    >
+      probability-chart
+    </button>
   ),
 }));
 vi.mock("./PostmatchIntelligencePanel", () => ({
@@ -479,6 +490,143 @@ describe("MatchWorkspace", () => {
     fireEvent.click(screen.getByText("查看阵容、策略记录与原始证据"));
     expect(advanced).toHaveAttribute("open");
     expect(screen.getByLabelText("Radiant 阵容")).toBeInTheDocument();
+  });
+
+  it("separates the locked manual draft from dynamic Vision state", () => {
+    const value = detail(0, "ready");
+    value.draft_mapping = {
+      raybet_match_id: "match-1",
+      map_number: 1,
+      version: 2,
+      source: "manual_correction",
+      is_locked: true,
+      created_by: "operator",
+      created_at: "2026-07-16T12:01:00+00:00",
+      slots: Array.from({ length: 10 }, (_, index) => ({
+        team_id: index < 5 ? 11 : 22,
+        side: index < 5 ? "radiant" as const : "dire" as const,
+        position: (index % 5) + 1,
+        hero_id: index + 1,
+        player_id: 100 + index,
+      })),
+    };
+    value.draft_context = {
+      status: "ready",
+      reason: "draft_context_ready",
+      source: "strict_mapping",
+      teams: [
+        {
+          match_side: "team_one",
+          team_id: 11,
+          team_name: "Radiant Club",
+          roster_match_id: 9001,
+          players: Array.from({ length: 5 }, (_, index) => ({
+            player_id: 100 + index,
+            player_name: `Radiant Player ${index + 1}`,
+            position: index + 1,
+            confidence: 1,
+            position_source: "historical_pattern",
+          })),
+        },
+        {
+          match_side: "team_two",
+          team_id: 22,
+          team_name: "Dire Club",
+          roster_match_id: 9002,
+          players: Array.from({ length: 5 }, (_, index) => ({
+            player_id: 105 + index,
+            player_name: `Dire Player ${index + 1}`,
+            position: index + 1,
+            confidence: 1,
+            position_source: "historical_pattern",
+          })),
+        },
+      ],
+    };
+    value.latest_game_snapshot = {
+      snapshot_id: 1,
+      raybet_match_id: "match-1",
+      map_number: 1,
+      game_time_seconds: 1420,
+      radiant_networth: 42300,
+      dire_networth: 38100,
+      networth_lead: 4200,
+      radiant_kills: 18,
+      dire_kills: 13,
+      vision_confidence: 0.94,
+      screenshot_path: null,
+      source: "vision",
+      captured_at: "2026-07-16T12:02:00+00:00",
+      created_by: null,
+      created_at: "2026-07-16T12:02:00+00:00",
+    };
+    value.game_snapshots = [value.latest_game_snapshot];
+
+    render(
+      <MatchWorkspace
+        csrfToken="csrf"
+        detail={value}
+        error={null}
+        loading={false}
+        match={match}
+        replay={false}
+      />,
+    );
+
+    expect(screen.getByText("本局阵容映射")).toBeInTheDocument();
+    expect(screen.getByText(/版本 2 · 已人工锁定/)).toBeInTheDocument();
+    expect(screen.getByText("天辉 · Radiant Club")).toBeInTheDocument();
+    expect(screen.getByText(/Radiant Player 1 \/ Radiant Player 2/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "选择 天辉 1 号位英雄" }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "天辉 1 号位选手" }))
+      .not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "编辑阵容" }));
+
+    const editor = screen.getByRole("dialog", { name: "阵容录入" });
+    expect(within(editor).getByRole("button", { name: "选择 天辉 1 号位英雄" }))
+      .toBeInTheDocument();
+    expect(within(editor).getByRole("combobox", { name: "天辉 1 号位选手" }))
+      .toHaveValue("100");
+    expect(within(editor).getByRole("option", { name: "Radiant Player 1 · 默认" }))
+      .toBeInTheDocument();
+    expect(screen.queryByText("队伍 ID")).not.toBeInTheDocument();
+    expect(screen.queryByText("英雄 ID")).not.toBeInTheDocument();
+    expect(screen.getByText("Vision 实时状态")).toBeInTheDocument();
+    expect(screen.getByText("42.3K")).toBeInTheDocument();
+    expect(screen.getByText("天辉 +4,200")).toBeInTheDocument();
+  });
+
+  it("keeps the chart on the active Vision map when a future market is open", async () => {
+    const value = detail(0, "ready");
+    value.current_map_number = 1;
+    value.winner = {
+      observed_at: "2026-07-16T12:00:00+00:00",
+      period: "map_2",
+      complete: true,
+      prices: { team_one: 1.9, team_two: 1.9 },
+      probabilities: { team_one: 0.5, team_two: 0.5 },
+    };
+    value.winner_timeline = ["map_1", "map_2"].map((period) => ({
+      observed_at: "2026-07-16T12:00:00+00:00",
+      period,
+      prices: { team_one: 1.9, team_two: 1.9 },
+      probabilities: { team_one: 0.5, team_two: 0.5 },
+      status: { team_one: "1", team_two: "1" },
+    }));
+
+    render(
+      <MatchWorkspace
+        detail={value}
+        error={null}
+        loading={false}
+        match={match}
+        replay={false}
+      />,
+    );
+
+    expect(await screen.findByRole("button", { name: "probability-chart" }))
+      .toHaveAttribute("data-selected-period", "map_1");
   });
 
   it("binds the hero and transition explanation to the chronological latest decision", () => {

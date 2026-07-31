@@ -42,6 +42,68 @@ export interface VisionPoint {
   frame_digest?: string | null;
   frame_url?: string | null;
   strategy_authority?: boolean;
+  dynamic_state_authority?: boolean;
+  draft_authority?: boolean;
+}
+
+export interface LiveDraftSlot {
+  team_id: number;
+  side: "radiant" | "dire";
+  position: number;
+  hero_id: number;
+  player_id: number | null;
+}
+
+export interface LiveDraftMapping {
+  raybet_match_id: string;
+  map_number: number;
+  version: number;
+  source: "manual" | "manual_correction";
+  is_locked: boolean;
+  created_by: string;
+  created_at: string;
+  slots: LiveDraftSlot[];
+}
+
+export interface LiveDraftContextPlayer {
+  player_id: number;
+  player_name: string | null;
+  position: number;
+  confidence: number;
+  position_source: string;
+}
+
+export interface LiveDraftContextTeam {
+  match_side: "team_one" | "team_two";
+  team_id: number;
+  team_name: string;
+  roster_match_id: number | null;
+  players: LiveDraftContextPlayer[];
+}
+
+export interface LiveDraftContext {
+  status: "ready" | "unavailable";
+  reason: string;
+  source: "strict_mapping" | "raybet_exact_name";
+  teams: LiveDraftContextTeam[];
+}
+
+export interface LiveGameSnapshot {
+  snapshot_id: number;
+  raybet_match_id: string;
+  map_number: number;
+  game_time_seconds: number;
+  radiant_networth: number;
+  dire_networth: number;
+  networth_lead: number;
+  radiant_kills: number | null;
+  dire_kills: number | null;
+  vision_confidence: number;
+  screenshot_path: string | null;
+  source: "vision" | "manual_correction";
+  captured_at: string;
+  created_by: string | null;
+  created_at: string;
 }
 
 export interface StrategyDecision {
@@ -288,6 +350,7 @@ export interface MonitorMatch {
    * rather than an implicit ended/history signal.
    */
   history_eligible: boolean;
+  current_map_number?: number | null;
   winner: WinnerQuote | null;
   latest_vision: VisionPoint | null;
   latest_decision: StrategyDecision | null;
@@ -326,6 +389,10 @@ export interface MatchDetail extends MonitorMatch {
   vision: VisionPoint[];
   /** Latest registered capture, including observations that are not strategy authority. */
   latest_capture?: VisionPoint | null;
+  draft_mapping?: LiveDraftMapping | null;
+  draft_context?: LiveDraftContext | null;
+  game_snapshots?: LiveGameSnapshot[];
+  latest_game_snapshot?: LiveGameSnapshot | null;
   markets: MarketQuote[];
   /** Optional for fail-closed compatibility with older monitor backends. */
   analysis?: MatchAnalysis;

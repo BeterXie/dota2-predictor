@@ -41,6 +41,7 @@ from .models import (
     RoshLineupScore,
     ShadowOrder,
 )
+from .live_match_state import append_live_game_snapshot
 from .odds_response_authority import (
     canonical_state_outcomes,
     response_artifact_identity as canonical_response_artifact_identity,
@@ -77,7 +78,7 @@ from .vision_frame_registry import (
 
 
 CURRENT_SCHEMA_VERSION = 12
-ALEMBIC_HEAD = "20260801_0019"
+ALEMBIC_HEAD = "20260801_0020"
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 ROSH_LINEUP_CACHE_TTL = timedelta(minutes=15)
 ROSH_FETCH_MAX_DURATION = timedelta(minutes=10)
@@ -4163,7 +4164,40 @@ class LiveBettingStore:
                     int(stored_confirmed),
                 ),
             )
-            return cursor.rowcount == 1
+            inserted = cursor.rowcount == 1
+        state = observation.comeback_state
+        if (
+            inserted
+            and observation.map_number is not None
+            and observation.game_clock_seconds is not None
+            and observation.screen_state == "game"
+            and observation.clock_confidence >= 0.9
+            and state.is_available
+            and state.confidence >= 0.9
+            and type(state.radiant_net_worth) is int
+            and type(state.dire_net_worth) is int
+        ):
+            try:
+                append_live_game_snapshot(
+                    self.connection,
+                    raybet_match_id=observation.raybet_match_id,
+                    map_number=observation.map_number,
+                    game_time_seconds=observation.game_clock_seconds,
+                    radiant_networth=state.radiant_net_worth,
+                    dire_networth=state.dire_net_worth,
+                    radiant_kills=state.radiant_kills,
+                    dire_kills=state.dire_kills,
+                    vision_confidence=min(
+                        observation.clock_confidence,
+                        state.confidence,
+                    ),
+                    screenshot_path=observation.source_frame_ref,
+                    source="vision",
+                    captured_at=observation.captured_at,
+                )
+            except ValueError:
+                pass
+        return inserted
 
     def _invalidate_vision_dependents(
         self,
