@@ -334,16 +334,21 @@ def _portrait(color: tuple[int, int, int], marker: str) -> np.ndarray:
 
 
 def _write_features(
-    path: Path, images: list[np.ndarray], *, ids: list[int] | None = None
+    path: Path,
+    images: list[np.ndarray],
+    *,
+    ids: list[int] | None = None,
+    variant_names: list[str] | None = None,
 ) -> None:
-    np.savez_compressed(
-        path,
-        ids=np.asarray(ids or range(1, len(images) + 1), dtype=np.int32),
-        hashes=np.asarray([compute_phash(image) for image in images], dtype=np.uint8),
-        histograms=np.asarray(
+    payload: dict[str, np.ndarray] = {
+        "ids": np.asarray(ids or range(1, len(images) + 1), dtype=np.int32),
+        "hashes": np.asarray(
+            [compute_phash(image) for image in images], dtype=np.uint8
+        ),
+        "histograms": np.asarray(
             [color_histogram(image) for image in images], dtype=np.float32
         ),
-        thumbnails=np.asarray(
+        "thumbnails": np.asarray(
             [
                 cv2.resize(
                     cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
@@ -354,7 +359,10 @@ def _write_features(
             ],
             dtype=np.uint8,
         ),
-    )
+    }
+    if variant_names is not None:
+        payload["variant_names"] = np.asarray(variant_names)
+    np.savez_compressed(path, **payload)
 
 
 def _logo(shape: str) -> np.ndarray:
@@ -825,6 +833,8 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
     assert len(parsed_v2["draft"]["slots"]) == 10
     assert parsed_v2["draft"]["slots"][0]["best"] == {
         "hero_id": 1,
+        "variant": None,
+        "hero_variant_count": 0,
         "combined": 0.8,
         "channels": None,
     }
@@ -835,6 +845,8 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
             "side": "dire",
             "slot": 4,
             "best_hero_id": 9,
+            "best_variant": None,
+            "hero_variant_count": 0,
             "best_score": 0.8,
             "second_score": 0.7,
             "margin": 0.1,
@@ -844,6 +856,8 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
             "side": "dire",
             "slot": 5,
             "best_hero_id": 10,
+            "best_variant": None,
+            "hero_variant_count": 0,
             "best_score": 0.8,
             "second_score": 0.7,
             "margin": 0.1,
@@ -892,7 +906,12 @@ def test_portrait_variants_compete_between_heroes(tmp_path: Path) -> None:
     one = _portrait((20, 90, 180), "1")
     two = _portrait((170, 60, 20), "2")
     features = tmp_path / "features.npz"
-    _write_features(features, [one, one.copy(), two], ids=[1, 1, 2])
+    _write_features(
+        features,
+        [one, one.copy(), two],
+        ids=[1, 1, 2],
+        variant_names=["1__death", "1", "2"],
+    )
 
     recognizer = HeroRecognizer(features, HERO_LAYOUT)
     scored = recognizer._score_crop(one)
@@ -900,8 +919,41 @@ def test_portrait_variants_compete_between_heroes(tmp_path: Path) -> None:
 
     assert recognizer.ids.tolist() == [1, 2]
     assert scored is not None and scored.combined.shape == (2,)
+    assert scored.variants.tolist() == ["1", "2"]
+    assert scored.variant_counts.tolist() == [2, 1]
     assert reading.hero_id == 1
     assert reading.margin >= 0.025
+
+
+def test_recognizer_rejects_untraceable_or_excessive_variants(
+    tmp_path: Path,
+) -> None:
+    one = _portrait((20, 90, 180), "1")
+    two = _portrait((170, 60, 20), "2")
+    features = tmp_path / "features.npz"
+
+    _write_features(features, [one, one.copy(), two], ids=[1, 1, 2])
+    with pytest.raises(ValueError, match="require variant_names"):
+        HeroRecognizer(features, HERO_LAYOUT)
+
+    _write_features(
+        features,
+        [one, two],
+        ids=[1, 2],
+        variant_names=["1__death", "2"],
+    )
+    with pytest.raises(ValueError, match="missing its base portrait"):
+        HeroRecognizer(features, HERO_LAYOUT)
+
+    names = ["1", "1__death", "1__dim", "1__inset08", "1__inset16", "2"]
+    _write_features(
+        features,
+        [one.copy() for _ in range(5)] + [two],
+        ids=[1, 1, 1, 1, 1, 2],
+        variant_names=names,
+    )
+    with pytest.raises(ValueError, match="template limit"):
+        HeroRecognizer(features, HERO_LAYOUT)
 
 
 def test_feature_asset_can_be_rebuilt_inside_predictor(tmp_path: Path) -> None:
@@ -918,7 +970,40 @@ def test_feature_asset_can_be_rebuilt_inside_predictor(tmp_path: Path) -> None:
     assert build_hero_features(source, output) == 2
     with np.load(output) as features:
         assert features["ids"].tolist() == [1, 1, 2]
+        assert features["variant_names"].tolist() == ["1", "1__death", "2"]
         assert features["hashes"].shape == (3, 64)
+
+
+@pytest.mark.parametrize("variant_name", ["random1", "better-final-new"])
+def test_feature_build_rejects_uncontrolled_variant_names(
+    tmp_path: Path, variant_name: str
+) -> None:
+    source = tmp_path / "heroes"
+    source.mkdir()
+    cv2.imwrite(str(source / "1.png"), _portrait((20, 90, 180), "1"))
+    cv2.imwrite(
+        str(source / f"1__{variant_name}.png"),
+        _portrait((20, 90, 180), "V"),
+    )
+    (source / "heroes.json").write_text(
+        json.dumps({"1": {"id": 1}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="invalid hero portrait filename"):
+        build_hero_features(source, tmp_path / "features.npz")
+
+
+def test_feature_build_limits_templates_per_hero(tmp_path: Path) -> None:
+    source = tmp_path / "heroes"
+    source.mkdir()
+    for name in ("1", "1__death", "1__dim", "1__inset08", "1__inset16"):
+        cv2.imwrite(str(source / f"{name}.png"), _portrait((20, 90, 180), name))
+    (source / "heroes.json").write_text(
+        json.dumps({"1": {"id": 1}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="variant limit exceeded"):
+        build_hero_features(source, tmp_path / "features.npz")
 
 
 def test_feature_build_rejects_corrupt_or_missing_portraits(tmp_path: Path) -> None:
@@ -989,6 +1074,8 @@ def test_hero_recognizer_reports_each_failed_slot(
             phash=row,
             histogram=row,
             pixel=row,
+            variants=np.asarray([str(hero_id) for hero_id in range(1, 12)]),
+            variant_counts=np.ones(11, dtype=np.int32),
             crop_hash=f"{index:016x}",
         )
         for index, row in enumerate(rows)
@@ -1008,6 +1095,8 @@ def test_hero_recognizer_reports_each_failed_slot(
     assert failed[0].best_hero_id == 3
     assert failed[0].margin == pytest.approx(0.01)
     assert failed[0].second_hero_id == 11
+    assert failed[0].best_variant == "3"
+    assert failed[0].hero_variant_count == 1
     assert failed[0].best_channels is not None
     assert failed[0].best_channels.phash == pytest.approx(0.8)
     assert failed[0].crop_hash == "0000000000000002"

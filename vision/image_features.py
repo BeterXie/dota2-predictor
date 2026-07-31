@@ -7,6 +7,10 @@ import numpy as np
 from scipy.fftpack import dct
 
 
+MAX_VARIANTS_PER_HERO = 4  # Includes the required base portrait.
+ALLOWED_HERO_VARIANT_NAMES = frozenset({"death", "dim", "inset08", "inset16"})
+
+
 def compute_phash(image: np.ndarray, hash_size: int = 8) -> np.ndarray:
     """Return a perceptual hash as a flat uint8 bit array."""
     if hash_size < 2:

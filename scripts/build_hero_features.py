@@ -15,7 +15,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vision.image_features import color_histogram, compute_phash  # noqa: E402
+from vision.image_features import (  # noqa: E402
+    ALLOWED_HERO_VARIANT_NAMES,
+    MAX_VARIANTS_PER_HERO,
+    color_histogram,
+    compute_phash,
+)
 
 
 DEFAULT_SOURCE = ROOT / "vision" / "templates" / "heroes"
@@ -35,7 +40,7 @@ def build_hero_features(source: Path, output: Path) -> int:
     source_paths: dict[int, list[Path]] = {}
     for path in source.glob("*.png"):
         hero_id_text, separator, variant_name = path.stem.partition("__")
-        if separator and not variant_name:
+        if separator and variant_name not in ALLOWED_HERO_VARIANT_NAMES:
             raise ValueError(f"invalid hero portrait filename: {path.name}")
         try:
             hero_id = int(hero_id_text)
@@ -56,8 +61,18 @@ def build_hero_features(source: Path, output: Path) -> int:
     ]
     if missing_base:
         raise ValueError(f"hero portrait set is missing base portraits: {missing_base}")
+    excessive_variants = {
+        hero_id: len(paths)
+        for hero_id, paths in source_paths.items()
+        if len(paths) > MAX_VARIANTS_PER_HERO
+    }
+    if excessive_variants:
+        raise ValueError(
+            f"hero portrait variant limit exceeded: {dict(sorted(excessive_variants.items()))}"
+        )
 
     ids: list[int] = []
+    variant_names: list[str] = []
     hashes: list[np.ndarray] = []
     histograms: list[np.ndarray] = []
     thumbnails: list[np.ndarray] = []
@@ -71,6 +86,7 @@ def build_hero_features(source: Path, output: Path) -> int:
             if image is None:
                 raise ValueError(f"invalid hero portrait: {path}")
             ids.append(hero_id)
+            variant_names.append(path.stem)
             hashes.append(compute_phash(image, hash_size=8))
             histograms.append(color_histogram(image))
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -83,6 +99,7 @@ def build_hero_features(source: Path, output: Path) -> int:
         np.savez_compressed(
             handle,
             ids=np.asarray(ids, dtype=np.int32),
+            variant_names=np.asarray(variant_names),
             hashes=np.asarray(hashes, dtype=np.uint8),
             histograms=np.asarray(histograms, dtype=np.float32),
             thumbnails=np.asarray(thumbnails, dtype=np.uint8),

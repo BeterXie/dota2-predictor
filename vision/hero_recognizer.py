@@ -9,7 +9,12 @@ from typing import Literal
 
 import cv2
 import numpy as np
-from vision.image_features import color_histogram, compute_phash
+from vision.image_features import (
+    ALLOWED_HERO_VARIANT_NAMES,
+    MAX_VARIANTS_PER_HERO,
+    color_histogram,
+    compute_phash,
+)
 from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
 
 
@@ -52,6 +57,10 @@ class HeroSlotDiagnostic:
     crop_hash: str | None = None
     best_channels: HeroFeatureChannelScores | None = None
     second_channels: HeroFeatureChannelScores | None = None
+    best_variant: str | None = None
+    hero_variant_count: int = 0
+    second_variant: str | None = None
+    second_hero_variant_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +104,8 @@ class _CropScores:
     phash: np.ndarray
     histogram: np.ndarray
     pixel: np.ndarray
+    variants: np.ndarray
+    variant_counts: np.ndarray
     crop_hash: str
 
 
@@ -106,13 +117,58 @@ class HeroRecognizer:
     ) -> None:
         with np.load(str(feature_path)) as data:
             variant_ids = np.asarray(data["ids"], dtype=np.int32)
+            if "variant_names" in data.files:
+                variant_names = np.asarray(data["variant_names"]).astype(str)
+            else:
+                if len(set(variant_ids.tolist())) != len(variant_ids):
+                    raise ValueError(
+                        "feature packs with duplicate hero ids require variant_names"
+                    )
+                variant_names = np.asarray(
+                    [str(hero_id) for hero_id in variant_ids]
+                )
             self.hashes = np.asarray(data["hashes"])
             self.histograms = np.asarray(data["histograms"])
             self.thumbnails = np.asarray(data["thumbnails"])
+        template_count = len(variant_ids)
+        arrays = (variant_names, self.hashes, self.histograms, self.thumbnails)
+        if any(array.ndim == 0 or array.shape[0] != template_count for array in arrays):
+            raise ValueError("hero feature arrays must have matching template counts")
+        invalid_names = [
+            name
+            for hero_id, name in zip(variant_ids, variant_names, strict=True)
+            if name != str(hero_id)
+            and (
+                not name.startswith(f"{hero_id}__")
+                or name.removeprefix(f"{hero_id}__")
+                not in ALLOWED_HERO_VARIANT_NAMES
+            )
+        ]
+        if invalid_names:
+            raise ValueError(f"invalid hero variant names: {sorted(invalid_names)}")
+        if len(set(zip(variant_ids.tolist(), variant_names.tolist(), strict=True))) != template_count:
+            raise ValueError("hero feature variant names must be unique per hero")
         self.ids = np.asarray(list(dict.fromkeys(variant_ids)), dtype=np.int32)
-        self._variant_groups = tuple(
-            np.flatnonzero(variant_ids == hero_id) for hero_id in self.ids
-        )
+        groups: list[np.ndarray] = []
+        for hero_id in self.ids:
+            indices = np.flatnonzero(variant_ids == hero_id)
+            base_name = str(hero_id)
+            if base_name not in variant_names[indices]:
+                raise ValueError(f"hero {hero_id} is missing its base portrait")
+            if len(indices) > MAX_VARIANTS_PER_HERO:
+                raise ValueError(
+                    f"hero {hero_id} exceeds the {MAX_VARIANTS_PER_HERO} template limit"
+                )
+            ordered = sorted(
+                (int(index) for index in indices),
+                key=lambda index: (
+                    variant_names[index] != base_name,
+                    variant_names[index],
+                ),
+            )
+            groups.append(np.asarray(ordered, dtype=np.intp))
+        self._variant_groups = tuple(groups)
+        self.variant_names = variant_names
         self.layout = layout
 
     def _score_crop(self, image: np.ndarray) -> _CropScores | None:
@@ -156,6 +212,10 @@ class HeroRecognizer:
             phash=variant_hash_scores[winner_indices],
             histogram=variant_hist_scores[winner_indices],
             pixel=variant_pixel_scores[winner_indices],
+            variants=self.variant_names[winner_indices],
+            variant_counts=np.asarray(
+                [len(group) for group in self._variant_groups], dtype=np.int32
+            ),
             crop_hash=np.packbits(hero_hash).tobytes().hex(),
         )
 
@@ -230,6 +290,10 @@ class HeroRecognizer:
                     crop_hash=scored.crop_hash,
                     best_channels=self._channels(scored, best),
                     second_channels=self._channels(scored, second),
+                    best_variant=str(scored.variants[best]),
+                    hero_variant_count=int(scored.variant_counts[best]),
+                    second_variant=str(scored.variants[second]),
+                    second_hero_variant_count=int(scored.variant_counts[second]),
                 )
             )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import sys
 from typing import Any
 
@@ -8,6 +9,7 @@ import pytest
 from scripts.evaluate_hero_recognition import (
     _validate_exact_mapping,
     _validate_single_map_clocks,
+    _render_variant_usage,
     main,
 )
 
@@ -101,3 +103,47 @@ def test_database_mode_requires_explicit_mapping_source(
         main()
 
     assert error.value.code == 2
+
+
+def test_variant_usage_reports_selection_and_truth_outcomes() -> None:
+    usage = {
+        (91, "91"): Counter(
+            selected=3,
+            accepted=1,
+            correct=2,
+            wrong=1,
+            accepted_correct=1,
+        ),
+        (91, "91__inset16"): Counter(
+            selected=5,
+            accepted=4,
+            correct=4,
+            wrong=1,
+            accepted_correct=4,
+        ),
+    }
+
+    assert _render_variant_usage(usage, {91: 2}, include_truth=True) == [
+        {
+            "hero_id": 91,
+            "variant": "91",
+            "hero_variant_count": 2,
+            "selected": 3,
+            "accepted": 1,
+            "correct": 2,
+            "wrong": 1,
+            "accepted_correct": 1,
+            "accepted_wrong": 0,
+        },
+        {
+            "hero_id": 91,
+            "variant": "91__inset16",
+            "hero_variant_count": 2,
+            "selected": 5,
+            "accepted": 4,
+            "correct": 4,
+            "wrong": 1,
+            "accepted_correct": 4,
+            "accepted_wrong": 0,
+        },
+    ]

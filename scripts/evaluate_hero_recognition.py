@@ -326,6 +326,34 @@ def _mean(values: list[float]) -> float:
     return round(fmean(values), 6) if values else 0.0
 
 
+def _render_variant_usage(
+    usage: dict[tuple[int, str], Counter[str]],
+    variant_counts: dict[int, int],
+    *,
+    include_truth: bool,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for (hero_id, variant), counts in sorted(usage.items()):
+        row: dict[str, object] = {
+            "hero_id": hero_id,
+            "variant": variant,
+            "hero_variant_count": variant_counts[hero_id],
+            "selected": counts["selected"],
+            "accepted": counts["accepted"],
+        }
+        if include_truth:
+            row.update(
+                {
+                    "correct": counts["correct"],
+                    "wrong": counts["wrong"],
+                    "accepted_correct": counts["accepted_correct"],
+                    "accepted_wrong": counts["accepted_wrong"],
+                }
+            )
+        rows.append(row)
+    return rows
+
+
 def evaluate(
     evidence_dir: Path,
     feature_path: Path,
@@ -347,6 +375,8 @@ def evaluate(
     best_confusion: Counter[tuple[int, int]] = Counter()
     accepted_confusion: Counter[tuple[int, int]] = Counter()
     tracker_confusion: Counter[tuple[int, int]] = Counter()
+    variant_usage: defaultdict[tuple[int, str], Counter[str]] = defaultdict(Counter)
+    variant_counts: dict[int, int] = {}
     previous_tracker_slots = tracker.slot_statuses
     wrong_locks: list[dict[str, object]] = []
 
@@ -381,12 +411,29 @@ def evaluate(
             row = {
                 "accepted": diagnostic.accepted,
                 "best_hero_id": diagnostic.best_hero_id,
+                "best_variant": diagnostic.best_variant,
                 "best_score": diagnostic.best_score,
                 "margin": diagnostic.margin,
                 "reason": diagnostic.reason,
             }
             slot_rows[key].append(row)
             accepted += int(diagnostic.accepted)
+            if (
+                diagnostic.best_hero_id is not None
+                and diagnostic.best_variant is not None
+            ):
+                usage_key = (diagnostic.best_hero_id, diagnostic.best_variant)
+                counts = variant_usage[usage_key]
+                variant_counts[diagnostic.best_hero_id] = diagnostic.hero_variant_count
+                counts["selected"] += 1
+                counts["accepted"] += int(diagnostic.accepted)
+                if truth_hero_ids is not None:
+                    correct = diagnostic.best_hero_id == truth_hero_ids[index]
+                    counts["correct" if correct else "wrong"] += 1
+                    if diagnostic.accepted:
+                        counts[
+                            "accepted_correct" if correct else "accepted_wrong"
+                        ] += 1
             if truth_hero_ids is not None and diagnostic.best_hero_id is not None:
                 truth_id = truth_hero_ids[index]
                 best_confusion[(truth_id, diagnostic.best_hero_id)] += 1
@@ -446,6 +493,11 @@ def evaluate(
             for row in rows
             if row["best_hero_id"] is not None
         )
+        variants = Counter(
+            str(row["best_variant"])
+            for row in rows
+            if row["best_variant"] is not None
+        )
         slot_summary[key] = {
             "samples": len(rows),
             "accepted": accepted_count,
@@ -454,6 +506,7 @@ def evaluate(
             "mean_margin": _mean([float(row["margin"]) for row in rows]),
             "failure_reasons": dict(sorted(reasons.items())),
             "top_candidates": dict(candidates.most_common(5)),
+            "top_variants": dict(variants.most_common(5)),
         }
 
     period_summary: dict[str, object] = {}
@@ -501,6 +554,11 @@ def evaluate(
         "slots": slot_summary,
         "most_failed_slots": failures,
         "capture_periods": period_summary,
+        "variant_usage": _render_variant_usage(
+            variant_usage,
+            variant_counts,
+            include_truth=truth_hero_ids is not None,
+        ),
         "portrait_state_proxy": {
             state: {
                 "samples": len(values),
