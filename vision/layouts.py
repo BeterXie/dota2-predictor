@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -65,7 +65,8 @@ STANDARD_DOTA_HUD = BroadcastLayout(
     radiant_net_worth_advantage=NormalizedRegion(0.452, 0.038, 0.478, 0.055),
     dire_net_worth_advantage=NormalizedRegion(0.527, 0.038, 0.555, 0.055),
     broadcast_status=NormalizedRegion(0.830, 0.000, 0.990, 0.280),
-    live_broadcast_marker_sets=(("playoffs", "quarterfinal"),),
+    scoreboard_strip=NormalizedRegion(0.300, 0.000, 0.700, 0.090),
+    requires_geometry_confirmation=True,
 )
 
 
@@ -103,6 +104,14 @@ EPL_MASTERS_LIVE = BroadcastLayout(
     replay_status_regions=(),
     requires_geometry_confirmation=True,
     draft_recognition_max_clock_seconds=180,
+)
+
+
+EPL_S39_LIVE = replace(
+    EPL_MASTERS_LIVE,
+    name="epl_s39_live_1080p",
+    # Late watcher attachment must still be able to establish the draft.
+    draft_recognition_max_clock_seconds=None,
 )
 
 

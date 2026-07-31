@@ -106,23 +106,172 @@ def _capture_heartbeat(path: Path, match_id: str) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         captured_at = datetime.fromisoformat(str(payload["captured_at"]))
-        confidence = payload["layout_confidence"]
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
     if (
-        payload.get("schema_version") != 1
-        or str(payload.get("match_id")) != match_id
-        or payload.get("capture_status")
-        not in {"producing_trusted", "capturing_unrecognized"}
+        str(payload.get("match_id")) != match_id
         or captured_at.tzinfo is None
         or captured_at.utcoffset() is None
-        or isinstance(confidence, bool)
-        or not isinstance(confidence, (int, float))
-        or not 0.0 <= float(confidence) <= 1.0
-        or not isinstance(payload.get("layout_profile"), str)
     ):
         return None
+    version = payload.get("schema_version")
+    if version == 1:
+        confidence = payload.get("layout_confidence")
+        if (
+            payload.get("capture_status")
+            not in {"producing_trusted", "capturing_unrecognized"}
+            or isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0.0 <= float(confidence) <= 1.0
+            or not isinstance(payload.get("layout_profile"), str)
+        ):
+            return None
+    elif version == 2:
+        if not _valid_v2_heartbeat(payload):
+            return None
+    else:
+        return None
     return {**payload, "captured_at_value": captured_at.astimezone(timezone.utc)}
+
+
+def _valid_v2_heartbeat(payload: Mapping[str, object]) -> bool:
+    layout = payload.get("layout")
+    screen = payload.get("screen")
+    replay_gate = payload.get("replay_gate")
+    clock = payload.get("clock")
+    scoreboard = payload.get("scoreboard")
+    net_worth = payload.get("net_worth")
+    draft = payload.get("draft")
+    team_side = payload.get("team_side")
+    groups = (layout, screen, replay_gate, clock, scoreboard, net_worth, draft)
+    if (
+        payload.get("capture_status") not in {"producing_trusted", "capturing_partial"}
+        or not isinstance(payload.get("blocker_code"), str)
+        or not all(isinstance(group, dict) for group in groups)
+        or (team_side is not None and not isinstance(team_side, dict))
+    ):
+        return False
+    assert isinstance(layout, dict)
+    assert isinstance(screen, dict)
+    assert isinstance(replay_gate, dict)
+    assert isinstance(clock, dict)
+    assert isinstance(scoreboard, dict)
+    assert isinstance(net_worth, dict)
+    assert isinstance(draft, dict)
+    team_side_confirmed = (
+        team_side.get("confirmed") if isinstance(team_side, dict) else None
+    )
+    confidence_values = (
+        layout.get("confidence"),
+        screen.get("confidence"),
+        replay_gate.get("confidence"),
+        clock.get("confidence"),
+        scoreboard.get("confidence"),
+        net_worth.get("confidence"),
+        draft.get("confidence"),
+    )
+    return (
+        (layout.get("profile") is None or isinstance(layout.get("profile"), str))
+        and isinstance(layout.get("supported"), bool)
+        and isinstance(screen.get("state"), str)
+        and replay_gate.get("status") in {"live", "replay", "untrusted"}
+        and all(
+            isinstance(value, bool)
+            for value in (
+                clock.get("confirmed"),
+                scoreboard.get("confirmed"),
+                net_worth.get("confirmed"),
+                draft.get("confirmed"),
+            )
+        )
+        and (
+            team_side_confirmed is None
+            or isinstance(team_side_confirmed, bool)
+        )
+        and all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and 0.0 <= float(value) <= 1.0
+            for value in confidence_values
+        )
+    )
+
+
+def _heartbeat_diagnostics(heartbeat: Mapping[str, object] | None) -> dict[str, object]:
+    if heartbeat is None:
+        return {}
+    if heartbeat.get("schema_version") == 1:
+        return {
+            "blocker_code": None,
+            "layout_profile": heartbeat.get("layout_profile"),
+            "layout_confidence": heartbeat.get("layout_confidence"),
+            "layout_supported": None,
+            "screen_state": heartbeat.get("screen_state"),
+            "replay_gate_status": heartbeat.get("replay_gate_status"),
+            "clock_confirmed": None,
+            "clock_seconds": None,
+            "scoreboard_confirmed": None,
+            "radiant_kills": None,
+            "dire_kills": None,
+            "net_worth_confirmed": None,
+            "net_worth_side": None,
+            "net_worth_minimum": None,
+            "net_worth_maximum": None,
+            "draft_confirmed": None,
+            "radiant_hero_count": None,
+            "dire_hero_count": None,
+            "team_side_confirmed": None,
+            "core_hud_ready": None,
+            "comeback_state_ready": None,
+            "strategy_ready": None,
+        }
+    layout = heartbeat.get("layout")
+    screen = heartbeat.get("screen")
+    replay_gate = heartbeat.get("replay_gate")
+    clock = heartbeat.get("clock")
+    scoreboard = heartbeat.get("scoreboard")
+    net_worth = heartbeat.get("net_worth")
+    draft = heartbeat.get("draft")
+    team_side = heartbeat.get("team_side")
+    required_groups = (
+        layout,
+        screen,
+        replay_gate,
+        clock,
+        scoreboard,
+        net_worth,
+        draft,
+    )
+    assert all(
+        isinstance(group, dict)
+        for group in required_groups
+    )
+    return {
+        "blocker_code": heartbeat.get("blocker_code"),
+        "layout_profile": layout.get("profile"),
+        "layout_confidence": layout.get("confidence"),
+        "layout_supported": layout.get("supported"),
+        "screen_state": screen.get("state"),
+        "replay_gate_status": replay_gate.get("status"),
+        "clock_confirmed": clock.get("confirmed"),
+        "clock_seconds": clock.get("seconds"),
+        "scoreboard_confirmed": scoreboard.get("confirmed"),
+        "radiant_kills": scoreboard.get("radiant_kills"),
+        "dire_kills": scoreboard.get("dire_kills"),
+        "net_worth_confirmed": net_worth.get("confirmed"),
+        "net_worth_side": net_worth.get("side"),
+        "net_worth_minimum": net_worth.get("minimum"),
+        "net_worth_maximum": net_worth.get("maximum"),
+        "draft_confirmed": draft.get("confirmed"),
+        "radiant_hero_count": draft.get("radiant_count"),
+        "dire_hero_count": draft.get("dire_count"),
+        "team_side_confirmed": (
+            team_side.get("confirmed") if isinstance(team_side, dict) else None
+        ),
+        "core_hud_ready": heartbeat.get("core_hud_ready"),
+        "comeback_state_ready": heartbeat.get("comeback_state_ready"),
+        "strategy_ready": heartbeat.get("strategy_ready"),
+    }
 
 
 def supervisor_health(
@@ -150,7 +299,7 @@ def supervisor_health(
     }
     producing: set[str] = set()
     capturing: set[str] = set()
-    unrecognized: set[str] = set()
+    partial: set[str] = set()
     watcher_details: dict[str, dict[str, object]] = {}
     stale: set[str] = set()
     capture_stalled_matches: set[str] = set()
@@ -208,6 +357,7 @@ def supervisor_health(
             and output_age <= OUTPUT_MAX_AGE.total_seconds()
         )
         capture_status = heartbeat.get("capture_status") if heartbeat else None
+        diagnostics = _heartbeat_diagnostics(heartbeat)
         is_capturing = fresh_capture or legacy_producing
         is_producing = bool(
             legacy_producing
@@ -262,8 +412,8 @@ def supervisor_health(
             reason = "fresh_output"
         elif is_capturing:
             state = "capturing"
-            reason = "capturing_unrecognized"
-            unrecognized.add(match_id)
+            reason = str(diagnostics.get("blocker_code") or "capturing_partial")
+            partial.add(match_id)
         elif startup_age is not None and startup_age <= WATCHER_STARTUP_GRACE.total_seconds():
             state = "running"
             reason = "awaiting_first_output"
@@ -297,16 +447,13 @@ def supervisor_health(
                 else None
             ),
             "capture_age_seconds": round(capture_age, 3) if capture_age is not None else None,
-            "layout_profile": heartbeat.get("layout_profile") if heartbeat else None,
-            "layout_confidence": heartbeat.get("layout_confidence") if heartbeat else None,
-            "screen_state": heartbeat.get("screen_state") if heartbeat else None,
-            "replay_gate_status": heartbeat.get("replay_gate_status") if heartbeat else None,
+            **diagnostics,
             "output_updated_at": output_at.isoformat() if output_at else None,
             "output_age_seconds": round(output_age, 3) if output_age is not None else None,
             "retry": retry_details,
         }
 
-    waiting = running - producing - unrecognized - stale
+    waiting = running - producing - partial - stale
     if not desired:
         status = "healthy"
         reason = "idle"
@@ -335,9 +482,9 @@ def supervisor_health(
         status = "degraded"
         reason = "watcher_capacity_limited"
         error = None
-    elif unrecognized:
+    elif partial:
         status = "degraded"
-        reason = "capturing_unrecognized"
+        reason = "capturing_partial"
         error = None
     elif producing == desired:
         status = "healthy"

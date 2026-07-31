@@ -15,14 +15,17 @@ from contracts.live_observation import ComebackState, LiveObservation
 from live_betting.vision import read_jsonl
 from scripts.build_hero_features import build_hero_features
 from scripts.fetch_hero_portraits import valid_portrait_bytes
+from scripts.supervise_raybet_streams import _capture_heartbeat, _heartbeat_diagnostics
+from scripts.watch_raybet_stream import allow_live_hud_tracking, _write_capture_heartbeat
 from vision.clock_reader import ClockReader, ClockReading
 from vision.hero_recognizer import DraftReading, DraftTracker, HeroRecognizer
-from vision.hud_reader import HudReader
+from vision.hud_reader import HudFrameReading, HudReader
 from vision.image_features import color_histogram, compute_phash
-from vision.layout_selector import select_broadcast_layout
+from vision.layout_selector import LayoutSelection, select_broadcast_layout
 from vision.layouts import (
     BroadcastLayout,
     EPL_MASTERS_LIVE,
+    EPL_S39_LIVE,
     NormalizedRegion,
     STANDARD_DOTA_HUD,
 )
@@ -66,6 +69,37 @@ def _synthetic_epl_hud() -> np.ndarray:
     return image
 
 
+def _synthetic_standard_hud() -> np.ndarray:
+    image = np.full((1080, 1920, 3), 70, dtype=np.uint8)
+    cv2.rectangle(image, (422, 0), (1497, 64), (20, 20, 20), -1)
+    for left in (856, 904, 1020, 1068):
+        cv2.rectangle(image, (left, 14), (left + 10, 42), (255, 255, 255), -1)
+    for index, region in enumerate(
+        STANDARD_DOTA_HUD.radiant_heroes + STANDARD_DOTA_HUD.dire_heroes
+    ):
+        crop = region.crop(image)
+        noise = np.random.default_rng(index).integers(0, 255, crop.shape, dtype=np.uint8)
+        crop[:] = noise
+    for region in (
+        STANDARD_DOTA_HUD.radiant_team_logo,
+        STANDARD_DOTA_HUD.dire_team_logo,
+    ):
+        assert region is not None
+        crop = region.crop(image)
+        crop[:] = np.random.default_rng(crop.shape[1]).integers(
+            0, 255, crop.shape, dtype=np.uint8
+        )
+    return image
+
+
+def _synthetic_epl_s39_hud() -> np.ndarray:
+    image = _synthetic_standard_hud()
+    plate = NormalizedRegion(0.735, 0.940, 0.860, 1.000).crop(image)
+    plate[:] = 12
+    plate[:, ::8] = (255, 255, 0)
+    return image
+
+
 def test_epl_layout_requires_the_complete_hud_geometry() -> None:
     image = _synthetic_epl_hud()
     selection = select_broadcast_layout(image)
@@ -74,8 +108,32 @@ def test_epl_layout_requires_the_complete_hud_geometry() -> None:
     assert selection.confidence >= 0.9
 
     image[:, 1440:1470] = 70
-    fallback = select_broadcast_layout(image)
-    assert fallback.layout == STANDARD_DOTA_HUD
+    unsupported = select_broadcast_layout(image)
+    assert unsupported.layout is None
+    assert not unsupported.supported
+
+
+def test_standard_layout_requires_its_own_complete_hud_geometry() -> None:
+    image = _synthetic_standard_hud()
+
+    selection = select_broadcast_layout(image)
+
+    assert selection.layout == STANDARD_DOTA_HUD
+    assert selection.supported
+    image[16:45, 904:915] = 70
+    assert not select_broadcast_layout(image).supported
+
+
+def test_epl_s39_layout_uses_its_live_hud_and_brand_plate() -> None:
+    image = _synthetic_epl_s39_hud()
+    selection = select_broadcast_layout(image)
+
+    assert selection.layout == EPL_S39_LIVE
+    assert selection.confidence >= 0.9
+    assert EPL_S39_LIVE.draft_recognition_max_clock_seconds is None
+
+    NormalizedRegion(0.735, 0.940, 0.860, 1.000).crop(image)[:] = 70
+    assert select_broadcast_layout(image).layout != EPL_S39_LIVE
 
 
 def test_epl_layout_uses_portrait_insets_for_hero_recognition() -> None:
@@ -463,6 +521,40 @@ def test_scoreboard_tracker_requires_two_monotonic_high_confidence_frames() -> N
     assert tracker.update(ScoreboardReading(18, 26, 0.89)) is None
 
 
+def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
+    clock = MapStateTracker(confirmations=2)
+    clock.reset_map(1)
+    scoreboard = ScoreboardTracker(confirmations=2)
+    advantage = NetWorthAdvantageTracker(confirmations=2)
+    clock.update(ClockReading(100, 0.95, "1:40"))
+    assert clock.update(ClockReading(101, 0.95, "1:41")) is not None
+    scoreboard.update(ScoreboardReading(8, 5, 0.95))
+    assert scoreboard.update(ScoreboardReading(8, 5, 0.95)) is not None
+    advantage.update(NetWorthAdvantageReading("radiant", 1_000, 1_999, 0.95))
+    assert (
+        advantage.update(
+            NetWorthAdvantageReading("radiant", 1_000, 1_999, 0.95)
+        )
+        is not None
+    )
+
+    assert not allow_live_hud_tracking(
+        ReplayGateReading("replay", 0.99),
+        map_number=1,
+        clock_tracker=clock,
+        scoreboard_tracker=scoreboard,
+        advantage_tracker=advantage,
+    )
+    assert clock.update(ClockReading(102, 0.95, "1:42")) is None
+    assert scoreboard.update(ScoreboardReading(8, 5, 0.95)) is None
+    assert (
+        advantage.update(
+            NetWorthAdvantageReading("radiant", 1_000, 1_999, 0.95)
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -507,8 +599,8 @@ def test_net_worth_advantage_requires_two_matching_high_confidence_frames() -> N
         ([('REPLAY', 0.95)], ReplayGateReading("replay", 0.95, "REPLAY")),
         ([('PLAYOFFS', 0.98)], ReplayGateReading("untrusted", 0.98, None)),
         (
-            [('PLAYOFFS', 0.98), ('QUARTERFINAL', 0.99)],
-            ReplayGateReading("live", 0.99, "QUARTERFINAL"),
+            [("PLAYOFFS", 0.98), ("QUARTERFINAL", 0.99)],
+            ReplayGateReading("untrusted", 0.99, None),
         ),
         (
             [
@@ -538,7 +630,12 @@ def test_replay_gate_matches_fixed_real_broadcast_status_crops() -> None:
     live = fixture_root / "live_playoffs_quarterfinal.jpg"
     assert highlight.is_file()
     assert live.is_file()
-    fixture_layout = replace(STANDARD_DOTA_HUD, broadcast_status=FULL)
+    fixture_layout = replace(
+        STANDARD_DOTA_HUD,
+        broadcast_status=FULL,
+        requires_geometry_confirmation=False,
+        live_broadcast_marker_sets=(("playoffs", "quarterfinal"),),
+    )
     reader = ScoreboardReader(fixture_layout)
     highlight_image = cv2.imread(str(highlight))
     live_image = cv2.imread(str(live))
@@ -547,6 +644,169 @@ def test_replay_gate_matches_fixed_real_broadcast_status_crops() -> None:
 
     assert reader.read_replay_gate(highlight_image).status == "replay"
     assert reader.read_replay_gate(live_image).status == "live"
+
+
+def test_standard_live_gate_requires_hud_geometry_scoreboard_and_clock() -> None:
+    image = _synthetic_standard_hud()
+    reader = ScoreboardReader(STANDARD_DOTA_HUD, use_ocr=False)
+
+    class PositionedOcr:
+        replay = False
+
+        def __call__(self, image, **kwargs):
+            del image, kwargs
+            rows = [
+                [[[280, 10], [305, 10], [305, 30], [280, 30]], "6", 0.99],
+                [[[445, 10], [465, 10], [465, 30], [445, 30]], "3", 0.98],
+                [[[326, 23], [365, 23], [365, 36], [326, 36]], "6:03", 0.97],
+            ]
+            if self.replay:
+                rows.append(
+                    [[[100, 65], [220, 65], [220, 82], [100, 82]], "REPLAY", 0.99]
+                )
+            return rows, None
+
+    ocr = PositionedOcr()
+    reader.ocr = ocr
+    assert reader.read_replay_gate(image).status == "live"
+
+    ocr.replay = True
+    reader._strip_cache_image = None
+    assert reader.read_replay_gate(image).status == "replay"
+
+    reader.ocr = lambda image, **kwargs: (
+        [[[[326, 23], [365, 23], [365, 36], [326, 36]], "6:03", 0.97]],
+        None,
+    )
+    reader._strip_cache_image = None
+    assert reader.read_replay_gate(image).status == "untrusted"
+
+
+def test_hud_diagnostics_reports_the_first_blocking_gate() -> None:
+    unavailable = HudFrameReading(
+        LayoutSelection(None, 0.4, False, "unsupported_layout"),
+        "unknown",
+        0.0,
+        ReplayGateReading("untrusted", 0.0),
+        ClockReading(None, 0.0, None),
+        ScoreboardReading(None, None, 0.0),
+        NetWorthAdvantageReading(None, None, None, 0.0),
+        DraftReading((), (), 0.0),
+    )
+    assert unavailable.diagnostics.blocker_code == "unsupported_layout"
+
+    partial = HudFrameReading(
+        LayoutSelection(EPL_MASTERS_LIVE, 0.95, True),
+        "game",
+        0.98,
+        ReplayGateReading("live", 0.97),
+        ClockReading(400, 0.97, "6:40"),
+        ScoreboardReading(8, 5, 0.96),
+        NetWorthAdvantageReading(None, None, None, 0.0),
+        DraftReading((1, 2, 3, 4), (5, 6, 7, 8), 0.8),
+    )
+    diagnostics = partial.diagnostics
+    assert partial.core_hud_ready
+    assert not partial.comeback_state_ready
+    assert diagnostics.blocker_code == "net_worth_advantage_unconfirmed"
+    assert diagnostics.core_hud_ready
+    assert not diagnostics.draft_confirmed
+
+    ready_except_draft = diagnostics.with_confirmations(net_worth_confirmed=True)
+    assert ready_except_draft.blocker_code == "draft_unconfirmed"
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected"),
+    [
+        ({"screen_state": "unknown"}, "screen_not_game"),
+        ({"replay_gate_status": "replay"}, "replay_detected"),
+        ({"replay_gate_status": "untrusted"}, "replay_gate_untrusted"),
+        ({"clock_confirmed": False}, "clock_unconfirmed"),
+        ({"scoreboard_confirmed": False}, "kill_score_unconfirmed"),
+        ({"net_worth_confirmed": False}, "net_worth_advantage_unconfirmed"),
+        ({"draft_confirmed": False}, "draft_unconfirmed"),
+        ({"team_side_confirmed": False}, "team_side_unconfirmed"),
+        ({}, "ready"),
+    ],
+)
+def test_hud_diagnostics_blocker_priority(
+    updates: dict[str, object],
+    expected: str,
+) -> None:
+    reading = HudFrameReading(
+        LayoutSelection(EPL_MASTERS_LIVE, 0.95, True),
+        "game",
+        0.98,
+        ReplayGateReading("live", 0.97),
+        ClockReading(400, 0.97, "6:40"),
+        ScoreboardReading(8, 5, 0.96),
+        NetWorthAdvantageReading("radiant", 1_000, 1_999, 0.95),
+        DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.95),
+    )
+    ready = reading.diagnostics.with_confirmations(team_side_confirmed=True)
+    diagnostics = replace(ready, **updates).with_confirmations()
+    assert diagnostics.blocker_code == expected
+
+
+def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> None:
+    reading = HudFrameReading(
+        LayoutSelection(EPL_MASTERS_LIVE, 0.95, True),
+        "game",
+        0.98,
+        ReplayGateReading("live", 0.97),
+        ClockReading(400, 0.97, "6:40"),
+        ScoreboardReading(8, 5, 0.96),
+        NetWorthAdvantageReading(None, None, None, 0.0),
+        DraftReading((1, 2, 3, 4), (5, 6, 7, 8), 0.8),
+    )
+    output = tmp_path / "42.jsonl"
+    _write_capture_heartbeat(
+        output,
+        match_id="42",
+        captured_at=datetime.now(timezone.utc),
+        capture_status="capturing_partial",
+        diagnostics=reading.diagnostics,
+    )
+
+    parsed_v2 = _capture_heartbeat(output.with_suffix(".heartbeat.json"), "42")
+    assert parsed_v2 is not None
+    diagnostics = _heartbeat_diagnostics(parsed_v2)
+    assert diagnostics["blocker_code"] == "net_worth_advantage_unconfirmed"
+    assert diagnostics["layout_profile"] == "epl_masters_live_1080p"
+    assert diagnostics["layout_supported"] is True
+    assert diagnostics["clock_seconds"] == 400
+    assert diagnostics["radiant_kills"] == 8
+    assert diagnostics["dire_kills"] == 5
+    assert diagnostics["core_hud_ready"] is True
+    assert diagnostics["net_worth_confirmed"] is False
+    assert diagnostics["strategy_ready"] is False
+
+    heartbeat_path = output.with_suffix(".heartbeat.json")
+    suggested_v2 = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    suggested_v2.pop("team_side")
+    suggested_v2.pop("strategy_ready")
+    heartbeat_path.write_text(json.dumps(suggested_v2), encoding="utf-8")
+    assert _capture_heartbeat(heartbeat_path, "42") is not None
+
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "match_id": "42",
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "capture_status": "capturing_unrecognized",
+                "layout_profile": "standard_dota_hud_1080p",
+                "layout_confidence": 0.5,
+                "screen_state": "unknown",
+                "replay_gate_status": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    parsed_v1 = _capture_heartbeat(heartbeat_path, "42")
+    assert parsed_v1 is not None
+    assert _heartbeat_diagnostics(parsed_v1)["layout_profile"] == "standard_dota_hud_1080p"
 
 
 def test_exact_portrait_is_recognized(tmp_path: Path) -> None:

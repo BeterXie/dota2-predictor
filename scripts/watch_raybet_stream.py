@@ -44,7 +44,7 @@ from vision.hero_recognizer import (  # noqa: E402
     DraftReading,
     DraftTracker,
 )
-from vision.hud_reader import HudReader  # noqa: E402
+from vision.hud_reader import HudDiagnostics, HudReader  # noqa: E402
 from vision.layouts import BroadcastLayout  # noqa: E402
 from vision.map_state import ConfirmedClock, MapStateTracker  # noqa: E402
 from vision.observation_writer import ObservationWriter  # noqa: E402
@@ -462,26 +462,61 @@ def _write_capture_heartbeat(
     match_id: str,
     captured_at: datetime,
     capture_status: str,
-    layout_name: str,
-    layout_confidence: float,
-    screen_state: str,
-    replay_gate_status: str | None,
+    diagnostics: HudDiagnostics,
 ) -> None:
-    if capture_status not in {"producing_trusted", "capturing_unrecognized"}:
+    if capture_status not in {"producing_trusted", "capturing_partial"}:
         raise ValueError("capture heartbeat status is invalid")
     if captured_at.tzinfo is None or captured_at.utcoffset() is None:
         raise ValueError("capture heartbeat time must be timezone-aware")
     heartbeat = capture_heartbeat_path(output)
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "match_id": match_id,
         "captured_at": captured_at.astimezone(timezone.utc).isoformat(),
         "capture_status": capture_status,
-        "layout_profile": layout_name,
-        "layout_confidence": round(max(0.0, min(1.0, layout_confidence)), 6),
-        "screen_state": screen_state,
-        "replay_gate_status": replay_gate_status,
+        "blocker_code": diagnostics.blocker_code,
+        "layout": {
+            "profile": diagnostics.layout_name,
+            "confidence": round(diagnostics.layout_confidence, 6),
+            "supported": diagnostics.layout_supported,
+        },
+        "screen": {
+            "state": diagnostics.screen_state,
+            "confidence": round(diagnostics.screen_confidence, 6),
+        },
+        "replay_gate": {
+            "status": diagnostics.replay_gate_status,
+            "confidence": round(diagnostics.replay_gate_confidence, 6),
+        },
+        "clock": {
+            "seconds": diagnostics.clock_seconds,
+            "confidence": round(diagnostics.clock_confidence, 6),
+            "confirmed": diagnostics.clock_confirmed,
+        },
+        "scoreboard": {
+            "radiant_kills": diagnostics.radiant_kills,
+            "dire_kills": diagnostics.dire_kills,
+            "confidence": round(diagnostics.scoreboard_confidence, 6),
+            "confirmed": diagnostics.scoreboard_confirmed,
+        },
+        "net_worth": {
+            "side": diagnostics.net_worth_side,
+            "minimum": diagnostics.net_worth_minimum,
+            "maximum": diagnostics.net_worth_maximum,
+            "confidence": round(diagnostics.net_worth_confidence, 6),
+            "confirmed": diagnostics.net_worth_confirmed,
+        },
+        "draft": {
+            "radiant_count": diagnostics.radiant_hero_count,
+            "dire_count": diagnostics.dire_hero_count,
+            "confidence": round(diagnostics.draft_confidence, 6),
+            "confirmed": diagnostics.draft_confirmed,
+        },
+        "team_side": {"confirmed": diagnostics.team_side_confirmed},
+        "core_hud_ready": diagnostics.core_hud_ready,
+        "comeback_state_ready": diagnostics.comeback_state_ready,
+        "strategy_ready": diagnostics.strategy_ready,
     }
     temporary = heartbeat.with_name(f".{heartbeat.name}.{os.getpid()}.tmp")
     try:
@@ -587,18 +622,19 @@ def _run_cli(args: argparse.Namespace) -> int:
                 break
             hud = hud_reader.read(frame.image)
             selection = hud.selection
-            if active_layout_name is not None and active_layout_name != selection.layout.name:
+            if active_layout_name != selection.layout_name:
                 clock_tracker.reset_map(map_number)
                 scoreboard_tracker.reset()
                 advantage_tracker.reset()
                 draft_tracker.reset()
-            active_layout_name = selection.layout.name
+            active_layout_name = selection.layout_name
             state = hud.screen_state
-            replay_gate_status: str | None = None
             confirmed_clock: ConfirmedClock | None = None
+            confirmed_scoreboard: ScoreboardReading | None = None
+            confirmed_advantage: NetWorthAdvantageReading | None = None
+            confirmed_draft: DraftReading | None = None
             if state == "game":
                 replay_gate = hud.replay_gate
-                replay_gate_status = replay_gate.status
                 if not allow_live_hud_tracking(
                     replay_gate,
                     map_number=map_number,
@@ -655,15 +691,8 @@ def _run_cli(args: argparse.Namespace) -> int:
                         output,
                         match_id=args.match_id,
                         captured_at=captured,
-                        capture_status=(
-                            "producing_trusted"
-                            if observation.is_hud_confirmed
-                            else "capturing_unrecognized"
-                        ),
-                        layout_name=selection.layout.name,
-                        layout_confidence=selection.confidence,
-                        screen_state=observation.screen_state,
-                        replay_gate_status=replay_gate_status,
+                        capture_status="capturing_partial",
+                        diagnostics=hud.diagnostics,
                     )
                     continue
                 raw_clock = hud.clock
@@ -764,12 +793,15 @@ def _run_cli(args: argparse.Namespace) -> int:
                 capture_status=(
                     "producing_trusted"
                     if observation.is_hud_confirmed
-                    else "capturing_unrecognized"
+                    else "capturing_partial"
                 ),
-                layout_name=selection.layout.name,
-                layout_confidence=selection.confidence,
-                screen_state=observation.screen_state,
-                replay_gate_status=replay_gate_status,
+                diagnostics=hud.diagnostics.with_confirmations(
+                    clock_confirmed=confirmed_clock is not None,
+                    scoreboard_confirmed=confirmed_scoreboard is not None,
+                    net_worth_confirmed=confirmed_advantage is not None,
+                    draft_confirmed=confirmed_draft is not None,
+                    team_side_confirmed=radiant_team_side is not None,
+                ),
             )
     except Exception as error:
         raise WatcherFailure(

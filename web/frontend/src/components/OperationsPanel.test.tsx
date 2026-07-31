@@ -31,6 +31,64 @@ const degradedMatch: MonitorMatch = {
 
 
 describe("OperationsPanel", () => {
+  it("shows per-gate vision diagnostics for the selected match", () => {
+    const view = render(
+      <FluentProvider theme={webDarkTheme} applyStylesToPortals={false}>
+        <OperationsPanel
+          alerts={[]}
+          busyKey={null}
+          components={[]}
+          controlMessage={null}
+          health={[{
+            component: "vision_worker",
+            status: "degraded",
+            reported_status: "degraded",
+            freshness: "fresh",
+            age_seconds: 2,
+            last_heartbeat_at: "2026-07-31T00:00:00+00:00",
+            last_success_at: null,
+            last_error_at: null,
+            last_error: null,
+            details: {
+              watchers: {
+                "match-1": {
+                  capture_state: "capturing_partial",
+                  blocker_code: "net_worth_advantage_unconfirmed",
+                  layout_profile: "standard_dota_hud_1080p",
+                  layout_supported: true,
+                  replay_gate_status: "live",
+                  clock_confirmed: true,
+                  clock_seconds: 842,
+                  scoreboard_confirmed: true,
+                  radiant_kills: 8,
+                  dire_kills: 5,
+                  net_worth_confirmed: false,
+                  draft_confirmed: false,
+                  radiant_hero_count: 4,
+                  dire_hero_count: 4,
+                  strategy_ready: false,
+                },
+              },
+            },
+          }]}
+          mappings={[]}
+          match={degradedMatch}
+          onAcknowledge={vi.fn()}
+          onApproveMapping={vi.fn()}
+          onControl={vi.fn()}
+          onCreateAutomaticMap={vi.fn()}
+          onInvalidateMapping={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+
+    const diagnostic = within(view.getByLabelText("视觉识别诊断"));
+    expect(diagnostic.getByText("经济优势未确认")).toBeInTheDocument();
+    expect(diagnostic.getByText("已确认 14:02")).toBeInTheDocument();
+    expect(diagnostic.getByText("已确认 8 : 5")).toBeInTheDocument();
+    expect(diagnostic.getByText("8 / 10")).toBeInTheDocument();
+  });
+
   it("separates data-chain readiness from the absence of active alerts", () => {
     const view = render(
       <FluentProvider theme={webDarkTheme} applyStylesToPortals={false}>

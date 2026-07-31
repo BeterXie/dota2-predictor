@@ -297,6 +297,21 @@ class ScoreboardReader:
             and isinstance(item[2], (int, float))
             and not isinstance(item[2], bool)
         ]
+        status_regions = self.layout.replay_status_regions + (
+            (self.layout.broadcast_status,) if self.layout.broadcast_status else ()
+        )
+        for status_region in status_regions:
+            status_crop = status_region.crop(image)
+            status_result, _ = self.ocr(status_crop)
+            readings.extend(
+                (str(item[1]), float(item[2]))
+                for item in status_result or []
+                if isinstance(item, (list, tuple))
+                and len(item) >= 3
+                and isinstance(item[1], str)
+                and isinstance(item[2], (int, float))
+                and not isinstance(item[2], bool)
+            )
         replay = self._classify_broadcast_text(readings)
         if replay.status == "replay" or replay.text is not None:
             return replay
