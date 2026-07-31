@@ -13,6 +13,7 @@ from statistics import fmean
 
 import cv2
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +36,37 @@ class EvidenceSample:
     observed_at: float
 
 
+@dataclass(frozen=True)
+class DraftTruthMapping:
+    raybet_match_id: str
+    raybet_map_number: int
+    opendota_match_id: int
+    mapping_source: str
+    raybet_team_one_name: str
+    raybet_team_two_name: str
+    team_one_id: int
+    team_two_id: int
+    opendota_radiant_team_id: int
+    opendota_dire_team_id: int
+    mapping_id: int | None = None
+
+    def report_context(self, truth_hero_count: int) -> dict[str, object]:
+        return {
+            "raybet_match_id": self.raybet_match_id,
+            "raybet_map_number": self.raybet_map_number,
+            "opendota_match_id": self.opendota_match_id,
+            "mapping_source": self.mapping_source,
+            "mapping_id": self.mapping_id,
+            "raybet_team_one_name": self.raybet_team_one_name,
+            "raybet_team_two_name": self.raybet_team_two_name,
+            "team_one_id": self.team_one_id,
+            "team_two_id": self.team_two_id,
+            "opendota_radiant_team_id": self.opendota_radiant_team_id,
+            "opendota_dire_team_id": self.opendota_dire_team_id,
+            "truth_hero_count": truth_hero_count,
+        }
+
+
 def _directory_samples(evidence_dir: Path) -> list[EvidenceSample]:
     paths = sorted(
         path
@@ -44,6 +76,147 @@ def _directory_samples(evidence_dir: Path) -> list[EvidenceSample]:
     return [EvidenceSample(path, path.stat().st_mtime) for path in paths]
 
 
+def _validate_exact_mapping(
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    opendota_match_id: int,
+    mapping_source: str,
+    raybet_team_one_name: str,
+    raybet_team_two_name: str,
+    team_one_id: int,
+    team_two_id: int,
+    radiant_team_id: int,
+    dire_team_id: int,
+    mapping_id: int | None = None,
+) -> DraftTruthMapping:
+    expected = (team_one_id, team_two_id)
+    actual = (radiant_team_id, dire_team_id)
+    if mapping_source not in {"manual_exact", "persisted_exact"}:
+        raise ValueError("mapping source is not exact")
+    if not raybet_team_one_name.strip() or not raybet_team_two_name.strip():
+        raise ValueError("RayBet mapping requires both team names")
+    if map_number <= 0:
+        raise ValueError("RayBet map number must be positive")
+    if any(team_id <= 0 for team_id in expected + actual):
+        raise ValueError("exact mapping requires four positive team IDs")
+    if team_one_id == team_two_id or radiant_team_id == dire_team_id:
+        raise ValueError("exact mapping requires two unique teams")
+    if set(expected) != set(actual):
+        raise ValueError("RayBet and OpenDota team IDs do not match exactly")
+    return DraftTruthMapping(
+        raybet_match_id=raybet_match_id,
+        raybet_map_number=map_number,
+        opendota_match_id=opendota_match_id,
+        mapping_source=mapping_source,
+        raybet_team_one_name=raybet_team_one_name,
+        raybet_team_two_name=raybet_team_two_name,
+        team_one_id=team_one_id,
+        team_two_id=team_two_id,
+        opendota_radiant_team_id=radiant_team_id,
+        opendota_dire_team_id=dire_team_id,
+        mapping_id=mapping_id,
+    )
+
+
+def _exact_mapping(
+    connection: Connection,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    opendota_match_id: int,
+    mapping_source: str,
+    manual_team_one_id: int | None,
+    manual_team_two_id: int | None,
+) -> DraftTruthMapping:
+    raybet = connection.execute(
+        text(
+            """
+            SELECT team_one, team_two
+            FROM raybet_matches
+            WHERE raybet_match_id = :raybet_match_id
+            """
+        ),
+        {"raybet_match_id": raybet_match_id},
+    ).mappings().one_or_none()
+    if (
+        raybet is None
+        or raybet["team_one"] is None
+        or raybet["team_two"] is None
+    ):
+        raise ValueError("RayBet match requires both team names")
+    opendota = connection.execute(
+        text(
+            """
+            SELECT radiant_team_id, dire_team_id
+            FROM matches
+            WHERE match_id = :match_id
+            """
+        ),
+        {"match_id": opendota_match_id},
+    ).mappings().one_or_none()
+    if (
+        opendota is None
+        or opendota["radiant_team_id"] is None
+        or opendota["dire_team_id"] is None
+    ):
+        raise ValueError("OpenDota match requires both team IDs")
+
+    mapping_id = None
+    if mapping_source == "manual_exact":
+        if manual_team_one_id is None or manual_team_two_id is None:
+            raise ValueError("manual_exact requires both explicit team IDs")
+        team_one_id = manual_team_one_id
+        team_two_id = manual_team_two_id
+    elif mapping_source == "persisted_exact":
+        mappings = connection.execute(
+            text(
+                """
+                SELECT mapping.mapping_id,
+                       mapping.canonical_team_one_id,
+                       mapping.canonical_team_two_id,
+                       mapping.acceptance_mode
+                FROM strict_live_map_mappings AS mapping
+                LEFT JOIN strict_live_map_mapping_invalidations AS invalidation
+                  ON invalidation.mapping_id = mapping.mapping_id
+                WHERE mapping.raybet_match_id = :raybet_match_id
+                  AND mapping.map_number = :map_number
+                  AND invalidation.invalidation_id IS NULL
+                ORDER BY mapping.mapping_id
+                LIMIT 2
+                """
+            ),
+            {
+                "raybet_match_id": raybet_match_id,
+                "map_number": map_number,
+            },
+        ).mappings().all()
+        if len(mappings) != 1:
+            raise ValueError("persisted exact mapping must resolve to exactly one row")
+        persisted = mappings[0]
+        if persisted["acceptance_mode"] not in {"manual_exact", "automatic_exact"}:
+            raise ValueError("persisted mapping is not exact")
+        mapping_id = int(persisted["mapping_id"])
+        team_one_id = int(persisted["canonical_team_one_id"])
+        team_two_id = int(persisted["canonical_team_two_id"])
+    else:
+        raise ValueError("mapping_source must be manual_exact or persisted_exact")
+
+    return _validate_exact_mapping(
+        raybet_match_id=raybet_match_id,
+        map_number=map_number,
+        opendota_match_id=opendota_match_id,
+        mapping_source=mapping_source,
+        raybet_team_one_name=str(raybet["team_one"]),
+        raybet_team_two_name=str(raybet["team_two"]),
+        team_one_id=team_one_id,
+        team_two_id=team_two_id,
+        radiant_team_id=int(opendota["radiant_team_id"]),
+        dire_team_id=int(opendota["dire_team_id"]),
+        mapping_id=mapping_id,
+    )
+
+
 def _database_samples(
     database_url: str | None,
     *,
@@ -51,16 +224,28 @@ def _database_samples(
     map_number: int,
     opendota_match_id: int,
     evidence_root: Path,
+    mapping_source: str,
+    manual_team_one_id: int | None = None,
+    manual_team_two_id: int | None = None,
     captured_after: float | None = None,
     captured_before: float | None = None,
-) -> tuple[list[EvidenceSample], tuple[int, ...]]:
+) -> tuple[list[EvidenceSample], tuple[int, ...], DraftTruthMapping]:
     engine = build_engine(database_url)
     try:
         with engine.connect() as connection:
+            mapping = _exact_mapping(
+                connection,
+                raybet_match_id=raybet_match_id,
+                map_number=map_number,
+                opendota_match_id=opendota_match_id,
+                mapping_source=mapping_source,
+                manual_team_one_id=manual_team_one_id,
+                manual_team_two_id=manual_team_two_id,
+            )
             observations = connection.execute(
                 text(
                     """
-                    SELECT captured_at, source_frame_sha256
+                    SELECT captured_at, game_clock_seconds, source_frame_sha256
                     FROM vision_observations
                     WHERE raybet_match_id = :raybet_match_id
                       AND map_number = :map_number
@@ -98,6 +283,7 @@ def _database_samples(
         else evidence_root / "sha256"
     )
     samples: list[EvidenceSample] = []
+    selected_clocks: list[int | None] = []
     for row in observations:
         observed_at = datetime.fromisoformat(str(row["captured_at"])).timestamp()
         if captured_after is not None and observed_at < captured_after:
@@ -105,13 +291,31 @@ def _database_samples(
         if captured_before is not None and observed_at >= captured_before:
             continue
         digest = str(row["source_frame_sha256"])
+        selected_clocks.append(
+            None
+            if row["game_clock_seconds"] is None
+            else int(row["game_clock_seconds"])
+        )
         samples.append(
             EvidenceSample(
                 content_root / digest[:2] / f"{digest}.jpg",
                 observed_at,
             )
         )
-    return samples, truth
+    if not samples:
+        raise ValueError("exact mapping has no Vision evidence frames")
+    _validate_single_map_clocks(selected_clocks)
+    return samples, truth, mapping
+
+
+def _validate_single_map_clocks(clocks: list[int | None]) -> None:
+    previous = None
+    for current in clocks:
+        if current is None:
+            continue
+        if previous is not None and current < previous - 180:
+            raise ValueError("Vision evidence crosses a game clock reset")
+        previous = current
 
 
 def _rate(numerator: int, denominator: int) -> float:
@@ -370,6 +574,12 @@ def main() -> int:
     parser.add_argument("--raybet-match-id")
     parser.add_argument("--map-number", type=int)
     parser.add_argument("--opendota-match-id", type=int)
+    parser.add_argument(
+        "--mapping-source",
+        choices=("manual_exact", "persisted_exact"),
+    )
+    parser.add_argument("--team-one-id", type=int)
+    parser.add_argument("--team-two-id", type=int)
     parser.add_argument("--captured-after", type=datetime.fromisoformat)
     parser.add_argument("--captured-before", type=datetime.fromisoformat)
     parser.add_argument(
@@ -384,6 +594,7 @@ def main() -> int:
             args.raybet_match_id,
             args.map_number,
             args.opendota_match_id,
+            args.mapping_source,
         )
     )
     if database_mode:
@@ -391,18 +602,26 @@ def main() -> int:
             args.raybet_match_id is None
             or args.map_number is None
             or args.opendota_match_id is None
+            or args.mapping_source is None
         ):
             parser.error(
-                "--raybet-match-id, --map-number, and --opendota-match-id "
-                "are required together"
+                "--raybet-match-id, --map-number, --opendota-match-id, and "
+                "--mapping-source are required together"
             )
+        if args.mapping_source == "manual_exact" and (
+            args.team_one_id is None or args.team_two_id is None
+        ):
+            parser.error("manual_exact requires --team-one-id and --team-two-id")
         load_environment_file(ROOT / ".env")
-        samples, truth = _database_samples(
+        samples, truth, mapping = _database_samples(
             args.database_url,
             raybet_match_id=args.raybet_match_id,
             map_number=args.map_number,
             opendota_match_id=args.opendota_match_id,
             evidence_root=args.evidence_root,
+            mapping_source=args.mapping_source,
+            manual_team_one_id=args.team_one_id,
+            manual_team_two_id=args.team_two_id,
             captured_after=(
                 args.captured_after.timestamp()
                 if args.captured_after is not None
@@ -420,9 +639,7 @@ def main() -> int:
             samples=samples,
             truth_hero_ids=truth,
             truth_context={
-                "raybet_match_id": args.raybet_match_id,
-                "map_number": args.map_number,
-                "opendota_match_id": args.opendota_match_id,
+                **mapping.report_context(len(truth)),
                 "captured_after": (
                     args.captured_after.isoformat()
                     if args.captured_after is not None
