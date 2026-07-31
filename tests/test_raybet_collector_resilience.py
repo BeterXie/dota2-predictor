@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -15,13 +16,18 @@ from live_betting.monitor import (
     DEFAULT_FULL_ODDS_INTERVAL_SECONDS,
     DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS,
     LIVE_LIST_CACHE_TTL_SECONDS,
+    MAX_PRIORITY_ODDS_WORKERS,
+    OddsChannelRuntime,
     PerRequestBackoff,
     _active_priority_match_ids,
     _claim_odds_request,
+    _collect_priority_rows,
+    _odds_channel_poll_interval,
     _odds_channel_rows,
     _partition_live_rows,
     _publish_live_rows,
     _refresh_live_list_cache,
+    _validate_odds_intervals,
     collect_once,
 )
 from live_betting.raybet import BASE_URL, RayBetClient, RayBetHTTPResponse
@@ -53,6 +59,20 @@ class PriorityConnection:
 def test_priority_odds_defaults_preserve_transport_freshness_budget() -> None:
     assert DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS == 8.0
     assert DEFAULT_FULL_ODDS_INTERVAL_SECONDS == 120.0
+    assert MAX_PRIORITY_ODDS_WORKERS == 4
+
+
+def test_daemon_requires_at_least_one_odds_channel() -> None:
+    with pytest.raises(ValueError, match="at least one RayBet odds channel"):
+        _validate_odds_intervals(0.0, 0.0, once=False)
+
+    _validate_odds_intervals(0.0, 0.0, once=True)
+
+
+def test_full_channel_polls_at_priority_cadence_without_changing_full_interval() -> None:
+    assert _odds_channel_poll_interval(120.0, "full", 8.0) == 8.0
+    assert _odds_channel_poll_interval(120.0, "full", 0.0) == 8.0
+    assert _odds_channel_poll_interval(8.0, "priority", 8.0) == 8.0
 
 
 def test_priority_selection_requires_active_non_invalidated_strict_mapping() -> None:
@@ -98,6 +118,124 @@ def test_priority_selection_requires_active_non_invalidated_strict_mapping() -> 
     assert "COALESCE(CAST(match.status AS TEXT), '')!='3'" in connection.statement
     assert "strict_live_map_mapping_invalidations" in connection.statement
     assert "strict_live_map_mapping_supersessions" in connection.statement
+
+
+def test_full_channel_takes_over_when_priority_is_unavailable() -> None:
+    connection = PriorityConnection([("1001",)])
+    store = type("Store", (), {"connection": connection})()
+    _publish_live_rows(
+        [
+            {"id": "1001", "status": 2},
+            {"id": "1002", "status": 2},
+        ]
+    )
+    try:
+        rows, source_count, excluded = _odds_channel_rows(
+            store,
+            "full",
+            priority_available=False,
+        )
+    finally:
+        _publish_live_rows([])
+
+    assert [row["id"] for row in rows] == ["1001", "1002"]
+    assert (source_count, excluded) == (2, 0)
+
+
+def test_priority_runtime_reports_dead_and_stale_workers() -> None:
+    thread = type("ThreadState", (), {"is_alive": lambda self: True})()
+    runtime = OddsChannelRuntime("priority", 8.0, True)
+    runtime.attach_thread(thread)
+    runtime.record_cycle(
+        active_match_ids=["1001", "1002"],
+        successful_match_ids=["1001"],
+        cycle_duration_seconds=4.0,
+        maximum_request_duration_seconds=3.0,
+        healthy=True,
+        completed_monotonic=100.0,
+    )
+
+    assert runtime.available(monotonic_now=115.0) is True
+    assert runtime.available(monotonic_now=117.0) is False
+    details = runtime.details(monotonic_now=117.0)
+    assert details["state"] == "stale"
+    assert details["thread_alive"] is True
+    assert details["oldest_match_refresh_age_seconds"] == 17.0
+    assert details["unrefreshed_match_count"] == 1
+
+    dead = type("ThreadState", (), {"is_alive": lambda self: False})()
+    runtime.attach_thread(dead)
+    assert runtime.needs_restart() is True
+    assert runtime.details(monotonic_now=117.0)["state"] == "dead"
+
+    runtime.attach_thread(thread)
+    runtime.record_cycle(
+        active_match_ids=["1001"],
+        successful_match_ids=[],
+        cycle_duration_seconds=4.0,
+        maximum_request_duration_seconds=3.0,
+        healthy=False,
+        completed_monotonic=120.0,
+    )
+    assert runtime.available(monotonic_now=121.0) is False
+    assert runtime.details(monotonic_now=121.0)["state"] == "degraded"
+
+
+def test_priority_collection_is_bounded_and_one_failure_does_not_cancel_others(
+    tmp_path: Path,
+) -> None:
+    barrier = threading.Barrier(2, timeout=2.0)
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def collect_row(
+        _database_url: str,
+        _raw_dir: Path,
+        row: dict[str, object],
+        _backoff: PerRequestBackoff,
+    ) -> dict[str, object]:
+        nonlocal active, maximum_active
+        match_id = str(row["id"])
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            barrier.wait()
+            if match_id == "1002":
+                raise RuntimeError("isolated request failure")
+            return {
+                "matches": 1,
+                "listed": 1,
+                "odds": 2,
+                "changed": 1,
+                "errors": 0,
+                "backoff_skipped": 0,
+                "in_flight_skipped": 0,
+                "prematch_collected": 0,
+                "prematch_skipped": 0,
+                "last_successful_match_ids": [match_id],
+                "maximum_request_duration_seconds": 0.5,
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    rows = [{"id": str(1000 + index), "status": 2} for index in range(1, 5)]
+    with patch("live_betting.monitor._collect_priority_row", side_effect=collect_row):
+        summary = _collect_priority_rows(
+            "postgresql+psycopg://unused",
+            tmp_path,
+            rows,
+            PerRequestBackoff(),
+            max_workers=2,
+        )
+
+    assert maximum_active == 2
+    assert summary["listed"] == 4
+    assert summary["matches"] == 3
+    assert summary["errors"] == 1
+    assert sorted(summary["last_successful_match_ids"]) == ["1001", "1003", "1004"]
 
 
 def test_priority_and_full_channels_cannot_claim_same_match() -> None:

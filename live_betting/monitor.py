@@ -10,8 +10,9 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ ODDS_BACKOFF_INITIAL_SECONDS = 3.0
 ODDS_BACKOFF_MAX_SECONDS = 300.0
 DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS = 8.0
 DEFAULT_FULL_ODDS_INTERVAL_SECONDS = 120.0
+MAX_PRIORITY_ODDS_WORKERS = 4
 _ODDS_REQUESTS_IN_FLIGHT: set[str] = set()
 _ODDS_REQUEST_LOCK = threading.Lock()
 _LIVE_ROWS: tuple[dict[str, Any], ...] = ()
@@ -124,6 +126,7 @@ class PerRequestBackoff:
     def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
         self._clock = clock or time.monotonic
         self._states: dict[tuple[str, str], RequestBackoffState] = {}
+        self._lock = threading.Lock()
 
     @staticmethod
     def key(endpoint: str, request_identity: str) -> tuple[str, str]:
@@ -139,12 +142,14 @@ class PerRequestBackoff:
         *,
         monotonic_now: float | None = None,
     ) -> bool:
-        state = self._states.get(self.key(endpoint, request_identity))
         now = self._clock() if monotonic_now is None else monotonic_now
-        return state is not None and now < state.retry_not_before_monotonic
+        with self._lock:
+            state = self._states.get(self.key(endpoint, request_identity))
+            return state is not None and now < state.retry_not_before_monotonic
 
     def record_success(self, endpoint: str, request_identity: str) -> None:
-        self._states.pop(self.key(endpoint, request_identity), None)
+        with self._lock:
+            self._states.pop(self.key(endpoint, request_identity), None)
 
     def record_failure(
         self,
@@ -165,31 +170,38 @@ class PerRequestBackoff:
             or (provider_code is not None and 500 <= provider_code <= 599)
         )
         if not retryable:
-            self._states.pop(key, None)
+            with self._lock:
+                self._states.pop(key, None)
             return False
-        previous = self._states.get(key)
-        failures = (previous.consecutive_failures if previous else 0) + 1
-        delay = min(
-            ODDS_BACKOFF_MAX_SECONDS,
-            ODDS_BACKOFF_INITIAL_SECONDS * (2 ** min(failures - 1, 7)),
-        )
-        now = self._clock() if monotonic_now is None else monotonic_now
-        self._states[key] = RequestBackoffState(
-            consecutive_failures=failures,
-            retry_not_before_monotonic=now + delay,
-            last_http_status=http_status,
-            last_provider_code=provider_code,
-            last_failure_reason=type(error).__name__[:100],
-        )
+        with self._lock:
+            previous = self._states.get(key)
+            failures = (previous.consecutive_failures if previous else 0) + 1
+            delay = min(
+                ODDS_BACKOFF_MAX_SECONDS,
+                ODDS_BACKOFF_INITIAL_SECONDS * (2 ** min(failures - 1, 7)),
+            )
+            now = self._clock() if monotonic_now is None else monotonic_now
+            self._states[key] = RequestBackoffState(
+                consecutive_failures=failures,
+                retry_not_before_monotonic=now + delay,
+                last_http_status=http_status,
+                last_provider_code=provider_code,
+                last_failure_reason=type(error).__name__[:100],
+            )
         return True
 
     def retain(self, keys: set[tuple[str, str]]) -> None:
-        self._states = {key: value for key, value in self._states.items() if key in keys}
+        with self._lock:
+            self._states = {
+                key: value for key, value in self._states.items() if key in keys
+            }
 
     def details(self, *, monotonic_now: float | None = None) -> dict[str, Any]:
         now = self._clock() if monotonic_now is None else monotonic_now
+        with self._lock:
+            states = sorted(self._states.items())
         entries = []
-        for (endpoint, request_identity), state in sorted(self._states.items()):
+        for (endpoint, request_identity), state in states:
             entries.append(
                 {
                     "endpoint": endpoint,
@@ -204,6 +216,128 @@ class PerRequestBackoff:
                 }
             )
         return {"active": len(entries), "entries": entries}
+
+
+@dataclass
+class OddsChannelRuntime:
+    channel: str
+    interval_seconds: float
+    enabled: bool
+    thread: threading.Thread | None = None
+    last_cycle_completed_monotonic: float | None = None
+    last_cycle_healthy: bool | None = None
+    cycle_duration_seconds: float | None = None
+    maximum_request_duration_seconds: float | None = None
+    last_successful_match_ids: tuple[str, ...] = ()
+    active_match_ids: tuple[str, ...] = ()
+    _last_success_by_match: dict[str, float] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def stale_after_seconds(self) -> float:
+        return max(15.0, self.interval_seconds * 2.0)
+
+    def attach_thread(self, thread: threading.Thread | None) -> None:
+        with self._lock:
+            self.thread = thread
+            self.last_cycle_completed_monotonic = None
+            self.last_cycle_healthy = None
+
+    def thread_alive(self) -> bool:
+        with self._lock:
+            thread = self.thread
+        return thread is not None and thread.is_alive()
+
+    def needs_restart(self) -> bool:
+        return self.enabled and not self.thread_alive()
+
+    def record_cycle(
+        self,
+        *,
+        active_match_ids: list[str],
+        successful_match_ids: list[str],
+        cycle_duration_seconds: float,
+        maximum_request_duration_seconds: float,
+        healthy: bool,
+        completed_monotonic: float | None = None,
+    ) -> None:
+        completed = (
+            time.monotonic() if completed_monotonic is None else completed_monotonic
+        )
+        active = tuple(dict.fromkeys(active_match_ids))
+        successful = tuple(dict.fromkeys(successful_match_ids))
+        with self._lock:
+            self.last_cycle_completed_monotonic = completed
+            self.last_cycle_healthy = healthy
+            self.cycle_duration_seconds = max(0.0, cycle_duration_seconds)
+            self.maximum_request_duration_seconds = max(
+                0.0, maximum_request_duration_seconds
+            )
+            self.last_successful_match_ids = successful
+            self.active_match_ids = active
+            self._last_success_by_match = {
+                match_id: refreshed_at
+                for match_id, refreshed_at in self._last_success_by_match.items()
+                if match_id in active
+            }
+            for match_id in successful:
+                self._last_success_by_match[match_id] = completed
+
+    def available(self, *, monotonic_now: float | None = None) -> bool:
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        if not self.enabled or not self.thread_alive():
+            return False
+        with self._lock:
+            completed = self.last_cycle_completed_monotonic
+            healthy = self.last_cycle_healthy
+        return (
+            completed is not None
+            and healthy is True
+            and now - completed <= self.stale_after_seconds
+        )
+
+    def details(self, *, monotonic_now: float | None = None) -> dict[str, Any]:
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        alive = self.thread_alive()
+        with self._lock:
+            completed = self.last_cycle_completed_monotonic
+            healthy = self.last_cycle_healthy
+            active = self.active_match_ids
+            refreshed = dict(self._last_success_by_match)
+            cycle_duration = self.cycle_duration_seconds
+            maximum_request_duration = self.maximum_request_duration_seconds
+            last_successful = self.last_successful_match_ids
+        ages = [
+            now - refreshed[match_id]
+            for match_id in active
+            if match_id in refreshed
+        ]
+        unrefreshed = sum(match_id not in refreshed for match_id in active)
+        if not self.enabled:
+            state = "disabled"
+        elif not alive:
+            state = "dead"
+        elif completed is None:
+            state = "starting"
+        elif now - completed > self.stale_after_seconds:
+            state = "stale"
+        elif not healthy:
+            state = "degraded"
+        else:
+            state = "healthy"
+        return {
+            "component": f"raybet_{self.channel}_odds_worker",
+            "interval_seconds": self.interval_seconds,
+            "enabled": self.enabled,
+            "thread_alive": alive,
+            "state": state,
+            "stale_after_seconds": self.stale_after_seconds,
+            "cycle_duration_seconds": cycle_duration,
+            "oldest_match_refresh_age_seconds": max(ages) if ages else None,
+            "maximum_request_duration_seconds": maximum_request_duration,
+            "last_successful_match_ids": list(last_successful),
+            "unrefreshed_match_count": unrefreshed,
+        }
 
 
 def _error_statuses(error: Exception) -> tuple[int | None, int | None]:
@@ -692,6 +826,8 @@ def _partition_live_rows(
 def _odds_channel_rows(
     store: LiveBettingStore,
     channel: str,
+    *,
+    priority_available: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int]:
     live_rows = _live_rows_snapshot()
     priority, full = _partition_live_rows(
@@ -701,8 +837,125 @@ def _odds_channel_rows(
     if channel == "priority":
         return priority, len(live_rows), 0
     if channel == "full":
+        if not priority_available:
+            return live_rows, len(live_rows), 0
         return full, len(live_rows), len(priority)
     raise ValueError("unknown odds collection channel")
+
+
+def _empty_odds_summary(*, listed: int) -> dict[str, Any]:
+    return {
+        "matches": 0,
+        "listed": listed,
+        "odds": 0,
+        "changed": 0,
+        "errors": 0,
+        "backoff_skipped": 0,
+        "in_flight_skipped": 0,
+        "prematch_collected": 0,
+        "prematch_skipped": 0,
+        "last_successful_match_ids": [],
+        "maximum_request_duration_seconds": 0.0,
+    }
+
+
+def _odds_channel_poll_interval(
+    interval: float,
+    channel: str,
+    priority_interval: float,
+) -> float:
+    if channel != "full":
+        return interval
+    fallback_interval = (
+        priority_interval
+        if priority_interval > 0
+        else DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS
+    )
+    return min(interval, fallback_interval)
+
+
+def _collect_priority_row(
+    database_url: str,
+    raw_dir: Path,
+    list_row: dict[str, Any],
+    backoff: PerRequestBackoff,
+) -> dict[str, Any]:
+    with LiveBettingStore(
+        database_url, raw_archive_root=raw_dir
+    ) as store, RayBetClient() as client:
+        return collect_once(
+            store,
+            client,
+            raw_dir,
+            list_rows=[list_row],
+            audit_match_list=False,
+            backoff=backoff,
+            collector_name="raybet_priority_odds",
+            retain_backoff=False,
+        )
+
+
+def _collect_priority_rows(
+    database_url: str,
+    raw_dir: Path,
+    rows: list[dict[str, Any]],
+    backoff: PerRequestBackoff,
+    *,
+    max_workers: int = MAX_PRIORITY_ODDS_WORKERS,
+) -> dict[str, Any]:
+    summary = _empty_odds_summary(listed=len(rows))
+    endpoint = f"{BASE_URL}/odds"
+    active_keys = {
+        backoff.key(endpoint, f"{endpoint}?match_id={str(row.get('id') or '')}")
+        for row in rows
+        if isinstance(row, dict) and str(row.get("id") or "").isdigit()
+    }
+    backoff.retain(active_keys)
+    if not rows:
+        return summary
+
+    workers = max(1, min(max_workers, len(rows)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _collect_priority_row,
+                database_url,
+                raw_dir,
+                row,
+                backoff,
+            )
+            for row in rows
+        ]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception as error:
+                summary["errors"] += 1
+                logger.warning(
+                    "priority RayBet odds worker failed (%s)",
+                    type(error).__name__,
+                )
+                continue
+            for key in (
+                "matches",
+                "odds",
+                "changed",
+                "errors",
+                "backoff_skipped",
+                "in_flight_skipped",
+                "prematch_collected",
+                "prematch_skipped",
+            ):
+                summary[key] += int(result[key])
+            summary["last_successful_match_ids"].extend(
+                result["last_successful_match_ids"]
+            )
+            summary["maximum_request_duration_seconds"] = max(
+                summary["maximum_request_duration_seconds"],
+                float(result["maximum_request_duration_seconds"]),
+            )
+    summary["last_successful_match_ids"].sort()
+    return summary
 
 
 def _odds_channel_loop(
@@ -710,6 +963,8 @@ def _odds_channel_loop(
     raw_dir: Path,
     interval: float,
     channel: str,
+    runtime: OddsChannelRuntime,
+    priority_runtime: OddsChannelRuntime,
 ) -> None:
     component = f"raybet_{channel}_odds_worker"
     collector = f"raybet_{channel}_odds"
@@ -717,48 +972,90 @@ def _odds_channel_loop(
     with LiveBettingStore(
         database_url, raw_archive_root=raw_dir
     ) as store, RayBetClient() as client:
+        next_regular_cycle = 0.0
         while True:
             started = time.monotonic()
-            summary = {
-                "matches": 0,
-                "listed": 0,
-                "odds": 0,
-                "changed": 0,
-                "errors": 0,
-                "backoff_skipped": 0,
-                "in_flight_skipped": 0,
-                "prematch_collected": 0,
-                "prematch_skipped": 0,
-            }
+            summary = _empty_odds_summary(listed=0)
             source_listed = 0
             priority_excluded = 0
+            priority_available = True
+            rows: list[dict[str, Any]] = []
             try:
+                if channel == "full":
+                    priority_available = priority_runtime.available()
+                    if priority_available and started < next_regular_cycle:
+                        priority_poll_interval = _odds_channel_poll_interval(
+                            interval,
+                            channel,
+                            priority_runtime.interval_seconds,
+                        )
+                        time.sleep(
+                            min(
+                                priority_poll_interval,
+                                next_regular_cycle - started,
+                            )
+                        )
+                        continue
                 rows, source_listed, priority_excluded = _odds_channel_rows(
                     store,
                     channel,
+                    priority_available=priority_available,
                 )
-                summary = collect_once(
-                    store,
-                    client,
-                    raw_dir,
-                    list_rows=rows,
-                    audit_match_list=False,
-                    backoff=backoff,
-                    collector_name=collector,
+                if channel == "priority":
+                    summary = _collect_priority_rows(
+                        database_url,
+                        raw_dir,
+                        rows,
+                        backoff,
+                    )
+                else:
+                    summary = collect_once(
+                        store,
+                        client,
+                        raw_dir,
+                        list_rows=rows,
+                        audit_match_list=False,
+                        backoff=backoff,
+                        collector_name=collector,
+                    )
+                cycle_duration = time.monotonic() - started
+                cycle_healthy = (
+                    summary["errors"] + summary["backoff_skipped"] == 0
+                    and (not rows or summary["matches"] == len(rows))
                 )
+                runtime.record_cycle(
+                    active_match_ids=[
+                        str(row.get("id") or "")
+                        for row in rows
+                        if isinstance(row, dict)
+                        and str(row.get("id") or "").isdigit()
+                    ],
+                    successful_match_ids=summary["last_successful_match_ids"],
+                    cycle_duration_seconds=cycle_duration,
+                    maximum_request_duration_seconds=summary[
+                        "maximum_request_duration_seconds"
+                    ],
+                    healthy=cycle_healthy,
+                )
+                if channel == "full" and priority_available:
+                    next_regular_cycle = started + interval
                 now = utc_now()
                 partial_errors = summary["errors"] + summary["backoff_skipped"]
                 record_health(
                     store.connection,
                     component,
-                    "degraded" if partial_errors else "healthy",
+                    "healthy" if cycle_healthy else "degraded",
                     heartbeat_at=now,
                     success_at=now if summary["matches"] else None,
-                    error_at=now if partial_errors else None,
+                    error_at=now if not cycle_healthy else None,
                     error=(
                         f"{partial_errors} {channel} odds collection error(s)"
                         if partial_errors
-                        else None
+                        else (
+                            f"incomplete {channel} odds collection cycle"
+                            if not cycle_healthy
+                            else None
+                        )
                     ),
                     details={
                         "source": "worker",
@@ -766,12 +1063,29 @@ def _odds_channel_loop(
                         "interval_seconds": interval,
                         "source_listed": source_listed,
                         "priority_excluded": priority_excluded,
+                        "priority_fallback": (
+                            channel == "full" and not priority_available
+                        ),
                         "has_channel_match": bool(summary["listed"]),
+                        **runtime.details(),
                         **summary,
                         "odds_backoff": backoff.details(),
                     },
                 )
             except Exception as error:
+                cycle_duration = time.monotonic() - started
+                runtime.record_cycle(
+                    active_match_ids=[
+                        str(row.get("id") or "")
+                        for row in rows
+                        if isinstance(row, dict)
+                        and str(row.get("id") or "").isdigit()
+                    ],
+                    successful_match_ids=[],
+                    cycle_duration_seconds=cycle_duration,
+                    maximum_request_duration_seconds=0.0,
+                    healthy=False,
+                )
                 now = utc_now()
                 record_health(
                     store.connection,
@@ -786,7 +1100,11 @@ def _odds_channel_loop(
                         "interval_seconds": interval,
                         "source_listed": source_listed,
                         "priority_excluded": priority_excluded,
+                        "priority_fallback": (
+                            channel == "full" and not priority_available
+                        ),
                         "has_channel_match": False,
+                        **runtime.details(),
                         **summary,
                         "odds_backoff": backoff.details(),
                     },
@@ -797,8 +1115,54 @@ def _odds_channel_loop(
                     type(error).__name__,
                 )
             elapsed = time.monotonic() - started
-            delay = interval if source_listed else min(interval, 1.0)
+            effective_interval = _odds_channel_poll_interval(
+                interval,
+                channel,
+                priority_runtime.interval_seconds,
+            )
+            delay = (
+                effective_interval
+                if source_listed
+                else min(effective_interval, 1.0)
+            )
             time.sleep(max(0.0, delay - elapsed))
+
+
+def _validate_odds_intervals(
+    priority_interval: float,
+    full_interval: float,
+    *,
+    once: bool,
+) -> None:
+    if not once and priority_interval <= 0 and full_interval <= 0:
+        raise ValueError("at least one RayBet odds channel must be enabled")
+
+
+def _start_odds_channel_thread(
+    database_url: str,
+    raw_dir: Path,
+    runtime: OddsChannelRuntime,
+    priority_runtime: OddsChannelRuntime,
+) -> None:
+    thread = threading.Thread(
+        target=_odds_channel_loop,
+        args=(
+            database_url,
+            raw_dir,
+            runtime.interval_seconds,
+            runtime.channel,
+            runtime,
+            priority_runtime,
+        ),
+        name=f"raybet-{runtime.channel}-odds",
+        daemon=True,
+    )
+    runtime.attach_thread(thread)
+    try:
+        thread.start()
+    except Exception:
+        runtime.attach_thread(None)
+        raise
 
 
 def collect_once(
@@ -812,7 +1176,8 @@ def collect_once(
     monotonic_now: float | None = None,
     wall_clock: Callable[[], datetime] = utc_now,
     collector_name: str = "raybet",
-) -> dict[str, int]:
+    retain_backoff: bool = True,
+) -> dict[str, Any]:
     _require_store_archive_root(store, raw_dir)
     if list_rows is None:
         list_rows = _fetch_match_list(
@@ -829,6 +1194,8 @@ def collect_once(
     in_flight_skipped = 0
     prematch_collected = 0
     prematch_skipped = 0
+    successful_match_ids: list[str] = []
+    request_durations: list[float] = []
     collection_now = wall_clock()
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
     if audit_match_list:
@@ -846,12 +1213,13 @@ def collect_once(
         and isinstance(row, dict)
         and str(row.get("id") or "").isdigit()
     }
-    if backoff is not None:
+    if backoff is not None and retain_backoff:
         backoff.retain(active_keys)
     for list_row in list_rows:
         match_id = ""
         request_identity = ""
         is_prematch = False
+        request_started = time.monotonic()
         try:
             if not isinstance(list_row, dict):
                 raise ValueError("live match list row is not an object")
@@ -886,6 +1254,7 @@ def collect_once(
             changed_count += changes
             odds_count += snapshot_count
             success_count += 1
+            successful_match_ids.append(match_id)
             prematch_collected += int(is_prematch)
             if backoff is not None:
                 backoff.record_success(endpoint, request_identity)
@@ -903,6 +1272,9 @@ def collect_once(
                 match_id or "<invalid>",
                 type(error).__name__,
             )
+        finally:
+            if request_identity:
+                request_durations.append(time.monotonic() - request_started)
     completed_at = utc_now()
     if error_count or backoff_skipped:
         store.record_collector(
@@ -926,6 +1298,8 @@ def collect_once(
         "in_flight_skipped": in_flight_skipped,
         "prematch_collected": prematch_collected,
         "prematch_skipped": prematch_skipped,
+        "last_successful_match_ids": successful_match_ids,
+        "maximum_request_duration_seconds": max(request_durations, default=0.0),
     }
 
 
@@ -1048,7 +1422,23 @@ def run(args: argparse.Namespace) -> int:
                 DEFAULT_FULL_ODDS_INTERVAL_SECONDS,
             )
         )
-        odds_workers_started = False
+        _validate_odds_intervals(
+            priority_interval,
+            full_interval,
+            once=bool(args.once),
+        )
+        odds_runtimes = {
+            "priority": OddsChannelRuntime(
+                "priority",
+                priority_interval,
+                priority_interval > 0,
+            ),
+            "full": OddsChannelRuntime(
+                "full",
+                full_interval,
+                full_interval > 0,
+            ),
+        }
         started_at = utc_now()
         record_health(
             store.connection,
@@ -1068,6 +1458,8 @@ def run(args: argparse.Namespace) -> int:
         prematch_rows: list[dict[str, Any]] | None = None
         next_prematch_refresh = 0.0
         while True:
+            odds_worker_restarts = 0
+            odds_thread_start_errors = 0
             try:
                 monotonic_now = time.monotonic()
                 cached_rows = (
@@ -1089,20 +1481,27 @@ def run(args: argparse.Namespace) -> int:
                 if cached_rows is None:
                     raise RuntimeError("live match list cache unavailable")
                 _publish_live_rows(cached_rows)
-                if not args.once and not odds_workers_started:
-                    for channel, interval in (
-                        ("priority", priority_interval),
-                        ("full", full_interval),
-                    ):
-                        if interval <= 0:
+                if not args.once:
+                    for runtime in odds_runtimes.values():
+                        if not runtime.needs_restart():
                             continue
-                        threading.Thread(
-                            target=_odds_channel_loop,
-                            args=(args.database_url, raw_dir, interval, channel),
-                            name=f"raybet-{channel}-odds",
-                            daemon=True,
-                        ).start()
-                    odds_workers_started = True
+                        restarting = runtime.thread is not None
+                        try:
+                            _start_odds_channel_thread(
+                                args.database_url,
+                                raw_dir,
+                                runtime,
+                                odds_runtimes["priority"],
+                            )
+                        except Exception as error:
+                            odds_thread_start_errors += 1
+                            logger.warning(
+                                "%s RayBet odds thread failed to start (%s)",
+                                runtime.channel,
+                                type(error).__name__,
+                            )
+                        else:
+                            odds_worker_restarts += int(restarting)
                 completed_refresh_needed = False
                 completed_summary = {
                     "matches": 0,
@@ -1247,6 +1646,29 @@ def run(args: argparse.Namespace) -> int:
                     + completed_summary["errors"]
                     + int(live_list_degraded)
                 )
+                priority_fallback_active = (
+                    not args.once
+                    and odds_runtimes["full"].enabled
+                    and not odds_runtimes["priority"].available(
+                        monotonic_now=health_monotonic_now
+                    )
+                )
+                odds_runtime_details = {
+                    channel: runtime.details(
+                        monotonic_now=health_monotonic_now
+                    )
+                    for channel, runtime in odds_runtimes.items()
+                }
+                odds_runtime_degraded = (
+                    odds_thread_start_errors > 0
+                    or odds_worker_restarts > 0
+                    or priority_fallback_active
+                    or any(
+                        details["state"] in {"dead", "stale", "degraded"}
+                        for details in odds_runtime_details.values()
+                    )
+                )
+                partial_errors += int(odds_runtime_degraded)
                 worker_status = "degraded" if partial_errors else "healthy"
                 collection_succeeded = any(
                     (
@@ -1274,14 +1696,11 @@ def run(args: argparse.Namespace) -> int:
                     details={
                         "source": "worker",
                         **summary,
-                        "full_odds": {
-                            "component": "raybet_full_odds_worker",
-                            "interval_seconds": full_interval,
-                        },
-                        "priority_odds": {
-                            "component": "raybet_priority_odds_worker",
-                            "interval_seconds": priority_interval,
-                        },
+                        "full_odds": odds_runtime_details["full"],
+                        "priority_odds": odds_runtime_details["priority"],
+                        "priority_fallback_active": priority_fallback_active,
+                        "odds_worker_restarts": odds_worker_restarts,
+                        "odds_thread_start_errors": odds_thread_start_errors,
                         "prematch": prematch_summary,
                         "completed": completed_summary,
                         "live_list_cache": _live_list_cache_details(
@@ -1303,6 +1722,7 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:
                 failures += 1
                 now = utc_now()
+                error_monotonic_now = time.monotonic()
                 store.record_collector("raybet", error_at=now, error=f"{type(exc).__name__}: {exc}")
                 record_health(
                     store.connection,
@@ -1314,9 +1734,15 @@ def run(args: argparse.Namespace) -> int:
                     details={
                         "source": "worker",
                         "consecutive_failures": failures,
+                        "full_odds": odds_runtimes["full"].details(
+                            monotonic_now=error_monotonic_now
+                        ),
+                        "priority_odds": odds_runtimes["priority"].details(
+                            monotonic_now=error_monotonic_now
+                        ),
                         "live_list_cache": _live_list_cache_details(
                             live_list_cache,
-                            monotonic_now=time.monotonic(),
+                            monotonic_now=error_monotonic_now,
                             degraded=True,
                         ),
                         "odds_backoff": odds_backoff.details(),
