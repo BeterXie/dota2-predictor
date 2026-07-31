@@ -39,6 +39,7 @@ from scripts.watch_raybet_stream import (
     ALLOWED_STREAM_HOSTS,
     ROOT,
     _meaningful,
+    _observation_persistence_decision,
     _draft_for_tracking,
     _sanitized_stream_location,
     _should_persist_frame,
@@ -1682,6 +1683,44 @@ def test_supervisor_distinguishes_partial_capture_from_a_stall(
     assert status == "unhealthy"
     assert error == "watchers capture stalled: 42"
     assert details["watchers"]["42"]["capture_state"] == "capture_stalled"
+
+
+def test_unchanged_partial_observation_refreshes_periodic_frame_evidence() -> None:
+    def row(sequence: int) -> LiveObservation:
+        return LiveObservation(
+            raybet_match_id="42",
+            map_number=None,
+            captured_at_utc=datetime.now(timezone.utc),
+            game_clock_seconds=None,
+            is_paused=None,
+            radiant_hero_ids=[],
+            dire_hero_ids=[],
+            radiant_team_side=None,
+            clock_confidence=0.0,
+            draft_confidence=0.0,
+            source_frame_ref=f"stream:hash:{sequence}",
+            screen_state="unknown",
+            comeback_state=ComebackState.unavailable("hud_replay_gate_untrusted"),
+        )
+
+    previous = row(1)
+    current = row(2)
+
+    assert not _meaningful(previous, current)
+    assert _observation_persistence_decision(
+        previous,
+        current,
+        captured_at=40.0,
+        last_evidence_at=9.0,
+        evidence_interval=30.0,
+    ) == (True, True)
+    assert _observation_persistence_decision(
+        previous,
+        current,
+        captured_at=20.0,
+        last_evidence_at=9.0,
+        evidence_interval=30.0,
+    ) == (False, False)
 
 
 def test_supervisor_terminates_watchers_that_are_no_longer_active() -> None:

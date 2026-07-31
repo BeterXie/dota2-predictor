@@ -442,6 +442,24 @@ def _should_persist_frame(
     )
 
 
+def _observation_persistence_decision(
+    previous: LiveObservation | None,
+    current: LiveObservation,
+    *,
+    captured_at: float,
+    last_evidence_at: float,
+    evidence_interval: float,
+) -> tuple[bool, bool]:
+    persist_frame = _should_persist_frame(
+        previous,
+        current,
+        captured_at=captured_at,
+        last_evidence_at=last_evidence_at,
+        evidence_interval=evidence_interval,
+    )
+    return _meaningful(previous, current) or persist_frame, persist_frame
+
+
 def _write_evidence_frame(
     evidence_root: Path,
     image: object,
@@ -759,14 +777,17 @@ def _run_cli(args: argparse.Namespace) -> int:
                             else "hud_replay_gate_untrusted"
                         ),
                     )
-                    if _meaningful(previous, observation):
-                        if _should_persist_frame(
+                    append_observation, persist_frame = (
+                        _observation_persistence_decision(
                             previous,
                             observation,
                             captured_at=frame.captured_at,
                             last_evidence_at=last_evidence_at,
                             evidence_interval=args.evidence_interval,
-                        ):
+                        )
+                    )
+                    if append_observation:
+                        if persist_frame:
                             receipt = _write_evidence_frame(evidence_dir, frame.image)
                             observation.source_frame_ref = receipt.frame_ref
                             observation.source_frame_sha256 = receipt.content_sha256
@@ -860,14 +881,15 @@ def _run_cli(args: argparse.Namespace) -> int:
                     confirmed_advantage if state == "game" else None,
                 ),
             )
-            if _meaningful(previous, observation):
-                if _should_persist_frame(
-                    previous,
-                    observation,
-                    captured_at=frame.captured_at,
-                    last_evidence_at=last_evidence_at,
-                    evidence_interval=args.evidence_interval,
-                ):
+            append_observation, persist_frame = _observation_persistence_decision(
+                previous,
+                observation,
+                captured_at=frame.captured_at,
+                last_evidence_at=last_evidence_at,
+                evidence_interval=args.evidence_interval,
+            )
+            if append_observation:
+                if persist_frame:
                     receipt = _write_evidence_frame(evidence_dir, frame.image)
                     observation.source_frame_ref = receipt.frame_ref
                     observation.source_frame_sha256 = receipt.content_sha256
