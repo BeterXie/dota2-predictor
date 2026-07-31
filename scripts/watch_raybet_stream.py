@@ -506,8 +506,6 @@ def allow_live_hud_tracking(
     clock_tracker.reset_map(map_number)
     scoreboard_tracker.reset()
     advantage_tracker.reset()
-    if draft_tracker is not None:
-        draft_tracker.reset()
     return False
 
 
@@ -627,6 +625,8 @@ def _draft_slot_status_payload(item: DraftSlotStatus) -> dict[str, object]:
                 "score": round(evidence.score, 6),
                 "margin": round(evidence.margin, 6),
                 "crop_hash": evidence.crop_hash,
+                "source_frame_hash": evidence.source_frame_hash,
+                "game_clock_seconds": evidence.game_clock_seconds,
             }
             for evidence in item.evidence
         ],
@@ -641,6 +641,7 @@ def _write_capture_heartbeat(
     capture_status: str,
     diagnostics: HudDiagnostics,
     draft_slot_statuses: tuple[DraftSlotStatus, ...] = (),
+    team_side_recognizer_status: str | None = None,
 ) -> None:
     if capture_status not in {"producing_trusted", "capturing_partial"}:
         raise ValueError("capture heartbeat status is invalid")
@@ -709,7 +710,10 @@ def _write_capture_heartbeat(
                 _draft_slot_status_payload(item) for item in draft_slot_statuses
             ],
         },
-        "team_side": {"confirmed": diagnostics.team_side_confirmed},
+        "team_side": {
+            "confirmed": diagnostics.team_side_confirmed,
+            "recognizer_status": team_side_recognizer_status,
+        },
         "core_hud_ready": diagnostics.core_hud_ready,
         "comeback_state_ready": diagnostics.comeback_state_ready,
         "strategy_ready": diagnostics.strategy_ready,
@@ -800,10 +804,13 @@ def _run_cli(args: argparse.Namespace) -> int:
     advantage_tracker = NetWorthAdvantageTracker()
     draft_tracker = DraftTracker()
     side_reader = None
+    team_side_recognizer_status = "manual_override"
     if not args.radiant_side:
-        side_reader = TeamSideRecognizer.from_database(
+        side_load = TeamSideRecognizer.load_from_database(
             args.database_url, args.match_id
         )
+        side_reader = side_load.recognizer
+        team_side_recognizer_status = side_load.error or "available"
     side_tracker = TeamSideTracker()
     writer = ObservationWriter(output)
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -829,13 +836,16 @@ def _run_cli(args: argparse.Namespace) -> int:
                 break
             hud = hud_reader.read(frame.image)
             selection = hud.selection
-            if active_layout_name != selection.layout_name:
+            if (
+                selection.layout_name is not None
+                and active_layout_name != selection.layout_name
+            ):
                 clock_tracker.reset_map(map_number)
                 scoreboard_tracker.reset()
                 advantage_tracker.reset()
                 draft_tracker.reset()
                 last_draft = None
-            active_layout_name = selection.layout_name
+                active_layout_name = selection.layout_name
             state = hud.screen_state
             confirmed_clock: ConfirmedClock | None = None
             confirmed_scoreboard: ScoreboardReading | None = None
@@ -907,6 +917,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                         capture_status="capturing_partial",
                         diagnostics=hud.diagnostics,
                         draft_slot_statuses=draft_tracker.slot_statuses,
+                        team_side_recognizer_status=team_side_recognizer_status,
                     )
                     continue
                 raw_clock = hud.clock
@@ -965,6 +976,12 @@ def _run_cli(args: argparse.Namespace) -> int:
                         last_clock,
                     ),
                     observed_at=frame.captured_at,
+                    source_frame_hash=frame.source_hash,
+                    game_clock_seconds=(
+                        confirmed_clock.seconds
+                        if confirmed_clock is not None
+                        else last_clock.seconds if last_clock is not None else None
+                    ),
                 )
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
@@ -1039,6 +1056,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     team_side_confirmed=radiant_team_side is not None,
                 ),
                 draft_slot_statuses=draft_tracker.slot_statuses,
+                team_side_recognizer_status=team_side_recognizer_status,
             )
     except Exception as error:
         raise WatcherFailure(

@@ -34,6 +34,8 @@ from shared.environment import load_environment_file  # noqa: E402
 class EvidenceSample:
     path: Path
     observed_at: float
+    source_frame_hash: str | None = None
+    game_clock_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -300,6 +302,8 @@ def _database_samples(
             EvidenceSample(
                 content_root / digest[:2] / f"{digest}.jpg",
                 observed_at,
+                digest,
+                selected_clocks[-1],
             )
         )
     if not samples:
@@ -403,6 +407,8 @@ def evaluate(
         confirmed = tracker.update(
             reading,
             observed_at=sample.observed_at,
+            source_frame_hash=sample.source_frame_hash,
+            game_clock_seconds=sample.game_clock_seconds,
         )
         accepted = 0
         regions = selection.layout.radiant_heroes + selection.layout.dire_heroes

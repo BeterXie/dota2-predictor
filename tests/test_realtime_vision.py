@@ -455,8 +455,9 @@ class FakeCapture:
 
 
 class FakeResponse:
-    def __init__(self, content: bytes) -> None:
+    def __init__(self, content: bytes, content_type: str = "image/png") -> None:
         self.content = content
+        self.headers = {"content-type": content_type}
 
     def raise_for_status(self) -> None:
         return None
@@ -616,7 +617,7 @@ def test_scoreboard_tracker_requires_two_monotonic_high_confidence_frames() -> N
     assert tracker.update(ScoreboardReading(18, 26, 0.89)) is None
 
 
-def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
+def test_replay_gate_pauses_draft_but_resets_live_hud_trackers() -> None:
     clock = MapStateTracker(confirmations=2)
     clock.reset_map(1)
     scoreboard = ScoreboardTracker(confirmations=2)
@@ -654,7 +655,7 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
         )
         is None
     )
-    assert draft.update(complete_draft, observed_at=9.0) is None
+    assert draft.update(complete_draft, observed_at=9.0) is not None
 
 
 @pytest.mark.parametrize(
@@ -1222,6 +1223,76 @@ def test_draft_tracker_rejects_correlated_duplicate_evidence() -> None:
     assert all(item.duplicate_evidence_count == 2 for item in tracker.slot_statuses)
 
 
+def test_draft_tracker_accepts_static_crops_from_new_clocked_frames() -> None:
+    tracker = DraftTracker(confirmations=2)
+    reading = DraftReading(
+        (),
+        (),
+        0.8,
+        _draft_slot_diagnostics(
+            set(range(10)),
+            crop_hash="0000000000000000",
+        ),
+    )
+
+    assert tracker.update(
+        reading,
+        observed_at=0.0,
+        source_frame_hash="frame-a",
+        game_clock_seconds=100,
+    ) is None
+    assert tracker.update(
+        reading,
+        observed_at=3.0,
+        source_frame_hash="frame-b",
+        game_clock_seconds=103,
+    ) is None
+    assert tracker.update(
+        reading,
+        observed_at=6.0,
+        source_frame_hash="frame-c",
+        game_clock_seconds=106,
+    ) is not None
+
+
+def test_draft_tracker_rejects_same_source_or_unadvanced_clock() -> None:
+    tracker = DraftTracker(confirmations=2)
+    reading = DraftReading(
+        (),
+        (),
+        0.8,
+        _draft_slot_diagnostics(
+            set(range(10)),
+            crop_hash="0000000000000000",
+        ),
+    )
+
+    tracker.update(
+        reading,
+        observed_at=0.0,
+        source_frame_hash="frame-a",
+        game_clock_seconds=100,
+    )
+    tracker.update(
+        reading,
+        observed_at=3.0,
+        source_frame_hash="frame-a",
+        game_clock_seconds=103,
+    )
+    tracker.update(
+        reading,
+        observed_at=6.0,
+        source_frame_hash="frame-b",
+        game_clock_seconds=100,
+    )
+
+    assert all(
+        status.independent_evidence_count == 0
+        for status in tracker.slot_statuses
+    )
+    assert all(status.duplicate_evidence_count == 2 for status in tracker.slot_statuses)
+
+
 def test_draft_tracker_requires_high_quality_support() -> None:
     tracker = DraftTracker()
     weak = DraftReading(
@@ -1664,3 +1735,21 @@ def test_team_side_database_degrades_when_all_logo_sources_fail(
     assert (
         TeamSideRecognizer.from_database("postgresql+psycopg://test", "42") is None
     )
+
+
+def test_team_side_database_rejects_html_logo_response(monkeypatch) -> None:
+    _patch_logo_store(monkeypatch, with_team_logos=False)
+    monkeypatch.setattr(
+        FakeHttpClient,
+        "get",
+        lambda self, url: FakeResponse(b"<html>login</html>", "text/html"),
+    )
+    monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+
+    loaded = TeamSideRecognizer.load_from_database(
+        "postgresql+psycopg://test",
+        "42",
+    )
+
+    assert loaded.recognizer is None
+    assert loaded.error == "team_one_logo_invalid"

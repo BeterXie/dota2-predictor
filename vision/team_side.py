@@ -24,6 +24,11 @@ def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+def _valid_logo_content_type(value: object) -> bool:
+    content_type = str(value or "").partition(";")[0].strip().casefold()
+    return content_type.startswith("image/") or content_type == "application/octet-stream"
+
+
 def _silhouette(image: np.ndarray) -> np.ndarray:
     if image.ndim == 3 and image.shape[2] == 4:
         alpha = image[:, :, 3]
@@ -54,7 +59,9 @@ def _team_table_logos(
     connection: PostgresSession, team_names: tuple[str, str]
 ) -> list[str | None]:
     rows = connection.execute(
-        "SELECT name, tag, logo_url FROM teams WHERE logo_url IS NOT NULL AND logo_url != ''"
+        "SELECT name, tag, logo_url FROM teams "
+        "WHERE logo_url IS NOT NULL AND logo_url != '' "
+        "ORDER BY updated_at DESC, team_id DESC"
     ).fetchall()
     output: list[str | None] = []
     for team_name in team_names:
@@ -93,6 +100,12 @@ class TeamSideReading:
     confidence: float
 
 
+@dataclass(frozen=True)
+class TeamSideRecognizerLoad:
+    recognizer: TeamSideRecognizer | None
+    error: str | None
+
+
 class TeamSideRecognizer:
     min_logo_similarity = 0.75
     min_assignment_margin = 0.04
@@ -113,6 +126,12 @@ class TeamSideRecognizer:
     def from_database(
         database_url: str, match_id: str
     ) -> "TeamSideRecognizer | None":
+        return TeamSideRecognizer.load_from_database(database_url, match_id).recognizer
+
+    @staticmethod
+    def load_from_database(
+        database_url: str, match_id: str
+    ) -> TeamSideRecognizerLoad:
         with LiveBettingStore(database_url) as store:
             connection = store.connection
             match = connection.execute(
@@ -121,7 +140,7 @@ class TeamSideRecognizer:
                 (match_id,),
             ).fetchone()
             if not match:
-                return None
+                return TeamSideRecognizerLoad(None, "raybet_match_missing")
             team_names = (str(match[0] or ""), str(match[1] or ""))
             try:
                 table_urls = _team_table_logos(connection, team_names)
@@ -140,16 +159,24 @@ class TeamSideRecognizer:
                 )
                 for index in range(2)
             ]
-        if not all(candidates):
-            return None
+        for index, urls in enumerate(candidates):
+            if not urls:
+                return TeamSideRecognizerLoad(
+                    None,
+                    f"team_{'one' if index == 0 else 'two'}_logo_missing",
+                )
         images: list[np.ndarray] = []
         with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-            for urls in candidates:
+            for index, urls in enumerate(candidates):
                 image = None
                 for url in urls:
                     try:
                         response = client.get(str(url))
                         response.raise_for_status()
+                        if not _valid_logo_content_type(
+                            response.headers.get("content-type")
+                        ):
+                            continue
                         image = cv2.imdecode(
                             np.frombuffer(response.content, np.uint8),
                             cv2.IMREAD_UNCHANGED,
@@ -159,9 +186,15 @@ class TeamSideRecognizer:
                     if image is not None:
                         break
                 if image is None:
-                    return None
+                    return TeamSideRecognizerLoad(
+                        None,
+                        f"team_{'one' if index == 0 else 'two'}_logo_invalid",
+                    )
                 images.append(image)
-        return TeamSideRecognizer(images[0], images[1])
+        return TeamSideRecognizerLoad(
+            TeamSideRecognizer(images[0], images[1]),
+            None,
+        )
 
     @staticmethod
     def _similarity(one: np.ndarray, two: np.ndarray) -> float:

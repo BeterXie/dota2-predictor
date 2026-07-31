@@ -82,6 +82,8 @@ class SlotCandidateEvidence:
     score: float
     margin: float
     crop_hash: str | None
+    source_frame_hash: str | None = None
+    game_clock_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +421,17 @@ class DraftTracker:
             return True
         if evidence.observed_at - previous.observed_at < self.minimum_evidence_interval:
             return False
+        if (
+            previous.source_frame_hash is not None
+            and evidence.source_frame_hash is not None
+        ):
+            if previous.source_frame_hash == evidence.source_frame_hash:
+                return False
+            if (
+                previous.game_clock_seconds is not None
+                and evidence.game_clock_seconds is not None
+            ):
+                return evidence.game_clock_seconds > previous.game_clock_seconds
         if previous.crop_hash is None or evidence.crop_hash is None:
             return True
         return (
@@ -539,7 +552,14 @@ class DraftTracker:
             min(slot.locked_confidence for slot in self._slots),
         )
 
-    def update(self, reading: DraftReading, *, observed_at: float) -> DraftReading | None:
+    def update(
+        self,
+        reading: DraftReading,
+        *,
+        observed_at: float,
+        source_frame_hash: str | None = None,
+        game_clock_seconds: int | None = None,
+    ) -> DraftReading | None:
         diagnostics = self._diagnostics(reading)
         if len(diagnostics) != 10:
             return self.current_draft
@@ -555,6 +575,8 @@ class DraftTracker:
                 score=diagnostic.best_score,
                 margin=diagnostic.margin,
                 crop_hash=diagnostic.crop_hash,
+                source_frame_hash=source_frame_hash,
+                game_clock_seconds=game_clock_seconds,
             )
             if not self._is_independent(slot, evidence):
                 slot.duplicate_evidence_count += 1
