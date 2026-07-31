@@ -47,7 +47,12 @@ from vision.scoreboard_reader import (
     ReplayGateReading,
 )
 from vision.stream_capture import HLSStreamCapture, nonblack_ratio
-from vision.team_side import TeamSideRecognizer, TeamSideTracker
+from vision.team_side import (
+    MAX_TEAM_LOGO_BYTES,
+    TeamSideRecognizer,
+    TeamSideTracker,
+    _validate_team_logo_url,
+)
 
 
 FULL = NormalizedRegion(0, 0, 1, 1)
@@ -455,16 +460,35 @@ class FakeCapture:
 
 
 class FakeResponse:
-    def __init__(self, content: bytes, content_type: str = "image/png") -> None:
+    def __init__(
+        self,
+        content: bytes,
+        content_type: str = "image/png",
+        *,
+        status_code: int = 200,
+        location: str | None = None,
+    ) -> None:
         self.content = content
+        self.status_code = status_code
         self.headers = {"content-type": content_type}
+        if location is not None:
+            self.headers["location"] = location
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
 
     def raise_for_status(self) -> None:
         return None
 
+    def iter_bytes(self):
+        yield self.content
+
 
 class FakeHttpClient:
-    responses: dict[str, bytes | Exception] = {}
+    responses: dict[str, bytes | Exception | FakeResponse] = {}
     requested: list[str] = []
 
     def __init__(self, **_: object) -> None:
@@ -477,12 +501,17 @@ class FakeHttpClient:
     def __exit__(self, *_: object) -> None:
         return None
 
-    def get(self, url: str) -> FakeResponse:
+    def stream(self, method: str, url: str) -> FakeResponse:
+        assert method == "GET"
         type(self).requested.append(url)
         response = type(self).responses[url]
         if isinstance(response, Exception):
             raise response
-        return FakeResponse(response)
+        return (
+            response
+            if isinstance(response, FakeResponse)
+            else FakeResponse(response)
+        )
 
 
 class _LogoQueryResult:
@@ -512,8 +541,16 @@ class _LogoConnection:
             ])
         if "FROM teams" in query and self.with_team_logos:
             return _LogoQueryResult([
-                ("Virtus.pro", "VP", "https://cdn.test/vp.png"),
-                ("Xtreme Gaming", "XG", "https://cdn.test/xg.png"),
+                (
+                    "Virtus.pro",
+                    "VP",
+                    "https://cdn.cloudflare.steamstatic.com/vp.png",
+                ),
+                (
+                    "Xtreme Gaming",
+                    "XG",
+                    "https://cdn.cloudflare.steamstatic.com/xg.png",
+                ),
             ])
         return _LogoQueryResult([])
 
@@ -1223,8 +1260,8 @@ def test_draft_tracker_rejects_correlated_duplicate_evidence() -> None:
     assert all(item.duplicate_evidence_count == 2 for item in tracker.slot_statuses)
 
 
-def test_draft_tracker_accepts_static_crops_from_new_clocked_frames() -> None:
-    tracker = DraftTracker(confirmations=2)
+def test_draft_tracker_caps_static_crop_cluster_votes() -> None:
+    tracker = DraftTracker()
     reading = DraftReading(
         (),
         (),
@@ -1235,24 +1272,46 @@ def test_draft_tracker_accepts_static_crops_from_new_clocked_frames() -> None:
         ),
     )
 
-    assert tracker.update(
-        reading,
-        observed_at=0.0,
-        source_frame_hash="frame-a",
-        game_clock_seconds=100,
-    ) is None
-    assert tracker.update(
-        reading,
-        observed_at=3.0,
-        source_frame_hash="frame-b",
-        game_clock_seconds=103,
-    ) is None
-    assert tracker.update(
-        reading,
-        observed_at=6.0,
-        source_frame_hash="frame-c",
-        game_clock_seconds=106,
-    ) is not None
+    for index in range(10):
+        assert tracker.update(
+            reading,
+            observed_at=float(index * 3),
+            source_frame_hash=f"frame-{index}",
+            game_clock_seconds=100 + index * 3,
+        ) is None
+
+    assert all(item.state == "observing" for item in tracker.slot_statuses)
+
+
+def test_draft_tracker_requires_crop_diversity_and_long_lock_window() -> None:
+    tracker = DraftTracker()
+    hashes = ("0000000000000000", "ffffffffffffffff")
+    confirmed = None
+
+    for index in range(12):
+        reading = DraftReading(
+            (),
+            (),
+            0.8,
+            _draft_slot_diagnostics(
+                set(range(10)),
+                crop_hash=hashes[index % 2],
+            ),
+        )
+        confirmed = tracker.update(
+            reading,
+            observed_at=float(index * 3),
+            source_frame_hash=f"frame-{index}",
+            game_clock_seconds=100 + index * 3,
+        )
+        if index < 11:
+            assert confirmed is None
+
+    assert confirmed is not None
+    assert all(item.state == "locked" for item in tracker.slot_statuses)
+    assert all(
+        item.unique_crop_cluster_count == 2 for item in tracker.slot_statuses
+    )
 
 
 def test_draft_tracker_rejects_same_source_or_unadvanced_clock() -> None:
@@ -1666,15 +1725,15 @@ def test_team_side_rejects_different_unrelated_stable_images() -> None:
 def test_team_side_database_prefers_team_tag_logo(monkeypatch) -> None:
     _patch_logo_store(monkeypatch, with_team_logos=True)
     FakeHttpClient.responses = {
-        "https://cdn.test/vp.png": _png(_logo("circle")),
-        "https://cdn.test/xg.png": _png(_logo("square")),
+        "https://cdn.cloudflare.steamstatic.com/vp.png": _png(_logo("circle")),
+        "https://cdn.cloudflare.steamstatic.com/xg.png": _png(_logo("square")),
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
     recognizer = TeamSideRecognizer.from_database("postgresql+psycopg://test", "42")
     assert recognizer is not None
     assert FakeHttpClient.requested == [
-        "https://cdn.test/vp.png",
-        "https://cdn.test/xg.png",
+        "https://cdn.cloudflare.steamstatic.com/vp.png",
+        "https://cdn.cloudflare.steamstatic.com/xg.png",
     ]
 
 
@@ -1701,8 +1760,12 @@ def test_team_side_database_falls_back_after_cdn_failure(
     one = "https://www.ray086.com/file/fallback-one.png"
     two = "https://www.ray086.com/file/fallback-two.png"
     FakeHttpClient.responses = {
-        "https://cdn.test/vp.png": httpx.ConnectError("offline"),
-        "https://cdn.test/xg.png": httpx.ConnectError("offline"),
+        "https://cdn.cloudflare.steamstatic.com/vp.png": httpx.ConnectError(
+            "offline"
+        ),
+        "https://cdn.cloudflare.steamstatic.com/xg.png": httpx.ConnectError(
+            "offline"
+        ),
         one: _png(_logo("circle")),
         two: _png(_logo("square")),
     }
@@ -1712,9 +1775,9 @@ def test_team_side_database_falls_back_after_cdn_failure(
 
     assert recognizer is not None
     assert FakeHttpClient.requested == [
-        "https://cdn.test/vp.png",
+        "https://cdn.cloudflare.steamstatic.com/vp.png",
         one,
-        "https://cdn.test/xg.png",
+        "https://cdn.cloudflare.steamstatic.com/xg.png",
         two,
     ]
 
@@ -1725,8 +1788,8 @@ def test_team_side_database_degrades_when_all_logo_sources_fail(
     _patch_logo_store(monkeypatch, with_team_logos=True)
     error = httpx.ConnectError("offline")
     FakeHttpClient.responses = {
-        "https://cdn.test/vp.png": error,
-        "https://cdn.test/xg.png": error,
+        "https://cdn.cloudflare.steamstatic.com/vp.png": error,
+        "https://cdn.cloudflare.steamstatic.com/xg.png": error,
         "https://www.ray086.com/file/fallback-one.png": error,
         "https://www.ray086.com/file/fallback-two.png": error,
     }
@@ -1741,9 +1804,75 @@ def test_team_side_database_rejects_html_logo_response(monkeypatch) -> None:
     _patch_logo_store(monkeypatch, with_team_logos=False)
     monkeypatch.setattr(
         FakeHttpClient,
-        "get",
-        lambda self, url: FakeResponse(b"<html>login</html>", "text/html"),
+        "stream",
+        lambda self, method, url: FakeResponse(
+            b"<html>login</html>", "text/html"
+        ),
     )
+    monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+
+    loaded = TeamSideRecognizer.load_from_database(
+        "postgresql+psycopg://test",
+        "42",
+    )
+
+    assert loaded.recognizer is None
+    assert loaded.error == "team_one_logo_invalid"
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://www.ray086.com/logo.png",
+        "https://127.0.0.1/logo.png",
+        "https://localhost/logo.png",
+        "https://cdn.cloudflare.steamstatic.com:8443/logo.png",
+        "https://user:pass@www.ray086.com/logo.png",
+        "https://example.com/logo.png",
+    ),
+)
+def test_team_logo_url_rejects_untrusted_sources(url: str) -> None:
+    with pytest.raises(ValueError, match="invalid team logo URL"):
+        _validate_team_logo_url(url)
+
+
+def test_team_logo_url_allows_current_steam_cdn() -> None:
+    url = "https://cdn.steamusercontent.com/team-logo.png"
+
+    assert _validate_team_logo_url(url) == url
+
+
+def test_team_side_revalidates_redirect_target(monkeypatch) -> None:
+    _patch_logo_store(monkeypatch, with_team_logos=True)
+    cdn_one = "https://cdn.cloudflare.steamstatic.com/vp.png"
+    cdn_two = "https://cdn.cloudflare.steamstatic.com/xg.png"
+    fallback_one = "https://www.ray086.com/file/fallback-one.png"
+    FakeHttpClient.responses = {
+        cdn_one: FakeResponse(
+            b"",
+            status_code=302,
+            location="http://127.0.0.1/private.png",
+        ),
+        fallback_one: _png(_logo("circle")),
+        cdn_two: _png(_logo("square")),
+    }
+    monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+
+    loaded = TeamSideRecognizer.load_from_database(
+        "postgresql+psycopg://test",
+        "42",
+    )
+
+    assert loaded.recognizer is not None
+    assert FakeHttpClient.requested == [cdn_one, fallback_one, cdn_two]
+
+
+def test_team_side_rejects_oversized_logo_response(monkeypatch) -> None:
+    _patch_logo_store(monkeypatch, with_team_logos=False)
+    fallback_one = "https://www.ray086.com/file/fallback-one.png"
+    FakeHttpClient.responses = {
+        fallback_one: b"x" * (MAX_TEAM_LOGO_BYTES + 1),
+    }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
 
     loaded = TeamSideRecognizer.load_from_database(

@@ -93,6 +93,7 @@ class DraftSlotStatus:
     state: Literal["observing", "provisional", "locked"]
     hero_id: int | None
     independent_evidence_count: int
+    unique_crop_cluster_count: int
     high_quality_evidence_count: int
     strong_conflict_count: int
     duplicate_evidence_count: int
@@ -353,6 +354,8 @@ class DraftTracker:
         minimum_high_quality: int = 2,
         minimum_evidence_interval: float = 3.0,
         maximum_similar_hash_distance: int = 2,
+        maximum_evidence_per_crop_cluster: int = 3,
+        minimum_lock_interval: float | None = None,
         high_quality_score: float = 0.67,
         high_quality_margin: float = 0.04,
     ) -> None:
@@ -363,11 +366,25 @@ class DraftTracker:
             raise ValueError("provisional_support must fit inside evidence_window")
         if not 1 <= minimum_high_quality <= provisional_support:
             raise ValueError("minimum_high_quality must not exceed provisional_support")
+        if maximum_evidence_per_crop_cluster < 1:
+            raise ValueError("maximum_evidence_per_crop_cluster must be positive")
+        if minimum_lock_interval is None:
+            minimum_lock_interval = (
+                minimum_evidence_interval if confirmations is not None else 20.0
+            )
+        if minimum_lock_interval < minimum_evidence_interval:
+            raise ValueError(
+                "minimum_lock_interval must not be shorter than evidence interval"
+            )
         self.evidence_window = evidence_window
         self.provisional_support = provisional_support
         self.minimum_high_quality = minimum_high_quality
         self.minimum_evidence_interval = minimum_evidence_interval
         self.maximum_similar_hash_distance = maximum_similar_hash_distance
+        self.maximum_evidence_per_crop_cluster = (
+            maximum_evidence_per_crop_cluster
+        )
+        self.minimum_lock_interval = minimum_lock_interval
         self.high_quality_score = high_quality_score
         self.high_quality_margin = high_quality_margin
         self._slots = [
@@ -413,6 +430,39 @@ class DraftTracker:
             and evidence.margin >= self.high_quality_margin
         )
 
+    def _crop_clusters(
+        self, evidence: list[SlotCandidateEvidence]
+    ) -> list[list[SlotCandidateEvidence]]:
+        clusters: list[list[SlotCandidateEvidence]] = []
+        representatives: list[str | None] = []
+        for item in evidence:
+            if item.crop_hash is None:
+                representatives.append(None)
+                clusters.append([item])
+                continue
+            cluster_index = next(
+                (
+                    index
+                    for index, representative in enumerate(representatives)
+                    if representative is not None
+                    and self._hash_distance(representative, item.crop_hash)
+                    <= self.maximum_similar_hash_distance
+                ),
+                None,
+            )
+            if cluster_index is None:
+                representatives.append(item.crop_hash)
+                clusters.append([item])
+            else:
+                clusters[cluster_index].append(item)
+        return clusters
+
+    def _effective_support(self, evidence: list[SlotCandidateEvidence]) -> int:
+        return sum(
+            min(len(cluster), self.maximum_evidence_per_crop_cluster)
+            for cluster in self._crop_clusters(evidence)
+        )
+
     def _is_independent(
         self, slot: _TrackedSlot, evidence: SlotCandidateEvidence
     ) -> bool:
@@ -455,9 +505,12 @@ class DraftTracker:
         if not counts:
             return
         hero_id, support = counts.most_common(1)[0]
-        if support < self.provisional_support:
-            return
         supporting = [item for item in slot.evidence if item.hero_id == hero_id]
+        if (
+            support < self.provisional_support
+            or self._effective_support(supporting) < self.provisional_support
+        ):
+            return
         if sum(self._is_high_quality(item) for item in supporting) < self.minimum_high_quality:
             return
         if any(
@@ -489,7 +542,7 @@ class DraftTracker:
                 and high_quality
                 and slot.provisional_at is not None
                 and evidence.observed_at - slot.provisional_at
-                >= self.minimum_evidence_interval
+                >= self.minimum_lock_interval
             ):
                 supporting = [
                     item.score for item in slot.evidence if item.hero_id == slot.hero_id
@@ -528,6 +581,9 @@ class DraftTracker:
                     state=slot.state,
                     hero_id=slot.hero_id,
                     independent_evidence_count=len(supporting),
+                    unique_crop_cluster_count=len(
+                        self._crop_clusters(supporting)
+                    ),
                     high_quality_evidence_count=sum(
                         self._is_high_quality(item) for item in supporting
                     ),

@@ -471,6 +471,9 @@ def evaluate(
                             "slot": status.slot,
                             "truth_hero_id": truth_id,
                             "locked_hero_id": status.hero_id,
+                            "unique_crop_cluster_count": (
+                                status.unique_crop_cluster_count
+                            ),
                         }
                     )
         previous_tracker_slots = tracker_slots
@@ -617,6 +620,16 @@ def evaluate(
                 item.state == "locked" and item.hero_id == truth_hero_ids[index]
                 for index, item in enumerate(final_slots)
             ),
+            "final_locked_crop_cluster_counts": [
+                {
+                    "side": item.side,
+                    "slot": item.slot,
+                    "hero_id": item.hero_id,
+                    "unique_crop_cluster_count": item.unique_crop_cluster_count,
+                }
+                for item in final_slots
+                if item.state == "locked"
+            ],
             "draft_ready": tracker.current_draft is not None,
             "best_candidate_confusion": rendered_confusion(best_confusion),
             "accepted_confusion": rendered_confusion(accepted_confusion),

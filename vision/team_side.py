@@ -6,7 +6,7 @@ import json
 import re
 from collections import deque
 from dataclasses import dataclass
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import cv2
 import httpx
@@ -20,6 +20,20 @@ from vision.image_features import compute_phash
 from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
 
 
+ALLOWED_TEAM_LOGO_HOSTS = frozenset(
+    {
+        "cdn.cloudflare.steamstatic.com",
+        "cdn.steamusercontent.com",
+        "images.opendota.com",
+        "steamcdn-a.akamaihd.net",
+        "steamusercontent-a.akamaihd.net",
+        "www.ray086.com",
+    }
+)
+MAX_TEAM_LOGO_BYTES = 2 * 1024 * 1024
+MAX_TEAM_LOGO_REDIRECTS = 3
+
+
 def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
@@ -27,6 +41,65 @@ def _normalize(value: str) -> str:
 def _valid_logo_content_type(value: object) -> bool:
     content_type = str(value or "").partition(";")[0].strip().casefold()
     return content_type.startswith("image/") or content_type == "application/octet-stream"
+
+
+def _validate_team_logo_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("invalid team logo URL") from error
+    hostname = parsed.hostname.casefold() if parsed.hostname is not None else None
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname not in ALLOWED_TEAM_LOGO_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.fragment
+    ):
+        raise ValueError("invalid team logo URL")
+    return url
+
+
+def _download_team_logo(client: httpx.Client, url: str) -> np.ndarray | None:
+    current = _validate_team_logo_url(url)
+    for redirect_count in range(MAX_TEAM_LOGO_REDIRECTS + 1):
+        with client.stream("GET", current) as response:
+            status_code = int(response.status_code)
+            if status_code in {301, 302, 303, 307, 308}:
+                if redirect_count >= MAX_TEAM_LOGO_REDIRECTS:
+                    raise ValueError("team logo redirect limit exceeded")
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("team logo redirect is missing location")
+                current = _validate_team_logo_url(urljoin(current, location))
+                continue
+            response.raise_for_status()
+            if not _valid_logo_content_type(
+                response.headers.get("content-type")
+            ):
+                return None
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("invalid team logo content length") from error
+                if declared_length < 0 or declared_length > MAX_TEAM_LOGO_BYTES:
+                    raise ValueError("team logo response is too large")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > MAX_TEAM_LOGO_BYTES:
+                    raise ValueError("team logo response is too large")
+                chunks.append(chunk)
+        return cv2.imdecode(
+            np.frombuffer(b"".join(chunks), np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+    raise ValueError("team logo redirect limit exceeded")
 
 
 def _silhouette(image: np.ndarray) -> np.ndarray:
@@ -166,21 +239,12 @@ class TeamSideRecognizer:
                     f"team_{'one' if index == 0 else 'two'}_logo_missing",
                 )
         images: list[np.ndarray] = []
-        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
             for index, urls in enumerate(candidates):
                 image = None
                 for url in urls:
                     try:
-                        response = client.get(str(url))
-                        response.raise_for_status()
-                        if not _valid_logo_content_type(
-                            response.headers.get("content-type")
-                        ):
-                            continue
-                        image = cv2.imdecode(
-                            np.frombuffer(response.content, np.uint8),
-                            cv2.IMREAD_UNCHANGED,
-                        )
+                        image = _download_team_logo(client, str(url))
                     except (httpx.HTTPError, cv2.error, ValueError):
                         image = None
                     if image is not None:

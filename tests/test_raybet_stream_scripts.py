@@ -41,6 +41,7 @@ from scripts.watch_raybet_stream import (
     _current_map_from_evidence,
     _latest_persisted_clock,
     _meaningful,
+    _next_map_number,
     _observation_persistence_decision,
     _resume_map_clock,
     _draft_for_tracking,
@@ -539,9 +540,22 @@ def test_resume_map_clock_never_restores_an_older_map() -> None:
     same = ConfirmedClock(2, 600, False, 0.94)
     newer = ConfirmedClock(3, 120, False, 0.94)
 
-    assert _resume_map_clock(2, older) == (2, None)
-    assert _resume_map_clock(2, same) == (2, same)
-    assert _resume_map_clock(2, newer) == (3, newer)
+    assert _resume_map_clock(2, older, 3) == (2, None)
+    assert _resume_map_clock(2, same, 3) == (2, same)
+    assert _resume_map_clock(2, newer, 3) == (3, newer)
+
+
+def test_map_rollover_stops_at_configured_series_length() -> None:
+    assert _next_map_number(1, 3) == 2
+    assert _next_map_number(2, 3) == 3
+    assert _next_map_number(3, 3) is None
+
+
+def test_resume_map_clock_rejects_persisted_map_past_series_length() -> None:
+    invalid = ConfirmedClock(4, 120, False, 0.94)
+
+    with pytest.raises(ValueError, match="persisted map exceeds"):
+        _resume_map_clock(3, invalid, 3)
 
 
 def test_latest_persisted_clock_loads_valid_database_row() -> None:

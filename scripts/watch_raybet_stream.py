@@ -221,11 +221,27 @@ def _current_map_from_evidence(
 def _resume_map_clock(
     resolved_map: int,
     persisted_clock: ConfirmedClock | None,
+    best_of: int | None = None,
 ) -> tuple[int, ConfirmedClock | None]:
     """Resume only same-or-newer append-only map state after a watcher restart."""
+    if resolved_map < 1 or (best_of is not None and resolved_map > best_of):
+        raise ValueError("resolved map exceeds the configured series length")
+    if persisted_clock is not None and (
+        persisted_clock.map_number < 1
+        or (best_of is not None and persisted_clock.map_number > best_of)
+    ):
+        raise ValueError("persisted map exceeds the configured series length")
     if persisted_clock is None or persisted_clock.map_number < resolved_map:
         return resolved_map, None
     return persisted_clock.map_number, persisted_clock
+
+
+def _next_map_number(map_number: int, best_of: int | None) -> int | None:
+    if map_number < 1 or (best_of is not None and map_number > best_of):
+        raise ValueError("current map exceeds the configured series length")
+    if best_of is not None and map_number >= best_of:
+        return None
+    return map_number + 1
 
 
 def _latest_persisted_clock(
@@ -374,6 +390,25 @@ def match_source(
             f"cannot determine a unique current map for RayBet match {match_id}"
         )
     return url, map_number
+
+
+def _configured_best_of(database_url: str, match_id: str) -> int | None:
+    with LiveBettingStore(database_url) as store:
+        row = store.connection.execute(
+            "SELECT best_of FROM raybet_matches WHERE raybet_match_id=?",
+            (match_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"RayBet match {match_id} does not exist")
+    if row[0] is None:
+        return None
+    try:
+        best_of = int(row[0])
+    except (TypeError, ValueError) as error:
+        raise ValueError("configured series length is invalid") from error
+    if not 1 <= best_of <= 10:
+        raise ValueError("configured series length is invalid")
+    return best_of
 
 
 def resolve_source(
@@ -614,6 +649,7 @@ def _draft_slot_status_payload(item: DraftSlotStatus) -> dict[str, object]:
         "state": item.state,
         "hero_id": item.hero_id,
         "independent_evidence_count": item.independent_evidence_count,
+        "unique_crop_cluster_count": item.unique_crop_cluster_count,
         "high_quality_evidence_count": item.high_quality_evidence_count,
         "strong_conflict_count": item.strong_conflict_count,
         "duplicate_evidence_count": item.duplicate_evidence_count,
@@ -774,6 +810,7 @@ def _parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
 def _run_cli(args: argparse.Namespace) -> int:
     url: str | None = None
     try:
+        best_of = None
         url, map_number = resolve_source(
             url=args.url,
             database_url=args.database_url,
@@ -782,15 +819,18 @@ def _run_cli(args: argparse.Namespace) -> int:
             refresh_url=args.refresh_url,
         )
         persisted_clock = None
-        if args.url is None and args.map_number is None:
-            persisted_clock = _latest_persisted_clock(
-                args.database_url,
-                args.match_id,
-            )
-            map_number, persisted_clock = _resume_map_clock(
-                map_number,
-                persisted_clock,
-            )
+        if args.url is None:
+            best_of = _configured_best_of(args.database_url, args.match_id)
+            if args.map_number is None:
+                persisted_clock = _latest_persisted_clock(
+                    args.database_url,
+                    args.match_id,
+                )
+                map_number, persisted_clock = _resume_map_clock(
+                    map_number,
+                    persisted_clock,
+                    best_of,
+                )
     except Exception as error:
         raise WatcherFailure(_watcher_error_category(error)) from None
     args._resolved_stream_location = _sanitized_stream_location(url)
@@ -823,6 +863,7 @@ def _run_cli(args: argparse.Namespace) -> int:
     last_evidence_at = 0.0
     sample_count = 0
     active_layout_name: str | None = None
+    awaiting_series_completion = False
 
     try:
         for frame in _native_safe_frames(
@@ -846,6 +887,18 @@ def _run_cli(args: argparse.Namespace) -> int:
                 draft_tracker.reset()
                 last_draft = None
                 active_layout_name = selection.layout_name
+            if awaiting_series_completion:
+                captured = datetime.fromtimestamp(frame.captured_at, timezone.utc)
+                _write_capture_heartbeat(
+                    output,
+                    match_id=args.match_id,
+                    captured_at=captured,
+                    capture_status="capturing_partial",
+                    diagnostics=hud.diagnostics,
+                    draft_slot_statuses=draft_tracker.slot_statuses,
+                    team_side_recognizer_status=team_side_recognizer_status,
+                )
+                continue
             state = hud.screen_state
             confirmed_clock: ConfirmedClock | None = None
             confirmed_scoreboard: ScoreboardReading | None = None
@@ -929,7 +982,13 @@ def _run_cli(args: argparse.Namespace) -> int:
                     and raw_clock.confidence >= clock_tracker.min_confidence
                     and raw_clock.seconds <= 180
                 ):
-                    map_number += 1
+                    next_map = _next_map_number(map_number, best_of)
+                    if next_map is None:
+                        awaiting_series_completion = True
+                        outside_game_frames = 0
+                        last_draft = None
+                        continue
+                    map_number = next_map
                     clock_tracker.reset_map(map_number)
                     scoreboard_tracker.reset()
                     advantage_tracker.reset()
@@ -947,7 +1006,13 @@ def _run_cli(args: argparse.Namespace) -> int:
                     and confirmed_clock is not None
                     and confirmed_clock.seconds <= 180
                 ):
-                    map_number += 1
+                    next_map = _next_map_number(map_number, best_of)
+                    if next_map is None:
+                        awaiting_series_completion = True
+                        outside_game_frames = 0
+                        last_draft = None
+                        continue
+                    map_number = next_map
                     clock_tracker.reset_map(map_number)
                     scoreboard_tracker.reset()
                     advantage_tracker.reset()
