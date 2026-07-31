@@ -333,7 +333,7 @@ def test_sqlite_import_is_read_only_atomic_and_verified(
     report = migrate_sqlite_to_postgres(source, postgres_database_url)
 
     assert report.dry_run is False
-    assert report.target_revision == "20260731_0018"
+    assert report.target_revision == "20260801_0019"
     assert report.row_counts == {
         "browser_events": 1,
         "draft_lineage_changes": 2,

@@ -237,3 +237,75 @@ def test_draft_lineage_bounds_current_raw_observation_to_match_start(
     assert change is not None
     assert tuple(change) == (start_time, "raw_source_observations", "INSERT")
     storage.close()
+
+
+def test_draft_lineage_preserves_earliest_match_start_impact(
+    postgres_engine,
+) -> None:
+    storage = IntelligenceStorage(engine=postgres_engine)
+    storage.init_schema(seed_events=True)
+    match_id = 9_920_002
+    now = "2033-05-18T03:33:20+00:00"
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            """INSERT INTO matches
+               (match_id, radiant_team_id, dire_team_id, radiant_win,
+                duration, start_time, leagueid)
+               VALUES (?, 1, 2, TRUE, 1800, 1000, 19543)""",
+            (match_id,),
+        )
+        storage.connection.execute(
+            """INSERT INTO match_ingest_status
+               (match_id, event_id, start_time, series_id, map_number,
+                stage_scope, stage_in_scope, has_valid_result, is_exhibition,
+                is_forfeit, is_void_remake, ingest_state, basic_result_state,
+                detailed_parse_state, cross_check_state, reconciliation_status,
+                missing_fields_json, raw_artifact_version, attempt_generation,
+                retry_count, player_readiness, state_readiness, draft_readiness,
+                discovered_at, updated_at)
+               VALUES (?, 'ewc-dota2-2026', 1000, 9920, 1, 'main_event', 1, 1,
+                       0, 0, 0, 'complete', 'ready', 'ready', 'ready',
+                       'reconciled', '[]', 1, 1, 0, 'ready', 'ready', 'ready',
+                       ?, ?)""",
+            (match_id, now, now),
+        )
+
+    def latest_match_change() -> tuple[int, str, str]:
+        row = storage.connection.execute(
+            """SELECT affected_from_unix, source_relation, operation
+                 FROM draft_lineage_changes
+                WHERE source_relation='matches'
+                ORDER BY dependency_revision DESC LIMIT 1"""
+        ).fetchone()
+        assert row is not None
+        return tuple(row)
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            "UPDATE matches SET start_time=2000 WHERE match_id=?",
+            (match_id,),
+        )
+    assert latest_match_change() == (1000, "matches", "UPDATE")
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            "UPDATE matches SET start_time=1000 WHERE match_id=?",
+            (match_id,),
+        )
+    assert latest_match_change() == (1000, "matches", "UPDATE")
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            "UPDATE matches SET duration=1900 WHERE match_id=?",
+            (match_id,),
+        )
+    assert latest_match_change() == (1000, "matches", "UPDATE")
+
+    with storage.connection.transaction():
+        storage.connection.execute(
+            "DELETE FROM matches WHERE match_id=?",
+            (match_id,),
+        )
+    assert latest_match_change() == (1000, "matches", "DELETE")
+    storage.close()
