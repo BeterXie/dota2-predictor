@@ -237,9 +237,10 @@ def _resume_map_clock(
 
 
 def _next_map_number(map_number: int, best_of: int | None) -> int | None:
-    if map_number < 1 or (best_of is not None and map_number > best_of):
+    maximum = min(best_of, 5) if best_of is not None else 5
+    if not 1 <= map_number <= maximum:
         raise ValueError("current map exceeds the configured series length")
-    if best_of is not None and map_number >= best_of:
+    if map_number >= maximum:
         return None
     return map_number + 1
 

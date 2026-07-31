@@ -551,6 +551,15 @@ def test_map_rollover_stops_at_configured_series_length() -> None:
     assert _next_map_number(3, 3) is None
 
 
+def test_map_rollover_caps_unknown_or_oversized_series_at_five() -> None:
+    assert _next_map_number(4, None) == 5
+    assert _next_map_number(5, None) is None
+    assert _next_map_number(5, 12) is None
+
+    with pytest.raises(ValueError, match="current map exceeds"):
+        _next_map_number(6, None)
+
+
 def test_resume_map_clock_rejects_persisted_map_past_series_length() -> None:
     invalid = ConfirmedClock(4, 120, False, 0.94)
 
