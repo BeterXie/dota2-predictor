@@ -38,8 +38,11 @@ from scripts.invalidate_vision_observations import freeze_draft_map, invalidate
 from scripts.watch_raybet_stream import (
     ALLOWED_STREAM_HOSTS,
     ROOT,
+    _current_map_from_evidence,
+    _latest_persisted_clock,
     _meaningful,
     _observation_persistence_decision,
+    _resume_map_clock,
     _draft_for_tracking,
     _sanitized_stream_location,
     _should_persist_frame,
@@ -496,6 +499,61 @@ def test_match_source_prefers_manual_current_index(tmp_path: Path) -> None:
         ],
     )
     assert match_source(database, "42") == (STREAM_URL, 3)
+
+
+def test_current_map_does_not_regress_behind_settled_map() -> None:
+    raw = _raybet_payload(settled_maps={1: "team_one"})
+    for team in raw["team"]:
+        team["score"] = {"manualControlData": {"currentIndex": 1}}
+
+    assert _current_map_from_evidence(raw, 3, "2") == 2
+
+
+def test_current_map_checks_settled_conflict_even_with_manual_map() -> None:
+    raw = {
+        "team": [
+            {"score": {"manualControlData": {"currentIndex": 1}}},
+            {"score": {"manualControlData": {"currentIndex": 1}}},
+        ]
+    }
+    with patch(
+        "scripts.watch_raybet_stream.infer_current_map_number",
+        side_effect=ValueError("settled evidence conflict"),
+    ):
+        with pytest.raises(ValueError, match="settled evidence conflict"):
+            _current_map_from_evidence(raw, 3, "2")
+
+
+def test_current_map_rejects_stale_manual_index_after_series_completion() -> None:
+    raw = _raybet_payload(
+        settled_maps={1: "team_two", 2: "team_two"},
+    )
+    for team in raw["team"]:
+        team["score"] = {"manualControlData": {"currentIndex": 1}}
+
+    assert _current_map_from_evidence(raw, 3, "2") is None
+
+
+def test_resume_map_clock_never_restores_an_older_map() -> None:
+    older = ConfirmedClock(1, 1800, False, 0.94)
+    same = ConfirmedClock(2, 600, False, 0.94)
+    newer = ConfirmedClock(3, 120, False, 0.94)
+
+    assert _resume_map_clock(2, older) == (2, None)
+    assert _resume_map_clock(2, same) == (2, same)
+    assert _resume_map_clock(2, newer) == (3, newer)
+
+
+def test_latest_persisted_clock_loads_valid_database_row() -> None:
+    with patch("scripts.watch_raybet_stream.LiveBettingStore") as store_type:
+        connection = store_type.return_value.__enter__.return_value.connection
+        connection.execute.return_value.fetchone.return_value = (1, 1800, 0, 0.94)
+
+        clock = _latest_persisted_clock("postgresql://test", "42")
+
+    assert clock == ConfirmedClock(1, 1800, False, 0.94)
+    statement = connection.execute.call_args.args[0]
+    assert "vision_observation_invalidations" in statement
 
 
 def test_match_source_refreshes_signed_url_without_reading_it_from_sqlite(

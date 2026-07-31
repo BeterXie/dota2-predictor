@@ -186,6 +186,100 @@ def _manual_map_number(payload: object, best_of: int | None) -> int | None:
     return map_number
 
 
+def _reconcile_current_map(
+    manual_map: int | None,
+    settled_map: int | None,
+    best_of: int | None,
+) -> int | None:
+    """Keep stale manual indexes from moving a live series backwards."""
+    candidates = [value for value in (manual_map, settled_map) if value is not None]
+    if not candidates:
+        return None
+    map_number = max(candidates)
+    if best_of is not None and map_number > best_of:
+        raise ValueError("current map exceeds the configured series length")
+    return map_number
+
+
+def _current_map_from_evidence(
+    payload: object,
+    best_of: int | None,
+    status: object,
+) -> int | None:
+    manual_map = _manual_map_number(payload, best_of)
+    settled_map = None
+    if str(status) == "2":
+        settled_map = infer_current_map_number(
+            payload if isinstance(payload, dict) else {},
+            best_of,
+        )
+        if settled_map is None:
+            return None
+    return _reconcile_current_map(manual_map, settled_map, best_of)
+
+
+def _resume_map_clock(
+    resolved_map: int,
+    persisted_clock: ConfirmedClock | None,
+) -> tuple[int, ConfirmedClock | None]:
+    """Resume only same-or-newer append-only map state after a watcher restart."""
+    if persisted_clock is None or persisted_clock.map_number < resolved_map:
+        return resolved_map, None
+    return persisted_clock.map_number, persisted_clock
+
+
+def _latest_persisted_clock(
+    database_url: str,
+    match_id: str,
+) -> ConfirmedClock | None:
+    with LiveBettingStore(database_url) as store:
+        row = store.connection.execute(
+            """SELECT observation.map_number,
+                      observation.game_clock_seconds,
+                      observation.is_paused,
+                      observation.clock_confidence
+                 FROM vision_observations AS observation
+                WHERE observation.raybet_match_id=?
+                  AND observation.map_number IS NOT NULL
+                  AND observation.game_clock_seconds IS NOT NULL
+                  AND observation.screen_state='game'
+                  AND observation.clock_confidence>=0.55
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM vision_observation_invalidations AS invalidation
+                       WHERE invalidation.raybet_match_id=
+                             observation.raybet_match_id
+                         AND invalidation.captured_at=observation.captured_at
+                         AND invalidation.source_frame_ref=
+                             observation.source_frame_ref
+                  )
+                ORDER BY live_text_timestamp_utc(observation.captured_at) DESC,
+                         observation.source_frame_ref DESC
+                LIMIT 1""",
+            (match_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        map_number = int(row[0])
+        seconds = int(row[1])
+        confidence = float(row[3])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not 1 <= map_number <= 10
+        or seconds < 0
+        or not 0.55 <= confidence <= 1.0
+    ):
+        return None
+    return ConfirmedClock(
+        map_number=map_number,
+        seconds=seconds,
+        is_paused=bool(row[2]),
+        confidence=confidence,
+    )
+
+
 def _fresh_stream_payload(
     database_url: str, match_id: str
 ) -> tuple[str, dict[str, object]]:
@@ -268,15 +362,13 @@ def match_source(
         if best_of is not None and map_override > best_of:
             raise ValueError("map override exceeds the configured series length")
         return url, map_override
-    map_number = _manual_map_number(payload, best_of)
-    if map_number is None and str(row[3]) == "2":
-        try:
-            map_number = infer_current_map_number(payload, best_of)
-        except ValueError as error:
-            raise ValueError(
-                f"cannot determine a unique current map for RayBet match "
-                f"{match_id}: {error}"
-            ) from error
+    try:
+        map_number = _current_map_from_evidence(payload, best_of, row[3])
+    except ValueError as error:
+        raise ValueError(
+            f"cannot determine a unique current map for RayBet match "
+            f"{match_id}: {error}"
+        ) from error
     if map_number is None or (best_of is not None and map_number > best_of):
         raise ValueError(
             f"cannot determine a unique current map for RayBet match {match_id}"
@@ -685,6 +777,16 @@ def _run_cli(args: argparse.Namespace) -> int:
             map_number=args.map_number,
             refresh_url=args.refresh_url,
         )
+        persisted_clock = None
+        if args.url is None and args.map_number is None:
+            persisted_clock = _latest_persisted_clock(
+                args.database_url,
+                args.match_id,
+            )
+            map_number, persisted_clock = _resume_map_clock(
+                map_number,
+                persisted_clock,
+            )
     except Exception as error:
         raise WatcherFailure(_watcher_error_category(error)) from None
     args._resolved_stream_location = _sanitized_stream_location(url)
@@ -705,7 +807,8 @@ def _run_cli(args: argparse.Namespace) -> int:
     side_tracker = TeamSideTracker()
     writer = ObservationWriter(output)
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    last_clock: ConfirmedClock | None = None
+    last_clock = persisted_clock
+    restart_clock = persisted_clock
     last_draft: DraftReading | None = None
     previous: LiveObservation | None = None
     outside_game_frames = 0
@@ -826,6 +929,26 @@ def _run_cli(args: argparse.Namespace) -> int:
                     side_tracker.reset()
                 outside_game_frames = 0
                 confirmed_clock = clock_tracker.update(raw_clock)
+                if (
+                    restart_clock is not None
+                    and restart_clock.map_number == map_number
+                    and restart_clock.seconds > 300
+                    and confirmed_clock is not None
+                    and confirmed_clock.seconds <= 180
+                ):
+                    map_number += 1
+                    clock_tracker.reset_map(map_number)
+                    scoreboard_tracker.reset()
+                    advantage_tracker.reset()
+                    draft_tracker.reset()
+                    last_clock = None
+                    last_draft = None
+                    radiant_team_side = None
+                    side_tracker.reset()
+                    restart_clock = None
+                    continue
+                if confirmed_clock is not None:
+                    restart_clock = None
                 confirmed_scoreboard = scoreboard_tracker.update(hud.scoreboard)
                 if confirmed_clock is not None and confirmed_scoreboard is not None:
                     confirmed_advantage = advantage_tracker.update(
