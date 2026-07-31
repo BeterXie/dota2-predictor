@@ -37,6 +37,7 @@ from live_betting.smtp_delivery import (  # noqa: E402
     SMTPConfigurationError,
 )
 from live_betting.storage import LiveBettingStore  # noqa: E402
+from shared.environment import load_environment_file  # noqa: E402
 from web.alerts import reconcile_alerts  # noqa: E402
 
 
@@ -590,6 +591,7 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = _parser()
     args = parser.parse_args()
+    load_environment_file(ROOT / ".env")
     if args.interval <= 0:
         parser.error("--interval must be positive")
     database_url = require_database_url(args.database_url)

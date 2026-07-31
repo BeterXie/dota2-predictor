@@ -14,6 +14,10 @@ import yaml
 from database.engine import require_database_url
 from live_betting.runtime_schema import verify_runtime_schema
 from live_betting.storage import LiveBettingStore
+from shared.environment import load_environment_file
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -67,6 +71,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     args = _parser().parse_args(argv)
+    load_environment_file(ROOT / ".env")
     config_path = args.config.resolve()
     config = _load_config(config_path)
 
