@@ -32,13 +32,16 @@ def build_hero_features(source: Path, output: Path) -> int:
     if not expected_ids:
         raise ValueError(f"hero metadata is empty: {metadata_path}")
 
-    source_paths: dict[int, Path] = {}
+    source_paths: dict[int, list[Path]] = {}
     for path in source.glob("*.png"):
+        hero_id_text, separator, variant_name = path.stem.partition("__")
+        if separator and not variant_name:
+            raise ValueError(f"invalid hero portrait filename: {path.name}")
         try:
-            hero_id = int(path.stem)
+            hero_id = int(hero_id_text)
         except ValueError as error:
             raise ValueError(f"invalid hero portrait filename: {path.name}") from error
-        source_paths[hero_id] = path
+        source_paths.setdefault(hero_id, []).append(path)
     if set(source_paths) != expected_ids:
         missing = sorted(expected_ids - set(source_paths))
         unexpected = sorted(set(source_paths) - expected_ids)
@@ -46,21 +49,34 @@ def build_hero_features(source: Path, output: Path) -> int:
             f"hero portrait set does not match metadata; missing={missing} "
             f"unexpected={unexpected}"
         )
+    missing_base = [
+        hero_id
+        for hero_id in sorted(expected_ids)
+        if not (source / f"{hero_id}.png").is_file()
+    ]
+    if missing_base:
+        raise ValueError(f"hero portrait set is missing base portraits: {missing_base}")
 
     ids: list[int] = []
     hashes: list[np.ndarray] = []
     histograms: list[np.ndarray] = []
     thumbnails: list[np.ndarray] = []
     for hero_id in sorted(expected_ids):
-        path = source_paths[hero_id]
-        image = cv2.imread(str(path))
-        if image is None:
-            raise ValueError(f"invalid hero portrait: {path}")
-        ids.append(hero_id)
-        hashes.append(compute_phash(image, hash_size=8))
-        histograms.append(color_histogram(image))
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        thumbnails.append(cv2.resize(gray, (48, 32), interpolation=cv2.INTER_AREA))
+        paths = sorted(
+            source_paths[hero_id],
+            key=lambda path: (path.stem != str(hero_id), path.name),
+        )
+        for path in paths:
+            image = cv2.imread(str(path))
+            if image is None:
+                raise ValueError(f"invalid hero portrait: {path}")
+            ids.append(hero_id)
+            hashes.append(compute_phash(image, hash_size=8))
+            histograms.append(color_histogram(image))
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            thumbnails.append(
+                cv2.resize(gray, (48, 32), interpolation=cv2.INTER_AREA)
+            )
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".part")
     with temporary.open("wb") as handle:
@@ -72,7 +88,7 @@ def build_hero_features(source: Path, output: Path) -> int:
             thumbnails=np.asarray(thumbnails, dtype=np.uint8),
         )
     temporary.replace(output)
-    return len(ids)
+    return len(expected_ids)
 
 
 def main() -> int:

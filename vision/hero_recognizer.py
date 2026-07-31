@@ -104,20 +104,24 @@ class HeroRecognizer:
         feature_path: str | Path = DEFAULT_FEATURE_PATH,
         layout: BroadcastLayout = STANDARD_DOTA_HUD,
     ) -> None:
-        data = np.load(str(feature_path))
-        self.ids = data["ids"]
-        self.hashes = data["hashes"]
-        self.histograms = data["histograms"]
-        self.thumbnails = data["thumbnails"]
+        with np.load(str(feature_path)) as data:
+            variant_ids = np.asarray(data["ids"], dtype=np.int32)
+            self.hashes = np.asarray(data["hashes"])
+            self.histograms = np.asarray(data["histograms"])
+            self.thumbnails = np.asarray(data["thumbnails"])
+        self.ids = np.asarray(list(dict.fromkeys(variant_ids)), dtype=np.int32)
+        self._variant_groups = tuple(
+            np.flatnonzero(variant_ids == hero_id) for hero_id in self.ids
+        )
         self.layout = layout
 
     def _score_crop(self, image: np.ndarray) -> _CropScores | None:
         if image.size == 0 or float(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).std()) < 8:
             return None
         hero_hash = compute_phash(image, hash_size=8)
-        hash_scores = 1.0 - np.mean(self.hashes != hero_hash, axis=1)
+        variant_hash_scores = 1.0 - np.mean(self.hashes != hero_hash, axis=1)
         histogram = color_histogram(image)
-        hist_scores = np.asarray(
+        variant_hist_scores = np.asarray(
             [
                 (cv2.compareHist(histogram, candidate, cv2.HISTCMP_CORREL) + 1.0) / 2.0
                 for candidate in self.histograms
@@ -125,7 +129,7 @@ class HeroRecognizer:
         )
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         thumbnail = cv2.resize(gray, (48, 32), interpolation=cv2.INTER_AREA)
-        pixel_scores = np.asarray(
+        variant_pixel_scores = np.asarray(
             [
                 (
                     cv2.matchTemplate(thumbnail, candidate, cv2.TM_CCOEFF_NORMED)[0, 0]
@@ -135,11 +139,23 @@ class HeroRecognizer:
                 for candidate in self.thumbnails
             ]
         )
+        variant_combined = (
+            variant_hash_scores * 0.5
+            + variant_hist_scores * 0.25
+            + variant_pixel_scores * 0.25
+        )
+        winner_indices = np.asarray(
+            [
+                group[int(np.argmax(variant_combined[group]))]
+                for group in self._variant_groups
+            ],
+            dtype=np.intp,
+        )
         return _CropScores(
-            combined=hash_scores * 0.5 + hist_scores * 0.25 + pixel_scores * 0.25,
-            phash=hash_scores,
-            histogram=hist_scores,
-            pixel=pixel_scores,
+            combined=variant_combined[winner_indices],
+            phash=variant_hash_scores[winner_indices],
+            histogram=variant_hist_scores[winner_indices],
+            pixel=variant_pixel_scores[winner_indices],
             crop_hash=np.packbits(hero_hash).tobytes().hex(),
         )
 

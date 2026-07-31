@@ -333,10 +333,12 @@ def _portrait(color: tuple[int, int, int], marker: str) -> np.ndarray:
     return image
 
 
-def _write_features(path: Path, images: list[np.ndarray]) -> None:
+def _write_features(
+    path: Path, images: list[np.ndarray], *, ids: list[int] | None = None
+) -> None:
     np.savez_compressed(
         path,
-        ids=np.arange(1, len(images) + 1, dtype=np.int32),
+        ids=np.asarray(ids or range(1, len(images) + 1), dtype=np.int32),
         hashes=np.asarray([compute_phash(image) for image in images], dtype=np.uint8),
         histograms=np.asarray(
             [color_histogram(image) for image in images], dtype=np.float32
@@ -886,10 +888,27 @@ def test_exact_portrait_is_recognized(tmp_path: Path) -> None:
     assert reading.confidence >= 0.62
 
 
+def test_portrait_variants_compete_between_heroes(tmp_path: Path) -> None:
+    one = _portrait((20, 90, 180), "1")
+    two = _portrait((170, 60, 20), "2")
+    features = tmp_path / "features.npz"
+    _write_features(features, [one, one.copy(), two], ids=[1, 1, 2])
+
+    recognizer = HeroRecognizer(features, HERO_LAYOUT)
+    scored = recognizer._score_crop(one)
+    reading = recognizer.recognize_crop(one)
+
+    assert recognizer.ids.tolist() == [1, 2]
+    assert scored is not None and scored.combined.shape == (2,)
+    assert reading.hero_id == 1
+    assert reading.margin >= 0.025
+
+
 def test_feature_asset_can_be_rebuilt_inside_predictor(tmp_path: Path) -> None:
     source = tmp_path / "heroes"
     source.mkdir()
     cv2.imwrite(str(source / "1.png"), _portrait((20, 90, 180), "1"))
+    cv2.imwrite(str(source / "1__death.png"), _portrait((20, 90, 180), "D"))
     cv2.imwrite(str(source / "2.png"), _portrait((170, 60, 20), "2"))
     (source / "heroes.json").write_text(
         json.dumps({"1": {"id": 1}, "2": {"id": 2}}), encoding="utf-8"
@@ -898,8 +917,8 @@ def test_feature_asset_can_be_rebuilt_inside_predictor(tmp_path: Path) -> None:
 
     assert build_hero_features(source, output) == 2
     with np.load(output) as features:
-        assert features["ids"].tolist() == [1, 2]
-        assert features["hashes"].shape == (2, 64)
+        assert features["ids"].tolist() == [1, 1, 2]
+        assert features["hashes"].shape == (3, 64)
 
 
 def test_feature_build_rejects_corrupt_or_missing_portraits(tmp_path: Path) -> None:
@@ -918,6 +937,10 @@ def test_feature_build_rejects_corrupt_or_missing_portraits(tmp_path: Path) -> N
 
     (source / "2.png").unlink()
     with pytest.raises(ValueError, match="does not match metadata"):
+        build_hero_features(source, output)
+
+    cv2.imwrite(str(source / "2__death.png"), _portrait((170, 60, 20), "D"))
+    with pytest.raises(ValueError, match="missing base portraits"):
         build_hero_features(source, output)
 
 
