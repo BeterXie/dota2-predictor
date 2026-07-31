@@ -115,6 +115,30 @@ APPROVED_EVENT_SEEDS: tuple[dict[str, Any], ...] = (
         "included_stages": ("main_event",),
         "include_internal_lcq": 0,
     },
+    {
+        "event_id": "games-of-the-future-2026",
+        "canonical_name": "Games of the Future 2026",
+        "tier": "tier_1",
+        "prize_pool_usd": 1_000_000,
+        "main_event_start_at": "2026-07-31T00:00:00+00:00",
+        "main_event_end_at": "2026-08-05T23:59:59+00:00",
+        "opendota_league_id": 19917,
+        "official_evidence_urls": (
+            "https://gofuture.games/news/item/"
+            "dota-2-returns-for-gotf-2026-with-1m-prize-pool/",
+        ),
+        "expected_map_count": None,
+        "observed_map_count": 2,
+        "public_map_count": 2,
+        "reconciliation_status": "reconciliation_pending",
+        "reconciliation_note": (
+            "The Dota 2 event remains active through 2026-08-05 UTC. "
+            "Two OpenDota maps were public when the event was approved; "
+            "the final map count remains unknown."
+        ),
+        "included_stages": ("main_event",),
+        "include_internal_lcq": 0,
+    },
 )
 
 
@@ -168,6 +192,17 @@ class EventRegistry:
                         AUDITED_AT,
                         REGISTRY_UPDATED_AT,
                     ),
+                )
+                self.connection.execute(
+                    """UPDATE event_candidates
+                          SET evidence_status='manually_audited',
+                              audit_status='promoted',
+                              audit_note='matched approved event registry seed',
+                              promoted_event_id=?
+                        WHERE source='opendota_league_catalog'
+                          AND provider_event_id=?
+                          AND audit_status IN ('pending', 'approved', 'promoted')""",
+                    (seed["event_id"], str(seed["opendota_league_id"])),
                 )
 
     def _migrate_known_seed_corrections(self) -> None:

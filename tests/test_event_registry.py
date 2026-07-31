@@ -16,11 +16,11 @@ from event_intelligence.storage import IntelligenceStorage
 
 
 NOW = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
-APPROVED_LEAGUE_IDS = (19543, 19696, 19101, 19785)
+APPROVED_LEAGUE_IDS = (19543, 19696, 19101, 19785, 19917)
 
 
 class EventRegistryTests(unittest.TestCase):
-    def test_seed_is_idempotent_and_returns_only_the_four_audited_events(self) -> None:
+    def test_seed_is_idempotent_and_returns_only_audited_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "intelligence.db"
             with IntelligenceStorage(path) as storage:
@@ -101,6 +101,30 @@ class EventRegistryTests(unittest.TestCase):
                 self.assertIn("120", ewc.reconciliation_note or "")
                 self.assertIn("active", ewc.reconciliation_note or "")
                 self.assertIn("no game object", ewc.reconciliation_note or "")
+
+    def test_games_of_the_future_uses_official_dota_event_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with IntelligenceStorage(Path(directory) / "intelligence.db") as storage:
+                storage.init_schema()
+                event = EventRegistry(storage).get_by_league_id(19917)
+
+                self.assertIsNotNone(event)
+                assert event is not None
+                self.assertEqual(event.prize_pool_usd, 1_000_000)
+                self.assertEqual(
+                    event.main_event_start_at,
+                    datetime(2026, 7, 31, tzinfo=timezone.utc),
+                )
+                self.assertEqual(
+                    event.main_event_end_at,
+                    datetime(2026, 8, 5, 23, 59, 59, tzinfo=timezone.utc),
+                )
+                self.assertIs(
+                    event.reconciliation_status,
+                    ReconciliationStatus.PENDING,
+                )
+                self.assertEqual(event.observed_map_count, 2)
+                self.assertIn("gofuture.games", event.official_evidence_urls[0])
 
     def test_seeding_repairs_static_audit_fields_without_resetting_observed_count(
         self,

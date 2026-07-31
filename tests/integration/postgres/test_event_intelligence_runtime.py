@@ -25,8 +25,24 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
 
     registry = EventRegistry(storage)
     events = registry.formal_events()
-    assert len(events) == 4
+    assert len(events) == 5
     assert registry.get_by_event_id("ewc-dota2-2026") is not None
+
+    gotf_candidate_id = registry.discover_candidate(
+        source="opendota_league_catalog",
+        provider_event_id="19917",
+        canonical_name="The Games of the Future 2026",
+        evidence_urls=("https://www.opendota.com/leagues/19917",),
+        discovered_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    registry.seed_approved_events()
+    gotf_candidate = next(
+        candidate
+        for candidate in registry.candidates()
+        if candidate.candidate_id == gotf_candidate_id
+    )
+    assert gotf_candidate.approval_status.value == "approved"
+    assert gotf_candidate.promoted_event_id == "games-of-the-future-2026"
 
     candidate_id = registry.discover_candidate(
         source="opendota",
@@ -44,7 +60,10 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
     )
 
     assert same_candidate_id == candidate_id
-    assert registry.candidates()[0].canonical_name == "Candidate Event Updated"
+    candidate = next(
+        item for item in registry.candidates() if item.candidate_id == candidate_id
+    )
+    assert candidate.canonical_name == "Candidate Event Updated"
 
     report = build_coverage_report(
         storage.connection,
@@ -56,7 +75,7 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
     assert report["integrity_check"] == "ok"
     assert report["invalid_constraints"] == 0
     intelligence = build_intelligence_report(storage.connection)
-    assert intelligence["strict_event_count"] == 4
+    assert intelligence["strict_event_count"] == 5
     assert intelligence["formal_maps"] == 0
 
     ensure_draft_lineage_tracking(storage.connection)

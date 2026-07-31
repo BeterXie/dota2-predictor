@@ -260,7 +260,7 @@ class IngestAdapterTests(unittest.TestCase):
         evidence = json.loads(rows[0][3])
         self.assertEqual(evidence["source_fields"]["ticket"], "ti")
         self.assertEqual(evidence["decision"], "pending_manual_audit")
-        self.assertEqual(len(self.registry.formal_events()), 4)
+        self.assertEqual(len(self.registry.formal_events()), 5)
         self.assertIsNotNone(
             self.storage.connection.execute(
                 "SELECT 1 FROM raw_source_observations WHERE endpoint='/api/leagues'"
