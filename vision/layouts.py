@@ -70,6 +70,31 @@ STANDARD_DOTA_HUD = BroadcastLayout(
 )
 
 
+WXC_GOTF_2026_LIVE = replace(
+    STANDARD_DOTA_HUD,
+    name="wxc_gotf_2026_live_1080p",
+    radiant_heroes=tuple(
+        NormalizedRegion(
+            0.288020833 + index * 0.032291667,
+            0.002777778,
+            0.316145833 + index * 0.032291667,
+            0.038888889,
+        )
+        for index in range(5)
+    ),
+    dire_heroes=tuple(
+        NormalizedRegion(
+            0.5546875 + index * 0.032291667,
+            0.002777778,
+            0.5828125 + index * 0.032291667,
+            0.038888889,
+        )
+        for index in range(5)
+    ),
+    draft_recognition_max_clock_seconds=None,
+)
+
+
 EPL_MASTERS_LIVE = BroadcastLayout(
     name="epl_masters_live_1080p",
     clock=STANDARD_DOTA_HUD.clock,

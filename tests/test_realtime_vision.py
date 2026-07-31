@@ -33,6 +33,7 @@ from vision.layouts import (
     EPL_S39_LIVE,
     NormalizedRegion,
     STANDARD_DOTA_HUD,
+    WXC_GOTF_2026_LIVE,
 )
 from vision.map_state import MapStateTracker
 from vision.observation_writer import ObservationWriter
@@ -105,6 +106,30 @@ def _synthetic_epl_s39_hud() -> np.ndarray:
     return image
 
 
+def _synthetic_wxc_gotf_hud() -> np.ndarray:
+    image = np.full((1080, 1920, 3), 70, dtype=np.uint8)
+    NormalizedRegion(0.241, 0.002, 0.2455, 0.052).crop(image)[:] = (0, 255, 255)
+    NormalizedRegion(0.755, 0.002, 0.759, 0.052).crop(image)[:] = (68, 0, 1)
+    for region in (
+        NormalizedRegion(1633 / 1920, 653 / 1080, 1639 / 1920, 812 / 1080),
+        NormalizedRegion(1633 / 1920, 653 / 1080, 1.0, 658 / 1080),
+        NormalizedRegion(1633 / 1920, 808 / 1080, 1.0, 812 / 1080),
+    ):
+        region.crop(image)[:] = (255, 0, 255)
+    for region in (
+        WXC_GOTF_2026_LIVE.clock,
+        WXC_GOTF_2026_LIVE.radiant_kills,
+        WXC_GOTF_2026_LIVE.dire_kills,
+    ):
+        region.crop(image)[:] = 255
+    for index, region in enumerate(
+        WXC_GOTF_2026_LIVE.radiant_heroes + WXC_GOTF_2026_LIVE.dire_heroes
+    ):
+        crop = region.crop(image)
+        crop[:] = np.random.default_rng(index).integers(0, 255, crop.shape, dtype=np.uint8)
+    return image
+
+
 def test_epl_layout_requires_the_complete_hud_geometry() -> None:
     image = _synthetic_epl_hud()
     selection = select_broadcast_layout(image)
@@ -139,6 +164,37 @@ def test_epl_s39_layout_uses_its_live_hud_and_brand_plate() -> None:
 
     NormalizedRegion(0.735, 0.940, 0.860, 1.000).crop(image)[:] = 70
     assert select_broadcast_layout(image).layout != EPL_S39_LIVE
+
+
+def test_wxc_gotf_layout_requires_its_tournament_caster_geometry() -> None:
+    image = _synthetic_wxc_gotf_hud()
+
+    selection = select_broadcast_layout(image)
+
+    assert selection.layout == WXC_GOTF_2026_LIVE
+    assert selection.confidence >= 0.9
+    NormalizedRegion(1633 / 1920, 653 / 1080, 1.0, 658 / 1080).crop(image)[:] = 70
+    assert select_broadcast_layout(image).layout != WXC_GOTF_2026_LIVE
+
+
+def test_wxc_gotf_layout_ignores_the_rotating_sponsor_plate() -> None:
+    image = _synthetic_wxc_gotf_hud()
+
+    NormalizedRegion(0.000, 0.692, 0.147, 0.745).crop(image)[:] = (0, 255, 255)
+
+    assert select_broadcast_layout(image).layout == WXC_GOTF_2026_LIVE
+
+
+def test_wxc_gotf_layout_uses_calibrated_portrait_insets() -> None:
+    radiant = WXC_GOTF_2026_LIVE.radiant_heroes
+    dire = WXC_GOTF_2026_LIVE.dire_heroes
+
+    assert (radiant[0].left, radiant[0].top, radiant[0].right, radiant[0].bottom) == pytest.approx(
+        (0.288020833, 0.002777778, 0.316145833, 0.038888889)
+    )
+    assert (dire[0].left, dire[0].top, dire[0].right, dire[0].bottom) == pytest.approx(
+        (0.5546875, 0.002777778, 0.5828125, 0.038888889)
+    )
 
 
 def test_epl_layout_uses_portrait_insets_for_hero_recognition() -> None:

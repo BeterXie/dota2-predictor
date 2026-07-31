@@ -13,6 +13,7 @@ from .layouts import (
     EPL_S39_LIVE,
     NormalizedRegion,
     STANDARD_DOTA_HUD,
+    WXC_GOTF_2026_LIVE,
 )
 
 
@@ -24,6 +25,12 @@ _EPL_SELECTION_THRESHOLD = 0.90
 _EPL_S39_SELECTION_THRESHOLD = 0.90
 _STANDARD_SELECTION_THRESHOLD = 0.90
 _EPL_S39_BRAND_PLATE = NormalizedRegion(0.735, 0.940, 0.860, 1.000)
+_WXC_LEFT_DIVIDER = NormalizedRegion(0.241, 0.002, 0.2455, 0.052)
+_WXC_RIGHT_DIVIDER = NormalizedRegion(0.755, 0.002, 0.759, 0.052)
+_WXC_CASTER_LEFT = NormalizedRegion(1633 / 1920, 653 / 1080, 1639 / 1920, 812 / 1080)
+_WXC_CASTER_TOP = NormalizedRegion(1633 / 1920, 653 / 1080, 1.0, 658 / 1080)
+_WXC_CASTER_BOTTOM = NormalizedRegion(1633 / 1920, 808 / 1080, 1.0, 812 / 1080)
+_WXC_SELECTION_THRESHOLD = 0.90
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,23 @@ def _cyan_ratio(image: np.ndarray, region: NormalizedRegion) -> float:
         & (hsv[:, :, 2] >= 100)
     )
     return float(cyan.mean())
+
+
+def _saturated_ratio(image: np.ndarray, region: NormalizedRegion) -> float:
+    hsv = cv2.cvtColor(region.crop(image), cv2.COLOR_BGR2HSV)
+    saturated = (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 40)
+    return float(saturated.mean())
+
+
+def _magenta_ratio(image: np.ndarray, region: NormalizedRegion) -> float:
+    hsv = cv2.cvtColor(region.crop(image), cv2.COLOR_BGR2HSV)
+    magenta = (
+        (hsv[:, :, 0] >= 140)
+        & (hsv[:, :, 0] <= 179)
+        & (hsv[:, :, 1] >= 100)
+        & (hsv[:, :, 2] >= 80)
+    )
+    return float(magenta.mean())
 
 
 def _dark_ratio(image: np.ndarray, region: NormalizedRegion) -> float:
@@ -145,6 +169,35 @@ def epl_s39_layout_confidence(image: np.ndarray) -> float:
     return min(signals)
 
 
+def wxc_gotf_2026_layout_confidence(image: np.ndarray) -> float:
+    """Score the WXC Games of the Future 2026 live overlay geometry."""
+    if not isinstance(image, np.ndarray) or image.ndim != 3 or image.size == 0:
+        return 0.0
+    signals = (
+        min(1.0, _saturated_ratio(image, _WXC_LEFT_DIVIDER) / 0.65),
+        min(1.0, _saturated_ratio(image, _WXC_RIGHT_DIVIDER) / 0.65),
+        min(1.0, _magenta_ratio(image, _WXC_CASTER_LEFT) / 0.50),
+        min(1.0, _magenta_ratio(image, _WXC_CASTER_TOP) / 0.65),
+        min(1.0, _magenta_ratio(image, _WXC_CASTER_BOTTOM) / 0.65),
+        min(1.0, _bright_ratio(image, WXC_GOTF_2026_LIVE.clock) / 0.035),
+        min(
+            1.0,
+            _bright_ratio(image, WXC_GOTF_2026_LIVE.radiant_kills) / 0.045,
+        ),
+        min(1.0, _bright_ratio(image, WXC_GOTF_2026_LIVE.dire_kills) / 0.045),
+        min(
+            1.0,
+            _detail(
+                image,
+                WXC_GOTF_2026_LIVE.radiant_heroes
+                + WXC_GOTF_2026_LIVE.dire_heroes,
+            )
+            / 18.0,
+        ),
+    )
+    return min(signals)
+
+
 def layout_match_confidence(image: np.ndarray, layout: BroadcastLayout) -> float:
     if layout.name == EPL_MASTERS_LIVE.name:
         return epl_masters_layout_confidence(image)
@@ -152,6 +205,8 @@ def layout_match_confidence(image: np.ndarray, layout: BroadcastLayout) -> float
         return standard_dota_hud_layout_confidence(image)
     if layout.name == EPL_S39_LIVE.name:
         return epl_s39_layout_confidence(image)
+    if layout.name == WXC_GOTF_2026_LIVE.name:
+        return wxc_gotf_2026_layout_confidence(image)
     return 0.0
 
 
@@ -162,12 +217,15 @@ def select_broadcast_layout(image: np.ndarray) -> LayoutSelection:
     epl_s39_confidence = epl_s39_layout_confidence(image)
     if epl_s39_confidence >= _EPL_S39_SELECTION_THRESHOLD:
         return LayoutSelection(EPL_S39_LIVE, epl_s39_confidence, True)
+    wxc_confidence = wxc_gotf_2026_layout_confidence(image)
+    if wxc_confidence >= _WXC_SELECTION_THRESHOLD:
+        return LayoutSelection(WXC_GOTF_2026_LIVE, wxc_confidence, True)
     standard_confidence = standard_dota_hud_layout_confidence(image)
     if standard_confidence >= _STANDARD_SELECTION_THRESHOLD:
         return LayoutSelection(STANDARD_DOTA_HUD, standard_confidence, True)
     return LayoutSelection(
         None,
-        max(epl_confidence, epl_s39_confidence, standard_confidence),
+        max(epl_confidence, epl_s39_confidence, wxc_confidence, standard_confidence),
         False,
         "unsupported_layout",
     )
