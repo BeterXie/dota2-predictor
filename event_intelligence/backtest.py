@@ -1746,6 +1746,12 @@ def _load_draft_corpus(
             (LABEL_VERSION,),
         ).fetchall()
     }
+    score_hashes_by_match: dict[int, list[str]] = {}
+    for (match_id, _player_slot), row in scores.items():
+        score_hashes_by_match.setdefault(match_id, []).append(str(row["input_hash"]))
+    state_hashes_by_match: dict[int, list[str]] = {}
+    for (match_id, _side), row in states.items():
+        state_hashes_by_match.setdefault(match_id, []).append(str(row["input_hash"]))
 
     loaded = []
     profile_maps: list[ProfileMap] = []
@@ -1990,16 +1996,8 @@ def _load_draft_corpus(
                 "raw_content_hash": content_hash,
                 "assignment_version": resolved_version,
                 "score_version": score_version,
-                "score_hashes": sorted(
-                    row["input_hash"]
-                    for key, row in scores.items()
-                    if key[0] == match_id
-                ),
-                "state_hashes": sorted(
-                    row["input_hash"]
-                    for key, row in states.items()
-                    if key[0] == match_id
-                ),
+                "score_hashes": sorted(score_hashes_by_match.get(match_id, ())),
+                "state_hashes": sorted(state_hashes_by_match.get(match_id, ())),
             }
         )
         map_number = _positive_integer(base["map_number"])
