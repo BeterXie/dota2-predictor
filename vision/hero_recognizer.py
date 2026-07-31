@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
-from scipy.optimize import linear_sum_assignment
-
 from vision.image_features import color_histogram, compute_phash
 from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
 
@@ -27,10 +26,33 @@ class HeroReading:
 
 
 @dataclass(frozen=True)
+class HeroSlotDiagnostic:
+    side: Literal["radiant", "dire"]
+    slot: int
+    best_hero_id: int | None
+    best_score: float
+    second_score: float
+    margin: float
+    accepted: bool
+    reason: Literal[
+        "accepted",
+        "low_signal",
+        "low_score",
+        "ambiguous_match",
+        "duplicate_hero",
+    ]
+
+
+@dataclass(frozen=True)
 class DraftReading:
     radiant_hero_ids: tuple[int, ...]
     dire_hero_ids: tuple[int, ...]
     confidence: float
+    slot_diagnostics: tuple[HeroSlotDiagnostic, ...] = ()
+
+    @property
+    def recognized_slot_count(self) -> int:
+        return sum(item.accepted for item in self.slot_diagnostics)
 
 
 class HeroRecognizer:
@@ -87,45 +109,147 @@ class HeroRecognizer:
     def read(self, image: np.ndarray) -> DraftReading:
         regions = self.layout.radiant_heroes + self.layout.dire_heroes
         score_rows = [self._scores(region.crop(image)) for region in regions]
-        if len(score_rows) != 10 or any(row is None for row in score_rows):
+        if len(score_rows) != 10:
             return DraftReading((), (), 0.0)
-        matrix = np.vstack(score_rows)
-        slot_indices, hero_indices = linear_sum_assignment(-matrix)
-        assigned = dict(zip(slot_indices.tolist(), hero_indices.tolist()))
-        ids = []
-        confidences = []
-        for slot in range(10):
-            hero_index = assigned[slot]
-            score = float(matrix[slot, hero_index])
-            alternatives = np.delete(matrix[slot], hero_index)
-            margin = score - float(alternatives.max())
-            if score < 0.62 or margin < 0.025:
-                return DraftReading((), (), score)
-            ids.append(int(self.ids[hero_index]))
-            confidences.append(score)
-        confidence = min(confidences)
-        return DraftReading(tuple(ids[:5]), tuple(ids[5:]), confidence)
+
+        diagnostics: list[HeroSlotDiagnostic] = []
+        for index, scores in enumerate(score_rows):
+            side: Literal["radiant", "dire"] = "radiant" if index < 5 else "dire"
+            slot = index % 5 + 1
+            if scores is None or len(scores) < 2:
+                diagnostics.append(
+                    HeroSlotDiagnostic(
+                        side, slot, None, 0.0, 0.0, 0.0, False, "low_signal"
+                    )
+                )
+                continue
+            order = np.argsort(scores)[::-1]
+            best, second = int(order[0]), int(order[1])
+            best_score = float(scores[best])
+            second_score = float(scores[second])
+            margin = best_score - second_score
+            if best_score < 0.62:
+                accepted = False
+                reason = "low_score"
+            elif margin < 0.025:
+                accepted = False
+                reason = "ambiguous_match"
+            else:
+                accepted = True
+                reason = "accepted"
+            diagnostics.append(
+                HeroSlotDiagnostic(
+                    side,
+                    slot,
+                    int(self.ids[best]),
+                    best_score,
+                    second_score,
+                    margin,
+                    accepted,
+                    reason,
+                )
+            )
+
+        accepted_ids = [
+            item.best_hero_id
+            for item in diagnostics
+            if item.accepted and item.best_hero_id is not None
+        ]
+        duplicate_ids = {
+            hero_id for hero_id in accepted_ids if accepted_ids.count(hero_id) > 1
+        }
+        if duplicate_ids:
+            diagnostics = [
+                replace(item, accepted=False, reason="duplicate_hero")
+                if item.best_hero_id in duplicate_ids
+                else item
+                for item in diagnostics
+            ]
+
+        accepted = [item for item in diagnostics if item.accepted]
+        confidence = min((item.best_score for item in accepted), default=0.0)
+        if len(accepted) != 10:
+            return DraftReading((), (), confidence, tuple(diagnostics))
+        ids = [item.best_hero_id for item in accepted]
+        assert all(hero_id is not None for hero_id in ids)
+        complete_ids = [int(hero_id) for hero_id in ids if hero_id is not None]
+        return DraftReading(
+            tuple(complete_ids[:5]),
+            tuple(complete_ids[5:]),
+            confidence,
+            tuple(diagnostics),
+        )
 
 
 class DraftTracker:
     def __init__(self, confirmations: int = 3) -> None:
-        self._recent: deque[DraftReading] = deque(maxlen=confirmations)
+        self.confirmations = confirmations
+        self._recent: tuple[deque[tuple[int, float]], ...] = tuple(
+            deque(maxlen=confirmations) for _ in range(10)
+        )
+        self._locked: dict[int, tuple[int, float]] = {}
 
     def reset(self) -> None:
-        self._recent.clear()
+        for recent in self._recent:
+            recent.clear()
+        self._locked.clear()
+
+    @staticmethod
+    def _diagnostics(reading: DraftReading) -> tuple[HeroSlotDiagnostic, ...]:
+        if len(reading.slot_diagnostics) == 10:
+            return reading.slot_diagnostics
+        heroes = reading.radiant_hero_ids + reading.dire_hero_ids
+        if len(heroes) != 10:
+            return ()
+        return tuple(
+            HeroSlotDiagnostic(
+                "radiant" if index < 5 else "dire",
+                index % 5 + 1,
+                hero_id,
+                reading.confidence,
+                0.0,
+                reading.confidence,
+                True,
+                "accepted",
+            )
+            for index, hero_id in enumerate(heroes)
+        )
 
     def update(self, reading: DraftReading) -> DraftReading | None:
-        if len(reading.radiant_hero_ids) != 5 or len(reading.dire_hero_ids) != 5:
-            self._recent.clear()
+        diagnostics = self._diagnostics(reading)
+        if len(diagnostics) != 10:
             return None
-        self._recent.append(reading)
-        if len(self._recent) < self._recent.maxlen:
+
+        for index, diagnostic in enumerate(diagnostics):
+            if index in self._locked:
+                continue
+            recent = self._recent[index]
+            if not diagnostic.accepted or diagnostic.best_hero_id is None:
+                recent.clear()
+                continue
+            recent.append((diagnostic.best_hero_id, diagnostic.best_score))
+            if len(recent) < self.confirmations:
+                continue
+            hero_ids = {hero_id for hero_id, _ in recent}
+            if len(hero_ids) != 1:
+                continue
+            hero_id = recent[-1][0]
+            if any(locked_id == hero_id for locked_id, _ in self._locked.values()):
+                recent.clear()
+                continue
+            self._locked[index] = (
+                hero_id,
+                min(score for _, score in recent),
+            )
+
+        if len(self._locked) != 10:
             return None
-        drafts = {(row.radiant_hero_ids, row.dire_hero_ids) for row in self._recent}
-        if len(drafts) != 1:
+        ids = [self._locked[index][0] for index in range(10)]
+        if len(set(ids)) != 10:
             return None
+        confidence = min(score for _, score in self._locked.values())
         return DraftReading(
-            reading.radiant_hero_ids,
-            reading.dire_hero_ids,
-            min(row.confidence for row in self._recent),
+            tuple(ids[:5]),
+            tuple(ids[5:]),
+            confidence,
         )

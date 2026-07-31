@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +17,12 @@ from scripts.fetch_hero_portraits import valid_portrait_bytes
 from scripts.supervise_raybet_streams import _capture_heartbeat, _heartbeat_diagnostics
 from scripts.watch_raybet_stream import allow_live_hud_tracking, _write_capture_heartbeat
 from vision.clock_reader import ClockReader, ClockReading
-from vision.hero_recognizer import DraftReading, DraftTracker, HeroRecognizer
+from vision.hero_recognizer import (
+    DraftReading,
+    DraftTracker,
+    HeroRecognizer,
+    HeroSlotDiagnostic,
+)
 from vision.hud_reader import HudFrameReading, HudReader
 from vision.image_features import color_histogram, compute_phash
 from vision.layout_selector import LayoutSelection, select_broadcast_layout
@@ -413,41 +417,65 @@ class FakeHttpClient:
         return FakeResponse(response)
 
 
-def _logo_database(path: Path, *, with_team_logos: bool) -> None:
-    payload = {
+class _LogoQueryResult:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self.rows = rows
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return self.rows
+
+
+class _LogoConnection:
+    def __init__(self, *, with_team_logos: bool) -> None:
+        self.with_team_logos = with_team_logos
+
+    def execute(
+        self,
+        query: str,
+        parameters: tuple[object, ...] = (),
+    ) -> _LogoQueryResult:
+        del parameters
+        if "FROM raybet_matches" in query:
+            return _LogoQueryResult([
+                ("VP", "Xtreme Gaming", json.dumps(_raw_logo_payload()))
+            ])
+        if "FROM teams" in query and self.with_team_logos:
+            return _LogoQueryResult([
+                ("Virtus.pro", "VP", "https://cdn.test/vp.png"),
+                ("Xtreme Gaming", "XG", "https://cdn.test/xg.png"),
+            ])
+        return _LogoQueryResult([])
+
+
+class _LogoStore:
+    def __init__(self, *, with_team_logos: bool) -> None:
+        self.connection = _LogoConnection(with_team_logos=with_team_logos)
+
+    def __enter__(self) -> "_LogoStore":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+
+def _raw_logo_payload() -> dict[str, object]:
+    return {
         "team": [
             {"pos": 2, "team_logo": "/file/fallback-two.png"},
             {"pos": 1, "team_logo": "file/fallback-one.png"},
         ]
     }
-    connection = sqlite3.connect(path)
-    try:
-        connection.executescript(
-            """
-            CREATE TABLE raybet_matches (
-                raybet_match_id TEXT PRIMARY KEY,
-                team_one TEXT,
-                team_two TEXT,
-                raw_json TEXT
-            );
-            CREATE TABLE teams (name TEXT, tag TEXT, logo_url TEXT);
-            """
-        )
-        connection.execute(
-            "INSERT INTO raybet_matches VALUES (?, ?, ?, ?)",
-            ("42", "VP", "Xtreme Gaming", json.dumps(payload)),
-        )
-        if with_team_logos:
-            connection.executemany(
-                "INSERT INTO teams VALUES (?, ?, ?)",
-                [
-                    ("Virtus.pro", "VP", "https://cdn.test/vp.png"),
-                    ("Xtreme Gaming", "XG", "https://cdn.test/xg.png"),
-                ],
-            )
-        connection.commit()
-    finally:
-        connection.close()
+
+
+def _patch_logo_store(monkeypatch: pytest.MonkeyPatch, *, with_team_logos: bool) -> None:
+    store = _LogoStore(with_team_logos=with_team_logos)
+    monkeypatch.setattr(
+        "vision.team_side.LiveBettingStore",
+        lambda database_url: store,
+    )
 
 
 def test_clock_tracker_confirms_pause_and_rejects_invalid_clock() -> None:
@@ -526,6 +554,7 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
     clock.reset_map(1)
     scoreboard = ScoreboardTracker(confirmations=2)
     advantage = NetWorthAdvantageTracker(confirmations=2)
+    draft = DraftTracker(confirmations=2)
     clock.update(ClockReading(100, 0.95, "1:40"))
     assert clock.update(ClockReading(101, 0.95, "1:41")) is not None
     scoreboard.update(ScoreboardReading(8, 5, 0.95))
@@ -537,6 +566,9 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
         )
         is not None
     )
+    complete_draft = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.95)
+    assert draft.update(complete_draft) is None
+    assert draft.update(complete_draft) is not None
 
     assert not allow_live_hud_tracking(
         ReplayGateReading("replay", 0.99),
@@ -544,6 +576,7 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
         clock_tracker=clock,
         scoreboard_tracker=scoreboard,
         advantage_tracker=advantage,
+        draft_tracker=draft,
     )
     assert clock.update(ClockReading(102, 0.95, "1:42")) is None
     assert scoreboard.update(ScoreboardReading(8, 5, 0.95)) is None
@@ -553,6 +586,7 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
         )
         is None
     )
+    assert draft.update(complete_draft) is None
 
 
 @pytest.mark.parametrize(
@@ -703,7 +737,7 @@ def test_hud_diagnostics_reports_the_first_blocking_gate() -> None:
         ClockReading(400, 0.97, "6:40"),
         ScoreboardReading(8, 5, 0.96),
         NetWorthAdvantageReading(None, None, None, 0.0),
-        DraftReading((1, 2, 3, 4), (5, 6, 7, 8), 0.8),
+        DraftReading((), (), 0.8, _draft_slot_diagnostics(set(range(8)))),
     )
     diagnostics = partial.diagnostics
     assert partial.core_hud_ready
@@ -758,7 +792,7 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
         ClockReading(400, 0.97, "6:40"),
         ScoreboardReading(8, 5, 0.96),
         NetWorthAdvantageReading(None, None, None, 0.0),
-        DraftReading((1, 2, 3, 4), (5, 6, 7, 8), 0.8),
+        DraftReading((), (), 0.8, _draft_slot_diagnostics(set(range(8)))),
     )
     output = tmp_path / "42.jsonl"
     _write_capture_heartbeat(
@@ -781,6 +815,28 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
     assert diagnostics["core_hud_ready"] is True
     assert diagnostics["net_worth_confirmed"] is False
     assert diagnostics["strategy_ready"] is False
+    assert diagnostics["radiant_hero_count"] == 5
+    assert diagnostics["dire_hero_count"] == 3
+    assert diagnostics["draft_failed_slots"] == [
+        {
+            "side": "dire",
+            "slot": 4,
+            "best_hero_id": 9,
+            "best_score": 0.8,
+            "second_score": 0.7,
+            "margin": 0.1,
+            "reason": "low_score",
+        },
+        {
+            "side": "dire",
+            "slot": 5,
+            "best_hero_id": 10,
+            "best_score": 0.8,
+            "second_score": 0.7,
+            "margin": 0.1,
+            "reason": "low_score",
+        },
+    ]
 
     heartbeat_path = output.with_suffix(".heartbeat.json")
     suggested_v2 = json.loads(heartbeat_path.read_text(encoding="utf-8"))
@@ -866,11 +922,79 @@ def test_draft_needs_temporal_agreement() -> None:
     confirmed = tracker.update(reading)
     assert confirmed is not None and confirmed.confidence == 0.7
     changed = DraftReading((1, 2, 3, 4, 6), (5, 7, 8, 9, 10), 0.95)
+    assert tracker.update(changed) == confirmed
+    tracker.reset()
     assert tracker.update(changed) is None
     switched = tracker.update(changed)
     assert switched is not None
     assert switched.radiant_hero_ids == changed.radiant_hero_ids
     assert switched.confidence == 0.95
+
+
+def test_hero_recognizer_reports_each_failed_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recognizer = HeroRecognizer.__new__(HeroRecognizer)
+    recognizer.ids = np.arange(1, 12, dtype=np.int32)
+    recognizer.layout = HERO_LAYOUT
+    rows: list[np.ndarray] = []
+    for slot in range(10):
+        scores = np.full(11, 0.1, dtype=np.float64)
+        scores[slot] = 0.8
+        scores[10] = 0.7
+        rows.append(scores)
+    rows[2][10] = 0.79
+    rows[6] = np.full(11, 0.1, dtype=np.float64)
+    rows[6][6] = 0.55
+    rows[6][10] = 0.5
+    score_rows = iter(rows)
+    monkeypatch.setattr(recognizer, "_scores", lambda image: next(score_rows))
+
+    reading = recognizer.read(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    assert reading.radiant_hero_ids == ()
+    assert reading.dire_hero_ids == ()
+    assert reading.recognized_slot_count == 8
+    failed = [item for item in reading.slot_diagnostics if not item.accepted]
+    assert [(item.side, item.slot, item.reason) for item in failed] == [
+        ("radiant", 3, "ambiguous_match"),
+        ("dire", 2, "low_score"),
+    ]
+    assert failed[0].best_hero_id == 3
+    assert failed[0].margin == pytest.approx(0.01)
+
+
+def _draft_slot_diagnostics(
+    accepted_slots: set[int],
+) -> tuple[HeroSlotDiagnostic, ...]:
+    return tuple(
+        HeroSlotDiagnostic(
+            "radiant" if index < 5 else "dire",
+            index % 5 + 1,
+            index + 1,
+            0.8,
+            0.7,
+            0.1,
+            index in accepted_slots,
+            "accepted" if index in accepted_slots else "low_score",
+        )
+        for index in range(10)
+    )
+
+
+def test_draft_tracker_confirms_slots_across_different_frames() -> None:
+    tracker = DraftTracker(confirmations=2)
+    first_half = DraftReading((), (), 0.8, _draft_slot_diagnostics(set(range(5))))
+    second_half = DraftReading((), (), 0.8, _draft_slot_diagnostics(set(range(5, 10))))
+
+    assert tracker.update(first_half) is None
+    assert tracker.update(first_half) is None
+    assert tracker.update(second_half) is None
+    confirmed = tracker.update(second_half)
+
+    assert confirmed is not None
+    assert confirmed.radiant_hero_ids == (1, 2, 3, 4, 5)
+    assert confirmed.dire_hero_ids == (6, 7, 8, 9, 10)
 
 
 def test_hls_capture_reads_frame() -> None:
@@ -1176,15 +1300,14 @@ def test_team_side_rejects_different_unrelated_stable_images() -> None:
     assert reading.radiant_team_side is None
 
 
-def test_team_side_database_prefers_team_tag_logo(tmp_path: Path, monkeypatch) -> None:
-    database = tmp_path / "logos.db"
-    _logo_database(database, with_team_logos=True)
+def test_team_side_database_prefers_team_tag_logo(monkeypatch) -> None:
+    _patch_logo_store(monkeypatch, with_team_logos=True)
     FakeHttpClient.responses = {
         "https://cdn.test/vp.png": _png(_logo("circle")),
         "https://cdn.test/xg.png": _png(_logo("square")),
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
-    recognizer = TeamSideRecognizer.from_database(database, "42")
+    recognizer = TeamSideRecognizer.from_database("postgresql+psycopg://test", "42")
     assert recognizer is not None
     assert FakeHttpClient.requested == [
         "https://cdn.test/vp.png",
@@ -1193,10 +1316,9 @@ def test_team_side_database_prefers_team_tag_logo(tmp_path: Path, monkeypatch) -
 
 
 def test_team_side_database_resolves_raybet_relative_logo_fallback(
-    tmp_path: Path, monkeypatch
+    monkeypatch,
 ) -> None:
-    database = tmp_path / "logos.db"
-    _logo_database(database, with_team_logos=False)
+    _patch_logo_store(monkeypatch, with_team_logos=False)
     one = "https://www.ray086.com/file/fallback-one.png"
     two = "https://www.ray086.com/file/fallback-two.png"
     FakeHttpClient.responses = {
@@ -1204,16 +1326,15 @@ def test_team_side_database_resolves_raybet_relative_logo_fallback(
         two: _png(_logo("square")),
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
-    recognizer = TeamSideRecognizer.from_database(database, "42")
+    recognizer = TeamSideRecognizer.from_database("postgresql+psycopg://test", "42")
     assert recognizer is not None
     assert FakeHttpClient.requested == [one, two]
 
 
 def test_team_side_database_falls_back_after_cdn_failure(
-    tmp_path: Path, monkeypatch
+    monkeypatch,
 ) -> None:
-    database = tmp_path / "logos.db"
-    _logo_database(database, with_team_logos=True)
+    _patch_logo_store(monkeypatch, with_team_logos=True)
     one = "https://www.ray086.com/file/fallback-one.png"
     two = "https://www.ray086.com/file/fallback-two.png"
     FakeHttpClient.responses = {
@@ -1224,7 +1345,7 @@ def test_team_side_database_falls_back_after_cdn_failure(
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
 
-    recognizer = TeamSideRecognizer.from_database(database, "42")
+    recognizer = TeamSideRecognizer.from_database("postgresql+psycopg://test", "42")
 
     assert recognizer is not None
     assert FakeHttpClient.requested == [
@@ -1236,10 +1357,9 @@ def test_team_side_database_falls_back_after_cdn_failure(
 
 
 def test_team_side_database_degrades_when_all_logo_sources_fail(
-    tmp_path: Path, monkeypatch
+    monkeypatch,
 ) -> None:
-    database = tmp_path / "logos.db"
-    _logo_database(database, with_team_logos=True)
+    _patch_logo_store(monkeypatch, with_team_logos=True)
     error = httpx.ConnectError("offline")
     FakeHttpClient.responses = {
         "https://cdn.test/vp.png": error,
@@ -1249,4 +1369,6 @@ def test_team_side_database_degrades_when_all_logo_sources_fail(
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
 
-    assert TeamSideRecognizer.from_database(database, "42") is None
+    assert (
+        TeamSideRecognizer.from_database("postgresql+psycopg://test", "42") is None
+    )

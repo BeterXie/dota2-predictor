@@ -57,7 +57,10 @@ from scripts.watch_raybet_stream import (
     resolve_data_paths as resolve_watcher_data_paths,
 )
 from contracts.live_observation import ComebackState, LiveObservation
+from vision.clock_reader import ClockReading
 from vision.hero_recognizer import DraftReading
+from vision.hud_reader import HudFrameReading
+from vision.layout_selector import LayoutSelection
 from vision.layouts import EPL_MASTERS_LIVE, STANDARD_DOTA_HUD
 from vision.map_state import ConfirmedClock
 from vision.scoreboard_reader import (
@@ -1629,7 +1632,7 @@ def test_supervisor_rejects_dead_or_stale_watchers(tmp_path: Path) -> None:
     assert details["watchers"]["42"]["state"] == "desired"
 
 
-def test_supervisor_distinguishes_unrecognized_capture_from_a_stall(
+def test_supervisor_distinguishes_partial_capture_from_a_stall(
     tmp_path: Path,
 ) -> None:
     now = datetime.now(timezone.utc)
@@ -1637,15 +1640,22 @@ def test_supervisor_distinguishes_unrecognized_capture_from_a_stall(
     output = tmp_path / "42.jsonl"
     output.write_text("unknown frame\n", encoding="utf-8")
     os.utime(output, (started.timestamp(), started.timestamp()))
+    reading = HudFrameReading(
+        LayoutSelection(EPL_MASTERS_LIVE, 0.98, True),
+        "game",
+        0.98,
+        ReplayGateReading("untrusted", 0.8),
+        ClockReading(None, 0.0, None),
+        ScoreboardReading(None, None, 0.0),
+        NetWorthAdvantageReading(None, None, None, 0.0),
+        DraftReading((), (), 0.0),
+    )
     _write_capture_heartbeat(
         output,
         match_id="42",
         captured_at=now,
-        capture_status="capturing_unrecognized",
-        layout_name="epl_masters_live_1080p",
-        layout_confidence=0.98,
-        screen_state="game",
-        replay_gate_status="untrusted",
+        capture_status="capturing_partial",
+        diagnostics=reading.diagnostics,
     )
     children = {"42": (FakeProcess(), StringIO(), StringIO())}
 
@@ -1657,7 +1667,8 @@ def test_supervisor_distinguishes_unrecognized_capture_from_a_stall(
     assert error is None
     assert details["capturing_watchers"] == 1
     assert details["producing_watchers"] == 0
-    assert details["watchers"]["42"]["capture_state"] == "capturing_unrecognized"
+    assert details["watchers"]["42"]["capture_state"] == "capturing_partial"
+    assert details["watchers"]["42"]["blocker_code"] == "replay_gate_untrusted"
     assert details["watchers"]["42"]["layout_profile"] == "epl_masters_live_1080p"
 
     heartbeat = capture_heartbeat_path(output)

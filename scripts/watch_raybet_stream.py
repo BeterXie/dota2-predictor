@@ -404,12 +404,15 @@ def allow_live_hud_tracking(
     clock_tracker: MapStateTracker,
     scoreboard_tracker: ScoreboardTracker,
     advantage_tracker: NetWorthAdvantageTracker,
+    draft_tracker: DraftTracker | None = None,
 ) -> bool:
     if replay_gate.status == "live":
         return True
     clock_tracker.reset_map(map_number)
     scoreboard_tracker.reset()
     advantage_tracker.reset()
+    if draft_tracker is not None:
+        draft_tracker.reset()
     return False
 
 
@@ -512,6 +515,18 @@ def _write_capture_heartbeat(
             "dire_count": diagnostics.dire_hero_count,
             "confidence": round(diagnostics.draft_confidence, 6),
             "confirmed": diagnostics.draft_confirmed,
+            "failed_slots": [
+                {
+                    "side": item.side,
+                    "slot": item.slot,
+                    "best_hero_id": item.best_hero_id,
+                    "best_score": round(item.best_score, 6),
+                    "second_score": round(item.second_score, 6),
+                    "margin": round(item.margin, 6),
+                    "reason": item.reason,
+                }
+                for item in diagnostics.draft_failed_slots
+            ],
         },
         "team_side": {"confirmed": diagnostics.team_side_confirmed},
         "core_hud_ready": diagnostics.core_hud_ready,
@@ -641,6 +656,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     clock_tracker=clock_tracker,
                     scoreboard_tracker=scoreboard_tracker,
                     advantage_tracker=advantage_tracker,
+                    draft_tracker=draft_tracker,
                 ):
                     outside_game_frames += 1
                     confirmed_scoreboard = None

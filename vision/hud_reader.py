@@ -10,7 +10,12 @@ import numpy as np
 from contracts.live_observation import COMEBACK_STATE_MIN_CONFIDENCE
 
 from .clock_reader import ClockReader, ClockReading
-from .hero_recognizer import DEFAULT_FEATURE_PATH, DraftReading, HeroRecognizer
+from .hero_recognizer import (
+    DEFAULT_FEATURE_PATH,
+    DraftReading,
+    HeroRecognizer,
+    HeroSlotDiagnostic,
+)
 from .layout_selector import LayoutSelection, select_broadcast_layout
 from .layouts import BroadcastLayout
 from .screen_state import classify_screen_state
@@ -102,6 +107,7 @@ class HudDiagnostics:
     dire_hero_count: int
     draft_confidence: float
     draft_confirmed: bool
+    draft_failed_slots: tuple[HeroSlotDiagnostic, ...]
     team_side_confirmed: bool
 
     @classmethod
@@ -122,6 +128,17 @@ class HudDiagnostics:
             and reading.net_worth_advantage.confidence >= COMEBACK_STATE_MIN_CONFIDENCE
         )
         draft_confirmed = reading.draft_ready
+        slot_diagnostics = reading.draft.slot_diagnostics
+        if slot_diagnostics:
+            radiant_hero_count = sum(
+                item.accepted and item.side == "radiant" for item in slot_diagnostics
+            )
+            dire_hero_count = sum(
+                item.accepted and item.side == "dire" for item in slot_diagnostics
+            )
+        else:
+            radiant_hero_count = len(reading.draft.radiant_hero_ids)
+            dire_hero_count = len(reading.draft.dire_hero_ids)
         diagnostics = cls(
             blocker_code="ready",
             layout_name=reading.selection.layout_name,
@@ -143,10 +160,13 @@ class HudDiagnostics:
             net_worth_maximum=reading.net_worth_advantage.maximum,
             net_worth_confidence=reading.net_worth_advantage.confidence,
             net_worth_confirmed=net_worth_confirmed,
-            radiant_hero_count=len(reading.draft.radiant_hero_ids),
-            dire_hero_count=len(reading.draft.dire_hero_ids),
+            radiant_hero_count=radiant_hero_count,
+            dire_hero_count=dire_hero_count,
             draft_confidence=reading.draft.confidence,
             draft_confirmed=draft_confirmed,
+            draft_failed_slots=tuple(
+                item for item in slot_diagnostics if not item.accepted
+            ),
             team_side_confirmed=False,
         )
         return diagnostics.with_confirmations()
