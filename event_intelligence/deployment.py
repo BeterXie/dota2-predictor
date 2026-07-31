@@ -117,7 +117,7 @@ def _actual_result_availability(
               AND observation.content_hash=artifact.content_hash
             WHERE artifact.first_usable_at IS NOT NULL
               AND observation.first_usable_at IS NOT NULL
-            GROUP BY status.match_id"""
+            GROUP BY status.match_id, artifact.first_usable_at"""
     ).fetchall()
     result: dict[int, datetime] = {}
     for row in rows:
@@ -235,7 +235,7 @@ def _current_calibration_samples(
                   prediction.probability, prediction.eventual_radiant_win,
                   prediction.prediction_cutoff, status.series_id,
                   status.event_id,
-                  MAX(
+                  GREATEST(
                       artifact.first_usable_at,
                       (SELECT MIN(observation.first_usable_at)
                          FROM raw_source_observations AS observation

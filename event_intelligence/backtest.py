@@ -153,7 +153,7 @@ _CORPUS_PLAYER_QUERY = f"""SELECT {_qualified_columns('player', _CORPUS_PLAYER_C
 _CORPUS_PICK_QUERY = f"""SELECT {_qualified_columns('pick', _CORPUS_PICK_COLUMNS)}
    FROM formal_map_eligibility AS eligible
    JOIN picks_bans AS pick ON pick.match_id=eligible.match_id
-   WHERE eligible.draft_readiness='ready' AND pick.is_pick=1
+   WHERE eligible.draft_readiness='ready' AND pick.is_pick IS TRUE
    ORDER BY pick.match_id, pick.ord, pick.id"""
 _CORPUS_STATE_QUERY = f"""SELECT {_qualified_columns('state', _CORPUS_STATE_COLUMNS)}
    FROM team_map_states AS state

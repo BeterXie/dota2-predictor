@@ -799,13 +799,13 @@ def _assert_runtime_artifact_limits(
 ) -> None:
     for horizon in HORIZONS:
         model = connection.execute(
-            """SELECT length(CAST(artifact_json AS BLOB))
+            """SELECT octet_length(artifact_json)
                  FROM draft_model_artifacts
                 WHERE model_hash=? AND horizon_minutes=?""",
             (model_hashes[horizon], horizon),
         ).fetchone()
         calibration = connection.execute(
-            """SELECT length(CAST(artifact_json AS BLOB)), support
+            """SELECT octet_length(artifact_json), support
                  FROM draft_calibration_artifacts
                 WHERE calibration_hash=? AND model_hash=?
                   AND horizon_minutes=?""",

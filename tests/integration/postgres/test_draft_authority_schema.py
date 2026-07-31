@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,6 +16,13 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError
 
 from database.engine import build_engine, require_database_url
+from database.session import PostgresSession
+from event_intelligence.backtest import _CORPUS_PICK_QUERY
+from event_intelligence.deployment import (
+    _actual_result_availability,
+    _current_calibration_samples,
+)
+from live_betting.draft_publisher import _assert_runtime_artifact_limits
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -222,6 +230,49 @@ def test_draft_schema_requires_complete_five_horizon_bundle(
                 ),
                 {"deployment_key": deployment_key},
             )
+
+
+def test_runtime_artifact_limits_use_postgres_byte_length(
+    postgres_engine: Engine,
+) -> None:
+    with postgres_engine.begin() as connection:
+        _, model_hashes, calibration_hashes, _ = _seed_deployment(connection)
+
+    session = PostgresSession(postgres_engine)
+    try:
+        _assert_runtime_artifact_limits(
+            session,
+            model_hashes=model_hashes,
+            calibration_hashes=calibration_hashes,
+        )
+    finally:
+        session.close()
+
+
+def test_draft_corpus_pick_query_uses_postgres_boolean(
+    postgres_engine: Engine,
+) -> None:
+    session = PostgresSession(postgres_engine)
+    try:
+        assert session.execute(_CORPUS_PICK_QUERY).fetchall() == []
+    finally:
+        session.close()
+
+
+def test_draft_deployment_availability_queries_use_postgres_sql(
+    postgres_engine: Engine,
+) -> None:
+    session = PostgresSession(postgres_engine)
+    try:
+        assert _actual_result_availability(session) == {}
+        samples = _current_calibration_samples(
+            session,
+            datetime(2026, 7, 1, tzinfo=UTC),
+        )
+    finally:
+        session.close()
+
+    assert all(not rows for rows in samples.values())
 
 
 def test_prospective_curve_and_landmark_require_deployed_authority(
