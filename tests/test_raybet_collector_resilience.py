@@ -12,8 +12,15 @@ from live_betting.direct_response_audit import (
     audited_direct_request,
 )
 from live_betting.monitor import (
+    DEFAULT_FULL_ODDS_INTERVAL_SECONDS,
+    DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS,
     LIVE_LIST_CACHE_TTL_SECONDS,
     PerRequestBackoff,
+    _active_priority_match_ids,
+    _claim_odds_request,
+    _odds_channel_rows,
+    _partition_live_rows,
+    _publish_live_rows,
     _refresh_live_list_cache,
     collect_once,
 )
@@ -23,6 +30,84 @@ from live_betting.storage import LiveBettingStore
 
 NOW = datetime(2026, 7, 23, 1, 2, 3, tzinfo=timezone.utc)
 ODDS_ENDPOINT = f"{BASE_URL}/odds"
+
+
+class PriorityQueryResult:
+    def __init__(self, rows: list[tuple[str]]) -> None:
+        self.rows = rows
+
+    def fetchall(self) -> list[tuple[str]]:
+        return self.rows
+
+
+class PriorityConnection:
+    def __init__(self, rows: list[tuple[str]]) -> None:
+        self.rows = rows
+        self.statement = ""
+
+    def execute(self, statement: str) -> PriorityQueryResult:
+        self.statement = statement
+        return PriorityQueryResult(self.rows)
+
+
+def test_priority_odds_defaults_preserve_transport_freshness_budget() -> None:
+    assert DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS == 8.0
+    assert DEFAULT_FULL_ODDS_INTERVAL_SECONDS == 120.0
+
+
+def test_priority_selection_requires_active_non_invalidated_strict_mapping() -> None:
+    connection = PriorityConnection([("1001",), ("1003",)])
+    store = type("Store", (), {"connection": connection})()
+
+    priority_ids = _active_priority_match_ids(store)
+    priority, full = _partition_live_rows(
+        [
+            {"id": "1001", "status": 2},
+            {"id": "1002", "status": 2},
+            {"id": "1003", "status": 1},
+        ],
+        priority_ids,
+    )
+
+    assert priority_ids == {"1001", "1003"}
+    assert [row["id"] for row in priority] == ["1001"]
+    assert [row["id"] for row in full] == ["1002", "1003"]
+    _publish_live_rows(
+        [
+            {"id": "1001", "status": 2},
+            {"id": "1002", "status": 2},
+            {"id": "1003", "status": 1},
+        ]
+    )
+    try:
+        priority_rows, source_count, excluded = _odds_channel_rows(
+            store,
+            "priority",
+        )
+        full_rows, full_source_count, full_excluded = _odds_channel_rows(
+            store,
+            "full",
+        )
+    finally:
+        _publish_live_rows([])
+
+    assert [row["id"] for row in priority_rows] == ["1001"]
+    assert [row["id"] for row in full_rows] == ["1002", "1003"]
+    assert (source_count, excluded) == (3, 0)
+    assert (full_source_count, full_excluded) == (3, 1)
+    assert "COALESCE(CAST(match.status AS TEXT), '')!='3'" in connection.statement
+    assert "strict_live_map_mapping_invalidations" in connection.statement
+    assert "strict_live_map_mapping_supersessions" in connection.statement
+
+
+def test_priority_and_full_channels_cannot_claim_same_match() -> None:
+    with _claim_odds_request("1001") as priority_claimed:
+        with _claim_odds_request("1001") as full_claimed:
+            assert priority_claimed is True
+            assert full_claimed is False
+
+    with _claim_odds_request("1001") as later_claimed:
+        assert later_claimed is True
 
 
 class Session:

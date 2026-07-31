@@ -7,8 +7,10 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,6 +49,38 @@ PREMATCH_COLLECTION_LEAD_TIME = timedelta(hours=2)
 RAYBET_SCHEDULE_TIMEZONE = timezone(timedelta(hours=8))
 ODDS_BACKOFF_INITIAL_SECONDS = 3.0
 ODDS_BACKOFF_MAX_SECONDS = 300.0
+DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS = 8.0
+DEFAULT_FULL_ODDS_INTERVAL_SECONDS = 120.0
+_ODDS_REQUESTS_IN_FLIGHT: set[str] = set()
+_ODDS_REQUEST_LOCK = threading.Lock()
+_LIVE_ROWS: tuple[dict[str, Any], ...] = ()
+_LIVE_ROWS_LOCK = threading.Lock()
+
+
+@contextmanager
+def _claim_odds_request(match_id: str) -> Iterator[bool]:
+    with _ODDS_REQUEST_LOCK:
+        claimed = match_id not in _ODDS_REQUESTS_IN_FLIGHT
+        if claimed:
+            _ODDS_REQUESTS_IN_FLIGHT.add(match_id)
+    try:
+        yield claimed
+    finally:
+        if claimed:
+            with _ODDS_REQUEST_LOCK:
+                _ODDS_REQUESTS_IN_FLIGHT.discard(match_id)
+
+
+def _publish_live_rows(rows: list[dict[str, Any]]) -> None:
+    snapshot = tuple(dict(row) for row in rows if isinstance(row, dict))
+    with _LIVE_ROWS_LOCK:
+        global _LIVE_ROWS
+        _LIVE_ROWS = snapshot
+
+
+def _live_rows_snapshot() -> list[dict[str, Any]]:
+    with _LIVE_ROWS_LOCK:
+        return [dict(row) for row in _LIVE_ROWS]
 
 
 @dataclass(frozen=True)
@@ -611,6 +645,162 @@ def completed_refresh_due(
     return completed_rows is None or monotonic_now >= next_refresh
 
 
+def _active_priority_match_ids(store: LiveBettingStore) -> set[str]:
+    rows = store.connection.execute(
+        """SELECT DISTINCT mapping.raybet_match_id
+             FROM strict_live_map_mappings AS mapping
+             JOIN raybet_matches AS match
+               ON match.raybet_match_id=mapping.raybet_match_id
+            WHERE COALESCE(CAST(match.status AS TEXT), '')!='3'
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM strict_live_map_mapping_invalidations AS invalidation
+                   WHERE invalidation.mapping_id=mapping.mapping_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM strict_live_map_mapping_supersessions AS supersession
+                   WHERE supersession.previous_mapping_id=mapping.mapping_id
+              )
+            ORDER BY mapping.raybet_match_id"""
+    ).fetchall()
+    return {
+        str(row[0])
+        for row in rows
+        if str(row[0] or "").isdigit()
+    }
+
+
+def _partition_live_rows(
+    list_rows: list[dict[str, Any]],
+    priority_match_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    priority: list[dict[str, Any]] = []
+    full: list[dict[str, Any]] = []
+    for row in list_rows:
+        match_id = str(row.get("id") or "") if isinstance(row, dict) else ""
+        if (
+            match_id in priority_match_ids
+            and str(row.get("status") or "") == "2"
+        ):
+            priority.append(row)
+        else:
+            full.append(row)
+    return priority, full
+
+
+def _odds_channel_rows(
+    store: LiveBettingStore,
+    channel: str,
+) -> tuple[list[dict[str, Any]], int, int]:
+    live_rows = _live_rows_snapshot()
+    priority, full = _partition_live_rows(
+        live_rows,
+        _active_priority_match_ids(store),
+    )
+    if channel == "priority":
+        return priority, len(live_rows), 0
+    if channel == "full":
+        return full, len(live_rows), len(priority)
+    raise ValueError("unknown odds collection channel")
+
+
+def _odds_channel_loop(
+    database_url: str,
+    raw_dir: Path,
+    interval: float,
+    channel: str,
+) -> None:
+    component = f"raybet_{channel}_odds_worker"
+    collector = f"raybet_{channel}_odds"
+    backoff = PerRequestBackoff()
+    with LiveBettingStore(
+        database_url, raw_archive_root=raw_dir
+    ) as store, RayBetClient() as client:
+        while True:
+            started = time.monotonic()
+            summary = {
+                "matches": 0,
+                "listed": 0,
+                "odds": 0,
+                "changed": 0,
+                "errors": 0,
+                "backoff_skipped": 0,
+                "in_flight_skipped": 0,
+                "prematch_collected": 0,
+                "prematch_skipped": 0,
+            }
+            source_listed = 0
+            priority_excluded = 0
+            try:
+                rows, source_listed, priority_excluded = _odds_channel_rows(
+                    store,
+                    channel,
+                )
+                summary = collect_once(
+                    store,
+                    client,
+                    raw_dir,
+                    list_rows=rows,
+                    audit_match_list=False,
+                    backoff=backoff,
+                    collector_name=collector,
+                )
+                now = utc_now()
+                partial_errors = summary["errors"] + summary["backoff_skipped"]
+                record_health(
+                    store.connection,
+                    component,
+                    "degraded" if partial_errors else "healthy",
+                    heartbeat_at=now,
+                    success_at=now if summary["matches"] else None,
+                    error_at=now if partial_errors else None,
+                    error=(
+                        f"{partial_errors} {channel} odds collection error(s)"
+                        if partial_errors
+                        else None
+                    ),
+                    details={
+                        "source": "worker",
+                        "channel": channel,
+                        "interval_seconds": interval,
+                        "source_listed": source_listed,
+                        "priority_excluded": priority_excluded,
+                        "has_channel_match": bool(summary["listed"]),
+                        **summary,
+                        "odds_backoff": backoff.details(),
+                    },
+                )
+            except Exception as error:
+                now = utc_now()
+                record_health(
+                    store.connection,
+                    component,
+                    "degraded",
+                    heartbeat_at=now,
+                    error_at=now,
+                    error=type(error).__name__,
+                    details={
+                        "source": "worker",
+                        "channel": channel,
+                        "interval_seconds": interval,
+                        "source_listed": source_listed,
+                        "priority_excluded": priority_excluded,
+                        "has_channel_match": False,
+                        **summary,
+                        "odds_backoff": backoff.details(),
+                    },
+                )
+                logger.warning(
+                    "%s RayBet odds refresh failed (%s)",
+                    channel,
+                    type(error).__name__,
+                )
+            elapsed = time.monotonic() - started
+            delay = interval if source_listed else min(interval, 1.0)
+            time.sleep(max(0.0, delay - elapsed))
+
+
 def collect_once(
     store: LiveBettingStore,
     client: RayBetClient,
@@ -621,6 +811,7 @@ def collect_once(
     backoff: PerRequestBackoff | None = None,
     monotonic_now: float | None = None,
     wall_clock: Callable[[], datetime] = utc_now,
+    collector_name: str = "raybet",
 ) -> dict[str, int]:
     _require_store_archive_root(store, raw_dir)
     if list_rows is None:
@@ -635,6 +826,7 @@ def collect_once(
     error_count = 0
     success_count = 0
     backoff_skipped = 0
+    in_flight_skipped = 0
     prematch_collected = 0
     prematch_skipped = 0
     collection_now = wall_clock()
@@ -678,14 +870,18 @@ def collect_once(
             ):
                 backoff_skipped += 1
                 continue
-            changes, snapshot_count, fingerprint, _ = _collect_odds_response(
-                store,
-                client,
-                match_id=match_id,
-                response_kind="live_odds",
-                list_row=list_row,
-                audit_only=is_prematch,
-            )
+            with _claim_odds_request(match_id) as claimed:
+                if not claimed:
+                    in_flight_skipped += 1
+                    continue
+                changes, snapshot_count, fingerprint, _ = _collect_odds_response(
+                    store,
+                    client,
+                    match_id=match_id,
+                    response_kind="live_odds",
+                    list_row=list_row,
+                    audit_only=is_prematch,
+                )
             raw_fingerprints[match_id] = fingerprint
             changed_count += changes
             odds_count += snapshot_count
@@ -710,7 +906,7 @@ def collect_once(
     completed_at = utc_now()
     if error_count or backoff_skipped:
         store.record_collector(
-            "raybet",
+            collector_name,
             success_at=completed_at if success_count else None,
             error_at=completed_at,
             error=(
@@ -719,7 +915,7 @@ def collect_once(
             ),
         )
     else:
-        store.record_collector("raybet", success_at=completed_at)
+        store.record_collector(collector_name, success_at=completed_at)
     return {
         "matches": success_count,
         "listed": len(list_rows),
@@ -727,6 +923,7 @@ def collect_once(
         "changed": changed_count,
         "errors": error_count,
         "backoff_skipped": backoff_skipped,
+        "in_flight_skipped": in_flight_skipped,
         "prematch_collected": prematch_collected,
         "prematch_skipped": prematch_skipped,
     }
@@ -837,6 +1034,21 @@ def run(args: argparse.Namespace) -> int:
     ) as store, RayBetClient() as client:
         if not getattr(args, "schema_prepared", False):
             store.init_schema()
+        priority_interval = float(
+            getattr(
+                args,
+                "priority_odds_interval",
+                DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS,
+            )
+        )
+        full_interval = float(
+            getattr(
+                args,
+                "full_odds_interval",
+                DEFAULT_FULL_ODDS_INTERVAL_SECONDS,
+            )
+        )
+        odds_workers_started = False
         started_at = utc_now()
         record_health(
             store.connection,
@@ -876,6 +1088,21 @@ def run(args: argparse.Namespace) -> int:
                     cached_rows = live_list_cache.current_rows(monotonic_now)
                 if cached_rows is None:
                     raise RuntimeError("live match list cache unavailable")
+                _publish_live_rows(cached_rows)
+                if not args.once and not odds_workers_started:
+                    for channel, interval in (
+                        ("priority", priority_interval),
+                        ("full", full_interval),
+                    ):
+                        if interval <= 0:
+                            continue
+                        threading.Thread(
+                            target=_odds_channel_loop,
+                            args=(args.database_url, raw_dir, interval, channel),
+                            name=f"raybet-{channel}-odds",
+                            daemon=True,
+                        ).start()
+                    odds_workers_started = True
                 completed_refresh_needed = False
                 completed_summary = {
                     "matches": 0,
@@ -912,12 +1139,30 @@ def run(args: argparse.Namespace) -> int:
                         )
                     else:
                         completed_refresh_needed = True
-                summary = collect_once(
-                    store, client, raw_dir, list_rows=cached_rows,
-                    raw_fingerprints=raw_fingerprints,
-                    audit_match_list=False,
-                    backoff=odds_backoff,
-                )
+                summary = {
+                    "matches": 0,
+                    "listed": len(cached_rows),
+                    "odds": 0,
+                    "changed": 0,
+                    "errors": 0,
+                    "backoff_skipped": 0,
+                    "in_flight_skipped": 0,
+                    "prematch_collected": 0,
+                    "prematch_skipped": 0,
+                    "delegated": 0,
+                }
+                if args.once:
+                    summary = collect_once(
+                        store,
+                        client,
+                        raw_dir,
+                        list_rows=cached_rows,
+                        raw_fingerprints=raw_fingerprints,
+                        audit_match_list=False,
+                        backoff=odds_backoff,
+                    )
+                else:
+                    summary["delegated"] = len(cached_rows)
                 prematch_summary = {
                     "matches": 0,
                     "listed": len(prematch_rows or []),
@@ -1006,7 +1251,9 @@ def run(args: argparse.Namespace) -> int:
                 collection_succeeded = any(
                     (
                         item["matches"] > 0
+                        or item.get("delegated", 0) > 0
                         or item.get("skipped", 0) > 0
+                        or item.get("in_flight_skipped", 0) > 0
                         or item.get("prematch_skipped", 0) > 0
                         or (item["listed"] == 0 and item["errors"] == 0)
                     )
@@ -1027,6 +1274,14 @@ def run(args: argparse.Namespace) -> int:
                     details={
                         "source": "worker",
                         **summary,
+                        "full_odds": {
+                            "component": "raybet_full_odds_worker",
+                            "interval_seconds": full_interval,
+                        },
+                        "priority_odds": {
+                            "component": "raybet_priority_odds_worker",
+                            "interval_seconds": priority_interval,
+                        },
                         "prematch": prematch_summary,
                         "completed": completed_summary,
                         "live_list_cache": _live_list_cache_details(
@@ -1088,6 +1343,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--list-interval", type=float, default=15.0)
+    parser.add_argument(
+        "--priority-odds-interval",
+        type=float,
+        default=DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS,
+    )
+    parser.add_argument(
+        "--full-odds-interval",
+        type=float,
+        default=DEFAULT_FULL_ODDS_INTERVAL_SECONDS,
+    )
     parser.add_argument(
         "--prematch-interval",
         type=float,
