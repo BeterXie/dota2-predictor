@@ -42,7 +42,10 @@ from live_betting.vision_frame_registry import (  # noqa: E402
 )
 from vision.hero_recognizer import (  # noqa: E402
     DraftReading,
+    DraftSlotStatus,
     DraftTracker,
+    HeroFeatureChannelScores,
+    HeroSlotDiagnostic,
 )
 from vision.hud_reader import HudDiagnostics, HudReader  # noqa: E402
 from vision.layouts import BroadcastLayout  # noqa: E402
@@ -459,6 +462,63 @@ def capture_heartbeat_path(output: Path) -> Path:
     return output.with_suffix(".heartbeat.json")
 
 
+def _feature_channel_payload(
+    channels: HeroFeatureChannelScores | None,
+) -> dict[str, float] | None:
+    if channels is None:
+        return None
+    return {
+        "phash": round(channels.phash, 6),
+        "histogram": round(channels.histogram, 6),
+        "pixel": round(channels.pixel, 6),
+    }
+
+
+def _hero_slot_payload(item: HeroSlotDiagnostic) -> dict[str, object]:
+    return {
+        "side": item.side,
+        "slot": item.slot,
+        "accepted": item.accepted,
+        "reason": item.reason,
+        "crop_hash": item.crop_hash,
+        "best": {
+            "hero_id": item.best_hero_id,
+            "combined": round(item.best_score, 6),
+            "channels": _feature_channel_payload(item.best_channels),
+        },
+        "second": {
+            "hero_id": item.second_hero_id,
+            "combined": round(item.second_score, 6),
+            "channels": _feature_channel_payload(item.second_channels),
+        },
+        "margin": round(item.margin, 6),
+    }
+
+
+def _draft_slot_status_payload(item: DraftSlotStatus) -> dict[str, object]:
+    return {
+        "side": item.side,
+        "slot": item.slot,
+        "state": item.state,
+        "hero_id": item.hero_id,
+        "independent_evidence_count": item.independent_evidence_count,
+        "high_quality_evidence_count": item.high_quality_evidence_count,
+        "strong_conflict_count": item.strong_conflict_count,
+        "duplicate_evidence_count": item.duplicate_evidence_count,
+        "last_observed_at": item.last_observed_at,
+        "evidence": [
+            {
+                "hero_id": evidence.hero_id,
+                "observed_at": evidence.observed_at,
+                "score": round(evidence.score, 6),
+                "margin": round(evidence.margin, 6),
+                "crop_hash": evidence.crop_hash,
+            }
+            for evidence in item.evidence
+        ],
+    }
+
+
 def _write_capture_heartbeat(
     output: Path,
     *,
@@ -466,6 +526,7 @@ def _write_capture_heartbeat(
     captured_at: datetime,
     capture_status: str,
     diagnostics: HudDiagnostics,
+    draft_slot_statuses: tuple[DraftSlotStatus, ...] = (),
 ) -> None:
     if capture_status not in {"producing_trusted", "capturing_partial"}:
         raise ValueError("capture heartbeat status is invalid")
@@ -515,6 +576,7 @@ def _write_capture_heartbeat(
             "dire_count": diagnostics.dire_hero_count,
             "confidence": round(diagnostics.draft_confidence, 6),
             "confirmed": diagnostics.draft_confirmed,
+            "slots": [_hero_slot_payload(item) for item in diagnostics.draft_slots],
             "failed_slots": [
                 {
                     "side": item.side,
@@ -526,6 +588,9 @@ def _write_capture_heartbeat(
                     "reason": item.reason,
                 }
                 for item in diagnostics.draft_failed_slots
+            ],
+            "tracker_slots": [
+                _draft_slot_status_payload(item) for item in draft_slot_statuses
             ],
         },
         "team_side": {"confirmed": diagnostics.team_side_confirmed},
@@ -642,6 +707,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 scoreboard_tracker.reset()
                 advantage_tracker.reset()
                 draft_tracker.reset()
+                last_draft = None
             active_layout_name = selection.layout_name
             state = hud.screen_state
             confirmed_clock: ConfirmedClock | None = None
@@ -658,6 +724,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     advantage_tracker=advantage_tracker,
                     draft_tracker=draft_tracker,
                 ):
+                    last_draft = None
                     outside_game_frames += 1
                     confirmed_scoreboard = None
                     confirmed_advantage = None
@@ -709,6 +776,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                         captured_at=captured,
                         capture_status="capturing_partial",
                         diagnostics=hud.diagnostics,
+                        draft_slot_statuses=draft_tracker.slot_statuses,
                     )
                     continue
                 raw_clock = hud.clock
@@ -745,11 +813,12 @@ def _run_cli(args: argparse.Namespace) -> int:
                         hud.draft,
                         confirmed_clock,
                         last_clock,
-                    )
+                    ),
+                    observed_at=frame.captured_at,
                 )
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
-                last_draft = confirmed_draft or last_draft
+                last_draft = confirmed_draft
                 if radiant_team_side is None and side_reader is not None:
                     side = side_tracker.update(side_reader.read(frame.image))
                     if side is not None:
@@ -818,6 +887,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     draft_confirmed=confirmed_draft is not None,
                     team_side_confirmed=radiant_team_side is not None,
                 ),
+                draft_slot_statuses=draft_tracker.slot_statuses,
             )
     except Exception as error:
         raise WatcherFailure(

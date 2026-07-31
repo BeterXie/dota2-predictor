@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -26,6 +26,13 @@ class HeroReading:
 
 
 @dataclass(frozen=True)
+class HeroFeatureChannelScores:
+    phash: float
+    histogram: float
+    pixel: float
+
+
+@dataclass(frozen=True)
 class HeroSlotDiagnostic:
     side: Literal["radiant", "dire"]
     slot: int
@@ -41,6 +48,10 @@ class HeroSlotDiagnostic:
         "ambiguous_match",
         "duplicate_hero",
     ]
+    second_hero_id: int | None = None
+    crop_hash: str | None = None
+    best_channels: HeroFeatureChannelScores | None = None
+    second_channels: HeroFeatureChannelScores | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +64,38 @@ class DraftReading:
     @property
     def recognized_slot_count(self) -> int:
         return sum(item.accepted for item in self.slot_diagnostics)
+
+
+@dataclass(frozen=True)
+class SlotCandidateEvidence:
+    hero_id: int
+    observed_at: float
+    score: float
+    margin: float
+    crop_hash: str | None
+
+
+@dataclass(frozen=True)
+class DraftSlotStatus:
+    side: Literal["radiant", "dire"]
+    slot: int
+    state: Literal["observing", "provisional", "locked"]
+    hero_id: int | None
+    independent_evidence_count: int
+    high_quality_evidence_count: int
+    strong_conflict_count: int
+    duplicate_evidence_count: int
+    last_observed_at: float | None
+    evidence: tuple[SlotCandidateEvidence, ...]
+
+
+@dataclass(frozen=True)
+class _CropScores:
+    combined: np.ndarray
+    phash: np.ndarray
+    histogram: np.ndarray
+    pixel: np.ndarray
+    crop_hash: str
 
 
 class HeroRecognizer:
@@ -68,7 +111,7 @@ class HeroRecognizer:
         self.thumbnails = data["thumbnails"]
         self.layout = layout
 
-    def _scores(self, image: np.ndarray) -> np.ndarray | None:
+    def _score_crop(self, image: np.ndarray) -> _CropScores | None:
         if image.size == 0 or float(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).std()) < 8:
             return None
         hero_hash = compute_phash(image, hash_size=8)
@@ -92,12 +135,31 @@ class HeroRecognizer:
                 for candidate in self.thumbnails
             ]
         )
-        return hash_scores * 0.5 + hist_scores * 0.25 + pixel_scores * 0.25
+        return _CropScores(
+            combined=hash_scores * 0.5 + hist_scores * 0.25 + pixel_scores * 0.25,
+            phash=hash_scores,
+            histogram=hist_scores,
+            pixel=pixel_scores,
+            crop_hash=np.packbits(hero_hash).tobytes().hex(),
+        )
+
+    def _scores(self, image: np.ndarray) -> np.ndarray | None:
+        scored = self._score_crop(image)
+        return None if scored is None else scored.combined
+
+    @staticmethod
+    def _channels(scores: _CropScores, index: int) -> HeroFeatureChannelScores:
+        return HeroFeatureChannelScores(
+            phash=float(scores.phash[index]),
+            histogram=float(scores.histogram[index]),
+            pixel=float(scores.pixel[index]),
+        )
 
     def recognize_crop(self, image: np.ndarray) -> HeroReading:
-        scores = self._scores(image)
-        if scores is None:
+        scored = self._score_crop(image)
+        if scored is None:
             return HeroReading(None, 0.0, 0.0)
+        scores = scored.combined
         order = np.argsort(scores)[::-1]
         best, second = int(order[0]), int(order[1])
         confidence = float(scores[best])
@@ -108,21 +170,22 @@ class HeroRecognizer:
 
     def read(self, image: np.ndarray) -> DraftReading:
         regions = self.layout.radiant_heroes + self.layout.dire_heroes
-        score_rows = [self._scores(region.crop(image)) for region in regions]
+        score_rows = [self._score_crop(region.crop(image)) for region in regions]
         if len(score_rows) != 10:
             return DraftReading((), (), 0.0)
 
         diagnostics: list[HeroSlotDiagnostic] = []
-        for index, scores in enumerate(score_rows):
+        for index, scored in enumerate(score_rows):
             side: Literal["radiant", "dire"] = "radiant" if index < 5 else "dire"
             slot = index % 5 + 1
-            if scores is None or len(scores) < 2:
+            if scored is None or len(scored.combined) < 2:
                 diagnostics.append(
                     HeroSlotDiagnostic(
                         side, slot, None, 0.0, 0.0, 0.0, False, "low_signal"
                     )
                 )
                 continue
+            scores = scored.combined
             order = np.argsort(scores)[::-1]
             best, second = int(order[0]), int(order[1])
             best_score = float(scores[best])
@@ -147,6 +210,10 @@ class HeroRecognizer:
                     margin,
                     accepted,
                     reason,
+                    second_hero_id=int(self.ids[second]),
+                    crop_hash=scored.crop_hash,
+                    best_channels=self._channels(scored, best),
+                    second_channels=self._channels(scored, second),
                 )
             )
 
@@ -181,18 +248,54 @@ class HeroRecognizer:
         )
 
 
+@dataclass
+class _TrackedSlot:
+    evidence: deque[SlotCandidateEvidence]
+    state: Literal["observing", "provisional", "locked"] = "observing"
+    hero_id: int | None = None
+    provisional_at: float | None = None
+    locked_confidence: float = 0.0
+    strong_conflict_count: int = 0
+    duplicate_evidence_count: int = 0
+    last_independent: SlotCandidateEvidence | None = None
+    last_observed_at: float | None = None
+
+
 class DraftTracker:
-    def __init__(self, confirmations: int = 3) -> None:
-        self.confirmations = confirmations
-        self._recent: tuple[deque[tuple[int, float]], ...] = tuple(
-            deque(maxlen=confirmations) for _ in range(10)
-        )
-        self._locked: dict[int, tuple[int, float]] = {}
+    def __init__(
+        self,
+        confirmations: int | None = None,
+        *,
+        evidence_window: int = 7,
+        provisional_support: int = 5,
+        minimum_high_quality: int = 2,
+        minimum_evidence_interval: float = 3.0,
+        maximum_similar_hash_distance: int = 2,
+        high_quality_score: float = 0.67,
+        high_quality_margin: float = 0.04,
+    ) -> None:
+        if confirmations is not None:
+            provisional_support = confirmations
+            evidence_window = max(evidence_window, confirmations)
+        if not 1 <= provisional_support <= evidence_window:
+            raise ValueError("provisional_support must fit inside evidence_window")
+        if not 1 <= minimum_high_quality <= provisional_support:
+            raise ValueError("minimum_high_quality must not exceed provisional_support")
+        self.evidence_window = evidence_window
+        self.provisional_support = provisional_support
+        self.minimum_high_quality = minimum_high_quality
+        self.minimum_evidence_interval = minimum_evidence_interval
+        self.maximum_similar_hash_distance = maximum_similar_hash_distance
+        self.high_quality_score = high_quality_score
+        self.high_quality_margin = high_quality_margin
+        self._slots = [
+            _TrackedSlot(deque(maxlen=evidence_window)) for _ in range(10)
+        ]
 
     def reset(self) -> None:
-        for recent in self._recent:
-            recent.clear()
-        self._locked.clear()
+        self._slots = [
+            _TrackedSlot(deque(maxlen=self.evidence_window)) for _ in range(10)
+        ]
 
     @staticmethod
     def _diagnostics(reading: DraftReading) -> tuple[HeroSlotDiagnostic, ...]:
@@ -215,41 +318,168 @@ class DraftTracker:
             for index, hero_id in enumerate(heroes)
         )
 
-    def update(self, reading: DraftReading) -> DraftReading | None:
-        diagnostics = self._diagnostics(reading)
-        if len(diagnostics) != 10:
-            return None
+    @staticmethod
+    def _hash_distance(left: str, right: str) -> int:
+        try:
+            return (int(left, 16) ^ int(right, 16)).bit_count()
+        except ValueError:
+            return 64
 
-        for index, diagnostic in enumerate(diagnostics):
-            if index in self._locked:
-                continue
-            recent = self._recent[index]
-            if not diagnostic.accepted or diagnostic.best_hero_id is None:
-                recent.clear()
-                continue
-            recent.append((diagnostic.best_hero_id, diagnostic.best_score))
-            if len(recent) < self.confirmations:
-                continue
-            hero_ids = {hero_id for hero_id, _ in recent}
-            if len(hero_ids) != 1:
-                continue
-            hero_id = recent[-1][0]
-            if any(locked_id == hero_id for locked_id, _ in self._locked.values()):
-                recent.clear()
-                continue
-            self._locked[index] = (
-                hero_id,
-                min(score for _, score in recent),
+    def _is_high_quality(self, evidence: SlotCandidateEvidence) -> bool:
+        return (
+            evidence.score >= self.high_quality_score
+            and evidence.margin >= self.high_quality_margin
+        )
+
+    def _is_independent(
+        self, slot: _TrackedSlot, evidence: SlotCandidateEvidence
+    ) -> bool:
+        previous = slot.last_independent
+        if previous is None:
+            return True
+        if evidence.observed_at - previous.observed_at < self.minimum_evidence_interval:
+            return False
+        if previous.crop_hash is None or evidence.crop_hash is None:
+            return True
+        return (
+            self._hash_distance(previous.crop_hash, evidence.crop_hash)
+            > self.maximum_similar_hash_distance
+        )
+
+    def _enter_observing(
+        self, slot: _TrackedSlot, evidence: SlotCandidateEvidence
+    ) -> None:
+        slot.state = "observing"
+        slot.hero_id = None
+        slot.provisional_at = None
+        slot.locked_confidence = 0.0
+        slot.strong_conflict_count = 0
+        slot.evidence.clear()
+        slot.evidence.append(evidence)
+
+    def _maybe_enter_provisional(self, slot: _TrackedSlot) -> None:
+        counts = Counter(item.hero_id for item in slot.evidence)
+        if not counts:
+            return
+        hero_id, support = counts.most_common(1)[0]
+        if support < self.provisional_support:
+            return
+        supporting = [item for item in slot.evidence if item.hero_id == hero_id]
+        if sum(self._is_high_quality(item) for item in supporting) < self.minimum_high_quality:
+            return
+        if any(
+            item.hero_id != hero_id and self._is_high_quality(item)
+            for item in slot.evidence
+        ):
+            return
+        slot.state = "provisional"
+        slot.hero_id = hero_id
+        slot.provisional_at = slot.evidence[-1].observed_at
+        slot.strong_conflict_count = 0
+
+    def _apply_independent_evidence(
+        self, slot: _TrackedSlot, evidence: SlotCandidateEvidence
+    ) -> None:
+        slot.evidence.append(evidence)
+        if slot.state == "observing":
+            self._maybe_enter_provisional(slot)
+            return
+
+        assert slot.hero_id is not None
+        high_quality = self._is_high_quality(evidence)
+        if slot.state == "provisional":
+            if evidence.hero_id != slot.hero_id and high_quality:
+                self._enter_observing(slot, evidence)
+                return
+            if (
+                evidence.hero_id == slot.hero_id
+                and high_quality
+                and slot.provisional_at is not None
+                and evidence.observed_at - slot.provisional_at
+                >= self.minimum_evidence_interval
+            ):
+                supporting = [
+                    item.score for item in slot.evidence if item.hero_id == slot.hero_id
+                ]
+                slot.state = "locked"
+                slot.locked_confidence = min(supporting, default=evidence.score)
+            return
+
+        if evidence.hero_id == slot.hero_id:
+            if high_quality:
+                slot.strong_conflict_count = 0
+            return
+        if not high_quality:
+            return
+        slot.strong_conflict_count += 1
+        if slot.strong_conflict_count >= 2:
+            slot.state = "provisional"
+            slot.provisional_at = evidence.observed_at
+            slot.locked_confidence = 0.0
+            slot.evidence.clear()
+            slot.evidence.append(evidence)
+
+    @property
+    def slot_statuses(self) -> tuple[DraftSlotStatus, ...]:
+        statuses: list[DraftSlotStatus] = []
+        for index, slot in enumerate(self._slots):
+            supporting = [
+                item
+                for item in slot.evidence
+                if slot.hero_id is not None and item.hero_id == slot.hero_id
+            ]
+            statuses.append(
+                DraftSlotStatus(
+                    side="radiant" if index < 5 else "dire",
+                    slot=index % 5 + 1,
+                    state=slot.state,
+                    hero_id=slot.hero_id,
+                    independent_evidence_count=len(supporting),
+                    high_quality_evidence_count=sum(
+                        self._is_high_quality(item) for item in supporting
+                    ),
+                    strong_conflict_count=slot.strong_conflict_count,
+                    duplicate_evidence_count=slot.duplicate_evidence_count,
+                    last_observed_at=slot.last_observed_at,
+                    evidence=tuple(slot.evidence),
+                )
             )
+        return tuple(statuses)
 
-        if len(self._locked) != 10:
+    @property
+    def current_draft(self) -> DraftReading | None:
+        if any(slot.state != "locked" or slot.hero_id is None for slot in self._slots):
             return None
-        ids = [self._locked[index][0] for index in range(10)]
-        if len(set(ids)) != 10:
+        ids = [int(slot.hero_id) for slot in self._slots if slot.hero_id is not None]
+        if len(ids) != 10 or len(set(ids)) != 10:
             return None
-        confidence = min(score for _, score in self._locked.values())
         return DraftReading(
             tuple(ids[:5]),
             tuple(ids[5:]),
-            confidence,
+            min(slot.locked_confidence for slot in self._slots),
         )
+
+    def update(self, reading: DraftReading, *, observed_at: float) -> DraftReading | None:
+        diagnostics = self._diagnostics(reading)
+        if len(diagnostics) != 10:
+            return self.current_draft
+
+        for index, diagnostic in enumerate(diagnostics):
+            if not diagnostic.accepted or diagnostic.best_hero_id is None:
+                continue
+            slot = self._slots[index]
+            slot.last_observed_at = observed_at
+            evidence = SlotCandidateEvidence(
+                hero_id=diagnostic.best_hero_id,
+                observed_at=observed_at,
+                score=diagnostic.best_score,
+                margin=diagnostic.margin,
+                crop_hash=diagnostic.crop_hash,
+            )
+            if not self._is_independent(slot, evidence):
+                slot.duplicate_evidence_count += 1
+                continue
+            slot.last_independent = evidence
+            self._apply_independent_evidence(slot, evidence)
+
+        return self.current_draft

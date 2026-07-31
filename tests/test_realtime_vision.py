@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import httpx
@@ -567,8 +568,9 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
         is not None
     )
     complete_draft = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.95)
-    assert draft.update(complete_draft) is None
-    assert draft.update(complete_draft) is not None
+    assert draft.update(complete_draft, observed_at=0.0) is None
+    assert draft.update(complete_draft, observed_at=3.0) is None
+    assert draft.update(complete_draft, observed_at=6.0) is not None
 
     assert not allow_live_hud_tracking(
         ReplayGateReading("replay", 0.99),
@@ -586,7 +588,7 @@ def test_replay_gate_resets_all_trusted_hud_trackers() -> None:
         )
         is None
     )
-    assert draft.update(complete_draft) is None
+    assert draft.update(complete_draft, observed_at=9.0) is None
 
 
 @pytest.mark.parametrize(
@@ -801,6 +803,7 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
         captured_at=datetime.now(timezone.utc),
         capture_status="capturing_partial",
         diagnostics=reading.diagnostics,
+        draft_slot_statuses=DraftTracker().slot_statuses,
     )
 
     parsed_v2 = _capture_heartbeat(output.with_suffix(".heartbeat.json"), "42")
@@ -817,6 +820,14 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
     assert diagnostics["strategy_ready"] is False
     assert diagnostics["radiant_hero_count"] == 5
     assert diagnostics["dire_hero_count"] == 3
+    assert len(parsed_v2["draft"]["slots"]) == 10
+    assert parsed_v2["draft"]["slots"][0]["best"] == {
+        "hero_id": 1,
+        "combined": 0.8,
+        "channels": None,
+    }
+    assert len(parsed_v2["draft"]["tracker_slots"]) == 10
+    assert parsed_v2["draft"]["tracker_slots"][0]["state"] == "observing"
     assert diagnostics["draft_failed_slots"] == [
         {
             "side": "dire",
@@ -918,14 +929,16 @@ def test_portrait_download_validation_decodes_image_content() -> None:
 def test_draft_needs_temporal_agreement() -> None:
     tracker = DraftTracker(confirmations=2)
     reading = DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.7)
-    assert tracker.update(reading) is None
-    confirmed = tracker.update(reading)
+    assert tracker.update(reading, observed_at=0.0) is None
+    assert tracker.update(reading, observed_at=3.0) is None
+    confirmed = tracker.update(reading, observed_at=6.0)
     assert confirmed is not None and confirmed.confidence == 0.7
     changed = DraftReading((1, 2, 3, 4, 6), (5, 7, 8, 9, 10), 0.95)
-    assert tracker.update(changed) == confirmed
+    assert tracker.update(changed, observed_at=9.0) == confirmed
     tracker.reset()
-    assert tracker.update(changed) is None
-    switched = tracker.update(changed)
+    assert tracker.update(changed, observed_at=12.0) is None
+    assert tracker.update(changed, observed_at=15.0) is None
+    switched = tracker.update(changed, observed_at=18.0)
     assert switched is not None
     assert switched.radiant_hero_ids == changed.radiant_hero_ids
     assert switched.confidence == 0.95
@@ -947,8 +960,17 @@ def test_hero_recognizer_reports_each_failed_slot(
     rows[6] = np.full(11, 0.1, dtype=np.float64)
     rows[6][6] = 0.55
     rows[6][10] = 0.5
-    score_rows = iter(rows)
-    monkeypatch.setattr(recognizer, "_scores", lambda image: next(score_rows))
+    score_rows = iter(
+        SimpleNamespace(
+            combined=row,
+            phash=row,
+            histogram=row,
+            pixel=row,
+            crop_hash=f"{index:016x}",
+        )
+        for index, row in enumerate(rows)
+    )
+    monkeypatch.setattr(recognizer, "_score_crop", lambda image: next(score_rows))
 
     reading = recognizer.read(np.zeros((100, 100, 3), dtype=np.uint8))
 
@@ -962,21 +984,31 @@ def test_hero_recognizer_reports_each_failed_slot(
     ]
     assert failed[0].best_hero_id == 3
     assert failed[0].margin == pytest.approx(0.01)
+    assert failed[0].second_hero_id == 11
+    assert failed[0].best_channels is not None
+    assert failed[0].best_channels.phash == pytest.approx(0.8)
+    assert failed[0].crop_hash == "0000000000000002"
 
 
 def _draft_slot_diagnostics(
     accepted_slots: set[int],
+    *,
+    hero_ids: tuple[int, ...] = tuple(range(1, 11)),
+    score: float = 0.8,
+    margin: float = 0.1,
+    crop_hash: str | None = None,
 ) -> tuple[HeroSlotDiagnostic, ...]:
     return tuple(
         HeroSlotDiagnostic(
             "radiant" if index < 5 else "dire",
             index % 5 + 1,
-            index + 1,
-            0.8,
-            0.7,
-            0.1,
+            hero_ids[index],
+            score,
+            score - margin,
+            margin,
             index in accepted_slots,
             "accepted" if index in accepted_slots else "low_score",
+            crop_hash=crop_hash,
         )
         for index in range(10)
     )
@@ -987,14 +1019,106 @@ def test_draft_tracker_confirms_slots_across_different_frames() -> None:
     first_half = DraftReading((), (), 0.8, _draft_slot_diagnostics(set(range(5))))
     second_half = DraftReading((), (), 0.8, _draft_slot_diagnostics(set(range(5, 10))))
 
-    assert tracker.update(first_half) is None
-    assert tracker.update(first_half) is None
-    assert tracker.update(second_half) is None
-    confirmed = tracker.update(second_half)
+    assert tracker.update(first_half, observed_at=0.0) is None
+    assert tracker.update(first_half, observed_at=3.0) is None
+    assert tracker.update(first_half, observed_at=6.0) is None
+    assert tracker.update(second_half, observed_at=9.0) is None
+    assert tracker.update(second_half, observed_at=12.0) is None
+    confirmed = tracker.update(second_half, observed_at=15.0)
 
     assert confirmed is not None
     assert confirmed.radiant_hero_ids == (1, 2, 3, 4, 5)
     assert confirmed.dire_hero_ids == (6, 7, 8, 9, 10)
+
+
+def test_draft_tracker_rejects_correlated_duplicate_evidence() -> None:
+    tracker = DraftTracker(confirmations=2)
+    first = DraftReading(
+        (),
+        (),
+        0.8,
+        _draft_slot_diagnostics(set(range(10)), crop_hash="0000000000000000"),
+    )
+    changed_crop = DraftReading(
+        (),
+        (),
+        0.8,
+        _draft_slot_diagnostics(set(range(10)), crop_hash="ffffffffffffffff"),
+    )
+
+    assert tracker.update(first, observed_at=0.0) is None
+    assert tracker.update(first, observed_at=1.0) is None
+    assert tracker.update(first, observed_at=4.0) is None
+    assert tracker.update(changed_crop, observed_at=4.0) is None
+    assert tracker.update(first, observed_at=7.0) is not None
+    assert all(item.duplicate_evidence_count == 2 for item in tracker.slot_statuses)
+
+
+def test_draft_tracker_requires_high_quality_support() -> None:
+    tracker = DraftTracker()
+    weak = DraftReading(
+        (),
+        (),
+        0.655,
+        _draft_slot_diagnostics(
+            set(range(10)),
+            score=0.655,
+            margin=0.03,
+        ),
+    )
+
+    for index in range(8):
+        assert tracker.update(weak, observed_at=float(index * 3)) is None
+
+    assert all(item.state == "observing" for item in tracker.slot_statuses)
+
+
+def test_draft_tracker_recovers_from_strong_locked_conflicts() -> None:
+    tracker = DraftTracker(confirmations=2)
+    original = DraftReading(
+        (),
+        (),
+        0.8,
+        _draft_slot_diagnostics(set(range(10)), crop_hash="0000000000000000"),
+    )
+    original_changed_crop = DraftReading(
+        (),
+        (),
+        0.8,
+        _draft_slot_diagnostics(set(range(10)), crop_hash="ffffffffffffffff"),
+    )
+    conflicting_ids = tuple(range(11, 21))
+    conflict = DraftReading(
+        (),
+        (),
+        0.82,
+        _draft_slot_diagnostics(
+            set(range(10)),
+            hero_ids=conflicting_ids,
+            score=0.82,
+            crop_hash="0f0f0f0f0f0f0f0f",
+        ),
+    )
+    conflict_changed_crop = DraftReading(
+        (),
+        (),
+        0.82,
+        _draft_slot_diagnostics(
+            set(range(10)),
+            hero_ids=conflicting_ids,
+            score=0.82,
+            crop_hash="f0f0f0f0f0f0f0f0",
+        ),
+    )
+
+    tracker.update(original, observed_at=0.0)
+    tracker.update(original_changed_crop, observed_at=3.0)
+    assert tracker.update(original, observed_at=6.0) is not None
+    assert tracker.update(conflict, observed_at=9.0) is not None
+    assert tracker.update(conflict_changed_crop, observed_at=12.0) is None
+    assert all(item.state == "provisional" for item in tracker.slot_statuses)
+    assert tracker.update(conflict, observed_at=15.0) is None
+    assert all(item.state == "observing" for item in tracker.slot_statuses)
 
 
 def test_hls_capture_reads_frame() -> None:

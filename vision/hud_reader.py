@@ -107,6 +107,7 @@ class HudDiagnostics:
     dire_hero_count: int
     draft_confidence: float
     draft_confirmed: bool
+    draft_slots: tuple[HeroSlotDiagnostic, ...]
     draft_failed_slots: tuple[HeroSlotDiagnostic, ...]
     team_side_confirmed: bool
 
@@ -164,6 +165,7 @@ class HudDiagnostics:
             dire_hero_count=dire_hero_count,
             draft_confidence=reading.draft.confidence,
             draft_confirmed=draft_confirmed,
+            draft_slots=tuple(slot_diagnostics),
             draft_failed_slots=tuple(
                 item for item in slot_diagnostics if not item.accepted
             ),
