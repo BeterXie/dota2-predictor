@@ -226,7 +226,7 @@ export function MatchWorkspace({
                   ? "市场概率与模型判断"
                   : hasChartTimeline ? "市场概率走势" : "市场概率记录"}</h2>
                 <p>{hasChartTimeline
-                  ? "横轴为真实采集时间。超过 60 秒的数据空档会断开曲线。"
+                  ? "横轴为真实采集时间。超过 150 秒的数据空档会断开曲线。"
                   : "等待同一采集时刻的完整双方报价。"}</p>
               </div>
               <span className="method-note" title="双方概率已按完整胜负盘去除水位">

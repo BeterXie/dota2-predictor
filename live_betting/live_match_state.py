@@ -109,24 +109,32 @@ def _draft_context_teams(
     catalog = connection.execute(
         "SELECT team_id, name, tag FROM teams ORDER BY team_id"
     ).fetchall()
+    identity_mappings = _raybet_identity_mappings(connection, ordered)
+    used_identity_mapping = False
     result: list[dict[str, Any]] = []
     fallback_names = (str(match[0] or ""), str(match[1] or ""))
     for index, raw_team in enumerate(ordered):
-        names = {
-            str(value).strip().casefold()
-            for value in (
-                raw_team.get("team_name"),
-                raw_team.get("team_short_name"),
-                fallback_names[index],
-            )
-            if str(value or "").strip()
-        }
-        matches = [
-            row
-            for row in catalog
-            if str(row[1] or "").strip().casefold() in names
-            or str(row[2] or "").strip().casefold() in names
-        ]
+        raybet_team_id = int(raw_team.get("team_id") or 0)
+        mapped_team_id = identity_mappings.get(raybet_team_id)
+        if mapped_team_id is not None:
+            matches = [row for row in catalog if int(row[0]) == mapped_team_id]
+            used_identity_mapping = True
+        else:
+            names = {
+                str(value).strip().casefold()
+                for value in (
+                    raw_team.get("team_name"),
+                    raw_team.get("team_short_name"),
+                    fallback_names[index],
+                )
+                if str(value or "").strip()
+            }
+            matches = [
+                row
+                for row in catalog
+                if str(row[1] or "").strip().casefold() in names
+                or str(row[2] or "").strip().casefold() in names
+            ]
         if len(matches) != 1:
             return [], "raybet_exact_name"
         result.append(
@@ -136,7 +144,34 @@ def _draft_context_teams(
                 "team_name": str(matches[0][1] or fallback_names[index]),
             }
         )
-    return result, "raybet_exact_name"
+    return result, (
+        "raybet_identity_mapping_v2"
+        if used_identity_mapping
+        else "raybet_exact_name"
+    )
+
+
+def _raybet_identity_mappings(
+    connection: PostgresSession,
+    ordered_teams: list[dict[str, Any]],
+) -> dict[int, int]:
+    team_ids = [int(team.get("team_id") or 0) for team in ordered_teams]
+    if len(team_ids) != 2 or any(team_id <= 0 for team_id in team_ids):
+        return {}
+    relation = connection.execute(
+        "SELECT to_regclass('team_identity_mappings_v2')"
+    ).fetchone()
+    if relation is None or relation[0] is None:
+        return {}
+    rows = connection.execute(
+        """SELECT DISTINCT ON (raybet_team_id)
+                  raybet_team_id, canonical_team_id
+             FROM team_identity_mappings_v2
+            WHERE raybet_team_id IN (?, ?)
+            ORDER BY raybet_team_id, observed_at DESC, mapping_id DESC""",
+        tuple(team_ids),
+    ).fetchall()
+    return {int(row[0]): int(row[1]) for row in rows}
 
 
 def _latest_positional_roster(

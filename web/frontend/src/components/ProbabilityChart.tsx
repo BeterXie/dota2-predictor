@@ -35,6 +35,8 @@ interface ProbabilityChartProps {
 
 type SeriesPoint = [number, number | null];
 
+const GAP_BREAK_MS = 150_000;
+
 echarts.use([
   LineChart,
   ScatterChart,
@@ -162,7 +164,8 @@ export function ProbabilityChart({
           name: teamOne || "队伍一",
           type: "line",
           step: "end",
-          showSymbol: false,
+          showSymbol: true,
+          symbolSize: 4,
           connectNulls: false,
           data: teamOneData,
           lineStyle: { width: 2, color: "#55c7bb" },
@@ -172,7 +175,8 @@ export function ProbabilityChart({
           name: teamTwo || "队伍二",
           type: "line",
           step: "end",
-          showSymbol: false,
+          showSymbol: true,
+          symbolSize: 4,
           connectNulls: false,
           data: teamTwoData,
           lineStyle: { width: 2, color: "#ef8b79" },
@@ -226,7 +230,7 @@ export function ProbabilityChart({
   );
 }
 
-function withGaps(
+export function withGaps(
   points: WinnerTimelinePoint[],
   side: "team_one" | "team_two",
 ): SeriesPoint[] {
@@ -235,7 +239,7 @@ function withGaps(
   for (const point of points) {
     const time = parseTimestamp(point.observed_at)?.getTime();
     if (time == null) continue;
-    if (previousTime != null && time - previousTime > 60_000) {
+    if (previousTime != null && time - previousTime > GAP_BREAK_MS) {
       output.push([previousTime + 1, null], [time - 1, null]);
     }
     output.push([time, point.probabilities[side]]);

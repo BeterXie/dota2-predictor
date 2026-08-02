@@ -221,3 +221,69 @@ def test_live_draft_context_resolves_teams_and_players_without_manual_ids(
         player["position"] for player in context["teams"][1]["players"]
     ] == [1, 2, 3, 4, 5]
     store.close()
+
+
+def test_live_draft_context_prefers_explicit_raybet_identity_mapping(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    with store.connection.transaction():
+        store.connection.execute(
+            """CREATE TEMP TABLE team_identity_mappings_v2 (
+                   mapping_id BIGINT PRIMARY KEY,
+                   canonical_team_id BIGINT NOT NULL,
+                   raybet_team_id BIGINT,
+                   observed_at TIMESTAMPTZ NOT NULL
+               )"""
+        )
+        store.connection.executemany(
+            "INSERT INTO teams (team_id, name, tag) VALUES (?, ?, ?)",
+            [
+                (11, "Nigma Galaxy", "NGX"),
+                (33, "Nigma Galaxy", "NGX"),
+                (22, "OG", "OG"),
+            ],
+        )
+        store.connection.executemany(
+            """INSERT INTO team_identity_mappings_v2
+               (mapping_id, canonical_team_id, raybet_team_id, observed_at)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (1, 33, 501, NOW),
+                (2, 22, 502, NOW),
+            ],
+        )
+        store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, team_one, team_two, best_of, status,
+                raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "mapped-context",
+                "Nigma Galaxy",
+                "OG",
+                3,
+                "2",
+                '{"team":['
+                '{"pos":1,"team_id":501,"team_name":"Nigma Galaxy"},'
+                '{"pos":2,"team_id":502,"team_name":"OG"}'
+                "]}",
+                NOW.isoformat(),
+            ),
+        )
+
+    context = live_draft_context(
+        store.connection,
+        "mapped-context",
+        as_of=NOW,
+    )
+
+    assert context is not None
+    assert context["status"] == "ready"
+    assert context["source"] == "raybet_identity_mapping_v2"
+    assert [team["team_id"] for team in context["teams"]] == [33, 22]
+    store.close()

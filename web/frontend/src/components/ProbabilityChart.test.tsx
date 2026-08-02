@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { mapNumberForPeriod, resolvePeriod } from "../probability-period";
-import { ProbabilityChart } from "./ProbabilityChart";
+import { ProbabilityChart, withGaps } from "./ProbabilityChart";
 
 vi.mock("echarts-for-react/lib/core", () => ({
   default: () => <div data-testid="probability-chart-canvas" />,
@@ -35,6 +35,28 @@ describe("resolvePeriod", () => {
 });
 
 describe("ProbabilityChart controls", () => {
+  it("keeps the default two-minute collection cadence connected", () => {
+    const points = [
+      ["2026-08-02T00:00:00Z", 0.55],
+      ["2026-08-02T00:02:00Z", 0.57],
+      ["2026-08-02T00:04:31Z", 0.59],
+    ].map(([observedAt, probability]) => ({
+      observed_at: String(observedAt),
+      period: "map_1",
+      prices: { team_one: 1.8, team_two: 2.1 },
+      probabilities: {
+        team_one: Number(probability),
+        team_two: 1 - Number(probability),
+      },
+      status: { team_one: "open", team_two: "open" },
+    }));
+
+    const series = withGaps(points, "team_one");
+
+    expect(series.filter(([, value]) => value == null)).toHaveLength(2);
+    expect(series.slice(0, 2).map(([, value]) => value)).toEqual([0.55, 0.57]);
+  });
+
   it("keeps the map selector in a dedicated normal-flow row above the chart canvas", () => {
     const onPeriodChange = vi.fn();
     render(
