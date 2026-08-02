@@ -86,20 +86,17 @@ after the run's `collected_at`.
 ## Supervisor
 
 The recurring supervisor verifies PostgreSQL and starts historical Rosh by
-default. Other components require explicit flags:
+default. Start the read-only odds collector explicitly:
 
 ```powershell
-$deploymentKey = "<deployment_key from the offline rebuild output>"
 python scripts/run_dota_shadow_service.py `
-  --start-collector --start-shadow --start-vision `
-  --start-strict-ingest --start-postmatch --start-draft-publisher `
-  --draft-deployment-key $deploymentKey `
-  --vision-jsonl data/live_betting/live_observations
+  --start-collector
 ```
 
-Use `--start-companion` only for browser audit/compare runs and `--start-mail`
-only after SMTP is configured. `--once` runs one PostgreSQL health/report cycle
-without starting the recurring historical Rosh worker.
+Use `--start-mail` only after SMTP is configured. Vision, live draft publishing,
+strict ingest, paper strategy, and post-match labeling remain available only as
+manual research commands and are not supervised. `--once` runs one PostgreSQL
+health/report cycle without starting the recurring historical Rosh worker.
 
 The supervisor uses a PostgreSQL advisory lock for singleton ownership. Child
 processes inherit `DATABASE_URL`; there are no SQLite file locks, writer scans,

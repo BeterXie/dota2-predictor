@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 LEGACY_SQLITE_MODULES = frozenset(
     {
         "tests/test_accept_strict_live_mapping_cli.py",
-        "tests/test_browser_companion.py",
         "tests/test_browser_ingest.py",
         "tests/test_browser_storage.py",
         "tests/test_cli_docs_consistency.py",
@@ -35,8 +34,6 @@ LEGACY_SQLITE_MODULES = frozenset(
         "tests/test_live_betting.py",
         "tests/test_live_landmark_strategy.py",
         "tests/test_live_report.py",
-        "tests/test_milestone_revocation.py",
-        "tests/test_milestone_revocation_security.py",
         "tests/test_monitor_alerts.py",
         "tests/test_monitor_control.py",
         "tests/test_monitoring_dashboard.py",
@@ -74,7 +71,7 @@ LEGACY_SQLITE_MODULES = frozenset(
         "tests/test_winner_timeline_v2.py",
     }
 )
-LEGACY_SQLITE_MODULE_BUDGET = 60
+LEGACY_SQLITE_MODULE_BUDGET = 57
 actual_legacy_sqlite_modules = len(LEGACY_SQLITE_MODULES)
 if actual_legacy_sqlite_modules != LEGACY_SQLITE_MODULE_BUDGET:
     raise RuntimeError(

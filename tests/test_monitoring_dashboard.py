@@ -26,12 +26,6 @@ from live_betting.markets import normalized_state_hash
 from live_betting.market_state import MarketSurface
 from live_betting.m1_verifier import verify_m1_qualifying_rejection
 from live_betting.models import Market, OddsSnapshot, RoshLineupScore
-from live_betting.milestone_revocation import (
-    MilestoneRevocationConfig,
-    append_milestone_revocation,
-    create_pair_baseline_manifest,
-    initialize_milestone_revocation_ledger,
-)
 from live_betting.profiles import DraftCurve, PlayerForm, TeamStyleProfile
 from live_betting.profiles.draft_curve import DraftPoint
 from live_betting.shadow_monitor import _persist_decision
@@ -60,7 +54,6 @@ from tests.draft_authority_fixture import (
     make_test_vision_observation,
     seed_test_draft_authority,
 )
-from tests.milestone_revocation_fixture import milestone_revocation_record
 from web import monitoring, queries
 from web.app import app
 from web.monitoring import (
@@ -989,59 +982,21 @@ class MonitoringDashboardTests(unittest.TestCase):
         self.assertEqual(mail["status"], "degraded")
         self.assertEqual(mail["last_error"], "configuration_missing")
 
-    def test_unconfigured_companion_is_informational_for_direct_primary(self) -> None:
-        for component in ("raybet_worker", "shadow_worker"):
-            record_health(
-                self.store.connection,
-                component,
-                "healthy",
-                heartbeat_at=NOW,
-                success_at=NOW,
-            )
-        record_health(
-            self.store.connection,
-            "companion",
-            "stopped",
-            heartbeat_at=NOW - timedelta(days=1),
-            details={
-                "configured": False,
-                "role": "optional_diagnostic",
-                "readiness_impact": "none",
-                "reason": "not_started_by_supervisor",
-            },
-        )
-
-        snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
-
-        self.assertEqual(snapshot["market_source_policy"], "direct_primary")
-        self.assertEqual(snapshot["summary"]["unhealthy_components"], 0)
-        self.assertFalse(snapshot["capabilities"]["browser_compare"]["required"])
-        companion = next(
-            item for item in snapshot["health"]
-            if item["component"] == "companion"
-        )
-        self.assertEqual(companion["status"], "stopped")
-        self.assertEqual(companion["freshness"], "informational")
-        self.assertEqual(
-            companion["details"]["reason"], "not_started_by_supervisor"
-        )
-
     def test_non_optional_worker_health_is_counted(self) -> None:
-        for component in ("raybet_worker", "shadow_worker"):
-            record_health(
-                self.store.connection,
-                component,
-                "healthy",
-                heartbeat_at=NOW,
-                success_at=NOW,
-            )
         record_health(
             self.store.connection,
-            "vision_worker",
+            "raybet_worker",
+            "healthy",
+            heartbeat_at=NOW,
+            success_at=NOW,
+        )
+        record_health(
+            self.store.connection,
+            "historical_rosh_worker",
             "unhealthy",
             heartbeat_at=NOW,
             error_at=NOW,
-            error="capture_failed",
+            error="historical_refresh_failed",
         )
 
         snapshot = build_monitor_snapshot(self.store.connection, now=NOW)
@@ -3149,10 +3104,6 @@ class MonitoringDashboardTests(unittest.TestCase):
 
         self.assertEqual(bootstrap.status_code, 200)
         self.assertEqual(bootstrap.json()["matches"][0]["raybet_match_id"], "match-1")
-        self.assertEqual(
-            bootstrap.json()["milestone_governance"]["status"],
-            "not_configured",
-        )
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(len(detail.json()["winner_timeline"]), 1)
         self.assertEqual(history.status_code, 200)
@@ -4998,151 +4949,6 @@ class MonitoringDashboardTests(unittest.TestCase):
             },
         )
         self.assertEqual(strategy["data"]["excluded_decision_count"], 12)
-
-    def test_paired_revocation_projection_hides_current_strategy_decision(
-        self,
-    ) -> None:
-        self.add_match(status=2)
-        decision_key = self.add_decision(
-            "revoked-monitor-decision",
-            NOW - timedelta(seconds=5),
-            0.65,
-        )
-        raw_root = Path(self.store.raw_archive_root)
-        raw_root.mkdir(parents=True, exist_ok=True)
-        ledger = Path(self.directory.name) / "revocations"
-        pair_manifest = create_pair_baseline_manifest(
-            self.database,
-            raw_root,
-            p0_baseline_evidence_identity="9" * 64,
-        )
-        pair_manifest_hash = hashlib.sha256(pair_manifest).hexdigest()
-        anchor = initialize_milestone_revocation_ledger(
-            ledger,
-            database_path=self.database,
-            raw_root=raw_root,
-            pair_manifest=pair_manifest,
-            expected_pair_manifest_hash=pair_manifest_hash,
-            p0_baseline_evidence_identity="9" * 64,
-        )
-        record = milestone_revocation_record()
-        record["affected"] = {
-            "decision_keys": [decision_key],
-            "order_keys": [],
-            "settlement_keys": [],
-            "sample_keys": [],
-            "sample_lineage": [],
-        }
-        anchor = append_milestone_revocation(
-            ledger,
-            record,
-            database_path=self.database,
-            raw_root=raw_root,
-            expected_anchor=anchor,
-            pair_manifest=pair_manifest,
-            expected_pair_manifest_hash=pair_manifest_hash,
-        )
-        revocation_config = MilestoneRevocationConfig(
-            root=ledger,
-            database_path=self.database,
-            raw_root=raw_root,
-            expected_anchor=anchor,
-            pair_manifest=pair_manifest,
-            expected_pair_manifest_hash=pair_manifest_hash,
-        )
-
-        snapshot = build_monitor_snapshot(
-            self.store.connection,
-            now=NOW,
-            revocation_config=revocation_config,
-        )
-        detail = monitor_match_detail(
-            self.store.connection,
-            "match-1",
-            now=NOW,
-            revocation_config=revocation_config,
-        )
-
-        assert detail is not None
-        governance = detail["milestone_governance"]
-        self.assertEqual(governance, snapshot["milestone_governance"])
-        self.assertEqual(governance["ledger_integrity"]["status"], "verified")
-        self.assertEqual(governance["isolated_keys"]["decision_keys"], [decision_key])
-        self.assertEqual(governance["records"][0]["evaluation_result"], "passed")
-        self.assertEqual(governance["records"][0]["governance_status"], "revoked")
-        strategy = detail["analysis"]["strategy"]
-        self.assertEqual(strategy["status"], "review")
-        self.assertEqual(strategy["reason"], "strategy_evidence_invalid")
-        self.assertEqual(strategy["data"]["decisions"], [])
-        self.assertEqual(
-            strategy["data"]["excluded"]["milestone_revocation"],
-            1,
-        )
-        self.assertIsNone(detail["latest_decision"])
-
-        previous_path = queries.DB_PATH
-        previous_config = app.state.milestone_revocation_config
-        queries.init_db(str(self.database))
-        try:
-            app.state.milestone_revocation_config = revocation_config
-            with TestClient(app, raise_server_exceptions=False) as client:
-                bootstrap_response = client.get("/api/monitor/bootstrap")
-                matches_response = client.get("/api/monitor/matches")
-                history_response = client.get("/api/monitor/history")
-                detail_response = client.get("/api/monitor/matches/match-1")
-                self.assertEqual(bootstrap_response.status_code, 200)
-                self.assertEqual(matches_response.status_code, 200)
-                self.assertEqual(history_response.status_code, 200)
-                self.assertEqual(detail_response.status_code, 200)
-                self.assertEqual(
-                    bootstrap_response.json()["milestone_governance"][
-                        "ledger_integrity"
-                    ]["status"],
-                    "verified",
-                )
-                self.assertEqual(
-                    detail_response.json()["milestone_governance"][
-                        "ledger_integrity"
-                    ]["status"],
-                    "verified",
-                )
-
-                bad_anchor = dict(anchor)
-                bad_anchor["head_entry_hash"] = "0" * 64
-                app.state.milestone_revocation_config = replace(
-                    revocation_config, expected_anchor=bad_anchor
-                )
-                for route in (
-                    "/api/monitor/bootstrap",
-                    "/api/monitor/health",
-                    "/api/monitor/matches",
-                    "/api/monitor/history",
-                    "/api/monitor/matches/match-1",
-                    "/api/monitor/matches/match-1/maps/1/postmatch",
-                    "/api/monitor/matches/match-1/vision-frames/"
-                    + "0" * 64
-                    + ".jpg",
-                    "/api/monitor/events",
-                ):
-                    self.assertEqual(client.get(route).status_code, 503)
-
-                app.state.milestone_revocation_config = {"ledger": ledger}
-                for route in (
-                    "/api/monitor/bootstrap",
-                    "/api/monitor/health",
-                    "/api/monitor/matches",
-                    "/api/monitor/history",
-                    "/api/monitor/matches/match-1",
-                    "/api/monitor/matches/match-1/maps/1/postmatch",
-                    "/api/monitor/matches/match-1/vision-frames/"
-                    + "0" * 64
-                    + ".jpg",
-                    "/api/monitor/events",
-                ):
-                    self.assertEqual(client.get(route).status_code, 500)
-        finally:
-            app.state.milestone_revocation_config = previous_config
-            queries.init_db(previous_path)
 
     def test_sqlite_errors_are_classified_and_busy_detail_returns_503(self) -> None:
         readonly = sqlite3.OperationalError("database is locked")

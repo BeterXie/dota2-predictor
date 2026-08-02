@@ -2468,9 +2468,6 @@ def _run_publisher_locked(
                     "old_deployment_key": old_key,
                     "new_deployment_key": deployment.deployment_key,
                     "inserted": inserted,
-                    "supervisor_argument": (
-                        "--draft-deployment-key " + deployment.deployment_key
-                    ),
                 },
                 sort_keys=True,
             ),
@@ -2528,9 +2525,6 @@ def _run_publisher_locked(
                     "status": "ok",
                     "phase": "offline_rebuild_complete",
                     "deployment_key": deployment.deployment_key,
-                    "supervisor_argument": (
-                        "--draft-deployment-key " + deployment.deployment_key
-                    ),
                 },
                 sort_keys=True,
             ),

@@ -466,13 +466,20 @@ def _conditions(
             operational_contract_failure = _operational_health_contract_failure(
                 exc
             )
+    monitored_workers = {
+        "raybet_worker",
+        "raybet_priority_odds_worker",
+        "raybet_full_odds_worker",
+        "historical_rosh_worker",
+        "mail_worker",
+    }
     conditions: dict[str, dict[str, Any]] = {}
     for item in health:
         component = str(item.get("component") or "").strip()
         status = str(item.get("status") or "missing")
         last_error = str(item.get("last_error") or status)
         if (
-            not component.endswith("_worker")
+            component not in monitored_workers
             or status in {"healthy", "starting"}
             or (
                 component == "mail_worker"

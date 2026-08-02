@@ -1,8 +1,5 @@
 import {
-  Brain,
-  Broadcast,
   CloudArrowDown,
-  Eye,
   GitMerge,
 } from "@phosphor-icons/react";
 import type { MonitorMatch, ReadinessStatus } from "../../types";
@@ -16,9 +13,6 @@ export function PipelineTopology({ match }: PipelineTopologyProps) {
   const nodes = [
     { key: "odds", label: "赔率采集", icon: CloudArrowDown, status: readiness?.odds.status || "missing" },
     { key: "mapping", label: "赛事映射", icon: GitMerge, status: readiness?.mapping.status || "missing" },
-    { key: "vision", label: "视觉观测", icon: Eye, status: readiness?.vision.status || "missing" },
-    { key: "model", label: "模型判断", icon: Brain, status: readiness?.model.status || "missing" },
-    { key: "strategy", label: "纸面策略", icon: Broadcast, status: readiness?.strategy.status || "missing" },
   ];
 
   return (

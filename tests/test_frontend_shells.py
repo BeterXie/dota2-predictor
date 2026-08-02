@@ -83,7 +83,6 @@ def test_monitor_console_exposes_runtime_safety_boundary() -> None:
     assert "不包含真实下注入口" in app
     assert "market_source_policy?: string" in types
     assert "capabilities?: Record<string, MonitorCapability>" in types
-    assert "milestone_governance?: MilestoneGovernanceProjection" in types
     assert '<main className="workspace" aria-live="polite">' not in workspace
 
 

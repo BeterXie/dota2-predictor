@@ -236,7 +236,6 @@ class RayBetPostmatchLinkApiTests(unittest.TestCase):
         self.snapshot_patch.start()
         self.scope_patch.start()
         app = FastAPI()
-        app.state.milestone_revocation_config = None
         app.include_router(router)
         self.client = TestClient(app)
 

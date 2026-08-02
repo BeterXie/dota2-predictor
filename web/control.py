@@ -47,39 +47,6 @@ COMPONENTS: dict[str, ComponentSpec] = {
             "--schema-prepared",
         ),
     ),
-    "shadow_monitor": ComponentSpec(
-        "Shadow monitor",
-        (
-            "-u",
-            "-m",
-            "live_betting.shadow_monitor",
-            "--vision-jsonl",
-            "{vision_observations}",
-            "--schema-prepared",
-        ),
-    ),
-    "vision_supervisor": ComponentSpec(
-        "Vision supervisor",
-        (
-            "-u",
-            "scripts/supervise_raybet_streams.py",
-            "--output-dir",
-            "{vision_observations}",
-            "--evidence-dir",
-            "{vision_evidence}",
-            "--log-dir",
-            "{vision_logs}",
-            "--schema-prepared",
-        ),
-    ),
-    "draft_publisher": ComponentSpec(
-        "Draft prediction publisher",
-        (
-            "-u",
-            "-m",
-            "live_betting.draft_publisher",
-        ),
-    ),
     "mail_worker": ComponentSpec(
         "Mail worker",
         (
@@ -116,9 +83,6 @@ class ControlService:
         root = self.project_dir / "data" / "live_betting"
         values = {
             "odds_raw_root": str(root / "raw-v2"),
-            "vision_observations": str(root / "vision_observations"),
-            "vision_evidence": str(root / "vision_evidence"),
-            "vision_logs": str(root / "watcher_logs"),
         }
         return [
             self.python_executable,

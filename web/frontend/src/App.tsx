@@ -1157,17 +1157,7 @@ function isLiveEligible(match: MonitorSnapshot["matches"][number]): boolean {
 
 function SafetyBoundaryBar({ snapshot }: { snapshot: MonitorSnapshot | null }) {
   const directStatus = snapshot?.capabilities?.direct_market_collection?.status;
-  const paperStatus = snapshot?.capabilities?.paper_decision?.status;
-  const governance = snapshot?.milestone_governance;
-  const integrity = governance?.ledger_integrity?.status || governance?.status;
-  const governanceStatus = governance?.governance_status;
-  const governanceTone = !integrity && !governanceStatus
-    ? "neutral"
-    : governanceStatus === "revoked" || governanceStatus === "review_required"
-      ? "critical"
-      : integrity === "verified"
-        ? "positive"
-        : "warning";
+  const historicalRoshStatus = snapshot?.capabilities?.historical_rosh?.status;
   const facts = [
     {
       label: "直连市场",
@@ -1175,14 +1165,9 @@ function SafetyBoundaryBar({ snapshot }: { snapshot: MonitorSnapshot | null }) {
       tone: capabilityTone(directStatus),
     },
     {
-      label: "纸面策略",
-      status: capabilityLabel(paperStatus),
-      tone: capabilityTone(paperStatus),
-    },
-    {
-      label: "治理链",
-      status: governanceLabel(integrity, governanceStatus),
-      tone: governanceTone,
+      label: "历史肉山",
+      status: capabilityLabel(historicalRoshStatus),
+      tone: capabilityTone(historicalRoshStatus),
     },
   ] as const;
   const abnormalFacts = facts.filter((fact) => fact.tone !== "positive");
@@ -1250,14 +1235,6 @@ function capabilityTone(status?: string): "neutral" | "positive" | "warning" | "
   if (status === "ready" || status === "healthy") return "positive";
   if (status === "invalid" || status === "unhealthy") return "critical";
   return "warning";
-}
-
-function governanceLabel(integrity?: string, status?: string): string {
-  if (status === "revoked") return "已撤销";
-  if (status === "review_required") return "需复核";
-  if (integrity === "verified") return "已校验";
-  if (integrity === "not_configured") return "未配置";
-  return integrity ? capabilityLabel(integrity) : "待加载";
 }
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {

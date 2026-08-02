@@ -381,8 +381,6 @@ def test_contract_survives_existing_storage_shape_without_migration() -> None:
             "policy_hash": None,
             "serialization_version": None,
             "m1_qualifying_rejection": False,
-            "governance_status": "active",
-            "authorized": True,
             "verifier_reason": "reason_not_allowlisted",
             "replay_reason": None,
         }
@@ -554,50 +552,9 @@ def test_full_authority_report_projects_m1_qualifying_rejection(
             "policy_hash": contract["policy_hash"],
             "serialization_version": contract["serialization_version"],
             "m1_qualifying_rejection": True,
-            "governance_status": "active",
-            "authorized": True,
             "verifier_reason": "qualifying_strategy_rejection",
             "replay_reason": "replayed",
         }
-    finally:
-        store.close()
-
-
-def test_revoked_m1_milestone_cannot_authorize_any_derived_verification(
-    tmp_path: Path,
-) -> None:
-    store, decision = _full_authority_fixture(tmp_path / "m1-revoked.db")
-    governance = {
-        "status": "revoked",
-        "governance_status": "revoked",
-        "ledger_integrity": {"status": "verified"},
-        "pair_identity": {},
-        "records": [],
-        "isolated_keys": {
-            "decision_keys": [],
-            "order_keys": [],
-            "settlement_keys": [],
-            "sample_keys": [],
-        },
-        "revoked_milestones": ["M1"],
-        "review_required_milestones": [],
-        "requires_new_cutoff_manifest_report_record": True,
-    }
-    try:
-        with patch(
-            "live_betting.report.load_milestone_revocation_projection",
-            return_value=governance,
-        ):
-            report = build_report(store.connection)
-        verification = next(
-            item
-            for item in report["m1_strategy_contract_verifications"]
-            if item["decision_key"] == decision.decision_key
-        )
-        assert verification["verifier_reason"] == "qualifying_strategy_rejection"
-        assert verification["governance_status"] == "revoked"
-        assert verification["authorized"] is False
-        assert verification["m1_qualifying_rejection"] is False
     finally:
         store.close()
 

@@ -945,9 +945,6 @@ def test_explicit_offline_rebuild_is_the_only_runtime_build_path(
         "status": "ok",
         "phase": "offline_rebuild_complete",
         "deployment_key": "offline-deployment",
-        "supervisor_argument": (
-            "--draft-deployment-key offline-deployment"
-        ),
     }
     with LiveBettingStore(prepared_database) as store:
         health = store.connection.execute(
@@ -2414,7 +2411,6 @@ def test_audited_rebase_cli_prints_exact_keys_and_supervisor_pin(
         "old_deployment_key": old_key,
         "new_deployment_key": new_key,
         "inserted": True,
-        "supervisor_argument": "--draft-deployment-key " + new_key,
     }
 
 

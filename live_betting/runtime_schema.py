@@ -16,9 +16,6 @@ RUNTIME_SCHEMA_CONTRACT_DIGEST = (
 )
 CONTROL_COMPONENT_NAMES = (
     "raybet_collector",
-    "shadow_monitor",
-    "vision_supervisor",
-    "draft_publisher",
     "mail_worker",
 )
 

@@ -138,8 +138,6 @@ def validate(window: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]
         integrity_blockers.append("signed_url_persistence_must_be_false")
     if get(window, "operations.paper_only") is not True:
         integrity_blockers.append("paper_only_not_enforced")
-    if get(window, "operations.browser_companion_configured") is not False:
-        integrity_blockers.append("browser_companion_must_be_disabled")
     if get(window, "approval.p4_live_canary_approved") is not False:
         integrity_blockers.append("p4_approval_must_remain_false")
     if get(window, "monitoring_clock.backfill_allowed") is not False:

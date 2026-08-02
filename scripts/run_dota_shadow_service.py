@@ -1,4 +1,4 @@
-"""Supervise the local Dota shadow components on PostgreSQL."""
+"""Supervise the local Dota data components on PostgreSQL."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,9 +24,7 @@ if str(ROOT) not in sys.path:
 
 from database.engine import build_engine, require_database_url  # noqa: E402
 from event_intelligence.report import build_intelligence_report  # noqa: E402
-from live_betting.browser_companion import PROTOCOL_VERSION  # noqa: E402
 from live_betting.health import record_health  # noqa: E402
-from live_betting.report import build_report  # noqa: E402
 from live_betting.process_control import (  # noqa: E402
     MARKET_SOURCE_POLICY,
     terminate_subprocess_tree,
@@ -41,27 +38,16 @@ from shared.environment import load_environment_file  # noqa: E402
 from web.alerts import reconcile_alerts  # noqa: E402
 
 
-COMPANION_HEALTH_URL = "http://127.0.0.1:8765/health"
 SERVICE_LOCK_KEY = "dota2-predictor:shadow-service"
 CHILD_RESTART_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 WORKER_MAX_AGE = {
     "raybet": timedelta(seconds=45),
-    "shadow": timedelta(seconds=45),
     "mail": timedelta(seconds=90),
-    "vision": timedelta(seconds=90),
-    "strict_ingest": timedelta(seconds=90),
-    "postmatch": timedelta(seconds=150),
-    "draft_publisher": timedelta(minutes=15),
     "historical_rosh": timedelta(minutes=15),
 }
 WORKER_COMPONENTS = {
     "raybet": "raybet_worker",
-    "shadow": "shadow_worker",
     "mail": "mail_worker",
-    "vision": "vision_worker",
-    "strict_ingest": "strict_ingest_worker",
-    "postmatch": "postmatch_worker",
-    "draft_publisher": "draft_publisher_worker",
     "historical_rosh": "historical_rosh_worker",
 }
 
@@ -182,39 +168,6 @@ def _worker_health(
     }
 
 
-def _probe_companion() -> Mapping[str, Any]:
-    with urllib.request.urlopen(COMPANION_HEALTH_URL, timeout=1.0) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError("companion health payload is invalid")
-    return payload
-
-
-def _companion_health(
-    active: bool,
-    probe: Callable[[], Mapping[str, Any]],
-) -> tuple[str, str, dict[str, Any]]:
-    if not active:
-        return "stopped", "not_started_by_supervisor", {"required": False}
-    try:
-        payload = probe()
-    except Exception as error:
-        return "degraded", "companion_probe_failed", {
-            "required": False,
-            "error_type": type(error).__name__,
-        }
-    protocol = payload.get("protocol_version")
-    if protocol != PROTOCOL_VERSION:
-        return "degraded", "companion_protocol_mismatch", {
-            "required": False,
-            "protocol_version": protocol,
-        }
-    return "healthy", "companion_available", {
-        "required": False,
-        "protocol_version": protocol,
-    }
-
-
 def _service_capabilities(connection: Any) -> dict[str, dict[str, Any]]:
     statuses = {
         str(row["component"]): str(row["status"])
@@ -227,17 +180,9 @@ def _service_capabilities(connection: Any) -> dict[str, dict[str, Any]]:
             "required": True,
             "status": statuses.get("raybet", "stopped"),
         },
-        "vision": {
+        "historical_rosh": {
             "required": True,
-            "status": statuses.get("vision", "stopped"),
-        },
-        "paper_decision": {
-            "required": True,
-            "status": statuses.get("shadow", "stopped"),
-        },
-        "browser_compare": {
-            "required": False,
-            "status": statuses.get("companion", "stopped"),
+            "status": statuses.get("historical_rosh", "stopped"),
         },
     }
 
@@ -247,7 +192,6 @@ def service_once(
     report_path: Path | None = None,
     *,
     active_components: set[str] | None = None,
-    companion_probe: Callable[[], Mapping[str, Any]] = _probe_companion,
     initialize_schema: bool = True,
     health_only: bool = False,
 ) -> dict[str, Any]:
@@ -279,11 +223,6 @@ def service_once(
                 details=details,
             )
 
-        pending = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM shadow_orders WHERE status='pending'"
-            ).fetchone()[0]
-        )
         try:
             SMTPConfig.from_environment()
             smtp_configured = True
@@ -303,27 +242,14 @@ def service_once(
                 "dead_letters": int(mail_row[0]),
             },
         )
-        companion_status, companion_reason, companion_details = _companion_health(
-            "companion" in active,
-            companion_probe,
-        )
-        _record_component(
-            connection,
-            "companion",
-            companion_status,
-            now,
-            reason=companion_reason,
-            details=companion_details,
-            informational="companion" not in active,
-        )
         reconcile_alerts(connection, now=now)
         if health_only:
-            return {"pending_orders": pending}
+            return {"pending_orders": 0}
         result = {
             "market_source_policy": MARKET_SOURCE_POLICY,
             "capabilities": _service_capabilities(connection),
-            "shadow": build_report(connection),
             "intelligence": build_intelligence_report(connection),
+            "pending_orders": 0,
         }
     if report_path is not None:
         _write_service_report(report_path, result)
@@ -380,12 +306,7 @@ def _data_paths() -> dict[str, Path]:
     root = ROOT / "data" / "live_betting"
     return {
         "raw": root / "raw-v2",
-        "observations": root / "vision_observations",
-        "evidence": root / "vision_evidence",
-        "vision_logs": root / "watcher_logs",
         "managed_logs": root / "logs" / "managed",
-        "source_archive": ROOT / "data" / "raw-sources",
-        "coverage": ROOT / "data" / "reports" / "strict_event_coverage_latest.json",
     }
 
 
@@ -402,77 +323,11 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
             str(paths["raw"]),
             "--schema-prepared",
         ]
-    if args.start_companion:
-        commands["companion"] = [
-            python,
-            "-m",
-            "live_betting.browser_companion",
-            "--schema-prepared",
-        ]
-    if args.start_shadow:
-        commands["shadow"] = [
-            python,
-            "-m",
-            "live_betting.shadow_monitor",
-            "--vision-jsonl",
-            str(paths["observations"]),
-            "--schema-prepared",
-        ]
-    if args.start_vision:
-        commands["vision"] = [
-            python,
-            "scripts/supervise_raybet_streams.py",
-            "--output-dir",
-            str(paths["observations"]),
-            "--evidence-dir",
-            str(paths["evidence"]),
-            "--log-dir",
-            str(paths["vision_logs"]),
-            "--schema-prepared",
-        ]
     if args.start_mail:
         commands["mail"] = [
             python,
             "scripts/run_notification_worker.py",
             "--schema-prepared",
-        ]
-    if args.start_strict_ingest:
-        commands["strict_ingest"] = [
-            python,
-            "scripts/run_strict_event_ingest.py",
-            "--archive-root",
-            str(paths["source_archive"]),
-            "--coverage-report",
-            str(paths["coverage"]),
-            "--schema-prepared",
-        ]
-    if args.start_postmatch:
-        commands["postmatch"] = [
-            python,
-            "-m",
-            "live_betting.postmatch_monitor",
-            "--all",
-            "--archive-root",
-            str(paths["source_archive"]),
-            "--schema-prepared",
-        ]
-    if args.start_draft_publisher or args.start_shadow:
-        deployment_key = args.draft_deployment_key
-        if (
-            not isinstance(deployment_key, str)
-            or len(deployment_key) != 64
-            or any(character not in "0123456789abcdef" for character in deployment_key)
-        ):
-            raise ValueError(
-                "--draft-deployment-key must be a lowercase SHA-256 when the "
-                "draft publisher is enabled"
-            )
-        commands["draft_publisher"] = [
-            python,
-            "-m",
-            "live_betting.draft_publisher",
-            "--deployment-key",
-            deployment_key,
         ]
     if not args.once and not args.disable_historical_rosh:
         commands["historical_rosh"] = [
@@ -576,15 +431,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--start-collector", action="store_true")
-    parser.add_argument("--start-companion", action="store_true")
-    parser.add_argument("--start-shadow", action="store_true")
-    parser.add_argument("--start-vision", action="store_true")
     parser.add_argument("--start-mail", action="store_true")
-    parser.add_argument("--start-strict-ingest", action="store_true")
-    parser.add_argument("--start-postmatch", action="store_true")
-    parser.add_argument("--start-draft-publisher", action="store_true")
     parser.add_argument("--disable-historical-rosh", action="store_true")
-    parser.add_argument("--draft-deployment-key")
     return parser
 
 
@@ -649,11 +497,7 @@ def main() -> int:
                         "status": "ok",
                         "database": "postgresql",
                         "components": sorted(commands),
-                        "pending": (
-                            result["pending_orders"]
-                            if not args.once
-                            else result["shadow"]["orders"]["signals"]
-                        ),
+                        "pending": result["pending_orders"],
                     },
                     ensure_ascii=False,
                 ),

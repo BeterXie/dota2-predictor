@@ -20,7 +20,6 @@ dota2-predictor/
 |-- train/               # Model training and walk-forward evaluation
 |-- predict/             # Prematch prediction
 |-- live_betting/        # RayBet collection and shadow-only strategy
-|-- edge-extension/      # Passive Edge market monitor (Manifest V3)
 |-- vision/              # Dota broadcast clock, draft, and side recognition
 |-- contracts/           # Versioned live-observation contracts
 |-- scripts/             # Ingestion, observation, labeling, and reporting CLIs
@@ -67,26 +66,26 @@ python -m web.main
 ```
 
 After building `web/frontend`, open `http://127.0.0.1:8000/monitor`.
-The recurring supervisor manages historical Rosh by default. Odds collection,
-Vision, notifications, and the paper strategy start only when their explicit
-`--start-*` flags are supplied.
+The recurring supervisor manages historical Rosh by default. Odds collection
+and notifications start only when their explicit `--start-*` flags are
+supplied.
 
-The standard direct-only paper mode is:
+The standard runtime is:
 
 ```powershell
-$draftDeploymentKey = "<approved frozen draft deployment SHA-256>"
 python scripts/run_dota_shadow_service.py `
-  --start-collector --start-vision --start-shadow `
-  --start-strict-ingest --start-postmatch `
-  --draft-deployment-key $draftDeploymentKey
+  --start-collector
 ```
 
-`--start-companion` is optional and reserved for browser audit/compare runs.
-The system never exposes a real betting endpoint.
+Vision, live draft publishing, strict ingest, the paper strategy, and post-match
+labeling are no longer part of the normal supervised runtime. Their historical
+data remains readable. The system never exposes a real betting endpoint.
 
-## Live Shadow Workflow
+## Optional Research Commands
 
-All commands use `DATABASE_URL`; `--database-url` is available when an explicit
+The supervisor and monitoring console do not start the following research
+workers. Run them only for an explicit offline or manual investigation. All
+commands use `DATABASE_URL`; `--database-url` is available when an explicit
 override is needed.
 
 ```powershell
@@ -94,7 +93,7 @@ $env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2
 $rawDir = "data/live_betting/raw-v2"
 $visionJsonl = "data/live_betting/live_observations"
 
-# Read-only RayBet odds collection
+# Optional one-shot/read-only RayBet odds collection
 python -m live_betting.monitor `
   --raw-dir $rawDir --interval 6 --list-interval 30
 

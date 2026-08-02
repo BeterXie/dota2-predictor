@@ -29,10 +29,6 @@ from .draft_authority import (
 )
 from .health import read_health
 from .m1_verifier import verify_m1_qualifying_rejection
-from .milestone_revocation import (
-    MilestoneRevocationConfig,
-    load_milestone_revocation_projection,
-)
 from .research import research_summary
 from .settlement import persisted_settlement_authority_reason
 from .strategy_contract import (
@@ -240,110 +236,6 @@ def _isolate_unverified_settlements(
     return output, failures
 
 
-def _revocation_keys(
-    projection: Mapping[str, object], field: str
-) -> set[str]:
-    isolated = projection.get("isolated_keys")
-    if not isinstance(isolated, Mapping):
-        return set()
-    values = isolated.get(field)
-    if not isinstance(values, list):
-        return set()
-    return {str(value) for value in values}
-
-
-def _governance_lineage_statuses(
-    connection: PostgresSession,
-    projection: Mapping[str, object],
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Project explicit record lineage through persisted order/decision lineage."""
-
-    priority = {"active": 0, "review_required": 1, "revoked": 2}
-    decisions: dict[str, str] = {}
-    orders: dict[str, str] = {}
-
-    def merge(target: dict[str, str], key: object, status: str) -> None:
-        text = str(key)
-        if priority.get(status, 0) > priority.get(target.get(text, "active"), 0):
-            target[text] = status
-
-    records = projection.get("records")
-    if isinstance(records, list):
-        for record in records:
-            if not isinstance(record, Mapping):
-                continue
-            status = str(record.get("governance_status", "review_required"))
-            affected = record.get("affected")
-            if not isinstance(affected, Mapping):
-                continue
-            for key in affected.get("decision_keys", []):
-                merge(decisions, key, status)
-            for field in ("order_keys", "settlement_keys"):
-                for key in affected.get(field, []):
-                    merge(orders, key, status)
-            lineage = affected.get("sample_lineage")
-            if isinstance(lineage, list):
-                for item in lineage:
-                    if not isinstance(item, Mapping):
-                        continue
-                    merge(decisions, item.get("decision_key"), status)
-                    merge(orders, item.get("order_key"), status)
-                    merge(orders, item.get("settlement_key"), status)
-    if not decisions and not orders:
-        return decisions, orders
-    try:
-        rows = connection.execute(
-            "SELECT order_key, decision_key FROM shadow_order_decision_lineage"
-        ).fetchall()
-    except SQLAlchemyError:
-        # A configured revocation with unreadable lineage cannot authorize any
-        # potentially dependent decision/order surface.
-        try:
-            for row in connection.execute("SELECT decision_key FROM strategy_decisions"):
-                merge(decisions, row[0], "review_required")
-            for row in connection.execute("SELECT order_key FROM shadow_orders"):
-                merge(orders, row[0], "review_required")
-        except SQLAlchemyError:
-            pass
-        return decisions, orders
-    changed = True
-    while changed:
-        changed = False
-        for order_key, decision_key in rows:
-            order_text = str(order_key)
-            decision_text = str(decision_key)
-            statuses = [
-                status
-                for status in (orders.get(order_text), decisions.get(decision_text))
-                if status is not None
-            ]
-            if not statuses:
-                continue
-            status = max(statuses, key=lambda item: priority[item])
-            before = (orders.get(order_text), decisions.get(decision_text))
-            merge(orders, order_text, status)
-            merge(decisions, decision_text, status)
-            changed = changed or before != (
-                orders.get(order_text), decisions.get(decision_text)
-            )
-    return decisions, orders
-
-
-def _add_revocation_exclusion(
-    audit: dict[str, object], count: int
-) -> dict[str, object]:
-    if count == 0:
-        return audit
-    output = dict(audit)
-    reasons = dict(output["exclusion_reasons"])
-    reasons["milestone_revocation"] = count
-    output["exclusion_reasons"] = reasons
-    if output["excluded_decisions" if "excluded_decisions" in output else "excluded_orders"] is not None:
-        key = "excluded_decisions" if "excluded_decisions" in output else "excluded_orders"
-        output[key] = int(output[key]) + count
-    return output
-
-
 def _add_decision_payload_exclusions(
     audit: dict[str, object], failures: Mapping[str, int]
 ) -> dict[str, object]:
@@ -517,20 +409,7 @@ def _official_rosh_v6_shadow_summary(
     }
 
 
-def build_report(
-    connection: PostgresSession,
-    *,
-    revocation_config: MilestoneRevocationConfig | None = None,
-) -> dict[str, object]:
-    governance = load_milestone_revocation_projection(
-        config=revocation_config,
-        connection=connection if revocation_config is not None else None,
-    )
-    decision_governance, order_governance = _governance_lineage_statuses(
-        connection, governance
-    )
-    isolated_decision_keys = set(decision_governance)
-    isolated_order_keys = set(order_governance)
+def build_report(connection: PostgresSession) -> dict[str, object]:
     invalidation_available = _table_exists(
         connection, "vision_derived_invalidations"
     )
@@ -647,12 +526,7 @@ def build_report(
     draft_authority_invalid_decision_count = (
         len(projection_valid_decisions) - len(draft_valid_decisions)
     )
-    decisions = [
-        row
-        for row in draft_valid_decisions
-        if str(row["decision_key"]) not in isolated_decision_keys
-    ]
-    governance_isolated_decision_count = len(draft_valid_decisions) - len(decisions)
+    decisions = draft_valid_decisions
     entry_validations = {
         str(row["decision_key"]): _validate_v4_entry(row)
         for row in decisions
@@ -842,30 +716,7 @@ def build_report(
         if _order_draft_authority_valid(connection, row)
     ]
     draft_authority_invalid_order_count = len(raw_order_rows) - len(draft_valid_orders)
-    if isolated_decision_keys:
-        try:
-            linked_revoked_orders = connection.execute(
-                """SELECT lineage.order_key
-                     FROM shadow_order_decision_lineage AS lineage
-                     JOIN jsonb_array_elements_text(CAST(? AS jsonb))
-                          AS revoked(value)
-                       ON revoked.value=lineage.decision_key""",
-                (json.dumps(sorted(isolated_decision_keys)),),
-            ).fetchall()
-        except SQLAlchemyError:
-            # A configured revocation must not leave dependent orders scored
-            # when their lineage relation cannot be read.
-            isolated_order_keys.update(
-                str(row["order_key"]) for row in draft_valid_orders
-            )
-        else:
-            isolated_order_keys.update(str(row[0]) for row in linked_revoked_orders)
-    orders = [
-        row
-        for row in draft_valid_orders
-        if str(row["order_key"]) not in isolated_order_keys
-    ]
-    governance_isolated_order_count = len(draft_valid_orders) - len(orders)
+    orders = draft_valid_orders
     orders, settlement_authority_failures = _isolate_unverified_settlements(
         connection, orders
     )
@@ -902,12 +753,6 @@ def build_report(
     )
     decision_audit = _add_decision_payload_exclusions(
         decision_audit, decision_payload_failures
-    )
-    order_audit = _add_revocation_exclusion(
-        order_audit, governance_isolated_order_count
-    )
-    decision_audit = _add_revocation_exclusion(
-        decision_audit, governance_isolated_decision_count
     )
     if (
         decision_audit["excluded_decisions"] is not None
@@ -951,26 +796,10 @@ def build_report(
     except SQLAlchemyError:
         m1_candidates = []
     m1_strategy_contract_verifications = []
-    revoked_milestones = set(governance.get("revoked_milestones", []))
-    review_milestones = set(governance.get("review_required_milestones", []))
-    milestone_status = (
-        "revoked"
-        if "M1" in revoked_milestones
-        else "review_required" if "M1" in review_milestones else "active"
-    )
-    governance_priority = {"active": 0, "review_required": 1, "revoked": 2}
     for candidate in m1_candidates:
         verification = verify_m1_qualifying_rejection(
             connection, str(candidate["decision_key"])
         )
-        governance_status = max(
-            (
-                decision_governance.get(verification.decision_key, "active"),
-                milestone_status,
-            ),
-            key=lambda status: governance_priority[status],
-        )
-        authorized = governance_status == "active"
         m1_strategy_contract_verifications.append(
             {
                 "decision_key": verification.decision_key,
@@ -978,11 +807,7 @@ def build_report(
                 "evaluator_hash": verification.evaluator_hash,
                 "policy_hash": verification.policy_hash,
                 "serialization_version": verification.serialization_version,
-                "m1_qualifying_rejection": (
-                    verification.m1_qualifying_rejection and authorized
-                ),
-                "governance_status": governance_status,
-                "authorized": authorized,
+                "m1_qualifying_rejection": verification.m1_qualifying_rejection,
                 "verifier_reason": verification.reason,
                 "replay_reason": verification.replay_reason,
             }
@@ -996,7 +821,6 @@ def build_report(
         "decision_payload_exclusion_reasons": dict(
             sorted(decision_payload_failures.items())
         ),
-        "governance_isolated_decision_count": governance_isolated_decision_count,
         "decision_audit": decision_audit,
         "raw_decision_count": decision_audit["raw_decisions"],
         "included_decision_count": decision_audit["included_decisions"],
@@ -1015,7 +839,6 @@ def build_report(
         "draft_authority_invalid_order_count": (
             draft_authority_invalid_order_count
         ),
-        "governance_isolated_order_count": governance_isolated_order_count,
         # Flat aliases keep the two safety-critical counts discoverable for
         # consumers that do not yet understand the nested audit object.
         "invalidated_order_count": order_audit["invalidated_orders"],
@@ -1061,7 +884,6 @@ def build_report(
         "m1_strategy_contract_verifications": (
             m1_strategy_contract_verifications
         ),
-        "milestone_governance": governance,
         "strict_scope": strict_counts,
         "research": research_summary(connection),
         "stability_status": _headline_stability_status(
@@ -1241,13 +1063,6 @@ def _evaluation_cohorts(
             records,
             identity_complete=identity_complete,
         )
-        failures = _promotion_gate_failures(
-            settled=int(metrics["settled_orders"]),
-            event_count=len(events),
-            identity_complete=identity_complete,
-            bootstrap_status=str(bootstrap["status"]),
-            sensitivity_status=str(sensitivity["status"]),
-        )
         output.append({
             "identity": cohort["identity"],
             "identity_complete": identity_complete,
@@ -1282,8 +1097,6 @@ def _evaluation_cohorts(
             "stability_status": _cohort_stability_status(
                 int(metrics["settled_orders"]), len(events), identity_complete
             ),
-            "promotion_gate_status": "not_passed",
-            "promotion_gate_failures": failures,
         })
     return output
 
@@ -2436,33 +2249,6 @@ def _slippage_bucket(record: _OrderRecord) -> str:
     if value <= 0.03:
         return "adverse_1-3pct"
     return "adverse_over_3pct"
-
-
-def _promotion_gate_failures(
-    *,
-    settled: int,
-    event_count: int,
-    identity_complete: bool,
-    bootstrap_status: str,
-    sensitivity_status: str,
-) -> list[str]:
-    failures = []
-    if not identity_complete:
-        failures.append("frozen_strategy_model_identity_incomplete")
-    if settled < 500:
-        failures.append("settled_forward_orders_below_500")
-    if event_count < 2:
-        failures.append("cross_event_evidence_missing")
-    if bootstrap_status != "computed":
-        failures.append("series_cluster_bootstrap_90_ci_missing")
-    if sensitivity_status != "computed":
-        failures.append("leave_one_event_out_sensitivity_missing")
-    failures.extend((
-        "forward_calibration_promotion_gate_not_recorded",
-        "market_baseline_promotion_gate_not_approved",
-        "return_slippage_drawdown_gate_not_approved",
-    ))
-    return failures
 
 
 def _cohort_stability_status(

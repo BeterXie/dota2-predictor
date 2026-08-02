@@ -431,9 +431,6 @@ export interface AlertIncident {
 export interface ControlComponent {
   component:
     | "raybet_collector"
-    | "shadow_monitor"
-    | "vision_supervisor"
-    | "draft_publisher"
     | "mail_worker";
   label: string;
   status: "running" | "stopped" | "identity_mismatch";
@@ -488,22 +485,10 @@ export interface MonitorCapability {
   status: ReadinessStatus | "healthy" | "unknown" | string;
 }
 
-export interface MilestoneGovernanceProjection {
-  status?: string;
-  governance_status?: string;
-  ledger_integrity?: {
-    status?: string;
-    [key: string]: unknown;
-  };
-  records?: Array<Record<string, unknown>>;
-  [key: string]: unknown;
-}
-
 export interface MonitorSnapshot {
   generated_at: string;
   market_source_policy?: string;
   capabilities?: Record<string, MonitorCapability>;
-  milestone_governance?: MilestoneGovernanceProjection;
   cursor: string;
   mapping_revision: string;
   health: HealthItem[];

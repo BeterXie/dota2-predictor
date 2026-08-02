@@ -75,7 +75,6 @@ def test_monitor_api_uses_postgres_session(postgres_engine, tmp_path, monkeypatc
     store.close()
 
     monkeypatch.setattr(queries, "get_db", lambda: PostgresSession(postgres_engine))
-    app.state.milestone_revocation_config = None
 
     with TestClient(app) as client:
         bootstrap = client.get("/api/monitor/bootstrap")

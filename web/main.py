@@ -94,17 +94,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     with LiveBettingStore(database_url) as store:
         store.init_schema()
         verify_runtime_schema(store.connection)
-    from .app import app, configure_milestone_revocation
-    revocation_config = None
-    configure_milestone_revocation(app, None)
     logging.getLogger("web").info(
         "PostgreSQL database configured from %s", source
     )
 
-    if reload and revocation_config is not None:
-        raise ValueError("reload cannot preserve explicit milestone revocation app state")
     uvicorn.run(
-        "web.app:app" if revocation_config is None else app,
+        "web.app:app",
         host=host,
         port=port,
         reload=reload,

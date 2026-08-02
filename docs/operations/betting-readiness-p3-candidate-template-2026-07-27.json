@@ -52,7 +52,6 @@
   },
   "operations": {
     "paper_only": true,
-    "browser_companion_configured": false,
     "operations_approved": false,
     "single_managed_writer_plan": false,
     "database_raw_pair_frozen": false

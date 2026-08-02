@@ -1,11 +1,11 @@
 # Dota 2 滚球监控台操作手册
 
-本文档适用于项目内置的本机监控台，用于查看 RayBet 赛事、赔率历史、可信视觉时钟、纸面策略、exact 映射和告警。系统不会提交真实投注。PostgreSQL 是唯一运行数据库；SQLite 只作为一次性历史导入源。
+本文档适用于项目内置的本机监控台，用于查看 RayBet 赛事、赔率历史、exact 映射和运行告警。系统不会提交真实投注。PostgreSQL 是唯一运行数据库；SQLite 只作为一次性历史导入源。Vision、纸面策略、strict ingest、阵容发布和 post-match 仅保留为历史数据或手动研究能力，不属于监控台主流程。
 
 ## 1. 安全边界
 
 - Web 默认监听 `127.0.0.1`，不要暴露到局域网或公网。
-- RayBet 采集只读，策略只生成纸面订单。
+- RayBet 采集只读；监控台不提交任何投注或策略订单。
 - 页面只能控制固定白名单进程，不能提交任意命令。
 - 停止进程前核对 PID、创建时间和固定命令；身份变化时拒绝终止。
 - 页面不能编辑原始赔率、实时调参、执行真实投注或接受 fuzzy/name-only 映射。
@@ -51,20 +51,14 @@ $env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
 & $python scripts\run_dota_shadow_service.py
 ```
 
-无 flag 启动只管理默认的历史 Rosh worker，不会启动赔率、视觉、邮件或纸面策略。标准 direct-only paper 模式：
+无 flag 启动只管理默认的历史 Rosh worker，不会启动赔率或邮件。标准运行模式：
 
 ```powershell
-$draftDeploymentKey = "<已批准的 frozen draft deployment SHA-256>"
 & $python scripts\run_dota_shadow_service.py `
-  --start-collector `
-  --start-vision `
-  --start-shadow `
-  --start-strict-ingest `
-  --start-postmatch `
-  --draft-deployment-key $draftDeploymentKey
+  --start-collector
 ```
 
-只有浏览器审计/对照运行才增加 `--start-companion`；SMTP 配置完成后才增加 `--start-mail`。
+SMTP 配置完成后才增加 `--start-mail`。Vision、阵容发布、strict ingest、纸面策略和 post-match 不再属于常驻主流程，只保留历史数据与手动研究命令。
 
 第二个 PowerShell 窗口：
 
@@ -117,17 +111,17 @@ $service.Id
 
 ## 5. 页面与时间轴
 
-赛事列表优先显示比赛、数据健康和策略状态。详情首屏显示比分、当前胜负盘和最终策略结论，阵容、策略记录与原始证据默认折叠。
+赛事列表优先显示比赛、数据健康和赛事映射状态。详情首屏显示比分、当前胜负盘和映射结果，历史证据默认折叠。
 
 历史复盘以真实采集时间为主轴：
 
 - 主时间：`received_at / observed_at / captured_at`
-- 辅助时间：可信视觉观测的 `game_clock_seconds`
+- 历史视觉观测等证据只作为已采集数据回看，不参与监控台运行就绪判断。
 - 超过 60 秒的采集空洞显示为断点，不补造数据。
 - 图表只使用真实完整胜负盘快照。
 - 不可信、手工或缺失的比赛时钟不会替代采集时间。
 
-就绪链路逐场显示赔率采集、赛事映射、视觉观测、模型判断和纸面策略。`延迟` 表示已有数据但超过警告时间；`过期`、`无效` 或 `异常` 不可作为当前策略依据。
+就绪链路逐场显示赔率采集和赛事映射。`延迟` 表示已有数据但超过警告时间；`过期`、`无效` 或 `异常` 不可作为当前监控依据。
 
 ## 6. 赔率采集规则
 
@@ -146,14 +140,9 @@ $service.Id
 | 页面名称 | 固定命令 |
 |---|---|
 | 赔率采集 | `python -u -m live_betting.monitor --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30` |
-| 纸面策略 | `python -u -m live_betting.shadow_monitor --vision-jsonl data/live_betting/live_observations` |
-| 视觉监控 | `python -u scripts/supervise_raybet_streams.py` |
-| 阵容预测发布器 | `python -u -m live_betting.draft_publisher` |
 | 邮件投递 | `python -u scripts/run_notification_worker.py` |
 
 历史 Rosh 不在 Web allowlist 中，由 supervisor 管理。每次控制操作都需要本机会话、CSRF 和二次确认，后端不接收页面提供的命令文本。
-
-Vision watcher 的 signed HLS URL 只能在进程内存短暂存在，不得写入命令、日志、`service_health`、数据库、artifact 或 Web 响应。
 
 ## 8. Exact 映射
 
@@ -181,7 +170,7 @@ CLI 人工登记示例：
 
 ## 9. 告警与通知
 
-`operational` 告警表示 worker 异常，持续 30 秒才开启；`paper_signal` 表示待处理纸面订单，立即开启。相同 dedupe key 只保留一个活动事件，条件消失后自动 recovered。
+`operational` 告警表示数据库、赔率采集、历史 Rosh 或邮件 worker 异常，持续 30 秒才开启；历史纸面订单若仍有待处理状态，会以 `paper_signal` 告警保留兼容读取。相同 dedupe key 只保留一个活动事件，条件消失后自动 recovered。
 
 SMTP 配置：
 
@@ -192,7 +181,7 @@ $env:DOTA2_ALERT_EMAIL_RECIPIENT = "receiver@example.com"
 & $python -u scripts\run_notification_worker.py
 ```
 
-发送使用 `smtp.qq.com:465` 和证书校验的隐式 TLS。未配置邮件不会阻断页面、赔率采集、视觉或策略。
+发送使用 `smtp.qq.com:465` 和证书校验的隐式 TLS。未配置邮件不会阻断页面或赔率采集。
 
 ## 10. 日志与数据
 
@@ -248,7 +237,7 @@ PostgreSQL 的物理备份和恢复应使用部署环境标准的 `pg_dump` / `p
 
 ## 12. 停止与重启
 
-1. 页面停止邮件、阵容发布器、纸面策略、视觉和赔率采集。
+1. 页面停止邮件和赔率采集。
 2. 停止 supervisor；默认历史 Rosh 会随之停止。
 3. 停止 Web。
 4. 更新代码，执行 `alembic upgrade head`，必要时重新构建前端。

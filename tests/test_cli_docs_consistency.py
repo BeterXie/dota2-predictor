@@ -87,14 +87,14 @@ def test_migration_readme_tracks_current_alembic_head() -> None:
     assert "does not create a SQLite backup" in content
 
 
-def test_supervisor_runbook_keeps_direct_only_start_flags() -> None:
+def test_supervisor_runbook_keeps_only_core_start_flags() -> None:
     content = _text(ROOT / "README.md")
-    for flag in (
-        "--start-collector",
+    assert "--start-collector" in content
+    for retired_flag in (
         "--start-vision",
         "--start-shadow",
         "--start-strict-ingest",
         "--start-postmatch",
         "--draft-deployment-key",
     ):
-        assert flag in content
+        assert retired_flag not in content

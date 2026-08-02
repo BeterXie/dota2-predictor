@@ -5,7 +5,7 @@ import type { MonitorMatch } from "../../types";
 import { PipelineTopology } from "./PipelineTopology";
 
 describe("PipelineTopology", () => {
-  it("shows all readiness states in operator-facing Chinese", () => {
+  it("shows the core readiness states in operator-facing Chinese", () => {
     const match: MonitorMatch = {
       raybet_match_id: "match-1",
       tournament: "Test event",
@@ -33,9 +33,9 @@ describe("PipelineTopology", () => {
 
     expect(screen.getByLabelText("赔率采集：已过期")).toBeInTheDocument();
     expect(screen.getByLabelText("赛事映射：无数据")).toBeInTheDocument();
-    expect(screen.getByLabelText("视觉观测：未确认")).toBeInTheDocument();
-    expect(screen.getByLabelText("模型判断：就绪")).toBeInTheDocument();
-    expect(screen.getByLabelText("纸面策略：已停止")).toBeInTheDocument();
+    expect(screen.queryByText("视觉观测")).not.toBeInTheDocument();
+    expect(screen.queryByText("模型判断")).not.toBeInTheDocument();
+    expect(screen.queryByText("纸面策略")).not.toBeInTheDocument();
     expect(screen.queryByText("stale")).not.toBeInTheDocument();
     expect(screen.queryByText("missing")).not.toBeInTheDocument();
   });

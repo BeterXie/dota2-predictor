@@ -64,14 +64,8 @@ class BrowserContractTests(unittest.TestCase):
     def parse(self, value: dict) -> BrowserEvent:
         return BrowserEvent.model_validate_json(json.dumps(value))
 
-    def test_canonical_json_matches_extension_rfc8785_vectors(self) -> None:
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "edge-extension"
-            / "tests"
-            / "fixtures"
-            / "canonical-vectors.json"
-        )
+    def test_canonical_json_matches_rfc8785_vectors(self) -> None:
+        path = Path(__file__).resolve().parent / "fixtures" / "canonical-vectors.json"
         for vector in json.loads(path.read_text(encoding="utf-8")):
             with self.subTest(name=vector["name"]):
                 self.assertEqual(

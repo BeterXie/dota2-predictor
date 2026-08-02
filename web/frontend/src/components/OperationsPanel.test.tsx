@@ -31,64 +31,6 @@ const degradedMatch: MonitorMatch = {
 
 
 describe("OperationsPanel", () => {
-  it("shows per-gate vision diagnostics for the selected match", () => {
-    const view = render(
-      <FluentProvider theme={webDarkTheme} applyStylesToPortals={false}>
-        <OperationsPanel
-          alerts={[]}
-          busyKey={null}
-          components={[]}
-          controlMessage={null}
-          health={[{
-            component: "vision_worker",
-            status: "degraded",
-            reported_status: "degraded",
-            freshness: "fresh",
-            age_seconds: 2,
-            last_heartbeat_at: "2026-07-31T00:00:00+00:00",
-            last_success_at: null,
-            last_error_at: null,
-            last_error: null,
-            details: {
-              watchers: {
-                "match-1": {
-                  capture_state: "capturing_partial",
-                  blocker_code: "net_worth_advantage_unconfirmed",
-                  layout_profile: "standard_dota_hud_1080p",
-                  layout_supported: true,
-                  replay_gate_status: "live",
-                  clock_confirmed: true,
-                  clock_seconds: 842,
-                  scoreboard_confirmed: true,
-                  radiant_kills: 8,
-                  dire_kills: 5,
-                  net_worth_confirmed: false,
-                  draft_confirmed: false,
-                  radiant_hero_count: 4,
-                  dire_hero_count: 4,
-                  strategy_ready: false,
-                },
-              },
-            },
-          }]}
-          mappings={[]}
-          match={degradedMatch}
-          onAcknowledge={vi.fn()}
-          onApproveMapping={vi.fn()}
-          onControl={vi.fn()}
-          onCreateAutomaticMap={vi.fn()}
-          onInvalidateMapping={vi.fn()}
-        />
-      </FluentProvider>,
-    );
-
-    const diagnostic = within(view.getByLabelText("视觉识别诊断"));
-    expect(diagnostic.getByText("经济优势未确认")).toBeInTheDocument();
-    expect(diagnostic.getByText("已确认 14:02")).toBeInTheDocument();
-    expect(diagnostic.getByText("已确认 8 : 5")).toBeInTheDocument();
-    expect(diagnostic.getByText("8 / 10")).toBeInTheDocument();
-  });
-
   it("separates data-chain readiness from the absence of active alerts", () => {
     const view = render(
       <FluentProvider theme={webDarkTheme} applyStylesToPortals={false}>
@@ -113,7 +55,7 @@ describe("OperationsPanel", () => {
     const panel = within(view.container);
     expect(panel.getByText("数据链路尚不可用于决策")).toBeInTheDocument();
     expect(panel.getByText("进程运行不代表数据可用于决策。")).toBeInTheDocument();
-    expect(panel.getByText("2/5")).toBeInTheDocument();
+    expect(panel.getByText("1/2")).toBeInTheDocument();
     expect(panel.getByText("当前没有活动告警")).toBeInTheDocument();
     expect(panel.getByText("0 仅表示未触发活动告警，请同时检查数据链路。")).toBeInTheDocument();
     expect(panel.queryByText("数据链路可用于决策")).not.toBeInTheDocument();
@@ -192,8 +134,8 @@ describe("OperationsPanel", () => {
             detail: null,
             control_allowed: true,
           }, {
-            component: "draft_publisher",
-            label: "Draft publisher",
+            component: "mail_worker",
+            label: "Mail worker",
             status: "stopped",
             pid: null,
             started_at: null,
@@ -232,7 +174,7 @@ describe("OperationsPanel", () => {
     const panel = within(view.container);
     expect(panel.getByRole("button", { name: "启动赔率采集" })).toBeEnabled();
     expect(panel.getByRole("button", { name: "停止赔率采集" })).toBeDisabled();
-    expect(panel.getByRole("button", { name: "启动阵容预测发布器" })).toBeEnabled();
+    expect(panel.getByRole("button", { name: "启动邮件投递" })).toBeEnabled();
     expect(panel.getByText("赔率采集状态异常")).toBeInTheDocument();
     expect(panel.getByRole("button", { name: /确认告警/ })).toBeEnabled();
     expect(panel.getByText("manual_exact")).toBeInTheDocument();

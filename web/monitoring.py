@@ -10,7 +10,6 @@ import math
 import re
 import secrets
 from collections import defaultdict
-from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -32,10 +31,6 @@ from live_betting.raybet_state import (
     infer_current_map_number,
     raybet_match_is_live,
     raybet_odds_is_open,
-)
-from live_betting.milestone_revocation import (
-    MilestoneRevocationConfig,
-    load_milestone_revocation_projection,
 )
 from live_betting.sanitize import stored_public_stream_url
 from live_betting.process_control import MARKET_SOURCE_POLICY
@@ -73,9 +68,21 @@ _HISTORY_ACTIVITY_GRACE = timedelta(minutes=15)
 _SQLITE_DATETIME_ROUNDING_GRACE = timedelta(milliseconds=1)
 _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
-    "shadow_worker": 45.0,
+    "historical_rosh_worker": 900.0,
 }
-_OPTIONAL_UNCONFIGURED_COMPONENTS = {"mail", "mail_worker", "companion"}
+_PRIMARY_HEALTH_COMPONENTS = {
+    "database",
+    "raybet",
+    "raybet_worker",
+    "raybet_priority_odds_worker",
+    "raybet_full_odds_worker",
+    "historical_rosh",
+    "historical_rosh_worker",
+    "mail",
+    "mail_worker",
+    "mail_delivery",
+}
+_OPTIONAL_UNCONFIGURED_COMPONENTS = {"mail", "mail_worker", "mail_delivery"}
 _RAYBET_PAGE_ORIGINS = frozenset(
     {"https://ray086.com", "https://www.ray086.com"}
 )
@@ -296,19 +303,10 @@ def build_monitor_snapshot(
     connection: PostgresSession,
     *,
     now: datetime | None = None,
-    revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, Any]:
     checked_at = _aware_utc(now or utc_now())
-    governance = load_milestone_revocation_projection(
-        config=revocation_config,
-        connection=connection if revocation_config is not None else None,
-    )
     health = derive_health(connection, now=checked_at)
-    matches = monitor_matches(
-        connection,
-        now=checked_at,
-        _governance=governance,
-    )
+    matches = monitor_matches(connection, now=checked_at)
     alerts = active_alerts(connection)
     all_counts = _lifecycle_counts(matches)
     live_view = [item for item in matches if not _is_historical_match(item)]
@@ -318,7 +316,6 @@ def build_monitor_snapshot(
         "market_source_policy": MARKET_SOURCE_POLICY,
         "capabilities": _monitor_capabilities(health),
         "mapping_revision": mapping_revision(connection),
-        "milestone_governance": governance,
         "health": health,
         "matches": matches,
         "alerts": alerts,
@@ -332,7 +329,8 @@ def build_monitor_snapshot(
             "unhealthy_components": sum(
                 item["status"] in {"degraded", "unhealthy", "stopped"}
                 for item in health
-                if not (
+                if item["component"] in _PRIMARY_HEALTH_COMPONENTS
+                and not (
                     item["component"] in _OPTIONAL_UNCONFIGURED_COMPONENTS
                     and (
                         item["last_error"] == "configuration_missing"
@@ -356,17 +354,9 @@ def _monitor_capabilities(
             "required": True,
             "status": statuses.get("raybet", "stopped"),
         },
-        "vision": {
+        "historical_rosh": {
             "required": True,
-            "status": statuses.get("vision", "stopped"),
-        },
-        "paper_decision": {
-            "required": True,
-            "status": statuses.get("shadow", "stopped"),
-        },
-        "browser_compare": {
-            "required": False,
-            "status": statuses.get("companion", "stopped"),
+            "status": statuses.get("historical_rosh", "stopped"),
         },
     }
 
@@ -375,24 +365,14 @@ def monitor_matches(
     connection: PostgresSession,
     *,
     now: datetime | None = None,
-    revocation_config: MilestoneRevocationConfig | None = None,
-    _governance: Mapping[str, object] | None = None,
 ) -> list[dict[str, Any]]:
     checked_at = _aware_utc(now or utc_now())
-    governance = (
-        _governance
-        if _governance is not None
-        else load_milestone_revocation_projection(
-            config=revocation_config,
-            connection=connection if revocation_config is not None else None,
-        )
-    )
     rows = _realtime_match_candidates(connection, checked_at)
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
     output = [
-        _monitor_match(connection, row, checked_at, health_by_component, governance)
+        _monitor_match(connection, row, checked_at, health_by_component)
         for row in rows
     ]
     lifecycle_order = {"live": 0, "degraded": 1, "upcoming": 2, "ended": 3}
@@ -412,7 +392,6 @@ def monitor_history_page(
     cursor: str | None = None,
     limit: int = _HISTORY_DEFAULT_LIMIT,
     now: datetime | None = None,
-    revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, Any]:
     """Return a bounded immutable-odds replay page.
 
@@ -423,10 +402,6 @@ def monitor_history_page(
 
     if type(limit) is not int or not 1 <= limit <= _HISTORY_MAX_LIMIT:
         raise ValueError("history limit is out of range")
-    governance = load_milestone_revocation_projection(
-        config=revocation_config,
-        connection=connection if revocation_config is not None else None,
-    )
     if cursor is None:
         checked_at = _aware_utc(now or utc_now())
         before = None
@@ -452,9 +427,7 @@ def monitor_history_page(
     found_extra = False
     for row in candidates:
         last_scanned = row
-        item = _monitor_match(
-            connection, row, checked_at, health_by_component, governance
-        )
+        item = _monitor_match(connection, row, checked_at, health_by_component)
         if item.get("history_eligible") is not True:
             continue
         if len(items) == limit:
@@ -489,13 +462,8 @@ def monitor_match_detail(
     *,
     now: datetime | None = None,
     max_points: int = 1200,
-    revocation_config: MilestoneRevocationConfig | None = None,
 ) -> dict[str, Any] | None:
     checked_at = _aware_utc(now or utc_now())
-    governance = load_milestone_revocation_projection(
-        config=revocation_config,
-        connection=connection if revocation_config is not None else None,
-    )
     row = connection.execute(
         """SELECT raybet_match_id, tournament, team_one, team_two,
                   scheduled_at, best_of, status, live_url, raw_json, updated_at
@@ -507,9 +475,7 @@ def monitor_match_detail(
     health_by_component = {
         item["component"]: item for item in derive_health(connection, now=checked_at)
     }
-    summary = _monitor_match(
-        connection, row, checked_at, health_by_component, governance
-    )
+    summary = _monitor_match(connection, row, checked_at, health_by_component)
     timeline = winner_timeline(
         connection,
         raybet_match_id,
@@ -522,7 +488,6 @@ def monitor_match_detail(
         summary["readiness"]["strategy"],
         lifecycle=str(summary["lifecycle"]),
         now=checked_at,
-        governance=governance,
     )
     decisions = (
         list(strategy["data"]["decisions"])
@@ -549,7 +514,6 @@ def monitor_match_detail(
     )
     return {
         **summary,
-        "milestone_governance": governance,
         "prematch_winner": (
             _current_winner(
                 connection,
@@ -1370,7 +1334,6 @@ def _monitor_match(
     row: DatabaseRow,
     now: datetime,
     health: dict[str, dict[str, Any]],
-    governance: Mapping[str, object],
 ) -> dict[str, Any]:
     match_id = str(row["raybet_match_id"])
     if _has_transport_observations(connection, match_id):
@@ -1395,9 +1358,7 @@ def _monitor_match(
             (match_id, now.isoformat()),
         )
     latest_vision = _latest_valid_vision_row(connection, match_id, now=now)
-    latest_decision = _latest_strategy_decision(
-        connection, match_id, now=now, governance=governance
-    )
+    latest_decision = _latest_strategy_decision(connection, match_id, now=now)
     mapping_readiness = _mapping_readiness(connection, match_id, now)
     latest_odds_activity = _latest_odds_activity(connection, match_id, now=now)
 
@@ -1863,49 +1824,6 @@ def _analysis_section(
     if status not in _ANALYSIS_STATUSES:
         raise ValueError("invalid analysis section status")
     return {"status": status, "reason": reason, "data": data}
-
-
-def _milestone_revocation_keys(
-    projection: Mapping[str, object], field: str
-) -> set[str]:
-    isolated = projection.get("isolated_keys")
-    if not isinstance(isolated, Mapping):
-        return set()
-    values = isolated.get(field)
-    if not isinstance(values, list):
-        return set()
-    return {str(value) for value in values}
-
-
-def _milestone_revocation_decision_keys(
-    connection: PostgresSession,
-    projection: Mapping[str, object],
-) -> set[str]:
-    decisions = _milestone_revocation_keys(projection, "decision_keys")
-    orders = _milestone_revocation_keys(projection, "order_keys")
-    orders.update(_milestone_revocation_keys(projection, "settlement_keys"))
-    if not orders:
-        return decisions
-    try:
-        rows = connection.execute(
-            """SELECT decision_key FROM shadow_order_decision_lineage
-                 WHERE order_key IN (
-                     SELECT jsonb_array_elements_text(CAST(? AS jsonb))
-                 )""",
-            (json.dumps(sorted(orders)),),
-        ).fetchall()
-    except SQLAlchemyError:
-        # An unreadable lineage relation cannot authorize a possibly affected
-        # strategy decision on a configured governance surface.
-        try:
-            return {
-                str(row[0])
-                for row in connection.execute("SELECT decision_key FROM strategy_decisions")
-            }
-        except SQLAlchemyError:
-            return decisions
-    decisions.update(str(row[0]) for row in rows)
-    return decisions
 
 
 def _odds_analysis(
@@ -2557,7 +2475,6 @@ def _strategy_analysis(
     *,
     lifecycle: str,
     now: datetime,
-    governance: Mapping[str, object],
 ) -> dict[str, Any]:
     required_relations = {
         "strategy_decisions": {
@@ -2666,14 +2583,6 @@ def _strategy_analysis(
         "draft_conflicted": 0,
         "invalid_payload": 0,
     }
-    ledger_integrity = governance.get("ledger_integrity")
-    ledger_configured = (
-        isinstance(ledger_integrity, Mapping)
-        and ledger_integrity.get("status") == "verified"
-    )
-    if ledger_configured:
-        excluded["milestone_revocation"] = 0
-    isolated_decisions = _milestone_revocation_decision_keys(connection, governance)
     excluded_decision_count = 0
     decisions_desc: list[dict[str, Any]] = []
     scanned_count = 0
@@ -2713,10 +2622,6 @@ def _strategy_analysis(
                     "mapping_impacted": bool(row["_mapping_impacted"]),
                     "draft_conflicted": bool(row["_draft_conflicted"]),
                 }
-                if ledger_configured:
-                    flags["milestone_revocation"] = (
-                        str(row["decision_key"]) in isolated_decisions
-                    )
                 if any(flags.values()):
                     excluded_decision_count += 1
                     for reason, present in flags.items():
@@ -3964,7 +3869,6 @@ def _latest_strategy_decision(
     raybet_match_id: str,
     *,
     now: datetime,
-    governance: Mapping[str, object],
 ) -> DatabaseRow | None:
     required_relations = {
         "strategy_decisions": {
@@ -3995,9 +3899,6 @@ def _latest_strategy_decision(
     ):
         return None
     try:
-        isolated = sorted(
-            _milestone_revocation_decision_keys(connection, governance)
-        )
         return connection.execute(
             """SELECT decided_at AS observed_at, map_number, model_probability,
                       market_probability, edge, eligible, reason, strategy_version
@@ -4005,11 +3906,6 @@ def _latest_strategy_decision(
                 WHERE decision.raybet_match_id=?
                   AND live_text_timestamp_utc(decision.decided_at)<=
                       CAST(? AS timestamptz)
-                  AND NOT EXISTS (
-                      SELECT 1
-                        FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS revoked(value)
-                       WHERE revoked.value=decision.decision_key
-                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM vision_derived_invalidations AS invalidation
                        WHERE invalidation.dependent_type='strategy_decision'
@@ -4056,7 +3952,7 @@ def _latest_strategy_decision(
                          )
                   )
                 ORDER BY decision.decided_at DESC LIMIT 1""",
-            (raybet_match_id, now.isoformat(), json.dumps(isolated)),
+            (raybet_match_id, now.isoformat()),
         ).fetchone()
     except SQLAlchemyError as error:
         if _is_schema_missing_error(error):

@@ -9,7 +9,6 @@ from web.app import app
 
 def test_intelligence_api_queries_alembic_schema(postgres_engine, monkeypatch) -> None:
     monkeypatch.setattr(queries, "get_db", lambda: PostgresSession(postgres_engine))
-    app.state.milestone_revocation_config = None
 
     with TestClient(app) as client:
         overview = client.get("/api/intelligence/overview")

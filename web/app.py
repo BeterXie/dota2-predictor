@@ -19,10 +19,6 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.responses import JSONResponse
 import psutil
 
-from live_betting.milestone_revocation import (
-    MilestoneRevocationConfig,
-    MilestoneRevocationIntegrityError,
-)
 from live_betting.rosh_parity import (
     ExactByteArtifactStore,
     RoshAnalysisError,
@@ -120,7 +116,6 @@ app = FastAPI(
     version="0.1.0",
     lifespan=_lifespan,
 )
-app.state.milestone_revocation_config = None
 
 
 @app.exception_handler(RequestValidationError)
@@ -154,24 +149,6 @@ async def _request_validation_error(
         content={"detail": jsonable_encoder(error.errors())},
     )
 
-
-def configure_milestone_revocation(
-    application: FastAPI,
-    config: MilestoneRevocationConfig | None,
-) -> None:
-    if config is not None and not isinstance(config, MilestoneRevocationConfig):
-        raise ValueError("milestone revocation configuration is incomplete")
-    application.state.milestone_revocation_config = config
-
-
-@app.exception_handler(MilestoneRevocationIntegrityError)
-async def _milestone_revocation_integrity_error(
-    _request: Request, error: MilestoneRevocationIntegrityError
-) -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={"detail": f"Milestone governance integrity failure: {error}"},
-    )
 
 app.include_router(matches.router)
 app.include_router(teams.router)

@@ -61,7 +61,6 @@ WRITER_ENTRYPOINTS = (
     "fetch/fetch_stratz_matchups.py",
     "fetch/hero_meta.py",
     "fetch/main.py",
-    "live_betting/browser_companion.py",
     "live_betting/draft_publisher.py",
     "live_betting/monitor.py",
     "live_betting/postmatch_monitor.py",
@@ -1113,7 +1112,7 @@ class ManagedWriterRecognitionTests(unittest.TestCase):
         self.assertEqual(result.conflicts, (ProcessIdentity(4200, 100.0),))
         self.assertEqual(result.unverifiable_pids, ())
 
-    def test_offline_mode_fences_legacy_web_and_uvicorn_target_peers(self) -> None:
+    def test_offline_mode_fences_worker_and_uvicorn_target_peers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "candidate.db"
             database.touch()
@@ -1124,7 +1123,7 @@ class ManagedWriterRecognitionTests(unittest.TestCase):
                     "name": "python.exe",
                     "cmdline": [
                         "python",
-                        "scripts/run_browser_companion.py",
+                        "scripts/run_historical_rosh_worker.py",
                         "--database",
                         target,
                     ],

@@ -60,7 +60,6 @@ def ready_candidate():
     })
     candidate["operations"].update({
         "paper_only": True,
-        "browser_companion_configured": False,
         "operations_approved": True,
         "single_managed_writer_plan": True,
         "database_raw_pair_frozen": True,

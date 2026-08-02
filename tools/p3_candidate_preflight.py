@@ -109,8 +109,6 @@ def validate(candidate: dict[str, Any], registry: dict[str, Any]) -> dict[str, A
         blockers.append("canonical_strategy_identity_mismatch")
 
     require_true("operations.paper_only", "paper_only_not_enforced")
-    if get(candidate, "operations.browser_companion_configured") is not False:
-        blockers.append("browser_companion_must_be_disabled")
     require_true("operations.operations_approved", "operations_candidate_approval_missing")
     require_true("operations.single_managed_writer_plan", "single_managed_writer_plan_missing")
     require_true("operations.database_raw_pair_frozen", "database_raw_pair_not_frozen")

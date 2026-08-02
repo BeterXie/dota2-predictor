@@ -995,18 +995,13 @@ describe("App data recovery and ownership", () => {
     expect(localStorage.getItem("dota2-monitor-browser-alerts")).toBe("on");
   });
 
-  it("shows only abnormal capabilities in the paper-only boundary", async () => {
+  it("shows only abnormal core capabilities in the safety boundary", async () => {
     api.fetchBootstrap.mockResolvedValue({
       ...snapshot,
       market_source_policy: "direct_primary",
       capabilities: {
         direct_market_collection: { required: true, status: "ready" },
-        paper_decision: { required: true, status: "degraded" },
-      },
-      milestone_governance: {
-        status: "configured",
-        governance_status: "active",
-        ledger_integrity: { status: "verified" },
+        historical_rosh: { required: true, status: "degraded" },
       },
     });
 
@@ -1015,9 +1010,8 @@ describe("App data recovery and ownership", () => {
     const boundary = await screen.findByRole("region", { name: "运行安全边界" });
     expect(boundary).toHaveTextContent("Paper Only");
     expect(boundary).toHaveTextContent("不包含真实下注入口");
-    expect(boundary).toHaveTextContent("纸面策略降级");
+    expect(boundary).toHaveTextContent("历史肉山降级");
     expect(boundary).not.toHaveTextContent("直连市场就绪");
-    expect(boundary).not.toHaveTextContent("治理链已校验");
   });
 
   it("collapses fully healthy capabilities into one status", async () => {
@@ -1025,12 +1019,7 @@ describe("App data recovery and ownership", () => {
       ...snapshot,
       capabilities: {
         direct_market_collection: { required: true, status: "ready" },
-        paper_decision: { required: true, status: "healthy" },
-      },
-      milestone_governance: {
-        status: "configured",
-        governance_status: "active",
-        ledger_integrity: { status: "verified" },
+        historical_rosh: { required: true, status: "healthy" },
       },
     });
 
