@@ -74,12 +74,14 @@ The standard runtime is:
 
 ```powershell
 python scripts/run_dota_shadow_service.py `
-  --start-collector
+  --start-collector `
+  --start-strict-ingest
 ```
 
-Vision, live draft publishing, strict ingest, the paper strategy, and post-match
-labeling are no longer part of the normal supervised runtime. Their historical
-data remains readable. The system never exposes a real betting endpoint.
+OpenDota strict ingest archives approved events and is part of the standard
+supervised runtime. Vision, live draft publishing, the paper strategy, and
+post-match labeling remain manual research commands. Their historical data
+remains readable. The system never exposes a real betting endpoint.
 
 ## Optional Research Commands
 

@@ -13,6 +13,7 @@ def _arguments(**overrides: object) -> Namespace:
         "once": False,
         "start_collector": False,
         "start_mail": False,
+        "start_strict_ingest": False,
         "disable_historical_rosh": False,
     }
     values.update(overrides)
@@ -27,6 +28,19 @@ def test_historical_rosh_remains_the_default_supervised_worker() -> None:
     }
 
 
+def test_strict_opendota_ingest_can_join_the_core_runtime() -> None:
+    commands = _commands(
+        _arguments(start_collector=True, start_strict_ingest=True)
+    )
+
+    assert set(commands) == {"collector", "strict_ingest", "historical_rosh"}
+    assert commands["strict_ingest"][1:3] == [
+        "scripts/run_strict_event_ingest.py",
+        "--archive-root",
+    ]
+    assert commands["strict_ingest"][-1] == "--schema-prepared"
+
+
 def test_retired_paper_and_browser_flags_are_rejected() -> None:
     parser = _parser()
 
@@ -34,7 +48,6 @@ def test_retired_paper_and_browser_flags_are_rejected() -> None:
         "--start-companion",
         "--start-vision",
         "--start-shadow",
-        "--start-strict-ingest",
         "--start-postmatch",
         "--start-draft-publisher",
     ):

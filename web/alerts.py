@@ -470,6 +470,7 @@ def _conditions(
         "raybet_worker",
         "raybet_priority_odds_worker",
         "raybet_full_odds_worker",
+        "strict_ingest_worker",
         "historical_rosh_worker",
         "mail_worker",
     }

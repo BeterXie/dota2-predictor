@@ -1157,12 +1157,18 @@ function isLiveEligible(match: MonitorSnapshot["matches"][number]): boolean {
 
 function SafetyBoundaryBar({ snapshot }: { snapshot: MonitorSnapshot | null }) {
   const directStatus = snapshot?.capabilities?.direct_market_collection?.status;
+  const openDotaStatus = snapshot?.capabilities?.opendota_event_ingest?.status;
   const historicalRoshStatus = snapshot?.capabilities?.historical_rosh?.status;
   const facts = [
     {
       label: "直连市场",
       status: capabilityLabel(directStatus),
       tone: capabilityTone(directStatus),
+    },
+    {
+      label: "OpenDota 入库",
+      status: capabilityLabel(openDotaStatus),
+      tone: capabilityTone(openDotaStatus),
     },
     {
       label: "历史肉山",

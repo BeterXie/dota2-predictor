@@ -692,17 +692,21 @@ class PostgresIngestAdapter:
         attempt_count = int(values["attempt_count"])
         attempt_generation = values.get("attempt_generation")
         next_at = values.get("next_retry_at")
+        ingest_state = "retryable" if next_at is not None else "failed"
+        generation_clause = (
+            "" if attempt_generation is None else " AND attempt_generation=?"
+        )
         with self.storage.transaction():
             self.connection.execute(
-                """UPDATE match_ingest_status
+                f"""UPDATE match_ingest_status
                    SET ingest_state=CASE
                          WHEN ingest_state='review_required' THEN ingest_state
-                         WHEN ? IS NOT NULL THEN 'retryable' ELSE 'failed' END,
+                         ELSE ? END,
                        next_retry_at=?, last_attempt_at=?, last_error=?, updated_at=?
                    WHERE match_id=? AND retry_count=? AND last_attempt_at=?
-                     AND (? IS NULL OR attempt_generation=?)""",
+                     {generation_clause}""",
                 (
-                    _iso(next_at),  # type: ignore[arg-type]
+                    ingest_state,
                     _iso(next_at),  # type: ignore[arg-type]
                     _iso(values["attempted_at"]),  # type: ignore[arg-type]
                     str(values["error"])[:500],
@@ -710,8 +714,7 @@ class PostgresIngestAdapter:
                     match_id,
                     attempt_count,
                     _iso(values["attempted_at"]),  # type: ignore[arg-type]
-                    attempt_generation,
-                    attempt_generation,
+                    *((attempt_generation,) if attempt_generation is not None else ()),
                 ),
             )
 

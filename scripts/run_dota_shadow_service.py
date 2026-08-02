@@ -43,11 +43,13 @@ CHILD_RESTART_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 WORKER_MAX_AGE = {
     "raybet": timedelta(seconds=45),
     "mail": timedelta(seconds=90),
+    "strict_ingest": timedelta(seconds=90),
     "historical_rosh": timedelta(minutes=15),
 }
 WORKER_COMPONENTS = {
     "raybet": "raybet_worker",
     "mail": "mail_worker",
+    "strict_ingest": "strict_ingest_worker",
     "historical_rosh": "historical_rosh_worker",
 }
 
@@ -180,6 +182,10 @@ def _service_capabilities(connection: Any) -> dict[str, dict[str, Any]]:
             "required": True,
             "status": statuses.get("raybet", "stopped"),
         },
+        "opendota_event_ingest": {
+            "required": True,
+            "status": statuses.get("strict_ingest", "stopped"),
+        },
         "historical_rosh": {
             "required": True,
             "status": statuses.get("historical_rosh", "stopped"),
@@ -307,6 +313,8 @@ def _data_paths() -> dict[str, Path]:
     return {
         "raw": root / "raw-v2",
         "managed_logs": root / "logs" / "managed",
+        "source_archive": ROOT / "data" / "raw-sources",
+        "coverage": ROOT / "data" / "reports" / "strict_event_coverage_latest.json",
     }
 
 
@@ -327,6 +335,16 @@ def _commands(args: argparse.Namespace) -> dict[str, list[str]]:
         commands["mail"] = [
             python,
             "scripts/run_notification_worker.py",
+            "--schema-prepared",
+        ]
+    if args.start_strict_ingest:
+        commands["strict_ingest"] = [
+            python,
+            "scripts/run_strict_event_ingest.py",
+            "--archive-root",
+            str(paths["source_archive"]),
+            "--coverage-report",
+            str(paths["coverage"]),
             "--schema-prepared",
         ]
     if not args.once and not args.disable_historical_rosh:
@@ -432,6 +450,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--start-collector", action="store_true")
     parser.add_argument("--start-mail", action="store_true")
+    parser.add_argument("--start-strict-ingest", action="store_true")
     parser.add_argument("--disable-historical-rosh", action="store_true")
     return parser
 

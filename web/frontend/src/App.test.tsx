@@ -1001,6 +1001,7 @@ describe("App data recovery and ownership", () => {
       market_source_policy: "direct_primary",
       capabilities: {
         direct_market_collection: { required: true, status: "ready" },
+        opendota_event_ingest: { required: true, status: "healthy" },
         historical_rosh: { required: true, status: "degraded" },
       },
     });
@@ -1019,6 +1020,7 @@ describe("App data recovery and ownership", () => {
       ...snapshot,
       capabilities: {
         direct_market_collection: { required: true, status: "ready" },
+        opendota_event_ingest: { required: true, status: "healthy" },
         historical_rosh: { required: true, status: "healthy" },
       },
     });

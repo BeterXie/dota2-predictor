@@ -1,6 +1,6 @@
 # Dota 2 滚球监控台操作手册
 
-本文档适用于项目内置的本机监控台，用于查看 RayBet 赛事、赔率历史、exact 映射和运行告警。系统不会提交真实投注。PostgreSQL 是唯一运行数据库；SQLite 只作为一次性历史导入源。Vision、纸面策略、strict ingest、阵容发布和 post-match 仅保留为历史数据或手动研究能力，不属于监控台主流程。
+本文档适用于项目内置的本机监控台，用于查看 RayBet 赛事、赔率历史、OpenDota 赛事数据、exact 映射和运行告警。系统不会提交真实投注。PostgreSQL 是唯一运行数据库；SQLite 只作为一次性历史导入源。Vision、纸面策略、阵容发布和 post-match 仅保留为历史数据或手动研究能力，不属于监控台主流程。
 
 ## 1. 安全边界
 
@@ -55,10 +55,11 @@ $env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
 
 ```powershell
 & $python scripts\run_dota_shadow_service.py `
-  --start-collector
+  --start-collector `
+  --start-strict-ingest
 ```
 
-SMTP 配置完成后才增加 `--start-mail`。Vision、阵容发布、strict ingest、纸面策略和 post-match 不再属于常驻主流程，只保留历史数据与手动研究命令。
+SMTP 配置完成后才增加 `--start-mail`。OpenDota strict ingest 由 supervisor 常驻管理；Vision、阵容发布、纸面策略和 post-match 只保留历史数据与手动研究命令。
 
 第二个 PowerShell 窗口：
 
@@ -142,7 +143,7 @@ $service.Id
 | 赔率采集 | `python -u -m live_betting.monitor --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30` |
 | 邮件投递 | `python -u scripts/run_notification_worker.py` |
 
-历史 Rosh 不在 Web allowlist 中，由 supervisor 管理。每次控制操作都需要本机会话、CSRF 和二次确认，后端不接收页面提供的命令文本。
+OpenDota strict ingest 和历史 Rosh 不在 Web allowlist 中，由 supervisor 管理。每次控制操作都需要本机会话、CSRF 和二次确认，后端不接收页面提供的命令文本。
 
 ## 8. Exact 映射
 
@@ -170,7 +171,7 @@ CLI 人工登记示例：
 
 ## 9. 告警与通知
 
-`operational` 告警表示数据库、赔率采集、历史 Rosh 或邮件 worker 异常，持续 30 秒才开启；历史纸面订单若仍有待处理状态，会以 `paper_signal` 告警保留兼容读取。相同 dedupe key 只保留一个活动事件，条件消失后自动 recovered。
+`operational` 告警表示数据库、赔率采集、OpenDota strict ingest、历史 Rosh 或邮件 worker 异常，持续 30 秒才开启；历史纸面订单若仍有待处理状态，会以 `paper_signal` 告警保留兼容读取。相同 dedupe key 只保留一个活动事件，条件消失后自动 recovered。
 
 SMTP 配置：
 
@@ -238,7 +239,7 @@ PostgreSQL 的物理备份和恢复应使用部署环境标准的 `pg_dump` / `p
 ## 12. 停止与重启
 
 1. 页面停止邮件和赔率采集。
-2. 停止 supervisor；默认历史 Rosh 会随之停止。
+2. 停止 supervisor；OpenDota strict ingest 和默认历史 Rosh 会随之停止。
 3. 停止 Web。
 4. 更新代码，执行 `alembic upgrade head`，必要时重新构建前端。
 5. 使用同一 `DATABASE_URL` 启动 supervisor 和 Web。

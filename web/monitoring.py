@@ -68,6 +68,7 @@ _HISTORY_ACTIVITY_GRACE = timedelta(minutes=15)
 _SQLITE_DATETIME_ROUNDING_GRACE = timedelta(milliseconds=1)
 _EXPECTED_HEALTH_COMPONENTS = {
     "raybet_worker": 45.0,
+    "strict_ingest_worker": 90.0,
     "historical_rosh_worker": 900.0,
 }
 _PRIMARY_HEALTH_COMPONENTS = {
@@ -76,6 +77,8 @@ _PRIMARY_HEALTH_COMPONENTS = {
     "raybet_worker",
     "raybet_priority_odds_worker",
     "raybet_full_odds_worker",
+    "strict_ingest",
+    "strict_ingest_worker",
     "historical_rosh",
     "historical_rosh_worker",
     "mail",
@@ -353,6 +356,10 @@ def _monitor_capabilities(
         "direct_market_collection": {
             "required": True,
             "status": statuses.get("raybet", "stopped"),
+        },
+        "opendota_event_ingest": {
+            "required": True,
+            "status": statuses.get("strict_ingest", "stopped"),
         },
         "historical_rosh": {
             "required": True,

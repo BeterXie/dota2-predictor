@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -212,4 +212,39 @@ def test_normalization_failure_preserves_raw_evidence(postgres_engine, tmp_path)
         assert connection.execute(
             text("SELECT ingest_state FROM match_ingest_status WHERE match_id = 8002")
         ).scalar_one() == "detail_pending"
+    storage.close()
+
+
+def test_retryable_ingest_failure_is_recorded_on_postgres(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    storage = IntelligenceStorage(engine=postgres_engine)
+    storage.init_schema()
+    registry = EventRegistry(storage)
+    store = PostgresIngestAdapter(storage, registry)
+    payload = _completed_payload(8_003, hero_start=30)
+    _discover_and_archive(store, registry, tmp_path, payload)
+    attempt = store.begin_ingest_attempt(payload["match_id"], NOW)
+    retry_at = NOW + timedelta(minutes=15)
+
+    store.record_ingest_failure(
+        match_id=payload["match_id"],
+        attempted_at=NOW,
+        attempt_count=int(attempt),
+        attempt_generation=attempt.generation,
+        error="temporary transport failure",
+        next_retry_at=retry_at,
+    )
+
+    row = storage.connection.execute(
+        """SELECT ingest_state, next_retry_at, last_error
+             FROM match_ingest_status WHERE match_id=?""",
+        (payload["match_id"],),
+    ).fetchone()
+    assert tuple(row) == (
+        "retryable",
+        retry_at.isoformat(),
+        "temporary transport failure",
+    )
     storage.close()

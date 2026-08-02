@@ -90,13 +90,15 @@ default. Start the read-only odds collector explicitly:
 
 ```powershell
 python scripts/run_dota_shadow_service.py `
-  --start-collector
+  --start-collector `
+  --start-strict-ingest
 ```
 
-Use `--start-mail` only after SMTP is configured. Vision, live draft publishing,
-strict ingest, paper strategy, and post-match labeling remain available only as
-manual research commands and are not supervised. `--once` runs one PostgreSQL
-health/report cycle without starting the recurring historical Rosh worker.
+Use `--start-mail` only after SMTP is configured. OpenDota strict ingest archives
+approved events under the supervisor. Vision, live draft publishing, paper
+strategy, and post-match labeling remain available only as manual research
+commands and are not supervised. `--once` runs one PostgreSQL health/report
+cycle without starting the recurring historical Rosh worker.
 
 The supervisor uses a PostgreSQL advisory lock for singleton ownership. Child
 processes inherit `DATABASE_URL`; there are no SQLite file locks, writer scans,
