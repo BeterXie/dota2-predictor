@@ -7,7 +7,9 @@ database. SQLite is accepted only as the source of a one-time historical import.
 `DESIGN.md` is the legacy module baseline, not the current acceptance source.
 See [live_betting/README.md](live_betting/README.md) for live operation and
 [docs/monitoring-console-operations-manual.md](docs/monitoring-console-operations-manual.md)
-for the Chinese monitoring-console guide.
+for the Chinese monitoring-console guide. The parallel prematch model contract
+is documented in
+[docs/prematch-prediction-model-v1-design.md](docs/prematch-prediction-model-v1-design.md).
 
 ## Project Structure
 
