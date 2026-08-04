@@ -26,6 +26,12 @@ from event_intelligence.roles import (
     PROSPECTIVE_ASSIGNMENT_VERSION,
     RECONSTRUCTED_ASSIGNMENT_VERSION,
 )
+from event_intelligence.team_rating import TEAM_RATING_VERSION
+from event_intelligence.team_rating_artifacts import TEAM_RATING_ARTIFACT_VERSION
+from event_intelligence.team_rating_backtest import (
+    TEAM_RATING_BACKTEST_VERSION,
+    TEAM_RATING_PARAMETER_GRID,
+)
 from live_betting.official_rosh_shadow_strategy import CANDIDATE_SCHEMA
 from live_betting.rosh_evidence import EVIDENCE_SCHEMA
 from live_betting.strategy_contract import (
@@ -57,6 +63,13 @@ def test_existing_draft_versions_remain_frozen() -> None:
     assert BACKTEST_VERSION == "strict-draft-walk-forward-v1"
     assert DRAFT_VALIDATION_VERSION == "draft-input-lineage-v4"
     assert DEPLOYMENT_VERSION == "frozen-pure-draft-deployment-v2"
+
+
+def test_team_rating_walk_forward_versions_and_grid_remain_frozen() -> None:
+    assert TEAM_RATING_VERSION == "team-rating-elo-v1"
+    assert TEAM_RATING_ARTIFACT_VERSION == "team-rating-artifact-v1"
+    assert TEAM_RATING_BACKTEST_VERSION == "team-rating-walk-forward-v1"
+    assert len(TEAM_RATING_PARAMETER_GRID) == 144
 
 
 def test_official_rosh_scorer_identity_remains_frozen() -> None:
