@@ -33,6 +33,12 @@ from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_PURE_SCHEMA,
     SHRINKAGE_STRENGTH,
 )
+from event_intelligence.rosh_features import (
+    ROSH_FEATURE_SCHEMA,
+    ROSH_FEATURE_VERSION,
+    ROSH_MODEL_SCHEMA,
+    ROSH_MODEL_SCHEMA_HASH,
+)
 from event_intelligence.team_rating import TEAM_RATING_VERSION
 from event_intelligence.team_rating_artifacts import TEAM_RATING_ARTIFACT_VERSION
 from event_intelligence.team_rating_backtest import (
@@ -96,6 +102,29 @@ def test_draft_residual_version_schema_and_shrinkage_remain_frozen() -> None:
     assert len(DRAFT_RESIDUAL_MODEL_SCHEMA) == 40
     assert len(DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH) == 64
     assert SHRINKAGE_STRENGTH == 10.0
+
+
+def test_official_rosh_feature_and_model_schemas_remain_frozen() -> None:
+    assert ROSH_FEATURE_VERSION == "official-rosh-features-v1"
+    assert ROSH_FEATURE_SCHEMA == (
+        "relative_advantage",
+        "score_20",
+        "score_30",
+        "score_40",
+        "score_50",
+        "slope_20_40",
+        "slope_30_50",
+        "curve_min",
+        "curve_max",
+        "curve_range",
+        "direction_flip_count",
+        "position_min_support",
+        "synergy_min_support",
+        "rank_fallback_ratio",
+        "coverage",
+    )
+    assert len(ROSH_MODEL_SCHEMA) == 30
+    assert len(ROSH_MODEL_SCHEMA_HASH) == 64
 
 
 def test_official_rosh_scorer_identity_remains_frozen() -> None:
