@@ -1,0 +1,523 @@
+from __future__ import annotations
+
+import math
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+import event_intelligence.prematch_model as prematch_model
+from event_intelligence.draft_features import AvailabilityMode
+from event_intelligence.draft_residual_features import (
+    DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
+    DRAFT_RESIDUAL_MODEL_SCHEMA_HASH,
+    DRAFT_RESIDUAL_PURE_SCHEMA,
+)
+from event_intelligence.prematch_features import (
+    PREMATCH_FEATURE_VERSION,
+    PrematchFeatureSnapshot,
+    project_prematch_features,
+)
+from event_intelligence.prematch_model import (
+    ModelStatus,
+    PredictionStatus,
+    PrematchTrainingRow,
+    fit_prematch_model,
+    offset_logistic_objective_and_gradient,
+    predict_prematch,
+)
+from event_intelligence.rosh_features import (
+    ROSH_FEATURE_SCHEMA,
+    ROSH_MODEL_SCHEMA,
+    ROSH_MODEL_SCHEMA_HASH,
+)
+
+
+UTC = timezone.utc
+START = datetime(2026, 1, 1, tzinfo=UTC)
+TRAINING_CUTOFF = START + timedelta(days=100)
+MODE = AvailabilityMode.RECONSTRUCTED.value
+
+
+def _digest(number: int) -> str:
+    return f"{number:064x}"
+
+
+def _snapshot(
+    match_id: int,
+    prediction_cutoff: datetime,
+    *,
+    team_base_logit: float,
+    draft_signal: float,
+    rosh_signal: float,
+    missing_rosh_score_20: bool = False,
+    availability_mode: str = MODE,
+) -> PrematchFeatureSnapshot:
+    draft: dict[str, float | None] = {}
+    for index, name in enumerate(DRAFT_RESIDUAL_PURE_SCHEMA):
+        value = draft_signal if index == 0 else float(index) / 10.0
+        draft[name] = value
+        draft[f"{name}__log1p_support"] = math.log1p(20.0 + index)
+        draft[f"{name}__coverage"] = 0.8
+        draft[f"{name}__missing"] = 0.0
+    rosh: dict[str, float | None] = {}
+    for index, name in enumerate(ROSH_FEATURE_SCHEMA):
+        missing = name == "score_20" and missing_rosh_score_20
+        if missing:
+            value = None
+        elif name == "coverage":
+            value = 0.9
+        elif index == 0:
+            value = rosh_signal
+        else:
+            value = float(index)
+        rosh[name] = value
+        rosh[f"{name}__missing"] = 1.0 if missing else 0.0
+    return PrematchFeatureSnapshot(
+        match_id=match_id,
+        prediction_cutoff=prediction_cutoff,
+        availability_mode=availability_mode,
+        feature_version=PREMATCH_FEATURE_VERSION,
+        team_base_logit=team_base_logit,
+        team_rating_run_id=_digest(1_000 + match_id),
+        team_rating_artifact_hash=_digest(2_000 + match_id),
+        team_rating_prediction_input_hash=_digest(3_000 + match_id),
+        team_rating_combined_training_input_hash=_digest(4_000 + match_id),
+        team_rating_support=30,
+        draft_residual_input_hash=_digest(5_000 + match_id),
+        draft_residual_authority_fingerprint=_digest(6_000 + match_id),
+        draft_residual_team_rating_input_hash=_digest(7_000 + match_id),
+        draft_residual_feature_schema_hash=DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
+        draft_residual_model_schema_hash=DRAFT_RESIDUAL_MODEL_SCHEMA_HASH,
+        draft_support=20,
+        draft_coverage=0.8,
+        draft_features=tuple(draft.items()),
+        rosh_status="available",
+        rosh_missing_reason=None,
+        rosh_input_hash=_digest(8_000 + match_id),
+        rosh_model_schema_hash=ROSH_MODEL_SCHEMA_HASH,
+        rosh_run_id=_digest(9_000 + match_id),
+        rosh_evidence_hash=_digest(10_000 + match_id),
+        rosh_formula_version="formula-v1",
+        rosh_profile_hash=_digest(11_000 + match_id),
+        rosh_result_hash=_digest(12_000 + match_id),
+        rosh_coverage=0.9,
+        rosh_features=tuple(rosh.items()),
+    )
+
+
+def _rows(
+    model_kind: str,
+    count: int = 40,
+    *,
+    outcome_override: int | None = None,
+) -> tuple[PrematchTrainingRow, ...]:
+    rows = []
+    for index in range(count):
+        prediction_cutoff = START + timedelta(days=index)
+        team_logit = (index % 5 - 2) * 0.15
+        draft_signal = float(index % 7 - 3)
+        rosh_signal = float((index * 3) % 9 - 4)
+        outcome = int(team_logit + 0.55 * draft_signal + 0.25 * rosh_signal > 0)
+        if outcome_override is not None:
+            outcome = outcome_override
+        snapshot = _snapshot(
+            index + 1,
+            prediction_cutoff,
+            team_base_logit=team_logit,
+            draft_signal=draft_signal,
+            rosh_signal=rosh_signal,
+            missing_rosh_score_20=index % 5 == 0,
+        )
+        rows.append(
+            PrematchTrainingRow.from_snapshot(
+                snapshot,
+                model_kind=model_kind,
+                completed_at=prediction_cutoff + timedelta(hours=1),
+                result_usable_at=prediction_cutoff + timedelta(hours=2),
+                outcome=outcome,
+                series_id=f"series-{index // 2}",
+                event_id=f"event-{index % 3}",
+                patch_id=f"7.{40 + index // 20}",
+            )
+        )
+    return tuple(rows)
+
+
+def test_analytic_gradient_matches_finite_difference_and_excludes_offset() -> None:
+    matrix = np.asarray(((1.0, -0.5), (0.2, 0.8), (-0.7, 1.1)))
+    offsets = np.asarray((0.4, -0.3, 0.1))
+    outcomes = np.asarray((1.0, 0.0, 1.0))
+    parameters = np.asarray((0.2, -0.4, 0.7))
+    regularization = 1.3
+    loss, gradient = offset_logistic_objective_and_gradient(
+        parameters,
+        matrix,
+        offsets,
+        outcomes,
+        regularization,
+    )
+    epsilon = 1e-6
+    numerical = []
+    for index in range(len(parameters)):
+        step = np.zeros_like(parameters)
+        step[index] = epsilon
+        high, _ = offset_logistic_objective_and_gradient(
+            parameters + step,
+            matrix,
+            offsets,
+            outcomes,
+            regularization,
+        )
+        low, _ = offset_logistic_objective_and_gradient(
+            parameters - step,
+            matrix,
+            offsets,
+            outcomes,
+            regularization,
+        )
+        numerical.append((high - low) / (2.0 * epsilon))
+
+    assert math.isfinite(loss)
+    assert np.allclose(gradient, numerical, rtol=0.0, atol=1e-6)
+    changed_offsets_loss, _ = offset_logistic_objective_and_gradient(
+        parameters,
+        matrix,
+        offsets + 1.0,
+        outcomes,
+        regularization,
+    )
+    assert changed_offsets_loss != loss
+
+
+def test_future_and_result_unavailable_rows_are_filtered_before_features() -> None:
+    baseline_rows = _rows("team_only", 20)
+    baseline = fit_prematch_model(
+        baseline_rows,
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    future = replace(
+        baseline_rows[0],
+        match_id=90_001,
+        input_snapshot_hash=_digest(90_001),
+        prediction_cutoff=TRAINING_CUTOFF + timedelta(seconds=1),
+        completed_at=TRAINING_CUTOFF + timedelta(hours=1),
+        result_usable_at=TRAINING_CUTOFF + timedelta(hours=2),
+        team_base_logit=float("inf"),
+        features={"unknown_future": float("inf")},
+    )
+    unavailable = replace(
+        baseline_rows[1],
+        match_id=90_002,
+        input_snapshot_hash=_digest(90_002),
+        result_usable_at=None,
+        team_base_logit=float("inf"),
+        features={"unknown_unavailable": float("inf")},
+    )
+    late = replace(
+        baseline_rows[2],
+        match_id=90_003,
+        input_snapshot_hash=_digest(90_003),
+        completed_at=TRAINING_CUTOFF - timedelta(hours=1),
+        result_usable_at=TRAINING_CUTOFF + timedelta(seconds=1),
+        team_base_logit=float("inf"),
+        features={"unknown_late": float("inf")},
+    )
+    changed = fit_prematch_model(
+        (*baseline_rows, future, unavailable, late),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+
+    assert changed == baseline
+
+
+def test_training_only_imputation_and_binary_missing_flags_are_unstandardized() -> None:
+    rows = _rows("team_plus_rosh", 30)
+    model = fit_prematch_model(
+        rows,
+        TRAINING_CUTOFF,
+        model_kind="team_plus_rosh",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    observed_score_20 = tuple(
+        float(row.features["score_20"])
+        for row in rows
+        if row.features["score_20"] is not None
+    )
+    expected_imputation = math.fsum(observed_score_20) / len(observed_score_20)
+
+    assert dict(model.imputation_values)["score_20"] == expected_imputation
+    assert dict(model.missing_counts)["score_20"] == 6
+    assert dict(model.imputation_values)["score_20__missing"] == 0.0
+    assert dict(model.standardization_means)["score_20__missing"] == 0.0
+    assert dict(model.standardization_scales)["score_20__missing"] == 1.0
+
+
+def test_training_rejects_raw_and_missing_flag_disagreement() -> None:
+    rows = list(_rows("team_plus_rosh", 20))
+    features = dict(rows[0].features)
+    assert features["score_20"] is None
+    features["score_20__missing"] = 0.0
+    rows[0] = replace(rows[0], features=features)
+
+    with pytest.raises(ValueError, match="missing flag.*disagrees"):
+        fit_prematch_model(
+            rows,
+            TRAINING_CUTOFF,
+            model_kind="team_plus_rosh",
+            availability_mode=MODE,
+            min_samples=5,
+        )
+
+
+def test_team_only_is_intercept_only_and_l2_never_penalizes_intercept() -> None:
+    rows = _rows("team_only", 30)
+    low_l2 = fit_prematch_model(
+        rows,
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+        l2_regularization=0.1,
+    )
+    high_l2 = fit_prematch_model(
+        rows,
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+        l2_regularization=100.0,
+    )
+
+    assert low_l2.status is ModelStatus.TRAINED
+    assert low_l2.feature_names == ()
+    assert low_l2.coefficients == ()
+    assert len(low_l2.logit_covariance) == 1
+    assert low_l2.intercept == high_l2.intercept
+    assert low_l2.logit_covariance == high_l2.logit_covariance
+
+
+def test_small_and_one_class_support_return_explicit_insufficient_artifacts() -> None:
+    too_small = fit_prematch_model(
+        _rows("team_only", 3),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=10,
+    )
+    one_class = fit_prematch_model(
+        _rows("team_only", 20, outcome_override=1),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+
+    assert too_small.status is ModelStatus.INSUFFICIENT_EVIDENCE
+    assert too_small.reason == "support_below_minimum"
+    assert one_class.status is ModelStatus.INSUFFICIENT_EVIDENCE
+    assert one_class.reason == "single_class_training_data"
+
+
+def test_covariance_dimensions_symmetry_and_psd() -> None:
+    model = fit_prematch_model(
+        _rows("team_plus_rosh", 35),
+        TRAINING_CUTOFF,
+        model_kind="team_plus_rosh",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    covariance = np.asarray(model.logit_covariance)
+
+    assert covariance.shape == (len(ROSH_MODEL_SCHEMA) + 1,) * 2
+    assert np.array_equal(covariance, covariance.T)
+    assert float(np.min(np.linalg.eigvalsh(covariance))) >= -1e-10
+
+
+def test_prediction_components_uncertainty_and_contribution_order_reconstruct() -> None:
+    model = fit_prematch_model(
+        _rows("team_plus_draft_rosh", 45),
+        TRAINING_CUTOFF,
+        model_kind="team_plus_draft_rosh",
+        availability_mode=MODE,
+        min_samples=10,
+    )
+    target = _snapshot(
+        500,
+        TRAINING_CUTOFF + timedelta(days=1),
+        team_base_logit=0.35,
+        draft_signal=1.25,
+        rosh_signal=-0.75,
+        missing_rosh_score_20=True,
+    )
+    prediction = predict_prematch(model, target, top_n=8)
+
+    assert prediction.status is PredictionStatus.PREDICTED
+    assert prediction.cluster_logit_delta is None
+    assert prediction.total_adjustment == (
+        prediction.learned_intercept
+        + prediction.draft_logit_delta
+        + prediction.rosh_logit_delta
+    )
+    reconstructed_logit = math.log(
+        prediction.raw_probability / (1.0 - prediction.raw_probability)
+    )
+    assert reconstructed_logit == pytest.approx(
+        prediction.team_base_logit + prediction.total_adjustment,
+        abs=1e-12,
+    )
+
+    features = project_prematch_features(target, model.model_kind)
+    means = dict(model.standardization_means)
+    scales = dict(model.standardization_scales)
+    imputation = dict(model.imputation_values)
+    standardized = []
+    for name in model.feature_names:
+        raw = features[name]
+        value = imputation[name] if raw is None else raw
+        standardized.append((value - means[name]) / scales[name])
+    design = np.asarray((1.0, *standardized))
+    covariance = np.asarray(model.logit_covariance)
+    expected_uncertainty = (
+        prediction.raw_probability
+        * (1.0 - prediction.raw_probability)
+        * math.sqrt(max(0.0, float(design @ covariance @ design)))
+    )
+    assert prediction.parameter_uncertainty == pytest.approx(
+        expected_uncertainty,
+        abs=1e-15,
+    )
+    assert "score_20" in prediction.missing_features
+    assert (
+        tuple(
+            sorted(
+                prediction.top_contributions,
+                key=lambda row: (-abs(row.log_odds_contribution), row.feature_name),
+            )
+        )
+        == prediction.top_contributions
+    )
+    assert all(
+        not row.feature_name.endswith("__missing")
+        for row in prediction.top_contributions
+    )
+
+
+def test_prediction_uses_none_for_components_outside_model_kind() -> None:
+    target = _snapshot(
+        700,
+        TRAINING_CUTOFF + timedelta(days=1),
+        team_base_logit=0.1,
+        draft_signal=0.5,
+        rosh_signal=-0.5,
+    )
+    team_only = fit_prematch_model(
+        _rows("team_only", 20),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    rosh_only = fit_prematch_model(
+        _rows("team_plus_rosh", 20),
+        TRAINING_CUTOFF,
+        model_kind="team_plus_rosh",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+
+    team_prediction = predict_prematch(team_only, target)
+    rosh_prediction = predict_prematch(rosh_only, target)
+
+    assert team_prediction.draft_logit_delta is None
+    assert team_prediction.rosh_logit_delta is None
+    assert team_prediction.total_adjustment == team_prediction.learned_intercept
+    assert rosh_prediction.draft_logit_delta is None
+    assert rosh_prediction.rosh_logit_delta is not None
+    assert rosh_prediction.total_adjustment == (
+        rosh_prediction.learned_intercept + rosh_prediction.rosh_logit_delta
+    )
+
+
+def test_prediction_rejects_evidence_mode_mix() -> None:
+    model = fit_prematch_model(
+        _rows("team_only", 20),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    prospective = _snapshot(
+        600,
+        TRAINING_CUTOFF + timedelta(days=1),
+        team_base_logit=0.0,
+        draft_signal=0.0,
+        rosh_signal=0.0,
+        availability_mode=AvailabilityMode.PROSPECTIVE.value,
+    )
+    with pytest.raises(ValueError, match="availability modes"):
+        predict_prematch(model, prospective)
+
+
+def test_prediction_rejects_target_match_in_training_corpus() -> None:
+    model = fit_prematch_model(
+        _rows("team_only", 20),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    target = _snapshot(
+        model.training_corpus[0].match_id,
+        TRAINING_CUTOFF + timedelta(days=1),
+        team_base_logit=0.0,
+        draft_signal=0.0,
+        rosh_signal=0.0,
+    )
+    with pytest.raises(ValueError, match="target match"):
+        predict_prematch(model, target)
+
+
+def test_unsuccessful_optimizer_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        prematch_model,
+        "minimize",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            success=False,
+            status=2,
+            message="forced failure",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="optimizer failed"):
+        fit_prematch_model(
+            _rows("team_only", 20),
+            TRAINING_CUTOFF,
+            model_kind="team_only",
+            availability_mode=MODE,
+            min_samples=5,
+        )
+
+
+def test_offset_and_snapshot_hash_are_embedded_in_canonical_corpus() -> None:
+    model = fit_prematch_model(
+        _rows("team_only", 20),
+        TRAINING_CUTOFF,
+        model_kind="team_only",
+        availability_mode=MODE,
+        min_samples=5,
+    )
+    first = model.training_corpus[0]
+
+    assert first.team_base_logit == _rows("team_only", 20)[0].team_base_logit
+    assert len(first.input_snapshot_hash) == 64
+    assert first.features == ()
+    assert first.missing_features == ()

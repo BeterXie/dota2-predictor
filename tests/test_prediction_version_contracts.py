@@ -33,6 +33,16 @@ from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_PURE_SCHEMA,
     SHRINKAGE_STRENGTH,
 )
+from event_intelligence.prematch_features import (
+    PREMATCH_FEATURE_SCHEMA_HASHES,
+    PREMATCH_FEATURE_SCHEMAS,
+    PREMATCH_FEATURE_VERSION,
+    PREMATCH_MODEL_KINDS,
+)
+from event_intelligence.prematch_model import (
+    PREMATCH_MODEL_ARTIFACT_VERSION,
+    PREMATCH_MODEL_VERSION,
+)
 from event_intelligence.rosh_features import (
     ROSH_FEATURE_SCHEMA,
     ROSH_FEATURE_VERSION,
@@ -125,6 +135,38 @@ def test_official_rosh_feature_and_model_schemas_remain_frozen() -> None:
     )
     assert len(ROSH_MODEL_SCHEMA) == 30
     assert len(ROSH_MODEL_SCHEMA_HASH) == 64
+
+
+def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
+    assert PREMATCH_FEATURE_VERSION == "prematch-features-v1"
+    assert PREMATCH_MODEL_VERSION == "prematch-offset-logistic-l2-v1"
+    assert PREMATCH_MODEL_ARTIFACT_VERSION == "prematch-model-artifact-v1"
+    assert PREMATCH_MODEL_KINDS == (
+        "team_only",
+        "team_plus_draft",
+        "team_plus_rosh",
+        "team_plus_draft_rosh",
+    )
+    assert PREMATCH_FEATURE_SCHEMAS["team_only"] == ()
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft"] == (DRAFT_RESIDUAL_MODEL_SCHEMA)
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_rosh"] == ROSH_MODEL_SCHEMA
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft_rosh"] == (
+        DRAFT_RESIDUAL_MODEL_SCHEMA + ROSH_MODEL_SCHEMA
+    )
+    assert dict(PREMATCH_FEATURE_SCHEMA_HASHES) == {
+        "team_only": (
+            "7110eb0dcd7bd9e60f3d392e2abe6b20eaed9c9df4a7aa0ce8aec5923144c69f"
+        ),
+        "team_plus_draft": (
+            "1230a670c93c1b794cab50bded1490a2385f74a302b751f494b70a2b23a68a48"
+        ),
+        "team_plus_rosh": (
+            "93400f9c773f90740760767382e9be33897e3ae0f25c30828ce65d35d802209d"
+        ),
+        "team_plus_draft_rosh": (
+            "581e42787406d3ce5b758d990e5db71d71e9c92e9d19baf85c70fdad85d9dedc"
+        ),
+    }
 
 
 def test_official_rosh_scorer_identity_remains_frozen() -> None:
