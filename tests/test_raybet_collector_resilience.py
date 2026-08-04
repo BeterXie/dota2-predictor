@@ -22,6 +22,7 @@ from live_betting.monitor import (
     _active_priority_match_ids,
     _claim_odds_request,
     _collect_priority_rows,
+    _odds_collection_cycle_healthy,
     _odds_channel_poll_interval,
     _odds_channel_rows,
     _partition_live_rows,
@@ -60,6 +61,22 @@ def test_priority_odds_defaults_preserve_transport_freshness_budget() -> None:
     assert DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS == 8.0
     assert DEFAULT_FULL_ODDS_INTERVAL_SECONDS == 120.0
     assert MAX_PRIORITY_ODDS_WORKERS == 4
+
+
+def test_prematch_skips_complete_a_healthy_odds_cycle() -> None:
+    summary = {
+        "listed": 7,
+        "matches": 0,
+        "errors": 0,
+        "backoff_skipped": 0,
+        "prematch_skipped": 7,
+        "required_match_ids": [],
+    }
+
+    assert _odds_collection_cycle_healthy(summary) is True
+
+    summary["required_match_ids"] = ["1001"]
+    assert _odds_collection_cycle_healthy(summary) is False
 
 
 def test_daemon_requires_at_least_one_odds_channel() -> None:

@@ -163,15 +163,21 @@ export function sortMatchesByAttention(
 }
 
 function latestMatchUpdate(match: MonitorMatch): string {
-  const candidates = [
-    match.updated_at,
-    match.latest_odds_activity_at,
-    match.winner?.observed_at,
+  const evidenceCandidates = [
+    match.winner?.complete ? match.winner.observed_at : null,
     match.latest_vision?.observed_at,
     match.latest_vision?.captured_at,
     match.latest_decision?.observed_at,
     match.latest_decision?.decided_at,
   ].filter((value): value is string => Boolean(value));
+  const archived = match.lifecycle === "ended" || match.history_eligible;
+  const candidates = archived && evidenceCandidates.length
+    ? evidenceCandidates
+    : [
+        match.updated_at,
+        match.latest_odds_activity_at,
+        ...evidenceCandidates,
+      ].filter((value): value is string => Boolean(value));
   return candidates.reduce((latest, candidate) => (
     timestamp(candidate) > timestamp(latest) ? candidate : latest
   ), candidates[0] || "");

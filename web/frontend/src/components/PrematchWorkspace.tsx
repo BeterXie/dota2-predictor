@@ -25,6 +25,7 @@ import {
   fetchPrematchHeroGrid,
   fetchPrematchLeagues,
   fetchPrematchRecentMatches,
+  fetchRoshAnalysisRecords,
   fetchPrematchTeams,
 } from "../api";
 import type {
@@ -232,12 +233,31 @@ export function PrematchWorkspace() {
         throw new Error("来源比赛缺少时间，无法建立官方 Rosh 请求身份");
       }
       const dateTime = sourceDateTime || Math.floor(Date.now() / 1_000);
+      if (sourceMatchId) {
+        const records = await fetchRoshAnalysisRecords(
+          "opendota",
+          String(sourceMatchId),
+        );
+        const existing = records.records.find(({ run }) => (
+          run.status === "succeeded"
+          && run.match_id === sourceMatchId
+          && run.rosh_profile_id === "stratz-rosh-web-2026-07-28-v2"
+        ));
+        if (existing) {
+          setPrediction(existing.run);
+          return;
+        }
+      }
       const result = await createRoshAnalysis(sourceMatchId ? {
         mode: "historical_match",
         match_id: sourceMatchId,
         date_time: dateTime,
         bracket_ids: ["IMMORTAL"],
         rosh_profile_id: "stratz-rosh-web-2026-07-28-v2",
+        match_links: [{
+          source: "opendota",
+          source_match_id: String(sourceMatchId),
+        }],
       } : {
         mode: "explicit_draft",
         date_time: dateTime,
@@ -480,7 +500,7 @@ function TeamLineup({
           <option value="">选择队伍</option>
           {teams.map((team) => (
             <option key={team.team_id} value={team.team_id}>
-              {team.name || `Team ${team.team_id}`} ({team.match_count} 场)
+              {team.name || "未命名队伍"} · #{team.team_id} ({team.match_count} 场)
             </option>
           ))}
         </Select>
@@ -661,8 +681,14 @@ function paddedLineup(heroes: PrematchHero[]): Array<PrematchHero | null> {
 }
 
 function recentMatchLabel(match: PrematchRecentMatch): string {
-  const date = new Date(match.start_time * 1_000).toLocaleDateString("zh-CN");
-  return `${date} ${match.radiant_name || match.radiant_team_id} vs ${match.dire_name || match.dire_team_id}`;
+  const date = new Date(match.start_time * 1_000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${date} · #${match.match_id} · ${match.radiant_name || match.radiant_team_id} vs ${match.dire_name || match.dire_team_id}`;
 }
 
 function signed(value: number): string {

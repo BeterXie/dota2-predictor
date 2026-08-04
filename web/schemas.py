@@ -211,6 +211,18 @@ class RoshAnalysisDraftSlot(BaseModel):
     position_id: int = Field(ge=1, le=5)
 
 
+class RoshAnalysisMatchLink(BaseModel):
+    source: Literal["raybet", "opendota", "stratz"]
+    source_match_id: str = Field(min_length=1, max_length=128)
+    map_number: int | None = Field(default=None, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "RoshAnalysisMatchLink":
+        if self.source_match_id != self.source_match_id.strip():
+            raise ValueError("source_match_id must be canonical")
+        return self
+
+
 class RoshAnalysisRequest(BaseModel):
     mode: Literal["historical_match", "explicit_draft"]
     date_time: int = Field(gt=0)
@@ -223,14 +235,27 @@ class RoshAnalysisRequest(BaseModel):
     match_id: int | None = Field(default=None, gt=0)
     radiant: list[RoshAnalysisDraftSlot] = Field(default_factory=list)
     dire: list[RoshAnalysisDraftSlot] = Field(default_factory=list)
+    match_links: list[RoshAnalysisMatchLink] = Field(
+        default_factory=list,
+        max_length=3,
+    )
 
     @model_validator(mode="after")
     def validate_mode(self) -> "RoshAnalysisRequest":
+        identities = {(link.source, link.source_match_id) for link in self.match_links}
+        if len(identities) != len(self.match_links):
+            raise ValueError("match links must have unique source identities")
         if self.mode == "historical_match":
             if self.match_id is None or self.radiant or self.dire:
                 raise ValueError(
                     "historical_match requires match_id and no explicit draft"
                 )
+            if any(
+                link.source in {"opendota", "stratz"}
+                and link.source_match_id != str(self.match_id)
+                for link in self.match_links
+            ):
+                raise ValueError("official match links must match historical match_id")
             return self
         if self.match_id is not None:
             raise ValueError("explicit_draft must not include match_id")
@@ -295,6 +320,17 @@ class RoshAnalysisRunResponse(BaseModel):
     hero_components: list[RoshAnalysisHeroComponent]
     minute_points: list[RoshAnalysisMinutePoint]
     error_code: str | None
+
+
+class RoshAnalysisRecordResponse(BaseModel):
+    run: RoshAnalysisRunResponse
+    links: list[RoshAnalysisMatchLink]
+
+
+class RoshAnalysisRecordPageResponse(BaseModel):
+    query_source: Literal["raybet", "opendota", "stratz"]
+    query_match_id: str
+    records: list[RoshAnalysisRecordResponse]
 
 
 class PredictionFactor(BaseModel):

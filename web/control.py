@@ -29,6 +29,9 @@ from live_betting.process_control import (
 class ComponentSpec:
     label: str
     arguments: tuple[str, ...]
+    supervisor_component: str | None = None
+    supervisor_timeout_seconds: float = 0.0
+    configuration_component: str | None = None
 
 
 COMPONENTS: dict[str, ComponentSpec] = {
@@ -46,6 +49,8 @@ COMPONENTS: dict[str, ComponentSpec] = {
             "30",
             "--schema-prepared",
         ),
+        supervisor_component="raybet_worker",
+        supervisor_timeout_seconds=90.0,
     ),
     "mail_worker": ComponentSpec(
         "Mail worker",
@@ -54,6 +59,9 @@ COMPONENTS: dict[str, ComponentSpec] = {
             "scripts/run_notification_worker.py",
             "--schema-prepared",
         ),
+        supervisor_component="mail_worker",
+        supervisor_timeout_seconds=180.0,
+        configuration_component="mail_delivery",
     ),
 }
 
@@ -183,6 +191,25 @@ class ControlService:
                 "pid": identity.pid if identity else None,
                 "detail": "already running",
             }
+        if state == "stopped" and self._configuration_missing(
+            connection, component
+        ):
+            return {
+                "ok": False,
+                "status": "stopped",
+                "pid": None,
+                "detail": "未配置",
+            }
+        supervisor_heartbeat = self._fresh_supervisor_heartbeat(
+            connection, component
+        )
+        if state == "stopped" and supervisor_heartbeat is not None:
+            return {
+                "ok": False,
+                "status": "running",
+                "pid": None,
+                "detail": "由 Supervisor 托管",
+            }
         process = self._popen(
             command,
             cwd=str(self.project_dir),
@@ -240,6 +267,15 @@ class ControlService:
         command = self.command_for(component)
         row = self._registry_row(connection, component)
         state, identity = self._inspect(row, command)
+        if state == "stopped" and self._fresh_supervisor_heartbeat(
+            connection, component
+        ) is not None:
+            return {
+                "ok": False,
+                "status": "running",
+                "pid": None,
+                "detail": "由 Supervisor 托管",
+            }
         if state == "running" and identity is not None:
             owned = self._owned.get(component)
             if owned is not None and owned[1] == identity:
@@ -279,15 +315,93 @@ class ControlService:
     ) -> dict[str, object]:
         row = self._registry_row(connection, component)
         state, identity = self._inspect(row, self.command_for(component))
+        detail: str | None = None
+        control_allowed = state not in {
+            "identity_mismatch",
+            "identity_unverifiable",
+        }
+        started_at = row["started_at"] if row is not None else None
+        if state == "stopped" and self._configuration_missing(
+            connection, component
+        ):
+            detail = "未配置"
+            control_allowed = False
+        elif state == "stopped":
+            supervisor_heartbeat = self._fresh_supervisor_heartbeat(
+                connection, component
+            )
+            if supervisor_heartbeat is not None:
+                state = "running"
+                detail = "由 Supervisor 托管"
+                control_allowed = False
+                started_at = supervisor_heartbeat
         return {
             "component": component,
             "label": spec.label,
             "status": state,
             "pid": identity.pid if identity is not None else None,
-            "started_at": row["started_at"] if row is not None else None,
-            "detail": None,
-            "control_allowed": state not in {"identity_mismatch", "identity_unverifiable"},
+            "started_at": started_at,
+            "detail": detail,
+            "control_allowed": control_allowed,
         }
+
+    def _fresh_supervisor_heartbeat(
+        self,
+        connection: PostgresSession,
+        component: str,
+    ) -> object | None:
+        spec = COMPONENTS[component]
+        if spec.supervisor_component is None:
+            return None
+        row = connection.execute(
+            "SELECT last_heartbeat_at FROM service_health WHERE component=?",
+            (spec.supervisor_component,),
+        ).fetchone()
+        if row is None:
+            return None
+        heartbeat = self._parse_time(row["last_heartbeat_at"])
+        if heartbeat is None:
+            return None
+        age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+        if not -5.0 <= age <= spec.supervisor_timeout_seconds:
+            return None
+        return row["last_heartbeat_at"]
+
+    @staticmethod
+    def _configuration_missing(
+        connection: PostgresSession,
+        component: str,
+    ) -> bool:
+        configuration_component = COMPONENTS[component].configuration_component
+        if configuration_component is None:
+            return False
+        row = connection.execute(
+            """SELECT last_error, details_json FROM service_health
+                WHERE component=?""",
+            (configuration_component,),
+        ).fetchone()
+        if row is None:
+            return False
+        if str(row["last_error"] or "") == "configuration_missing":
+            return True
+        try:
+            details = json.loads(str(row["details_json"] or "{}"))
+        except (TypeError, ValueError):
+            return False
+        return isinstance(details, dict) and details.get("smtp_configured") is False
+
+    @staticmethod
+    def _parse_time(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
 
     def _inspect(
         self,

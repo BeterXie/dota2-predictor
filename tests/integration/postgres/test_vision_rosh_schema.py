@@ -79,6 +79,7 @@ def test_vision_and_rosh_authority_tables_exist(postgres_engine: Engine) -> None
         "rosh_analysis_runs",
         "rosh_hero_scores",
         "rosh_minute_points",
+        "rosh_run_match_links",
         "official_rosh_shadow_evaluations",
         "vision_derived_invalidations",
         "odds_alignments",
@@ -575,6 +576,46 @@ def _insert_rosh_run(connection, *, run_id: str, status: str) -> None:
             "error_code": None if succeeded else "upstream_failed",
         },
     )
+
+
+def test_rosh_match_links_require_succeeded_runs_and_are_append_only(
+    postgres_engine: Engine,
+) -> None:
+    succeeded_run = _hash("linked-succeeded-run")
+    failed_run = _hash("linked-failed-run")
+    with postgres_engine.begin() as connection:
+        _insert_rosh_run(connection, run_id=succeeded_run, status="succeeded")
+        _insert_rosh_run(connection, run_id=failed_run, status="failed")
+        connection.execute(
+            text(
+                """INSERT INTO rosh_run_match_links
+                   (source, source_match_id, run_id, map_number, linked_at)
+                   VALUES ('raybet', '38417786', :run_id, 3,
+                           '2026-08-02T12:00:00Z')"""
+            ),
+            {"run_id": succeeded_run},
+        )
+
+    with pytest.raises(DBAPIError, match="requires succeeded run"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO rosh_run_match_links
+                       (source, source_match_id, run_id, linked_at)
+                       VALUES ('stratz', '8904419709', :run_id,
+                               '2026-08-02T12:00:00Z')"""
+                ),
+                {"run_id": failed_run},
+            )
+
+    with pytest.raises(DBAPIError, match="append-only"):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """UPDATE rosh_run_match_links SET map_number=2
+                       WHERE source='raybet' AND source_match_id='38417786'"""
+                )
+            )
 
 
 def test_rosh_children_require_succeeded_immutable_run(

@@ -8,7 +8,7 @@ alembic upgrade head
 ```
 
 The migration target is PostgreSQL-only runtime operation. Revision
-`20260801_0020` is the current head. It includes the core match,
+`20260802_0021` is the current head. It includes the core match,
 event-intelligence, live odds, strict mapping, draft, vision/Rosh, strategy,
 runtime monitor, settlement, and research schemas. `live_schema_version` is 12
 and the runtime contract is version 1.

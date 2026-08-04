@@ -84,7 +84,12 @@ export interface LiveDraftContextTeam {
 export interface LiveDraftContext {
   status: "ready" | "unavailable";
   reason: string;
-  source: "strict_mapping" | "raybet_exact_name";
+  source:
+    | "strict_mapping"
+    | "raybet_exact_name"
+    | "raybet_normalized_name_v1"
+    | "raybet_identity_mapping_v2"
+    | "raybet_recent_activity_v1";
   teams: LiveDraftContextTeam[];
 }
 
@@ -934,6 +939,14 @@ export interface RoshAnalysisDraftSlot {
   position_id: number;
 }
 
+export type RoshAnalysisMatchSource = "raybet" | "opendota" | "stratz";
+
+export interface RoshAnalysisMatchLink {
+  source: RoshAnalysisMatchSource;
+  source_match_id: string;
+  map_number?: number | null;
+}
+
 export interface RoshAnalysisRequest {
   mode: "historical_match" | "explicit_draft";
   date_time: number;
@@ -942,6 +955,7 @@ export interface RoshAnalysisRequest {
   match_id?: number;
   radiant?: RoshAnalysisDraftSlot[];
   dire?: RoshAnalysisDraftSlot[];
+  match_links?: RoshAnalysisMatchLink[];
 }
 
 export interface RoshAnalysisHeroComponent {
@@ -989,4 +1003,15 @@ export interface RoshAnalysisRunResponse {
   hero_components: RoshAnalysisHeroComponent[];
   minute_points: RoshAnalysisMinutePoint[];
   error_code: string | null;
+}
+
+export interface RoshAnalysisRecord {
+  run: RoshAnalysisRunResponse;
+  links: RoshAnalysisMatchLink[];
+}
+
+export interface RoshAnalysisRecordPage {
+  query_source: RoshAnalysisMatchSource;
+  query_match_id: string;
+  records: RoshAnalysisRecord[];
 }

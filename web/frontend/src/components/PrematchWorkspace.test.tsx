@@ -1,7 +1,14 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createRoshAnalysis, fetchPrematchDraft, fetchPrematchHeroGrid } from "../api";
+import {
+  createRoshAnalysis,
+  fetchPrematchDraft,
+  fetchPrematchHeroGrid,
+  fetchPrematchRecentMatches,
+  fetchPrematchTeams,
+  fetchRoshAnalysisRecords,
+} from "../api";
 import type { RoshAnalysisRunResponse } from "../types";
 import { PredictionResult, PrematchWorkspace } from "./PrematchWorkspace";
 
@@ -12,9 +19,17 @@ vi.mock("../api", () => ({
   fetchPrematchLeagues: vi.fn().mockResolvedValue([]),
   fetchPrematchRecentMatches: vi.fn().mockResolvedValue([]),
   fetchPrematchTeams: vi.fn().mockResolvedValue([]),
+  fetchRoshAnalysisRecords: vi.fn().mockResolvedValue({
+    query_source: "opendota",
+    query_match_id: "",
+    records: [],
+  }),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 describe("PrematchWorkspace", () => {
   it("does not expose manual data-fetch controls", () => {
@@ -22,6 +37,44 @@ describe("PrematchWorkspace", () => {
 
     expect(screen.queryByRole("button", { name: "重新抓取" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "抓取新数据" })).not.toBeInTheDocument();
+  });
+
+  it("disambiguates official match and team identities in selectors", async () => {
+    vi.mocked(fetchPrematchRecentMatches).mockResolvedValueOnce([{
+      match_id: 8904322271,
+      radiant_team_id: 10,
+      dire_team_id: 20,
+      radiant_name: "Zero Tenacity",
+      dire_name: "LGD.Pinghu",
+      start_time: 1784478900,
+      leagueid: 19785,
+      league_name: "The Games of the Future 2026",
+    }]);
+    vi.mocked(fetchPrematchTeams).mockResolvedValueOnce([{
+      team_id: 8254145,
+      name: "Execration",
+      tag: "XctN",
+      logo_url: null,
+      match_count: 5,
+    }, {
+      team_id: 10207960,
+      name: "Execration",
+      tag: "XctN",
+      logo_url: null,
+      match_count: 3,
+    }]);
+
+    render(<PrematchWorkspace />);
+
+    expect(await screen.findByRole("option", {
+      name: /#8904322271.*Zero Tenacity vs LGD\.Pinghu/,
+    })).toBeInTheDocument();
+    expect(await screen.findAllByRole("option", {
+      name: "Execration · #8254145 (5 场)",
+    })).toHaveLength(2);
+    expect(screen.getAllByRole("option", {
+      name: "Execration · #10207960 (3 场)",
+    })).toHaveLength(2);
   });
 
   it("uses the source match end time for historical Rosh identity", async () => {
@@ -55,13 +108,66 @@ describe("PrematchWorkspace", () => {
     await screen.findByText(/比赛 8904322271 已载入/);
     fireEvent.click(screen.getByRole("button", { name: "分析阵容" }));
 
+    await waitFor(() => expect(fetchRoshAnalysisRecords).toHaveBeenCalledWith(
+      "opendota",
+      "8904322271",
+    ));
     await waitFor(() => expect(createRoshAnalysis).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "historical_match",
         match_id: 8904322271,
         date_time: 1784481374,
+        match_links: [{
+          source: "opendota",
+          source_match_id: "8904322271",
+        }],
       }),
     ));
+  });
+
+  it("uses an existing OpenDota-linked run without calling STRATZ again", async () => {
+    vi.mocked(fetchPrematchDraft).mockResolvedValue({
+      match_id: 8904322271,
+      radiant_team_id: 10,
+      dire_team_id: 20,
+      league_id: 19785,
+      start_time: 1784478900,
+      end_time: 1784481374,
+      radiant_heroes: [1, 2, 3, 4, 5].map((hero_id) => ({
+        hero_id, name: `Radiant ${hero_id}`, image_url: "", account_id: hero_id,
+      })),
+      dire_heroes: [6, 7, 8, 9, 10].map((hero_id) => ({
+        hero_id, name: `Dire ${hero_id}`, image_url: "", account_id: hero_id,
+      })),
+    });
+    const existing = {
+      ...predictionResult,
+      mode: "historical_match" as const,
+      match_id: 8904322271,
+      date_time: 1784481374,
+    };
+    vi.mocked(fetchRoshAnalysisRecords).mockResolvedValueOnce({
+      query_source: "opendota",
+      query_match_id: "8904322271",
+      records: [{
+        run: existing,
+        links: [
+          { source: "opendota", source_match_id: "8904322271" },
+          { source: "stratz", source_match_id: "8904322271" },
+        ],
+      }],
+    });
+    render(<PrematchWorkspace />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "比赛 ID" }), {
+      target: { value: "8904322271" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "自动填充" }));
+    await screen.findByText(/比赛 8904322271 已载入/);
+    fireEvent.click(screen.getByRole("button", { name: "分析阵容" }));
+
+    await screen.findByText("阵容更偏向 Radiant");
+    expect(createRoshAnalysis).not.toHaveBeenCalled();
   });
 
   it("uses an accessible hero dialog with focus and Escape handling", async () => {

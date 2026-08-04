@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database.session import PostgresSession
 
 
-ALEMBIC_HEAD = "20260801_0020"
+ALEMBIC_HEAD = "20260802_0021"
 CURRENT_RUNTIME_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_CONTRACT_DIGEST = (
     "eb58ed6794cd39cdf4b9947a9132f2c2683cb20c769770586e3ca5c9f093beb9"

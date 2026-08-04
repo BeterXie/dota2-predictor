@@ -223,6 +223,231 @@ def test_live_draft_context_resolves_teams_and_players_without_manual_ids(
     store.close()
 
 
+def test_live_draft_context_resolves_unique_normalized_team_names(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    with store.connection.transaction():
+        store.connection.executemany(
+            "INSERT INTO teams (team_id, name, tag) VALUES (?, ?, ?)",
+            [(11, "Team Falcons", "FLCN"), (22, "1w", "1w")],
+        )
+        store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, team_one, team_two, best_of, status,
+                raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "normalized-context",
+                "Team Falcons",
+                "1w Team",
+                2,
+                "2",
+                '{"team":['
+                '{"pos":1,"team_name":"Team Falcons"},'
+                '{"pos":2,"team_name":"1w Team"}'
+                "]}",
+                NOW.isoformat(),
+            ),
+        )
+
+    context = live_draft_context(
+        store.connection,
+        "normalized-context",
+        as_of=NOW,
+    )
+
+    assert context is not None
+    assert context["status"] == "ready"
+    assert context["source"] == "raybet_normalized_name_v1"
+    assert [team["team_id"] for team in context["teams"]] == [11, 22]
+    store.close()
+
+
+def test_live_draft_context_rejects_ambiguous_normalized_team_names(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    with store.connection.transaction():
+        store.connection.executemany(
+            "INSERT INTO teams (team_id, name, tag) VALUES (?, ?, ?)",
+            [
+                (11, "Alpha", "A"),
+                (12, "Alpha Team", "AT"),
+                (22, "Beta", "B"),
+            ],
+        )
+        store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, team_one, team_two, best_of, status,
+                raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "ambiguous-normalized-context",
+                "Alpha Gaming",
+                "Beta",
+                3,
+                "2",
+                '{"team":['
+                '{"pos":1,"team_name":"Alpha Gaming"},'
+                '{"pos":2,"team_name":"Beta"}'
+                "]}",
+                NOW.isoformat(),
+            ),
+        )
+
+    context = live_draft_context(
+        store.connection,
+        "ambiguous-normalized-context",
+        as_of=NOW,
+    )
+
+    assert context is not None
+    assert context["status"] == "unavailable"
+    assert context["source"] == "raybet_normalized_name_v1"
+    assert context["teams"] == []
+    store.close()
+
+
+def test_live_draft_context_resolves_reused_names_by_recent_activity(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    old_start = int((NOW - timedelta(days=70)).timestamp())
+    current_start = int((NOW - timedelta(days=1)).timestamp())
+    with store.connection.transaction():
+        store.connection.executemany(
+            "INSERT INTO teams (team_id, name, tag) VALUES (?, ?, ?)",
+            [
+                (11, "GLYPH", "GLYPH"),
+                (12, "GLYPH", "GLY"),
+                (21, "PlayTime", "PlayTime"),
+                (22, "PlayTime", "PT"),
+            ],
+        )
+        store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, team_one, team_two, best_of, status,
+                raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "reused-name-context",
+                "GLYPH",
+                "PlayTime",
+                3,
+                "1",
+                '{"team":['
+                '{"pos":1,"team_id":501,"team_name":"GLYPH"},'
+                '{"pos":2,"team_id":502,"team_name":"PlayTime"}'
+                "]}",
+                NOW.isoformat(),
+            ),
+        )
+        store.connection.executemany(
+            """INSERT INTO matches
+               (match_id, radiant_team_id, dire_team_id, start_time)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (101, 11, 99, old_start),
+                (102, 12, 98, current_start),
+                (201, 21, 97, old_start),
+                (202, 22, 96, current_start),
+            ],
+        )
+        store.connection.executemany(
+            """INSERT INTO match_players
+               (match_id, account_id, player_slot, is_radiant, team_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (102, 1000 + position, position - 1, True, 12)
+                for position in range(1, 6)
+            ]
+            + [
+                (202, 2000 + position, position - 1, True, 22)
+                for position in range(1, 6)
+            ],
+        )
+
+    context = live_draft_context(
+        store.connection,
+        "reused-name-context",
+        as_of=NOW,
+    )
+
+    assert context is not None
+    assert context["status"] == "ready"
+    assert context["source"] == "raybet_recent_activity_v1"
+    assert [team["team_id"] for team in context["teams"]] == [12, 22]
+    assert [len(team["players"]) for team in context["teams"]] == [5, 5]
+    store.close()
+
+
+def test_live_draft_context_keeps_recent_name_collision_ambiguous(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    with store.connection.transaction():
+        store.connection.executemany(
+            "INSERT INTO teams (team_id, name, tag) VALUES (?, ?, ?)",
+            [(11, "Alpha", "A1"), (12, "Alpha", "A2"), (22, "Beta", "B")],
+        )
+        store.connection.executemany(
+            """INSERT INTO matches
+               (match_id, radiant_team_id, dire_team_id, start_time)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (101, 11, 99, int((NOW - timedelta(days=2)).timestamp())),
+                (102, 12, 98, int((NOW - timedelta(days=1)).timestamp())),
+            ],
+        )
+        store.connection.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, team_one, team_two, best_of, status,
+                raw_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "recent-collision-context",
+                "Alpha",
+                "Beta",
+                3,
+                "1",
+                '{"team":['
+                '{"pos":1,"team_name":"Alpha"},'
+                '{"pos":2,"team_name":"Beta"}'
+                "]}",
+                NOW.isoformat(),
+            ),
+        )
+
+    context = live_draft_context(
+        store.connection,
+        "recent-collision-context",
+        as_of=NOW,
+    )
+
+    assert context is not None
+    assert context["status"] == "unavailable"
+    assert context["source"] == "raybet_exact_name"
+    assert context["teams"] == []
+    store.close()
+
+
 def test_live_draft_context_prefers_explicit_raybet_identity_mapping(
     postgres_engine,
     tmp_path,

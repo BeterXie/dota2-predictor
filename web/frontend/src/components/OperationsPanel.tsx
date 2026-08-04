@@ -335,6 +335,13 @@ function componentName(component: ControlComponent["component"]): string {
 }
 
 function mailState(health: HealthItem[]): string {
+  const mailComponents = health.filter((item) => item.component.startsWith("mail"));
+  const configurationMissing = mailComponents.some((item) => (
+    item.last_error === "configuration_missing"
+    || item.details.configured === false
+    || item.details.smtp_configured === false
+  ));
+  if (configurationMissing) return "未配置";
   const mail = health.find((item) => item.component === "mail")
     || health.find((item) => item.component === "mail_worker");
   if (!mail) return "未配置";

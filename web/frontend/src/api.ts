@@ -20,6 +20,8 @@ import type {
   PrematchLeague,
   PrematchRecentMatch,
   PrematchTeam,
+  RoshAnalysisMatchSource,
+  RoshAnalysisRecordPage,
   RoshAnalysisRequest,
   RoshAnalysisRunResponse,
 } from "./types";
@@ -337,6 +339,18 @@ export function fetchRoshAnalysis(
 ): Promise<RoshAnalysisRunResponse> {
   return getJson<RoshAnalysisRunResponse>(
     `/api/prematch/rosh-analysis/${encodeURIComponent(runId)}`,
+    signal,
+  );
+}
+
+export function fetchRoshAnalysisRecords(
+  source: RoshAnalysisMatchSource,
+  matchId: string,
+  signal?: AbortSignal,
+): Promise<RoshAnalysisRecordPage> {
+  const query = new URLSearchParams({ source, match_id: matchId });
+  return getJson<RoshAnalysisRecordPage>(
+    `/api/prematch/rosh-analysis/records?${query.toString()}`,
     signal,
   );
 }

@@ -192,7 +192,7 @@ describe("OperationsPanel", () => {
             status: "running",
             pid: null,
             started_at: "2026-07-16T00:00:00+00:00",
-            detail: "managed by unified supervisor",
+            detail: "由 Supervisor 托管",
             control_allowed: false,
           }]}
           controlMessage={null}
@@ -210,12 +210,13 @@ describe("OperationsPanel", () => {
     );
 
     const buttons = container.querySelectorAll(".managed-worker button");
+    expect(within(container).getByText("由 Supervisor 托管")).toBeInTheDocument();
     expect(buttons).toHaveLength(3);
     buttons.forEach((button) => expect(button).toBeDisabled());
   });
 
   it("shows optional SMTP as unconfigured despite a stale worker heartbeat", () => {
-    render(
+    const view = render(
       <FluentProvider theme={webDarkTheme} applyStylesToPortals={false}>
         <OperationsPanel
           alerts={[]}
@@ -260,8 +261,9 @@ describe("OperationsPanel", () => {
       </FluentProvider>,
     );
 
-    expect(screen.getByText("未配置或未启动")).toBeInTheDocument();
-    expect(screen.queryByText(/heartbeat_expired/)).not.toBeInTheDocument();
+    const panel = within(view.container);
+    expect(panel.getByText("未配置")).toBeInTheDocument();
+    expect(panel.queryByText(/heartbeat_expired/)).not.toBeInTheDocument();
   });
 
   it("keeps unacknowledged alerts visible when the panel is capped", () => {

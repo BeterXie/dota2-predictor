@@ -11,6 +11,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -51,6 +52,7 @@ from .schemas import (
     MatchSummary,
     PrematchRequest,
     PredictionRequest,
+    RoshAnalysisRecordPageResponse,
     RoshAnalysisRequest,
     RoshAnalysisRunResponse,
     TeamBase,
@@ -613,6 +615,25 @@ def _rosh_run_response(stored: StoredRoshRun) -> dict:
     }
 
 
+def _rosh_match_links(request: RoshAnalysisRequest) -> list[dict]:
+    links = [link.model_dump() for link in request.match_links]
+    if request.mode == "historical_match":
+        assert request.match_id is not None
+        stratz_identity = ("stratz", str(request.match_id))
+        if not any(
+            (link["source"], link["source_match_id"]) == stratz_identity
+            for link in links
+        ):
+            links.append(
+                {
+                    "source": "stratz",
+                    "source_match_id": str(request.match_id),
+                    "map_number": None,
+                }
+            )
+    return links
+
+
 _ROSH_ERROR_STATUS = {
     "invalid_request": 400,
     "source_match_not_found": 404,
@@ -660,14 +681,59 @@ def create_rosh_analysis(request: RoshAnalysisRequest):
                 }
             )
             _raise_rosh_http(RoshAnalysisError("profile_drift"))
-        analysis_input = request.model_dump(exclude={"rosh_profile_id"})
+        analysis_input = request.model_dump(
+            exclude={"match_links", "rosh_profile_id"}
+        )
         stored = _get_rosh_analysis_orchestrator(connection).execute(
             analysis_input,
             profile,
         )
+        match_links = _rosh_match_links(request)
+        if match_links:
+            RoshRunRepository(connection).link_matches(
+                stored.run.run_id,
+                match_links,
+                linked_at=stored.run.collected_at,
+            )
         return _rosh_run_response(stored)
     except RoshAnalysisError as error:
         _raise_rosh_http(error)
+    finally:
+        connection.close()
+
+
+@app.get(
+    "/api/prematch/rosh-analysis/records",
+    response_model=RoshAnalysisRecordPageResponse,
+    tags=["predictions"],
+)
+def get_rosh_analysis_records(
+    source: Literal["raybet", "opendota", "stratz"] = Query(),
+    match_id: str = Query(min_length=1, max_length=128),
+):
+    if match_id != match_id.strip():
+        raise HTTPException(status_code=400, detail="match_id must be canonical")
+    connection = queries.get_db()
+    try:
+        records = RoshRunRepository(connection).get_match_records(source, match_id)
+        return {
+            "query_source": source,
+            "query_match_id": match_id,
+            "records": [
+                {
+                    "run": _rosh_run_response(stored),
+                    "links": [
+                        {
+                            "source": link.source,
+                            "source_match_id": link.source_match_id,
+                            "map_number": link.map_number,
+                        }
+                        for link in links
+                    ],
+                }
+                for stored, links in records
+            ],
+        }
     finally:
         connection.close()
 

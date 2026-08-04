@@ -3342,6 +3342,65 @@ summary:focus-visible {
   line-height: 1.45;
 }
 
+.rosh-records {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 12px 16px 14px;
+  border-top: 1px solid var(--border);
+  background: rgba(10, 15, 21, 0.2);
+}
+
+.rosh-records > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.rosh-records > header strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.rosh-records > header span {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.rosh-record-table-scroll {
+  overflow-x: auto;
+}
+
+.rosh-record-table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-align: left;
+}
+
+.rosh-record-table th,
+.rosh-record-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rosh-record-table th {
+  color: var(--text-dim);
+  font-weight: 650;
+}
+
+.rosh-record-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.rosh-record-table code {
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
 .decision-delta {
   grid-column: 1 / -1;
   min-width: 0;

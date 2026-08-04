@@ -217,4 +217,37 @@ describe("match attention presentation", () => {
       "no-start",
     ]);
   });
+
+  it("sorts archived matches by valid evidence instead of later transport metadata", () => {
+    const olderEvidence = match("older-evidence", {
+      lifecycle: "ended",
+      history_eligible: true,
+      updated_at: "2026-07-30T12:10:00+00:00",
+      latest_odds_activity_at: "2026-07-30T12:10:00+00:00",
+      winner: {
+        complete: true,
+        observed_at: "2026-07-30T10:00:00+00:00",
+      },
+    });
+    const newerEvidence = match("newer-evidence", {
+      lifecycle: "ended",
+      history_eligible: true,
+      updated_at: "2026-07-30T12:05:00+00:00",
+      latest_odds_activity_at: "2026-07-30T12:05:00+00:00",
+      winner: {
+        complete: true,
+        observed_at: "2026-07-30T11:00:00+00:00",
+      },
+    });
+
+    expect(sortMatchesByAttention(
+      [olderEvidence, newerEvidence],
+      "updated",
+    ).map((item) => item.raybet_match_id)).toEqual([
+      "newer-evidence",
+      "older-evidence",
+    ]);
+    expect(getMatchAttentionState(olderEvidence).updatedAt)
+      .toBe("2026-07-30T10:00:00+00:00");
+  });
 });

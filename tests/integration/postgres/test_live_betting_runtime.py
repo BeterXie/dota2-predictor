@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 
 import pytest
@@ -12,6 +12,7 @@ from live_betting.draft_publisher import (
     ready_draft_anchors,
 )
 from live_betting.models import ProviderMatch
+from live_betting.monitor import collect_completed_once
 from live_betting.health import read_health, record_health
 from live_betting.notifications import EVENT_MONITOR_ALERT, claim, enqueue
 from live_betting.runtime_schema import verify_runtime_schema
@@ -170,6 +171,161 @@ def test_live_workers_execute_postgres_causal_queries(postgres_engine, tmp_path)
         "missing-match",
         1,
     )
+    store.close()
+
+
+def test_completed_collector_skips_persisted_final_odds(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    payload = {
+        "result": {
+            "id": "9001",
+            "game_id": 151,
+            "status": 3,
+            "team": [
+                {"team_id": 11, "pos": 1, "team_name": "Radiant Five"},
+                {"team_id": 22, "pos": 2, "team_name": "Dire Five"},
+            ],
+            "odds": [
+                {
+                    "id": "winner-one",
+                    "odds_group_id": "winner-map-1",
+                    "team_id": 11,
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "odds": 1.8,
+                    "status": 5,
+                },
+                {
+                    "id": "winner-two",
+                    "odds_group_id": "winner-map-1",
+                    "team_id": 22,
+                    "match_stage": "r1",
+                    "group_short_name": "Winner",
+                    "tag": "win",
+                    "odds": 2.0,
+                    "status": 5,
+                },
+            ],
+        }
+    }
+
+    class Client:
+        calls = 0
+
+        def match_odds(self, _match_id: str) -> dict[str, object]:
+            self.calls += 1
+            return payload
+
+    client = Client()
+    completed_rows = [{"id": "9001", "status": 3}]
+
+    first = collect_completed_once(
+        store,
+        client,
+        tmp_path / "raw",
+        completed_rows=completed_rows,
+        audit_match_list=False,
+    )
+    second = collect_completed_once(
+        store,
+        client,
+        tmp_path / "raw",
+        completed_rows=completed_rows,
+        audit_match_list=False,
+    )
+
+    assert (first["matches"], first["skipped"]) == (1, 0)
+    assert (second["matches"], second["skipped"]) == (0, 1)
+    assert client.calls == 1
+    assert store.connection.execute(
+        """SELECT COUNT(*) FROM odds_transport_observations
+            WHERE raybet_match_id='9001'"""
+    ).fetchone()[0] == 1
+    store.close()
+
+
+def test_completed_collector_stops_retrying_stable_strict_rejection(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    match_id = "9002"
+    store.upsert_raybet_match(
+        {
+            "id": match_id,
+            "game_id": 151,
+            "status": 2,
+            "team": [
+                {"team_id": 11, "pos": 1, "team_name": "Radiant Five"},
+                {"team_id": 22, "pos": 2, "team_name": "Dire Five"},
+            ],
+        },
+        NOW,
+    )
+    rejected_payload = {
+        "code": 200,
+        "result": {
+            "id": match_id,
+            "game_id": 151,
+            "status": 3,
+            "odds": [{"status": 99, "odds": 0.01}],
+        },
+    }
+    for index in range(3):
+        receipt = store.archive_response_payload(
+            rejected_payload,
+            observed_at=NOW + timedelta(seconds=index),
+            match_id=match_id,
+            response_kind="completed_odds",
+        )
+        store.record_direct_response_audit(
+            receipt,
+            response_kind="completed_odds",
+            claimed_raybet_match_id=match_id,
+            observed_raybet_match_id=match_id,
+            disposition="rejected",
+            reason="validation_failed",
+        )
+
+    class Client:
+        calls = 0
+
+        def match_odds(self, _match_id: str) -> dict[str, object]:
+            self.calls += 1
+            raise AssertionError("terminal strict rejection must not be fetched again")
+
+    client = Client()
+    result = collect_completed_once(
+        store,
+        client,
+        tmp_path / "raw",
+        completed_rows=[{"id": match_id, "status": 3}],
+        audit_match_list=False,
+    )
+
+    assert result == {
+        "matches": 0,
+        "listed": 1,
+        "odds": 0,
+        "changed": 0,
+        "errors": 0,
+        "skipped": 1,
+    }
+    assert client.calls == 0
+    assert store.connection.execute(
+        "SELECT status FROM raybet_matches WHERE raybet_match_id=?",
+        (match_id,),
+    ).fetchone()[0] == "3"
     store.close()
 
 

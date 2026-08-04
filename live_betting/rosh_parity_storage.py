@@ -17,6 +17,7 @@ from database.session import DatabaseRow, PostgresSession
 
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
 _ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*")
+_MATCH_LINK_SOURCES = frozenset({"raybet", "opendota", "stratz"})
 _PLACEHOLDERS = frozenset(
     {"", "n/a", "none", "null", "placeholder", "tbd", "todo", "unknown"}
 )
@@ -113,6 +114,15 @@ class StoredRoshRun:
     hero_scores: tuple[RoshHeroScoreRecord, ...]
     minute_points: tuple[RoshMinutePointRecord, ...]
     result: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class RoshRunMatchLink:
+    source: str
+    source_match_id: str
+    run_id: str
+    map_number: int | None
+    linked_at: str
 
 
 def _finite_number(value: object, label: str) -> float:
@@ -610,6 +620,99 @@ class RoshRunRepository:
         result = None if row["result_json"] is None else json.loads(str(row["result_json"]))
         return StoredRoshRun(run, heroes, minutes, result)
 
+    def link_matches(
+        self,
+        run_id: str,
+        links: Sequence[Mapping[str, Any]],
+        *,
+        linked_at: str,
+    ) -> tuple[RoshRunMatchLink, ...]:
+        _hash(run_id, "run_id")
+        timestamp = _timestamp(linked_at, "linked_at")
+        stored = self.get(run_id)
+        if stored is None or stored.run.status != "succeeded":
+            raise ValueError("match links require a succeeded Rosh run")
+        normalized: list[tuple[str, str, int | None]] = []
+        seen: set[tuple[str, str]] = set()
+        for link in links:
+            source = _identity(link.get("source"), "match link source")
+            if source not in _MATCH_LINK_SOURCES:
+                raise ValueError("match link source is unsupported")
+            source_match_id = _identity(
+                link.get("source_match_id"), "source_match_id"
+            )
+            if len(source_match_id) > 128:
+                raise ValueError("source_match_id is too long")
+            map_number = link.get("map_number")
+            if map_number is not None:
+                map_number = _positive_integer(map_number, "map_number")
+                if map_number > 5:
+                    raise ValueError("map_number must be between 1 and 5")
+            identity = (source, source_match_id)
+            if identity in seen:
+                raise ValueError("duplicate match link identity")
+            seen.add(identity)
+            normalized.append((source, source_match_id, map_number))
+
+        with self._transaction():
+            for source, source_match_id, map_number in normalized:
+                self.connection.execute(
+                    """INSERT INTO rosh_run_match_links
+                       (source, source_match_id, run_id, map_number, linked_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT (source, source_match_id, run_id) DO NOTHING""",
+                    (source, source_match_id, run_id, map_number, timestamp),
+                )
+        return self.get_match_links(run_id)
+
+    def get_match_links(self, run_id: str) -> tuple[RoshRunMatchLink, ...]:
+        _hash(run_id, "run_id")
+        rows = self.connection.execute(
+            """SELECT source, source_match_id, run_id, map_number, linked_at
+                 FROM rosh_run_match_links
+                WHERE run_id=?
+                ORDER BY source, source_match_id""",
+            (run_id,),
+        ).fetchall()
+        return tuple(
+            RoshRunMatchLink(
+                source=str(row["source"]),
+                source_match_id=str(row["source_match_id"]),
+                run_id=str(row["run_id"]),
+                map_number=(
+                    None if row["map_number"] is None else int(row["map_number"])
+                ),
+                linked_at=str(row["linked_at"]),
+            )
+            for row in rows
+        )
+
+    def get_match_records(
+        self,
+        source: str,
+        source_match_id: str,
+    ) -> tuple[tuple[StoredRoshRun, tuple[RoshRunMatchLink, ...]], ...]:
+        normalized_source = _identity(source, "match link source")
+        if normalized_source not in _MATCH_LINK_SOURCES:
+            raise ValueError("match link source is unsupported")
+        normalized_match_id = _identity(source_match_id, "source_match_id")
+        rows = self.connection.execute(
+            """SELECT link.run_id
+                 FROM rosh_run_match_links AS link
+                 JOIN rosh_analysis_runs AS run ON run.run_id=link.run_id
+                WHERE link.source=? AND link.source_match_id=?
+                ORDER BY live_text_timestamp_utc(run.collected_at) DESC,
+                         run.run_id DESC""",
+            (normalized_source, normalized_match_id),
+        ).fetchall()
+        records: list[tuple[StoredRoshRun, tuple[RoshRunMatchLink, ...]]] = []
+        for row in rows:
+            run_id = str(row["run_id"])
+            stored = self.get(run_id)
+            if stored is not None:
+                records.append((stored, self.get_match_links(run_id)))
+        return tuple(records)
+
     def get_by_evidence_hash(self, evidence_hash: str) -> StoredRoshRun | None:
         _hash(evidence_hash, "evidence_hash")
         row = self.connection.execute(
@@ -837,6 +940,7 @@ __all__ = [
     "RoshEvidenceCollisionError",
     "RoshHeroScoreRecord",
     "RoshMinutePointRecord",
+    "RoshRunMatchLink",
     "RoshRunRecord",
     "RoshRunRepository",
     "StoredRoshRun",

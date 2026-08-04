@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from database.session import PostgresSession
+
+
+_TEAM_NAME_EDGE_WORDS = frozenset({"esport", "esports", "gaming", "team"})
+_TEAM_NAME_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+_TEAM_ACTIVITY_DISAMBIGUATION_GAP_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -34,7 +41,13 @@ def live_draft_context(
     ).fetchone()
     if match is None:
         return None
-    teams, source = _draft_context_teams(connection, match_id, match)
+    cutoff = int(_aware_utc(as_of or datetime.now(timezone.utc)).timestamp())
+    teams, source = _draft_context_teams(
+        connection,
+        match_id,
+        match,
+        cutoff_epoch=cutoff,
+    )
     if len(teams) != 2 or teams[0]["team_id"] == teams[1]["team_id"]:
         return {
             "status": "unavailable",
@@ -42,7 +55,6 @@ def live_draft_context(
             "source": source,
             "teams": [],
         }
-    cutoff = int(_aware_utc(as_of or datetime.now(timezone.utc)).timestamp())
     return {
         "status": "ready",
         "reason": "draft_context_ready",
@@ -65,6 +77,8 @@ def _draft_context_teams(
     connection: PostgresSession,
     match_id: str,
     match: Any,
+    *,
+    cutoff_epoch: int,
 ) -> tuple[list[dict[str, Any]], str]:
     mapping = connection.execute(
         """SELECT mapping.canonical_team_one_id,
@@ -111,6 +125,8 @@ def _draft_context_teams(
     ).fetchall()
     identity_mappings = _raybet_identity_mappings(connection, ordered)
     used_identity_mapping = False
+    used_normalized_name = False
+    used_recent_activity = False
     result: list[dict[str, Any]] = []
     fallback_names = (str(match[0] or ""), str(match[1] or ""))
     for index, raw_team in enumerate(ordered):
@@ -135,8 +151,38 @@ def _draft_context_teams(
                 if str(row[1] or "").strip().casefold() in names
                 or str(row[2] or "").strip().casefold() in names
             ]
+            if not matches:
+                normalized_names = {
+                    normalized
+                    for value in names
+                    if (normalized := _normalized_team_name(value))
+                }
+                matches = [
+                    row
+                    for row in catalog
+                    if _normalized_team_name(row[1]) in normalized_names
+                    or _normalized_team_name(row[2]) in normalized_names
+                ]
+                used_normalized_name = bool(matches)
+            if len(matches) > 1:
+                recent_match = _recently_active_team(
+                    connection,
+                    matches,
+                    cutoff_epoch=cutoff_epoch,
+                )
+                if recent_match is not None:
+                    matches = [recent_match]
+                    used_recent_activity = True
         if len(matches) != 1:
-            return [], "raybet_exact_name"
+            return [], (
+                "raybet_recent_activity_v1"
+                if used_recent_activity
+                else (
+                    "raybet_normalized_name_v1"
+                    if used_normalized_name
+                    else "raybet_exact_name"
+                )
+            )
         result.append(
             {
                 "match_side": "team_one" if index == 0 else "team_two",
@@ -145,10 +191,56 @@ def _draft_context_teams(
             }
         )
     return result, (
-        "raybet_identity_mapping_v2"
-        if used_identity_mapping
-        else "raybet_exact_name"
+        "raybet_recent_activity_v1"
+        if used_recent_activity
+        else (
+            "raybet_identity_mapping_v2"
+            if used_identity_mapping
+            else (
+                "raybet_normalized_name_v1"
+                if used_normalized_name
+                else "raybet_exact_name"
+            )
+        )
     )
+
+
+def _normalized_team_name(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    tokens = _TEAM_NAME_TOKEN.findall(text)
+    while tokens and tokens[0] in _TEAM_NAME_EDGE_WORDS:
+        tokens.pop(0)
+    while tokens and tokens[-1] in _TEAM_NAME_EDGE_WORDS:
+        tokens.pop()
+    return "".join(tokens)
+
+
+def _recently_active_team(
+    connection: PostgresSession,
+    candidates: list[Any],
+    *,
+    cutoff_epoch: int,
+) -> Any | None:
+    activity: list[tuple[int, Any]] = []
+    for candidate in candidates:
+        row = connection.execute(
+            """SELECT MAX(start_time)
+                 FROM matches
+                WHERE start_time<?
+                  AND (radiant_team_id=? OR dire_team_id=?)""",
+            (cutoff_epoch, int(candidate[0]), int(candidate[0])),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        activity.append((int(row[0]), candidate))
+    activity.sort(key=lambda item: item[0], reverse=True)
+    if (
+        len(activity) < 2
+        or activity[0][0] - activity[1][0]
+        < _TEAM_ACTIVITY_DISAMBIGUATION_GAP_SECONDS
+    ):
+        return None
+    return activity[0][1]
 
 
 def _raybet_identity_mappings(

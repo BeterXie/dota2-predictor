@@ -53,6 +53,7 @@ ODDS_BACKOFF_MAX_SECONDS = 300.0
 DEFAULT_PRIORITY_ODDS_INTERVAL_SECONDS = 8.0
 DEFAULT_FULL_ODDS_INTERVAL_SECONDS = 120.0
 MAX_PRIORITY_ODDS_WORKERS = 4
+COMPLETED_TERMINAL_REJECTION_THRESHOLD = 3
 _ODDS_REQUESTS_IN_FLIGHT: set[str] = set()
 _ODDS_REQUEST_LOCK = threading.Lock()
 _LIVE_ROWS: tuple[dict[str, Any], ...] = ()
@@ -854,9 +855,17 @@ def _empty_odds_summary(*, listed: int) -> dict[str, Any]:
         "in_flight_skipped": 0,
         "prematch_collected": 0,
         "prematch_skipped": 0,
+        "required_match_ids": [],
         "last_successful_match_ids": [],
         "maximum_request_duration_seconds": 0.0,
     }
+
+
+def _odds_collection_cycle_healthy(summary: dict[str, Any]) -> bool:
+    return (
+        int(summary["errors"]) + int(summary["backoff_skipped"]) == 0
+        and int(summary["matches"]) == len(summary["required_match_ids"])
+    )
 
 
 def _odds_channel_poll_interval(
@@ -950,11 +959,15 @@ def _collect_priority_rows(
             summary["last_successful_match_ids"].extend(
                 result["last_successful_match_ids"]
             )
+            summary["required_match_ids"].extend(
+                result.get("required_match_ids", [])
+            )
             summary["maximum_request_duration_seconds"] = max(
                 summary["maximum_request_duration_seconds"],
                 float(result["maximum_request_duration_seconds"]),
             )
     summary["last_successful_match_ids"].sort()
+    summary["required_match_ids"].sort()
     return summary
 
 
@@ -1019,17 +1032,9 @@ def _odds_channel_loop(
                         collector_name=collector,
                     )
                 cycle_duration = time.monotonic() - started
-                cycle_healthy = (
-                    summary["errors"] + summary["backoff_skipped"] == 0
-                    and (not rows or summary["matches"] == len(rows))
-                )
+                cycle_healthy = _odds_collection_cycle_healthy(summary)
                 runtime.record_cycle(
-                    active_match_ids=[
-                        str(row.get("id") or "")
-                        for row in rows
-                        if isinstance(row, dict)
-                        and str(row.get("id") or "").isdigit()
-                    ],
+                    active_match_ids=summary["required_match_ids"],
                     successful_match_ids=summary["last_successful_match_ids"],
                     cycle_duration_seconds=cycle_duration,
                     maximum_request_duration_seconds=summary[
@@ -1046,7 +1051,7 @@ def _odds_channel_loop(
                     component,
                     "healthy" if cycle_healthy else "degraded",
                     heartbeat_at=now,
-                    success_at=now if summary["matches"] else None,
+                    success_at=now if cycle_healthy else None,
                     error_at=now if not cycle_healthy else None,
                     error=(
                         f"{partial_errors} {channel} odds collection error(s)"
@@ -1194,6 +1199,7 @@ def collect_once(
     in_flight_skipped = 0
     prematch_collected = 0
     prematch_skipped = 0
+    required_match_ids: list[str] = []
     successful_match_ids: list[str] = []
     request_durations: list[float] = []
     collection_now = wall_clock()
@@ -1242,6 +1248,7 @@ def collect_once(
                 if not claimed:
                     in_flight_skipped += 1
                     continue
+                required_match_ids.append(match_id)
                 changes, snapshot_count, fingerprint, _ = _collect_odds_response(
                     store,
                     client,
@@ -1298,6 +1305,7 @@ def collect_once(
         "in_flight_skipped": in_flight_skipped,
         "prematch_collected": prematch_collected,
         "prematch_skipped": prematch_skipped,
+        "required_match_ids": required_match_ids,
         "last_successful_match_ids": successful_match_ids,
         "maximum_request_duration_seconds": max(request_durations, default=0.0),
     }
@@ -1349,6 +1357,10 @@ def collect_completed_once(
             match_id = str(list_row.get("id") or "")
             if not match_id.isdigit():
                 raise ValueError("completed match list id is invalid")
+            _mark_match_seen_in_completed_feed(store, match_id)
+            if _completed_odds_archived(store, match_id):
+                skipped_count += 1
+                continue
             changes, snapshot_count, _, skipped = _collect_odds_response(
                 store,
                 client,
@@ -1387,6 +1399,66 @@ def collect_completed_once(
         "errors": error_count,
         "skipped": skipped_count,
     }
+
+
+def _mark_match_seen_in_completed_feed(
+    store: LiveBettingStore,
+    match_id: str,
+) -> None:
+    with store.transaction():
+        store.connection.execute(
+            """UPDATE raybet_matches SET status='3'
+                WHERE raybet_match_id=? AND status<>'3'""",
+            (match_id,),
+        )
+
+
+def _completed_odds_archived(store: LiveBettingStore, match_id: str) -> bool:
+    row = store.connection.execute(
+        """SELECT 1
+             FROM raybet_matches AS match
+            WHERE match.raybet_match_id=?
+              AND match.status='3'
+              AND (
+                  EXISTS (
+                    SELECT 1
+                      FROM direct_response_audit AS audit
+                      JOIN odds_transport_observations AS transport
+                        ON transport.raybet_match_id=
+                           audit.claimed_raybet_match_id
+                       AND transport.response_artifact_hash=audit.artifact_hash
+                     WHERE audit.claimed_raybet_match_id=
+                           match.raybet_match_id
+                       AND audit.response_kind='completed_odds'
+                       AND audit.disposition='accepted'
+                       AND transport.source='direct'
+                       AND transport.timing_status='on_time'
+                       AND transport.processing_status='processed'
+                       AND EXISTS (
+                             SELECT 1
+                               FROM odds_response_outcomes_effective AS outcome
+                              WHERE outcome.observation_key=
+                                    transport.observation_key
+                                AND outcome.raybet_match_id=
+                                    match.raybet_match_id
+                       )
+                  )
+                  OR EXISTS (
+                      SELECT audit.artifact_hash
+                        FROM direct_response_audit AS audit
+                       WHERE audit.claimed_raybet_match_id=
+                             match.raybet_match_id
+                         AND audit.response_kind='completed_odds'
+                         AND audit.disposition='rejected'
+                         AND audit.reason='validation_failed'
+                       GROUP BY audit.artifact_hash
+                      HAVING COUNT(*)>=?
+                  )
+              )
+            LIMIT 1""",
+        (match_id, COMPLETED_TERMINAL_REJECTION_THRESHOLD),
+    ).fetchone()
+    return row is not None
 
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:

@@ -64,6 +64,7 @@ _ENDED_STATUS_SQL = (
 )
 _UPCOMING_MATCH_STATUSES = {"1", "upcoming", "scheduled", "not_started"}
 _HISTORY_SCHEDULE_GRACE = timedelta(hours=12)
+_PREMATCH_HISTORY_SCHEDULE_GRACE = timedelta(hours=4)
 _HISTORY_ACTIVITY_GRACE = timedelta(minutes=15)
 _SQLITE_DATETIME_ROUNDING_GRACE = timedelta(milliseconds=1)
 _EXPECTED_HEALTH_COMPONENTS = {
@@ -314,6 +315,15 @@ def build_monitor_snapshot(
     all_counts = _lifecycle_counts(matches)
     live_view = [item for item in matches if not _is_historical_match(item)]
     history_view = [item for item in matches if _is_historical_match(item)]
+    optional_components_unconfigured = any(
+        item["component"] in _OPTIONAL_UNCONFIGURED_COMPONENTS
+        and (
+            item["last_error"] == "configuration_missing"
+            or item["details"].get("configured") is False
+            or item["details"].get("smtp_configured") is False
+        )
+        for item in health
+    )
     snapshot = {
         "generated_at": checked_at.isoformat(),
         "market_source_policy": MARKET_SOURCE_POLICY,
@@ -335,10 +345,7 @@ def build_monitor_snapshot(
                 if item["component"] in _PRIMARY_HEALTH_COMPONENTS
                 and not (
                     item["component"] in _OPTIONAL_UNCONFIGURED_COMPONENTS
-                    and (
-                        item["last_error"] == "configuration_missing"
-                        or item["details"].get("configured") is False
-                    )
+                    and optional_components_unconfigured
                 )
             ),
             "active_alerts": len(alerts),
@@ -489,6 +496,16 @@ def monitor_match_detail(
         max_points=max_points,
         as_of=checked_at,
     )
+    if summary["lifecycle"] == "ended" and timeline:
+        summary["winner"] = {
+            **(
+                summary["winner"]
+                if isinstance(summary.get("winner"), dict)
+                else {}
+            ),
+            **timeline[-1],
+            "complete": True,
+        }
     strategy = _strategy_analysis(
         connection,
         raybet_match_id,
@@ -519,6 +536,10 @@ def monitor_match_detail(
         raybet_match_id,
         limit=min(max_points, 1200),
     )
+    provider_is_prematch = (
+        str(summary["provider_status"]).casefold()
+        in _UPCOMING_MATCH_STATUSES
+    )
     return {
         **summary,
         "prematch_winner": (
@@ -529,7 +550,7 @@ def monitor_match_detail(
                 processing_status="audit_only",
                 transport_only=True,
             )
-            if summary["lifecycle"] == "upcoming"
+            if provider_is_prematch
             else None
         ),
         "latest_decision": decisions[-1] if decisions else None,
@@ -581,6 +602,10 @@ def winner_timeline(
     as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
     cutoff = _aware_utc(as_of).isoformat() if as_of is not None else None
+    ended_match = connection.execute(
+        "SELECT 1 FROM raybet_matches WHERE raybet_match_id=? AND status='3'",
+        (raybet_match_id,),
+    ).fetchone() is not None
     authority_relations = {
         str(row[0])
         for row in connection.execute(
@@ -720,6 +745,7 @@ def winner_timeline(
         grouped[key].append(row)
 
     points: list[dict[str, Any]] = []
+    ended_signatures: dict[str, tuple[object, ...]] = {}
     for (
         observed_at,
         _response_key,
@@ -785,29 +811,41 @@ def winner_timeline(
             )
             else None
         )
-        points.append(
-            {
-                "observed_at": observed_at,
-                "period": point_period,
-                "prices": prices,
-                "probabilities": {
-                    side: round(value / total, 8) for side, value in inverse.items()
-                },
-                "status": {side: str(quotes[side]["status"]) for side in quotes},
-                "game_clock_seconds": (
-                    int(aligned["game_clock_seconds"]) if aligned is not None else None
-                ),
-                "map_number": int(aligned["map_number"]) if aligned is not None else None,
-                "alignment": (
-                    {
-                        "method": aligned["alignment_method"],
-                        "lag_seconds": aligned["lag_seconds"],
-                    }
-                    if aligned is not None
-                    else None
-                ),
-            }
-        )
+        point = {
+            "observed_at": observed_at,
+            "period": point_period,
+            "prices": prices,
+            "probabilities": {
+                side: round(value / total, 8) for side, value in inverse.items()
+            },
+            "status": {side: str(quotes[side]["status"]) for side in quotes},
+            "game_clock_seconds": (
+                int(aligned["game_clock_seconds"]) if aligned is not None else None
+            ),
+            "map_number": int(aligned["map_number"]) if aligned is not None else None,
+            "alignment": (
+                {
+                    "method": aligned["alignment_method"],
+                    "lag_seconds": aligned["lag_seconds"],
+                }
+                if aligned is not None
+                else None
+            ),
+        }
+        if ended_match:
+            signature = (
+                tuple(sorted(prices.items())),
+                tuple(sorted(point["status"].items())),
+                point["game_clock_seconds"],
+                point["map_number"],
+                None
+                if point["alignment"] is None
+                else tuple(sorted(point["alignment"].items())),
+            )
+            if ended_signatures.get(point_period) == signature:
+                continue
+            ended_signatures[point_period] = signature
+        points.append(point)
     return points if max_points is None else _downsample(points, max_points)
 
 
@@ -1416,6 +1454,7 @@ def _monitor_match(
     )
     history_eligible = _history_eligible(
         lifecycle,
+        str(row["status"] or ""),
         row["scheduled_at"],
         row["updated_at"],
         odds_activity_at=latest_odds_activity,
@@ -1636,6 +1675,7 @@ def _current_winner(
     transport_only: bool = False,
     preferred_period: str | None = None,
 ) -> dict[str, Any] | None:
+    normalized_status = provider_status.casefold()
     transport_columns = _relation_columns(
         connection, "odds_transport_observations"
     )
@@ -1679,9 +1719,12 @@ def _current_winner(
         ):
             return None
         try:
+            transport_limit = (
+                "" if normalized_status in _ENDED_MATCH_STATUSES else "LIMIT 16"
+            )
             quotes = _rows(
                 connection,
-                """WITH recent_transport AS (
+                f"""WITH recent_transport AS (
                    SELECT observation_key, observed_at
                      FROM odds_transport_observations
                     WHERE raybet_match_id=?
@@ -1689,7 +1732,7 @@ def _current_winner(
                       AND timing_status='on_time'
                       AND processing_status=?
                     ORDER BY observed_at DESC, observation_key DESC
-                    LIMIT 16
+                    {transport_limit}
                )
                SELECT outcome.observation_key, outcome.odds_group_id,
                       outcome.side, outcome.price, outcome.status,
@@ -1741,10 +1784,14 @@ def _current_winner(
             )
             grouped[key].setdefault(side, quote)
     by_period: dict[str, tuple[str, str, dict[str, DatabaseRow]]] = {}
+    paired_by_period: dict[
+        str, list[tuple[str, str, dict[str, DatabaseRow]]]
+    ] = defaultdict(list)
     for (period, response_key, _group_id), sides in grouped.items():
         if set(sides) != {"team_one", "team_two"}:
             continue
         observed_at = str(next(iter(sides.values()))["received_at"])
+        paired_by_period[period].append((observed_at, response_key, sides))
         current = by_period.get(period)
         candidate_key = (observed_at, response_key)
         current_key = (current[0], current[1]) if current is not None else None
@@ -1757,7 +1804,6 @@ def _current_winner(
     if not paired_periods:
         return {"observed_at": str(quotes[0]["received_at"]), "complete": False}
 
-    normalized_status = provider_status.casefold()
     if normalized_status in _ENDED_MATCH_STATUSES:
         eligible_periods = [
             period
@@ -1801,6 +1847,33 @@ def _current_winner(
     if set(by_side) != {"team_one", "team_two"}:
         return {"observed_at": observed_at, "complete": False}
     prices = {side: float(by_side[side]["price"]) for side in by_side}
+    if normalized_status in _ENDED_MATCH_STATUSES:
+        final_signature = (
+            tuple(sorted(prices.items())),
+            tuple(sorted((side, str(by_side[side]["status"])) for side in by_side)),
+        )
+        for candidate_at, _candidate_key, candidate_sides in sorted(
+            paired_by_period[period],
+            key=lambda item: (item[0], item[1]),
+            reverse=True,
+        ):
+            candidate_signature = (
+                tuple(
+                    sorted(
+                        (side, float(candidate_sides[side]["price"]))
+                        for side in candidate_sides
+                    )
+                ),
+                tuple(
+                    sorted(
+                        (side, str(candidate_sides[side]["status"]))
+                        for side in candidate_sides
+                    )
+                ),
+            )
+            if candidate_signature != final_signature:
+                break
+            observed_at = candidate_at
     if any(price <= 1.0 for price in prices.values()):
         return {"observed_at": observed_at, "complete": False, "prices": prices}
     inverse = {side: 1.0 / price for side, price in prices.items()}
@@ -4266,6 +4339,7 @@ def _lifecycle(
 
 def _history_eligible(
     lifecycle: str,
+    provider_status: str,
     scheduled_at: object,
     updated_at: object,
     *,
@@ -4290,8 +4364,13 @@ def _history_eligible(
     if scheduled is None or not activity_candidates:
         return False
     activity = max(activity_candidates)
+    schedule_grace = (
+        _PREMATCH_HISTORY_SCHEDULE_GRACE
+        if provider_status.casefold() in _UPCOMING_MATCH_STATUSES
+        else _HISTORY_SCHEDULE_GRACE
+    )
     return (
-        scheduled <= checked_at - _HISTORY_SCHEDULE_GRACE
+        scheduled <= checked_at - schedule_grace
         and activity <= checked_at - _HISTORY_ACTIVITY_GRACE
     )
 
