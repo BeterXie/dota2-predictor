@@ -26,6 +26,13 @@ from event_intelligence.roles import (
     PROSPECTIVE_ASSIGNMENT_VERSION,
     RECONSTRUCTED_ASSIGNMENT_VERSION,
 )
+from event_intelligence.draft_residual_features import (
+    DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
+    DRAFT_RESIDUAL_FEATURE_VERSION,
+    DRAFT_RESIDUAL_MODEL_SCHEMA,
+    DRAFT_RESIDUAL_PURE_SCHEMA,
+    SHRINKAGE_STRENGTH,
+)
 from event_intelligence.team_rating import TEAM_RATING_VERSION
 from event_intelligence.team_rating_artifacts import TEAM_RATING_ARTIFACT_VERSION
 from event_intelligence.team_rating_backtest import (
@@ -70,6 +77,25 @@ def test_team_rating_walk_forward_versions_and_grid_remain_frozen() -> None:
     assert TEAM_RATING_ARTIFACT_VERSION == "team-rating-artifact-v1"
     assert TEAM_RATING_BACKTEST_VERSION == "team-rating-walk-forward-v1"
     assert len(TEAM_RATING_PARAMETER_GRID) == 144
+
+
+def test_draft_residual_version_schema_and_shrinkage_remain_frozen() -> None:
+    assert DRAFT_RESIDUAL_FEATURE_VERSION == "draft-residual-features-v1"
+    assert DRAFT_RESIDUAL_PURE_SCHEMA == (
+        "hero_residual_diff",
+        "role_residual_diff",
+        "synergy_residual_diff",
+        "counter_residual_edge",
+        "scaling_40m_residual_diff",
+        "control_initiation_proxy_diff",
+        "save_sustain_proxy_diff",
+        "wave_clear_proxy_diff",
+        "push_high_ground_proxy_diff",
+        "farm_demand_balance_diff",
+    )
+    assert len(DRAFT_RESIDUAL_MODEL_SCHEMA) == 40
+    assert len(DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH) == 64
+    assert SHRINKAGE_STRENGTH == 10.0
 
 
 def test_official_rosh_scorer_identity_remains_frozen() -> None:
