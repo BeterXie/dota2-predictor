@@ -573,7 +573,7 @@ def update_team_ratings(
     ordered, index = _state_index(states)
     if row.result_usable_at is None or row.result_usable_at > cutoff:
         return ordered
-    event_cutoff = row.result_usable_at
+    rating_as_of = row.started_at
     radiant_state = index.get(
         row.radiant_team_id,
         _default_state(row.radiant_team_id, config),
@@ -585,13 +585,13 @@ def update_team_ratings(
     radiant_rating, _radiant_continuity = effective_team_rating(
         radiant_state,
         row.radiant_roster,
-        event_cutoff,
+        rating_as_of,
         config,
     )
     dire_rating, _dire_continuity = effective_team_rating(
         dire_state,
         row.dire_roster,
-        event_cutoff,
+        rating_as_of,
         config,
     )
     expected = team_rating_probability(radiant_rating, dire_rating, config)
@@ -601,14 +601,14 @@ def update_team_ratings(
         rating=radiant_rating + config.k_factor * error,
         maps_seen=radiant_state.maps_seen + 1,
         roster=row.radiant_roster,
-        last_observed_at=event_cutoff,
+        last_observed_at=row.completed_at,
     )
     index[row.dire_team_id] = TeamRatingState(
         team_id=row.dire_team_id,
         rating=dire_rating - config.k_factor * error,
         maps_seen=dire_state.maps_seen + 1,
         roster=row.dire_roster,
-        last_observed_at=event_cutoff,
+        last_observed_at=row.completed_at,
     )
     return tuple(index[team_id] for team_id in sorted(index))
 
@@ -637,8 +637,8 @@ def canonical_training_corpus(
         sorted(
             eligible,
             key=lambda row: (
-                row.result_usable_at,
                 row.started_at,
+                row.completed_at,
                 row.match_id,
                 row.event_id,
             ),

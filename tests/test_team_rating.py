@@ -129,10 +129,10 @@ def test_elo_update_is_zero_sum_relative_to_effective_ratings() -> None:
     row = _row(1, started_at=START + timedelta(days=1))
     assert row.result_usable_at is not None
     radiant_before, _ = effective_team_rating(
-        states[0], row.radiant_roster, row.result_usable_at, config
+        states[0], row.radiant_roster, row.started_at, config
     )
     dire_before, _ = effective_team_rating(
-        states[1], row.dire_roster, row.result_usable_at, config
+        states[1], row.dire_roster, row.started_at, config
     )
 
     updated = {
@@ -150,7 +150,7 @@ def test_elo_update_is_zero_sum_relative_to_effective_ratings() -> None:
     assert radiant_delta + dire_delta == pytest.approx(0.0)
     assert updated[10].maps_seen == 5
     assert updated[20].maps_seen == 7
-    assert updated[10].last_observed_at == row.result_usable_at
+    assert updated[10].last_observed_at == row.completed_at
 
 
 def test_result_must_be_usable_before_it_updates_or_counts_support() -> None:
@@ -173,6 +173,28 @@ def test_result_must_be_usable_before_it_updates_or_counts_support() -> None:
     )
     updated = update_team_ratings((), future, future.result_usable_at, config)
     assert sum(state.maps_seen for state in updated) == 2
+
+
+def test_provider_result_delay_does_not_change_rating_update() -> None:
+    config = _config(inactivity_half_life_days=1.0)
+    started_at = START + timedelta(days=2)
+    fast = _row(
+        1,
+        started_at=started_at,
+        result_usable_at=started_at + timedelta(minutes=47),
+    )
+    delayed = replace(
+        fast,
+        result_usable_at=fast.completed_at + timedelta(hours=2),
+    )
+    assert delayed.result_usable_at is not None
+    update_cutoff = delayed.result_usable_at + timedelta(minutes=1)
+
+    fast_update = update_team_ratings(_states(), fast, update_cutoff, config)
+    delayed_update = update_team_ratings(_states(), delayed, update_cutoff, config)
+
+    assert fast_update == delayed_update
+    assert all(state.last_observed_at == fast.completed_at for state in fast_update)
 
 
 def test_same_series_map_inherits_only_an_available_previous_result() -> None:
@@ -199,6 +221,36 @@ def test_same_series_map_inherits_only_an_available_previous_result() -> None:
     assert sum(state.maps_seen for state in after) == 2
     assert prediction.support == 2
     assert prediction.radiant_rating > prediction.dire_rating
+
+
+def test_next_map_inactivity_starts_at_previous_completion() -> None:
+    config = _config(inactivity_half_life_days=1.0)
+    first = _row(
+        1,
+        started_at=START + timedelta(days=1),
+        result_usable_at=START + timedelta(days=1, hours=7),
+        series_id=55,
+    )
+    assert first.result_usable_at is not None
+    states = replay_team_ratings((first,), first.result_usable_at, config)
+    state_by_team = {state.team_id: state for state in states}
+    second_started = first.completed_at + timedelta(days=1)
+    second = _row(
+        2,
+        started_at=second_started,
+        result_usable_at=None,
+        series_id=55,
+    )
+
+    prediction = predict_team_rating(states, second, second_started, config)
+
+    assert state_by_team[10].last_observed_at == first.completed_at
+    assert prediction.radiant_rating == pytest.approx(
+        config.initial_rating + 0.5 * (state_by_team[10].rating - config.initial_rating)
+    )
+    assert prediction.dire_rating == pytest.approx(
+        config.initial_rating + 0.5 * (state_by_team[20].rating - config.initial_rating)
+    )
 
 
 def test_roster_carry_handles_same_changed_partial_and_missing_rosters() -> None:
@@ -330,6 +382,36 @@ def test_corpus_order_duplicates_hashes_and_conflicts_are_deterministic() -> Non
             (first, replace(first, radiant_win=not first.radiant_win)),
             cutoff,
         )
+
+
+def test_corpus_replay_order_does_not_follow_provider_delay() -> None:
+    config = _config(inactivity_half_life_days=30.0)
+    first = _row(
+        1,
+        started_at=START + timedelta(days=1),
+        result_usable_at=START + timedelta(days=5),
+    )
+    second = _row(
+        2,
+        started_at=START + timedelta(days=2),
+        result_usable_at=START + timedelta(days=3),
+        radiant_win=False,
+    )
+    cutoff = START + timedelta(days=10)
+
+    ordered = canonical_training_corpus((second, first), cutoff)
+    delayed_states = replay_team_ratings((second, first), cutoff, config)
+    prompt_states = replay_team_ratings(
+        (
+            replace(first, result_usable_at=first.completed_at),
+            replace(second, result_usable_at=second.completed_at),
+        ),
+        cutoff,
+        config,
+    )
+
+    assert tuple(row.match_id for row in ordered) == (1, 2)
+    assert delayed_states == prompt_states
 
 
 def test_target_outcome_and_postmatch_fields_cannot_change_prediction() -> None:
