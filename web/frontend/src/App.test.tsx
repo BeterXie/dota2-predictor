@@ -690,6 +690,7 @@ describe("App data recovery and ownership", () => {
       details: api.fetchMatchDetail.mock.calls.length,
       mappings: api.fetchMappings.mock.calls.length,
       controls: api.fetchControlComponents.mock.calls.length,
+      sessions: api.createControlSession.mock.calls.length,
     };
     await act(async () => {
       vi.advanceTimersByTime(15_000);
@@ -700,7 +701,7 @@ describe("App data recovery and ownership", () => {
     expect(api.fetchMatchDetail).toHaveBeenCalledTimes(before.details);
     expect(api.fetchMappings).toHaveBeenCalledTimes(before.mappings);
     expect(api.fetchControlComponents).toHaveBeenCalledTimes(before.controls);
-    expect(api.createControlSession).not.toHaveBeenCalled();
+    expect(api.createControlSession).toHaveBeenCalledTimes(before.sessions);
   });
 
   it("does not refetch an immutable replay detail when live snapshots advance", async () => {
@@ -954,6 +955,7 @@ describe("App data recovery and ownership", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    const callsBeforeRenewal = api.createControlSession.mock.calls.length;
 
     await act(async () => {
       vi.advanceTimersByTime(5_000);
@@ -961,7 +963,7 @@ describe("App data recovery and ownership", () => {
       await Promise.resolve();
     });
 
-    expect(api.createControlSession).toHaveBeenCalledTimes(2);
+    expect(api.createControlSession).toHaveBeenCalledTimes(callsBeforeRenewal + 1);
   });
 
   it("does not mark an alert acknowledged when the API reports no change", async () => {

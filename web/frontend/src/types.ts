@@ -1015,3 +1015,204 @@ export interface RoshAnalysisRecordPage {
   query_match_id: string;
   records: RoshAnalysisRecord[];
 }
+
+/**
+ * Read-only M7 prematch delivery contract.  These types intentionally keep
+ * status values open-ended so an unknown server status can fail closed in the
+ * presentation layer instead of being treated as a successful prediction.
+ */
+export type PrematchAvailabilityMode = IntelligenceAvailabilityMode;
+
+export type PrematchCalibrationStatus =
+  | "unsupported"
+  | "failed"
+  | "provisional"
+  | "reconstructed_only"
+  | "shadow_collecting"
+  | "passed"
+  | (string & {});
+
+export type PrematchModelStatus =
+  | "trained"
+  | "insufficient_evidence"
+  | (string & {});
+
+export type PrematchPredictionStatus =
+  | "predicted"
+  | "settled"
+  | "insufficient_evidence"
+  | "unavailable"
+  | "failed"
+  | (string & {});
+
+export interface PrematchMetricSummary {
+  support?: number | null;
+  brier_score?: number | null;
+  log_loss?: number | null;
+  expected_calibration_error?: number | null;
+  ece?: number | null;
+  auc?: number | null;
+  accuracy?: number | null;
+  [key: string]: unknown;
+}
+
+export interface PrematchCalibrationSummary {
+  calibration_hash: string;
+  calibration_version: string;
+  fit_cutoff: string | null;
+  evaluation_cutoff?: string | null;
+  evaluation_start?: string | null;
+  fit_support: number;
+  evaluation_support: number;
+  parameters: { a: number; b: number } | null;
+  metrics: PrematchMetricSummary | null;
+  status: PrematchCalibrationStatus;
+  reason?: string | null;
+  gate_passed?: boolean;
+  created_at: string;
+}
+
+export interface PrematchModelSummary {
+  run_id: string;
+  model_hash: string;
+  model_version: string;
+  artifact_version: string;
+  model_kind: string;
+  availability_mode: PrematchAvailabilityMode;
+  training_cutoff: string;
+  feature_schema_hash: string;
+  training_input_hash: string;
+  metrics: PrematchMetricSummary | null;
+  status: PrematchModelStatus;
+  created_at: string;
+  calibration: PrematchCalibrationSummary | null;
+  runtime_ready: boolean;
+  runtime_block_reason: string | null;
+  deployment_key: string | null;
+}
+
+export interface PrematchTopContribution {
+  feature_name?: string;
+  component?: string;
+  input_value?: number | null;
+  log_odds_contribution?: number | null;
+  [key: string]: unknown;
+}
+
+export type PrematchClusterId =
+  | "C0" | "C1" | "C2" | "C3" | "C4"
+  | "C5" | "C6" | "C7" | "C8" | "C9";
+
+export interface PrematchClusterCount {
+  radiant: number;
+  dire: number;
+  difference: number;
+}
+
+export interface PrematchClusterAssignment {
+  hero_id: number;
+  expected_role: string | null;
+  expected_lane: string | null;
+  cluster_id: PrematchClusterId | "unavailable";
+  mapping_support: number;
+  mapping_confidence: number;
+  assignment_source: string;
+  missing_reason: string | null;
+}
+
+export interface PrematchClusterAssignments {
+  radiant: PrematchClusterAssignment[];
+  dire: PrematchClusterAssignment[];
+}
+
+export interface PrematchRoshMetrics {
+  status?: string | null;
+  missing_reason?: string | null;
+  relative_advantage?: number | null;
+  score_20?: number | null;
+  score_30?: number | null;
+  score_40?: number | null;
+  score_50?: number | null;
+  slope_20_40?: number | null;
+  slope_30_50?: number | null;
+  coverage?: number | null;
+  [key: string]: unknown;
+}
+
+export interface PrematchPredictionValidation {
+  validation_version: string;
+  validated_at: string;
+  [key: string]: unknown;
+}
+
+export interface PrematchPrediction {
+  run_id: string;
+  model_hash: string;
+  model_kind: string;
+  model_status: PrematchModelStatus;
+  availability_mode: PrematchAvailabilityMode;
+  training_cutoff: string;
+  match_id: number;
+  prediction_cutoff: string;
+  cutoff_source: string;
+  input_snapshot_hash: string;
+  artifact_fingerprint: string;
+  dependency_fingerprint: string;
+  dependency_revision: number;
+  calibration_hash: string | null;
+  team_base_probability: number | null;
+  raw_probability: number | null;
+  calibrated_probability: number | null;
+  parameter_uncertainty: number | null;
+  draft_logit_delta: number | null;
+  rosh_logit_delta: number | null;
+  cluster_logit_delta: number | null;
+  cluster_coverage: number;
+  cluster_support: number;
+  cluster_resource_version: string | null;
+  cluster_evidence_mode: string | null;
+  cluster_missing_reason: string | null;
+  cluster_counts: Partial<Record<PrematchClusterId, PrematchClusterCount>>;
+  cluster_assignments: PrematchClusterAssignments;
+  top_cluster_contributions: PrematchTopContribution[];
+  total_adjustment: number | null;
+  coverage: number | null;
+  support: number | null;
+  eventual_radiant_win: boolean | null;
+  result_usable_at: string | null;
+  settled_at: string | null;
+  status: PrematchPredictionStatus;
+  reason: string | null;
+  learned_intercept?: number | null;
+  missing_features: string[];
+  top_contributions: PrematchTopContribution[];
+  validation: PrematchPredictionValidation | null;
+  calibration_status?: PrematchCalibrationStatus | null;
+  rosh_metrics?: PrematchRoshMetrics | null;
+  rosh_features?: PrematchRoshMetrics | null;
+  runtime_ready: boolean;
+  runtime_block_reason: string | null;
+  deployment_key: string | null;
+}
+
+export interface PrematchPagination {
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+}
+
+export interface PrematchModelPage {
+  data: PrematchModelSummary[];
+  pagination: PrematchPagination;
+}
+
+export interface PrematchPredictionPage {
+  data: PrematchPrediction[];
+  pagination: PrematchPagination;
+}
+
+export interface PrematchMatchPredictionPage {
+  match_id: number;
+  predictions: PrematchPrediction[];
+}

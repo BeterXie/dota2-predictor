@@ -82,9 +82,15 @@ def test_runtime_entrypoints_publish_database_url_option() -> None:
 
 def test_migration_readme_tracks_current_alembic_head() -> None:
     content = _text(ROOT / "database" / "migrations" / "README.md")
-    assert "20260802_0021" in content
+    assert "20260805_0026" in content
     assert "PostgreSQL-only" in content
     assert "does not create a SQLite backup" in content
+    for module in (
+        ROOT / "event_intelligence" / "storage.py",
+        ROOT / "live_betting" / "runtime_schema.py",
+        ROOT / "live_betting" / "storage.py",
+    ):
+        assert 'ALEMBIC_HEAD = "20260805_0026"' in _text(module)
 
 
 def test_supervisor_runbook_keeps_only_active_start_flags() -> None:

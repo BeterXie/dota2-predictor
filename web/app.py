@@ -37,6 +37,7 @@ from live_betting.process_control import (
 )
 
 from . import queries
+from . import prematch_predictions
 from .routers import (
     control,
     heroes,
@@ -160,6 +161,7 @@ app.include_router(monitor.router)
 app.include_router(control.router)
 app.include_router(mappings.router)
 app.include_router(intelligence.router)
+app.include_router(prematch_predictions.router)
 
 
 def _note_fetch_cleanup_error(

@@ -92,7 +92,6 @@ def test_service_health_probe_uses_postgres(postgres_engine) -> None:
     result = service_once(
         _url(postgres_engine),
         active_components=set(),
-        companion_probe=lambda: {},
         health_only=True,
     )
 
