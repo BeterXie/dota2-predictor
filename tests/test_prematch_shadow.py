@@ -288,7 +288,7 @@ def test_metrics_and_prospective_gate_use_settled_event_patch_support() -> None:
     assert shadow.evaluate_prematch_prospective_gate(
         metrics,
         calibration_gate_passed=False,
-    ).status == "unsupported"
+    ).status == "failed"
 
 
 def test_prospective_gate_collects_until_paired_support_is_sufficient() -> None:
@@ -319,7 +319,7 @@ def test_prospective_gate_rejects_non_improving_paired_intervals() -> None:
     assert not metrics.incremental_gate_passed
     assert metrics.paired_brier.delta is not None
     assert metrics.paired_brier.delta > 0.0
-    assert decision.status == "unsupported"
+    assert decision.status == "failed"
     assert "prospective_incremental_gate_failed" in decision.reasons
 
 
@@ -353,3 +353,31 @@ def test_cluster_shadow_uses_same_cutoff_pair_and_collects_incremental_metrics()
     assert metrics.cluster_paired_brier.ci_90.upper < 0.0
     assert metrics.cluster_incremental_gate_passed
     assert metrics.cluster_status == "passed"
+
+
+def test_cluster_shadow_marks_mature_non_improving_sample_failed() -> None:
+    rows = _settled_rows(200, candidate_better=True)
+    for row in rows:
+        payload = json.loads(str(row["prediction_json"]))
+        outcome = bool(row["eventual_radiant_win"])
+        payload.update(
+            {
+                "candidate_without_cluster_probability": (
+                    0.85 if outcome else 0.15
+                ),
+                "candidate_without_cluster_model_hash": "c" * 64,
+                "candidate_with_cluster_probability": 0.75 if outcome else 0.25,
+                "candidate_with_cluster_model_hash": "d" * 64,
+                "cluster_feature_snapshot_hash": "e" * 64,
+                "cluster_resource_hash": "f" * 64,
+            }
+        )
+        row["prediction_json"] = json.dumps(payload)
+
+    metrics = shadow.load_prematch_shadow_metrics(_Connection(tuple(rows)))
+
+    assert metrics.cluster_paired_support == 200
+    assert metrics.cluster_paired_brier.delta is not None
+    assert metrics.cluster_paired_brier.delta > 0.0
+    assert not metrics.cluster_incremental_gate_passed
+    assert metrics.cluster_status == "failed"

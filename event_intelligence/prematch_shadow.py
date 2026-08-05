@@ -598,7 +598,7 @@ def load_prematch_shadow_metrics(
         if len(cluster_paired) < PROSPECTIVE_MIN_SETTLED_MAPS
         else "passed"
         if cluster_incremental_gate_passed
-        else "unsupported"
+        else "failed"
     )
 
     def mean_brier(points: list[_PairedPoint], *, candidate: bool) -> float | None:
@@ -753,7 +753,7 @@ def evaluate_prematch_prospective_gate(
     if collecting:
         status = "collecting"
     elif not calibration_gate_passed or not metrics.incremental_gate_passed:
-        status = "unsupported"
+        status = "failed"
     else:
         status = "passed"
     return PrematchProspectiveDecision(status, tuple(reasons))
