@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from live_betting.rosh_parity_storage import RoshRunMatchLink, StoredRoshRun
 
-from .draft_features import AvailabilityMode
+from .draft_features import ROLE_CONFIDENCE_MIN, AvailabilityMode
 from .draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
     DRAFT_RESIDUAL_FEATURE_VERSION,
@@ -548,6 +548,7 @@ def _side_draft_hero_identity(
         raise ValueError(f"verified Draft authority has invalid {side} players")
     hero_ids: list[int] = []
     by_position: dict[int, int] = {}
+    known_positions: set[int] = set()
     positions_complete = True
     for player in players:
         if not isinstance(player, Mapping):
@@ -560,6 +561,10 @@ def _side_draft_hero_identity(
         if not isinstance(role, Mapping):
             raise ValueError(f"verified Draft authority has invalid {side} role")
         position = role.get("position")
+        confidence = _probability(
+            role.get("confidence"),
+            f"verified Draft authority {side} role confidence",
+        )
         if position is None:
             positions_complete = False
             continue
@@ -567,9 +572,13 @@ def _side_draft_hero_identity(
             isinstance(position, bool)
             or not isinstance(position, int)
             or position not in range(1, 6)
-            or position in by_position
+            or position in known_positions
         ):
             raise ValueError(f"verified Draft authority has invalid {side} positions")
+        known_positions.add(position)
+        if confidence < ROLE_CONFIDENCE_MIN:
+            positions_complete = False
+            continue
         by_position[position] = hero_id
     if len(set(hero_ids)) != 5:
         raise ValueError(f"verified Draft authority has duplicate {side} heroes")

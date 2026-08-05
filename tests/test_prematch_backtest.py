@@ -10,7 +10,7 @@ import pytest
 
 import event_intelligence.prematch_backtest as prematch_backtest
 import event_intelligence.prematch_storage as prematch_storage
-from event_intelligence.draft_features import AvailabilityMode
+from event_intelligence.draft_features import ROLE_CONFIDENCE_MIN, AvailabilityMode
 from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
     DRAFT_RESIDUAL_MODEL_SCHEMA_HASH,
@@ -517,32 +517,67 @@ def test_rosh_heroes_are_ordered_by_expected_position_and_missing_is_fail_closed
     None
 ):
     players = tuple(
-        SimpleNamespace(expected_position=position, hero_id=100 + position)
+        SimpleNamespace(
+            expected_position=position,
+            expected_position_confidence=1.0,
+            hero_id=100 + position,
+        )
         for position in (5, 2, 4, 1, 3)
     )
     assert prematch_backtest._heroes_by_expected_position(  # noqa: SLF001
         SimpleNamespace(players=players)
     ) == (101, 102, 103, 104, 105)
-    incomplete = (*players[:-1], SimpleNamespace(expected_position=None, hero_id=103))
+    incomplete = (
+        *players[:-1],
+        SimpleNamespace(
+            expected_position=None,
+            expected_position_confidence=0.0,
+            hero_id=103,
+        ),
+    )
     assert (
         prematch_backtest._heroes_by_expected_position(  # noqa: SLF001
             SimpleNamespace(players=incomplete)
         )
         is None
     )
+    low_confidence = (
+        *players[:-1],
+        SimpleNamespace(
+            expected_position=3,
+            expected_position_confidence=ROLE_CONFIDENCE_MIN - 0.01,
+            hero_id=103,
+        ),
+    )
+    assert (
+        prematch_backtest._heroes_by_expected_position(  # noqa: SLF001
+            SimpleNamespace(players=low_confidence)
+        )
+        is None
+    )
 
 
-def test_incomplete_positions_use_public_replayable_rosh_unavailable_authority() -> (
+def test_low_confidence_positions_use_replayable_rosh_unavailable_authority() -> (
     None
 ):
     radiant_players = tuple(
-        SimpleNamespace(expected_position=position, hero_id=hero_id)
-        for position, hero_id in zip((1, 2, None, 4, 5), (5, 1, 4, 2, 3), strict=True)
+        SimpleNamespace(
+            expected_position=position,
+            expected_position_confidence=(
+                ROLE_CONFIDENCE_MIN - 0.01 if position == 3 else 1.0
+            ),
+            hero_id=hero_id,
+        )
+        for position, hero_id in zip((1, 2, 3, 4, 5), (5, 1, 4, 2, 3), strict=True)
     )
     dire_players = tuple(
-        SimpleNamespace(expected_position=position, hero_id=hero_id)
+        SimpleNamespace(
+            expected_position=position,
+            expected_position_confidence=1.0,
+            hero_id=hero_id,
+        )
         for position, hero_id in zip(
-            (1, 2, 3, None, 5),
+            (1, 2, 3, 4, 5),
             (15, 11, 14, 12, 13),
             strict=True,
         )

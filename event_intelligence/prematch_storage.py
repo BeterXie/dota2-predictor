@@ -15,7 +15,7 @@ from database.session import DatabaseRow, PostgresSession
 
 from .prematch_calibration import (
     PrematchCalibrationArtifact,
-    load_and_apply_prematch_calibration_json,
+    _load_and_apply_prematch_calibration_json,
     load_prematch_calibration_artifact_json,
 )
 from .prematch_artifacts import (
@@ -850,7 +850,7 @@ def build_prematch_prediction_record(
             )
         if prediction.raw_probability is None:
             raise ValueError("insufficient prediction cannot be calibrated")
-        application = load_and_apply_prematch_calibration_json(
+        application = _load_and_apply_prematch_calibration_json(
             calibration.artifact_json,
             prediction.raw_probability,
             prediction_cutoff=snapshot.prediction_cutoff,
@@ -1058,7 +1058,7 @@ def _validate_prediction_calibration(
         or prediction.calibrated_probability is None
     ):
         raise ValueError("prematch prediction calibration identity disagrees")
-    application = load_and_apply_prematch_calibration_json(
+    application = _load_and_apply_prematch_calibration_json(
         artifact_json,
         prediction.raw_probability,
         prediction_cutoff=prediction.prediction_cutoff,

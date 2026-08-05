@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import event_intelligence.prematch_features as prematch_features
-from event_intelligence.draft_features import AvailabilityMode
+from event_intelligence.draft_features import ROLE_CONFIDENCE_MIN, AvailabilityMode
 from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
     DRAFT_RESIDUAL_FEATURE_VERSION,
@@ -233,16 +233,31 @@ def _rosh_snapshot(
 def _draft_authority(
     *,
     positions_complete: bool = True,
+    low_confidence: bool = False,
     radiant_hero_ids: tuple[int, ...] = RADIANT_HEROES,
     dire_hero_ids: tuple[int, ...] = DIRE_HEROES,
 ) -> dict[str, object]:
-    def players(hero_ids: tuple[int, ...], *, incomplete: bool) -> list[object]:
+    def players(
+        hero_ids: tuple[int, ...],
+        *,
+        incomplete: bool,
+        low_confidence_role: bool,
+    ) -> list[object]:
         return [
             {
                 "player_id": index + 100,
                 "hero_id": hero_id,
                 "expected_role": {
                     "position": None if incomplete and index == 4 else index + 1,
+                    "confidence": (
+                        0.0
+                        if incomplete and index == 4
+                        else (
+                            ROLE_CONFIDENCE_MIN - 0.01
+                            if low_confidence_role and index == 2
+                            else 1.0
+                        )
+                    ),
                 },
             }
             for index, hero_id in enumerate(hero_ids)
@@ -255,9 +270,16 @@ def _draft_authority(
                     "players": players(
                         radiant_hero_ids,
                         incomplete=not positions_complete,
+                        low_confidence_role=low_confidence,
                     )
                 },
-                "dire": {"players": players(dire_hero_ids, incomplete=False)},
+                "dire": {
+                    "players": players(
+                        dire_hero_ids,
+                        incomplete=False,
+                        low_confidence_role=False,
+                    )
+                },
             }
         }
     }
@@ -473,6 +495,38 @@ def test_public_builder_replays_incomplete_positions_as_fixed_missing(
     assert snapshot.rosh_missing_reason == "expected_positions_incomplete"
     assert snapshot.rosh_coverage == 0.0
     assert dict(snapshot.rosh_features)["relative_advantage"] is None
+
+
+def test_public_builder_replays_low_confidence_positions_as_fixed_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    draft_authority = _draft_authority(low_confidence=True)
+    _rosh, rosh_authority = build_unavailable_rosh_feature_snapshot_with_authority(
+        match_id=100,
+        prediction_cutoff=TARGET_CUTOFF,
+        availability_mode=AvailabilityMode.RECONSTRUCTED,
+        radiant_hero_ids=reversed(RADIANT_HEROES),
+        dire_hero_ids={*DIRE_HEROES},
+    )
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_draft_residual_snapshot",
+        lambda *_args, **_kwargs: _draft_snapshot(),
+    )
+
+    snapshot = build_prematch_feature_snapshot(
+        draft_authority,
+        rosh_authority,
+        target_team_rating=_team_run(),
+        team_rating_history=(),
+        rosh_runs=(),
+        artifact_root=tmp_path,
+    )
+
+    assert snapshot.rosh_status == "unavailable"
+    assert snapshot.rosh_missing_reason == "expected_positions_incomplete"
+    assert snapshot.rosh_coverage == 0.0
 
 
 def test_public_builder_rejects_incomplete_position_cross_draft(

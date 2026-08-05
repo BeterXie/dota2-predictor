@@ -168,6 +168,11 @@ def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
         "idx_prematch_calibration_model_cutoff",
         "idx_prematch_prediction_validations_fingerprint",
     } <= indexes
+    calibration_checks = {
+        row["name"]
+        for row in inspector.get_check_constraints("prematch_calibration_artifacts")
+    }
+    assert "ck_prematch_calibration_parameters_by_status" in calibration_checks
     with postgres_engine.connect() as connection:
         revision = connection.execute(
             text("SELECT version_num FROM alembic_version")
@@ -180,7 +185,7 @@ def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
                 )
             ).scalars()
         )
-    assert revision == "20260805_0024"
+    assert revision == "20260805_0025"
     assert {
         "prematch_predictions_mutation_guard",
         "prematch_calibration_mode_guard",
@@ -306,7 +311,7 @@ def test_unsupported_calibration_preserves_null_fit_cutoff_and_reconstructed_can
                         artifact_json, status, created_at
                         ) VALUES (
                             :key, 'team_only', :model_hash,
-                            'prematch-platt-v1', :fit_cutoff, :evaluation_cutoff,
+                            :version, :fit_cutoff, :evaluation_cutoff,
                             20, 100, :parameters_json, :metrics_json, :input_hash,
                             :calibration_hash, :artifact_json, 'passed',
                             '2026-08-05T00:00:00+00:00'
@@ -316,6 +321,7 @@ def test_unsupported_calibration_preserves_null_fit_cutoff_and_reconstructed_can
                 {
                     "key": "e" * 64,
                     "model_hash": "a" * 64,
+                    "version": payload["calibration_version"],
                     "fit_cutoff": payload["fit_cutoff"],
                     "evaluation_cutoff": payload["calibration_cutoff"],
                     "parameters_json": '{"a":0.0,"b":1.0}',
@@ -354,7 +360,7 @@ def test_calibration_parameters_and_mode_must_match_artifact_claims(
             metrics_json, input_hash, calibration_hash,
             artifact_json, status, created_at
         ) VALUES (
-            :key, 'team_only', :model_hash, 'prematch-platt-v1',
+            :key, 'team_only', :model_hash, :version,
             :fit_cutoff, :evaluation_cutoff, 0, 0, :parameters_json,
             '{}', :input_hash, :calibration_hash, :artifact_json,
             'provisional', '2026-08-05T00:00:00+00:00'
@@ -371,6 +377,7 @@ def test_calibration_parameters_and_mode_must_match_artifact_claims(
                 {
                     "key": "e" * 64,
                     "model_hash": "a" * 64,
+                    "version": base_payload["calibration_version"],
                     "fit_cutoff": base_payload["fit_cutoff"],
                     "evaluation_cutoff": base_payload["calibration_cutoff"],
                     "parameters_json": '{"a":0.0,"b":2.0}',
@@ -390,6 +397,7 @@ def test_calibration_parameters_and_mode_must_match_artifact_claims(
                 {
                     "key": "1" * 64,
                     "model_hash": "a" * 64,
+                    "version": mode_mismatch["calibration_version"],
                     "fit_cutoff": mode_mismatch["fit_cutoff"],
                     "evaluation_cutoff": mode_mismatch["calibration_cutoff"],
                     "parameters_json": '{"a":0.0,"b":1.0}',

@@ -17,9 +17,9 @@ from event_intelligence.prematch_calibration import (
     PREMATCH_CALIBRATION_VERSION,
     CalibrationStatus,
     PrematchCalibrationSample,
-    apply_prematch_calibration,
+    _apply_prematch_calibration,
+    _load_and_apply_prematch_calibration_json,
     build_prematch_calibration_artifact,
-    load_and_apply_prematch_calibration_json,
     load_prematch_calibration_artifact_json,
     replay_prematch_calibration_artifact,
 )
@@ -141,7 +141,7 @@ def test_builds_chronological_series_complete_platt_artifact_and_applies_extreme
     assert len(artifact.calibration_hash) == 64
 
     for raw_probability in (0.0, 1.0):
-        applied = apply_prematch_calibration(
+        applied = _apply_prematch_calibration(
             artifact,
             raw_probability,
             prediction_cutoff=artifact.calibration_cutoff + timedelta(days=1),
@@ -170,7 +170,7 @@ def test_json_load_and_apply_replays_once_and_rejects_noncanonical_input(
     )
     payload_json = canonical_json_bytes(artifact.to_payload()).decode("utf-8")
     cutoff = artifact.calibration_cutoff + timedelta(days=1)
-    application = apply_prematch_calibration(
+    application = _apply_prematch_calibration(
         artifact,
         0.7,
         prediction_cutoff=cutoff,
@@ -191,7 +191,7 @@ def test_json_load_and_apply_replays_once_and_rejects_noncanonical_input(
         "replay_prematch_calibration_artifact",
         counted_replay,
     )
-    loaded_application = load_and_apply_prematch_calibration_json(
+    loaded_application = _load_and_apply_prematch_calibration_json(
         payload_json,
         0.7,
         prediction_cutoff=cutoff,
@@ -203,7 +203,7 @@ def test_json_load_and_apply_replays_once_and_rejects_noncanonical_input(
     assert calls == 1
 
     with pytest.raises(ValueError, match="canonical"):
-        load_and_apply_prematch_calibration_json(
+        _load_and_apply_prematch_calibration_json(
             " " + payload_json,
             0.7,
             prediction_cutoff=cutoff,
@@ -243,9 +243,60 @@ def test_evaluation_support_gate_is_fixed_at_100() -> None:
     assert below.fit_support == 20
     assert below.evaluation_support == 99
     assert below.status is CalibrationStatus.PROVISIONAL
+    assert below.reason == "evaluation_support_below_100"
     assert "evaluation_support_below_100" in below.gate_reasons
     assert exact.evaluation_support == 100
     assert exact.status is CalibrationStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (AvailabilityMode.PROSPECTIVE.value, AvailabilityMode.RECONSTRUCTED.value),
+)
+def test_sufficient_gate_failure_is_failed_and_not_applied(mode: str) -> None:
+    rows = _samples(120, mode=mode)
+    adversarial = tuple(
+        row if index < 20 else replace(row, outcome=1 - row.outcome)
+        for index, row in enumerate(rows)
+    )
+    artifact = build_prematch_calibration_artifact(
+        adversarial,
+        _cutoff(120),
+        model_kind=MODEL_KIND,
+        availability_mode=mode,
+    )
+
+    assert artifact.evaluation_support == CALIBRATION_MIN_EVALUATION_SUPPORT
+    assert artifact.parameters is not None
+    assert artifact.gate_passed is False
+    assert artifact.status is CalibrationStatus.FAILED
+    assert artifact.reason == "calibration_gate_failed"
+    application = _apply_prematch_calibration(
+        artifact,
+        0.7,
+        prediction_cutoff=artifact.calibration_cutoff + timedelta(days=1),
+        availability_mode=mode,
+        model_hash=_digest("current-model"),
+        input_snapshot_hash=_digest("target"),
+    )
+    assert application.status is CalibrationStatus.FAILED
+    assert application.calibrated_probability is None
+
+
+def test_optimizer_failure_is_failed_without_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(calibration, "_fit_platt", lambda _rows: None)
+    artifact = build_prematch_calibration_artifact(
+        _samples(120),
+        _cutoff(120),
+        model_kind=MODEL_KIND,
+        availability_mode=AvailabilityMode.PROSPECTIVE.value,
+    )
+
+    assert artifact.status is CalibrationStatus.FAILED
+    assert artifact.reason == "optimizer_failed"
+    assert artifact.parameters is None
 
 
 def test_minimum_fit_support_no_legal_split_and_single_class_are_unsupported() -> None:
@@ -384,7 +435,7 @@ def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> N
     )
     assert trained.fit_cutoff is not None
     with pytest.raises(ValueError, match="not usable"):
-        apply_prematch_calibration(
+        _apply_prematch_calibration(
             trained,
             0.6,
             prediction_cutoff=trained.calibration_cutoff,
@@ -393,7 +444,7 @@ def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> N
             input_snapshot_hash=_digest("input"),
         )
     with pytest.raises(ValueError, match="availability modes"):
-        apply_prematch_calibration(
+        _apply_prematch_calibration(
             trained,
             0.6,
             prediction_cutoff=trained.calibration_cutoff + timedelta(days=1),
@@ -408,7 +459,7 @@ def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> N
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
-    applied = apply_prematch_calibration(
+    applied = _apply_prematch_calibration(
         unsupported,
         0.73,
         prediction_cutoff=unsupported.calibration_cutoff + timedelta(days=1),
@@ -419,6 +470,44 @@ def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> N
     assert applied.status is CalibrationStatus.UNSUPPORTED
     assert applied.raw_probability == 0.73
     assert applied.calibrated_probability is None
+
+
+def test_legacy_v1_gate_failure_replays_but_cannot_calibrate() -> None:
+    rows = _samples(120, mode=AvailabilityMode.RECONSTRUCTED.value)
+    adversarial = tuple(
+        row if index < 20 else replace(row, outcome=1 - row.outcome)
+        for index, row in enumerate(rows)
+    )
+    legacy = calibration._build_artifact(
+        adversarial,
+        _cutoff(120),
+        model_kind=MODEL_KIND,
+        availability_mode=AvailabilityMode.RECONSTRUCTED.value,
+        legacy_status_policy=True,
+    )
+
+    assert legacy.status is CalibrationStatus.RECONSTRUCTED_ONLY
+    assert legacy.gate_passed is False
+    loaded = load_prematch_calibration_artifact_json(
+        legacy.canonical_bytes().decode("utf-8")
+    )
+    assert loaded == legacy
+    application = _apply_prematch_calibration(
+        loaded,
+        0.7,
+        prediction_cutoff=loaded.calibration_cutoff + timedelta(days=1),
+        availability_mode=loaded.availability_mode,
+        model_hash=_digest("current-model"),
+        input_snapshot_hash=_digest("target"),
+    )
+    assert application.calibrated_probability is None
+
+
+def test_unbound_calibration_application_helpers_are_private() -> None:
+    assert "apply_prematch_calibration" not in calibration.__all__
+    assert "load_and_apply_prematch_calibration_json" not in calibration.__all__
+    assert not hasattr(calibration, "apply_prematch_calibration")
+    assert not hasattr(calibration, "load_and_apply_prematch_calibration_json")
 
 
 def test_json_load_and_full_refit_replay_are_exact_and_deterministic() -> None:

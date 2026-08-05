@@ -21,7 +21,7 @@ from event_intelligence.draft_residual_features import (
 )
 from event_intelligence.prematch_calibration import (
     PrematchCalibrationSample,
-    apply_prematch_calibration,
+    _apply_prematch_calibration,
     build_prematch_calibration_artifact,
 )
 from event_intelligence.prematch_features import (
@@ -535,7 +535,7 @@ def test_prediction_builder_applies_supported_replayed_calibration() -> None:
         calibration=calibration,
     )
     assert record.raw_probability is not None
-    expected = apply_prematch_calibration(
+    expected = _apply_prematch_calibration(
         artifact,
         record.raw_probability,
         prediction_cutoff=snapshot.prediction_cutoff,
@@ -545,6 +545,64 @@ def test_prediction_builder_applies_supported_replayed_calibration() -> None:
     )
     assert record.calibration_hash == artifact.calibration_hash
     assert record.calibrated_probability == expected.calibrated_probability
+
+    wrong_model = build_prematch_calibration_record(
+        artifact,
+        model_hash=_digest(999_999),
+    )
+    with pytest.raises(ValueError, match="belongs to another model"):
+        build_prematch_prediction_record(
+            model,
+            snapshot,
+            cutoff_source="reconstructed_map_start",
+            dependency_revision=1,
+            calibration=wrong_model,
+        )
+
+
+def test_gate_failed_calibration_keeps_parameters_but_cannot_predict() -> None:
+    model = _model()
+    snapshot = _snapshot()
+    samples = tuple(
+        PrematchCalibrationSample(
+            match_id=2_000 + index,
+            series_id=f"failed-series-{index:03d}",
+            event_id=f"event-{index % 5}",
+            patch_id=f"7.4{index % 2}",
+            model_kind=model.model_kind,
+            availability_mode=MODE,
+            prediction_cutoff=START + timedelta(hours=index),
+            result_usable_at=START + timedelta(hours=index, minutes=30),
+            raw_probability=0.15 if index % 2 == 0 else 0.85,
+            outcome=index % 2 if index < 20 else 1 - index % 2,
+            model_hash=_digest(400 + index // 10),
+            input_snapshot_hash=_digest(500 + index),
+        )
+        for index in range(120)
+    )
+    artifact = build_prematch_calibration_artifact(
+        samples,
+        START + timedelta(hours=120, minutes=31),
+        model_kind=model.model_kind,
+        availability_mode=MODE,
+    )
+    calibration_record = build_prematch_calibration_record(
+        artifact,
+        model_hash=model.model_hash,
+    )
+
+    assert artifact.status.value == "failed"
+    assert artifact.reason == "calibration_gate_failed"
+    assert artifact.parameters is not None
+    assert calibration_record.parameters_json is not None
+    with pytest.raises(ValueError, match="unusable calibration"):
+        build_prematch_prediction_record(
+            model,
+            snapshot,
+            cutoff_source="reconstructed_map_start",
+            dependency_revision=1,
+            calibration=calibration_record,
+        )
 
 
 def test_team_base_probability_is_stable_for_extreme_finite_logits() -> None:

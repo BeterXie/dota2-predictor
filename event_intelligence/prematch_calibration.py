@@ -585,12 +585,35 @@ def _gate(
     return not reasons, tuple(reasons)
 
 
+def _status_after_gate(
+    *,
+    availability_mode: str,
+    evaluation_support: int,
+    gate_passed: bool,
+    legacy_status_policy: bool,
+) -> tuple[CalibrationStatus, str | None]:
+    if legacy_status_policy:
+        if availability_mode == AvailabilityMode.RECONSTRUCTED.value:
+            return CalibrationStatus.RECONSTRUCTED_ONLY, None
+        if gate_passed:
+            return CalibrationStatus.PASSED, None
+        return CalibrationStatus.PROVISIONAL, None
+    if evaluation_support < CALIBRATION_MIN_EVALUATION_SUPPORT:
+        return CalibrationStatus.PROVISIONAL, "evaluation_support_below_100"
+    if not gate_passed:
+        return CalibrationStatus.FAILED, "calibration_gate_failed"
+    if availability_mode == AvailabilityMode.RECONSTRUCTED.value:
+        return CalibrationStatus.RECONSTRUCTED_ONLY, None
+    return CalibrationStatus.PASSED, None
+
+
 def _build_artifact(
     samples: Iterable[PrematchCalibrationSample],
     calibration_cutoff: datetime,
     *,
     model_kind: str,
     availability_mode: str,
+    legacy_status_policy: bool = False,
 ) -> PrematchCalibrationArtifact:
     cutoff = _utc(calibration_cutoff, "calibration_cutoff")
     kind = _model_kind(model_kind)
@@ -675,13 +698,12 @@ def _build_artifact(
                 calibrated_metrics,
                 ece_90_upper,
             )
-            reason = None
-            if mode == AvailabilityMode.RECONSTRUCTED.value:
-                status = CalibrationStatus.RECONSTRUCTED_ONLY
-            elif gate_passed:
-                status = CalibrationStatus.PASSED
-            else:
-                status = CalibrationStatus.PROVISIONAL
+            status, reason = _status_after_gate(
+                availability_mode=mode,
+                evaluation_support=len(evaluation),
+                gate_passed=gate_passed,
+                legacy_status_policy=legacy_status_policy,
+            )
     partial = PrematchCalibrationArtifact(
         artifact_schema=PREMATCH_CALIBRATION_ARTIFACT_SCHEMA,
         calibration_version=PREMATCH_CALIBRATION_VERSION,
@@ -1131,9 +1153,22 @@ def replay_prematch_calibration_artifact(
     )
     actual = canonical_json_bytes(artifact.to_payload(include_calibration_hash=False))
     expected = canonical_json_bytes(replayed.to_payload(include_calibration_hash=False))
-    if not hmac.compare_digest(actual, expected):
-        raise ValueError("prematch calibration does not replay from its OOS stream")
-    return replayed
+    if hmac.compare_digest(actual, expected):
+        return replayed
+    # Artifacts persisted before M6.1 used the original v1 status mapping.
+    legacy_replayed = _build_artifact(
+        artifact.oos_samples,
+        artifact.calibration_cutoff,
+        model_kind=artifact.model_kind,
+        availability_mode=artifact.availability_mode,
+        legacy_status_policy=True,
+    )
+    legacy_expected = canonical_json_bytes(
+        legacy_replayed.to_payload(include_calibration_hash=False)
+    )
+    if hmac.compare_digest(actual, legacy_expected):
+        return legacy_replayed
+    raise ValueError("prematch calibration does not replay from its OOS stream")
 
 
 def load_prematch_calibration_artifact_json(
@@ -1164,7 +1199,14 @@ def _apply_verified_prematch_calibration(
     snapshot_hash = _digest(input_snapshot_hash, "input_snapshot_hash")
     if artifact.calibration_cutoff >= cutoff:
         raise ValueError("calibration artifact was not usable before prediction cutoff")
-    if artifact.parameters is None:
+    if (
+        artifact.parameters is None
+        or artifact.status in {CalibrationStatus.UNSUPPORTED, CalibrationStatus.FAILED}
+        or (
+            not artifact.gate_passed
+            and artifact.evaluation_support >= CALIBRATION_MIN_EVALUATION_SUPPORT
+        )
+    ):
         return PrematchCalibrationApplication(
             status=artifact.status,
             reason=artifact.reason,
@@ -1193,7 +1235,7 @@ def _apply_verified_prematch_calibration(
     )
 
 
-def apply_prematch_calibration(
+def _apply_prematch_calibration(
     artifact: PrematchCalibrationArtifact,
     raw_probability: float,
     *,
@@ -1213,7 +1255,7 @@ def apply_prematch_calibration(
     )
 
 
-def load_and_apply_prematch_calibration_json(
+def _load_and_apply_prematch_calibration_json(
     payload_json: str,
     raw_probability: float,
     *,
@@ -1224,25 +1266,6 @@ def load_and_apply_prematch_calibration_json(
 ) -> PrematchCalibrationApplication:
     artifact = load_prematch_calibration_artifact_json(payload_json)
     return _apply_verified_prematch_calibration(
-        artifact,
-        raw_probability,
-        prediction_cutoff=prediction_cutoff,
-        availability_mode=availability_mode,
-        model_hash=model_hash,
-        input_snapshot_hash=input_snapshot_hash,
-    )
-
-
-def apply_calibration(
-    artifact: PrematchCalibrationArtifact,
-    raw_probability: float,
-    *,
-    prediction_cutoff: datetime,
-    availability_mode: str,
-    model_hash: str,
-    input_snapshot_hash: str,
-) -> PrematchCalibrationApplication:
-    return apply_prematch_calibration(
         artifact,
         raw_probability,
         prediction_cutoff=prediction_cutoff,
@@ -1266,11 +1289,8 @@ __all__ = [
     "PrematchCalibrationApplication",
     "PrematchCalibrationArtifact",
     "PrematchCalibrationSample",
-    "apply_calibration",
-    "apply_prematch_calibration",
     "build_prematch_calibration",
     "build_prematch_calibration_artifact",
-    "load_and_apply_prematch_calibration_json",
     "load_calibration_artifact_json",
     "load_prematch_calibration_artifact_json",
     "prematch_calibration_artifact_from_payload",

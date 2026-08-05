@@ -385,6 +385,39 @@ def _supported_calibration(model):
     )
 
 
+def _failed_calibration(model):
+    start = TRAINING_CUTOFF - timedelta(days=10)
+    samples = tuple(
+        PrematchCalibrationSample(
+            match_id=3_000 + index,
+            series_id=f"failed-calibration-series-{index:03d}",
+            event_id=f"calibration-event-{index % 5}",
+            patch_id=f"7.4{index % 2}",
+            model_kind=model.model_kind,
+            availability_mode=MODE,
+            prediction_cutoff=start + timedelta(hours=index),
+            result_usable_at=start + timedelta(hours=index, minutes=30),
+            raw_probability=0.15 if index % 2 == 0 else 0.85,
+            outcome=index % 2 if index < 20 else 1 - index % 2,
+            model_hash=_digest(900 + index // 10),
+            input_snapshot_hash=_digest(1_000 + index),
+        )
+        for index in range(120)
+    )
+    artifact = build_prematch_calibration_artifact(
+        samples,
+        TRAINING_CUTOFF + timedelta(minutes=3),
+        model_kind=model.model_kind,
+        availability_mode=MODE,
+    )
+    assert artifact.status.value == "failed"
+    assert artifact.parameters is not None
+    return build_prematch_calibration_record(
+        artifact,
+        model_hash=model.model_hash,
+    )
+
+
 def test_postgres_persistence_replay_idempotency_and_controlled_settlement(
     postgres_engine: Engine,
 ) -> None:
@@ -636,6 +669,7 @@ def test_direct_sql_rejects_unusable_cross_model_or_noncausal_calibration(
         model_b = _model(l2_regularization=2.0)
         run_b = build_prematch_model_run_record(model_b)
         supported_b = _supported_calibration(model_b)
+        failed_a = _failed_calibration(model_a)
         unsupported_artifact = build_prematch_calibration_artifact(
             (),
             TRAINING_CUTOFF + timedelta(minutes=2),
@@ -659,7 +693,7 @@ def test_direct_sql_rejects_unusable_cross_model_or_noncausal_calibration(
         persist_prematch_records(
             session,
             model_runs=(run_a, run_b),
-            calibration_artifacts=(supported_b, unsupported_a),
+            calibration_artifacts=(supported_b, unsupported_a, failed_a),
             created_at=CREATED_AT,
         )
     finally:
@@ -689,6 +723,15 @@ def test_direct_sql_rejects_unusable_cross_model_or_noncausal_calibration(
             artifact_fingerprint=prematch_artifact_fingerprint(
                 model_hash=model_a.model_hash,
                 calibration_hash=unsupported_a.calibration_hash,
+            ),
+        ),
+        _prediction_values(
+            prediction_a,
+            calibration_hash=failed_a.calibration_hash,
+            calibrated_probability=raw,
+            artifact_fingerprint=prematch_artifact_fingerprint(
+                model_hash=model_a.model_hash,
+                calibration_hash=failed_a.calibration_hash,
             ),
         ),
         _prediction_values(

@@ -16,7 +16,12 @@ from live_betting.rosh_parity_storage import (
 )
 
 from .backtest import DraftCorpus, LoadedDraftMap, load_draft_corpus
-from .draft_features import AvailabilityMode, DraftTarget, DraftTeam
+from .draft_features import (
+    ROLE_CONFIDENCE_MIN,
+    AvailabilityMode,
+    DraftTarget,
+    DraftTeam,
+)
 from .draft_residual_features import (
     TeamRatingResidualEvidenceCache,
     build_draft_residual_snapshot_with_authority,
@@ -415,7 +420,11 @@ def _heroes_by_expected_position(team: DraftTeam) -> tuple[int, ...] | None:
     by_position: dict[int, int] = {}
     for player in team.players:
         position = player.expected_position
-        if position is None or position in by_position:
+        if (
+            position is None
+            or player.expected_position_confidence < ROLE_CONFIDENCE_MIN
+            or position in by_position
+        ):
             return None
         by_position[position] = player.hero_id
     if set(by_position) != set(range(1, 6)):
