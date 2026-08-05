@@ -10,6 +10,7 @@ import {
   Spinner,
 } from "@fluentui/react-components";
 import { AdvantageSparkline } from "./common/AdvantageSparkline";
+import { PrematchPredictionView } from "./PrematchPredictionView";
 import {
   ChartLineUp,
   MagicWand,
@@ -307,6 +308,8 @@ export function PrematchWorkspace() {
           <strong>官方有符号分</strong>
         </div>
       </header>
+
+      <PrematchPredictionView />
 
       <section className="prematch-source" aria-label="比赛来源">
         <Input
