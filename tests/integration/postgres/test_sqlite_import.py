@@ -333,7 +333,7 @@ def test_sqlite_import_is_read_only_atomic_and_verified(
     report = migrate_sqlite_to_postgres(source, postgres_database_url)
 
     assert report.dry_run is False
-    assert report.target_revision == "20260805_0022"
+    assert report.target_revision == "20260805_0024"
     assert report.row_counts == {
         "browser_events": 1,
         "draft_lineage_changes": 2,
@@ -396,6 +396,18 @@ def test_sqlite_import_is_read_only_atomic_and_verified(
                     "WHERE singleton = 1"
                 )
             ).scalar_one()
+            prematch_lineage_revision = connection.execute(
+                text(
+                    "SELECT dependency_revision, artifact_revision "
+                    "FROM prematch_lineage_revisions WHERE singleton = 1"
+                )
+            ).one()
+            prematch_lineage_changes = connection.execute(
+                text(
+                    "SELECT dependency_revision, source_relation, operation "
+                    "FROM prematch_lineage_changes ORDER BY dependency_revision"
+                )
+            ).all()
             anchor = connection.execute(
                 text(
                     "SELECT status, conflict_at, source_frame_ref "
@@ -433,6 +445,8 @@ def test_sqlite_import_is_read_only_atomic_and_verified(
             (2, "2026-07-30T01:02:00Z"),
         ]
         assert lineage_revision == 2
+        assert prematch_lineage_revision == (1, 1)
+        assert prematch_lineage_changes == [(1, "__tracking__", "INITIALIZE")]
         assert anchor == (
             "conflict",
             "2026-07-30T01:04:00Z",
@@ -444,6 +458,26 @@ def test_sqlite_import_is_read_only_atomic_and_verified(
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         )
         assert raw_source_path == "new-source-path"
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO heroes (hero_id, localized_name, hero_key) "
+                    "VALUES (2, 'Axe', 'axe')"
+                )
+            )
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT dependency_revision FROM prematch_lineage_revisions "
+                    "WHERE singleton = 1"
+                )
+            ).scalar_one() == 2
+            assert connection.execute(
+                text(
+                    "SELECT source_relation FROM prematch_lineage_changes "
+                    "WHERE dependency_revision = 2"
+                )
+            ).scalar_one() == "heroes"
         with pytest.raises(DBAPIError, match="external payload authority"):
             with engine.begin() as connection:
                 connection.execute(

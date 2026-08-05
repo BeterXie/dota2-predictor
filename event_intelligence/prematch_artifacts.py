@@ -152,6 +152,12 @@ def _strict_json_object(payload_json: str) -> Mapping[str, Any]:
         raise ValueError("prematch model artifact JSON is invalid") from error
     if not isinstance(payload, dict):
         raise ValueError("prematch model artifact must be an object")
+    canonical_json = canonical_json_bytes(payload).decode("utf-8")
+    if not hmac.compare_digest(
+        payload_json.encode("utf-8"),
+        canonical_json.encode("utf-8"),
+    ):
+        raise ValueError("prematch model artifact JSON is not canonical")
     return payload
 
 

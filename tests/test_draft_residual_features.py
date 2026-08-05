@@ -25,8 +25,10 @@ from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_PURE_SCHEMA,
     SHRINKAGE_STRENGTH,
     TeamRatingResidualEvidence,
+    TeamRatingResidualEvidenceCache,
     build_draft_residual_snapshot,
     build_draft_residual_snapshot_with_authority,
+    build_team_rating_residual_evidence_cache,
     project_draft_residual_features,
     replay_draft_residual_snapshot,
 )
@@ -781,6 +783,159 @@ def test_team_rating_evidence_factory_verifies_run_and_strips_target_outcome() -
     assert target_evidence.prediction_input_hash == (
         runs[2].artifact.prediction.input_hash
     )
+
+
+def test_verified_evidence_cache_matches_strict_snapshot_and_authority() -> None:
+    target = _target()
+    history = (_map(101, completed_at=START + timedelta(days=1)),)
+    target_run, history_runs = _team_runs(target, history)
+
+    strict_snapshot, strict_authority = build_draft_residual_snapshot_with_authority(
+        target,
+        history,
+        target_team_rating=target_run,
+        team_rating_history=history_runs,
+    )
+    cache = build_team_rating_residual_evidence_cache(
+        (target_run, *history_runs)
+    )
+    cached_snapshot, cached_authority = build_draft_residual_snapshot_with_authority(
+        target,
+        history,
+        target_team_rating=target_run,
+        team_rating_history=history_runs,
+        team_rating_evidence_cache=cache,
+    )
+
+    assert isinstance(cache, TeamRatingResidualEvidenceCache)
+    assert cached_snapshot == strict_snapshot
+    assert cached_authority == strict_authority
+    assert replay_draft_residual_snapshot(
+        strict_authority,
+        target_team_rating=target_run,
+        team_rating_history=history_runs,
+        team_rating_evidence_cache=cache,
+    ) == strict_snapshot
+
+
+def test_verified_evidence_cache_preserves_target_outcome_invariance() -> None:
+    target = _target()
+    history = (_map(101, completed_at=START + timedelta(days=1)),)
+    target_run, history_runs = _team_runs(target, history)
+    cache = build_team_rating_residual_evidence_cache((target_run, *history_runs))
+
+    changed_target_run = replace(
+        target_run,
+        eventual_radiant_win=not target_run.eventual_radiant_win,
+    )
+    baseline = build_draft_residual_snapshot(
+        target,
+        history,
+        target_team_rating=target_run,
+        team_rating_history=history_runs,
+        team_rating_evidence_cache=cache,
+    )
+    changed = build_draft_residual_snapshot(
+        target,
+        history,
+        target_team_rating=changed_target_run,
+        team_rating_history=history_runs,
+        team_rating_evidence_cache=cache,
+    )
+
+    assert changed == baseline
+
+
+def test_evidence_cache_verifies_each_distinct_run_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    history = tuple(
+        _map(100 + index, completed_at=START + timedelta(days=index))
+        for index in range(1, 4)
+    )
+    target_run, history_runs = _team_runs(target, history)
+    import event_intelligence.draft_residual_features as residual_module
+
+    calls = 0
+    original = residual_module.verify_team_rating_artifact
+
+    def verify(artifact):
+        nonlocal calls
+        calls += 1
+        return original(artifact)
+
+    monkeypatch.setattr(residual_module, "verify_team_rating_artifact", verify)
+    cache = build_team_rating_residual_evidence_cache(
+        (target_run, *history_runs, history_runs[0])
+    )
+    build_draft_residual_snapshot(
+        target,
+        history,
+        target_team_rating=target_run,
+        team_rating_history=history_runs,
+        team_rating_evidence_cache=cache,
+    )
+    assert calls == len({target_run.run_id, *(row.run_id for row in history_runs)})
+
+
+def test_evidence_cache_tamper_missing_and_conflict_fail_closed() -> None:
+    target = _target()
+    history = (_map(101, completed_at=START + timedelta(days=1)),)
+    target_run, history_runs = _team_runs(target, history)
+    cache = build_team_rating_residual_evidence_cache(
+        (target_run, *history_runs)
+    )
+
+    target_evidence = next(
+        row for row in cache.entries if row.match_id == target_run.artifact.target.match_id
+    )
+    tampered = replace(
+        target_evidence,
+        radiant_probability=target_evidence.radiant_probability + 0.01,
+        evidence_hash="",
+    )
+    tampered_cache = TeamRatingResidualEvidenceCache((tampered,))
+    with pytest.raises(ValueError, match="does not match run"):
+        build_draft_residual_snapshot(
+            target,
+            history,
+            target_team_rating=target_run,
+            team_rating_history=history_runs,
+            team_rating_evidence_cache=tampered_cache,
+        )
+
+    history_evidence = next(
+        row for row in cache.entries if row.match_id == history_runs[0].artifact.target.match_id
+    )
+    missing_cache = TeamRatingResidualEvidenceCache((history_evidence,))
+    with pytest.raises(ValueError, match="missing match"):
+        build_draft_residual_snapshot(
+            target,
+            history,
+            target_team_rating=target_run,
+            team_rating_history=history_runs,
+            team_rating_evidence_cache=missing_cache,
+        )
+
+    _alternate_target, alternate_history = _team_runs(
+        target,
+        history,
+        parameters=ALTERNATE_PARAMETERS,
+    )
+    with pytest.raises(ValueError, match="conflicting Team Rating evidence"):
+        build_team_rating_residual_evidence_cache(
+            (history_runs[0], alternate_history[0])
+        )
+
+    with pytest.raises(ValueError, match="unsupported type"):
+        build_draft_residual_snapshot(
+            target,
+            history,
+            target_team_rating=target_run,
+            team_rating_history=history_runs,
+            team_rating_evidence_cache={},
+        )
 
 
 def test_datetime_mode_and_conflicting_duplicate_evidence_fail_closed() -> None:

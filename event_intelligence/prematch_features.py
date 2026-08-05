@@ -21,15 +21,18 @@ from .draft_residual_features import (
     DRAFT_RESIDUAL_MODEL_SCHEMA,
     DRAFT_RESIDUAL_MODEL_SCHEMA_HASH,
     DraftResidualSnapshot,
-    TeamRatingResidualEvidence,
+    TeamRatingResidualEvidenceCache,
     project_draft_residual_features,
     replay_draft_residual_snapshot,
+    team_rating_residual_evidence,
 )
 from .raw_archive import canonical_json_bytes
 from .rosh_features import (
+    ROSH_AUTHORITY_SCHEMA,
     ROSH_FEATURE_VERSION,
     ROSH_MODEL_SCHEMA,
     ROSH_MODEL_SCHEMA_HASH,
+    ROSH_UNAVAILABLE_AUTHORITY_SCHEMA,
     RoshFeatureSnapshot,
     project_rosh_features,
     replay_rosh_feature_snapshot,
@@ -437,6 +440,8 @@ def _compose_prematch_feature_snapshot(
     team_rating_run: TeamRatingWalkForwardRun,
     draft_residual_snapshot: DraftResidualSnapshot,
     rosh_snapshot: RoshFeatureSnapshot,
+    *,
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> PrematchFeatureSnapshot:
     """Compose snapshots only after their public replay boundaries verified them."""
 
@@ -447,9 +452,10 @@ def _compose_prematch_feature_snapshot(
     if not isinstance(rosh_snapshot, RoshFeatureSnapshot):
         raise ValueError("rosh_snapshot must be a RoshFeatureSnapshot")
 
-    team = TeamRatingResidualEvidence.from_walk_forward_run(
+    team = team_rating_residual_evidence(
         team_rating_run,
         include_outcome=False,
+        evidence_cache=team_rating_evidence_cache,
     )
     probability = team.radiant_probability
     if not 0.0 < probability < 1.0:
@@ -530,6 +536,131 @@ def _compose_prematch_feature_snapshot(
     )
 
 
+def _side_draft_hero_identity(
+    target: Mapping[str, Any],
+    side: str,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+    team = target.get(side)
+    if not isinstance(team, Mapping):
+        raise ValueError(f"verified Draft authority has no {side} team")
+    players = team.get("players")
+    if not isinstance(players, list) or len(players) != 5:
+        raise ValueError(f"verified Draft authority has invalid {side} players")
+    hero_ids: list[int] = []
+    by_position: dict[int, int] = {}
+    positions_complete = True
+    for player in players:
+        if not isinstance(player, Mapping):
+            raise ValueError(f"verified Draft authority has invalid {side} player")
+        hero_id = player.get("hero_id")
+        if isinstance(hero_id, bool) or not isinstance(hero_id, int) or hero_id <= 0:
+            raise ValueError(f"verified Draft authority has invalid {side} hero")
+        hero_ids.append(hero_id)
+        role = player.get("expected_role")
+        if not isinstance(role, Mapping):
+            raise ValueError(f"verified Draft authority has invalid {side} role")
+        position = role.get("position")
+        if position is None:
+            positions_complete = False
+            continue
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position not in range(1, 6)
+            or position in by_position
+        ):
+            raise ValueError(f"verified Draft authority has invalid {side} positions")
+        by_position[position] = hero_id
+    if len(set(hero_ids)) != 5:
+        raise ValueError(f"verified Draft authority has duplicate {side} heroes")
+    ordered = (
+        tuple(by_position[position] for position in range(1, 6))
+        if positions_complete and len(by_position) == 5
+        else None
+    )
+    return tuple(sorted(hero_ids)), ordered
+
+
+def _draft_authority_hero_identity(
+    authority_payload: Mapping[str, Any],
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+]:
+    draft_authority = authority_payload.get("draft_authority")
+    if not isinstance(draft_authority, Mapping):
+        raise ValueError("verified Draft residual authority is incomplete")
+    target = draft_authority.get("target")
+    if not isinstance(target, Mapping):
+        raise ValueError("verified Draft target authority is incomplete")
+    radiant_set, radiant_positions = _side_draft_hero_identity(target, "radiant")
+    dire_set, dire_positions = _side_draft_hero_identity(target, "dire")
+    if len(set((*radiant_set, *dire_set))) != 10:
+        raise ValueError("verified Draft target heroes are not unique")
+    return radiant_set, dire_set, radiant_positions, dire_positions
+
+
+def _rosh_authority_hero_identity(
+    authority_payload: Mapping[str, Any],
+) -> tuple[str, tuple[int, ...], tuple[int, ...]]:
+    schema = authority_payload.get("schema")
+    if schema == ROSH_AUTHORITY_SCHEMA:
+        target = authority_payload.get("target")
+        if not isinstance(target, Mapping):
+            raise ValueError("verified R.O.S.H. target authority is incomplete")
+        radiant_raw = target.get("radiant_hero_ids")
+        dire_raw = target.get("dire_hero_ids")
+    elif schema == ROSH_UNAVAILABLE_AUTHORITY_SCHEMA:
+        radiant_raw = authority_payload.get("radiant_hero_ids")
+        dire_raw = authority_payload.get("dire_hero_ids")
+    else:
+        raise ValueError("verified R.O.S.H. authority schema is unsupported")
+    if not isinstance(radiant_raw, list) or not isinstance(dire_raw, list):
+        raise ValueError("verified R.O.S.H. authority heroes are incomplete")
+    for side, values in (("radiant", radiant_raw), ("dire", dire_raw)):
+        if len(values) != 5 or any(
+            isinstance(hero_id, bool) or not isinstance(hero_id, int) or hero_id <= 0
+            for hero_id in values
+        ):
+            raise ValueError(f"verified R.O.S.H. authority has invalid {side} heroes")
+    radiant = tuple(radiant_raw)
+    dire = tuple(dire_raw)
+    if len(set((*radiant, *dire))) != 10:
+        raise ValueError("verified R.O.S.H. authority heroes are not unique")
+    return schema, radiant, dire
+
+
+def _validate_draft_rosh_hero_identity(
+    draft_authority_payload: Mapping[str, Any],
+    rosh_authority_payload: Mapping[str, Any],
+) -> None:
+    draft_radiant, draft_dire, radiant_positions, dire_positions = (
+        _draft_authority_hero_identity(draft_authority_payload)
+    )
+    rosh_schema, rosh_radiant, rosh_dire = _rosh_authority_hero_identity(
+        rosh_authority_payload
+    )
+    positions_complete = radiant_positions is not None and dire_positions is not None
+    if positions_complete:
+        if rosh_schema != ROSH_AUTHORITY_SCHEMA:
+            raise ValueError(
+                "complete Draft positions require standard R.O.S.H. authority"
+            )
+        if radiant_positions != rosh_radiant or dire_positions != rosh_dire:
+            raise ValueError("Draft and R.O.S.H. position hero identities disagree")
+        return
+    if rosh_schema != ROSH_UNAVAILABLE_AUTHORITY_SCHEMA:
+        raise ValueError(
+            "incomplete Draft positions require unavailable R.O.S.H. authority"
+        )
+    if draft_radiant != tuple(sorted(rosh_radiant)) or draft_dire != tuple(
+        sorted(rosh_dire)
+    ):
+        raise ValueError("Draft and R.O.S.H. hero sets disagree")
+
+
 def build_prematch_feature_snapshot(
     draft_residual_authority_payload: Mapping[str, Any],
     rosh_authority_payload: Mapping[str, Any],
@@ -539,6 +670,7 @@ def build_prematch_feature_snapshot(
     rosh_runs: Iterable[StoredRoshRun],
     artifact_root: str | Path,
     match_links: Iterable[RoshRunMatchLink] = (),
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> PrematchFeatureSnapshot:
     """Replay external M3/M4 authority before composing an M5 snapshot."""
 
@@ -546,10 +678,15 @@ def build_prematch_feature_snapshot(
         raise ValueError("Draft residual authority payload must be an object")
     if not isinstance(rosh_authority_payload, Mapping):
         raise ValueError("R.O.S.H. authority payload must be an object")
+    draft_replay_kwargs: dict[str, Any] = {
+        "target_team_rating": target_team_rating,
+        "team_rating_history": team_rating_history,
+    }
+    if team_rating_evidence_cache is not None:
+        draft_replay_kwargs["team_rating_evidence_cache"] = team_rating_evidence_cache
     draft_snapshot = replay_draft_residual_snapshot(
         draft_residual_authority_payload,
-        target_team_rating=target_team_rating,
-        team_rating_history=team_rating_history,
+        **draft_replay_kwargs,
     )
     rosh_snapshot = replay_rosh_feature_snapshot(
         rosh_authority_payload,
@@ -557,10 +694,15 @@ def build_prematch_feature_snapshot(
         artifact_root=artifact_root,
         match_links=match_links,
     )
+    _validate_draft_rosh_hero_identity(
+        draft_residual_authority_payload,
+        rosh_authority_payload,
+    )
     return _compose_prematch_feature_snapshot(
         target_team_rating,
         draft_snapshot,
         rosh_snapshot,
+        team_rating_evidence_cache=team_rating_evidence_cache,
     )
 
 

@@ -39,11 +39,18 @@ from event_intelligence.prematch_features import (
     PREMATCH_FEATURE_VERSION,
     PREMATCH_MODEL_KINDS,
 )
+from event_intelligence.prematch_backtest import PREMATCH_BACKTEST_VERSION
+from event_intelligence.prematch_calibration import (
+    PREMATCH_CALIBRATION_ARTIFACT_SCHEMA,
+    PREMATCH_CALIBRATION_VERSION,
+)
 from event_intelligence.prematch_model import (
     PREMATCH_MODEL_ARTIFACT_VERSION,
     PREMATCH_MODEL_VERSION,
 )
+from event_intelligence.prematch_storage import PREMATCH_VALIDATION_VERSION
 from event_intelligence.rosh_features import (
+    ROSH_UNAVAILABLE_AUTHORITY_SCHEMA,
     ROSH_FEATURE_SCHEMA,
     ROSH_FEATURE_VERSION,
     ROSH_MODEL_SCHEMA,
@@ -167,6 +174,18 @@ def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
             "581e42787406d3ce5b758d990e5db71d71e9c92e9d19baf85c70fdad85d9dedc"
         ),
     }
+
+
+def test_prematch_validation_versions_remain_frozen() -> None:
+    assert PREMATCH_BACKTEST_VERSION == "prematch-walk-forward-v1"
+    assert PREMATCH_CALIBRATION_VERSION == "prematch-platt-v1"
+    assert PREMATCH_CALIBRATION_ARTIFACT_SCHEMA == (
+        "prematch-calibration-artifact/v1"
+    )
+    assert PREMATCH_VALIDATION_VERSION == "prematch-input-lineage-v1"
+    assert ROSH_UNAVAILABLE_AUTHORITY_SCHEMA == (
+        "official-rosh-feature-unavailable-authority/v1"
+    )
 
 
 def test_official_rosh_scorer_identity_remains_frozen() -> None:

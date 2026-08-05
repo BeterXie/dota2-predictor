@@ -10,6 +10,7 @@ import pytest
 
 from event_intelligence.draft_features import AvailabilityMode
 from event_intelligence.prematch_artifacts import (
+    canonical_json_bytes,
     canonical_hash,
     load_prematch_model_artifact_json,
     prematch_model_artifact_from_payload,
@@ -138,6 +139,29 @@ def test_json_loader_rejects_duplicate_keys_and_nonfinite_numbers() -> None:
         load_prematch_model_artifact_json(duplicate)
     with pytest.raises(ValueError, match="invalid JSON constant"):
         load_prematch_model_artifact_json(json.dumps(nonfinite, allow_nan=True))
+
+
+def test_json_loader_accepts_only_canonical_serialization() -> None:
+    model = _model()
+    payload = model.to_payload()
+    canonical = canonical_json_bytes(payload).decode("utf-8")
+    reordered = json.dumps(
+        dict(reversed(tuple(payload.items()))),
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    alternate_number = canonical.replace(
+        '"l2_regularization":1.0',
+        '"l2_regularization":1e0',
+        1,
+    )
+
+    assert load_prematch_model_artifact_json(canonical) == model
+    assert reordered != canonical
+    assert alternate_number != canonical
+    for noncanonical in (f" {canonical}", reordered, alternate_number):
+        with pytest.raises(ValueError, match="JSON is not canonical"):
+            load_prematch_model_artifact_json(noncanonical)
 
 
 @pytest.mark.parametrize(

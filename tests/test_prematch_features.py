@@ -14,6 +14,7 @@ from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_PURE_SCHEMA,
     DraftResidualSnapshot,
     ResidualFeatureEstimate,
+    build_team_rating_residual_evidence_cache,
 )
 from event_intelligence.prematch_features import (
     PREMATCH_FEATURE_SCHEMA_HASHES,
@@ -27,9 +28,12 @@ from event_intelligence.prematch_features import (
     verify_prematch_feature_snapshot,
 )
 from event_intelligence.rosh_features import (
+    ROSH_AUTHORITY_SCHEMA,
     ROSH_FEATURE_VERSION,
     ROSH_MODEL_SCHEMA,
+    ROSH_UNAVAILABLE_AUTHORITY_SCHEMA,
     RoshFeatureSnapshot,
+    build_unavailable_rosh_feature_snapshot_with_authority,
 )
 from event_intelligence.team_rating import (
     TEAM_RATING_VERSION,
@@ -50,6 +54,8 @@ from event_intelligence.team_rating_backtest import (
 
 UTC = timezone.utc
 TARGET_CUTOFF = datetime(2026, 7, 1, tzinfo=UTC)
+RADIANT_HEROES = (1, 2, 3, 4, 5)
+DIRE_HEROES = (6, 7, 8, 9, 10)
 
 
 def _digest(number: int) -> str:
@@ -224,6 +230,53 @@ def _rosh_snapshot(
     )
 
 
+def _draft_authority(
+    *,
+    positions_complete: bool = True,
+    radiant_hero_ids: tuple[int, ...] = RADIANT_HEROES,
+    dire_hero_ids: tuple[int, ...] = DIRE_HEROES,
+) -> dict[str, object]:
+    def players(hero_ids: tuple[int, ...], *, incomplete: bool) -> list[object]:
+        return [
+            {
+                "player_id": index + 100,
+                "hero_id": hero_id,
+                "expected_role": {
+                    "position": None if incomplete and index == 4 else index + 1,
+                },
+            }
+            for index, hero_id in enumerate(hero_ids)
+        ]
+
+    return {
+        "draft_authority": {
+            "target": {
+                "radiant": {
+                    "players": players(
+                        radiant_hero_ids,
+                        incomplete=not positions_complete,
+                    )
+                },
+                "dire": {"players": players(dire_hero_ids, incomplete=False)},
+            }
+        }
+    }
+
+
+def _standard_rosh_authority(
+    *,
+    radiant_hero_ids: tuple[int, ...] = RADIANT_HEROES,
+    dire_hero_ids: tuple[int, ...] = DIRE_HEROES,
+) -> dict[str, object]:
+    return {
+        "schema": ROSH_AUTHORITY_SCHEMA,
+        "target": {
+            "radiant_hero_ids": list(radiant_hero_ids),
+            "dire_hero_ids": list(dire_hero_ids),
+        },
+    }
+
+
 def _snapshot(
     *, outcome: bool = True, rosh_available: bool = True
 ) -> PrematchFeatureSnapshot:
@@ -293,8 +346,8 @@ def test_public_builder_replays_both_external_authorities(
     team_run = _team_run()
     draft = _draft_snapshot()
     rosh = _rosh_snapshot()
-    draft_authority = {"authority": "draft"}
-    rosh_authority = {"authority": "rosh"}
+    draft_authority = _draft_authority()
+    rosh_authority = _standard_rosh_authority()
     history = (team_run,)
     rosh_runs = (object(),)
     links = (object(),)
@@ -339,6 +392,164 @@ def test_public_builder_replays_both_external_authorities(
     assert calls["rosh"] == (rosh_authority, rosh_runs, tmp_path, links)
 
 
+def test_m5_compose_with_verified_evidence_cache_matches_strict_path() -> None:
+    team_run = _team_run()
+    draft = _draft_snapshot()
+    rosh = _rosh_snapshot()
+    strict = prematch_features._compose_prematch_feature_snapshot(
+        team_run,
+        draft,
+        rosh,
+    )
+    cache = build_team_rating_residual_evidence_cache((team_run,))
+    cached = prematch_features._compose_prematch_feature_snapshot(
+        team_run,
+        draft,
+        rosh,
+        team_rating_evidence_cache=cache,
+    )
+
+    assert cached == strict
+    assert cached.input_hash == strict.input_hash
+
+
+def test_public_builder_rejects_complete_position_cross_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_draft_residual_snapshot",
+        lambda *_args, **_kwargs: _draft_snapshot(),
+    )
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_rosh_feature_snapshot",
+        lambda *_args, **_kwargs: _rosh_snapshot(),
+    )
+
+    with pytest.raises(ValueError, match="position hero identities disagree"):
+        build_prematch_feature_snapshot(
+            _draft_authority(),
+            _standard_rosh_authority(
+                radiant_hero_ids=(2, 1, 3, 4, 5),
+            ),
+            target_team_rating=_team_run(),
+            team_rating_history=(),
+            rosh_runs=(),
+            artifact_root=tmp_path,
+        )
+
+
+def test_public_builder_replays_incomplete_positions_as_fixed_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    draft_authority = _draft_authority(positions_complete=False)
+    _rosh, rosh_authority = build_unavailable_rosh_feature_snapshot_with_authority(
+        match_id=100,
+        prediction_cutoff=TARGET_CUTOFF,
+        availability_mode=AvailabilityMode.RECONSTRUCTED,
+        radiant_hero_ids=reversed(RADIANT_HEROES),
+        dire_hero_ids={*DIRE_HEROES},
+    )
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_draft_residual_snapshot",
+        lambda *_args, **_kwargs: _draft_snapshot(),
+    )
+
+    snapshot = build_prematch_feature_snapshot(
+        draft_authority,
+        rosh_authority,
+        target_team_rating=_team_run(),
+        team_rating_history=(),
+        rosh_runs=(),
+        artifact_root=tmp_path,
+    )
+
+    assert rosh_authority["schema"] == ROSH_UNAVAILABLE_AUTHORITY_SCHEMA
+    assert snapshot.rosh_status == "unavailable"
+    assert snapshot.rosh_missing_reason == "expected_positions_incomplete"
+    assert snapshot.rosh_coverage == 0.0
+    assert dict(snapshot.rosh_features)["relative_advantage"] is None
+
+
+def test_public_builder_rejects_incomplete_position_cross_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _rosh, other_draft_authority = (
+        build_unavailable_rosh_feature_snapshot_with_authority(
+            match_id=100,
+            prediction_cutoff=TARGET_CUTOFF,
+            availability_mode=AvailabilityMode.RECONSTRUCTED,
+            radiant_hero_ids=(1, 2, 3, 4, 11),
+            dire_hero_ids=DIRE_HEROES,
+        )
+    )
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_draft_residual_snapshot",
+        lambda *_args, **_kwargs: _draft_snapshot(),
+    )
+
+    with pytest.raises(ValueError, match="hero sets disagree"):
+        build_prematch_feature_snapshot(
+            _draft_authority(positions_complete=False),
+            other_draft_authority,
+            target_team_rating=_team_run(),
+            team_rating_history=(),
+            rosh_runs=(),
+            artifact_root=tmp_path,
+        )
+
+
+def test_public_builder_requires_authority_schema_for_position_completeness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_draft_residual_snapshot",
+        lambda *_args, **_kwargs: _draft_snapshot(),
+    )
+    monkeypatch.setattr(
+        prematch_features,
+        "replay_rosh_feature_snapshot",
+        lambda *_args, **_kwargs: _rosh_snapshot(available=False),
+    )
+
+    with pytest.raises(ValueError, match="incomplete Draft positions require"):
+        build_prematch_feature_snapshot(
+            _draft_authority(positions_complete=False),
+            _standard_rosh_authority(),
+            target_team_rating=_team_run(),
+            team_rating_history=(),
+            rosh_runs=(),
+            artifact_root=tmp_path,
+        )
+
+    _snapshot, unavailable_authority = (
+        build_unavailable_rosh_feature_snapshot_with_authority(
+            match_id=100,
+            prediction_cutoff=TARGET_CUTOFF,
+            availability_mode=AvailabilityMode.RECONSTRUCTED,
+            radiant_hero_ids=RADIANT_HEROES,
+            dire_hero_ids=DIRE_HEROES,
+        )
+    )
+    with pytest.raises(ValueError, match="complete Draft positions require"):
+        build_prematch_feature_snapshot(
+            _draft_authority(),
+            unavailable_authority,
+            target_team_rating=_team_run(),
+            team_rating_history=(),
+            rosh_runs=(),
+            artifact_root=tmp_path,
+        )
+
+
 def test_public_builder_propagates_replay_tampering_and_identity_mismatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -373,8 +584,8 @@ def test_public_builder_propagates_replay_tampering_and_identity_mismatch(
     )
     with pytest.raises(ValueError, match="match_id"):
         build_prematch_feature_snapshot(
-            {},
-            {},
+            _draft_authority(),
+            _standard_rosh_authority(),
             target_team_rating=team_run,
             team_rating_history=(),
             rosh_runs=(),

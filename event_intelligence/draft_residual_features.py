@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from .draft_features import (
@@ -347,6 +348,199 @@ class TeamRatingResidualEvidence:
         if include_hash:
             payload["evidence_hash"] = self.evidence_hash
         return payload
+
+    def without_outcome(self) -> TeamRatingResidualEvidence:
+        """Return the same verified claim with the target outcome removed."""
+
+        if self.radiant_win is None:
+            return self
+        return replace(self, radiant_win=None, evidence_hash="")
+
+
+@dataclass(frozen=True)
+class TeamRatingResidualEvidenceCache:
+    """Immutable, strictly verified Team Rating claims for one M6 replay."""
+
+    entries: tuple[TeamRatingResidualEvidence, ...]
+    cache_hash: str = ""
+    _by_match: Mapping[int, TeamRatingResidualEvidence] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        entries = tuple(self.entries)
+        if any(not isinstance(row, TeamRatingResidualEvidence) for row in entries):
+            raise ValueError("Team Rating evidence cache entries are invalid")
+        # Canonicalize only at the dedicated construction boundary.  A repeated
+        # identical claim is harmless; contradictory claims for one map are not.
+        ordered = sorted(entries, key=lambda row: (row.match_id, row.run_id))
+        unique: list[TeamRatingResidualEvidence] = []
+        by_match: dict[int, TeamRatingResidualEvidence] = {}
+        for row in ordered:
+            existing = by_match.get(row.match_id)
+            if existing is not None:
+                if existing != row:
+                    raise ValueError(
+                        f"conflicting Team Rating evidence cache for match {row.match_id}"
+                    )
+                continue
+            if row.radiant_win is None:
+                raise ValueError(
+                    "Team Rating evidence cache entries require outcomes"
+                )
+            by_match[row.match_id] = row
+            unique.append(row)
+        canonical_entries = tuple(unique)
+        object.__setattr__(self, "entries", canonical_entries)
+        expected_hash = _hash(
+            {
+                "domain": "team-rating-residual-evidence-cache/v1",
+                "entries": [row.to_payload() for row in canonical_entries],
+            }
+        )
+        if not self.cache_hash:
+            object.__setattr__(self, "cache_hash", expected_hash)
+        elif not hmac.compare_digest(
+            _sha256(self.cache_hash, "Team Rating evidence cache hash"),
+            expected_hash,
+        ):
+            raise ValueError("Team Rating evidence cache hash does not recompute")
+        object.__setattr__(self, "_by_match", MappingProxyType(by_match))
+
+    def evidence_for_run(
+        self,
+        run: TeamRatingWalkForwardRun,
+        *,
+        include_outcome: bool,
+    ) -> TeamRatingResidualEvidence:
+        """Bind one cached claim to the supplied immutable run identity."""
+
+        if not isinstance(run, TeamRatingWalkForwardRun):
+            raise ValueError("Team Rating evidence requires a walk-forward run")
+        if not isinstance(include_outcome, bool):
+            raise ValueError("include_outcome must be boolean")
+        evidence = self._by_match.get(run.artifact.target.match_id)
+        if evidence is None:
+            raise ValueError(
+                "Team Rating evidence cache is missing match "
+                f"{run.artifact.target.match_id}"
+            )
+        _assert_cached_evidence_matches_run(
+            run,
+            evidence,
+            include_outcome=include_outcome,
+        )
+        if include_outcome:
+            return evidence
+        return evidence.without_outcome()
+
+
+def build_team_rating_residual_evidence_cache(
+    runs: Iterable[TeamRatingWalkForwardRun],
+) -> TeamRatingResidualEvidenceCache:
+    """Strictly verify each distinct Team Rating run once and freeze its claim."""
+
+    by_run_id: dict[str, TeamRatingWalkForwardRun] = {}
+    for run in runs:
+        if not isinstance(run, TeamRatingWalkForwardRun):
+            raise ValueError("Team Rating evidence requires walk-forward runs")
+        existing = by_run_id.get(run.run_id)
+        if existing is not None and existing != run:
+            raise ValueError(f"conflicting Team Rating run {run.run_id}")
+        by_run_id[run.run_id] = run
+    evidence: list[TeamRatingResidualEvidence] = []
+    for run in sorted(
+        by_run_id.values(),
+        key=lambda row: (row.artifact.target.match_id, row.run_id),
+    ):
+        if run.status == "insufficient_evidence":
+            continue
+        evidence.append(
+            TeamRatingResidualEvidence.from_walk_forward_run(
+                run,
+                include_outcome=True,
+            )
+        )
+    return TeamRatingResidualEvidenceCache(tuple(evidence))
+
+
+def _assert_cached_evidence_matches_run(
+    run: TeamRatingWalkForwardRun,
+    evidence: TeamRatingResidualEvidence,
+    *,
+    include_outcome: bool,
+) -> None:
+    """Check cache/run binding without replaying the expensive artifact."""
+
+    artifact = run.artifact
+    target = artifact.target
+    prediction = artifact.prediction
+    expected = {
+        "match_id": target.match_id,
+        "target_started_at": target.started_at,
+        "prediction_cutoff": prediction.prediction_cutoff,
+        "cutoff_source": run.cutoff_source,
+        "availability_mode": run.availability_mode,
+        "radiant_team_id": target.radiant_team_id,
+        "dire_team_id": target.dire_team_id,
+        "radiant_probability": prediction.raw_probability,
+        "prediction_input_hash": prediction.input_hash,
+        "artifact_hash": artifact.artifact_hash,
+        "artifact_training_input_hash": artifact.training_input_hash,
+        "run_id": run.run_id,
+        "authority_fingerprint": run.authority_fingerprint,
+        "combined_training_input_hash": run.combined_training_input_hash,
+    }
+    for field_name, expected_value in expected.items():
+        if getattr(evidence, field_name) != expected_value:
+            raise ValueError(
+                "Team Rating evidence cache does not match run "
+                f"{run.run_id}: {field_name}"
+            )
+    if include_outcome and evidence.radiant_win != run.eventual_radiant_win:
+        raise ValueError(
+            "Team Rating evidence cache does not match run "
+            f"{run.run_id}: radiant_win"
+        )
+    mode = AvailabilityMode(run.availability_mode)
+    if mode is AvailabilityMode.RECONSTRUCTED:
+        if evidence.first_usable_at is not None:
+            raise ValueError(
+                "reconstructed Team Rating evidence cache timing is invalid"
+            )
+        if evidence.reconstruction_rule != RECONSTRUCTION_RULE:
+            raise ValueError(
+                "Team Rating evidence cache reconstruction rule is invalid"
+            )
+    elif (
+        evidence.first_usable_at is None
+        or evidence.first_usable_at > evidence.prediction_cutoff
+        or evidence.reconstruction_rule is not None
+    ):
+        raise ValueError("prospective Team Rating evidence cache timing is invalid")
+
+
+def team_rating_residual_evidence(
+    run: TeamRatingWalkForwardRun,
+    *,
+    include_outcome: bool,
+    evidence_cache: TeamRatingResidualEvidenceCache | None = None,
+) -> TeamRatingResidualEvidence:
+    """Resolve one claim through a verified cache or the strict public path."""
+
+    if evidence_cache is None:
+        return TeamRatingResidualEvidence.from_walk_forward_run(
+            run,
+            include_outcome=include_outcome,
+        )
+    if not isinstance(evidence_cache, TeamRatingResidualEvidenceCache):
+        raise ValueError("Team Rating evidence cache has an unsupported type")
+    return evidence_cache.evidence_for_run(
+        run,
+        include_outcome=include_outcome,
+    )
 
 
 @dataclass(frozen=True)
@@ -1026,20 +1220,26 @@ def _draft_residual_authority_payload(
     *,
     target_team_rating: TeamRatingWalkForwardRun,
     team_rating_history: Iterable[TeamRatingWalkForwardRun],
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> dict[str, Any]:
     draft_snapshot, draft_authority = build_draft_feature_snapshot_with_authority(
         target,
         history,
     )
-    target_evidence = TeamRatingResidualEvidence.from_walk_forward_run(
+    target_evidence = team_rating_residual_evidence(
         target_team_rating,
         include_outcome=False,
+        evidence_cache=team_rating_evidence_cache,
     )
     eligible_raw = draft_authority["eligible_history"]
     if not isinstance(eligible_raw, list):
         raise AssertionError("Draft v3 authority history is not an array")
     eligible_ids = tuple(int(row["match_id"]) for row in eligible_raw)
-    by_match = _verified_history_evidence(eligible_ids, team_rating_history)
+    by_match = _verified_history_evidence(
+        eligible_ids,
+        team_rating_history,
+        evidence_cache=team_rating_evidence_cache,
+    )
     ordered = tuple(by_match[match_id] for match_id in eligible_ids if match_id in by_match)
     missing = [match_id for match_id in eligible_ids if match_id not in by_match]
     return {
@@ -1059,6 +1259,8 @@ def _draft_residual_authority_payload(
 def _verified_history_evidence(
     eligible_match_ids: Sequence[int],
     runs: Iterable[TeamRatingWalkForwardRun],
+    *,
+    evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> dict[int, TeamRatingResidualEvidence]:
     eligible = set(eligible_match_ids)
     by_match: dict[int, TeamRatingResidualEvidence] = {}
@@ -1070,9 +1272,10 @@ def _verified_history_evidence(
             continue
         if run.status == "insufficient_evidence":
             continue
-        evidence = TeamRatingResidualEvidence.from_walk_forward_run(
+        evidence = team_rating_residual_evidence(
             run,
             include_outcome=True,
+            evidence_cache=evidence_cache,
         )
         existing = by_match.get(match_id)
         if existing is not None and existing != evidence:
@@ -1086,6 +1289,7 @@ def _verify_team_rating_authority_claims(
     *,
     target_team_rating: TeamRatingWalkForwardRun,
     team_rating_history: Iterable[TeamRatingWalkForwardRun],
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> None:
     authority = _exact_object(
         authority_payload,
@@ -1099,11 +1303,16 @@ def _verify_team_rating_authority_claims(
     if not isinstance(eligible_raw, list):
         raise ValueError("Draft v3 eligible history must be an array")
     eligible_ids = tuple(int(row["match_id"]) for row in eligible_raw)
-    target_evidence = TeamRatingResidualEvidence.from_walk_forward_run(
+    target_evidence = team_rating_residual_evidence(
         target_team_rating,
         include_outcome=False,
+        evidence_cache=team_rating_evidence_cache,
     )
-    by_match = _verified_history_evidence(eligible_ids, team_rating_history)
+    by_match = _verified_history_evidence(
+        eligible_ids,
+        team_rating_history,
+        evidence_cache=team_rating_evidence_cache,
+    )
     ordered = tuple(by_match[match_id] for match_id in eligible_ids if match_id in by_match)
     expected_history = [row.to_payload() for row in ordered]
     expected_missing = [match_id for match_id in eligible_ids if match_id not in by_match]
@@ -1121,12 +1330,14 @@ def draft_residual_authority_payload(
     *,
     target_team_rating: TeamRatingWalkForwardRun,
     team_rating_history: Iterable[TeamRatingWalkForwardRun],
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> dict[str, Any]:
     authority = _draft_residual_authority_payload(
         target,
         history,
         target_team_rating=target_team_rating,
         team_rating_history=team_rating_history,
+        team_rating_evidence_cache=team_rating_evidence_cache,
     )
     _snapshot_from_authority(authority)
     return authority
@@ -1138,12 +1349,14 @@ def build_draft_residual_snapshot_with_authority(
     *,
     target_team_rating: TeamRatingWalkForwardRun,
     team_rating_history: Iterable[TeamRatingWalkForwardRun],
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> tuple[DraftResidualSnapshot, dict[str, Any]]:
     authority = _draft_residual_authority_payload(
         target,
         history,
         target_team_rating=target_team_rating,
         team_rating_history=team_rating_history,
+        team_rating_evidence_cache=team_rating_evidence_cache,
     )
     return _snapshot_from_authority(authority), authority
 
@@ -1154,12 +1367,14 @@ def build_draft_residual_snapshot(
     *,
     target_team_rating: TeamRatingWalkForwardRun,
     team_rating_history: Iterable[TeamRatingWalkForwardRun],
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> DraftResidualSnapshot:
     snapshot, _authority = build_draft_residual_snapshot_with_authority(
         target,
         history,
         target_team_rating=target_team_rating,
         team_rating_history=team_rating_history,
+        team_rating_evidence_cache=team_rating_evidence_cache,
     )
     return snapshot
 
@@ -1169,6 +1384,7 @@ def replay_draft_residual_snapshot(
     *,
     target_team_rating: TeamRatingWalkForwardRun,
     team_rating_history: Iterable[TeamRatingWalkForwardRun],
+    team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
 ) -> DraftResidualSnapshot:
     """Replay Draft authority and reverify every bounded M2 claim externally."""
 
@@ -1176,6 +1392,7 @@ def replay_draft_residual_snapshot(
         authority_payload,
         target_team_rating=target_team_rating,
         team_rating_history=team_rating_history,
+        team_rating_evidence_cache=team_rating_evidence_cache,
     )
     return _snapshot_from_authority(authority_payload)
 
@@ -1210,9 +1427,12 @@ __all__ = [
     "DraftResidualSnapshot",
     "ResidualFeatureEstimate",
     "TeamRatingResidualEvidence",
+    "TeamRatingResidualEvidenceCache",
     "build_draft_residual_snapshot",
     "build_draft_residual_snapshot_with_authority",
+    "build_team_rating_residual_evidence_cache",
     "draft_residual_authority_payload",
     "project_draft_residual_features",
     "replay_draft_residual_snapshot",
+    "team_rating_residual_evidence",
 ]

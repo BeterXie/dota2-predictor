@@ -40,6 +40,7 @@ from .draft_features import AvailabilityMode
 UTC = timezone.utc
 ROSH_FEATURE_VERSION = "official-rosh-features-v1"
 ROSH_AUTHORITY_SCHEMA = "official-rosh-feature-authority/v1"
+ROSH_UNAVAILABLE_AUTHORITY_SCHEMA = "official-rosh-feature-unavailable-authority/v1"
 ROSH_REQUEST_PLAN_WITNESS_SCHEMA = "official-rosh-request-plan-witness/v1"
 ROSH_PROSPECTIVE_TIMING_SCHEMA = "official-rosh-prospective-timing/v1"
 
@@ -83,6 +84,18 @@ _AUTHORITY_FIELDS = (
     "request_plan_witness",
     "prospective_timing",
 )
+_UNAVAILABLE_AUTHORITY_FIELDS = (
+    "schema",
+    "feature_version",
+    "match_id",
+    "prediction_cutoff",
+    "availability_mode",
+    "radiant_hero_ids",
+    "dire_hero_ids",
+    "missing_reason",
+    "authority_hash",
+)
+_EXPECTED_POSITIONS_INCOMPLETE = "expected_positions_incomplete"
 
 
 class _UnavailableEvidence(Exception):
@@ -185,6 +198,13 @@ def _hero_ids(value: Iterable[int], field: str) -> tuple[int, ...]:
     for hero_id in result:
         _positive_int(hero_id, field)
     return result
+
+
+def _canonical_hero_set(value: Iterable[int], field: str) -> tuple[int, ...]:
+    result = _hero_ids(value, field)
+    if len(set(result)) != 5:
+        raise ValueError(f"{field} must contain five unique heroes")
+    return tuple(sorted(result))
 
 
 @dataclass(frozen=True)
@@ -792,6 +812,92 @@ def _authority_payload(
             None if prospective_timing is None else prospective_timing.to_payload()
         ),
     }
+
+
+def _unavailable_authority_payload(
+    *,
+    match_id: int,
+    prediction_cutoff: datetime,
+    availability_mode: str | AvailabilityMode,
+    radiant_hero_ids: Iterable[int],
+    dire_hero_ids: Iterable[int],
+    reason: str,
+) -> dict[str, object]:
+    match = _positive_int(match_id, "R.O.S.H. unavailable match_id")
+    cutoff = _utc(
+        prediction_cutoff,
+        "R.O.S.H. unavailable prediction_cutoff",
+    )
+    mode = AvailabilityMode(availability_mode)
+    radiant = _canonical_hero_set(radiant_hero_ids, "radiant_hero_ids")
+    dire = _canonical_hero_set(dire_hero_ids, "dire_hero_ids")
+    if len(set((*radiant, *dire))) != 10:
+        raise ValueError("R.O.S.H. unavailable heroes must be unique")
+    if reason != _EXPECTED_POSITIONS_INCOMPLETE:
+        raise ValueError("unsupported R.O.S.H. unavailable reason")
+    payload: dict[str, object] = {
+        "schema": ROSH_UNAVAILABLE_AUTHORITY_SCHEMA,
+        "feature_version": ROSH_FEATURE_VERSION,
+        "match_id": match,
+        "prediction_cutoff": cutoff.isoformat(),
+        "availability_mode": mode.value,
+        "radiant_hero_ids": list(radiant),
+        "dire_hero_ids": list(dire),
+        "missing_reason": reason,
+    }
+    payload["authority_hash"] = _hash(
+        {
+            "domain": "official-rosh-feature-unavailable-authority-hash/v1",
+            "authority": payload,
+        }
+    )
+    return payload
+
+
+def _validated_unavailable_authority(
+    authority_payload: Mapping[str, Any],
+) -> tuple[int, datetime, str, tuple[int, ...], tuple[int, ...], str]:
+    authority = _exact_object(
+        authority_payload,
+        _UNAVAILABLE_AUTHORITY_FIELDS,
+        "R.O.S.H. unavailable feature authority",
+    )
+    if authority["schema"] != ROSH_UNAVAILABLE_AUTHORITY_SCHEMA:
+        raise ValueError("unsupported R.O.S.H. unavailable authority schema")
+    if authority["feature_version"] != ROSH_FEATURE_VERSION:
+        raise ValueError("unsupported R.O.S.H. feature version")
+    match_id = _positive_int(authority["match_id"], "match_id")
+    cutoff = _parse_utc(authority["prediction_cutoff"], "prediction_cutoff")
+    if authority["prediction_cutoff"] != cutoff.isoformat():
+        raise ValueError("R.O.S.H. unavailable cutoff is not canonical UTC")
+    if not isinstance(authority["availability_mode"], str):
+        raise ValueError("R.O.S.H. unavailable mode must be a string")
+    mode = AvailabilityMode(authority["availability_mode"]).value
+    radiant_raw = authority["radiant_hero_ids"]
+    dire_raw = authority["dire_hero_ids"]
+    if not isinstance(radiant_raw, list) or not isinstance(dire_raw, list):
+        raise ValueError("R.O.S.H. unavailable heroes must be arrays")
+    radiant = _canonical_hero_set(radiant_raw, "radiant_hero_ids")
+    dire = _canonical_hero_set(dire_raw, "dire_hero_ids")
+    if radiant_raw != list(radiant) or dire_raw != list(dire):
+        raise ValueError("R.O.S.H. unavailable heroes are not canonical")
+    if len(set((*radiant, *dire))) != 10:
+        raise ValueError("R.O.S.H. unavailable heroes must be unique")
+    reason = authority["missing_reason"]
+    if reason != _EXPECTED_POSITIONS_INCOMPLETE:
+        raise ValueError("unsupported R.O.S.H. unavailable reason")
+    claimed_hash = _sha256(authority["authority_hash"], "authority_hash")
+    expected = _unavailable_authority_payload(
+        match_id=match_id,
+        prediction_cutoff=cutoff,
+        availability_mode=mode,
+        radiant_hero_ids=radiant,
+        dire_hero_ids=dire,
+        reason=reason,
+    )
+    if not hmac.compare_digest(claimed_hash, str(expected["authority_hash"])):
+        raise ValueError("R.O.S.H. unavailable authority hash does not recompute")
+    return match_id, cutoff, mode, radiant, dire, reason
 
 
 def _validated_authority(
@@ -1592,6 +1698,23 @@ def _unavailable_snapshot(
     target: RoshFeatureTarget,
     reason: str,
 ) -> RoshFeatureSnapshot:
+    return _unavailable_snapshot_for_identity(
+        authority,
+        match_id=target.match_id,
+        prediction_cutoff=target.prediction_cutoff,
+        availability_mode=target.availability_mode,
+        reason=reason,
+    )
+
+
+def _unavailable_snapshot_for_identity(
+    authority: Mapping[str, Any],
+    *,
+    match_id: int,
+    prediction_cutoff: datetime,
+    availability_mode: str,
+    reason: str,
+) -> RoshFeatureSnapshot:
     input_hash = _hash(
         {
             "domain": "official-rosh-feature-input/v1",
@@ -1601,9 +1724,9 @@ def _unavailable_snapshot(
         }
     )
     return RoshFeatureSnapshot(
-        match_id=target.match_id,
-        prediction_cutoff=target.prediction_cutoff,
-        availability_mode=target.availability_mode,
+        match_id=match_id,
+        prediction_cutoff=prediction_cutoff,
+        availability_mode=availability_mode,
         status=_UNAVAILABLE,
         missing_reason=reason,
         feature_version=ROSH_FEATURE_VERSION,
@@ -1679,6 +1802,40 @@ def _effective_selected_run_id(
     return prospective_timing.run_id
 
 
+def build_unavailable_rosh_feature_snapshot_with_authority(
+    *,
+    match_id: int,
+    prediction_cutoff: datetime,
+    availability_mode: str | AvailabilityMode,
+    radiant_hero_ids: Iterable[int],
+    dire_hero_ids: Iterable[int],
+    reason: str = _EXPECTED_POSITIONS_INCOMPLETE,
+) -> tuple[RoshFeatureSnapshot, dict[str, object]]:
+    """Build the fixed missing projection when expected positions are incomplete."""
+
+    authority = _unavailable_authority_payload(
+        match_id=match_id,
+        prediction_cutoff=prediction_cutoff,
+        availability_mode=availability_mode,
+        radiant_hero_ids=radiant_hero_ids,
+        dire_hero_ids=dire_hero_ids,
+        reason=reason,
+    )
+    validated_match, cutoff, mode, _radiant, _dire, missing_reason = (
+        _validated_unavailable_authority(authority)
+    )
+    return (
+        _unavailable_snapshot_for_identity(
+            authority,
+            match_id=validated_match,
+            prediction_cutoff=cutoff,
+            availability_mode=mode,
+            reason=missing_reason,
+        ),
+        authority,
+    )
+
+
 def build_rosh_feature_snapshot_with_authority(
     target: RoshFeatureTarget,
     runs: Iterable[StoredRoshRun],
@@ -1749,6 +1906,20 @@ def replay_rosh_feature_snapshot(
 ) -> RoshFeatureSnapshot:
     """Replay M4 from external run/link/archive authority and reject claim drift."""
 
+    if not isinstance(authority_payload, Mapping):
+        raise ValueError("R.O.S.H. authority payload must be an object")
+    if authority_payload.get("schema") == ROSH_UNAVAILABLE_AUTHORITY_SCHEMA:
+        match_id, cutoff, mode, _radiant, _dire, reason = (
+            _validated_unavailable_authority(authority_payload)
+        )
+        return _unavailable_snapshot_for_identity(
+            authority_payload,
+            match_id=match_id,
+            prediction_cutoff=cutoff,
+            availability_mode=mode,
+            reason=reason,
+        )
+
     target, requested, candidate_ids, _witness, _timing = _validated_authority(
         authority_payload
     )
@@ -1785,6 +1956,7 @@ __all__ = [
     "ROSH_MODEL_SCHEMA_HASH",
     "ROSH_PROSPECTIVE_TIMING_SCHEMA",
     "ROSH_REQUEST_PLAN_WITNESS_SCHEMA",
+    "ROSH_UNAVAILABLE_AUTHORITY_SCHEMA",
     "RoshFeatureSnapshot",
     "RoshFeatureTarget",
     "RoshProspectiveTimingAuthority",
@@ -1792,6 +1964,7 @@ __all__ = [
     "RoshResponseTiming",
     "build_rosh_feature_snapshot",
     "build_rosh_feature_snapshot_with_authority",
+    "build_unavailable_rosh_feature_snapshot_with_authority",
     "project_rosh_features",
     "replay_rosh_feature_snapshot",
 ]

@@ -18,12 +18,14 @@ from event_intelligence.rosh_features import (
     ROSH_FEATURE_VERSION,
     ROSH_MODEL_SCHEMA,
     ROSH_MODEL_SCHEMA_HASH,
+    ROSH_UNAVAILABLE_AUTHORITY_SCHEMA,
     RoshFeatureTarget,
     RoshProspectiveTimingAuthority,
     RoshRequestPlanWitness,
     RoshResponseTiming,
     build_rosh_feature_snapshot,
     build_rosh_feature_snapshot_with_authority,
+    build_unavailable_rosh_feature_snapshot_with_authority,
     project_rosh_features,
     replay_rosh_feature_snapshot,
 )
@@ -347,6 +349,101 @@ def _prospective_target() -> RoshFeatureTarget:
         match_source="stratz",
         source_match_id="999001",
     )
+
+
+def test_expected_position_unavailable_authority_is_canonical_and_replayable(
+    tmp_path: Path,
+) -> None:
+    local_cutoff = datetime(2026, 7, 28, 20, 0, tzinfo=timezone(timedelta(hours=8)))
+    snapshot, authority = build_unavailable_rosh_feature_snapshot_with_authority(
+        match_id=MATCH_ID,
+        prediction_cutoff=local_cutoff,
+        availability_mode=AvailabilityMode.RECONSTRUCTED,
+        radiant_hero_ids=reversed(RADIANT),
+        dire_hero_ids={*DIRE},
+    )
+    repeated, repeated_authority = (
+        build_unavailable_rosh_feature_snapshot_with_authority(
+            match_id=MATCH_ID,
+            prediction_cutoff=local_cutoff.astimezone(UTC),
+            availability_mode=AvailabilityMode.RECONSTRUCTED.value,
+            radiant_hero_ids=sorted(RADIANT),
+            dire_hero_ids=reversed(DIRE),
+        )
+    )
+
+    assert authority["schema"] == ROSH_UNAVAILABLE_AUTHORITY_SCHEMA
+    assert authority["prediction_cutoff"] == local_cutoff.astimezone(UTC).isoformat()
+    assert authority["radiant_hero_ids"] == sorted(RADIANT)
+    assert authority["dire_hero_ids"] == sorted(DIRE)
+    assert len(str(authority["authority_hash"])) == 64
+    assert repeated_authority == authority
+    assert repeated == snapshot
+    assert snapshot.status == "unavailable"
+    assert snapshot.missing_reason == "expected_positions_incomplete"
+    assert snapshot.coverage == 0.0
+    assert snapshot.run_id is None
+    assert snapshot.profile_hash is None
+    assert snapshot.result_hash is None
+    projection = project_rosh_features(snapshot)
+    for name in ROSH_FEATURE_SCHEMA:
+        if name == "coverage":
+            assert projection[name] == 0.0
+            assert projection[f"{name}__missing"] == 0.0
+        else:
+            assert projection[name] is None
+            assert projection[f"{name}__missing"] == 1.0
+    assert (
+        replay_rosh_feature_snapshot(
+            authority,
+            runs=(),
+            artifact_root=tmp_path,
+        )
+        == snapshot
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.update(match_id=MATCH_ID + 1),
+        lambda value: value.update(authority_hash="0" * 64),
+        lambda value: value.update(missing_reason="run_unavailable"),
+        lambda value: value["radiant_hero_ids"].reverse(),
+    ),
+)
+def test_expected_position_unavailable_authority_rejects_tampering(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    _snapshot, authority = build_unavailable_rosh_feature_snapshot_with_authority(
+        match_id=MATCH_ID,
+        prediction_cutoff=STARTED_AT,
+        availability_mode=AvailabilityMode.RECONSTRUCTED,
+        radiant_hero_ids=RADIANT,
+        dire_hero_ids=DIRE,
+    )
+    changed = copy.deepcopy(authority)
+    mutate(changed)
+
+    with pytest.raises(ValueError):
+        replay_rosh_feature_snapshot(
+            changed,
+            runs=(),
+            artifact_root=tmp_path,
+        )
+
+
+def test_expected_position_unavailable_authority_rejects_other_reasons() -> None:
+    with pytest.raises(ValueError, match="unsupported.*reason"):
+        build_unavailable_rosh_feature_snapshot_with_authority(
+            match_id=MATCH_ID,
+            prediction_cutoff=STARTED_AT,
+            availability_mode=AvailabilityMode.RECONSTRUCTED,
+            radiant_hero_ids=RADIANT,
+            dire_hero_ids=DIRE,
+            reason="run_unavailable",
+        )
 
 
 def _prospective_link(
