@@ -1086,10 +1086,9 @@ export interface PrematchModelSummary {
   status: PrematchModelStatus;
   created_at: string;
   calibration: PrematchCalibrationSummary | null;
-  /** Optional deployment proof fields; absent means the UI cannot authorize use. */
-  runtime_authorized?: boolean;
-  deployment_key?: string | null;
-  evidence_mode?: string | null;
+  runtime_ready: boolean;
+  runtime_block_reason: string | null;
+  deployment_key: string | null;
 }
 
 export interface PrematchTopContribution {
@@ -1098,6 +1097,32 @@ export interface PrematchTopContribution {
   input_value?: number | null;
   log_odds_contribution?: number | null;
   [key: string]: unknown;
+}
+
+export type PrematchClusterId =
+  | "C0" | "C1" | "C2" | "C3" | "C4"
+  | "C5" | "C6" | "C7" | "C8" | "C9";
+
+export interface PrematchClusterCount {
+  radiant: number;
+  dire: number;
+  difference: number;
+}
+
+export interface PrematchClusterAssignment {
+  hero_id: number;
+  expected_role: string | null;
+  expected_lane: string | null;
+  cluster_id: PrematchClusterId | "unavailable";
+  mapping_support: number;
+  mapping_confidence: number;
+  assignment_source: string;
+  missing_reason: string | null;
+}
+
+export interface PrematchClusterAssignments {
+  radiant: PrematchClusterAssignment[];
+  dire: PrematchClusterAssignment[];
 }
 
 export interface PrematchRoshMetrics {
@@ -1142,6 +1167,14 @@ export interface PrematchPrediction {
   draft_logit_delta: number | null;
   rosh_logit_delta: number | null;
   cluster_logit_delta: number | null;
+  cluster_coverage: number;
+  cluster_support: number;
+  cluster_resource_version: string | null;
+  cluster_evidence_mode: string | null;
+  cluster_missing_reason: string | null;
+  cluster_counts: Partial<Record<PrematchClusterId, PrematchClusterCount>>;
+  cluster_assignments: PrematchClusterAssignments;
+  top_cluster_contributions: PrematchTopContribution[];
   total_adjustment: number | null;
   coverage: number | null;
   support: number | null;
@@ -1157,6 +1190,9 @@ export interface PrematchPrediction {
   calibration_status?: PrematchCalibrationStatus | null;
   rosh_metrics?: PrematchRoshMetrics | null;
   rosh_features?: PrematchRoshMetrics | null;
+  runtime_ready: boolean;
+  runtime_block_reason: string | null;
+  deployment_key: string | null;
 }
 
 export interface PrematchPagination {

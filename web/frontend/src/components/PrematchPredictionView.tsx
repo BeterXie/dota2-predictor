@@ -16,6 +16,7 @@ import {
 } from "../api";
 import type {
   PrematchAvailabilityMode,
+  PrematchClusterId,
   PrematchModelSummary,
   PrematchPrediction,
   PrematchPredictionPage,
@@ -24,6 +25,9 @@ import type {
 import "./PrematchPredictionView.css";
 
 const PAGE_SIZE = 20;
+const CLUSTER_IDS: PrematchClusterId[] = [
+  "C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9",
+];
 
 const CALIBRATION_LABELS: Record<string, string> = {
   unsupported: "不支持",
@@ -39,6 +43,7 @@ const MODEL_LABELS: Record<string, string> = {
   team_plus_draft: "球队 + Draft",
   team_plus_rosh: "球队 + R.O.S.H.",
   team_plus_draft_rosh: "球队 + Draft + R.O.S.H.",
+  team_plus_draft_rosh_clusters: "球队 + Draft + R.O.S.H. + Cluster",
 };
 
 const PREDICTION_STATUS_LABELS: Record<string, string> = {
@@ -57,8 +62,8 @@ const AVAILABILITY_LABELS: Record<PrematchAvailabilityMode, string> = {
 interface GateResult {
   /** Existing, current-lineage numbers may be shown as evidence. */
   evidenceAllowed: boolean;
-  /** Only a prospective, explicitly authorized deployment may be applied. */
-  runtimeAuthorized: boolean;
+  /** True only when the configured Frozen Deployment passes automatic checks. */
+  runtimeReady: boolean;
   label: string;
 }
 
@@ -250,7 +255,7 @@ export function PrematchPredictionView() {
                     <span role="cell"><strong>{modelLabel(prediction.model_kind)}</strong><small>{availabilityLabel(prediction.availability_mode)}</small></span>
                     <span role="cell" className="prematch-prediction-number">{formatProbability(prediction.team_base_probability, gate.evidenceAllowed)}</span>
                     <span role="cell" className="prematch-prediction-number">{formatProbability(prediction.raw_probability, gate.evidenceAllowed)} <small>/ {formatProbability(prediction.calibrated_probability, gate.evidenceAllowed)}</small></span>
-                    <span role="cell"><span className={`prematch-prediction-status ${gate.runtimeAuthorized ? "allowed" : "blocked"}`}>{gate.label}</span></span>
+                    <span role="cell"><span className={`prematch-prediction-status ${gate.runtimeReady ? "allowed" : "blocked"}`}>{gate.label}</span></span>
                   </button>
                 );
               })}
@@ -304,6 +309,11 @@ function PredictionEvidence({
   gate: GateResult;
 }) {
   const rosh = prediction.rosh_metrics || prediction.rosh_features || null;
+  const clusterAvailable = prediction.cluster_resource_version != null;
+  const clusterApplied = clusterAvailable
+    && prediction.model_kind === "team_plus_draft_rosh_clusters"
+    && prediction.cluster_logit_delta != null
+    && Number.isFinite(prediction.cluster_logit_delta);
   return (
     <aside className="prematch-prediction-evidence" aria-label={`比赛 ${prediction.match_id} 预测证据`}>
       <header>
@@ -311,18 +321,20 @@ function PredictionEvidence({
         {loading && <Spinner size="tiny" label="正在读取详情" />}
       </header>
       {detailError && <p className="prematch-prediction-detail-note">{detailError}</p>}
-      <div className={`prematch-prediction-gate ${gate.runtimeAuthorized ? "allowed" : "blocked"}`}>
+      <div className={`prematch-prediction-gate ${gate.runtimeReady ? "allowed" : "blocked"}`}>
         <strong>{gate.label}</strong>
         <span>{gate.evidenceAllowed
-          ? gate.runtimeAuthorized
-            ? "当前记录满足展示条件"
-            : "历史证据可查看，但当前运行未获授权"
-          : "当前状态禁止运行授权"}</span>
+          ? gate.runtimeReady
+            ? "Frozen Deployment 自动检查通过"
+            : "历史证据可查看，当前记录不参与前瞻运行"
+          : "Frozen Deployment 自动检查未通过"}</span>
       </div>
       <dl className="prematch-prediction-meta">
         <Metric label="模型状态" value={modelStatusLabel(prediction.model_status)} />
         <Metric label="availability mode" value={availabilityLabel(prediction.availability_mode)} />
-        <Metric label="校准状态" value={calibrationLabel(model?.calibration?.status || prediction.calibration_status)} />
+        <Metric label="校准状态" value={calibrationLabel(prediction.calibration_status || model?.calibration?.status)} />
+        <Metric label="runtime ready" value={prediction.runtime_ready ? "就绪" : "未就绪"} />
+        <Metric label="deployment key" value={shortIdentity(prediction.deployment_key)} />
         <Metric label="prediction cutoff" value={shortDate(prediction.prediction_cutoff)} />
         <Metric label="settled" value={prediction.settled_at ? "已结算" : "未结算"} />
       </dl>
@@ -336,9 +348,62 @@ function PredictionEvidence({
         <ComponentMetric label="parameter uncertainty" value={formatUncertainty(prediction.parameter_uncertainty, gate.evidenceAllowed)} />
         <ComponentMetric label="coverage / support" value={formatCoverageSupport(prediction.coverage, prediction.support)} />
       </div>
+      <section className="prematch-prediction-cluster" aria-label="C0-C9 阵容结构">
+        <header>
+          <div><span>CLUSTER FEATURES</span><h4>C0–C9 阵容结构</h4></div>
+          <strong className={clusterApplied ? "applied" : "not-applied"}>
+            {clusterApplied ? "当前模型已采用" : "当前模型未采用"}
+          </strong>
+        </header>
+        <p>Cluster 是结构修正特征，不是独立胜率，也不是固定权重。</p>
+        <div className="prematch-prediction-cluster-metrics">
+          <ComponentMetric
+            label="Cluster 修正值"
+            value={formatLogit(prediction.cluster_logit_delta, clusterAvailable)}
+          />
+          <ComponentMetric
+            label="Cluster coverage / support"
+            value={formatClusterCoverageSupport(prediction, clusterAvailable)}
+          />
+          <ComponentMetric
+            label="资源版本"
+            value={prediction.cluster_resource_version || "不可用"}
+          />
+          <ComponentMetric
+            label="证据模式"
+            value={clusterEvidenceLabel(prediction.cluster_evidence_mode)}
+          />
+        </div>
+        {clusterAvailable ? (
+          <div className="prematch-prediction-cluster-table-wrap">
+            <div className="prematch-prediction-cluster-table" role="table" aria-label="C0-C9 阵营计数">
+              <div role="row">
+                <span role="columnheader">阵营</span>
+                {CLUSTER_IDS.map((clusterId) => <span role="columnheader" key={clusterId}>{clusterId}</span>)}
+              </div>
+              <ClusterCountRow label="Radiant" field="radiant" prediction={prediction} />
+              <ClusterCountRow label="Dire" field="dire" prediction={prediction} />
+              <ClusterCountRow label="差值" field="difference" prediction={prediction} />
+            </div>
+          </div>
+        ) : (
+          <p className="prematch-prediction-cluster-empty">{clusterReasonLabel(prediction.cluster_missing_reason)}</p>
+        )}
+        {!clusterApplied && (
+          <p className="prematch-prediction-cluster-note">
+            未采用原因：{clusterNotAppliedReason(prediction, clusterAvailable)}。此条最终概率沿用无 Cluster 模型。
+          </p>
+        )}
+        {clusterApplied && prediction.cluster_missing_reason && (
+          <p className="prematch-prediction-cluster-note">
+            分析状态：{clusterReasonLabel(prediction.cluster_missing_reason)}
+          </p>
+        )}
+      </section>
       <footer className="prematch-prediction-evidence-footer">
         <span>截断来源：{prediction.cutoff_source}</span>
         <span>血缘修订：{prediction.dependency_revision}</span>
+        {prediction.runtime_block_reason && <code>{prediction.runtime_block_reason}</code>}
         {prediction.reason && <code>{prediction.reason}</code>}
       </footer>
     </aside>
@@ -353,6 +418,27 @@ function ComponentMetric({ label, value }: { label: string; value: string }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
 }
 
+function ClusterCountRow({
+  label,
+  field,
+  prediction,
+}: {
+  label: string;
+  field: "radiant" | "dire" | "difference";
+  prediction: PrematchPrediction;
+}) {
+  return (
+    <div role="row">
+      <strong role="rowheader">{label}</strong>
+      {CLUSTER_IDS.map((clusterId) => (
+        <span role="cell" key={clusterId}>
+          {formatClusterCount(prediction.cluster_counts[clusterId]?.[field])}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function predictionGate(
   prediction: PrematchPrediction,
   model: PrematchModelSummary | null,
@@ -363,42 +449,50 @@ function predictionGate(
       && prediction.model_status === "trained",
   );
   if (!modelReady) {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: modelStatusLabel(prediction.model_status) };
+    return { evidenceAllowed: false, runtimeReady: false, label: modelStatusLabel(prediction.model_status) };
   }
   if (prediction.status !== "predicted" && prediction.status !== "settled") {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: predictionStatusLabel(prediction.status) };
+    return { evidenceAllowed: false, runtimeReady: false, label: predictionStatusLabel(prediction.status) };
   }
   if (!prediction.validation) {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: "缺少验证记录" };
+    return { evidenceAllowed: false, runtimeReady: false, label: "缺少验证记录" };
   }
   if (prediction.raw_probability == null || !Number.isFinite(prediction.raw_probability)) {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: "概率不可用" };
+    return { evidenceAllowed: false, runtimeReady: false, label: "概率不可用" };
   }
 
-  const calibrationStatus = model?.calibration?.status || prediction.calibration_status;
-  const calibrationGatePassed = model?.calibration?.gate_passed === true;
-  if (prediction.availability_mode === "prospective" && model?.runtime_authorized !== true) {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: "运行未授权" };
+  const calibrationStatus = prediction.calibration_status || model?.calibration?.status;
+  if (prediction.availability_mode === "reconstructed_walk_forward") {
+    return { evidenceAllowed: true, runtimeReady: false, label: "仅历史重建" };
   }
-  const runtimeAuthorized = prediction.availability_mode === "prospective"
-    && model?.runtime_authorized === true
-    && calibrationStatus === "passed"
-    && calibrationGatePassed
+  const runtimeReady = prediction.runtime_ready === true
+    && model?.runtime_ready === true
+    && prediction.deployment_key != null
+    && prediction.deployment_key === model.deployment_key
     && prediction.calibrated_probability != null
     && Number.isFinite(prediction.calibrated_probability);
-  if (runtimeAuthorized) {
-    return { evidenceAllowed: true, runtimeAuthorized: true, label: "运行已授权" };
+  if (runtimeReady) {
+    return { evidenceAllowed: true, runtimeReady: true, label: "运行就绪" };
   }
-  if (prediction.availability_mode === "reconstructed_walk_forward") {
-    return { evidenceAllowed: true, runtimeAuthorized: false, label: "仅历史重建" };
+  const blockReason = prediction.runtime_block_reason || model?.runtime_block_reason;
+  if (prediction.runtime_ready !== true || model?.runtime_ready !== true) {
+    return { evidenceAllowed: false, runtimeReady: false, label: runtimeBlockLabel(blockReason) };
+  }
+  if (!prediction.deployment_key || prediction.deployment_key !== model?.deployment_key) {
+    return { evidenceAllowed: false, runtimeReady: false, label: "部署身份不一致" };
   }
   if (!calibrationStatus) {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: "缺少校准状态" };
+    return { evidenceAllowed: false, runtimeReady: false, label: "缺少校准状态" };
   }
-  if (calibrationStatus === "passed" && !calibrationGatePassed) {
-    return { evidenceAllowed: false, runtimeAuthorized: false, label: "缺少校准门槛证明" };
-  }
-  return { evidenceAllowed: false, runtimeAuthorized: false, label: calibrationLabel(calibrationStatus) };
+  return { evidenceAllowed: false, runtimeReady: false, label: calibrationLabel(calibrationStatus) };
+}
+
+function runtimeBlockLabel(reason: string | null | undefined): string {
+  if (reason === "deployment_not_configured") return "冻结部署未配置";
+  if (reason === "deployment_invalid") return "冻结部署无效";
+  if (reason?.includes("stale") || reason?.includes("revision")) return "部署血缘已过期";
+  if (reason?.includes("calibration")) return "校准未通过";
+  return "运行未就绪";
 }
 
 function findModel(models: PrematchModelSummary[], prediction: PrematchPrediction): PrematchModelSummary | null {
@@ -458,6 +552,42 @@ function formatCoverageSupport(coverage: number | null, support: number | null):
   return `${coverageText} / ${support == null ? "未提供" : support}`;
 }
 
+function formatClusterCoverageSupport(
+  prediction: PrematchPrediction,
+  available: boolean,
+): string {
+  if (!available || !Number.isFinite(prediction.cluster_coverage)) return "不可用";
+  return `${(prediction.cluster_coverage * 100).toFixed(1)}% / ${prediction.cluster_support}`;
+}
+
+function formatClusterCount(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "–";
+  return Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1);
+}
+
+function clusterEvidenceLabel(mode: string | null): string {
+  if (mode === "published_static") return "发布静态";
+  if (mode === "reconstructed_walk_forward") return "历史重建";
+  return "不可用";
+}
+
+function clusterReasonLabel(reason: string | null): string {
+  if (reason === "cluster_evidence_unavailable") return "Cluster 证据不可用";
+  if (reason === "partial_cluster_assignment") return "部分英雄缺少可靠 Cluster 映射";
+  return reason || "未提供原因";
+}
+
+function clusterNotAppliedReason(
+  prediction: PrematchPrediction,
+  available: boolean,
+): string {
+  if (!available) return clusterReasonLabel(prediction.cluster_missing_reason);
+  if (prediction.model_kind !== "team_plus_draft_rosh_clusters") {
+    return "当前模型为无 Cluster 版本";
+  }
+  return clusterReasonLabel(prediction.cluster_missing_reason || prediction.reason);
+}
+
 function formatRoshMetric(metrics: PrematchRoshMetrics | null, allowed: boolean): string {
   if (!allowed) return "不可用";
   if (!metrics) return "未提供";
@@ -478,6 +608,10 @@ function shortDate(value: string): string {
     minute: "2-digit",
     hour12: false,
   });
+}
+
+function shortIdentity(value: string | null): string {
+  return value ? `${value.slice(0, 12)}…` : "未绑定";
 }
 
 function errorMessage(reason: unknown, fallback: string): string {

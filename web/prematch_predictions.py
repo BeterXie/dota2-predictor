@@ -3,18 +3,26 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import Any, Iterator, Literal, Mapping
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from sqlalchemy.exc import SQLAlchemyError
 
 from database.session import PostgresSession
-from event_intelligence.prematch_calibration import (
-    CALIBRATION_MIN_EVALUATION_SUPPORT,
+from event_intelligence.prematch_deployment import (
+    FrozenPrematchDeployment,
+    assert_frozen_prematch_deployment_deployable,
+    load_frozen_prematch_deployment_json,
 )
-from event_intelligence.prematch_storage import PREMATCH_VALIDATION_VERSION
+from event_intelligence.prematch_storage import (
+    PREMATCH_VALIDATION_VERSION,
+    current_prematch_lineage_revisions,
+)
 
 from . import queries
 
@@ -30,6 +38,7 @@ ModelKind = Literal[
     "team_plus_draft",
     "team_plus_rosh",
     "team_plus_draft_rosh",
+    "team_plus_draft_rosh_clusters",
 ]
 AvailabilityMode = Literal["reconstructed_walk_forward", "prospective"]
 ModelStatus = Literal["trained", "insufficient_evidence"]
@@ -49,18 +58,120 @@ _CONTRIBUTION_FIELDS = (
     "log_odds_contribution",
     "was_imputed",
 )
-_BLOCKED_CALIBRATION_STATUSES = {"unsupported", "failed"}
 _CALIBRATION_STATUSES = {
-    *_BLOCKED_CALIBRATION_STATUSES,
+    "unsupported",
+    "failed",
     "provisional",
     "reconstructed_only",
     "shadow_collecting",
     "passed",
 }
+_CLUSTER_IDS = tuple(f"C{index}" for index in range(10))
+_CLUSTER_METADATA_FIELDS = frozenset(
+    {
+        "cluster_resource_version",
+        "cluster_evidence_mode",
+        "cluster_coverage",
+        "cluster_support",
+        "cluster_missing_reason",
+        "cluster_counts",
+        "cluster_assignments",
+        "top_cluster_contributions",
+    }
+)
+_CLUSTER_ASSIGNMENT_FIELDS = (
+    "hero_id",
+    "expected_role",
+    "expected_lane",
+    "cluster_id",
+    "mapping_support",
+    "mapping_confidence",
+    "assignment_source",
+    "missing_reason",
+)
+_RUNTIME_DEPLOYMENT_ENV = "PREMATCH_DEPLOYMENT_PATH"
 
 
 class PrematchAuthorityError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _RuntimeDeploymentState:
+    deployment: FrozenPrematchDeployment | None
+    runtime_ready: bool
+    runtime_block_reason: str | None
+
+
+def _configured_runtime_deployment(
+    connection: PostgresSession,
+) -> _RuntimeDeploymentState:
+    configured_path = os.environ.get(_RUNTIME_DEPLOYMENT_ENV, "").strip()
+    if not configured_path:
+        return _RuntimeDeploymentState(None, False, "deployment_not_configured")
+    try:
+        deployment = load_frozen_prematch_deployment_json(
+            FilePath(configured_path).read_text(encoding="utf-8")
+        )
+    except (OSError, RuntimeError, ValueError):
+        return _RuntimeDeploymentState(None, False, "deployment_invalid")
+
+    dependency_revision, _ = current_prematch_lineage_revisions(connection)
+    try:
+        assert_frozen_prematch_deployment_deployable(
+            deployment,
+            current_dependency_revision=dependency_revision,
+        )
+    except (RuntimeError, ValueError) as error:
+        return _RuntimeDeploymentState(deployment, False, str(error))
+    return _RuntimeDeploymentState(deployment, True, None)
+
+
+def _runtime_fields(
+    state: _RuntimeDeploymentState,
+    row: Mapping[str, Any],
+    *,
+    prediction: bool,
+) -> dict[str, object]:
+    deployment = state.deployment
+    if deployment is None:
+        return {
+            "runtime_ready": False,
+            "runtime_block_reason": state.runtime_block_reason,
+            "deployment_key": None,
+        }
+
+    if row["model_hash"] != deployment.prematch_model_artifact.model_hash:
+        reason = "deployment_model_mismatch"
+    elif row["availability_mode"] != deployment.availability_mode:
+        reason = "deployment_availability_mode_mismatch"
+    elif _utc(row["training_cutoff"], "training cutoff") != (
+        deployment.training_cutoff.isoformat()
+    ):
+        reason = "deployment_training_cutoff_mismatch"
+    elif prediction and (
+        row["calibration_hash"] != deployment.calibration_artifact.calibration_hash
+    ):
+        reason = "deployment_calibration_mismatch"
+    elif prediction and row["match_id"] != deployment.feature_snapshot.match_id:
+        reason = "deployment_match_mismatch"
+    elif prediction and row["input_snapshot_hash"] != deployment.feature_snapshot.input_hash:
+        reason = "deployment_input_snapshot_mismatch"
+    elif prediction and row["dependency_fingerprint"] != deployment.dependency_fingerprint:
+        reason = "deployment_dependency_fingerprint_mismatch"
+    elif prediction and row["dependency_revision"] != deployment.dependency_revision:
+        reason = "deployment_dependency_revision_mismatch"
+    else:
+        return {
+            "runtime_ready": state.runtime_ready,
+            "runtime_block_reason": state.runtime_block_reason,
+            "deployment_key": deployment.deployment_key,
+        }
+    return {
+        "runtime_ready": False,
+        "runtime_block_reason": reason,
+        "deployment_key": None,
+    }
 
 
 @contextmanager
@@ -165,7 +276,10 @@ def _calibration(row: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _model(row: Mapping[str, Any]) -> dict[str, Any]:
+def _model(
+    row: Mapping[str, Any],
+    runtime: _RuntimeDeploymentState,
+) -> dict[str, Any]:
     if row["run_id"] != row["model_hash"]:
         raise PrematchAuthorityError("inconsistent prematch model identity")
     return {
@@ -182,6 +296,7 @@ def _model(row: Mapping[str, Any]) -> dict[str, Any]:
         "status": row["status"],
         "created_at": _utc(row["created_at"], "model created_at"),
         "calibration": _calibration(row),
+        **_runtime_fields(runtime, row, prediction=False),
     }
 
 
@@ -242,9 +357,10 @@ def list_models(
                  LIMIT ? OFFSET ?""",
             (*params, page_size, (page - 1) * page_size),
         ).fetchall()
+        runtime = _configured_runtime_deployment(connection)
     total = int(count["total"])
     return {
-        "data": [_model(row) for row in rows],
+        "data": [_model(row, runtime) for row in rows],
         "pagination": _pagination(page, page_size, total),
     }
 
@@ -322,7 +438,137 @@ def _top_contributions(value: Any) -> list[dict[str, Any]]:
     return output
 
 
-def _prediction(row: Mapping[str, Any]) -> dict[str, object]:
+def _cluster_counts(value: Any) -> dict[str, dict[str, float]]:
+    if not isinstance(value, Mapping) or set(value) != set(_CLUSTER_IDS):
+        raise PrematchAuthorityError("invalid cluster_counts")
+    output = {}
+    for cluster_id in _CLUSTER_IDS:
+        counts = value[cluster_id]
+        if not isinstance(counts, Mapping) or set(counts) != {
+            "radiant",
+            "dire",
+            "difference",
+        }:
+            raise PrematchAuthorityError("invalid cluster_counts")
+        normalized = {}
+        for field in ("radiant", "dire", "difference"):
+            count = counts[field]
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, (int, float))
+                or not math.isfinite(count)
+            ):
+                raise PrematchAuthorityError("invalid cluster_counts")
+            normalized[field] = float(count)
+        if normalized["radiant"] < 0.0 or normalized["dire"] < 0.0:
+            raise PrematchAuthorityError("invalid cluster_counts")
+        output[cluster_id] = normalized
+    return output
+
+
+def _cluster_assignments(value: Any) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(value, Mapping) or set(value) != {"radiant", "dire"}:
+        raise PrematchAuthorityError("invalid cluster_assignments")
+    output = {}
+    for side in ("radiant", "dire"):
+        assignments = value[side]
+        if not isinstance(assignments, list) or len(assignments) != 5:
+            raise PrematchAuthorityError("invalid cluster_assignments")
+        normalized = []
+        for assignment in assignments:
+            if not isinstance(assignment, Mapping) or any(
+                field not in assignment for field in _CLUSTER_ASSIGNMENT_FIELDS
+            ):
+                raise PrematchAuthorityError("invalid cluster_assignments")
+            hero_id = assignment["hero_id"]
+            support = assignment["mapping_support"]
+            confidence = assignment["mapping_confidence"]
+            if (
+                isinstance(hero_id, bool)
+                or not isinstance(hero_id, int)
+                or hero_id <= 0
+                or isinstance(support, bool)
+                or not isinstance(support, int)
+                or support < 0
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not math.isfinite(confidence)
+                or not 0.0 <= confidence <= 1.0
+            ):
+                raise PrematchAuthorityError("invalid cluster_assignments")
+            if any(
+                assignment[field] is not None
+                and not isinstance(assignment[field], str)
+                for field in ("expected_role", "expected_lane", "missing_reason")
+            ) or any(
+                not isinstance(assignment[field], str) or not assignment[field]
+                for field in ("cluster_id", "assignment_source")
+            ) or assignment["cluster_id"] not in {*_CLUSTER_IDS, "unavailable"}:
+                raise PrematchAuthorityError("invalid cluster_assignments")
+            normalized.append(
+                {field: assignment[field] for field in _CLUSTER_ASSIGNMENT_FIELDS}
+            )
+        output[side] = normalized
+    return output
+
+
+def _cluster_metadata(artifact: Mapping[str, Any]) -> dict[str, object]:
+    present = _CLUSTER_METADATA_FIELDS.intersection(artifact)
+    if not present:
+        return {
+            "cluster_coverage": 0.0,
+            "cluster_support": 0,
+            "cluster_resource_version": None,
+            "cluster_evidence_mode": None,
+            "cluster_missing_reason": "cluster_evidence_unavailable",
+            "cluster_counts": {},
+            "cluster_assignments": {"radiant": [], "dire": []},
+            "top_cluster_contributions": [],
+        }
+    if present != _CLUSTER_METADATA_FIELDS:
+        raise PrematchAuthorityError("incomplete cluster metadata")
+
+    resource_version = artifact["cluster_resource_version"]
+    evidence_mode = artifact["cluster_evidence_mode"]
+    coverage = artifact["cluster_coverage"]
+    support = artifact["cluster_support"]
+    missing_reason = artifact["cluster_missing_reason"]
+    if not isinstance(resource_version, str) or not resource_version:
+        raise PrematchAuthorityError("invalid cluster resource version")
+    if evidence_mode not in {"published_static", "reconstructed_walk_forward"}:
+        raise PrematchAuthorityError("invalid cluster evidence mode")
+    if (
+        isinstance(coverage, bool)
+        or not isinstance(coverage, (int, float))
+        or not math.isfinite(coverage)
+        or not 0.0 <= coverage <= 1.0
+    ):
+        raise PrematchAuthorityError("invalid cluster coverage")
+    if isinstance(support, bool) or not isinstance(support, int) or support < 0:
+        raise PrematchAuthorityError("invalid cluster support")
+    if missing_reason is not None and (
+        not isinstance(missing_reason, str) or not missing_reason
+    ):
+        raise PrematchAuthorityError("invalid cluster missing reason")
+    contributions = _top_contributions(artifact["top_cluster_contributions"])
+    if any(row["component"] != "cluster" for row in contributions):
+        raise PrematchAuthorityError("invalid top_cluster_contributions")
+    return {
+        "cluster_coverage": float(coverage),
+        "cluster_support": support,
+        "cluster_resource_version": resource_version,
+        "cluster_evidence_mode": evidence_mode,
+        "cluster_missing_reason": missing_reason,
+        "cluster_counts": _cluster_counts(artifact["cluster_counts"]),
+        "cluster_assignments": _cluster_assignments(artifact["cluster_assignments"]),
+        "top_cluster_contributions": contributions,
+    }
+
+
+def _prediction(
+    row: Mapping[str, Any],
+    runtime: _RuntimeDeploymentState,
+) -> dict[str, object]:
     if row["run_id"] != row["model_hash"]:
         raise PrematchAuthorityError("inconsistent prediction model identity")
     artifact = _json_object(row["prediction_json"], "prediction artifact")
@@ -366,11 +612,6 @@ def _prediction(row: Mapping[str, Any]) -> dict[str, object]:
             or evaluation_support < 0
         ):
             raise PrematchAuthorityError("invalid calibration authority")
-        if calibration_status in _BLOCKED_CALIBRATION_STATUSES or (
-            not gate_passed
-            and evaluation_support >= CALIBRATION_MIN_EVALUATION_SUPPORT
-        ):
-            raise PrematchAuthorityError("calibrated probability is not authorized")
     missing = artifact.get("missing_features")
     if not isinstance(missing, list) or not all(
         isinstance(value, str) for value in missing
@@ -403,6 +644,29 @@ def _prediction(row: Mapping[str, Any]) -> dict[str, object]:
     reason = artifact.get("reason")
     if reason is not None and not isinstance(reason, str):
         raise PrematchAuthorityError("invalid prediction reason")
+    cluster_metadata = _cluster_metadata(artifact)
+    cluster_candidate_delta = artifact.get("cluster_candidate_logit_delta")
+    if cluster_candidate_delta is not None and (
+        isinstance(cluster_candidate_delta, bool)
+        or not isinstance(cluster_candidate_delta, (int, float))
+        or not math.isfinite(cluster_candidate_delta)
+        or cluster_metadata["cluster_resource_version"] is None
+    ):
+        raise PrematchAuthorityError("invalid cluster candidate logit delta")
+    cluster_analysis_delta = (
+        row["cluster_logit_delta"]
+        if row["cluster_logit_delta"] is not None
+        else cluster_candidate_delta
+    )
+    if (
+        row["model_kind"] == "team_plus_draft_rosh_clusters"
+        and stored_status in {"predicted", "settled"}
+        and (
+            cluster_metadata["cluster_resource_version"] is None
+            or row["cluster_logit_delta"] is None
+        )
+    ):
+        raise PrematchAuthorityError("cluster prediction metadata is unavailable")
     return {
         "run_id": row["run_id"],
         "model_hash": row["model_hash"],
@@ -425,7 +689,7 @@ def _prediction(row: Mapping[str, Any]) -> dict[str, object]:
         "parameter_uncertainty": row["parameter_uncertainty"],
         "draft_logit_delta": row["draft_logit_delta"],
         "rosh_logit_delta": row["rosh_logit_delta"],
-        "cluster_logit_delta": row["cluster_logit_delta"],
+        "cluster_logit_delta": cluster_analysis_delta,
         "total_adjustment": row["total_adjustment"],
         "coverage": row["coverage"],
         "support": row["support"],
@@ -439,10 +703,12 @@ def _prediction(row: Mapping[str, Any]) -> dict[str, object]:
         "learned_intercept": artifact.get("learned_intercept"),
         "missing_features": missing,
         "top_contributions": _top_contributions(artifact.get("top_contributions")),
+        **cluster_metadata,
         "validation": {
             "validation_version": validation_version,
             "validated_at": _utc(row["validated_at"], "validated_at"),
         },
+        **_runtime_fields(runtime, row, prediction=True),
     }
 
 
@@ -501,9 +767,10 @@ def list_predictions(
             status=status,
             limit=(page_size, (page - 1) * page_size),
         )
+        runtime = _configured_runtime_deployment(connection)
     total = int(count["total"])
     return {
-        "data": [_prediction(row) for row in rows],
+        "data": [_prediction(row, runtime) for row in rows],
         "pagination": _pagination(page, page_size, total),
     }
 
@@ -517,9 +784,10 @@ def get_match_predictions(match_id: int) -> dict[str, object] | None:
         if exists is None:
             return None
         rows = _prediction_rows(connection, match_id=match_id)
+        runtime = _configured_runtime_deployment(connection)
     return {
         "match_id": match_id,
-        "predictions": [_prediction(row) for row in rows],
+        "predictions": [_prediction(row, runtime) for row in rows],
     }
 
 
