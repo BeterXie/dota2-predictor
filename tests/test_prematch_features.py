@@ -6,6 +6,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import event_intelligence.prematch_features as prematch_features
+from event_intelligence.cluster_artifacts import build_cluster_feature_artifact
+from event_intelligence.cluster_features import (
+    CLUSTER_MODEL_FEATURE_SCHEMA,
+    ClusterFeatureTarget,
+    ClusterPlayer,
+)
 from event_intelligence.draft_features import ROLE_CONFIDENCE_MIN, AvailabilityMode
 from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
@@ -17,6 +23,7 @@ from event_intelligence.draft_residual_features import (
     build_team_rating_residual_evidence_cache,
 )
 from event_intelligence.prematch_features import (
+    PREMATCH_CLUSTER_MODEL_SCHEMA,
     PREMATCH_FEATURE_SCHEMA_HASHES,
     PREMATCH_FEATURE_SCHEMAS,
     PREMATCH_FEATURE_VERSION,
@@ -26,6 +33,10 @@ from event_intelligence.prematch_features import (
     prematch_feature_schema,
     project_prematch_features,
     verify_prematch_feature_snapshot,
+)
+from event_intelligence.hero_clusters import (
+    ClusterEvidenceMode,
+    load_cluster_resource,
 )
 from event_intelligence.rosh_features import (
     ROSH_AUTHORITY_SCHEMA,
@@ -309,6 +320,40 @@ def _snapshot(
     )
 
 
+def _cluster_artifact(*, match_id: int = 100):
+    resource = replace(
+        load_cluster_resource(),
+        published_at=None,
+        evidence_mode=ClusterEvidenceMode.RECONSTRUCTED_WALK_FORWARD,
+        training_cutoff=TARGET_CUTOFF - timedelta(days=1),
+    )
+
+    def player(hero_id: int, role: str, lane: str) -> ClusterPlayer:
+        return ClusterPlayer(hero_id, role, lane, 1.0, 1.0)
+
+    target = ClusterFeatureTarget(
+        match_id=match_id,
+        prediction_cutoff=TARGET_CUTOFF,
+        patch="7.41",
+        evidence_mode=ClusterEvidenceMode.RECONSTRUCTED_WALK_FORWARD,
+        radiant=(
+            player(70, "core", "safe"),
+            player(106, "core", "mid"),
+            player(96, "core", "off"),
+            player(50, "support", "safe"),
+            player(100, "support", "off"),
+        ),
+        dire=(
+            player(73, "core", "safe"),
+            player(39, "core", "mid"),
+            player(78, "core", "off"),
+            player(87, "support", "safe"),
+            player(123, "support", "off"),
+        ),
+    )
+    return build_cluster_feature_artifact(target, resource)
+
+
 def test_model_kind_schemas_are_fixed_exact_and_deterministic() -> None:
     assert PREMATCH_FEATURE_VERSION == "prematch-features-v1"
     assert prematch_feature_schema("team_only") == ()
@@ -316,6 +361,14 @@ def test_model_kind_schemas_are_fixed_exact_and_deterministic() -> None:
     assert prematch_feature_schema("team_plus_rosh") == ROSH_MODEL_SCHEMA
     assert prematch_feature_schema("team_plus_draft_rosh") == (
         DRAFT_RESIDUAL_MODEL_SCHEMA + ROSH_MODEL_SCHEMA
+    )
+    assert prematch_feature_schema("team_plus_draft_rosh_clusters") == (
+        DRAFT_RESIDUAL_MODEL_SCHEMA
+        + ROSH_MODEL_SCHEMA
+        + PREMATCH_CLUSTER_MODEL_SCHEMA
+    )
+    assert PREMATCH_CLUSTER_MODEL_SCHEMA == tuple(
+        f"cluster__{name}" for name in CLUSTER_MODEL_FEATURE_SCHEMA
     )
     assert TEAM_PLUS_DRAFT_ROSH_SCHEMA == prematch_feature_schema(
         "team_plus_draft_rosh"
@@ -325,6 +378,7 @@ def test_model_kind_schemas_are_fixed_exact_and_deterministic() -> None:
         "team_plus_draft",
         "team_plus_rosh",
         "team_plus_draft_rosh",
+        "team_plus_draft_rosh_clusters",
     )
     assert all(len(value) == 64 for value in PREMATCH_FEATURE_SCHEMA_HASHES.values())
     with pytest.raises(ValueError, match="unsupported"):
@@ -690,6 +744,46 @@ def test_snapshot_hash_is_stable_binds_upstream_hashes_and_rejects_tampering() -
     assert revised.input_hash != first.input_hash
     with pytest.raises(ValueError, match="input hash"):
         replace(first, team_base_logit=first.team_base_logit + 0.1)
+
+
+def test_cluster_artifact_is_conditional_replayed_and_fully_projected() -> None:
+    plain = _snapshot()
+    artifact = _cluster_artifact()
+    clustered = prematch_features._compose_prematch_feature_snapshot(
+        _team_run(),
+        _draft_snapshot(),
+        _rosh_snapshot(),
+        cluster_artifact=artifact,
+    )
+
+    assert "cluster" not in plain.to_payload()
+    assert clustered.cluster_artifact is artifact
+    assert clustered.cluster_snapshot is not None
+    assert clustered.cluster_snapshot.to_payload() == artifact.snapshot
+    assert clustered.input_hash != plain.input_hash
+    assert clustered.to_payload()["cluster"] == artifact.to_payload()
+    assert project_prematch_features(plain, "team_plus_draft_rosh") == (
+        project_prematch_features(clustered, "team_plus_draft_rosh")
+    )
+    projected = project_prematch_features(
+        clustered,
+        "team_plus_draft_rosh_clusters",
+    )
+    assert tuple(projected)[-len(PREMATCH_CLUSTER_MODEL_SCHEMA) :] == (
+        PREMATCH_CLUSTER_MODEL_SCHEMA
+    )
+    assert projected["cluster__radiant_cluster_count_C0"] is not None
+    assert projected["cluster__cross_team_cluster_edge__missing"] == 1.0
+
+    with pytest.raises(ValueError, match="cluster_evidence_unavailable"):
+        project_prematch_features(plain, "team_plus_draft_rosh_clusters")
+    with pytest.raises(ValueError, match="Cluster snapshot identities"):
+        prematch_features._compose_prematch_feature_snapshot(
+            _team_run(),
+            _draft_snapshot(),
+            _rosh_snapshot(),
+            cluster_artifact=_cluster_artifact(match_id=101),
+        )
 
 
 def test_snapshot_rejects_noncanonical_schema_hashes_and_missing_flags() -> None:

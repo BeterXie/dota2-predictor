@@ -20,6 +20,7 @@ from scipy.special import expit
 from .draft_features import AvailabilityMode
 from .draft_residual_features import DRAFT_RESIDUAL_MODEL_SCHEMA
 from .prematch_features import (
+    PREMATCH_CLUSTER_MODEL_SCHEMA,
     PREMATCH_FEATURE_VERSION,
     PrematchFeatureSnapshot,
     prematch_feature_schema,
@@ -332,16 +333,17 @@ class PrematchPrediction:
     learned_intercept: float | None
     draft_logit_delta: float | None
     rosh_logit_delta: float | None
-    cluster_logit_delta: None
+    cluster_logit_delta: float | None
     total_adjustment: float | None
     support: int
     model_hash: str
     input_snapshot_hash: str
     missing_features: tuple[str, ...]
     top_contributions: tuple[FeatureContribution, ...]
+    top_cluster_contributions: tuple[FeatureContribution, ...]
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": self.status.value,
             "reason": self.reason,
             "raw_probability": self.raw_probability,
@@ -358,6 +360,11 @@ class PrematchPrediction:
             "missing_features": list(self.missing_features),
             "top_contributions": [row.to_payload() for row in self.top_contributions],
         }
+        if self.top_cluster_contributions:
+            payload["top_cluster_contributions"] = [
+                row.to_payload() for row in self.top_cluster_contributions
+            ]
+        return payload
 
 
 PreparedRow = tuple[
@@ -401,7 +408,12 @@ def _align_features(
         if missing_name not in aligned:
             continue
         expected = 1.0 if aligned[name] is None else 0.0
-        if aligned[missing_name] != expected:
+        cluster_evidence_flag = (
+            name in PREMATCH_CLUSTER_MODEL_SCHEMA
+            and aligned[name] is not None
+            and aligned[missing_name] == 1.0
+        )
+        if aligned[missing_name] != expected and not cluster_evidence_flag:
             raise ValueError(f"missing flag {missing_name} disagrees with {name}")
     return tuple(values), tuple(missing)
 
@@ -991,6 +1003,7 @@ def predict_prematch(
             input_snapshot_hash=snapshot.input_hash,
             missing_features=missing,
             top_contributions=(),
+            top_cluster_contributions=(),
         )
 
     coefficients = dict(model.coefficients)
@@ -1008,7 +1021,15 @@ def predict_prematch(
             raise ValueError("prematch imputation parameters are incomplete")
         standardized = (value - means[name]) / scales[name]
         contribution = coefficients[name] * standardized
-        component = "draft" if name in DRAFT_RESIDUAL_MODEL_SCHEMA else "rosh"
+        component = (
+            "draft"
+            if name in DRAFT_RESIDUAL_MODEL_SCHEMA
+            else "rosh"
+            if name in ROSH_MODEL_SCHEMA
+            else "cluster"
+        )
+        if component == "cluster" and name not in PREMATCH_CLUSTER_MODEL_SCHEMA:
+            raise ValueError("prematch feature has no component")
         standardized_values.append(standardized)
         contributions.append(
             FeatureContribution(
@@ -1025,6 +1046,9 @@ def predict_prematch(
         name in DRAFT_RESIDUAL_MODEL_SCHEMA for name in model.feature_names
     )
     includes_rosh = any(name in ROSH_MODEL_SCHEMA for name in model.feature_names)
+    includes_cluster = any(
+        name in PREMATCH_CLUSTER_MODEL_SCHEMA for name in model.feature_names
+    )
     draft_delta = (
         math.fsum(
             row.log_odds_contribution
@@ -1043,7 +1067,21 @@ def predict_prematch(
         if includes_rosh
         else None
     )
-    total_adjustment = model.intercept + (draft_delta or 0.0) + (rosh_delta or 0.0)
+    cluster_delta = (
+        math.fsum(
+            row.log_odds_contribution
+            for row in contributions
+            if row.feature_name in PREMATCH_CLUSTER_MODEL_SCHEMA
+        )
+        if includes_cluster
+        else None
+    )
+    total_adjustment = (
+        model.intercept
+        + (draft_delta or 0.0)
+        + (rosh_delta or 0.0)
+        + (cluster_delta or 0.0)
+    )
     probability = float(expit(snapshot.team_base_logit + total_adjustment))
     covariance = np.asarray(model.logit_covariance, dtype=np.float64)
     design = np.asarray((1.0, *standardized_values), dtype=np.float64)
@@ -1061,6 +1099,17 @@ def predict_prematch(
             key=lambda row: (-abs(row.log_odds_contribution), row.feature_name),
         )[:top_n]
     )
+    ranked_cluster = tuple(
+        sorted(
+            (
+                row
+                for row in contributions
+                if row.component == "cluster"
+                and not row.feature_name.endswith("__missing")
+            ),
+            key=lambda row: (-abs(row.log_odds_contribution), row.feature_name),
+        )[:top_n]
+    )
     return PrematchPrediction(
         status=PredictionStatus.PREDICTED,
         reason=None,
@@ -1070,13 +1119,14 @@ def predict_prematch(
         learned_intercept=model.intercept,
         draft_logit_delta=draft_delta,
         rosh_logit_delta=rosh_delta,
-        cluster_logit_delta=None,
+        cluster_logit_delta=cluster_delta,
         total_adjustment=total_adjustment,
         support=model.support,
         model_hash=model.model_hash,
         input_snapshot_hash=snapshot.input_hash,
         missing_features=missing,
         top_contributions=ranked,
+        top_cluster_contributions=ranked_cluster,
     )
 
 

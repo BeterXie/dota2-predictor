@@ -13,6 +13,9 @@ from typing import Any, Callable, TypeVar
 
 from database.session import DatabaseRow, PostgresSession
 
+from .cluster_artifacts import replay_cluster_feature_artifact
+from .cluster_features import cluster_snapshot_hash
+from .hero_clusters import CLUSTER_IDS
 from .prematch_calibration import (
     PrematchCalibrationArtifact,
     _load_and_apply_prematch_calibration_json,
@@ -22,7 +25,11 @@ from .prematch_artifacts import (
     canonical_json_bytes,
     load_prematch_model_artifact_json,
 )
-from .prematch_features import PrematchFeatureSnapshot, verify_prematch_feature_snapshot
+from .prematch_features import (
+    PREMATCH_MODEL_KINDS,
+    PrematchFeatureSnapshot,
+    verify_prematch_feature_snapshot,
+)
 from .prematch_model import (
     ModelStatus,
     PredictionStatus,
@@ -34,9 +41,7 @@ from .prematch_model import (
 
 UTC = timezone.utc
 PREMATCH_VALIDATION_VERSION = "prematch-input-lineage-v1"
-_MODEL_KINDS = frozenset(
-    {"team_only", "team_plus_draft", "team_plus_rosh", "team_plus_draft_rosh"}
-)
+_MODEL_KINDS = frozenset(PREMATCH_MODEL_KINDS)
 _AVAILABILITY_MODES = frozenset({"reconstructed_walk_forward", "prospective"})
 _CALIBRATION_STATUSES = frozenset(
     {
@@ -773,14 +778,52 @@ def build_prematch_calibration_record(
     )
 
 
-def _prediction_payload(prediction: PrematchPrediction) -> str:
-    return _canonical_json(prediction.to_payload())
+def _prediction_payload(
+    prediction: PrematchPrediction,
+    snapshot: PrematchFeatureSnapshot,
+) -> str:
+    payload = prediction.to_payload()
+    artifact = snapshot.cluster_artifact
+    if artifact is None:
+        return _canonical_json(payload)
+
+    cluster = replay_cluster_feature_artifact(artifact)
+    values = cluster.values()
+    payload.update(
+        {
+            "cluster_artifact_hash": artifact.artifact_hash,
+            "cluster_feature_snapshot_hash": cluster_snapshot_hash(cluster),
+            "cluster_feature_schema_hash": cluster.feature_schema_hash,
+            "cluster_resource_version": cluster.cluster_resource_version,
+            "cluster_resource_hash": cluster.cluster_resource_hash,
+            "cluster_evidence_mode": cluster.evidence_mode.value,
+            "cluster_coverage": cluster.mapping_coverage,
+            "cluster_support": cluster.support,
+            "cluster_missing_reason": cluster.missing_reason,
+            "cluster_counts": {
+                cluster_id: {
+                    "radiant": values[f"radiant_cluster_count_{cluster_id}"],
+                    "dire": values[f"dire_cluster_count_{cluster_id}"],
+                    "difference": values[f"cluster_count_diff_{cluster_id}"],
+                }
+                for cluster_id in CLUSTER_IDS
+            },
+            "cluster_assignments": {
+                "radiant": [row.to_payload() for row in cluster.radiant_assignments],
+                "dire": [row.to_payload() for row in cluster.dire_assignments],
+            },
+            "top_cluster_contributions": [
+                row.to_payload()
+                for row in getattr(prediction, "top_cluster_contributions", ())
+            ],
+        }
+    )
+    return _canonical_json(payload)
 
 
 def prematch_dependency_fingerprint(snapshot: PrematchFeatureSnapshot) -> str:
     verify_prematch_feature_snapshot(snapshot)
-    return _hash(
-        {
+    payload: dict[str, object] = {
             "domain": "prematch-dependency-fingerprint/v1",
             "availability_mode": snapshot.availability_mode,
             "match_id": snapshot.match_id,
@@ -816,8 +859,19 @@ def prematch_dependency_fingerprint(snapshot: PrematchFeatureSnapshot) -> str:
                 "model_schema_hash": snapshot.rosh_model_schema_hash,
             },
             "prematch_input_hash": snapshot.input_hash,
+    }
+    if snapshot.cluster_artifact is not None:
+        cluster = replay_cluster_feature_artifact(snapshot.cluster_artifact)
+        payload["cluster"] = {
+            "artifact_hash": snapshot.cluster_artifact.artifact_hash,
+            "feature_schema_hash": cluster.feature_schema_hash,
+            "feature_snapshot_hash": cluster_snapshot_hash(cluster),
+            "resource_version": cluster.cluster_resource_version,
+            "resource_hash": cluster.cluster_resource_hash,
+            "evidence_mode": cluster.evidence_mode.value,
+            "patch": cluster.patch,
         }
-    )
+    return _hash(payload)
 
 
 def build_prematch_prediction_record(
@@ -891,7 +945,7 @@ def build_prematch_prediction_record(
         total_adjustment=prediction.total_adjustment,
         coverage=snapshot.coverage,
         support=prediction.support,
-        prediction_json=_prediction_payload(prediction),
+        prediction_json=_prediction_payload(prediction, snapshot),
         eventual_radiant_win=None,
         result_usable_at=None,
         settled_at=None,

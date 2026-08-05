@@ -34,6 +34,7 @@ from event_intelligence.draft_residual_features import (
     SHRINKAGE_STRENGTH,
 )
 from event_intelligence.prematch_features import (
+    PREMATCH_CLUSTER_MODEL_SCHEMA,
     PREMATCH_FEATURE_SCHEMA_HASHES,
     PREMATCH_FEATURE_SCHEMAS,
     PREMATCH_FEATURE_VERSION,
@@ -153,12 +154,18 @@ def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
         "team_plus_draft",
         "team_plus_rosh",
         "team_plus_draft_rosh",
+        "team_plus_draft_rosh_clusters",
     )
     assert PREMATCH_FEATURE_SCHEMAS["team_only"] == ()
     assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft"] == (DRAFT_RESIDUAL_MODEL_SCHEMA)
     assert PREMATCH_FEATURE_SCHEMAS["team_plus_rosh"] == ROSH_MODEL_SCHEMA
     assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft_rosh"] == (
         DRAFT_RESIDUAL_MODEL_SCHEMA + ROSH_MODEL_SCHEMA
+    )
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft_rosh_clusters"] == (
+        DRAFT_RESIDUAL_MODEL_SCHEMA
+        + ROSH_MODEL_SCHEMA
+        + PREMATCH_CLUSTER_MODEL_SCHEMA
     )
     assert dict(PREMATCH_FEATURE_SCHEMA_HASHES) == {
         "team_only": (
@@ -172,6 +179,9 @@ def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
         ),
         "team_plus_draft_rosh": (
             "581e42787406d3ce5b758d990e5db71d71e9c92e9d19baf85c70fdad85d9dedc"
+        ),
+        "team_plus_draft_rosh_clusters": (
+            "51d4a5f530ff760e19ff700ccb0bbff50bc8238c1d4d9fd3701c4ea247c42295"
         ),
     }
 

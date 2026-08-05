@@ -16,6 +16,8 @@ from live_betting.rosh_parity_storage import (
 )
 
 from .backtest import DraftCorpus, LoadedDraftMap, load_draft_corpus
+from .cluster_artifacts import ClusterFeatureArtifact, build_cluster_feature_artifact
+from .cluster_features import ClusterFeatureTarget, ClusterPlayer
 from .draft_features import (
     ROLE_CONFIDENCE_MIN,
     AvailabilityMode,
@@ -27,6 +29,7 @@ from .draft_residual_features import (
     build_draft_residual_snapshot_with_authority,
     build_team_rating_residual_evidence_cache,
 )
+from .hero_clusters import ClusterEvidenceMode, ClusterResource, load_cluster_resource
 from .prematch_calibration import (
     PrematchCalibrationArtifact,
     PrematchCalibrationSample,
@@ -69,6 +72,7 @@ if TYPE_CHECKING:
 
 UTC = timezone.utc
 PREMATCH_BACKTEST_VERSION = "prematch-walk-forward-v1"
+CLUSTER_MODEL_KIND = "team_plus_draft_rosh_clusters"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -432,6 +436,49 @@ def _heroes_by_expected_position(team: DraftTeam) -> tuple[int, ...] | None:
     return tuple(by_position[position] for position in range(1, 6))
 
 
+_CLUSTER_POSITION = {
+    1: ("core", "safe"),
+    2: ("core", "mid"),
+    3: ("core", "off"),
+    4: ("support", "off"),
+    5: ("support", "safe"),
+}
+
+
+def _cluster_players(team: DraftTeam) -> tuple[ClusterPlayer, ...]:
+    players: list[ClusterPlayer] = []
+    for player in team.players:
+        role_lane = _CLUSTER_POSITION.get(player.expected_position)
+        confidence = player.expected_position_confidence
+        players.append(
+            ClusterPlayer(
+                hero_id=player.hero_id,
+                expected_role=None if role_lane is None else role_lane[0],
+                expected_lane=None if role_lane is None else role_lane[1],
+                role_confidence=confidence,
+                lane_confidence=confidence,
+            )
+        )
+    return tuple(players)
+
+
+def _build_cluster_artifact(
+    draft_target: DraftTarget,
+    resource: ClusterResource,
+) -> ClusterFeatureArtifact:
+    return build_cluster_feature_artifact(
+        ClusterFeatureTarget(
+            match_id=draft_target.match_id,
+            prediction_cutoff=draft_target.prediction_cutoff,
+            patch=str(draft_target.patch),
+            evidence_mode=ClusterEvidenceMode.PUBLISHED_STATIC,
+            radiant=_cluster_players(draft_target.radiant),
+            dire=_cluster_players(draft_target.dire),
+        ),
+        resource,
+    )
+
+
 def _build_rosh_snapshot_with_authority(
     draft_target: DraftTarget,
     rosh_runs: Iterable[StoredRoshRun],
@@ -508,12 +555,18 @@ def load_prematch_corpus(
     *,
     artifact_root: str | Path,
     availability_mode: AvailabilityMode,
+    cluster_resource: ClusterResource | None = None,
 ) -> PrematchCorpus:
     """Rebuild M2-M5 authority for every formal target; never accept snapshots."""
 
     if not isinstance(availability_mode, AvailabilityMode):
         raise ValueError("availability_mode must be an AvailabilityMode")
     connection = _connection(storage_or_connection)
+    published_cluster_resource = (
+        None
+        if availability_mode is AvailabilityMode.RECONSTRUCTED
+        else cluster_resource or load_cluster_resource()
+    )
     # Keep the reads atomic with the caller and detect READ COMMITTED revision
     # drift explicitly. PostgresSession uses a savepoint for an existing
     # transaction; before the M6 migration, the revision table is absent.
@@ -620,6 +673,11 @@ def load_prematch_corpus(
             artifact_root=artifact_root,
             match_links=rosh_links,
         )
+        cluster_artifact = (
+            None
+            if published_cluster_resource is None
+            else _build_cluster_artifact(draft_target, published_cluster_resource)
+        )
         snapshot = build_prematch_feature_snapshot(
             draft_authority,
             rosh_authority,
@@ -629,6 +687,7 @@ def load_prematch_corpus(
             artifact_root=artifact_root,
             match_links=rosh_links,
             team_rating_evidence_cache=team_rating_evidence_cache,
+            cluster_artifact=cluster_artifact,
         )
         if (
             snapshot.draft_residual_input_hash != draft_snapshot.input_hash
@@ -683,6 +742,15 @@ def _training_row(
         series_id=_series_key(target.series_id, target.match_id),
         event_id=target.event_id,
         patch_id=target.patch_id,
+    )
+
+
+def _snapshot_supports_model(
+    snapshot: PrematchFeatureSnapshot,
+    model_kind: str,
+) -> bool:
+    return model_kind != CLUSTER_MODEL_KIND or (
+        snapshot.cluster_artifact is not None and snapshot.cluster_coverage > 0.0
     )
 
 
@@ -744,6 +812,8 @@ def build_prematch_walk_forward(
         if target.snapshot is None:
             continue
         for model_kind in PREMATCH_MODEL_KINDS:
+            if not _snapshot_supports_model(target.snapshot, model_kind):
+                continue
             model = fit_prematch_model(
                 histories[model_kind],
                 target.prediction_cutoff,
@@ -768,7 +838,8 @@ def build_prematch_walk_forward(
                 )
             )
         for model_kind in PREMATCH_MODEL_KINDS:
-            histories[model_kind].append(_training_row(target, model_kind))
+            if _snapshot_supports_model(target.snapshot, model_kind):
+                histories[model_kind].append(_training_row(target, model_kind))
 
     cutoff = _evaluation_cutoff(corpus.targets)
     samples_by_kind: dict[str, list[PrematchCalibrationSample]] = {
@@ -989,6 +1060,7 @@ def persist_prematch_backtest_result(
 
 
 __all__ = [
+    "CLUSTER_MODEL_KIND",
     "PREMATCH_BACKTEST_VERSION",
     "PrematchBacktestResult",
     "PrematchBacktestTarget",

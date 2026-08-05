@@ -185,7 +185,7 @@ def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
                 )
             ).scalars()
         )
-    assert revision == "20260805_0025"
+    assert revision == "20260805_0026"
     assert {
         "prematch_predictions_mutation_guard",
         "prematch_calibration_mode_guard",

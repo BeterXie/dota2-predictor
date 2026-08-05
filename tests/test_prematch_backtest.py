@@ -10,7 +10,9 @@ import pytest
 
 import event_intelligence.prematch_backtest as prematch_backtest
 import event_intelligence.prematch_storage as prematch_storage
+from event_intelligence.cluster_artifacts import replay_cluster_feature_artifact
 from event_intelligence.draft_features import ROLE_CONFIDENCE_MIN, AvailabilityMode
+from event_intelligence.hero_clusters import load_cluster_resource
 from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
     DRAFT_RESIDUAL_MODEL_SCHEMA_HASH,
@@ -175,7 +177,7 @@ def test_walk_forward_uses_only_earlier_usable_results_and_exposes_oos_data() ->
     result = build_prematch_walk_forward(_corpus(), min_samples=4)
 
     assert result.backtest_version == PREMATCH_BACKTEST_VERSION
-    assert len(result.walk_forward_runs) == 12 * len(PREMATCH_MODEL_KINDS)
+    assert len(result.walk_forward_runs) == 12 * (len(PREMATCH_MODEL_KINDS) - 1)
     assert len(result.model_artifacts) == len(result.predictions) == 48
     assert tuple(row.model_artifact.model_kind for row in result.final_models) == (
         PREMATCH_MODEL_KINDS
@@ -198,6 +200,14 @@ def test_walk_forward_uses_only_earlier_usable_results_and_exposes_oos_data() ->
     assert all(
         all(sample.is_out_of_sample for sample in artifact.oos_samples)
         for artifact in result.calibration_artifacts
+    )
+    cluster_final = result.final_models[-1].model_artifact
+    assert cluster_final.model_kind == "team_plus_draft_rosh_clusters"
+    assert cluster_final.support == 0
+    assert cluster_final.reason == "support_below_minimum"
+    assert not any(
+        row.model_kind == "team_plus_draft_rosh_clusters"
+        for row in result.walk_forward_runs
     )
 
 
@@ -554,6 +564,47 @@ def test_rosh_heroes_are_ordered_by_expected_position_and_missing_is_fail_closed
             SimpleNamespace(players=low_confidence)
         )
         is None
+    )
+
+
+def test_prospective_cluster_artifact_uses_expected_position_mapping() -> None:
+    cutoff = datetime(2026, 8, 1, tzinfo=UTC)
+
+    def team(hero_ids: tuple[int, ...]) -> SimpleNamespace:
+        return SimpleNamespace(
+            players=tuple(
+                SimpleNamespace(
+                    hero_id=hero_id,
+                    expected_position=position,
+                    expected_position_confidence=1.0,
+                )
+                for position, hero_id in enumerate(hero_ids, start=1)
+            )
+        )
+
+    target = SimpleNamespace(
+        match_id=90,
+        prediction_cutoff=cutoff,
+        patch="7.41",
+        radiant=team((70, 106, 96, 100, 50)),
+        dire=team((73, 39, 78, 123, 87)),
+    )
+    artifact = prematch_backtest._build_cluster_artifact(  # noqa: SLF001
+        target,
+        load_cluster_resource(),
+    )
+    snapshot = replay_cluster_feature_artifact(artifact)
+
+    assert snapshot.mapping_coverage == 1.0
+    assert tuple(
+        (row.expected_role, row.expected_lane)
+        for row in snapshot.radiant_assignments
+    ) == (
+        ("core", "safe"),
+        ("core", "mid"),
+        ("core", "off"),
+        ("support", "off"),
+        ("support", "safe"),
     )
 
 

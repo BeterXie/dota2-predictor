@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 
 import event_intelligence.prematch_model as prematch_model
+from event_intelligence.cluster_artifacts import build_cluster_feature_artifact
+from event_intelligence.cluster_features import ClusterFeatureTarget, ClusterPlayer
 from event_intelligence.draft_features import AvailabilityMode
 from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
@@ -16,9 +18,14 @@ from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_PURE_SCHEMA,
 )
 from event_intelligence.prematch_features import (
+    PREMATCH_CLUSTER_MODEL_SCHEMA,
     PREMATCH_FEATURE_VERSION,
     PrematchFeatureSnapshot,
     project_prematch_features,
+)
+from event_intelligence.hero_clusters import (
+    ClusterEvidenceMode,
+    load_cluster_resource,
 )
 from event_intelligence.prematch_model import (
     ModelStatus,
@@ -54,6 +61,7 @@ def _snapshot(
     rosh_signal: float,
     missing_rosh_score_20: bool = False,
     availability_mode: str = MODE,
+    cluster_signal: float | None = None,
 ) -> PrematchFeatureSnapshot:
     draft: dict[str, float | None] = {}
     for index, name in enumerate(DRAFT_RESIDUAL_PURE_SCHEMA):
@@ -105,7 +113,57 @@ def _snapshot(
         rosh_result_hash=_digest(12_000 + match_id),
         rosh_coverage=0.9,
         rosh_features=tuple(rosh.items()),
+        cluster_artifact=(
+            None
+            if cluster_signal is None
+            else _cluster_artifact(
+                match_id,
+                prediction_cutoff,
+                reverse=cluster_signal < 0.0,
+            )
+        ),
     )
+
+
+def _cluster_artifact(
+    match_id: int,
+    prediction_cutoff: datetime,
+    *,
+    reverse: bool,
+):
+    resource = replace(
+        load_cluster_resource(),
+        published_at=None,
+        evidence_mode=ClusterEvidenceMode.RECONSTRUCTED_WALK_FORWARD,
+        training_cutoff=START - timedelta(days=1),
+    )
+
+    def player(hero_id: int, role: str, lane: str) -> ClusterPlayer:
+        return ClusterPlayer(hero_id, role, lane, 1.0, 1.0)
+
+    radiant = (
+        player(70, "core", "safe"),
+        player(106, "core", "mid"),
+        player(96, "core", "off"),
+        player(50, "support", "safe"),
+        player(100, "support", "off"),
+    )
+    dire = (
+        player(73, "core", "safe"),
+        player(39, "core", "mid"),
+        player(78, "core", "off"),
+        player(87, "support", "safe"),
+        player(123, "support", "off"),
+    )
+    target = ClusterFeatureTarget(
+        match_id=match_id,
+        prediction_cutoff=prediction_cutoff,
+        patch="7.41",
+        evidence_mode=ClusterEvidenceMode.RECONSTRUCTED_WALK_FORWARD,
+        radiant=dire if reverse else radiant,
+        dire=radiant if reverse else dire,
+    )
+    return build_cluster_feature_artifact(target, resource)
 
 
 def _rows(
@@ -113,6 +171,7 @@ def _rows(
     count: int = 40,
     *,
     outcome_override: int | None = None,
+    with_cluster: bool = False,
 ) -> tuple[PrematchTrainingRow, ...]:
     rows = []
     for index in range(count):
@@ -130,6 +189,9 @@ def _rows(
             draft_signal=draft_signal,
             rosh_signal=rosh_signal,
             missing_rosh_score_20=index % 5 == 0,
+            cluster_signal=(
+                None if not with_cluster else 1.0 if index % 2 == 0 else -1.0
+            ),
         )
         rows.append(
             PrematchTrainingRow.from_snapshot(
@@ -409,6 +471,44 @@ def test_prediction_components_uncertainty_and_contribution_order_reconstruct() 
     assert all(
         not row.feature_name.endswith("__missing")
         for row in prediction.top_contributions
+    )
+
+
+def test_cluster_model_learns_a_separate_cluster_delta() -> None:
+    model = fit_prematch_model(
+        _rows(
+            "team_plus_draft_rosh_clusters",
+            12,
+            with_cluster=True,
+        ),
+        TRAINING_CUTOFF,
+        model_kind="team_plus_draft_rosh_clusters",
+        availability_mode=MODE,
+        min_samples=4,
+    )
+    target = _snapshot(
+        850,
+        TRAINING_CUTOFF + timedelta(days=1),
+        team_base_logit=0.1,
+        draft_signal=0.25,
+        rosh_signal=-0.5,
+        cluster_signal=1.0,
+    )
+    prediction = predict_prematch(model, target, top_n=len(model.feature_names))
+
+    assert prediction.status is PredictionStatus.PREDICTED
+    assert prediction.cluster_logit_delta is not None
+    assert prediction.total_adjustment == pytest.approx(
+        prediction.learned_intercept
+        + prediction.draft_logit_delta
+        + prediction.rosh_logit_delta
+        + prediction.cluster_logit_delta
+    )
+    cluster_contributions = prediction.top_cluster_contributions
+    assert cluster_contributions
+    assert all(
+        row.feature_name in PREMATCH_CLUSTER_MODEL_SCHEMA
+        for row in cluster_contributions
     )
 
 

@@ -15,7 +15,13 @@ from typing import Any, Callable, Mapping
 
 from prematch.stratz_official_profile import get_profile
 
+from .cluster_artifacts import (
+    cluster_feature_artifact_from_payload,
+    replay_cluster_feature_artifact,
+)
+from .cluster_features import CLUSTER_FEATURE_SCHEMA_HASH
 from .draft_features import AvailabilityMode
+from .hero_clusters import ClusterEvidenceMode, load_cluster_resource
 from .prematch_artifacts import (
     canonical_json_bytes,
     prematch_model_artifact_from_payload,
@@ -60,6 +66,7 @@ UTC = timezone.utc
 PREMATCH_DEPLOYMENT_VERSION = "prematch-frozen-deployment-v1"
 PREMATCH_DEPLOYMENT_SCHEMA = "prematch-frozen-deployment/v1"
 PREMATCH_DEPLOYMENT_PROOF_SCHEMA = "prematch-m6-default-decision-proof/v1"
+CLUSTER_MODEL_KIND = "team_plus_draft_rosh_clusters"
 
 _DEPLOYMENT_FIELDS = frozenset(
     {
@@ -78,6 +85,9 @@ _DEPLOYMENT_FIELDS = frozenset(
         "m6_report_hash",
     }
 )
+_CLUSTER_DEPLOYMENT_FIELDS = _DEPLOYMENT_FIELDS | {
+    "cluster_candidate_model_artifact"
+}
 _FEATURE_FIELDS = frozenset(
     {
         "feature_version",
@@ -94,6 +104,7 @@ _FEATURE_FIELDS = frozenset(
         "input_hash",
     }
 )
+_CLUSTER_FEATURE_FIELDS = _FEATURE_FIELDS | {"cluster"}
 _TEAM_FEATURE_FIELDS = frozenset(
     {
         "run_id",
@@ -395,7 +406,12 @@ def _feature_snapshot_from_payload(
     *,
     team_base_logit: float | None = None,
 ) -> PrematchFeatureSnapshot:
-    row = _exact_object(value, _FEATURE_FIELDS, "prematch feature snapshot")
+    fields = (
+        _CLUSTER_FEATURE_FIELDS
+        if isinstance(value, Mapping) and "cluster" in value
+        else _FEATURE_FIELDS
+    )
+    row = _exact_object(value, fields, "prematch feature snapshot")
     team = _exact_object(
         row["team_rating"], _TEAM_FEATURE_FIELDS, "team rating snapshot"
     )
@@ -403,6 +419,11 @@ def _feature_snapshot_from_payload(
         row["draft_residual"], _DRAFT_FEATURE_FIELDS, "draft residual snapshot"
     )
     rosh = _exact_object(row["rosh"], _ROSH_FEATURE_FIELDS, "R.O.S.H. snapshot")
+    cluster_artifact = (
+        None
+        if "cluster" not in row
+        else cluster_feature_artifact_from_payload(row["cluster"])
+    )
 
     draft_features_raw = draft["features"]
     if not isinstance(draft_features_raw, Mapping):
@@ -485,6 +506,7 @@ def _feature_snapshot_from_payload(
             (name, rosh_features_raw[name]) for name in ROSH_MODEL_SCHEMA
         ),
         input_hash=_digest(row["input_hash"], "input_hash"),
+        cluster_artifact=cluster_artifact,
     )
     if canonical_json_bytes(snapshot.to_payload()) != canonical_json_bytes(dict(row)):
         raise ValueError("prematch feature snapshot payload is not canonical")
@@ -581,6 +603,7 @@ _REQUIRED_INCREMENTAL_COMPARISONS: Mapping[str, tuple[str, ...]] = MappingProxyT
         # report, but the design contract requires only the two component
         # comparisons for the combined candidate.
         "team_plus_draft_rosh": ("M5-M3", "M5-M4"),
+        "team_plus_draft_rosh_clusters": ("M6_CLUSTER-M5",),
     }
 )
 _INCREMENTAL_COMPONENTS: Mapping[str, str] = MappingProxyType(
@@ -590,6 +613,7 @@ _INCREMENTAL_COMPONENTS: Mapping[str, str] = MappingProxyType(
         "M5-M3": "rosh",
         "M5-M4": "draft",
         "M5-M2": "combined",
+        "M6_CLUSTER-M5": "cluster",
     }
 )
 
@@ -604,6 +628,8 @@ def _validate_incremental_metrics(
         raise ValueError(f"M6 comparison {comparison} has no paired metrics")
     seen: set[str] = set()
     significant = False
+    brier_significant = False
+    log_loss_clearly_worse = False
     for index, raw in enumerate(rows):
         row = _exact_object(
             raw,
@@ -648,13 +674,22 @@ def _validate_incremental_metrics(
                 )
             if confidence == "ci_90" and delta is not None and upper is not None:
                 significant = significant or (delta < 0.0 and upper < 0.0)
+                if metric == "brier_score":
+                    brier_significant = delta < 0.0 and upper < 0.0
+                elif lower is not None:
+                    log_loss_clearly_worse = delta > 0.0 and lower > 0.0
         probability = row["probability_of_improvement"]
         if probability is not None:
             _probability(
                 probability,
                 f"M6 comparison {comparison}.{metric}.probability_of_improvement",
             )
-    if not significant:
+    if comparison == "M6_CLUSTER-M5":
+        if not brier_significant or log_loss_clearly_worse:
+            raise ValueError(
+                "M6 Cluster comparison lacks required Brier improvement"
+            )
+    elif not significant:
         raise ValueError(
             f"M6 comparison {comparison} has no significant paired improvement"
         )
@@ -900,6 +935,7 @@ class FrozenPrematchDeployment:
     calibration_artifact: PrematchCalibrationArtifact
     m6_report_payload: Mapping[str, Any]
     m6_report_hash: str = ""
+    cluster_candidate_model_artifact: PrematchModelArtifact | None = None
 
     def __post_init__(self) -> None:
         cutoff = _utc(self.training_cutoff, "training_cutoff")
@@ -919,6 +955,11 @@ class FrozenPrematchDeployment:
         ):
             if not isinstance(getattr(self, field), expected_type):
                 raise ValueError(f"{field} has an unsupported type")
+        if self.cluster_candidate_model_artifact is not None and not isinstance(
+            self.cluster_candidate_model_artifact,
+            PrematchModelArtifact,
+        ):
+            raise ValueError("cluster candidate model artifact has an unsupported type")
         payload = _report_payload(None, self.m6_report_payload)
         frozen_payload = _freeze(payload)
         if not isinstance(frozen_payload, Mapping):
@@ -983,12 +1024,12 @@ class FrozenPrematchDeployment:
         return self.prematch_model_artifact.model_kind
 
     @property
-    def static_gate_authorized(self) -> bool:
+    def static_gate_ready(self) -> bool:
         """Return static M6 gate state; lineage freshness is checked separately.
 
         Callers must invoke :func:`assert_frozen_prematch_deployment_deployable`
         with a current dependency revision/fingerprint before treating a bundle
-        as runtime-authorized.
+        as runtime-ready.
         """
 
         decision = self.m6_report_payload.get("default_decision")
@@ -1005,7 +1046,7 @@ class FrozenPrematchDeployment:
         return self.availability_mode
 
     def _payload_without_key(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema": PREMATCH_DEPLOYMENT_SCHEMA,
             "deployment_version": PREMATCH_DEPLOYMENT_VERSION,
             "training_cutoff": self.training_cutoff.isoformat(),
@@ -1019,6 +1060,11 @@ class FrozenPrematchDeployment:
             "m6_report": _thaw(self.m6_report_payload),
             "m6_report_hash": self.m6_report_hash,
         }
+        if self.cluster_candidate_model_artifact is not None:
+            payload["cluster_candidate_model_artifact"] = (
+                self.cluster_candidate_model_artifact.to_payload()
+            )
+        return payload
 
     def to_payload(self, *, include_deployment_key: bool = True) -> dict[str, object]:
         payload = self._payload_without_key()
@@ -1048,6 +1094,9 @@ def _validate_bundle_identities(
     verify_prematch_feature_snapshot(snapshot)
     verify_prematch_model_artifact(model)
     replay_prematch_calibration_artifact(calibration)
+    cluster_candidate = deployment.cluster_candidate_model_artifact
+    if cluster_candidate is not None:
+        verify_prematch_model_artifact(cluster_candidate)
 
     if snapshot.feature_version != PREMATCH_FEATURE_VERSION:
         raise ValueError("unsupported prematch feature version")
@@ -1076,6 +1125,20 @@ def _validate_bundle_identities(
         raise ValueError("prospective deployment calibration is not passed")
     if calibration.calibration_cutoff >= snapshot.prediction_cutoff:
         raise ValueError("calibration was not usable before target prediction cutoff")
+    if cluster_candidate is not None:
+        if model.model_kind == CLUSTER_MODEL_KIND:
+            raise ValueError("cluster default cannot carry a duplicate cluster candidate")
+        if (
+            cluster_candidate.model_kind != CLUSTER_MODEL_KIND
+            or cluster_candidate.availability_mode != mode
+            or cluster_candidate.training_cutoff != deployment.training_cutoff
+        ):
+            raise ValueError("cluster candidate model identity does not match deployment")
+        if any(
+            row.match_id == snapshot.match_id
+            for row in cluster_candidate.training_corpus
+        ):
+            raise ValueError("target match entered cluster candidate training corpus")
     if any(
         row.match_id == snapshot.match_id for row in model.training_corpus
     ):
@@ -1143,6 +1206,29 @@ def _validate_bundle_identities(
         ROSH_MODEL_SCHEMA_HASH,
     ):
         raise ValueError("R.O.S.H. model schema does not match")
+    cluster_artifact = snapshot.cluster_artifact
+    uses_cluster = model.model_kind == CLUSTER_MODEL_KIND or cluster_candidate is not None
+    if uses_cluster and cluster_artifact is None:
+        raise ValueError("cluster model requires a bound cluster feature artifact")
+    if cluster_artifact is not None:
+        cluster_snapshot = replay_cluster_feature_artifact(cluster_artifact)
+        if not hmac.compare_digest(
+            cluster_snapshot.feature_schema_hash,
+            CLUSTER_FEATURE_SCHEMA_HASH,
+        ):
+            raise ValueError("Cluster feature schema does not match")
+        if cluster_snapshot.evidence_mode is ClusterEvidenceMode.PUBLISHED_STATIC:
+            resource = load_cluster_resource()
+            if (
+                resource.resource_version != cluster_artifact.cluster_resource_version
+                or not hmac.compare_digest(
+                    resource.resource_hash,
+                    cluster_artifact.cluster_resource_hash,
+                )
+            ):
+                raise ValueError("Cluster runtime resource identity does not match")
+        if uses_cluster and cluster_snapshot.mapping_coverage <= 0.0:
+            raise ValueError("cluster model has no cutoff-legal feature coverage")
     _validate_rosh_identity(snapshot, model_kind=model.model_kind)
     _validate_report_identity(
         deployment.m6_report_payload,
@@ -1155,7 +1241,7 @@ def _validate_bundle_identities(
     if for_runtime:
         if mode != AvailabilityMode.PROSPECTIVE.value:
             raise RuntimeError(
-                "reconstructed prematch deployment cannot authorize prospective runtime"
+                "reconstructed prematch deployment cannot be runtime-ready"
             )
         if decision_status != "passed":
             raise RuntimeError("prematch deployment default gate is not passed")
@@ -1241,6 +1327,7 @@ def build_frozen_prematch_deployment(
     feature_snapshot: PrematchFeatureSnapshot,
     prematch_model_artifact: PrematchModelArtifact,
     calibration_artifact: PrematchCalibrationArtifact,
+    cluster_candidate_model_artifact: PrematchModelArtifact | None = None,
     report: PrematchBacktestReport | Mapping[str, Any] | None = None,
     m6_report_payload: Mapping[str, Any] | None = None,
     m6_report_hash: str | None = None,
@@ -1282,6 +1369,7 @@ def build_frozen_prematch_deployment(
         calibration_artifact=calibration_artifact,
         m6_report_payload=payload,
         m6_report_hash=report_hash,
+        cluster_candidate_model_artifact=cluster_candidate_model_artifact,
     )
     verify_frozen_prematch_deployment(
         deployment,
@@ -1307,7 +1395,12 @@ def frozen_prematch_deployment_from_payload(
     stale_check: Callable[..., object] | None = None,
     for_runtime: bool = False,
 ) -> FrozenPrematchDeployment:
-    row = _exact_object(payload, _DEPLOYMENT_FIELDS, "prematch deployment")
+    fields = (
+        _CLUSTER_DEPLOYMENT_FIELDS
+        if "cluster_candidate_model_artifact" in payload
+        else _DEPLOYMENT_FIELDS
+    )
+    row = _exact_object(payload, fields, "prematch deployment")
     if row["schema"] != PREMATCH_DEPLOYMENT_SCHEMA:
         raise ValueError("unsupported prematch deployment schema")
     if row["deployment_version"] != PREMATCH_DEPLOYMENT_VERSION:
@@ -1320,6 +1413,13 @@ def frozen_prematch_deployment_from_payload(
     team_artifact = team_rating_artifact_from_payload(team_payload)
     model = prematch_model_artifact_from_payload(model_payload)
     calibration = prematch_calibration_artifact_from_payload(calibration_payload)
+    cluster_candidate = (
+        None
+        if "cluster_candidate_model_artifact" not in row
+        else prematch_model_artifact_from_payload(
+            row["cluster_candidate_model_artifact"]
+        )
+    )
     probability = team_artifact.prediction.raw_probability
     feature_snapshot = _feature_snapshot_from_payload(
         row["feature_snapshot"],
@@ -1345,6 +1445,7 @@ def frozen_prematch_deployment_from_payload(
         calibration_artifact=calibration,
         m6_report_payload=report_payload,
         m6_report_hash=_digest(row["m6_report_hash"], "m6_report_hash"),
+        cluster_candidate_model_artifact=cluster_candidate,
     )
     verify_frozen_prematch_deployment(
         deployment,

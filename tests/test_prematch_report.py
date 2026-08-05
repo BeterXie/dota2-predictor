@@ -144,6 +144,7 @@ def test_report_contains_all_slices_metrics_and_component_qualified_support(
         "M3",
         "M4",
         "M5",
+        "M6_CLUSTER",
     )
     assert all(row.eligible_targets == 28 for row in report.model_slices)
     assert all(row.support == row.predicted for row in report.model_slices)
@@ -152,8 +153,12 @@ def test_report_contains_all_slices_metrics_and_component_qualified_support(
         and row.log_loss is not None
         and row.ece is not None
         and row.accuracy is not None
-        for row in report.model_slices
+        for row in report.model_slices[:-1]
     )
+    cluster_slice = report.model_slices[-1]
+    assert cluster_slice.model_name == "team_plus_draft_rosh_clusters"
+    assert cluster_slice.support == 0
+    assert cluster_slice.cluster_available_support == 0
     comparisons = {row.comparison: row for row in report.incremental_comparisons}
     assert tuple(comparisons) == (
         "M3-M2",
@@ -161,6 +166,7 @@ def test_report_contains_all_slices_metrics_and_component_qualified_support(
         "M5-M3",
         "M5-M4",
         "M5-M2",
+        "M6_CLUSTER-M5",
     )
     assert comparisons["M4-M2"].available_support == 9
     assert comparisons["M5-M3"].available_support == 9
@@ -168,6 +174,11 @@ def test_report_contains_all_slices_metrics_and_component_qualified_support(
     assert comparisons["M5-M3"].status == "unsupported"
     assert "no_incremental_value" in comparisons["M4-M2"].reasons
     assert comparisons["M5-M2"].available_support == 24
+    assert comparisons["M6_CLUSTER-M5"].available_support == 0
+    assert comparisons["M6_CLUSTER-M5"].reasons == (
+        "cluster_evidence_unavailable",
+        "no_incremental_value",
+    )
     assert report.default_decision.model_kind != "team_plus_draft_rosh"
     assert report.default_decision.status != "passed"
 
@@ -182,6 +193,8 @@ def test_bootstrap_report_is_deterministic_and_serializable(backtest_result) -> 
     assert payload["model_slices"][0]["support"] == 28
     markdown = report_as_markdown(first)
     assert "M5-M2" in markdown
+    assert "M6_CLUSTER-M5" in markdown
+    assert "cluster_evidence_unavailable" in str(payload)
     assert "Available support" in markdown
     assert "reconstructed_walk_forward" in markdown
 
@@ -279,3 +292,80 @@ def test_combined_default_requires_direct_team_only_paired_gate() -> None:
 def test_invalid_bootstrap_sample_count_is_rejected(backtest_result) -> None:
     with pytest.raises(ValueError, match="bootstrap sample count"):
         build_prematch_report(backtest_result, bootstrap_samples=0)
+
+
+def _cluster_point(
+    match_id: int,
+    probability: float,
+    outcome: bool,
+    *,
+    series_id: int,
+):
+    return prematch_report._EvaluationPoint(  # noqa: SLF001
+        match_id=match_id,
+        series_id=series_id,
+        outcome=outcome,
+        probability=probability,
+        coverage=1.0,
+        draft_available=True,
+        rosh_available=True,
+        cluster_available=True,
+    )
+
+
+def test_cluster_gate_requires_brier_ci_and_no_clear_log_loss_regression() -> None:
+    baseline = tuple(
+        _cluster_point(
+            index + 1,
+            0.6 if index % 2 else 0.4,
+            bool(index % 2),
+            series_id=index // 2,
+        )
+        for index in range(20)
+    )
+    improved = tuple(
+        _cluster_point(
+            index + 1,
+            0.8 if index % 2 else 0.2,
+            bool(index % 2),
+            series_id=index // 2,
+        )
+        for index in range(20)
+    )
+    passed = prematch_report._incremental_report(  # noqa: SLF001
+        "M6_CLUSTER-M5",
+        "cluster",
+        improved,
+        baseline,
+        bootstrap_samples=40,
+    )
+
+    assert passed.status == "incremental_value"
+    assert passed.reasons == ()
+    assert {row.metric: row for row in passed.metrics}[
+        "brier_score"
+    ].ci_90.upper < 0.0
+
+    all_true_baseline = tuple(
+        _cluster_point(index + 1, 0.6, True, series_id=1)
+        for index in range(20)
+    )
+    log_loss_regression = tuple(
+        _cluster_point(
+            index + 1,
+            1e-6 if index == 0 else 0.8,
+            True,
+            series_id=1,
+        )
+        for index in range(20)
+    )
+    stopped = prematch_report._incremental_report(  # noqa: SLF001
+        "M6_CLUSTER-M5",
+        "cluster",
+        log_loss_regression,
+        all_true_baseline,
+        bootstrap_samples=20,
+    )
+
+    assert stopped.status == "no_incremental_value"
+    assert stopped.reasons == ("paired_log_loss_clearly_worse",)

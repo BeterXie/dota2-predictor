@@ -8,6 +8,11 @@ from dataclasses import replace
 
 import pytest
 
+from event_intelligence.cluster_artifacts import build_cluster_feature_artifact
+from event_intelligence.cluster_features import (
+    ClusterFeatureTarget,
+    ClusterPlayer,
+)
 from event_intelligence.draft_features import AvailabilityMode
 from event_intelligence.draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
@@ -37,6 +42,10 @@ from event_intelligence.prematch_features import (
 from event_intelligence.prematch_model import (
     PrematchTrainingRow,
     fit_prematch_model,
+)
+from event_intelligence.hero_clusters import (
+    ClusterEvidenceMode,
+    load_cluster_resource,
 )
 from event_intelligence.prematch_storage import prematch_dependency_fingerprint
 from event_intelligence.rosh_features import (
@@ -293,6 +302,35 @@ def _deployment(bundle_parts, **kwargs) -> FrozenPrematchDeployment:
     )
 
 
+def _cluster_artifact(snapshot: PrematchFeatureSnapshot, resource):
+    def player(hero_id: int, role: str, lane: str) -> ClusterPlayer:
+        return ClusterPlayer(hero_id, role, lane, 1.0, 1.0)
+
+    return build_cluster_feature_artifact(
+        ClusterFeatureTarget(
+            match_id=snapshot.match_id,
+            prediction_cutoff=snapshot.prediction_cutoff,
+            patch="7.41",
+            evidence_mode=ClusterEvidenceMode.PUBLISHED_STATIC,
+            radiant=(
+                player(70, "core", "safe"),
+                player(106, "core", "mid"),
+                player(96, "core", "off"),
+                player(50, "support", "safe"),
+                player(100, "support", "off"),
+            ),
+            dire=(
+                player(73, "core", "safe"),
+                player(39, "core", "mid"),
+                player(78, "core", "off"),
+                player(87, "support", "safe"),
+                player(123, "support", "off"),
+            ),
+        ),
+        resource,
+    )
+
+
 def test_build_replay_and_canonical_json_round_trip(bundle_parts) -> None:
     deployment = _deployment(bundle_parts)
     assert PREMATCH_DEPLOYMENT_VERSION == "prematch-frozen-deployment-v1"
@@ -310,7 +348,53 @@ def test_build_replay_and_canonical_json_round_trip(bundle_parts) -> None:
         frozen_prematch_deployment_from_payload(deployment.to_payload()) == deployment
     )
     assert deployment.model_kind == MODEL_KIND
-    assert deployment.static_gate_authorized is True
+    assert deployment.static_gate_ready is True
+
+
+def test_bundle_binds_optional_cluster_shadow_candidate(
+    bundle_parts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team, base_snapshot, model, calibration = bundle_parts
+    resource = replace(
+        load_cluster_resource(),
+        published_at=MODEL_CUTOFF - timedelta(days=1),
+    )
+    monkeypatch.setattr(
+        "event_intelligence.prematch_deployment.load_cluster_resource",
+        lambda: resource,
+    )
+    cluster_artifact = _cluster_artifact(base_snapshot, resource)
+    snapshot = replace(
+        base_snapshot,
+        input_hash="",
+        cluster_artifact=cluster_artifact,
+    )
+    candidate = fit_prematch_model(
+        (),
+        MODEL_CUTOFF,
+        model_kind="team_plus_draft_rosh_clusters",
+        availability_mode=MODE,
+        min_samples=10,
+    )
+    deployment = build_frozen_prematch_deployment(
+        training_cutoff=MODEL_CUTOFF,
+        availability_mode=MODE,
+        dependency_revision=3,
+        team_rating_artifact=team,
+        feature_snapshot=snapshot,
+        prematch_model_artifact=model,
+        calibration_artifact=calibration,
+        cluster_candidate_model_artifact=candidate,
+        report=_proof(model.model_hash, calibration.calibration_hash),
+    )
+
+    loaded = load_frozen_prematch_deployment_json(
+        deployment.canonical_bytes().decode("utf-8")
+    )
+
+    assert loaded.cluster_candidate_model_artifact == candidate
+    assert loaded.feature_snapshot.cluster_artifact == cluster_artifact
 
 
 def test_exact_duplicate_is_idempotent_and_key_binds_all_inputs(bundle_parts) -> None:
@@ -467,7 +551,7 @@ def test_dependency_fingerprint_is_recomputed_from_feature_snapshot(
         frozen_prematch_deployment_from_payload(payload)
 
 
-def test_reconstructed_bundle_never_authorizes_runtime(bundle_parts) -> None:
+def test_reconstructed_bundle_is_never_runtime_ready(bundle_parts) -> None:
     deployment = _deployment(bundle_parts)
     forged = replace(
         deployment,

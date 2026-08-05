@@ -14,6 +14,15 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from live_betting.rosh_parity_storage import RoshRunMatchLink, StoredRoshRun
 
+from .cluster_artifacts import (
+    ClusterFeatureArtifact,
+    replay_cluster_feature_artifact,
+)
+from .cluster_features import (
+    CLUSTER_MODEL_FEATURE_SCHEMA,
+    ClusterFeatureSnapshot,
+    project_cluster_features,
+)
 from .draft_features import ROLE_CONFIDENCE_MIN, AvailabilityMode
 from .draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
@@ -26,6 +35,7 @@ from .draft_residual_features import (
     replay_draft_residual_snapshot,
     team_rating_residual_evidence,
 )
+from .hero_clusters import ClusterEvidenceMode
 from .raw_archive import canonical_json_bytes
 from .rosh_features import (
     ROSH_AUTHORITY_SCHEMA,
@@ -47,18 +57,26 @@ PREMATCH_MODEL_KINDS = (
     "team_plus_draft",
     "team_plus_rosh",
     "team_plus_draft_rosh",
+    "team_plus_draft_rosh_clusters",
 )
 
 TEAM_ONLY_SCHEMA: tuple[str, ...] = ()
 TEAM_PLUS_DRAFT_SCHEMA = DRAFT_RESIDUAL_MODEL_SCHEMA
 TEAM_PLUS_ROSH_SCHEMA = ROSH_MODEL_SCHEMA
 TEAM_PLUS_DRAFT_ROSH_SCHEMA = DRAFT_RESIDUAL_MODEL_SCHEMA + ROSH_MODEL_SCHEMA
+PREMATCH_CLUSTER_MODEL_SCHEMA = tuple(
+    f"cluster__{name}" for name in CLUSTER_MODEL_FEATURE_SCHEMA
+)
+TEAM_PLUS_DRAFT_ROSH_CLUSTERS_SCHEMA = (
+    TEAM_PLUS_DRAFT_ROSH_SCHEMA + PREMATCH_CLUSTER_MODEL_SCHEMA
+)
 
 _SCHEMAS = {
     "team_only": TEAM_ONLY_SCHEMA,
     "team_plus_draft": TEAM_PLUS_DRAFT_SCHEMA,
     "team_plus_rosh": TEAM_PLUS_ROSH_SCHEMA,
     "team_plus_draft_rosh": TEAM_PLUS_DRAFT_ROSH_SCHEMA,
+    "team_plus_draft_rosh_clusters": TEAM_PLUS_DRAFT_ROSH_CLUSTERS_SCHEMA,
 }
 PREMATCH_FEATURE_SCHEMAS: Mapping[str, tuple[str, ...]] = MappingProxyType(_SCHEMAS)
 PREMATCH_FEATURE_SCHEMA_HASHES: Mapping[str, str] = MappingProxyType(
@@ -217,6 +235,32 @@ class PrematchFeatureSnapshot:
     rosh_coverage: float
     rosh_features: FeaturePairs
     input_hash: str = ""
+    cluster_artifact: ClusterFeatureArtifact | None = None
+
+    @property
+    def cluster_snapshot(self) -> ClusterFeatureSnapshot | None:
+        if self.cluster_artifact is None:
+            return None
+        return replay_cluster_feature_artifact(self.cluster_artifact)
+
+    @property
+    def cluster_coverage(self) -> float:
+        snapshot = self.cluster_snapshot
+        return 0.0 if snapshot is None else snapshot.mapping_coverage
+
+    @property
+    def cluster_support(self) -> int:
+        snapshot = self.cluster_snapshot
+        return 0 if snapshot is None else snapshot.support
+
+    @property
+    def cluster_missing_reason(self) -> str | None:
+        snapshot = self.cluster_snapshot
+        return (
+            "cluster_evidence_unavailable"
+            if snapshot is None
+            else snapshot.missing_reason
+        )
 
     @property
     def support(self) -> int:
@@ -371,6 +415,22 @@ class PrematchFeatureSnapshot:
         ):
             raise ValueError("R.O.S.H. coverage projection does not match")
 
+        if self.cluster_artifact is not None:
+            if not isinstance(self.cluster_artifact, ClusterFeatureArtifact):
+                raise ValueError("cluster artifact has an unsupported type")
+            cluster = replay_cluster_feature_artifact(self.cluster_artifact)
+            expected_cluster_mode = (
+                ClusterEvidenceMode.RECONSTRUCTED_WALK_FORWARD
+                if mode is AvailabilityMode.RECONSTRUCTED
+                else ClusterEvidenceMode.PUBLISHED_STATIC
+            )
+            if (
+                cluster.match_id != self.match_id
+                or cluster.prediction_cutoff != self.prediction_cutoff
+                or cluster.evidence_mode is not expected_cluster_mode
+            ):
+                raise ValueError("prematch and Cluster snapshot identities disagree")
+
         expected = _hash(self.to_payload(include_hash=False))
         if not self.input_hash:
             object.__setattr__(self, "input_hash", expected)
@@ -424,6 +484,8 @@ class PrematchFeatureSnapshot:
         }
         if include_hash:
             payload["input_hash"] = self.input_hash
+        if self.cluster_artifact is not None:
+            payload["cluster"] = self.cluster_artifact.to_payload()
         return payload
 
 
@@ -442,6 +504,7 @@ def _compose_prematch_feature_snapshot(
     rosh_snapshot: RoshFeatureSnapshot,
     *,
     team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
+    cluster_artifact: ClusterFeatureArtifact | None = None,
 ) -> PrematchFeatureSnapshot:
     """Compose snapshots only after their public replay boundaries verified them."""
 
@@ -533,6 +596,7 @@ def _compose_prematch_feature_snapshot(
         rosh_result_hash=rosh_snapshot.result_hash,
         rosh_coverage=rosh_snapshot.coverage,
         rosh_features=tuple(rosh_projection.items()),
+        cluster_artifact=cluster_artifact,
     )
 
 
@@ -670,6 +734,22 @@ def _validate_draft_rosh_hero_identity(
         raise ValueError("Draft and R.O.S.H. hero sets disagree")
 
 
+def _validate_draft_cluster_hero_identity(
+    draft_authority_payload: Mapping[str, Any],
+    cluster_artifact: ClusterFeatureArtifact,
+) -> None:
+    draft_radiant, draft_dire, _radiant_positions, _dire_positions = (
+        _draft_authority_hero_identity(draft_authority_payload)
+    )
+    cluster = replay_cluster_feature_artifact(cluster_artifact)
+    cluster_radiant = tuple(
+        sorted(row.hero_id for row in cluster.radiant_assignments)
+    )
+    cluster_dire = tuple(sorted(row.hero_id for row in cluster.dire_assignments))
+    if draft_radiant != cluster_radiant or draft_dire != cluster_dire:
+        raise ValueError("Draft and Cluster hero sets disagree")
+
+
 def build_prematch_feature_snapshot(
     draft_residual_authority_payload: Mapping[str, Any],
     rosh_authority_payload: Mapping[str, Any],
@@ -680,6 +760,7 @@ def build_prematch_feature_snapshot(
     artifact_root: str | Path,
     match_links: Iterable[RoshRunMatchLink] = (),
     team_rating_evidence_cache: TeamRatingResidualEvidenceCache | None = None,
+    cluster_artifact: ClusterFeatureArtifact | None = None,
 ) -> PrematchFeatureSnapshot:
     """Replay external M3/M4 authority before composing an M5 snapshot."""
 
@@ -707,11 +788,17 @@ def build_prematch_feature_snapshot(
         draft_residual_authority_payload,
         rosh_authority_payload,
     )
+    if cluster_artifact is not None:
+        _validate_draft_cluster_hero_identity(
+            draft_residual_authority_payload,
+            cluster_artifact,
+        )
     return _compose_prematch_feature_snapshot(
         target_team_rating,
         draft_snapshot,
         rosh_snapshot,
         team_rating_evidence_cache=team_rating_evidence_cache,
+        cluster_artifact=cluster_artifact,
     )
 
 
@@ -722,6 +809,16 @@ def project_prematch_features(
     verify_prematch_feature_snapshot(snapshot)
     schema = prematch_feature_schema(model_kind)
     available = dict((*snapshot.draft_features, *snapshot.rosh_features))
+    if model_kind == "team_plus_draft_rosh_clusters":
+        if snapshot.cluster_artifact is None:
+            raise ValueError("cluster_evidence_unavailable")
+        cluster_snapshot = replay_cluster_feature_artifact(snapshot.cluster_artifact)
+        available.update(
+            {
+                f"cluster__{name}": value
+                for name, value in project_cluster_features(cluster_snapshot).items()
+            }
+        )
     return {name: available[name] for name in schema}
 
 
@@ -729,8 +826,10 @@ __all__ = [
     "PREMATCH_FEATURE_SCHEMA_HASHES",
     "PREMATCH_FEATURE_SCHEMAS",
     "PREMATCH_FEATURE_VERSION",
+    "PREMATCH_CLUSTER_MODEL_SCHEMA",
     "PREMATCH_MODEL_KINDS",
     "TEAM_ONLY_SCHEMA",
+    "TEAM_PLUS_DRAFT_ROSH_CLUSTERS_SCHEMA",
     "TEAM_PLUS_DRAFT_ROSH_SCHEMA",
     "TEAM_PLUS_DRAFT_SCHEMA",
     "TEAM_PLUS_ROSH_SCHEMA",

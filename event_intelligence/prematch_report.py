@@ -37,6 +37,7 @@ _SLICE_KINDS = (
     ("M3", "team_plus_draft"),
     ("M4", "team_plus_rosh"),
     ("M5", "team_plus_draft_rosh"),
+    ("M6_CLUSTER", "team_plus_draft_rosh_clusters"),
 )
 _INCREMENTAL_COMPARISONS = (
     ("M3-M2", "draft", "M3", "M2"),
@@ -46,12 +47,19 @@ _INCREMENTAL_COMPARISONS = (
     # Deployment additionally requires a direct comparison with team_only.
     # This uses the complete common OOS population and is not R.O.S.H. support.
     ("M5-M2", "combined", "M5", "M2"),
+    ("M6_CLUSTER-M5", "cluster", "M6_CLUSTER", "M5"),
 )
 _RELATED_COMPARISONS = {
     "team_only": ("M3-M2", "M4-M2", "M5-M2"),
     "team_plus_draft": ("M3-M2", "M5-M3"),
     "team_plus_rosh": ("M4-M2", "M5-M4"),
     "team_plus_draft_rosh": ("M5-M3", "M5-M4", "M5-M2"),
+    "team_plus_draft_rosh_clusters": (
+        "M6_CLUSTER-M5",
+        "M5-M3",
+        "M5-M4",
+        "M5-M2",
+    ),
 }
 _PointT = TypeVar("_PointT")
 
@@ -77,6 +85,7 @@ class PrematchModelSliceReport:
     support: int
     draft_available_support: int
     rosh_available_support: int
+    cluster_available_support: int
     coverage: CoverageDistribution
     brier_score: float | None
     log_loss: float | None
@@ -154,6 +163,7 @@ class _EvaluationPoint:
     coverage: float
     draft_available: bool
     rosh_available: bool
+    cluster_available: bool
 
 
 @dataclass(frozen=True)
@@ -281,15 +291,19 @@ def _metric_intervals(
     )
 
 
-def _availability(target: PrematchBacktestTarget) -> tuple[bool, bool]:
+def _availability(target: PrematchBacktestTarget) -> tuple[bool, bool, bool]:
     snapshot = target.snapshot
     if snapshot is None:
-        return False, False
+        return False, False, False
     draft_values = dict(snapshot.draft_features)
     draft_available = snapshot.draft_coverage > 0.0 and any(
         draft_values[name] is not None for name in DRAFT_RESIDUAL_PURE_SCHEMA
     )
-    return draft_available, snapshot.rosh_status == "available"
+    return (
+        draft_available,
+        snapshot.rosh_status == "available",
+        snapshot.cluster_artifact is not None and snapshot.cluster_coverage > 0.0,
+    )
 
 
 def _coverage_for_model(target: PrematchBacktestTarget, slice_id: str) -> float:
@@ -302,6 +316,8 @@ def _coverage_for_model(target: PrematchBacktestTarget, slice_id: str) -> float:
         return snapshot.rosh_coverage
     if slice_id == "M5":
         return snapshot.coverage
+    if slice_id == "M6_CLUSTER":
+        return snapshot.cluster_coverage
     raise ValueError("unsupported prematch ablation slice")
 
 
@@ -316,7 +332,7 @@ def _points_by_slice(
     )
     output: dict[str, list[_EvaluationPoint]] = {name: [] for name, _ in _SLICE_KINDS}
     for target in eligible:
-        draft_available, rosh_available = _availability(target)
+        draft_available, rosh_available, cluster_available = _availability(target)
         for slice_id, probability in (
             ("M0", 0.5),
             ("M1", target.radiant_prior_probability),
@@ -330,6 +346,7 @@ def _points_by_slice(
                     _coverage_for_model(target, slice_id),
                     draft_available,
                     rosh_available,
+                    cluster_available,
                 )
             )
     slice_by_kind = {kind: slice_id for slice_id, kind in _SLICE_KINDS[2:]}
@@ -343,7 +360,7 @@ def _points_by_slice(
         ):
             continue
         slice_id = slice_by_kind[run.model_kind]
-        draft_available, rosh_available = _availability(run.target)
+        draft_available, rosh_available, cluster_available = _availability(run.target)
         output[slice_id].append(
             _EvaluationPoint(
                 run.target.match_id,
@@ -353,6 +370,7 @@ def _points_by_slice(
                 _coverage_for_model(run.target, slice_id),
                 draft_available,
                 rosh_available,
+                cluster_available,
             )
         )
     return {key: tuple(value) for key, value in output.items()}
@@ -376,6 +394,7 @@ def _model_slice(
         support=metrics.support,
         draft_available_support=sum(point.draft_available for point in points),
         rosh_available_support=sum(point.rosh_available for point in points),
+        cluster_available_support=sum(point.cluster_available for point in points),
         coverage=_coverage(point.coverage for point in points),
         brier_score=metrics.brier_score,
         log_loss=metrics.log_loss,
@@ -448,6 +467,8 @@ def _incremental_report(
             if component == "draft"
             else candidate_point.rosh_available
             if component == "rosh"
+            else candidate_point.cluster_available
+            if component == "cluster"
             else True
         )
         if not available:
@@ -480,8 +501,39 @@ def _incremental_report(
     if len(paired) < PREMATCH_MIN_INCREMENTAL_SUPPORT:
         status = "unsupported"
         reasons = (
-            f"{component}_available_support_below_{PREMATCH_MIN_INCREMENTAL_SUPPORT}",
+            "cluster_evidence_unavailable"
+            if component == "cluster" and not paired
+            else f"{component}_available_support_below_{PREMATCH_MIN_INCREMENTAL_SUPPORT}",
             "no_incremental_value",
+        )
+    elif component == "cluster":
+        by_name = {row.metric: row for row in metrics}
+        brier = by_name["brier_score"]
+        log_loss = by_name["log_loss"]
+        brier_passed = (
+            brier.delta is not None
+            and brier.delta < 0.0
+            and brier.ci_90.upper is not None
+            and brier.ci_90.upper < 0.0
+        )
+        log_loss_clearly_worse = (
+            log_loss.delta is not None
+            and log_loss.delta > 0.0
+            and log_loss.ci_90.lower is not None
+            and log_loss.ci_90.lower > 0.0
+        )
+        status = (
+            "incremental_value"
+            if brier_passed and not log_loss_clearly_worse
+            else "no_incremental_value"
+        )
+        reasons = tuple(
+            reason
+            for failed, reason in (
+                (not brier_passed, "paired_brier_90_ci_not_below_zero"),
+                (log_loss_clearly_worse, "paired_log_loss_clearly_worse"),
+            )
+            if failed
         )
     else:
         significant = any(
@@ -532,6 +584,10 @@ def _default_decision(
     calibration = {row.model_kind: row for row in calibrations}
     candidates = (
         (
+            "team_plus_draft_rosh_clusters",
+            ("M6_CLUSTER-M5", "M5-M3", "M5-M4", "M5-M2"),
+        ),
+        (
             "team_plus_draft_rosh",
             ("M5-M3", "M5-M4", "M5-M2"),
         ),
@@ -540,7 +596,10 @@ def _default_decision(
     )
     rejected: list[str] = []
     for model_kind, required in candidates:
-        if not all(comparison[name].status == "incremental_value" for name in required):
+        if not all(
+            name in comparison and comparison[name].status == "incremental_value"
+            for name in required
+        ):
             continue
         gate = calibration[model_kind]
         if not gate.gate_passed:
@@ -696,14 +755,15 @@ def report_as_markdown(report: PrematchBacktestReport) -> str:
         "",
         "## Ablations",
         "",
-        "| Slice | Model | Eligible | Predicted | Insufficient | Support | Coverage mean | Brier | Log loss | ECE | AUC | Accuracy |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Slice | Model | Eligible | Predicted | Insufficient | Support | Cluster available | Coverage mean | Brier | Log loss | ECE | AUC | Accuracy |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in report.model_slices:
         lines.append(
             f"| {row.slice_id} | {row.model_name} | {row.eligible_targets} | "
             f"{row.predicted} | {row.insufficient_evidence} | {row.support} | "
-            f"{render(row.coverage.mean)} | {render(row.brier_score)} | "
+            f"{row.cluster_available_support} | {render(row.coverage.mean)} | "
+            f"{render(row.brier_score)} | "
             f"{render(row.log_loss)} | {render(row.ece)} | {render(row.auc)} | "
             f"{render(row.accuracy)} |"
         )
