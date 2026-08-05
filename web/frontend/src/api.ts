@@ -15,10 +15,15 @@ import type {
   MatchDetail,
   MonitorHistoryPage,
   MonitorSnapshot,
+  PrematchAvailabilityMode,
   PrematchDraft,
   PrematchHeroGrid,
   PrematchLeague,
+  PrematchMatchPredictionPage,
+  PrematchModelPage,
   PrematchRecentMatch,
+  PrematchPredictionPage,
+  PrematchPredictionStatus,
   PrematchTeam,
   RoshAnalysisMatchSource,
   RoshAnalysisRecordPage,
@@ -281,6 +286,62 @@ export function fetchIntelligenceTeams(
 ): Promise<IntelligenceTeamPage> {
   return getJson<IntelligenceTeamPage>(`${INTELLIGENCE_API}/teams`, signal);
 }
+
+export interface PrematchPredictionListOptions {
+  page?: number;
+  pageSize?: number;
+  modelKind?: string;
+  availabilityMode?: PrematchAvailabilityMode;
+  status?: PrematchPredictionStatus | string;
+}
+
+function prematchQuery(options: PrematchPredictionListOptions): URLSearchParams {
+  const query = new URLSearchParams({
+    page: String(options.page || 1),
+    page_size: String(options.pageSize || 20),
+  });
+  if (options.modelKind) query.set("model_kind", options.modelKind);
+  if (options.availabilityMode) query.set("availability_mode", options.availabilityMode);
+  if (options.status) query.set("status", options.status);
+  return query;
+}
+
+/** Read the frozen model and calibration identities exposed by M7. */
+export function fetchPrematchPredictionModels(
+  options: PrematchPredictionListOptions = {},
+  signal?: AbortSignal,
+): Promise<PrematchModelPage> {
+  return getJson<PrematchModelPage>(
+    `${INTELLIGENCE_API}/prematch/models?${prematchQuery(options).toString()}`,
+    signal,
+  );
+}
+
+/** Read only predictions with a current, exact lineage validation record. */
+export function fetchPrematchPredictions(
+  options: PrematchPredictionListOptions = {},
+  signal?: AbortSignal,
+): Promise<PrematchPredictionPage> {
+  return getJson<PrematchPredictionPage>(
+    `${INTELLIGENCE_API}/prematch/predictions?${prematchQuery(options).toString()}`,
+    signal,
+  );
+}
+
+export function fetchPrematchMatchPredictions(
+  matchId: number,
+  signal?: AbortSignal,
+): Promise<PrematchMatchPredictionPage> {
+  return getJson<PrematchMatchPredictionPage>(
+    `${INTELLIGENCE_API}/prematch/matches/${encodeURIComponent(matchId)}`,
+    signal,
+  );
+}
+
+// Descriptive aliases keep call sites readable for consumers that distinguish
+// a model catalogue from a prediction collection.
+export const fetchPrematchModels = fetchPrematchPredictionModels;
+export const fetchPrematchPredictionMatch = fetchPrematchMatchPredictions;
 
 export function fetchPrematchTeams(signal?: AbortSignal): Promise<PrematchTeam[]> {
   return getJson<PrematchTeam[]>("/api/teams", signal);

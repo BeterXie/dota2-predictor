@@ -1,0 +1,4 @@
+/prematch/stratz_official_score.py text eol=lf
+/tests/fixtures/stratz_official_rosh/8904419709/expected.json text eol=lf
+/tests/fixtures/stratz_official_rosh/8904419709/manifest.json text eol=lf
+/tests/fixtures/stratz_official_rosh/8904419709/page-assets.json text eol=lf

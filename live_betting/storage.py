@@ -78,7 +78,7 @@ from .vision_frame_registry import (
 
 
 CURRENT_SCHEMA_VERSION = 12
-ALEMBIC_HEAD = "20260802_0021"
+ALEMBIC_HEAD = "20260805_0026"
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 ROSH_LINEUP_CACHE_TTL = timedelta(minutes=15)
 ROSH_FETCH_MAX_DURATION = timedelta(minutes=10)

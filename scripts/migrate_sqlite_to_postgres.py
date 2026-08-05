@@ -38,8 +38,10 @@ SINGLETON_TABLES = {
     "draft_authority_revisions",
     "draft_deployment_revisions",
     "draft_lineage_revisions",
+    "prematch_lineage_revisions",
 }
 SEEDED_APPEND_TABLES = {
+    "prematch_lineage_changes",
     "raybet_match_odds_activity",
     "research_result_labels",
 }
@@ -97,6 +99,31 @@ DRAFT_LINEAGE_DEPENDENCY_TABLES = (
     "team_map_states",
 )
 DRAFT_LINEAGE_ARTIFACT_TABLES = ("draft_model_runs", "draft_predictions")
+PREMATCH_LINEAGE_DEPENDENCY_TABLES = (
+    "event_registry",
+    "heroes",
+    "raw_source_artifacts",
+    "raw_source_observations",
+    "team_rating_runs",
+    "rosh_analysis_runs",
+    "rosh_hero_scores",
+    "rosh_minute_points",
+    "rosh_run_match_links",
+    "match_ingest_status",
+    "matches",
+    "player_map_facts",
+    "match_players",
+    "picks_bans",
+    "player_role_assignments",
+    "player_map_scores",
+    "team_map_states",
+    "team_rating_predictions",
+)
+PREMATCH_LINEAGE_ARTIFACT_TABLES = (
+    "prematch_model_runs",
+    "prematch_predictions",
+    "prematch_calibration_artifacts",
+)
 
 
 @dataclass(frozen=True)
@@ -346,27 +373,28 @@ def _set_import_triggers(
 ) -> None:
     preparer = connection.dialect.identifier_preparer
     action = "ENABLE" if enabled else "DISABLE"
-    for kind, tables in (
-        ("dependency", DRAFT_LINEAGE_DEPENDENCY_TABLES),
-        ("artifact", DRAFT_LINEAGE_ARTIFACT_TABLES),
+    for lineage, kind, tables in (
+        ("draft", "dependency", DRAFT_LINEAGE_DEPENDENCY_TABLES),
+        ("draft", "artifact", DRAFT_LINEAGE_ARTIFACT_TABLES),
+        ("prematch", "dependency", PREMATCH_LINEAGE_DEPENDENCY_TABLES),
+        ("prematch", "artifact", PREMATCH_LINEAGE_ARTIFACT_TABLES),
     ):
         for table in tables:
             quoted_table = preparer.quote(table)
             for operation in ("insert", "update", "delete"):
-                trigger = f"draft_lineage_{kind}_{table}_{operation}"
+                trigger = f"{lineage}_lineage_{kind}_{table}_{operation}"
                 connection.exec_driver_sql(
                     f"ALTER TABLE {quoted_table} {action} TRIGGER "
                     + preparer.quote(trigger)
                 )
-    for trigger in (
-        "draft_lineage_changes_append_only",
-        "draft_lineage_changes_no_update",
-        "draft_lineage_changes_no_delete",
-    ):
-        connection.exec_driver_sql(
-            f"ALTER TABLE draft_lineage_changes {action} TRIGGER "
-            + preparer.quote(trigger)
-        )
+    for lineage in ("draft", "prematch"):
+        table = f"{lineage}_lineage_changes"
+        for suffix in ("append_only", "no_update", "no_delete"):
+            trigger = f"{table}_{suffix}"
+            connection.exec_driver_sql(
+                f"ALTER TABLE {table} {action} TRIGGER "
+                + preparer.quote(trigger)
+            )
     connection.exec_driver_sql(
         f"ALTER TABLE browser_events {action} TRIGGER "
         + preparer.quote("browser_events_require_external_payload")

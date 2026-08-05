@@ -26,6 +26,43 @@ from event_intelligence.roles import (
     PROSPECTIVE_ASSIGNMENT_VERSION,
     RECONSTRUCTED_ASSIGNMENT_VERSION,
 )
+from event_intelligence.draft_residual_features import (
+    DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH,
+    DRAFT_RESIDUAL_FEATURE_VERSION,
+    DRAFT_RESIDUAL_MODEL_SCHEMA,
+    DRAFT_RESIDUAL_PURE_SCHEMA,
+    SHRINKAGE_STRENGTH,
+)
+from event_intelligence.prematch_features import (
+    PREMATCH_CLUSTER_MODEL_SCHEMA,
+    PREMATCH_FEATURE_SCHEMA_HASHES,
+    PREMATCH_FEATURE_SCHEMAS,
+    PREMATCH_FEATURE_VERSION,
+    PREMATCH_MODEL_KINDS,
+)
+from event_intelligence.prematch_backtest import PREMATCH_BACKTEST_VERSION
+from event_intelligence.prematch_calibration import (
+    PREMATCH_CALIBRATION_ARTIFACT_SCHEMA,
+    PREMATCH_CALIBRATION_VERSION,
+)
+from event_intelligence.prematch_model import (
+    PREMATCH_MODEL_ARTIFACT_VERSION,
+    PREMATCH_MODEL_VERSION,
+)
+from event_intelligence.prematch_storage import PREMATCH_VALIDATION_VERSION
+from event_intelligence.rosh_features import (
+    ROSH_UNAVAILABLE_AUTHORITY_SCHEMA,
+    ROSH_FEATURE_SCHEMA,
+    ROSH_FEATURE_VERSION,
+    ROSH_MODEL_SCHEMA,
+    ROSH_MODEL_SCHEMA_HASH,
+)
+from event_intelligence.team_rating import TEAM_RATING_VERSION
+from event_intelligence.team_rating_artifacts import TEAM_RATING_ARTIFACT_VERSION
+from event_intelligence.team_rating_backtest import (
+    TEAM_RATING_BACKTEST_VERSION,
+    TEAM_RATING_PARAMETER_GRID,
+)
 from live_betting.official_rosh_shadow_strategy import CANDIDATE_SCHEMA
 from live_betting.rosh_evidence import EVIDENCE_SCHEMA
 from live_betting.strategy_contract import (
@@ -57,6 +94,108 @@ def test_existing_draft_versions_remain_frozen() -> None:
     assert BACKTEST_VERSION == "strict-draft-walk-forward-v1"
     assert DRAFT_VALIDATION_VERSION == "draft-input-lineage-v4"
     assert DEPLOYMENT_VERSION == "frozen-pure-draft-deployment-v2"
+
+
+def test_team_rating_walk_forward_versions_and_grid_remain_frozen() -> None:
+    assert TEAM_RATING_VERSION == "team-rating-elo-v1"
+    assert TEAM_RATING_ARTIFACT_VERSION == "team-rating-artifact-v1"
+    assert TEAM_RATING_BACKTEST_VERSION == "team-rating-walk-forward-v1"
+    assert len(TEAM_RATING_PARAMETER_GRID) == 144
+
+
+def test_draft_residual_version_schema_and_shrinkage_remain_frozen() -> None:
+    assert DRAFT_RESIDUAL_FEATURE_VERSION == "draft-residual-features-v1"
+    assert DRAFT_RESIDUAL_PURE_SCHEMA == (
+        "hero_residual_diff",
+        "role_residual_diff",
+        "synergy_residual_diff",
+        "counter_residual_edge",
+        "scaling_40m_residual_diff",
+        "control_initiation_proxy_diff",
+        "save_sustain_proxy_diff",
+        "wave_clear_proxy_diff",
+        "push_high_ground_proxy_diff",
+        "farm_demand_balance_diff",
+    )
+    assert len(DRAFT_RESIDUAL_MODEL_SCHEMA) == 40
+    assert len(DRAFT_RESIDUAL_FEATURE_SCHEMA_HASH) == 64
+    assert SHRINKAGE_STRENGTH == 10.0
+
+
+def test_official_rosh_feature_and_model_schemas_remain_frozen() -> None:
+    assert ROSH_FEATURE_VERSION == "official-rosh-features-v1"
+    assert ROSH_FEATURE_SCHEMA == (
+        "relative_advantage",
+        "score_20",
+        "score_30",
+        "score_40",
+        "score_50",
+        "slope_20_40",
+        "slope_30_50",
+        "curve_min",
+        "curve_max",
+        "curve_range",
+        "direction_flip_count",
+        "position_min_support",
+        "synergy_min_support",
+        "rank_fallback_ratio",
+        "coverage",
+    )
+    assert len(ROSH_MODEL_SCHEMA) == 30
+    assert len(ROSH_MODEL_SCHEMA_HASH) == 64
+
+
+def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
+    assert PREMATCH_FEATURE_VERSION == "prematch-features-v1"
+    assert PREMATCH_MODEL_VERSION == "prematch-offset-logistic-l2-v1"
+    assert PREMATCH_MODEL_ARTIFACT_VERSION == "prematch-model-artifact-v1"
+    assert PREMATCH_MODEL_KINDS == (
+        "team_only",
+        "team_plus_draft",
+        "team_plus_rosh",
+        "team_plus_draft_rosh",
+        "team_plus_draft_rosh_clusters",
+    )
+    assert PREMATCH_FEATURE_SCHEMAS["team_only"] == ()
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft"] == (DRAFT_RESIDUAL_MODEL_SCHEMA)
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_rosh"] == ROSH_MODEL_SCHEMA
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft_rosh"] == (
+        DRAFT_RESIDUAL_MODEL_SCHEMA + ROSH_MODEL_SCHEMA
+    )
+    assert PREMATCH_FEATURE_SCHEMAS["team_plus_draft_rosh_clusters"] == (
+        DRAFT_RESIDUAL_MODEL_SCHEMA
+        + ROSH_MODEL_SCHEMA
+        + PREMATCH_CLUSTER_MODEL_SCHEMA
+    )
+    assert dict(PREMATCH_FEATURE_SCHEMA_HASHES) == {
+        "team_only": (
+            "7110eb0dcd7bd9e60f3d392e2abe6b20eaed9c9df4a7aa0ce8aec5923144c69f"
+        ),
+        "team_plus_draft": (
+            "1230a670c93c1b794cab50bded1490a2385f74a302b751f494b70a2b23a68a48"
+        ),
+        "team_plus_rosh": (
+            "93400f9c773f90740760767382e9be33897e3ae0f25c30828ce65d35d802209d"
+        ),
+        "team_plus_draft_rosh": (
+            "581e42787406d3ce5b758d990e5db71d71e9c92e9d19baf85c70fdad85d9dedc"
+        ),
+        "team_plus_draft_rosh_clusters": (
+            "51d4a5f530ff760e19ff700ccb0bbff50bc8238c1d4d9fd3701c4ea247c42295"
+        ),
+    }
+
+
+def test_prematch_validation_versions_remain_frozen() -> None:
+    assert PREMATCH_BACKTEST_VERSION == "prematch-walk-forward-v1"
+    assert PREMATCH_CALIBRATION_VERSION == "prematch-platt-v1"
+    assert PREMATCH_CALIBRATION_ARTIFACT_SCHEMA == (
+        "prematch-calibration-artifact/v1"
+    )
+    assert PREMATCH_VALIDATION_VERSION == "prematch-input-lineage-v1"
+    assert ROSH_UNAVAILABLE_AUTHORITY_SCHEMA == (
+        "official-rosh-feature-unavailable-authority/v1"
+    )
 
 
 def test_official_rosh_scorer_identity_remains_frozen() -> None:
