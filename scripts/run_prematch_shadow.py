@@ -69,7 +69,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         decision = evaluate_prematch_prospective_gate(
             metrics,
             calibration_gate_passed=deployment.calibration_artifact.gate_passed,
-            incremental_gate_passed=True,
         )
     print(
         json.dumps(

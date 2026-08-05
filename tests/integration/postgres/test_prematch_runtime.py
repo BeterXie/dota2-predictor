@@ -33,6 +33,7 @@ from event_intelligence.prematch_features import (
 )
 from event_intelligence.prematch_model import PrematchTrainingRow, fit_prematch_model
 from event_intelligence.prematch_report import build_prematch_report
+from event_intelligence.prematch_shadow import load_prematch_shadow_metrics
 from event_intelligence.prematch_storage import (
     build_prematch_calibration_record,
     build_prematch_model_run_record,
@@ -1093,3 +1094,15 @@ def test_prediction_update_outside_settlement_is_rejected(
                 {"run_id": run.run_id},
             )
     assert math.isfinite(prediction.team_base_probability)
+
+
+def test_shadow_metrics_query_runs_on_postgres(postgres_engine: Engine) -> None:
+    session = PostgresSession(postgres_engine)
+    try:
+        metrics = load_prematch_shadow_metrics(session)
+    finally:
+        session.close()
+
+    assert metrics.prediction_support == 0
+    assert metrics.paired_support == 0
+    assert metrics.cluster_status == "collecting"
