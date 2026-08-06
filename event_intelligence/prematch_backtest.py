@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from database.session import PostgresSession
 from live_betting.rosh_parity_storage import (
@@ -54,9 +54,11 @@ from .prematch_model import (
 from .rosh_features import (
     RoshFeatureSnapshot,
     RoshFeatureTarget,
+    RoshRequestPlanWitness,
     build_rosh_feature_snapshot_with_authority,
     build_unavailable_rosh_feature_snapshot_with_authority,
 )
+from .rosh_authority_bridge import load_rosh_bridge_witnesses
 from .roles import PROSPECTIVE_ASSIGNMENT_VERSION, RECONSTRUCTED_ASSIGNMENT_VERSION
 from .storage import IntelligenceStorage
 from .team_rating import RatingMapInput
@@ -486,6 +488,7 @@ def _build_rosh_snapshot_with_authority(
     *,
     artifact_root: str | Path,
     match_links: Iterable[RoshRunMatchLink],
+    bridge_witnesses: Mapping[int, RoshRequestPlanWitness] | None = None,
 ) -> tuple[RoshFeatureSnapshot, dict[str, object]]:
     radiant_heroes = _heroes_by_expected_position(draft_target.radiant)
     dire_heroes = _heroes_by_expected_position(draft_target.dire)
@@ -499,9 +502,22 @@ def _build_rosh_snapshot_with_authority(
             ),
             dire_hero_ids=(player.hero_id for player in draft_target.dire.players),
         )
+    witness = None if bridge_witnesses is None else bridge_witnesses.get(draft_target.match_id)
+    selected_run = next(
+        (
+            stored
+            for stored in rosh_runs
+            if witness is not None and stored.run.run_id == witness.run_id
+        ),
+        None,
+    )
     rosh_target = RoshFeatureTarget(
         match_id=draft_target.match_id,
-        date_time=int(draft_target.prediction_cutoff.timestamp()),
+        date_time=(
+            int(draft_target.prediction_cutoff.timestamp())
+            if selected_run is None
+            else selected_run.run.date_time
+        ),
         prediction_cutoff=draft_target.prediction_cutoff,
         availability_mode=draft_target.availability_mode.value,
         radiant_hero_ids=radiant_heroes,
@@ -512,6 +528,8 @@ def _build_rosh_snapshot_with_authority(
         rosh_runs,
         artifact_root=artifact_root,
         match_links=match_links,
+        run_id=None if witness is None else witness.run_id,
+        request_plan_witness=witness,
     )
 
 
@@ -592,6 +610,11 @@ def load_prematch_corpus(
             ),
         )
         rosh_runs, rosh_links = _load_rosh_authority(connection)
+        rosh_bridge_witnesses = (
+            load_rosh_bridge_witnesses(connection)
+            if isinstance(connection, PostgresSession)
+            else {}
+        )
         revision_after = _prematch_dependency_revision(connection)
         if revision_before != revision_after:
             raise ValueError("prematch authority changed during corpus load")
@@ -701,6 +724,7 @@ def load_prematch_corpus(
             rosh_runs,
             artifact_root=artifact_root,
             match_links=rosh_links,
+            bridge_witnesses=rosh_bridge_witnesses,
         )
         cluster_artifact = (
             None

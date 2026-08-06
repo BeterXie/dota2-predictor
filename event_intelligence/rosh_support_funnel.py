@@ -125,8 +125,7 @@ def _legacy_rows(connection: PostgresSession) -> tuple[dict[str, object], ...]:
         {key: row[key] for key in row.keys()}
         for row in connection.execute(
             """SELECT match_id, radiant_hero_ids_json, dire_hero_ids_json,
-                      radiant_player_ids_json, dire_player_ids_json,
-                      player_coverage_count, backtest_eligible
+                      backtest_eligible
                  FROM historical_rosh_lineup_scores
                 ORDER BY match_id, score_key"""
         ).fetchall()
@@ -180,16 +179,6 @@ def _legacy_funnel(
     stages.append(RoshFunnelStage("ten_heroes_complete", len(current)))
     current = [row for row in current if int(row["match_id"]) in exact_position_ids]
     stages.append(RoshFunnelStage("ten_expected_positions_complete", len(current)))
-    current = [
-        row
-        for row in current
-        if row["player_coverage_count"] == 10
-        and (radiant := _five_positive_ids(row["radiant_player_ids_json"]))
-        is not None
-        and (dire := _five_positive_ids(row["dire_player_ids_json"])) is not None
-        and len(set((*radiant, *dire))) == 10
-    ]
-    stages.append(RoshFunnelStage("player_coverage_complete", len(current)))
     current = [row for row in current if row["backtest_eligible"] in (1, True)]
     stages.append(RoshFunnelStage("legacy_backtest_eligible", len(current)))
     current = [row for row in current if int(row["match_id"]) in official_match_ids]
