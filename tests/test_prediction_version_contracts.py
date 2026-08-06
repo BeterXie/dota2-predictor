@@ -147,7 +147,7 @@ def test_official_rosh_feature_and_model_schemas_remain_frozen() -> None:
 
 def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
     assert PREMATCH_FEATURE_VERSION == "prematch-features-v1"
-    assert PREMATCH_MODEL_VERSION == "prematch-offset-logistic-l2-v1"
+    assert PREMATCH_MODEL_VERSION == "prematch-offset-logistic-l2-v2"
     assert PREMATCH_MODEL_ARTIFACT_VERSION == "prematch-model-artifact-v1"
     assert PREMATCH_MODEL_KINDS == (
         "team_only",
@@ -183,12 +183,33 @@ def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
         "team_plus_draft_rosh_clusters": (
             "51d4a5f530ff760e19ff700ccb0bbff50bc8238c1d4d9fd3701c4ea247c42295"
         ),
+        "draft_ablation_d1_values": (
+            "d6380e73e664f7dc2e1ccfb7bec1f2d25c6bb9d953eb8fcf45e6b726d77e9d99"
+        ),
+        "draft_ablation_d2_hero_role": (
+            "7a4163e2051ed656423529d8290c0ec431a438932ad06ba9ddd3dae1d9ffe271"
+        ),
+        "draft_ablation_d3_synergy_counter": (
+            "1a5f9cce1c5abbc10a744b1b5349aed432a076bf91cbf6e9883f84593ead4496"
+        ),
+        "draft_ablation_d4_scaling": (
+            "a52ac96f0257ff625945c5285c9092e48d809574385961759b1e28beb115970e"
+        ),
+        "draft_ablation_d5_proxies": (
+            "2b2e730a86b50a0c4bdb44b4184385b095d1b26a74a6d28cb115840674896113"
+        ),
+        "draft_ablation_d6_values_missing": (
+            "bcd4659c72cf49508c8a0fb0deda83baf18edc60552d642f02e85ed2d1ee05e8"
+        ),
+        "draft_ablation_d7_values_support_coverage": (
+            "5568e33ded9c16d791b6ffe8413e219e6ca2316958ee869676093a2b74dbf702"
+        ),
     }
 
 
 def test_prematch_validation_versions_remain_frozen() -> None:
     assert PREMATCH_BACKTEST_VERSION == "prematch-walk-forward-v1"
-    assert PREMATCH_CALIBRATION_VERSION == "prematch-platt-v1"
+    assert PREMATCH_CALIBRATION_VERSION == "prematch-platt-v2"
     assert PREMATCH_CALIBRATION_ARTIFACT_SCHEMA == (
         "prematch-calibration-artifact/v1"
     )

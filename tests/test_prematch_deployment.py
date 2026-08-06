@@ -205,7 +205,7 @@ def _model_and_calibration(snapshot: PrematchFeatureSnapshot):
     samples = tuple(
         PrematchCalibrationSample(
             match_id=10_000 + index,
-            series_id=f"cal-series-{index}",
+            series_id=f"cal-series-{index // 2}",
             event_id="event-a",
             patch_id="7.41",
             model_kind=MODEL_KIND,
@@ -219,7 +219,7 @@ def _model_and_calibration(snapshot: PrematchFeatureSnapshot):
             model_hash=_digest(f"oos-model-{index // 10}"),
             input_snapshot_hash=_digest(f"oos-input-{index}"),
         )
-        for index in range(120)
+        for index in range(200)
     )
     calibration = build_prematch_calibration_artifact(
         samples,

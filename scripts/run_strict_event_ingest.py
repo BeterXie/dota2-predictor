@@ -1,4 +1,4 @@
-"""Incrementally archive approved Tier-1 Dota 2 completed matches."""
+"""Incrementally archive approved Tier-1 and Tier-2 Dota 2 completed matches."""
 
 from __future__ import annotations
 
@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--coverage-report",
         type=Path,
+    )
+    parser.add_argument(
+        "--defer-derived",
+        action="store_true",
+        help="archive and normalize matches without running derived data",
     )
     parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
@@ -179,7 +184,9 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
         callbacks,
         database_url=args.database_url,
         health_connection=storage.connection,
-        derived_pipeline=StrictDerivedPipeline(storage),
+        derived_pipeline=(
+            None if args.defer_derived else StrictDerivedPipeline(storage)
+        ),
         coverage_report=args.coverage_report,
     )
 

@@ -14,13 +14,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Collection, Mapping, Sequence
 
-from database.session import PostgresSession
-
-
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from database.session import PostgresSession  # noqa: E402
 from event_intelligence.roles import (  # noqa: E402
     HistoricalPositionEvidence,
     PROSPECTIVE_ASSIGNMENT_VERSION,

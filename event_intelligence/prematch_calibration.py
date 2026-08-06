@@ -30,9 +30,9 @@ from .raw_archive import canonical_json_bytes
 
 
 UTC = timezone.utc
-PREMATCH_CALIBRATION_VERSION = "prematch-platt-v1"
+PREMATCH_CALIBRATION_VERSION = "prematch-platt-v2"
 PREMATCH_CALIBRATION_ARTIFACT_SCHEMA = "prematch-calibration-artifact/v1"
-CALIBRATION_MIN_FIT_SUPPORT = 20
+CALIBRATION_MIN_FIT_SUPPORT = 100
 CALIBRATION_MIN_EVALUATION_SUPPORT = 100
 CALIBRATION_ECE_BINS = 5
 CALIBRATION_MAX_BRIER = 0.25
@@ -452,7 +452,7 @@ def _choose_series_split(
     supported = [pair for pair in causal if len(pair[0]) >= CALIBRATION_MIN_FIT_SUPPORT]
     if not supported:
         fit, evaluation = causal[0]
-        return _SeriesSplit(fit, evaluation, "fit_support_below_20")
+        return _SeriesSplit(fit, evaluation, "fit_support_below_100")
     for fit, evaluation in supported:
         if _has_both_classes(fit) and _has_both_classes(evaluation):
             return _SeriesSplit(fit, evaluation, None)
@@ -590,14 +590,7 @@ def _status_after_gate(
     availability_mode: str,
     evaluation_support: int,
     gate_passed: bool,
-    legacy_status_policy: bool,
 ) -> tuple[CalibrationStatus, str | None]:
-    if legacy_status_policy:
-        if availability_mode == AvailabilityMode.RECONSTRUCTED.value:
-            return CalibrationStatus.RECONSTRUCTED_ONLY, None
-        if gate_passed:
-            return CalibrationStatus.PASSED, None
-        return CalibrationStatus.PROVISIONAL, None
     if evaluation_support < CALIBRATION_MIN_EVALUATION_SUPPORT:
         return CalibrationStatus.PROVISIONAL, "evaluation_support_below_100"
     if not gate_passed:
@@ -613,7 +606,6 @@ def _build_artifact(
     *,
     model_kind: str,
     availability_mode: str,
-    legacy_status_policy: bool = False,
 ) -> PrematchCalibrationArtifact:
     cutoff = _utc(calibration_cutoff, "calibration_cutoff")
     kind = _model_kind(model_kind)
@@ -679,6 +671,10 @@ def _build_artifact(
             status = CalibrationStatus.FAILED
             reason = "optimizer_failed"
             gate_reasons = (reason,)
+        elif parameters[1] <= 0.0:
+            status = CalibrationStatus.FAILED
+            reason = "reverse_monotonic_calibration"
+            gate_reasons = (reason,)
         else:
             calibrated_probabilities = tuple(
                 _calibrated_probability(parameters, row.raw_probability)
@@ -702,7 +698,6 @@ def _build_artifact(
                 availability_mode=mode,
                 evaluation_support=len(evaluation),
                 gate_passed=gate_passed,
-                legacy_status_policy=legacy_status_policy,
             )
     partial = PrematchCalibrationArtifact(
         artifact_schema=PREMATCH_CALIBRATION_ARTIFACT_SCHEMA,
@@ -1155,19 +1150,6 @@ def replay_prematch_calibration_artifact(
     expected = canonical_json_bytes(replayed.to_payload(include_calibration_hash=False))
     if hmac.compare_digest(actual, expected):
         return replayed
-    # Artifacts persisted before M6.1 used the original v1 status mapping.
-    legacy_replayed = _build_artifact(
-        artifact.oos_samples,
-        artifact.calibration_cutoff,
-        model_kind=artifact.model_kind,
-        availability_mode=artifact.availability_mode,
-        legacy_status_policy=True,
-    )
-    legacy_expected = canonical_json_bytes(
-        legacy_replayed.to_payload(include_calibration_hash=False)
-    )
-    if hmac.compare_digest(actual, legacy_expected):
-        return legacy_replayed
     raise ValueError("prematch calibration does not replay from its OOS stream")
 
 

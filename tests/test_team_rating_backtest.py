@@ -121,6 +121,76 @@ def test_full_parameter_grid_is_frozen_and_complete() -> None:
     assert len(set(TEAM_RATING_PARAMETER_GRID)) == 144
 
 
+def test_vectorized_prefix_replay_matches_per_cutoff_reference() -> None:
+    rows = tuple(
+        _row(
+            index + 1,
+            started_at=START + timedelta(hours=2 * index),
+            result_usable_at=START + timedelta(hours=2 * index, minutes=40),
+            radiant_win=bool(index % 3),
+            radiant_team_id=10 + index % 4,
+            dire_team_id=10 + (index + 1) % 4,
+        )
+        for index in range(12)
+    )
+    candidates = (
+        TeamRatingParameters(200.0, 8.0, None, 1.0),
+        PARAMETERS,
+        TeamRatingParameters(300.0, 24.0, 90.0, 2.0),
+    )
+    histories = {
+        row.match_id: team_rating_backtest._earlier_training_corpus(  # noqa: SLF001
+            rows,
+            row.started_at,
+        )
+        for row in rows
+    }
+    probabilities = team_rating_backtest._vectorized_candidate_probabilities(  # noqa: SLF001
+        rows,
+        candidates,
+        histories,
+        batch_size=2,
+    )
+    selections = team_rating_backtest._walk_forward_parameter_selections(  # noqa: SLF001
+        rows,
+        candidates,
+        probabilities,
+    )
+
+    for parameter_index, parameters in enumerate(candidates):
+        for map_index, target in enumerate(rows):
+            reference = team_rating_backtest._inner_candidate_probability(  # noqa: SLF001
+                histories[target.match_id],
+                target,
+                parameters,
+            )
+            assert probabilities[parameter_index, map_index] == pytest.approx(
+                reference,
+                abs=1e-12,
+            )
+    for target in rows:
+        history = histories[target.match_id]
+        reference = select_team_rating_parameters(
+            history,
+            candidate_probabilities={
+                (parameters, inner.match_id): float(
+                    probabilities[parameter_index, rows.index(inner)]
+                )
+                for parameter_index, parameters in enumerate(candidates)
+                for inner in history
+            },
+            candidates=candidates,
+        )
+        optimized = selections[target.match_id]
+        assert optimized.parameters == reference.parameters
+        assert optimized.support == reference.support
+        assert optimized.log_loss == pytest.approx(reference.log_loss, abs=1e-15)
+        assert optimized.brier_score == pytest.approx(
+            reference.brier_score,
+            abs=1e-15,
+        )
+
+
 def test_parameter_selection_uses_log_loss_then_brier() -> None:
     first = _row(1, radiant_win=True)
     second = _row(2, radiant_win=False)
@@ -482,6 +552,7 @@ def _formal_fixture(
             "start_time": int(started.timestamp()),
             "duration": 40 * 60,
             "radiant_win": True,
+            "patch": 60,
             "radiant_team_id": 10,
             "dire_team_id": 20,
             "artifact_usable_at": (
@@ -530,6 +601,7 @@ def test_formal_loader_reconstructs_completion_but_never_promotes_to_prospective
     assert reconstructed.targets[0].prediction_cutoff == started
     assert reconstructed.maps[0].row.result_usable_at == completed
     assert reconstructed.maps[0].row.radiant_roster == RADIANT_ROSTER
+    assert reconstructed.maps[0].patch == 60
     assert reconstructed.maps[0].source_authority.artifact_id == base[
         "latest_raw_artifact_id"
     ]
@@ -684,6 +756,20 @@ def test_report_serialization_includes_metrics_parameters_and_gate() -> None:
     assert "Failed targets: 0" in markdown
     assert "Evaluation coverage: 0.666667" in markdown
     assert "## Baseline 90% Series-cluster Bootstrap Intervals" in markdown
+    assert "## Diagnostic Slices" in markdown
+    assert "## Probability Distribution" in markdown
+    assert "## Calibration Bins" in markdown
+    assert sum(row.support for row in report.probability_bins) == 2
+    assert sum(row.support for row in report.calibration_bins) == 2
+    assert {
+        (row.dimension, row.value)
+        for row in report.diagnostic_slices
+    } >= {
+        ("event", "event-a"),
+        ("month", "2026-01"),
+        ("patch", "unknown"),
+        ("team_experience", "new_team_involved"),
+    }
     assert "| constant_50 |" in markdown
     assert "  - 90% CI:" not in markdown
     assert f"`{report.gate.status}`" in markdown

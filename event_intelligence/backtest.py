@@ -430,8 +430,8 @@ FROM event_registry
 WHERE scope = 'formal_main_event'
   AND approval_status = 'approved'
   AND evidence_status = 'manually_audited'
-  AND tier = 'tier_1'
-  AND prize_pool_usd >= 1000000""",
+  AND tier IN ('tier_1', 'tier_2')
+  AND prize_pool_usd >= 0""",
     "formal_map_eligibility": """CREATE VIEW formal_map_eligibility AS
 SELECT
     m.match_id,
@@ -604,8 +604,8 @@ def _draft_trigger_scope(table: str, operation: str) -> str:
             f"({reference}.scope='formal_main_event' "
             f"AND {reference}.approval_status='approved' "
             f"AND {reference}.evidence_status='manually_audited' "
-            f"AND {reference}.tier='tier_1' "
-            f"AND {reference}.prize_pool_usd>=1000000)"
+            f"AND {reference}.tier IN ('tier_1', 'tier_2') "
+            f"AND {reference}.prize_pool_usd>=0)"
         )
 
     def formal_status(reference: str) -> str:
@@ -615,7 +615,8 @@ def _draft_trigger_scope(table: str, operation: str) -> str:
             "AND event.scope='formal_main_event' "
             "AND event.approval_status='approved' "
             "AND event.evidence_status='manually_audited' "
-            "AND event.tier='tier_1' AND event.prize_pool_usd>=1000000 "
+            "AND event.tier IN ('tier_1', 'tier_2') "
+            "AND event.prize_pool_usd>=0 "
             f"AND {reference}.stage_in_scope=1 "
             f"AND {reference}.has_valid_result=1 "
             f"AND {reference}.is_exhibition=0 "
@@ -1705,7 +1706,13 @@ def _load_draft_corpus(
             AND artifact.content_hash=status.latest_raw_content_hash
             AND artifact.source='opendota'
            WHERE eligible.draft_readiness='ready'
-           ORDER BY match.start_time, eligible.match_id"""
+             AND (SELECT COUNT(DISTINCT roles.player_slot)
+                    FROM player_role_assignments AS roles
+                   WHERE roles.match_id=eligible.match_id
+                     AND roles.purpose='expected_position'
+                     AND roles.assignment_version=?)=10
+           ORDER BY match.start_time, eligible.match_id""",
+        (resolved_version,),
     ).fetchall()
     formal_count = int(
         connection.execute(
@@ -1713,8 +1720,24 @@ def _load_draft_corpus(
                WHERE draft_readiness='ready'"""
         ).fetchone()[0]
     )
-    if len(base_rows) != formal_count:
-        raise ValueError("a formal draft-ready map lacks its exact latest raw artifact")
+    role_ready_count = int(
+        connection.execute(
+            """SELECT COUNT(*) FROM (
+                   SELECT eligible.match_id
+                     FROM formal_map_eligibility AS eligible
+                     JOIN player_role_assignments AS roles
+                       ON roles.match_id=eligible.match_id
+                    WHERE eligible.draft_readiness='ready'
+                      AND roles.purpose='expected_position'
+                      AND roles.assignment_version=?
+                    GROUP BY eligible.match_id
+                   HAVING COUNT(DISTINCT roles.player_slot)=10
+               ) AS role_ready""",
+            (resolved_version,),
+        ).fetchone()[0]
+    )
+    if len(base_rows) != role_ready_count:
+        raise ValueError("a role-ready formal draft map lacks its exact raw artifact")
 
     facts_by_match = _rows_by_match(
         connection.execute(

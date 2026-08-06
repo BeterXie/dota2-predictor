@@ -1,4 +1,4 @@
-"""Run formal nested chronological Team Rating evaluation."""
+"""Run fixed-cohort D0-D8 Prematch Draft ablation without persistence."""
 
 from __future__ import annotations
 
@@ -15,12 +15,14 @@ if str(ROOT) not in sys.path:
 
 from database.engine import require_database_url  # noqa: E402
 from event_intelligence.draft_features import AvailabilityMode  # noqa: E402
-from event_intelligence.storage import IntelligenceStorage  # noqa: E402
-from event_intelligence.team_rating_backtest import (  # noqa: E402
+from event_intelligence.prematch_ablation import (  # noqa: E402
+    DRAFT_ABLATION_BOOTSTRAP_SAMPLES,
     report_as_dict,
     report_as_markdown,
-    run_team_rating_backtest,
+    run_draft_ablation,
 )
+from event_intelligence.prematch_backtest import load_prematch_corpus  # noqa: E402
+from event_intelligence.storage import IntelligenceStorage  # noqa: E402
 
 
 def _positive_int(value: str) -> int:
@@ -37,21 +39,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="PostgreSQL URL (default: DATABASE_URL)",
     )
     parser.add_argument(
-        "--availability-mode",
-        choices=(AvailabilityMode.RECONSTRUCTED.value,),
-        default=AvailabilityMode.RECONSTRUCTED.value,
-        help="formal post-match evaluation is reconstructed walk-forward only",
+        "--artifact-root",
+        type=Path,
+        required=True,
+        help="root containing authoritative R.O.S.H. artifacts",
     )
-    parser.add_argument("--dry-run", action="store_true", help="compute without writes")
     parser.add_argument(
         "--max-maps",
         type=_positive_int,
-        help="bound formal maps for staged acceptance runs",
+        default=300,
+        help="fixed chronological cohort size (default: 300)",
     )
     parser.add_argument(
-        "--checkpoint-latest",
-        action="store_true",
-        help="persist only the final target's pre-match rating state",
+        "--bootstrap-samples",
+        type=_positive_int,
+        default=DRAFT_ABLATION_BOOTSTRAP_SAMPLES,
     )
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--markdown-output", type=Path)
@@ -64,20 +66,25 @@ def _write(path: Path, value: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.max_maps is not None and not args.dry_run:
-        parser.error("--max-maps requires --dry-run")
+    args = build_parser().parse_args(argv)
     with IntelligenceStorage(require_database_url(args.database_url)) as storage:
         storage.init_schema()
-        report = run_team_rating_backtest(
+        corpus = load_prematch_corpus(
             storage,
-            availability_mode=AvailabilityMode(args.availability_mode),
-            dry_run=args.dry_run,
-            checkpoint_latest=args.checkpoint_latest,
+            artifact_root=args.artifact_root,
+            availability_mode=AvailabilityMode.RECONSTRUCTED,
             max_maps=args.max_maps,
         )
-    payload = json.dumps(report_as_dict(report), ensure_ascii=True, sort_keys=True)
+    report = run_draft_ablation(
+        corpus,
+        bootstrap_samples=args.bootstrap_samples,
+    )
+    payload = json.dumps(
+        report_as_dict(report),
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+    )
     if args.json_output is not None:
         _write(args.json_output, payload + "\n")
     if args.markdown_output is not None:

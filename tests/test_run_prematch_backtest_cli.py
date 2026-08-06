@@ -14,6 +14,13 @@ def test_formal_prematch_cli_defaults_to_reconstructed_mode() -> None:
     assert not hasattr(args, "bootstrap_samples")
 
 
+def test_bounded_acceptance_requires_dry_run() -> None:
+    with pytest.raises(SystemExit) as error:
+        main(("--artifact-root", "artifacts", "--max-maps", "300"))
+
+    assert error.value.code == 2
+
+
 def test_formal_prematch_cli_rejects_prospective_before_database_access(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

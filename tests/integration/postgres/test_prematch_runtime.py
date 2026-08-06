@@ -978,7 +978,7 @@ def test_current_revision_cannot_substitute_for_model_archive_replay(
             "feature_schema_hash": "b" * 64,
             "model_hash": fake_hash,
             "model_kind": "team_only",
-            "model_version": "prematch-offset-logistic-l2-v1",
+            "model_version": "prematch-offset-logistic-l2-v2",
             "status": "trained",
             "training_cutoff": TRAINING_CUTOFF.isoformat(),
             "training_input_hash": "c" * 64,
@@ -994,7 +994,7 @@ def test_current_revision_cannot_substitute_for_model_archive_replay(
                     training_input_hash, model_hash, artifact_json,
                     metrics_json, status, created_at
                 ) VALUES (
-                    :hash, 'prematch-offset-logistic-l2-v1',
+                    :hash, 'prematch-offset-logistic-l2-v2',
                     'prematch-model-artifact-v1', 'team_only', :mode,
                     :cutoff, :feature_hash, :training_hash, :hash,
                     :artifact, NULL, 'trained',

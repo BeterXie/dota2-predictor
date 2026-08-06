@@ -7,7 +7,7 @@ import hmac
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 
@@ -41,6 +41,7 @@ from .prematch_model import (
 
 UTC = timezone.utc
 PREMATCH_VALIDATION_VERSION = "prematch-input-lineage-v1"
+PREMATCH_CORPUS_STORAGE_SCHEMA = "prematch-corpus-prefix/v1"
 _MODEL_KINDS = frozenset(PREMATCH_MODEL_KINDS)
 _AVAILABILITY_MODES = frozenset({"reconstructed_walk_forward", "prospective"})
 _CALIBRATION_STATUSES = frozenset(
@@ -65,6 +66,36 @@ def _canonical_json(value: object) -> str:
 
 def _hash(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _training_row_hash(model_kind: str, row_payload: Mapping[str, Any]) -> str:
+    return _hash(
+        {
+            "domain": "prematch-training-row/v1",
+            "model_kind": model_kind,
+            "row": dict(row_payload),
+        }
+    )
+
+
+def _training_prefix_hash(
+    *,
+    model_kind: str,
+    availability_mode: str,
+    parent_prefix_hash: str | None,
+    row_hash: str,
+    support: int,
+) -> str:
+    return _hash(
+        {
+            "domain": PREMATCH_CORPUS_STORAGE_SCHEMA,
+            "model_kind": model_kind,
+            "availability_mode": availability_mode,
+            "parent_prefix_hash": parent_prefix_hash,
+            "row_hash": row_hash,
+            "support": support,
+        }
+    )
 
 
 def _utc(value: object, field: str) -> datetime:
@@ -219,6 +250,211 @@ def require_prematch_dependency_revision_current(
 
 
 @dataclass(frozen=True)
+class PrematchTrainingRowRecord:
+    row_hash: str
+    model_kind: str
+    row_json: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "row_hash", _sha256(self.row_hash, "row_hash"))
+        if self.model_kind not in _MODEL_KINDS:
+            raise ValueError("unsupported prematch training-row model kind")
+        row_json = _canonical_object_json(self.row_json, "row_json")
+        object.__setattr__(self, "row_json", row_json)
+        if self.row_hash != _training_row_hash(
+            self.model_kind,
+            json.loads(row_json),
+        ):
+            raise ValueError("prematch training row hash does not recompute")
+
+    def stable_columns(self) -> tuple[object, ...]:
+        return self.model_kind, self.row_json
+
+
+@dataclass(frozen=True)
+class PrematchTrainingPrefixRecord:
+    prefix_hash: str
+    model_kind: str
+    availability_mode: str
+    parent_prefix_hash: str | None
+    row_hash: str
+    support: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "prefix_hash",
+            _sha256(self.prefix_hash, "prefix_hash"),
+        )
+        if self.model_kind not in _MODEL_KINDS:
+            raise ValueError("unsupported prematch prefix model kind")
+        if self.availability_mode not in _AVAILABILITY_MODES:
+            raise ValueError("unsupported prematch prefix availability mode")
+        object.__setattr__(
+            self,
+            "parent_prefix_hash",
+            _optional_sha256(self.parent_prefix_hash, "parent_prefix_hash"),
+        )
+        object.__setattr__(self, "row_hash", _sha256(self.row_hash, "row_hash"))
+        _positive_int(self.support, "prefix support")
+        expected = _training_prefix_hash(
+            model_kind=self.model_kind,
+            availability_mode=self.availability_mode,
+            parent_prefix_hash=self.parent_prefix_hash,
+            row_hash=self.row_hash,
+            support=self.support,
+        )
+        if self.prefix_hash != expected:
+            raise ValueError("prematch training prefix hash does not recompute")
+
+    def stable_columns(self) -> tuple[object, ...]:
+        return (
+            self.model_kind,
+            self.availability_mode,
+            self.parent_prefix_hash,
+            self.row_hash,
+            self.support,
+        )
+
+
+class PrematchCorpusStore:
+    """Deduplicate immutable training rows and linked corpus prefixes."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, PrematchTrainingRowRecord] = {}
+        self.prefixes: dict[str, PrematchTrainingPrefixRecord] = {}
+        self._rows_by_identity: dict[tuple[object, ...], str] = {}
+        self._prefixes_by_components: dict[
+            tuple[str, str, str | None, str, int], str
+        ] = {}
+
+    def add(self, model: PrematchModelArtifact) -> str | None:
+        parent: str | None = None
+        for support, row in enumerate(model.training_corpus, start=1):
+            row_identity = (
+                model.model_kind,
+                row.match_id,
+                row.input_snapshot_hash,
+                row.prediction_cutoff,
+                row.completed_at,
+                row.result_usable_at,
+                row.outcome,
+                row.series_id,
+                row.event_id,
+                row.patch_id,
+                row.team_base_logit,
+            )
+            row_hash = self._rows_by_identity.get(row_identity)
+            if row_hash is None:
+                row_payload = row.to_payload()
+                row_hash = _training_row_hash(model.model_kind, row_payload)
+                row_record = PrematchTrainingRowRecord(
+                    row_hash,
+                    model.model_kind,
+                    _canonical_json(row_payload),
+                )
+                existing_row = self.rows.setdefault(row_hash, row_record)
+                if existing_row != row_record:
+                    raise ValueError("conflicting prematch training row hash")
+                self._rows_by_identity[row_identity] = row_hash
+            components = (
+                model.model_kind,
+                model.availability_mode,
+                parent,
+                row_hash,
+                support,
+            )
+            prefix_hash = self._prefixes_by_components.get(components)
+            if prefix_hash is None:
+                prefix_hash = _training_prefix_hash(
+                    model_kind=model.model_kind,
+                    availability_mode=model.availability_mode,
+                    parent_prefix_hash=parent,
+                    row_hash=row_hash,
+                    support=support,
+                )
+                prefix_record = PrematchTrainingPrefixRecord(
+                    prefix_hash,
+                    model.model_kind,
+                    model.availability_mode,
+                    parent,
+                    row_hash,
+                    support,
+                )
+                existing_prefix = self.prefixes.setdefault(
+                    prefix_hash,
+                    prefix_record,
+                )
+                if existing_prefix != prefix_record:
+                    raise ValueError("conflicting prematch training prefix hash")
+                self._prefixes_by_components[components] = prefix_hash
+            parent = prefix_hash
+        return parent
+
+    def corpus_payloads(
+        self,
+        prefix_hash: str | None,
+        support: int,
+    ) -> list[dict[str, Any]]:
+        expected_support = _nonnegative_int(support, "training corpus support")
+        if expected_support == 0:
+            if prefix_hash is not None:
+                raise ValueError("empty prematch corpus cannot have a prefix")
+            return []
+        current = _sha256(prefix_hash, "training prefix hash")
+        reversed_rows: list[dict[str, Any]] = []
+        while current is not None:
+            prefix = self.prefixes.get(current)
+            if prefix is None:
+                raise ValueError("prematch training prefix is unavailable")
+            row = self.rows.get(prefix.row_hash)
+            if row is None:
+                raise ValueError("prematch training row is unavailable")
+            reversed_rows.append(json.loads(row.row_json))
+            current = prefix.parent_prefix_hash
+        payloads = list(reversed(reversed_rows))
+        if len(payloads) != expected_support:
+            raise ValueError("prematch training prefix support disagrees")
+        return payloads
+
+
+def _compact_model_artifact_payload(
+    model: PrematchModelArtifact,
+    store: PrematchCorpusStore,
+) -> dict[str, Any]:
+    prefix_hash = store.add(model)
+    payload = model.to_payload()
+    payload["training_corpus"] = {
+        "storage_schema": PREMATCH_CORPUS_STORAGE_SCHEMA,
+        "prefix_hash": prefix_hash,
+        "support": model.support,
+    }
+    return payload
+
+
+def _model_artifact_from_record_json(
+    artifact_json: str,
+    store: PrematchCorpusStore | None,
+) -> PrematchModelArtifact:
+    payload = json.loads(artifact_json)
+    corpus = payload.get("training_corpus")
+    if isinstance(corpus, list):
+        return load_prematch_model_artifact_json(artifact_json)
+    if not isinstance(corpus, dict) or set(corpus) != {
+        "storage_schema",
+        "prefix_hash",
+        "support",
+    }:
+        raise ValueError("prematch training corpus manifest is invalid")
+    if corpus["storage_schema"] != PREMATCH_CORPUS_STORAGE_SCHEMA or store is None:
+        raise ValueError("prematch training corpus store is unavailable")
+    support = _nonnegative_int(corpus["support"], "training corpus support")
+    prefix_hash = _optional_sha256(corpus["prefix_hash"], "training prefix hash")
+    payload["training_corpus"] = store.corpus_payloads(prefix_hash, support)
+    return load_prematch_model_artifact_json(_canonical_json(payload))
+
+
+@dataclass(frozen=True)
 class PrematchModelRunRecord:
     run_id: str
     model_version: str
@@ -232,6 +468,11 @@ class PrematchModelRunRecord:
     artifact_json: str
     metrics_json: str | None
     status: str
+    corpus_store: PrematchCorpusStore | None = dataclass_field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         run_id = _sha256(self.run_id, "run_id")
@@ -270,7 +511,7 @@ class PrematchModelRunRecord:
         )
         if self.status not in {status.value for status in ModelStatus}:
             raise ValueError("unsupported prematch model status")
-        artifact = load_prematch_model_artifact_json(artifact_json)
+        artifact = _model_artifact_from_record_json(artifact_json, self.corpus_store)
         expected = (
             artifact.model_version,
             artifact.artifact_version,
@@ -683,6 +924,10 @@ class PrematchValidationRecord:
 
 @dataclass(frozen=True)
 class PrematchPersistenceCounts:
+    inserted_corpus_rows: int = 0
+    unchanged_corpus_rows: int = 0
+    inserted_corpus_prefixes: int = 0
+    unchanged_corpus_prefixes: int = 0
     inserted_model_runs: int = 0
     unchanged_model_runs: int = 0
     inserted_calibrations: int = 0
@@ -703,9 +948,13 @@ def build_prematch_model_run_record(
     model: PrematchModelArtifact,
     *,
     metrics: Mapping[str, Any] | None = None,
+    corpus_store: PrematchCorpusStore | None = None,
 ) -> PrematchModelRunRecord:
     if not isinstance(model, PrematchModelArtifact):
         raise ValueError("model must be a PrematchModelArtifact")
+    store = PrematchCorpusStore() if corpus_store is None else corpus_store
+    if not isinstance(store, PrematchCorpusStore):
+        raise ValueError("corpus_store must be a PrematchCorpusStore")
     return PrematchModelRunRecord(
         run_id=model.model_hash,
         model_version=model.model_version,
@@ -716,9 +965,10 @@ def build_prematch_model_run_record(
         feature_schema_hash=model.feature_schema_hash,
         training_input_hash=model.training_input_hash,
         model_hash=model.model_hash,
-        artifact_json=_canonical_json(model.to_payload()),
+        artifact_json=_canonical_json(_compact_model_artifact_payload(model, store)),
         metrics_json=None if metrics is None else _canonical_json(dict(metrics)),
         status=model.status.value,
+        corpus_store=store,
     )
 
 
@@ -1151,6 +1401,38 @@ def persist_prematch_records(
         stable=lambda row: row.stable_columns(),
         conflict=lambda row: f"immutable prematch model run conflict: {row.run_id}",
     )
+    corpus_stores = {
+        id(run.corpus_store): run.corpus_store
+        for run in runs
+        if run.corpus_store is not None
+    }.values()
+    corpus_rows = _normalize_records(
+        tuple(
+            corpus_row
+            for store in corpus_stores
+            for corpus_row in store.rows.values()
+        ),
+        key=lambda row: row.row_hash,
+        stable=lambda row: row.stable_columns(),
+        conflict=lambda row: f"immutable prematch corpus row conflict: {row.row_hash}",
+    )
+    corpus_prefixes = tuple(
+        sorted(
+            _normalize_records(
+                tuple(
+                    prefix
+                    for store in corpus_stores
+                    for prefix in store.prefixes.values()
+                ),
+                key=lambda row: row.prefix_hash,
+                stable=lambda row: row.stable_columns(),
+                conflict=lambda row: (
+                    "immutable prematch corpus prefix conflict: " + row.prefix_hash
+                ),
+            ),
+            key=lambda row: (row.support, row.prefix_hash),
+        )
+    )
     calibrations = _normalize_records(
         tuple(calibration_artifacts),
         key=lambda row: row.calibration_key,
@@ -1194,6 +1476,10 @@ def persist_prematch_records(
             raise ValueError("prematch validation claims disagree")
 
     counts = {
+        "inserted_corpus_rows": 0,
+        "unchanged_corpus_rows": 0,
+        "inserted_corpus_prefixes": 0,
+        "unchanged_corpus_prefixes": 0,
         "inserted_model_runs": 0,
         "unchanged_model_runs": 0,
         "inserted_calibrations": 0,
@@ -1205,6 +1491,87 @@ def persist_prematch_records(
     }
     effective_prediction_revisions: dict[tuple[str, int], int] = {}
     with connection.transaction():
+        for row in corpus_rows:
+            existing = connection.execute(
+                """SELECT model_kind, row_json
+                     FROM prematch_training_corpus_rows WHERE row_hash=?""",
+                (row.row_hash,),
+            ).fetchone()
+            if existing is not None:
+                _require_exact_row(
+                    existing,
+                    row.stable_columns(),
+                    f"immutable prematch corpus row conflict: {row.row_hash}",
+                )
+                counts["unchanged_corpus_rows"] += 1
+            elif dry_run:
+                counts["inserted_corpus_rows"] += 1
+            else:
+                inserted = connection.execute(
+                    """INSERT INTO prematch_training_corpus_rows
+                       (row_hash, model_kind, row_json, created_at)
+                       VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+                       RETURNING row_hash""",
+                    (row.row_hash, *row.stable_columns(), created),
+                ).fetchone()
+                if inserted is not None:
+                    counts["inserted_corpus_rows"] += 1
+                else:
+                    _require_exact_row(
+                        connection.execute(
+                            """SELECT model_kind, row_json
+                               FROM prematch_training_corpus_rows
+                              WHERE row_hash=?""",
+                            (row.row_hash,),
+                        ).fetchone(),
+                        row.stable_columns(),
+                        f"immutable prematch corpus row conflict: {row.row_hash}",
+                    )
+                    counts["unchanged_corpus_rows"] += 1
+
+        for row in corpus_prefixes:
+            existing = connection.execute(
+                """SELECT model_kind, availability_mode, parent_prefix_hash,
+                          row_hash, support
+                     FROM prematch_training_corpus_prefixes
+                    WHERE prefix_hash=?""",
+                (row.prefix_hash,),
+            ).fetchone()
+            if existing is not None:
+                _require_exact_row(
+                    existing,
+                    row.stable_columns(),
+                    "immutable prematch corpus prefix conflict: " + row.prefix_hash,
+                )
+                counts["unchanged_corpus_prefixes"] += 1
+            elif dry_run:
+                counts["inserted_corpus_prefixes"] += 1
+            else:
+                inserted = connection.execute(
+                    """INSERT INTO prematch_training_corpus_prefixes
+                       (prefix_hash, model_kind, availability_mode,
+                        parent_prefix_hash, row_hash, support, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+                       RETURNING prefix_hash""",
+                    (row.prefix_hash, *row.stable_columns(), created),
+                ).fetchone()
+                if inserted is not None:
+                    counts["inserted_corpus_prefixes"] += 1
+                else:
+                    _require_exact_row(
+                        connection.execute(
+                            """SELECT model_kind, availability_mode,
+                                      parent_prefix_hash, row_hash, support
+                                 FROM prematch_training_corpus_prefixes
+                                WHERE prefix_hash=?""",
+                            (row.prefix_hash,),
+                        ).fetchone(),
+                        row.stable_columns(),
+                        "immutable prematch corpus prefix conflict: "
+                        + row.prefix_hash,
+                    )
+                    counts["unchanged_corpus_prefixes"] += 1
+
         for row in runs:
             existing = connection.execute(
                 """SELECT model_version, artifact_version, model_kind,
@@ -1472,6 +1839,92 @@ def persist_prematch_records(
     return PrematchPersistenceCounts(**counts)
 
 
+def _load_stored_model_artifact(
+    connection: PostgresSession,
+    artifact_json: str,
+) -> PrematchModelArtifact:
+    payload = json.loads(artifact_json)
+    if not hmac.compare_digest(
+        artifact_json.encode("utf-8"),
+        _canonical_json(payload).encode("utf-8"),
+    ):
+        raise ValueError("prematch model artifact JSON is not canonical")
+    corpus = payload.get("training_corpus")
+    if isinstance(corpus, list):
+        return load_prematch_model_artifact_json(artifact_json)
+    if not isinstance(corpus, dict) or set(corpus) != {
+        "storage_schema",
+        "prefix_hash",
+        "support",
+    }:
+        raise ValueError("prematch model artifact corpus manifest is invalid")
+    if corpus["storage_schema"] != PREMATCH_CORPUS_STORAGE_SCHEMA:
+        raise ValueError("unsupported prematch training corpus storage schema")
+    support = _nonnegative_int(corpus["support"], "training corpus support")
+    prefix_hash = _optional_sha256(corpus["prefix_hash"], "training prefix hash")
+    if support == 0:
+        if prefix_hash is not None:
+            raise ValueError("empty prematch corpus cannot have a prefix")
+        row_payloads: list[dict[str, Any]] = []
+    else:
+        if prefix_hash is None:
+            raise ValueError("non-empty prematch corpus lacks a prefix")
+        chain = connection.execute(
+            """WITH RECURSIVE chain AS (
+                   SELECT prefix_hash, model_kind, availability_mode,
+                          parent_prefix_hash, row_hash, support
+                     FROM prematch_training_corpus_prefixes
+                    WHERE prefix_hash=?
+                   UNION ALL
+                   SELECT parent.prefix_hash, parent.model_kind,
+                          parent.availability_mode, parent.parent_prefix_hash,
+                          parent.row_hash, parent.support
+                     FROM prematch_training_corpus_prefixes AS parent
+                     JOIN chain AS child
+                       ON parent.prefix_hash=child.parent_prefix_hash
+               )
+               SELECT chain.prefix_hash, chain.model_kind,
+                      chain.availability_mode, chain.parent_prefix_hash,
+                      chain.row_hash, chain.support, rows.row_json
+                 FROM chain
+                 JOIN prematch_training_corpus_rows AS rows
+                   ON rows.row_hash=chain.row_hash
+                ORDER BY chain.support""",
+            (prefix_hash,),
+        ).fetchall()
+        if len(chain) != support:
+            raise ValueError("prematch training prefix chain is incomplete")
+        parent: str | None = None
+        row_payloads = []
+        for expected_support, item in enumerate(chain, start=1):
+            row_payload = json.loads(
+                _canonical_object_json(str(item["row_json"]), "row_json")
+            )
+            row_hash = _training_row_hash(str(item["model_kind"]), row_payload)
+            expected_prefix = _training_prefix_hash(
+                model_kind=str(item["model_kind"]),
+                availability_mode=str(item["availability_mode"]),
+                parent_prefix_hash=parent,
+                row_hash=row_hash,
+                support=expected_support,
+            )
+            if (
+                str(item["model_kind"]) != payload["model_kind"]
+                or str(item["availability_mode"]) != payload["availability_mode"]
+                or item["parent_prefix_hash"] != parent
+                or str(item["row_hash"]) != row_hash
+                or int(item["support"]) != expected_support
+                or str(item["prefix_hash"]) != expected_prefix
+            ):
+                raise ValueError("prematch training prefix chain does not recompute")
+            parent = expected_prefix
+            row_payloads.append(row_payload)
+        if parent != prefix_hash:
+            raise ValueError("prematch training prefix head disagrees")
+    payload["training_corpus"] = row_payloads
+    return load_prematch_model_artifact_json(_canonical_json(payload))
+
+
 def load_prematch_model_artifact(
     connection: PostgresSession,
     run_id: str,
@@ -1486,7 +1939,7 @@ def load_prematch_model_artifact(
     ).fetchone()
     if row is None:
         raise ValueError("prematch model run is unavailable")
-    artifact = load_prematch_model_artifact_json(str(row["artifact_json"]))
+    artifact = _load_stored_model_artifact(connection, str(row["artifact_json"]))
     expected = (
         artifact.model_version,
         artifact.artifact_version,
@@ -1617,12 +2070,16 @@ def current_prematch_lineage_revisions(
 
 
 __all__ = [
+    "PREMATCH_CORPUS_STORAGE_SCHEMA",
     "PREMATCH_VALIDATION_VERSION",
+    "PrematchCorpusStore",
     "PrematchCalibrationRecord",
     "PrematchModelRunRecord",
     "PrematchPersistenceCounts",
     "PrematchPredictionRecord",
     "PrematchSettlementResult",
+    "PrematchTrainingPrefixRecord",
+    "PrematchTrainingRowRecord",
     "PrematchValidationRecord",
     "build_prematch_calibration_record",
     "build_prematch_model_run_record",

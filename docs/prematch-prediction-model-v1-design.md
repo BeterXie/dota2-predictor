@@ -104,10 +104,10 @@ DRAFT_RESIDUAL_FEATURE_VERSION = "draft-residual-features-v1"
 ROSH_FEATURE_VERSION = "official-rosh-features-v1"
 PREMATCH_FEATURE_VERSION = "prematch-features-v1"
 
-PREMATCH_MODEL_VERSION = "prematch-offset-logistic-l2-v1"
+PREMATCH_MODEL_VERSION = "prematch-offset-logistic-l2-v2"
 PREMATCH_MODEL_ARTIFACT_VERSION = "prematch-model-artifact-v1"
 
-PREMATCH_CALIBRATION_VERSION = "prematch-platt-v1"
+PREMATCH_CALIBRATION_VERSION = "prematch-platt-v2"
 PREMATCH_BACKTEST_VERSION = "prematch-walk-forward-v1"
 PREMATCH_DEPLOYMENT_VERSION = "prematch-frozen-deployment-v1"
 PREMATCH_VALIDATION_VERSION = "prematch-input-lineage-v1"
@@ -178,6 +178,19 @@ Official R.O.S.H. shadow behavior remains separate from the new prematch model.
 The current shadow path can emit direction evidence or a rejection. It must not
 manufacture calibrated probability, edge, stake multiplier, paper order, or
 real-money execution.
+
+### Cluster Evidence Route
+
+The selected Cluster route is **prospective shadow only**. The published 7.41
+static resource may be attached only to prospective targets at or after its
+declared publication time. It must remain unavailable in
+`reconstructed_walk_forward`, so historical M6 Cluster support is expected to
+be zero.
+
+Historical Cluster OOS evaluation is deferred unless a separately versioned
+walk-forward resource is rebuilt from evidence available before every target
+cutoff. A current static resource must never be projected backward merely to
+increase reconstructed support.
 
 ## Schema, Artifact, Replay, And Lineage
 

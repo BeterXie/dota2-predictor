@@ -29,6 +29,7 @@ from .draft_residual_features import (
     DRAFT_RESIDUAL_FEATURE_VERSION,
     DRAFT_RESIDUAL_MODEL_SCHEMA,
     DRAFT_RESIDUAL_MODEL_SCHEMA_HASH,
+    DRAFT_RESIDUAL_PURE_SCHEMA,
     DraftResidualSnapshot,
     TeamRatingResidualEvidenceCache,
     project_draft_residual_features,
@@ -71,12 +72,33 @@ TEAM_PLUS_DRAFT_ROSH_CLUSTERS_SCHEMA = (
     TEAM_PLUS_DRAFT_ROSH_SCHEMA + PREMATCH_CLUSTER_MODEL_SCHEMA
 )
 
+DRAFT_ABLATION_FEATURE_SCHEMAS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "draft_ablation_d1_values": DRAFT_RESIDUAL_PURE_SCHEMA,
+        "draft_ablation_d2_hero_role": DRAFT_RESIDUAL_PURE_SCHEMA[:2],
+        "draft_ablation_d3_synergy_counter": DRAFT_RESIDUAL_PURE_SCHEMA[2:4],
+        "draft_ablation_d4_scaling": DRAFT_RESIDUAL_PURE_SCHEMA[4:5],
+        "draft_ablation_d5_proxies": DRAFT_RESIDUAL_PURE_SCHEMA[5:],
+        "draft_ablation_d6_values_missing": tuple(
+            feature
+            for name in DRAFT_RESIDUAL_PURE_SCHEMA
+            for feature in (name, f"{name}__missing")
+        ),
+        "draft_ablation_d7_values_support_coverage": tuple(
+            feature
+            for name in DRAFT_RESIDUAL_PURE_SCHEMA
+            for feature in (name, f"{name}__log1p_support", f"{name}__coverage")
+        ),
+    }
+)
+
 _SCHEMAS = {
     "team_only": TEAM_ONLY_SCHEMA,
     "team_plus_draft": TEAM_PLUS_DRAFT_SCHEMA,
     "team_plus_rosh": TEAM_PLUS_ROSH_SCHEMA,
     "team_plus_draft_rosh": TEAM_PLUS_DRAFT_ROSH_SCHEMA,
     "team_plus_draft_rosh_clusters": TEAM_PLUS_DRAFT_ROSH_CLUSTERS_SCHEMA,
+    **DRAFT_ABLATION_FEATURE_SCHEMAS,
 }
 PREMATCH_FEATURE_SCHEMAS: Mapping[str, tuple[str, ...]] = MappingProxyType(_SCHEMAS)
 PREMATCH_FEATURE_SCHEMA_HASHES: Mapping[str, str] = MappingProxyType(
@@ -823,6 +845,7 @@ def project_prematch_features(
 
 
 __all__ = [
+    "DRAFT_ABLATION_FEATURE_SCHEMAS",
     "PREMATCH_FEATURE_SCHEMA_HASHES",
     "PREMATCH_FEATURE_SCHEMAS",
     "PREMATCH_FEATURE_VERSION",

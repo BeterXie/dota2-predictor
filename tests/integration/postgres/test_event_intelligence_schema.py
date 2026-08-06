@@ -129,6 +129,148 @@ def test_event_schema_preserves_constraints_views_and_audit_triggers(
     assert AUDIT_TRIGGERS <= triggers
 
 
+def test_tier_2_can_enter_formal_scope_and_unknown_tier_is_rejected(
+    postgres_engine: Engine,
+) -> None:
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option(
+        "sqlalchemy.url",
+        postgres_engine.url.render_as_string(hide_password=False),
+    )
+    command.downgrade(config, "20260805_0026")
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO event_registry (
+                    event_id, canonical_name, tier, prize_pool_usd,
+                    main_event_start_at, main_event_end_at, opendota_league_id,
+                    official_evidence_urls_json, evidence_status,
+                    scope_policy_version, scope, approval_status,
+                    approved_by, approved_at, reconciliation_status,
+                    included_stages_json, excluded_categories_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'old-policy-event', 'Old Policy Event', 'tier_1', 1000000,
+                    '2026-08-01T00:00:00Z', '2026-08-10T00:00:00Z', 29900,
+                    '[]', 'manually_audited',
+                    'strict-t1-usd1m-main-event-v1', 'formal_main_event',
+                    'approved', 'tester', '2026-07-13T00:00:00+00:00',
+                    'not_required', '[]', '[]',
+                    '2026-07-13T00:00:00+00:00',
+                    '2026-07-13T20:56:00+00:00'
+                )
+                """
+            )
+        )
+    command.upgrade(config, "head")
+
+    with postgres_engine.begin() as connection:
+        migrated_policy = connection.execute(
+            text(
+                "SELECT scope_policy_version, approved_at, updated_at "
+                "FROM event_registry WHERE event_id='old-policy-event'"
+            )
+        ).one()
+        before_revision = connection.execute(
+            text(
+                "SELECT dependency_revision FROM draft_lineage_revisions "
+                "WHERE singleton=1"
+            )
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO event_registry (
+                    event_id, canonical_name, tier, prize_pool_usd,
+                    main_event_start_at, main_event_end_at, opendota_league_id,
+                    official_evidence_urls_json, evidence_status,
+                    scope_policy_version, scope, approval_status,
+                    approved_by, approved_at, reconciliation_status,
+                    included_stages_json, excluded_categories_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'tier-2-event', 'Tier 2 Event', 'tier_2', 250000,
+                    '2026-08-01T00:00:00Z', '2026-08-10T00:00:00Z', 29901,
+                    '[]', 'manually_audited', 'strict-t1-t2-main-event-v2',
+                    'formal_main_event', 'approved', 'tester',
+                    '2026-07-01T00:00:00Z', 'not_required', '[]', '[]',
+                    '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO event_registry (
+                    event_id, canonical_name, tier, prize_pool_usd,
+                    main_event_start_at, main_event_end_at, opendota_league_id,
+                    official_evidence_urls_json, evidence_status,
+                    scope_policy_version, scope, approval_status,
+                    approved_by, approved_at, reconciliation_status,
+                    included_stages_json, excluded_categories_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'sub-million-tier-1', 'Sub-million Tier 1', 'tier_1', 500000,
+                    '2026-08-01T00:00:00Z', '2026-08-10T00:00:00Z', 29903,
+                    '[]', 'manually_audited', 'strict-t1-t2-main-event-v2',
+                    'formal_main_event', 'approved', 'tester',
+                    '2026-07-01T00:00:00Z', 'not_required', '[]', '[]',
+                    '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
+                )
+                """
+            )
+        )
+        formal = connection.execute(
+            text(
+                "SELECT event_id FROM formal_events "
+                "WHERE event_id IN ('tier-2-event', 'sub-million-tier-1') "
+                "ORDER BY event_id"
+            )
+        ).scalars().all()
+        after_revision = connection.execute(
+            text(
+                "SELECT dependency_revision FROM draft_lineage_revisions "
+                "WHERE singleton=1"
+            )
+        ).scalar_one()
+
+    assert migrated_policy == (
+        "strict-t1-t2-main-event-v2",
+        "2026-08-05T13:30:00+00:00",
+        "2026-08-05T13:30:00+00:00",
+    )
+    assert formal == ["sub-million-tier-1", "tier-2-event"]
+    assert after_revision == before_revision + 2
+
+    with pytest.raises(DBAPIError):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO event_registry (
+                        event_id, canonical_name, tier, prize_pool_usd,
+                        main_event_start_at, main_event_end_at,
+                        opendota_league_id, official_evidence_urls_json,
+                        evidence_status, scope_policy_version, scope,
+                        approval_status, approved_by, approved_at,
+                        reconciliation_status, included_stages_json,
+                        excluded_categories_json, created_at, updated_at
+                    ) VALUES (
+                        'unknown-tier-event', 'Unknown Tier Event', 'tier_3', 0,
+                        '2026-08-01T00:00:00Z', '2026-08-10T00:00:00Z',
+                        29902, '[]', 'manually_audited',
+                        'strict-t1-t2-main-event-v2', 'formal_main_event',
+                        'approved', 'tester', '2026-07-01T00:00:00Z',
+                        'not_required', '[]', '[]',
+                        '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
+                    )
+                    """
+                )
+            )
+
+
 def test_raw_artifact_relocation_requires_append_only_audit(
     postgres_engine: Engine,
 ) -> None:

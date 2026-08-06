@@ -1,4 +1,4 @@
-"""Continuously backfill historical Rosh scores for approved Tier-1 maps."""
+"""Continuously backfill historical Rosh scores for approved T1/T2 maps."""
 
 from __future__ import annotations
 

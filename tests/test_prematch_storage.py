@@ -167,6 +167,8 @@ def _result(
 class _MemoryConnection:
     def __init__(self) -> None:
         self.runs: dict[str, tuple[object, ...]] = {}
+        self.corpus_rows: dict[str, tuple[object, ...]] = {}
+        self.corpus_prefixes: dict[str, tuple[object, ...]] = {}
         self.calibrations: dict[str, tuple[object, ...]] = {}
         self.predictions: dict[tuple[str, int], tuple[object, ...]] = {}
         self.validations: dict[tuple[str, int], tuple[object, ...]] = {}
@@ -175,12 +177,26 @@ class _MemoryConnection:
     @contextmanager
     def transaction(self) -> Iterator[None]:
         before = deepcopy(
-            (self.runs, self.calibrations, self.predictions, self.validations)
+            (
+                self.runs,
+                self.corpus_rows,
+                self.corpus_prefixes,
+                self.calibrations,
+                self.predictions,
+                self.validations,
+            )
         )
         try:
             yield
         except BaseException:
-            self.runs, self.calibrations, self.predictions, self.validations = before
+            (
+                self.runs,
+                self.corpus_rows,
+                self.corpus_prefixes,
+                self.calibrations,
+                self.predictions,
+                self.validations,
+            ) = before
             raise
 
     def execute(
@@ -195,6 +211,36 @@ class _MemoryConnection:
                 ("is_current",),
                 (int(values[0]) in self.current_dependency_revisions,),
             )
+        if sql.startswith("SELECT model_kind, row_json"):
+            return _result(
+                ("model_kind", "row_json"),
+                self.corpus_rows.get(str(values[0])),
+            )
+        if sql.startswith("INSERT INTO prematch_training_corpus_rows"):
+            key = str(values[0])
+            if key in self.corpus_rows:
+                return _result(("row_hash",), None)
+            self.corpus_rows[key] = values[1:-1]
+            return _result(("row_hash",), (key,))
+        if sql.startswith(
+            "SELECT model_kind, availability_mode, parent_prefix_hash"
+        ):
+            return _result(
+                (
+                    "model_kind",
+                    "availability_mode",
+                    "parent_prefix_hash",
+                    "row_hash",
+                    "support",
+                ),
+                self.corpus_prefixes.get(str(values[0])),
+            )
+        if sql.startswith("INSERT INTO prematch_training_corpus_prefixes"):
+            key = str(values[0])
+            if key in self.corpus_prefixes:
+                return _result(("prefix_hash",), None)
+            self.corpus_prefixes[key] = values[1:-1]
+            return _result(("prefix_hash",), (key,))
         if sql.startswith("SELECT model_version"):
             columns = (
                 "model_version",
@@ -308,7 +354,20 @@ class _MemoryConnection:
 def test_records_bind_full_replayable_artifacts_and_dependency_identity() -> None:
     model, snapshot, run, calibration, prediction, validation = _records()
 
-    assert json.loads(run.artifact_json) == model.to_payload()
+    payload = json.loads(run.artifact_json)
+    manifest = payload["training_corpus"]
+    assert manifest["storage_schema"] == "prematch-corpus-prefix/v1"
+    assert manifest["support"] == model.support
+    assert run.corpus_store is not None
+    assert len(run.corpus_store.rows) == model.support
+    assert len(run.corpus_store.prefixes) == model.support
+    assert (
+        prematch_storage._model_artifact_from_record_json(  # noqa: SLF001
+            run.artifact_json,
+            run.corpus_store,
+        )
+        == model
+    )
     assert calibration.fit_cutoff is None
     assert calibration.parameters_json is None
     assert json.loads(calibration.artifact_json)["oos_samples"] == []
@@ -319,6 +378,26 @@ def test_records_bind_full_replayable_artifacts_and_dependency_identity() -> Non
 
     changed = replace(snapshot, team_rating_artifact_hash=_digest(999), input_hash="")
     assert prematch_dependency_fingerprint(changed) != prediction.dependency_fingerprint
+
+
+def test_corpus_store_deduplicates_rows_and_prefixes_across_model_runs() -> None:
+    store = prematch_storage.PrematchCorpusStore()
+    baseline = _model()
+    first = build_prematch_model_run_record(baseline, corpus_store=store)
+    second = build_prematch_model_run_record(
+        _model(l2_regularization=2.0),
+        corpus_store=store,
+    )
+
+    assert first.model_hash != second.model_hash
+    assert len(store.rows) == 24
+    assert len(store.prefixes) == 24
+    full_bytes = len(prematch_storage._canonical_json(baseline.to_payload()))  # noqa: SLF001
+    assert len(first.artifact_json) < full_bytes / 4
+    assert prematch_storage._model_artifact_from_record_json(  # noqa: SLF001
+        first.artifact_json,
+        store,
+    ) == baseline
 
 
 def test_prediction_record_rejects_all_derivable_payload_drift() -> None:
@@ -574,15 +653,15 @@ def test_gate_failed_calibration_keeps_parameters_but_cannot_predict() -> None:
             prediction_cutoff=START + timedelta(hours=index),
             result_usable_at=START + timedelta(hours=index, minutes=30),
             raw_probability=0.15 if index % 2 == 0 else 0.85,
-            outcome=index % 2 if index < 20 else 1 - index % 2,
+            outcome=index % 2 if index < 100 else 1 - index % 2,
             model_hash=_digest(400 + index // 10),
             input_snapshot_hash=_digest(500 + index),
         )
-        for index in range(120)
+            for index in range(200)
     )
     artifact = build_prematch_calibration_artifact(
         samples,
-        START + timedelta(hours=120, minutes=31),
+        START + timedelta(hours=200, minutes=31),
         model_kind=model.model_kind,
         availability_mode=MODE,
     )

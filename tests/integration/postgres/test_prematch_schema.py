@@ -21,6 +21,8 @@ from event_intelligence.raw_archive import canonical_json_bytes
 ROOT = Path(__file__).resolve().parents[3]
 MODE = "reconstructed_walk_forward"
 PREMATCH_TABLES = {
+    "prematch_training_corpus_rows",
+    "prematch_training_corpus_prefixes",
     "prematch_model_runs",
     "prematch_predictions",
     "prematch_calibration_artifacts",
@@ -49,7 +51,7 @@ def _insert_parent_model(
                 "feature_schema_hash": "b" * 64,
                 "model_hash": model_hash,
                 "model_kind": "team_only",
-                "model_version": "prematch-offset-logistic-l2-v1",
+                "model_version": "prematch-offset-logistic-l2-v2",
                 "status": "trained",
                 "training_cutoff": "2026-01-01T00:00:00+00:00",
                 "training_input_hash": "c" * 64,
@@ -65,7 +67,7 @@ def _insert_parent_model(
                 training_input_hash, model_hash, artifact_json,
                 metrics_json, status, created_at
             ) VALUES (
-                :model_hash, 'prematch-offset-logistic-l2-v1',
+                :model_hash, 'prematch-offset-logistic-l2-v2',
                 'prematch-model-artifact-v1', 'team_only', :mode,
                 '2026-01-01T00:00:00+00:00', :feature_hash,
                 :training_hash, :model_hash, :artifact, NULL, 'trained',
@@ -83,7 +85,7 @@ def _insert_parent_model(
     )
 
 
-def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
+def test_prematch_schema_has_tables_columns_indexes_and_triggers(
     postgres_engine: Engine,
 ) -> None:
     inspector = inspect(postgres_engine)
@@ -101,6 +103,21 @@ def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
         "artifact_json",
         "metrics_json",
         "status",
+        "created_at",
+    )
+    assert _columns(postgres_engine, "prematch_training_corpus_rows") == (
+        "row_hash",
+        "model_kind",
+        "row_json",
+        "created_at",
+    )
+    assert _columns(postgres_engine, "prematch_training_corpus_prefixes") == (
+        "prefix_hash",
+        "model_kind",
+        "availability_mode",
+        "parent_prefix_hash",
+        "row_hash",
+        "support",
         "created_at",
     )
     assert _columns(postgres_engine, "prematch_predictions") == (
@@ -167,6 +184,7 @@ def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
         "idx_prematch_predictions_run",
         "idx_prematch_calibration_model_cutoff",
         "idx_prematch_prediction_validations_fingerprint",
+        "idx_prematch_corpus_prefix_parent",
     } <= indexes
     calibration_checks = {
         row["name"]
@@ -185,10 +203,12 @@ def test_prematch_schema_has_six_tables_columns_indexes_and_triggers(
                 )
             ).scalars()
         )
-    assert revision == "20260805_0026"
+    assert revision == "20260806_0029"
     assert {
         "prematch_predictions_mutation_guard",
         "prematch_calibration_mode_guard",
+        "prematch_training_corpus_rows_append_only",
+        "prematch_training_corpus_prefixes_append_only",
         "prematch_prediction_validations_claim_guard",
         "prematch_model_runs_append_only",
         "prematch_calibration_artifacts_append_only",
@@ -208,7 +228,7 @@ def test_json_object_checks_preserve_jcs_numeric_text_and_reject_arrays(
             "feature_schema_hash": "b" * 64,
             "model_hash": model_hash,
             "model_kind": "team_only",
-            "model_version": "prematch-offset-logistic-l2-v1",
+            "model_version": "prematch-offset-logistic-l2-v2",
             "numeric_probe": 1e-15,
             "status": "trained",
             "training_cutoff": "2026-01-01T00:00:00+00:00",
@@ -235,6 +255,48 @@ def test_json_object_checks_preserve_jcs_numeric_text_and_reject_arrays(
                 connection,
                 model_hash="e" * 64,
                 artifact_json="[]",
+            )
+
+
+def test_corpus_rows_preserve_application_canonical_float_text(
+    postgres_engine: Engine,
+) -> None:
+    row_json = canonical_json_bytes(
+        {
+            "availability_mode": MODE,
+            "team_base_logit": 0.01617391412884206,
+        }
+    ).decode()
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                """INSERT INTO prematch_training_corpus_rows
+                       (row_hash, model_kind, row_json, created_at)
+                     VALUES (:row_hash, 'team_plus_draft_rosh', :row_json,
+                             '2026-08-06T00:00:00+00:00')"""
+            ),
+            {"row_hash": "f" * 64, "row_json": row_json},
+        )
+    with postgres_engine.connect() as connection:
+        stored = connection.execute(
+            text(
+                "SELECT row_json FROM prematch_training_corpus_rows "
+                "WHERE row_hash=:row_hash"
+            ),
+            {"row_hash": "f" * 64},
+        ).scalar_one()
+    assert stored == row_json
+
+    with pytest.raises(DBAPIError):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO prematch_training_corpus_rows
+                           (row_hash, model_kind, row_json, created_at)
+                         VALUES (:row_hash, 'team_only', '[]',
+                                 '2026-08-06T00:00:00+00:00')"""
+                ),
+                {"row_hash": "1" * 64},
             )
 
 

@@ -6,9 +6,13 @@ import hashlib
 import hmac
 import math
 import random
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+from scipy.special import expit
 
 from database.session import DatabaseRow, PostgresSession
 
@@ -32,6 +36,8 @@ UTC = timezone.utc
 TEAM_RATING_BACKTEST_VERSION = "team-rating-walk-forward-v1"
 BOOTSTRAP_SAMPLES = 1_000
 CALIBRATION_BINS = 5
+PROBABILITY_BINS = 10
+NEW_TEAM_PRIOR_MAP_THRESHOLD = 5
 BOOTSTRAP_ALGORITHM_VERSION = "series-cluster-percentile-v1"
 BOOTSTRAP_SEED_MATERIAL = f"{TEAM_RATING_BACKTEST_VERSION}:b0-b1-b2"
 
@@ -267,6 +273,7 @@ class LoadedTeamRatingMap:
     prediction_cutoff: datetime | None
     cutoff_source: str | None
     source_authority: TeamRatingSourceAuthority
+    patch: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.row, RatingMapInput):
@@ -275,6 +282,8 @@ class LoadedTeamRatingMap:
             raise ValueError("source_authority must be a TeamRatingSourceAuthority")
         if self.source_authority.match_id != self.row.match_id:
             raise ValueError("source authority and map match IDs disagree")
+        if self.patch is not None:
+            _positive_int(self.patch, "patch")
         if (self.prediction_cutoff is None) != (self.cutoff_source is None):
             raise ValueError("prediction cutoff and source must both be set or absent")
         if self.prediction_cutoff is not None:
@@ -447,6 +456,37 @@ class GateReport:
 
 
 @dataclass(frozen=True)
+class DiagnosticSliceReport:
+    dimension: str
+    value: str
+    support: int
+    brier_score: float | None
+    log_loss: float | None
+    ece: float | None
+    auc: float | None
+    accuracy: float | None
+    brier_delta_vs_constant_50: float | None
+    log_loss_delta_vs_constant_50: float | None
+
+
+@dataclass(frozen=True)
+class ProbabilityBinReport:
+    lower: float
+    upper: float
+    support: int
+
+
+@dataclass(frozen=True)
+class CalibrationBinReport:
+    lower: float
+    upper: float
+    support: int
+    mean_probability: float | None
+    observed_win_rate: float | None
+    brier_score: float | None
+
+
+@dataclass(frozen=True)
 class TeamRatingBacktestReport:
     backtest_version: str
     bootstrap_algorithm: str
@@ -471,6 +511,9 @@ class TeamRatingBacktestReport:
     selected_parameter_counts: tuple[tuple[str, int], ...]
     baselines: tuple[BaselineReport, ...]
     paired_deltas: tuple[PairedDeltaReport, ...]
+    diagnostic_slices: tuple[DiagnosticSliceReport, ...]
+    probability_bins: tuple[ProbabilityBinReport, ...]
+    calibration_bins: tuple[CalibrationBinReport, ...]
     gate: GateReport
 
 
@@ -544,7 +587,7 @@ def load_team_rating_corpus(
     base_rows = connection.execute(
         """SELECT eligible.match_id, eligible.event_id, status.series_id,
                   status.latest_raw_artifact_id, status.latest_raw_content_hash,
-                  match.start_time, match.duration, match.radiant_win,
+                  match.start_time, match.duration, match.radiant_win, match.patch,
                   match.radiant_team_id, match.dire_team_id,
                   artifact.first_usable_at AS artifact_usable_at,
                   (SELECT MIN(observation.first_usable_at)
@@ -661,6 +704,11 @@ def load_team_rating_corpus(
                 prediction_cutoff,
                 cutoff_source,
                 source_authority,
+                patch=(
+                    None
+                    if base["patch"] is None
+                    else _positive_int(base["patch"], f"map {match_id} patch")
+                ),
             )
         )
     return TeamRatingCorpus(availability_mode.value, formal_maps, tuple(loaded))
@@ -800,6 +848,246 @@ def _candidate_sort_key(
     )
 
 
+def _history_available_from(
+    maps: Sequence[RatingMapInput],
+) -> tuple[int, ...]:
+    target_cutoffs = tuple(row.started_at for row in maps)
+    result = []
+    for row in maps:
+        if row.result_usable_at is None:
+            result.append(len(maps))
+            continue
+        result.append(
+            max(
+                bisect_left(target_cutoffs, row.result_usable_at),
+                bisect_right(target_cutoffs, row.completed_at),
+            )
+        )
+    return tuple(result)
+
+
+def _effective_modifier_inputs(
+    maps: Sequence[RatingMapInput],
+) -> tuple[tuple[tuple[float | None, float | None], ...], ...]:
+    previous: dict[int, tuple[tuple[int, ...], datetime]] = {}
+    result: list[tuple[tuple[float | None, float | None], ...]] = []
+    for row in maps:
+        sides = []
+        for team_id, roster in (
+            (row.radiant_team_id, row.radiant_roster),
+            (row.dire_team_id, row.dire_roster),
+        ):
+            prior = previous.get(team_id)
+            if prior is None:
+                sides.append((None, None))
+            else:
+                prior_roster, last_observed_at = prior
+                inactive_days = (
+                    row.started_at - last_observed_at
+                ).total_seconds() / 86_400.0
+                if inactive_days < 0.0:
+                    raise ValueError("rating cutoff cannot precede last_observed_at")
+                continuity = (
+                    None
+                    if not prior_roster or not roster
+                    else sum(player_id in roster for player_id in prior_roster) / 5.0
+                )
+                sides.append((inactive_days, continuity))
+            previous[team_id] = (roster, row.completed_at)
+        result.append(tuple(sides))
+    return tuple(result)
+
+
+def _vectorized_candidate_probabilities(
+    maps: Sequence[RatingMapInput],
+    candidates: Sequence[TeamRatingParameters],
+    histories: Mapping[int, Sequence[RatingMapInput]],
+    *,
+    batch_size: int = 8,
+) -> np.ndarray:
+    """Evaluate exact per-cutoff prefix replays in bounded NumPy batches."""
+
+    if not candidates:
+        raise ValueError("Team Rating parameter grid cannot be empty")
+    count = len(maps)
+    probabilities = np.empty((len(candidates), count), dtype=np.float64)
+    if not count:
+        return probabilities
+    if any(
+        row.result_usable_at is not None
+        and row.result_usable_at != row.completed_at
+        for row in maps
+    ):
+        for parameter_index, parameters in enumerate(candidates):
+            probabilities[parameter_index] = tuple(
+                _inner_candidate_probability(
+                    histories[row.match_id],
+                    row,
+                    parameters,
+                )
+                for row in maps
+            )
+        return probabilities
+
+    initial = 1_500.0
+    team_ids = sorted(
+        {
+            team_id
+            for row in maps
+            for team_id in (row.radiant_team_id, row.dire_team_id)
+        }
+    )
+    team_indexes = {team_id: index for index, team_id in enumerate(team_ids)}
+    radiant_indexes = tuple(team_indexes[row.radiant_team_id] for row in maps)
+    dire_indexes = tuple(team_indexes[row.dire_team_id] for row in maps)
+    available_from = _history_available_from(maps)
+    modifier_inputs = _effective_modifier_inputs(maps)
+    side_logits = np.asarray(
+        [
+            estimate_radiant_side_logit(
+                sum(row.radiant_win for row in histories[target.match_id]),
+                len(histories[target.match_id]),
+            )
+            for target in maps
+        ],
+        dtype=np.float64,
+    )
+
+    for batch_start in range(0, len(candidates), batch_size):
+        batch = candidates[batch_start : batch_start + batch_size]
+        size = len(batch)
+        rating_scales = np.asarray(
+            [math.log(10.0) / parameters.scale for parameters in batch],
+            dtype=np.float64,
+        )
+        k_factors = np.asarray(
+            [parameters.k_factor for parameters in batch],
+            dtype=np.float64,
+        )
+        modifiers = np.ones((size, count, 2), dtype=np.float64)
+        for parameter_index, parameters in enumerate(batch):
+            for map_index, sides in enumerate(modifier_inputs):
+                for side_index, (inactive_days, continuity) in enumerate(sides):
+                    if (
+                        inactive_days is not None
+                        and parameters.inactivity_half_life_days is not None
+                    ):
+                        modifiers[parameter_index, map_index, side_index] *= math.exp(
+                            -math.log(2.0)
+                            * inactive_days
+                            / parameters.inactivity_half_life_days
+                        )
+                    if continuity is not None:
+                        modifiers[parameter_index, map_index, side_index] *= (
+                            continuity**parameters.roster_carry_power
+                        )
+
+        ratings = np.full(
+            (size, count, len(team_ids)),
+            initial,
+            dtype=np.float64,
+        )
+        for map_index, row in enumerate(maps):
+            radiant_index = radiant_indexes[map_index]
+            dire_index = dire_indexes[map_index]
+            radiant_target = initial + modifiers[:, map_index, 0] * (
+                ratings[:, map_index, radiant_index] - initial
+            )
+            dire_target = initial + modifiers[:, map_index, 1] * (
+                ratings[:, map_index, dire_index] - initial
+            )
+            probabilities[
+                batch_start : batch_start + size, map_index
+            ] = expit(
+                rating_scales * (radiant_target - dire_target)
+                + side_logits[map_index]
+            )
+
+            first_target = available_from[map_index]
+            if first_target >= count:
+                continue
+            radiant_effective = initial + modifiers[:, map_index, 0, None] * (
+                ratings[:, first_target:, radiant_index] - initial
+            )
+            dire_effective = initial + modifiers[:, map_index, 1, None] * (
+                ratings[:, first_target:, dire_index] - initial
+            )
+            expected = expit(
+                rating_scales[:, None]
+                * (radiant_effective - dire_effective)
+                + side_logits[None, first_target:]
+            )
+            error = float(row.radiant_win) - expected
+            ratings[:, first_target:, radiant_index] = (
+                radiant_effective + k_factors[:, None] * error
+            )
+            ratings[:, first_target:, dire_index] = (
+                dire_effective - k_factors[:, None] * error
+            )
+    return probabilities
+
+
+def _walk_forward_parameter_selections(
+    maps: Sequence[RatingMapInput],
+    candidates: Sequence[TeamRatingParameters],
+    probabilities: np.ndarray,
+) -> dict[int, ParameterSelection]:
+    count = len(maps)
+    if probabilities.shape != (len(candidates), count):
+        raise ValueError("candidate probability matrix has invalid dimensions")
+    available_from = _history_available_from(maps)
+    outcomes = np.asarray([float(row.radiant_win) for row in maps])
+    bounded = np.clip(probabilities, 1e-15, 1.0 - 1e-15)
+    losses = -(outcomes[None, :] * np.log(bounded) + (1.0 - outcomes)[None, :] * np.log1p(-bounded))
+    briers = np.square(probabilities - outcomes[None, :])
+    loss_events = np.zeros((len(candidates), count + 1), dtype=np.float64)
+    brier_events = np.zeros((len(candidates), count + 1), dtype=np.float64)
+    support_events = np.zeros(count + 1, dtype=np.int64)
+    for map_index, first_target in enumerate(available_from):
+        if first_target < count:
+            loss_events[:, first_target] += losses[:, map_index]
+            brier_events[:, first_target] += briers[:, map_index]
+            support_events[first_target] += 1
+    cumulative_loss = np.cumsum(loss_events, axis=1)
+    cumulative_brier = np.cumsum(brier_events, axis=1)
+    cumulative_support = np.cumsum(support_events)
+
+    selections: dict[int, ParameterSelection] = {}
+    for map_index, target in enumerate(maps):
+        support = int(cumulative_support[map_index])
+        ranked = []
+        for parameter_index, parameters in enumerate(candidates):
+            log_loss = (
+                None
+                if support == 0
+                else float(cumulative_loss[parameter_index, map_index] / support)
+            )
+            brier_score = (
+                None
+                if support == 0
+                else float(cumulative_brier[parameter_index, map_index] / support)
+            )
+            selection = ParameterSelection(
+                parameters=parameters,
+                support=support,
+                log_loss=log_loss,
+                brier_score=brier_score,
+            )
+            ranked.append(
+                (
+                    _candidate_sort_key(
+                        parameters,
+                        support=support,
+                        log_loss=log_loss,
+                        brier_score=brier_score,
+                    ),
+                    selection,
+                )
+            )
+        selections[target.match_id] = min(ranked, key=lambda value: value[0])[1]
+    return selections
+
+
 def select_team_rating_parameters(
     inner_targets: Sequence[RatingMapInput],
     *,
@@ -877,20 +1165,16 @@ def build_team_rating_walk_forward_runs(
         loaded.row.match_id: _earlier_training_corpus(maps, loaded.row.started_at)
         for loaded in corpus.maps
     }
-    candidate_probabilities: dict[tuple[TeamRatingParameters, int], float] = {}
-
-    def candidate_probability(
-        parameters: TeamRatingParameters,
-        target: RatingMapInput,
-    ) -> float:
-        key = (parameters, target.match_id)
-        cached = candidate_probabilities.get(key)
-        if cached is not None:
-            return cached
-        history = histories[target.match_id]
-        probability = _inner_candidate_probability(history, target, parameters)
-        candidate_probabilities[key] = probability
-        return probability
+    candidate_probabilities = _vectorized_candidate_probabilities(
+        maps,
+        candidates,
+        histories,
+    )
+    selections = _walk_forward_parameter_selections(
+        maps,
+        candidates,
+        candidate_probabilities,
+    )
 
     runs: list[TeamRatingWalkForwardRun] = []
     for loaded in targets:
@@ -898,14 +1182,7 @@ def build_team_rating_walk_forward_runs(
         assert loaded.prediction_cutoff is not None
         assert loaded.cutoff_source is not None
         history = _earlier_training_corpus(maps, loaded.prediction_cutoff)
-        for parameters in candidates:
-            for inner_target in history:
-                candidate_probability(parameters, inner_target)
-        selection = select_team_rating_parameters(
-            history,
-            candidate_probabilities=candidate_probabilities,
-            candidates=candidates,
-        )
+        selection = selections[target.match_id]
         config = _config(selection.parameters, history)
         artifact = build_team_rating_artifact(
             history,
@@ -1028,6 +1305,18 @@ def _metrics(
     )
 
 
+def _evaluation_point(run: TeamRatingWalkForwardRun) -> _EvaluationPoint:
+    return _EvaluationPoint(
+        match_id=run.artifact.target.match_id,
+        series_id=run.series_id,
+        event_id=run.event_id,
+        outcome=run.eventual_radiant_win,
+        constant_50=0.5,
+        radiant_prior=run.radiant_prior_probability,
+        team_rating=run.artifact.prediction.raw_probability,
+    )
+
+
 def _model_report(
     points: Sequence[_EvaluationPoint],
     samples: Sequence[Sequence[_EvaluationPoint]],
@@ -1128,18 +1417,7 @@ def evaluate_team_rating_runs(
         )
     failed_targets = sum(run.status == "failed" for run in runs)
     evaluated_runs = tuple(run for run in runs if run.status == "trained")
-    points = tuple(
-        _EvaluationPoint(
-            match_id=run.artifact.target.match_id,
-            series_id=run.series_id,
-            event_id=run.event_id,
-            outcome=run.eventual_radiant_win,
-            constant_50=0.5,
-            radiant_prior=run.radiant_prior_probability,
-            team_rating=run.artifact.prediction.raw_probability,
-        )
-        for run in evaluated_runs
-    )
+    points = tuple(_evaluation_point(run) for run in evaluated_runs)
     if not points:
         empty_interval = BootstrapInterval(None, None)
         empty_intervals = MetricIntervals(*(empty_interval,) * 10)
@@ -1189,6 +1467,140 @@ def evaluate_team_rating_runs(
         deltas,
         GateReport("passed" if not failures else "failed", tuple(failures)),
     )
+
+
+def _team_experience(run: TeamRatingWalkForwardRun) -> str:
+    target = run.artifact.target
+    maps_seen = {
+        state.team_id: state.maps_seen for state in run.artifact.state_before_target
+    }
+    minimum = min(
+        maps_seen.get(target.radiant_team_id, 0),
+        maps_seen.get(target.dire_team_id, 0),
+    )
+    return (
+        "new_team_involved"
+        if minimum < NEW_TEAM_PRIOR_MAP_THRESHOLD
+        else "established_teams"
+    )
+
+
+def _diagnostic_slice(
+    dimension: str,
+    value: str,
+    runs: Sequence[TeamRatingWalkForwardRun],
+) -> DiagnosticSliceReport:
+    points = tuple(_evaluation_point(run) for run in runs)
+    metrics = _metrics(points, "team_rating")
+    constant = _metrics(points, "constant_50")
+    return DiagnosticSliceReport(
+        dimension=dimension,
+        value=value,
+        support=metrics.support,
+        brier_score=metrics.brier_score,
+        log_loss=metrics.log_loss,
+        ece=metrics.expected_calibration_error,
+        auc=metrics.auc,
+        accuracy=metrics.accuracy,
+        brier_delta_vs_constant_50=(
+            None
+            if metrics.brier_score is None or constant.brier_score is None
+            else metrics.brier_score - constant.brier_score
+        ),
+        log_loss_delta_vs_constant_50=(
+            None
+            if metrics.log_loss is None or constant.log_loss is None
+            else metrics.log_loss - constant.log_loss
+        ),
+    )
+
+
+def _diagnostic_slices(
+    corpus: TeamRatingCorpus,
+    runs: Sequence[TeamRatingWalkForwardRun],
+) -> tuple[DiagnosticSliceReport, ...]:
+    patch_by_match = {row.row.match_id: row.patch for row in corpus.maps}
+    grouped: dict[tuple[str, str], list[TeamRatingWalkForwardRun]] = {}
+    for run in runs:
+        if run.status != "trained":
+            continue
+        match_id = run.artifact.target.match_id
+        values = (
+            ("patch", str(patch_by_match.get(match_id) or "unknown")),
+            ("event", run.event_id),
+            ("month", run.artifact.target.started_at.strftime("%Y-%m")),
+            ("team_experience", _team_experience(run)),
+        )
+        for key in values:
+            grouped.setdefault(key, []).append(run)
+    return tuple(
+        _diagnostic_slice(dimension, value, grouped[(dimension, value)])
+        for dimension, value in sorted(grouped)
+    )
+
+
+def _probability_bins(
+    runs: Sequence[TeamRatingWalkForwardRun],
+) -> tuple[ProbabilityBinReport, ...]:
+    counts = [0] * PROBABILITY_BINS
+    for run in runs:
+        if run.status != "trained":
+            continue
+        probability = run.artifact.prediction.raw_probability
+        index = min(PROBABILITY_BINS - 1, max(0, int(probability * PROBABILITY_BINS)))
+        counts[index] += 1
+    return tuple(
+        ProbabilityBinReport(
+            lower=index / PROBABILITY_BINS,
+            upper=(index + 1) / PROBABILITY_BINS,
+            support=support,
+        )
+        for index, support in enumerate(counts)
+    )
+
+
+def _calibration_bins(
+    runs: Sequence[TeamRatingWalkForwardRun],
+) -> tuple[CalibrationBinReport, ...]:
+    grouped: list[list[tuple[float, bool]]] = [[] for _ in range(CALIBRATION_BINS)]
+    for run in runs:
+        if run.status != "trained":
+            continue
+        probability = run.artifact.prediction.raw_probability
+        index = min(CALIBRATION_BINS - 1, max(0, int(probability * CALIBRATION_BINS)))
+        grouped[index].append((probability, run.eventual_radiant_win))
+    output: list[CalibrationBinReport] = []
+    for index, rows in enumerate(grouped):
+        support = len(rows)
+        output.append(
+            CalibrationBinReport(
+                lower=index / CALIBRATION_BINS,
+                upper=(index + 1) / CALIBRATION_BINS,
+                support=support,
+                mean_probability=(
+                    None
+                    if not rows
+                    else math.fsum(probability for probability, _outcome in rows)
+                    / support
+                ),
+                observed_win_rate=(
+                    None
+                    if not rows
+                    else math.fsum(float(outcome) for _probability, outcome in rows)
+                    / support
+                ),
+                brier_score=(
+                    None
+                    if not rows
+                    else math.fsum(
+                        (probability - float(outcome)) ** 2
+                        for probability, outcome in rows
+                    )
+                    / support
+                ),
+            )
+        )
+    return tuple(output)
 
 
 def build_team_rating_report(
@@ -1246,6 +1658,9 @@ def build_team_rating_report(
         selected_parameter_counts=tuple(sorted(selected_counts.items())),
         baselines=baselines,
         paired_deltas=deltas,
+        diagnostic_slices=_diagnostic_slices(corpus, runs),
+        probability_bins=_probability_bins(runs),
+        calibration_bins=_calibration_bins(runs),
         gate=gate,
     )
 
@@ -1317,6 +1732,54 @@ def report_as_markdown(report: TeamRatingBacktestReport) -> str:
             f"95% CI=[{render(row.ci_95.lower)}, {render(row.ci_95.upper)}], "
             f"P(improvement)={render(row.probability_of_improvement)}"
         )
+    lines.extend(
+        (
+            "",
+            "## Diagnostic Slices",
+            "",
+            f"New-team threshold: fewer than {NEW_TEAM_PRIOR_MAP_THRESHOLD} "
+            "prior formal maps for either side.",
+            "",
+            "| Dimension | Value | Support | Brier | Log loss | ECE | AUC | "
+            "Brier vs 50% | Log loss vs 50% |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        )
+    )
+    for row in report.diagnostic_slices:
+        lines.append(
+            f"| {row.dimension} | {row.value} | {row.support} | "
+            f"{render(row.brier_score)} | {render(row.log_loss)} | "
+            f"{render(row.ece)} | {render(row.auc)} | "
+            f"{render(row.brier_delta_vs_constant_50)} | "
+            f"{render(row.log_loss_delta_vs_constant_50)} |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Probability Distribution",
+            "",
+            "| Probability bin | Support |",
+            "| --- | ---: |",
+        )
+    )
+    for row in report.probability_bins:
+        lines.append(f"| [{row.lower:.1f}, {row.upper:.1f}] | {row.support} |")
+    lines.extend(
+        (
+            "",
+            "## Calibration Bins",
+            "",
+            "| Probability bin | Support | Mean probability | Observed win rate | "
+            "Brier |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        )
+    )
+    for row in report.calibration_bins:
+        lines.append(
+            f"| [{row.lower:.1f}, {row.upper:.1f}] | {row.support} | "
+            f"{render(row.mean_probability)} | {render(row.observed_win_rate)} | "
+            f"{render(row.brier_score)} |"
+        )
     if report.gate.failures:
         lines.extend(("", "## Gate Failures", ""))
         lines.extend(f"- `{failure}`" for failure in report.gate.failures)
@@ -1330,6 +1793,7 @@ def run_team_rating_backtest(
     dry_run: bool = False,
     checkpoint_latest: bool = False,
     candidates: Sequence[TeamRatingParameters] = TEAM_RATING_PARAMETER_GRID,
+    max_maps: int | None = None,
 ) -> TeamRatingBacktestReport:
     """Load, evaluate, and atomically persist formal Team Rating runs."""
 
@@ -1344,10 +1808,21 @@ def run_team_rating_backtest(
         raise ValueError(
             "formal Team Rating backtest only supports reconstructed walk-forward"
         )
+    if max_maps is not None and (
+        isinstance(max_maps, bool) or not isinstance(max_maps, int) or max_maps < 1
+    ):
+        raise ValueError("max_maps must be a positive integer")
     with storage.connection.transaction():
         corpus = load_team_rating_corpus(
             storage.connection,
             availability_mode=availability_mode,
+        )
+    if max_maps is not None:
+        selected_maps = corpus.maps[:max_maps]
+        corpus = TeamRatingCorpus(
+            corpus.availability_mode,
+            len(selected_maps),
+            selected_maps,
         )
     runs = build_team_rating_walk_forward_runs(corpus, candidates=candidates)
     checkpoint_run_ids = (runs[-1].run_id,) if checkpoint_latest and runs else ()
@@ -1375,15 +1850,20 @@ __all__ = [
     "BOOTSTRAP_SAMPLES",
     "BOOTSTRAP_ALGORITHM_VERSION",
     "BOOTSTRAP_SEED_MATERIAL",
+    "NEW_TEAM_PRIOR_MAP_THRESHOLD",
+    "PROBABILITY_BINS",
     "TEAM_RATING_BACKTEST_VERSION",
     "TEAM_RATING_PARAMETER_GRID",
     "BaselineReport",
     "BootstrapInterval",
+    "CalibrationBinReport",
+    "DiagnosticSliceReport",
     "GateReport",
     "LoadedTeamRatingMap",
     "MetricIntervals",
     "PairedDeltaReport",
     "ParameterSelection",
+    "ProbabilityBinReport",
     "TeamRatingBacktestReport",
     "TeamRatingCorpus",
     "TeamRatingParameters",

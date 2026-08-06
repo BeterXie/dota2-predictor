@@ -12,6 +12,13 @@ def test_formal_team_rating_cli_defaults_to_reconstructed_mode() -> None:
     assert args.availability_mode == AvailabilityMode.RECONSTRUCTED.value
 
 
+def test_bounded_acceptance_requires_dry_run() -> None:
+    with pytest.raises(SystemExit) as error:
+        main(("--max-maps", "300"))
+
+    assert error.value.code == 2
+
+
 def test_formal_team_rating_cli_rejects_prospective_before_database_access(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

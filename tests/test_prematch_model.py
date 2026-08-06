@@ -29,6 +29,9 @@ from event_intelligence.hero_clusters import (
 )
 from event_intelligence.prematch_model import (
     ModelStatus,
+    PREMATCH_MAX_ABS_STANDARDIZED_VALUE,
+    PREMATCH_MIN_FEATURE_NONMISSING_SUPPORT,
+    PREMATCH_MIN_STANDARDIZATION_SCALE,
     PredictionStatus,
     PrematchTrainingRow,
     fit_prematch_model,
@@ -316,12 +319,70 @@ def test_training_only_imputation_and_binary_missing_flags_are_unstandardized() 
         if row.features["score_20"] is not None
     )
     expected_imputation = math.fsum(observed_score_20) / len(observed_score_20)
+    expected_scale = math.sqrt(
+        math.fsum((value - expected_imputation) ** 2 for value in observed_score_20)
+        / len(observed_score_20)
+    )
 
     assert dict(model.imputation_values)["score_20"] == expected_imputation
+    assert dict(model.standardization_means)["score_20"] == expected_imputation
+    assert dict(model.standardization_scales)["score_20"] == pytest.approx(
+        max(expected_scale, PREMATCH_MIN_STANDARDIZATION_SCALE)
+    )
     assert dict(model.missing_counts)["score_20"] == 6
     assert dict(model.imputation_values)["score_20__missing"] == 0.0
     assert dict(model.standardization_means)["score_20__missing"] == 0.0
     assert dict(model.standardization_scales)["score_20__missing"] == 1.0
+
+
+def test_sparse_feature_cannot_create_extreme_standardized_prediction() -> None:
+    rows = list(_rows("team_plus_draft", 81))
+    sparse_values = (-0.052711, -0.048686)
+    for index, row in enumerate(rows):
+        features = dict(row.features)
+        features["role_residual_diff"] = (
+            sparse_values[index] if index < len(sparse_values) else None
+        )
+        features["role_residual_diff__missing"] = float(index >= len(sparse_values))
+        rows[index] = replace(row, features=features)
+
+    model = fit_prematch_model(
+        rows,
+        TRAINING_CUTOFF,
+        model_kind="team_plus_draft",
+        availability_mode=MODE,
+    )
+    target = _snapshot(
+        8_781_808_385,
+        TRAINING_CUTOFF + timedelta(days=1),
+        team_base_logit=0.0,
+        draft_signal=0.0,
+        rosh_signal=0.0,
+    )
+    target_features = dict(target.draft_features)
+    target_features["role_residual_diff"] = 0.168472
+    target_features["role_residual_diff__missing"] = 0.0
+    target = replace(
+        target,
+        draft_features=tuple(target_features.items()),
+        input_hash="",
+    )
+
+    prediction = predict_prematch(model, target, top_n=len(model.feature_names))
+    contribution = next(
+        row
+        for row in prediction.top_contributions
+        if row.feature_name == "role_residual_diff"
+    )
+
+    assert dict(model.missing_counts)["role_residual_diff"] == 79
+    assert PREMATCH_MIN_FEATURE_NONMISSING_SUPPORT == 20
+    assert dict(model.standardization_scales)["role_residual_diff"] == 1.0
+    assert contribution.standardized_value <= PREMATCH_MAX_ABS_STANDARDIZED_VALUE
+    assert contribution.coefficient == pytest.approx(0.0, abs=1e-12)
+    assert contribution.log_odds_contribution == pytest.approx(0.0, abs=1e-12)
+    assert prediction.raw_probability is not None
+    assert 0.0 < prediction.raw_probability < 1.0
 
 
 def test_training_rejects_raw_and_missing_flag_disagreement() -> None:
@@ -478,7 +539,7 @@ def test_cluster_model_learns_a_separate_cluster_delta() -> None:
     model = fit_prematch_model(
         _rows(
             "team_plus_draft_rosh_clusters",
-            12,
+            20,
             with_cluster=True,
         ),
         TRAINING_CUTOFF,

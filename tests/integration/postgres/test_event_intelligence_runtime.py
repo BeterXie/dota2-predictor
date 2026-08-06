@@ -25,8 +25,16 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
 
     registry = EventRegistry(storage)
     events = registry.formal_events()
-    assert len(events) == 5
+    assert len(events) == 39
     assert registry.get_by_event_id("ewc-dota2-2026") is not None
+    tier_two = registry.get_by_event_id("fissure-special-2025")
+    low_prize_tier_one = registry.get_by_event_id("fissure-universe-4-2025")
+    assert tier_two is not None and tier_two.tier == "tier_2"
+    assert low_prize_tier_one is not None
+    assert (low_prize_tier_one.tier, low_prize_tier_one.prize_pool_usd) == (
+        "tier_1",
+        500_000,
+    )
 
     gotf_candidate_id = registry.discover_candidate(
         source="opendota_league_catalog",
@@ -75,7 +83,7 @@ def test_event_registry_runs_on_postgres_and_remains_idempotent(
     assert report["integrity_check"] == "ok"
     assert report["invalid_constraints"] == 0
     intelligence = build_intelligence_report(storage.connection)
-    assert intelligence["strict_event_count"] == 5
+    assert intelligence["strict_event_count"] == 39
     assert intelligence["formal_maps"] == 0
 
     ensure_draft_lineage_tracking(storage.connection)

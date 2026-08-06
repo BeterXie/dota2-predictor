@@ -33,10 +33,13 @@ from .rosh_features import ROSH_MODEL_SCHEMA
 
 
 UTC = timezone.utc
-PREMATCH_MODEL_VERSION = "prematch-offset-logistic-l2-v1"
+PREMATCH_MODEL_VERSION = "prematch-offset-logistic-l2-v2"
 PREMATCH_MODEL_ARTIFACT_VERSION = "prematch-model-artifact-v1"
 DEFAULT_MIN_SAMPLES = 20
 DEFAULT_L2_REGULARIZATION = 1.0
+PREMATCH_MIN_FEATURE_NONMISSING_SUPPORT = 20
+PREMATCH_MIN_STANDARDIZATION_SCALE = 1e-6
+PREMATCH_MAX_ABS_STANDARDIZED_VALUE = 8.0
 PREMATCH_SOLVER_METHOD = "L-BFGS-B"
 PREMATCH_MAX_ITERATIONS = 2_000
 PREMATCH_FTOL = 1e-12
@@ -499,11 +502,23 @@ def _column_statistics(
                 [imputation if value is None else value for value in column],
                 dtype=np.float64,
             )
-            mean = float(np.mean(complete))
-            scale = float(np.sqrt(np.mean(np.square(complete - mean))))
-            if scale <= 1e-12:
+            mean = imputation
+            if len(observed) < PREMATCH_MIN_FEATURE_NONMISSING_SUPPORT:
+                complete.fill(imputation)
                 scale = 1.0
-        matrix[:, index] = (complete - mean) / scale
+            else:
+                observed_values = np.asarray(observed, dtype=np.float64)
+                scale = max(
+                    float(
+                        np.sqrt(np.mean(np.square(observed_values - mean)))
+                    ),
+                    PREMATCH_MIN_STANDARDIZATION_SCALE,
+                )
+        matrix[:, index] = np.clip(
+            (complete - mean) / scale,
+            -PREMATCH_MAX_ABS_STANDARDIZED_VALUE,
+            PREMATCH_MAX_ABS_STANDARDIZED_VALUE,
+        )
         missing_counts.append((name, sum(value is None for value in column)))
         imputation_values.append((name, imputation))
         means.append((name, mean))
@@ -892,6 +907,12 @@ def verify_prematch_model_artifact(model: PrematchModelArtifact) -> None:
             _finite(value, field)
     if any(value <= 0.0 for _name, value in model.standardization_scales):
         raise ValueError("prematch standardization scales must be positive")
+    if any(
+        value < PREMATCH_MIN_STANDARDIZATION_SCALE
+        for name, value in model.standardization_scales
+        if not name.endswith("__missing")
+    ):
+        raise ValueError("prematch standardization scales are below the floor")
     means = dict(model.standardization_means)
     scales = dict(model.standardization_scales)
     imputation = dict(model.imputation_values)
@@ -1019,7 +1040,13 @@ def predict_prematch(
         value = imputation[name] if was_imputed else raw
         if value is None:
             raise ValueError("prematch imputation parameters are incomplete")
-        standardized = (value - means[name]) / scales[name]
+        standardized = max(
+            -PREMATCH_MAX_ABS_STANDARDIZED_VALUE,
+            min(
+                PREMATCH_MAX_ABS_STANDARDIZED_VALUE,
+                (value - means[name]) / scales[name],
+            ),
+        )
         contribution = coefficients[name] * standardized
         component = (
             "draft"
@@ -1137,6 +1164,9 @@ __all__ = [
     "PREMATCH_GTOL",
     "PREMATCH_MAX_ITERATIONS",
     "PREMATCH_MAX_LINE_SEARCH_STEPS",
+    "PREMATCH_MAX_ABS_STANDARDIZED_VALUE",
+    "PREMATCH_MIN_FEATURE_NONMISSING_SUPPORT",
+    "PREMATCH_MIN_STANDARDIZATION_SCALE",
     "PREMATCH_MODEL_ARTIFACT_VERSION",
     "PREMATCH_MODEL_VERSION",
     "PREMATCH_PINV_RCOND",
