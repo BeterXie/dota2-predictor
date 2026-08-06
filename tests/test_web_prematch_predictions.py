@@ -96,7 +96,7 @@ def _model_row(**overrides):
     row = {
         "run_id": MODEL_HASH,
         "model_hash": MODEL_HASH,
-        "model_version": "prematch-offset-logistic-l2-v1",
+        "model_version": "prematch-offset-logistic-l2-v2",
         "artifact_version": "prematch-model-artifact-v1",
         "model_kind": "team_plus_draft_rosh",
         "availability_mode": "reconstructed_walk_forward",

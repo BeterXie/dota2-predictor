@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -61,6 +61,7 @@ from .roles import PROSPECTIVE_ASSIGNMENT_VERSION, RECONSTRUCTED_ASSIGNMENT_VERS
 from .storage import IntelligenceStorage
 from .team_rating import RatingMapInput
 from .team_rating_backtest import (
+    TeamRatingCorpus,
     TeamRatingWalkForwardRun,
     build_team_rating_walk_forward_runs,
     load_team_rating_corpus,
@@ -556,11 +557,16 @@ def load_prematch_corpus(
     artifact_root: str | Path,
     availability_mode: AvailabilityMode,
     cluster_resource: ClusterResource | None = None,
+    max_maps: int | None = None,
 ) -> PrematchCorpus:
     """Rebuild M2-M5 authority for every formal target; never accept snapshots."""
 
     if not isinstance(availability_mode, AvailabilityMode):
         raise ValueError("availability_mode must be an AvailabilityMode")
+    if max_maps is not None and (
+        isinstance(max_maps, bool) or not isinstance(max_maps, int) or max_maps < 1
+    ):
+        raise ValueError("max_maps must be a positive integer")
     connection = _connection(storage_or_connection)
     published_cluster_resource = (
         None
@@ -589,6 +595,29 @@ def load_prematch_corpus(
         revision_after = _prematch_dependency_revision(connection)
         if revision_before != revision_after:
             raise ValueError("prematch authority changed during corpus load")
+    if max_maps is not None:
+        selected_team_maps = team_corpus.maps[:max_maps]
+        team_corpus = TeamRatingCorpus(
+            team_corpus.availability_mode,
+            len(selected_team_maps),
+            selected_team_maps,
+        )
+        selected_match_ids = {
+            loaded.row.match_id for loaded in selected_team_maps
+        }
+        selected_draft_maps = tuple(
+            row for row in draft_corpus.maps if row.match_id in selected_match_ids
+        )
+        draft_corpus = replace(
+            draft_corpus,
+            formal_draft_maps=len(selected_draft_maps),
+            maps=selected_draft_maps,
+            profile_maps=tuple(
+                row
+                for row in draft_corpus.profile_maps
+                if row.state.match_id in selected_match_ids
+            ),
+        )
     # Nested Team Rating selection and all feature replay are CPU-bound and
     # operate on the immutable dataclasses loaded above.
     team_runs = build_team_rating_walk_forward_runs(team_corpus)
@@ -883,6 +912,7 @@ def run_prematch_backtest(
     *,
     artifact_root: str | Path,
     availability_mode: AvailabilityMode = AvailabilityMode.RECONSTRUCTED,
+    max_maps: int | None = None,
 ) -> PrematchBacktestResult:
     """Load formal authority and execute M6 without persistence side effects."""
 
@@ -890,6 +920,7 @@ def run_prematch_backtest(
         storage_or_connection,
         artifact_root=artifact_root,
         availability_mode=availability_mode,
+        max_maps=max_maps,
     )
     return build_prematch_walk_forward(corpus)
 
@@ -922,6 +953,7 @@ def persist_prematch_backtest_result(
         prematch_model_run_metrics,
     )
     from .prematch_storage import (
+        PrematchCorpusStore,
         build_prematch_calibration_record,
         build_prematch_model_run_record,
         build_prematch_prediction_record,
@@ -963,6 +995,7 @@ def persist_prematch_backtest_result(
         else _utc(validated_at, "validated_at")
     )
     model_runs_by_hash: dict[str, object] = {}
+    corpus_store = PrematchCorpusStore()
     prediction_records: list[object] = []
     validation_records: list[object] = []
     target_by_identity = {
@@ -970,7 +1003,10 @@ def persist_prematch_backtest_result(
         for run in result.walk_forward_runs
     }
     for run in result.walk_forward_runs:
-        model_record = build_prematch_model_run_record(run.model_artifact)
+        model_record = build_prematch_model_run_record(
+            run.model_artifact,
+            corpus_store=corpus_store,
+        )
         model_runs_by_hash[model_record.run_id] = model_record
         prediction_record = build_prematch_prediction_record(
             run.model_artifact,
@@ -995,6 +1031,7 @@ def persist_prematch_backtest_result(
                 report,
                 final.model_artifact.model_kind,
             ),
+            corpus_store=corpus_store,
         )
         model_runs_by_hash[model_record.run_id] = model_record
         calibration_records.append(

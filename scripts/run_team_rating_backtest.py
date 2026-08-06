@@ -23,6 +23,13 @@ from event_intelligence.team_rating_backtest import (  # noqa: E402
 )
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -36,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="formal post-match evaluation is reconstructed walk-forward only",
     )
     parser.add_argument("--dry-run", action="store_true", help="compute without writes")
+    parser.add_argument(
+        "--max-maps",
+        type=_positive_int,
+        help="bound formal maps for staged acceptance runs",
+    )
     parser.add_argument(
         "--checkpoint-latest",
         action="store_true",
@@ -52,7 +64,10 @@ def _write(path: Path, value: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_maps is not None and not args.dry_run:
+        parser.error("--max-maps requires --dry-run")
     with IntelligenceStorage(require_database_url(args.database_url)) as storage:
         storage.init_schema()
         report = run_team_rating_backtest(
@@ -60,6 +75,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             availability_mode=AvailabilityMode(args.availability_mode),
             dry_run=args.dry_run,
             checkpoint_latest=args.checkpoint_latest,
+            max_maps=args.max_maps,
         )
     payload = json.dumps(report_as_dict(report), ensure_ascii=True, sort_keys=True)
     if args.json_output is not None:

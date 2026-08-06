@@ -147,7 +147,7 @@ def test_official_rosh_feature_and_model_schemas_remain_frozen() -> None:
 
 def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
     assert PREMATCH_FEATURE_VERSION == "prematch-features-v1"
-    assert PREMATCH_MODEL_VERSION == "prematch-offset-logistic-l2-v1"
+    assert PREMATCH_MODEL_VERSION == "prematch-offset-logistic-l2-v2"
     assert PREMATCH_MODEL_ARTIFACT_VERSION == "prematch-model-artifact-v1"
     assert PREMATCH_MODEL_KINDS == (
         "team_only",
@@ -188,7 +188,7 @@ def test_prematch_model_versions_kinds_and_schemas_remain_frozen() -> None:
 
 def test_prematch_validation_versions_remain_frozen() -> None:
     assert PREMATCH_BACKTEST_VERSION == "prematch-walk-forward-v1"
-    assert PREMATCH_CALIBRATION_VERSION == "prematch-platt-v1"
+    assert PREMATCH_CALIBRATION_VERSION == "prematch-platt-v2"
     assert PREMATCH_CALIBRATION_ARTIFACT_SCHEMA == (
         "prematch-calibration-artifact/v1"
     )

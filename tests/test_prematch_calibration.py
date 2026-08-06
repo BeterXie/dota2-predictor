@@ -100,17 +100,17 @@ def _artifact_hash(payload: dict[str, object]) -> str:
 def test_builds_chronological_series_complete_platt_artifact_and_applies_extremes() -> (
     None
 ):
-    rows = _samples(120, series_size=2)
+    rows = _samples(200, series_size=2)
     artifact = build_prematch_calibration_artifact(
         reversed(rows),
-        _cutoff(120),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
 
     assert artifact.calibration_version == PREMATCH_CALIBRATION_VERSION
     assert artifact.status is CalibrationStatus.PASSED
-    assert artifact.fit_support == CALIBRATION_MIN_FIT_SUPPORT == 20
+    assert artifact.fit_support == CALIBRATION_MIN_FIT_SUPPORT == 100
     assert artifact.evaluation_support == CALIBRATION_MIN_EVALUATION_SUPPORT == 100
     assert artifact.fit_cutoff is not None
     assert artifact.evaluation_start is not None
@@ -163,8 +163,8 @@ def test_json_load_and_apply_replays_once_and_rejects_noncanonical_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -215,8 +215,8 @@ def test_json_load_and_apply_replays_once_and_rejects_noncanonical_input(
 
 def test_reconstructed_numeric_pass_never_becomes_passed() -> None:
     artifact = build_prematch_calibration_artifact(
-        _samples(120, mode=AvailabilityMode.RECONSTRUCTED.value),
-        _cutoff(120),
+        _samples(200, mode=AvailabilityMode.RECONSTRUCTED.value),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.RECONSTRUCTED.value,
     )
@@ -228,19 +228,19 @@ def test_reconstructed_numeric_pass_never_becomes_passed() -> None:
 
 def test_evaluation_support_gate_is_fixed_at_100() -> None:
     below = build_prematch_calibration_artifact(
-        _samples(119),
-        _cutoff(119),
+        _samples(199),
+        _cutoff(199),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
     exact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
 
-    assert below.fit_support == 20
+    assert below.fit_support == 100
     assert below.evaluation_support == 99
     assert below.status is CalibrationStatus.PROVISIONAL
     assert below.reason == "evaluation_support_below_100"
@@ -254,14 +254,14 @@ def test_evaluation_support_gate_is_fixed_at_100() -> None:
     (AvailabilityMode.PROSPECTIVE.value, AvailabilityMode.RECONSTRUCTED.value),
 )
 def test_sufficient_gate_failure_is_failed_and_not_applied(mode: str) -> None:
-    rows = _samples(120, mode=mode)
+    rows = _samples(200, mode=mode)
     adversarial = tuple(
-        row if index < 20 else replace(row, outcome=1 - row.outcome)
+        row if index < 100 else replace(row, outcome=1 - row.outcome)
         for index, row in enumerate(rows)
     )
     artifact = build_prematch_calibration_artifact(
         adversarial,
-        _cutoff(120),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=mode,
     )
@@ -288,8 +288,8 @@ def test_optimizer_failure_is_failed_without_parameters(
 ) -> None:
     monkeypatch.setattr(calibration, "_fit_platt", lambda _rows: None)
     artifact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -301,8 +301,8 @@ def test_optimizer_failure_is_failed_without_parameters(
 
 def test_minimum_fit_support_no_legal_split_and_single_class_are_unsupported() -> None:
     too_small = build_prematch_calibration_artifact(
-        _samples(20),
-        _cutoff(20),
+        _samples(100),
+        _cutoff(100),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -325,14 +325,14 @@ def test_minimum_fit_support_no_legal_split_and_single_class_are_unsupported() -
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
     single_class = build_prematch_calibration_artifact(
-        _samples(120, outcome=0),
-        _cutoff(120),
+        _samples(200, outcome=0),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
 
     assert too_small.status is CalibrationStatus.UNSUPPORTED
-    assert too_small.reason == "fit_support_below_20"
+    assert too_small.reason == "fit_support_below_100"
     assert no_split.status is CalibrationStatus.UNSUPPORTED
     assert no_split.reason == "no_legal_series_split"
     assert single_class.status is CalibrationStatus.UNSUPPORTED
@@ -343,18 +343,19 @@ def test_minimum_fit_support_no_legal_split_and_single_class_are_unsupported() -
 
 def test_splitter_continues_past_first_supported_single_class_boundary() -> None:
     rows = tuple(
-        _sample(index, outcome=0 if index < 20 else index % 2) for index in range(130)
+        _sample(index, outcome=0 if index < 100 else index % 2)
+        for index in range(210)
     )
 
     artifact = build_prematch_calibration_artifact(
         rows,
-        _cutoff(130),
+        _cutoff(210),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
 
     assert artifact.reason is None
-    assert artifact.fit_support == 22
+    assert artifact.fit_support == 102
     assert artifact.evaluation_support == 108
     assert {row.outcome for row in artifact.fit_samples} == {0, 1}
     assert {row.outcome for row in artifact.evaluation_samples} == {0, 1}
@@ -362,8 +363,8 @@ def test_splitter_continues_past_first_supported_single_class_boundary() -> None
 
 
 def test_future_samples_and_outcomes_do_not_change_bounded_artifact() -> None:
-    rows = _samples(120)
-    cutoff = _cutoff(120)
+    rows = _samples(200)
+    cutoff = _cutoff(200)
     baseline = build_prematch_calibration_artifact(
         rows,
         cutoff,
@@ -401,20 +402,20 @@ def test_future_samples_and_outcomes_do_not_change_bounded_artifact() -> None:
 
 
 def test_evaluation_outcomes_never_change_split_or_fitted_parameters() -> None:
-    rows = _samples(120)
+    rows = _samples(200)
     baseline = build_prematch_calibration_artifact(
         rows,
-        _cutoff(120),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
     changed_rows = tuple(
-        row if index < 20 else replace(row, outcome=1 - row.outcome)
+        row if index < 100 else replace(row, outcome=1 - row.outcome)
         for index, row in enumerate(rows)
     )
     changed = build_prematch_calibration_artifact(
         changed_rows,
-        _cutoff(120),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -426,10 +427,39 @@ def test_evaluation_outcomes_never_change_split_or_fitted_parameters() -> None:
     assert changed.oos_stream_hash != baseline.oos_stream_hash
 
 
+def test_reverse_monotonic_fit_is_failed_and_never_applied() -> None:
+    rows = _samples(200)
+    reversed_fit = tuple(
+        replace(row, outcome=1 - row.outcome) if index < 100 else row
+        for index, row in enumerate(rows)
+    )
+    artifact = build_prematch_calibration_artifact(
+        reversed_fit,
+        _cutoff(200),
+        model_kind=MODEL_KIND,
+        availability_mode=AvailabilityMode.PROSPECTIVE.value,
+    )
+
+    assert artifact.fit_support == 100
+    assert artifact.parameters is not None and artifact.parameters[1] < 0.0
+    assert artifact.status is CalibrationStatus.FAILED
+    assert artifact.reason == "reverse_monotonic_calibration"
+    assert artifact.gate_reasons == ("reverse_monotonic_calibration",)
+    application = _apply_prematch_calibration(
+        artifact,
+        0.7,
+        prediction_cutoff=artifact.calibration_cutoff + timedelta(days=1),
+        availability_mode=artifact.availability_mode,
+        model_hash=_digest("current-model"),
+        input_snapshot_hash=_digest("target"),
+    )
+    assert application.calibrated_probability is None
+
+
 def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> None:
     trained = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -454,8 +484,8 @@ def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> N
         )
 
     unsupported = build_prematch_calibration_artifact(
-        _samples(120, outcome=0),
-        _cutoff(120),
+        _samples(200, outcome=0),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -472,37 +502,6 @@ def test_apply_enforces_time_mode_and_never_uses_identity_for_unsupported() -> N
     assert applied.calibrated_probability is None
 
 
-def test_legacy_v1_gate_failure_replays_but_cannot_calibrate() -> None:
-    rows = _samples(120, mode=AvailabilityMode.RECONSTRUCTED.value)
-    adversarial = tuple(
-        row if index < 20 else replace(row, outcome=1 - row.outcome)
-        for index, row in enumerate(rows)
-    )
-    legacy = calibration._build_artifact(
-        adversarial,
-        _cutoff(120),
-        model_kind=MODEL_KIND,
-        availability_mode=AvailabilityMode.RECONSTRUCTED.value,
-        legacy_status_policy=True,
-    )
-
-    assert legacy.status is CalibrationStatus.RECONSTRUCTED_ONLY
-    assert legacy.gate_passed is False
-    loaded = load_prematch_calibration_artifact_json(
-        legacy.canonical_bytes().decode("utf-8")
-    )
-    assert loaded == legacy
-    application = _apply_prematch_calibration(
-        loaded,
-        0.7,
-        prediction_cutoff=loaded.calibration_cutoff + timedelta(days=1),
-        availability_mode=loaded.availability_mode,
-        model_hash=_digest("current-model"),
-        input_snapshot_hash=_digest("target"),
-    )
-    assert application.calibrated_probability is None
-
-
 def test_unbound_calibration_application_helpers_are_private() -> None:
     assert "apply_prematch_calibration" not in calibration.__all__
     assert "load_and_apply_prematch_calibration_json" not in calibration.__all__
@@ -512,8 +511,8 @@ def test_unbound_calibration_application_helpers_are_private() -> None:
 
 def test_json_load_and_full_refit_replay_are_exact_and_deterministic() -> None:
     artifact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -522,8 +521,8 @@ def test_json_load_and_full_refit_replay_are_exact_and_deterministic() -> None:
     loaded = load_prematch_calibration_artifact_json(payload_json)
     replayed = replay_prematch_calibration_artifact(loaded)
     reordered = build_prematch_calibration_artifact(
-        reversed(_samples(120)),
-        _cutoff(120),
+        reversed(_samples(200)),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -539,8 +538,8 @@ def test_loader_rejects_hash_parameter_runtime_and_version_tampering(
     tamper: str,
 ) -> None:
     artifact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -567,14 +566,14 @@ def test_loader_rejects_hash_parameter_runtime_and_version_tampering(
 
 def test_strict_json_rejects_duplicate_keys_and_nonfinite_constants() -> None:
     artifact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
     canonical = json.dumps(artifact.to_payload(), separators=(",", ":"))
     duplicate = '{"artifact_schema":"duplicate",' + canonical[1:]
-    nonfinite = canonical.replace('"fit_support":20', '"fit_support":NaN', 1)
+    nonfinite = canonical.replace('"fit_support":100', '"fit_support":NaN', 1)
 
     with pytest.raises(ValueError, match="duplicate JSON key"):
         load_prematch_calibration_artifact_json(duplicate)
@@ -584,8 +583,8 @@ def test_strict_json_rejects_duplicate_keys_and_nonfinite_constants() -> None:
 
 def test_json_loader_accepts_only_canonical_serialization() -> None:
     artifact = build_prematch_calibration_artifact(
-        _samples(120),
-        _cutoff(120),
+        _samples(200),
+        _cutoff(200),
         model_kind=MODEL_KIND,
         availability_mode=AvailabilityMode.PROSPECTIVE.value,
     )
@@ -640,13 +639,13 @@ def test_stream_rejects_mixed_mode_kind_and_non_oos_claims() -> None:
         replace(_sample(0), is_out_of_sample=False)
 
     mixed_mode = (
-        *_samples(119),
+        *_samples(199),
         _sample(119, mode=AvailabilityMode.RECONSTRUCTED.value),
     )
     with pytest.raises(ValueError, match="availability modes"):
         build_prematch_calibration_artifact(
             mixed_mode,
-            _cutoff(120),
+            _cutoff(200),
             model_kind=MODEL_KIND,
             availability_mode=AvailabilityMode.PROSPECTIVE.value,
         )
@@ -654,8 +653,8 @@ def test_stream_rejects_mixed_mode_kind_and_non_oos_claims() -> None:
     mixed_kind = replace(_sample(119), model_kind="team_plus_draft")
     with pytest.raises(ValueError, match="model kinds"):
         build_prematch_calibration_artifact(
-            (*_samples(119), mixed_kind),
-            _cutoff(120),
+            (*_samples(199), mixed_kind),
+            _cutoff(200),
             model_kind=MODEL_KIND,
             availability_mode=AvailabilityMode.PROSPECTIVE.value,
         )

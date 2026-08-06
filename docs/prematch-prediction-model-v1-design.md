@@ -104,10 +104,10 @@ DRAFT_RESIDUAL_FEATURE_VERSION = "draft-residual-features-v1"
 ROSH_FEATURE_VERSION = "official-rosh-features-v1"
 PREMATCH_FEATURE_VERSION = "prematch-features-v1"
 
-PREMATCH_MODEL_VERSION = "prematch-offset-logistic-l2-v1"
+PREMATCH_MODEL_VERSION = "prematch-offset-logistic-l2-v2"
 PREMATCH_MODEL_ARTIFACT_VERSION = "prematch-model-artifact-v1"
 
-PREMATCH_CALIBRATION_VERSION = "prematch-platt-v1"
+PREMATCH_CALIBRATION_VERSION = "prematch-platt-v2"
 PREMATCH_BACKTEST_VERSION = "prematch-walk-forward-v1"
 PREMATCH_DEPLOYMENT_VERSION = "prematch-frozen-deployment-v1"
 PREMATCH_VALIDATION_VERSION = "prematch-input-lineage-v1"

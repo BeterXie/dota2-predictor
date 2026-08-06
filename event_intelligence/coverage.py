@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,52 @@ from .team_states import LABEL_VERSION
 UTC = timezone.utc
 
 
+def _role_readiness_by_match(
+    connection: PostgresSession,
+) -> dict[int, dict[str, Any]]:
+    readiness: dict[int, dict[str, Any]] = {}
+    for row in connection.execute(
+        """SELECT eligible.event_id, eligible.match_id,
+                  COUNT(DISTINCT CASE
+                    WHEN roles.purpose='expected_position'
+                    THEN roles.player_slot END) AS expected_role_rows,
+                  COUNT(DISTINCT CASE
+                    WHEN roles.purpose='observed_position'
+                    THEN roles.player_slot END) AS observed_role_rows,
+                  COUNT(DISTINCT CASE
+                    WHEN roles.purpose='expected_position'
+                     AND roles.position IS NOT NULL
+                    THEN roles.player_slot END) AS expected_position_rows,
+                  COUNT(DISTINCT CASE
+                    WHEN roles.purpose='observed_position'
+                     AND roles.position IS NOT NULL
+                    THEN roles.player_slot END) AS observed_position_rows
+             FROM formal_map_eligibility AS eligible
+             LEFT JOIN player_role_assignments AS roles
+               ON roles.match_id=eligible.match_id
+              AND roles.assignment_version=?
+            GROUP BY eligible.event_id, eligible.match_id""",
+        (ROLE_VERSION,),
+    ):
+        expected_rows = int(row["expected_role_rows"])
+        observed_rows = int(row["observed_role_rows"])
+        expected_positions = int(row["expected_position_rows"])
+        observed_positions = int(row["observed_position_rows"])
+        readiness[int(row["match_id"])] = {
+            "event_id": str(row["event_id"]),
+            "expected_role_rows": expected_rows,
+            "observed_role_rows": observed_rows,
+            "expected_position_rows": expected_positions,
+            "observed_position_rows": observed_positions,
+            "expected_role_ready": expected_rows == 10,
+            "observed_role_ready": observed_rows == 10,
+            "complete_positions": (
+                expected_positions == 10 and observed_positions == 10
+            ),
+        }
+    return readiness
+
+
 def build_coverage_report(
     connection: PostgresSession,
     *,
@@ -28,6 +75,20 @@ def build_coverage_report(
     include_integrity: bool = False,
 ) -> dict[str, Any]:
     generated_at = generated_at.astimezone(UTC)
+    role_readiness = _role_readiness_by_match(connection)
+    event_role_totals: dict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "expected_role_ready_maps": 0,
+            "observed_role_ready_maps": 0,
+            "complete_position_maps": 0,
+        }
+    )
+    for value in role_readiness.values():
+        totals = event_role_totals[value["event_id"]]
+        totals["expected_role_ready_maps"] += int(value["expected_role_ready"])
+        totals["observed_role_ready_maps"] += int(value["observed_role_ready"])
+        totals["complete_position_maps"] += int(value["complete_positions"])
+
     events = []
     for row in connection.execute(
         """SELECT registry.event_id, registry.canonical_name,
@@ -49,6 +110,7 @@ def build_coverage_report(
     ):
         value = dict(row)
         event_id = str(row["event_id"])
+        value.update(event_role_totals[event_id])
         value["player_facts"] = connection.execute(
             """SELECT COUNT(*) FROM player_map_facts AS facts
                 JOIN match_ingest_status AS status USING(match_id)
@@ -71,6 +133,70 @@ def build_coverage_report(
         ).fetchone()[0]
         events.append(value)
 
+    issue_rows = [
+        dict(row)
+        for row in connection.execute(
+            """SELECT event_id, match_id, ingest_state, missing_fields_json,
+                      player_readiness, state_readiness, draft_readiness,
+                      reconciliation_status, last_error, next_retry_at
+                 FROM match_ingest_status
+                WHERE ingest_state IN ('retryable', 'failed', 'review_required')
+                   OR player_readiness<>'ready'
+                   OR state_readiness<>'ready'
+                   OR draft_readiness<>'ready'"""
+        )
+    ]
+    issues_by_match = {int(row["match_id"]): row for row in issue_rows}
+    for status in connection.execute(
+        """SELECT status.event_id, status.match_id, status.ingest_state,
+                  status.missing_fields_json, status.player_readiness,
+                  status.state_readiness, status.draft_readiness,
+                  status.reconciliation_status, status.last_error,
+                  status.next_retry_at
+             FROM match_ingest_status AS status
+             JOIN formal_map_eligibility AS eligible
+               ON eligible.match_id=status.match_id"""
+    ):
+        match_id = int(status["match_id"])
+        readiness = role_readiness[match_id]
+        if (
+            readiness["expected_role_ready"]
+            and readiness["observed_role_ready"]
+            and readiness["complete_positions"]
+        ):
+            continue
+        issue = issues_by_match.get(match_id)
+        if issue is None:
+            issue = dict(status)
+            issue_rows.append(issue)
+            issues_by_match[match_id] = issue
+        issue.update(
+            {
+                "expected_role_readiness": (
+                    "ready" if readiness["expected_role_ready"] else "missing"
+                ),
+                "observed_role_readiness": (
+                    "ready" if readiness["observed_role_ready"] else "missing"
+                ),
+                "complete_position_readiness": (
+                    "ready" if readiness["complete_positions"] else "missing"
+                ),
+                "missing_expected_role_rows": max(
+                    0, 10 - readiness["expected_role_rows"]
+                ),
+                "missing_observed_role_rows": max(
+                    0, 10 - readiness["observed_role_rows"]
+                ),
+                "missing_position_values": max(
+                    0,
+                    20
+                    - readiness["expected_position_rows"]
+                    - readiness["observed_position_rows"],
+                ),
+            }
+        )
+    issue_rows.sort(key=lambda row: (str(row["event_id"]), int(row["match_id"])))
+
     report: dict[str, Any] = {
         "database": database,
         "generated_at": generated_at.isoformat(),
@@ -85,6 +211,15 @@ def build_coverage_report(
         "formal_maps": connection.execute(
             "SELECT COUNT(*) FROM formal_map_eligibility"
         ).fetchone()[0],
+        "expected_role_ready_maps": sum(
+            value["expected_role_ready"] for value in role_readiness.values()
+        ),
+        "observed_role_ready_maps": sum(
+            value["observed_role_ready"] for value in role_readiness.values()
+        ),
+        "complete_position_maps": sum(
+            value["complete_positions"] for value in role_readiness.values()
+        ),
         "current_player_facts": connection.execute(
             """SELECT COUNT(*) FROM player_map_facts AS facts
                 JOIN match_ingest_status AS status USING(match_id)
@@ -139,20 +274,7 @@ def build_coverage_report(
                 "FROM ingest_scheduler_checkpoints ORDER BY checkpoint_key"
             )
         },
-        "issues": [
-            dict(row)
-            for row in connection.execute(
-                """SELECT event_id, match_id, ingest_state, missing_fields_json,
-                          player_readiness, state_readiness, draft_readiness,
-                          reconciliation_status, last_error, next_retry_at
-                     FROM match_ingest_status
-                    WHERE ingest_state IN ('retryable', 'failed', 'review_required')
-                       OR player_readiness<>'ready'
-                       OR state_readiness<>'ready'
-                       OR draft_readiness<>'ready'
-                    ORDER BY event_id, match_id"""
-            )
-        ],
+        "issues": issue_rows,
     }
     if include_integrity:
         revision = connection.execute(

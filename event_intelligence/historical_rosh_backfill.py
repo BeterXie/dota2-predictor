@@ -1,4 +1,4 @@
-"""Backfill retrospective Rosh scores for approved Tier-1 OpenDota maps."""
+"""Backfill retrospective Rosh scores for approved T1/T2 OpenDota maps."""
 
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ def load_formal_match_ids(
         tuple(parameters),
     ).fetchall()
     if match_id is not None and not rows:
-        raise ValueError(f"formal Tier-1 match {match_id} was not found")
+        raise ValueError(f"formal T1/T2 match {match_id} was not found")
     return tuple(int(row[0]) for row in rows)
 
 

@@ -310,11 +310,12 @@ def test_persistence_wrapper_saves_oos_and_final_records_and_settles(
 
     connection = FakeConnection()
 
-    def model_record(model, *, metrics=None):
+    def model_record(model, *, metrics=None, corpus_store=None):
         return SimpleNamespace(
             run_id=model.model_hash,
             model_hash=model.model_hash,
             metrics=metrics,
+            corpus_store=corpus_store,
         )
 
     def calibration_record(artifact, *, model_hash):

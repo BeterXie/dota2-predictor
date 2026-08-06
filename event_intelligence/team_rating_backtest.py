@@ -6,9 +6,13 @@ import hashlib
 import hmac
 import math
 import random
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+from scipy.special import expit
 
 from database.session import DatabaseRow, PostgresSession
 
@@ -800,6 +804,246 @@ def _candidate_sort_key(
     )
 
 
+def _history_available_from(
+    maps: Sequence[RatingMapInput],
+) -> tuple[int, ...]:
+    target_cutoffs = tuple(row.started_at for row in maps)
+    result = []
+    for row in maps:
+        if row.result_usable_at is None:
+            result.append(len(maps))
+            continue
+        result.append(
+            max(
+                bisect_left(target_cutoffs, row.result_usable_at),
+                bisect_right(target_cutoffs, row.completed_at),
+            )
+        )
+    return tuple(result)
+
+
+def _effective_modifier_inputs(
+    maps: Sequence[RatingMapInput],
+) -> tuple[tuple[tuple[float | None, float | None], ...], ...]:
+    previous: dict[int, tuple[tuple[int, ...], datetime]] = {}
+    result: list[tuple[tuple[float | None, float | None], ...]] = []
+    for row in maps:
+        sides = []
+        for team_id, roster in (
+            (row.radiant_team_id, row.radiant_roster),
+            (row.dire_team_id, row.dire_roster),
+        ):
+            prior = previous.get(team_id)
+            if prior is None:
+                sides.append((None, None))
+            else:
+                prior_roster, last_observed_at = prior
+                inactive_days = (
+                    row.started_at - last_observed_at
+                ).total_seconds() / 86_400.0
+                if inactive_days < 0.0:
+                    raise ValueError("rating cutoff cannot precede last_observed_at")
+                continuity = (
+                    None
+                    if not prior_roster or not roster
+                    else sum(player_id in roster for player_id in prior_roster) / 5.0
+                )
+                sides.append((inactive_days, continuity))
+            previous[team_id] = (roster, row.completed_at)
+        result.append(tuple(sides))
+    return tuple(result)
+
+
+def _vectorized_candidate_probabilities(
+    maps: Sequence[RatingMapInput],
+    candidates: Sequence[TeamRatingParameters],
+    histories: Mapping[int, Sequence[RatingMapInput]],
+    *,
+    batch_size: int = 8,
+) -> np.ndarray:
+    """Evaluate exact per-cutoff prefix replays in bounded NumPy batches."""
+
+    if not candidates:
+        raise ValueError("Team Rating parameter grid cannot be empty")
+    count = len(maps)
+    probabilities = np.empty((len(candidates), count), dtype=np.float64)
+    if not count:
+        return probabilities
+    if any(
+        row.result_usable_at is not None
+        and row.result_usable_at != row.completed_at
+        for row in maps
+    ):
+        for parameter_index, parameters in enumerate(candidates):
+            probabilities[parameter_index] = tuple(
+                _inner_candidate_probability(
+                    histories[row.match_id],
+                    row,
+                    parameters,
+                )
+                for row in maps
+            )
+        return probabilities
+
+    initial = 1_500.0
+    team_ids = sorted(
+        {
+            team_id
+            for row in maps
+            for team_id in (row.radiant_team_id, row.dire_team_id)
+        }
+    )
+    team_indexes = {team_id: index for index, team_id in enumerate(team_ids)}
+    radiant_indexes = tuple(team_indexes[row.radiant_team_id] for row in maps)
+    dire_indexes = tuple(team_indexes[row.dire_team_id] for row in maps)
+    available_from = _history_available_from(maps)
+    modifier_inputs = _effective_modifier_inputs(maps)
+    side_logits = np.asarray(
+        [
+            estimate_radiant_side_logit(
+                sum(row.radiant_win for row in histories[target.match_id]),
+                len(histories[target.match_id]),
+            )
+            for target in maps
+        ],
+        dtype=np.float64,
+    )
+
+    for batch_start in range(0, len(candidates), batch_size):
+        batch = candidates[batch_start : batch_start + batch_size]
+        size = len(batch)
+        rating_scales = np.asarray(
+            [math.log(10.0) / parameters.scale for parameters in batch],
+            dtype=np.float64,
+        )
+        k_factors = np.asarray(
+            [parameters.k_factor for parameters in batch],
+            dtype=np.float64,
+        )
+        modifiers = np.ones((size, count, 2), dtype=np.float64)
+        for parameter_index, parameters in enumerate(batch):
+            for map_index, sides in enumerate(modifier_inputs):
+                for side_index, (inactive_days, continuity) in enumerate(sides):
+                    if (
+                        inactive_days is not None
+                        and parameters.inactivity_half_life_days is not None
+                    ):
+                        modifiers[parameter_index, map_index, side_index] *= math.exp(
+                            -math.log(2.0)
+                            * inactive_days
+                            / parameters.inactivity_half_life_days
+                        )
+                    if continuity is not None:
+                        modifiers[parameter_index, map_index, side_index] *= (
+                            continuity**parameters.roster_carry_power
+                        )
+
+        ratings = np.full(
+            (size, count, len(team_ids)),
+            initial,
+            dtype=np.float64,
+        )
+        for map_index, row in enumerate(maps):
+            radiant_index = radiant_indexes[map_index]
+            dire_index = dire_indexes[map_index]
+            radiant_target = initial + modifiers[:, map_index, 0] * (
+                ratings[:, map_index, radiant_index] - initial
+            )
+            dire_target = initial + modifiers[:, map_index, 1] * (
+                ratings[:, map_index, dire_index] - initial
+            )
+            probabilities[
+                batch_start : batch_start + size, map_index
+            ] = expit(
+                rating_scales * (radiant_target - dire_target)
+                + side_logits[map_index]
+            )
+
+            first_target = available_from[map_index]
+            if first_target >= count:
+                continue
+            radiant_effective = initial + modifiers[:, map_index, 0, None] * (
+                ratings[:, first_target:, radiant_index] - initial
+            )
+            dire_effective = initial + modifiers[:, map_index, 1, None] * (
+                ratings[:, first_target:, dire_index] - initial
+            )
+            expected = expit(
+                rating_scales[:, None]
+                * (radiant_effective - dire_effective)
+                + side_logits[None, first_target:]
+            )
+            error = float(row.radiant_win) - expected
+            ratings[:, first_target:, radiant_index] = (
+                radiant_effective + k_factors[:, None] * error
+            )
+            ratings[:, first_target:, dire_index] = (
+                dire_effective - k_factors[:, None] * error
+            )
+    return probabilities
+
+
+def _walk_forward_parameter_selections(
+    maps: Sequence[RatingMapInput],
+    candidates: Sequence[TeamRatingParameters],
+    probabilities: np.ndarray,
+) -> dict[int, ParameterSelection]:
+    count = len(maps)
+    if probabilities.shape != (len(candidates), count):
+        raise ValueError("candidate probability matrix has invalid dimensions")
+    available_from = _history_available_from(maps)
+    outcomes = np.asarray([float(row.radiant_win) for row in maps])
+    bounded = np.clip(probabilities, 1e-15, 1.0 - 1e-15)
+    losses = -(outcomes[None, :] * np.log(bounded) + (1.0 - outcomes)[None, :] * np.log1p(-bounded))
+    briers = np.square(probabilities - outcomes[None, :])
+    loss_events = np.zeros((len(candidates), count + 1), dtype=np.float64)
+    brier_events = np.zeros((len(candidates), count + 1), dtype=np.float64)
+    support_events = np.zeros(count + 1, dtype=np.int64)
+    for map_index, first_target in enumerate(available_from):
+        if first_target < count:
+            loss_events[:, first_target] += losses[:, map_index]
+            brier_events[:, first_target] += briers[:, map_index]
+            support_events[first_target] += 1
+    cumulative_loss = np.cumsum(loss_events, axis=1)
+    cumulative_brier = np.cumsum(brier_events, axis=1)
+    cumulative_support = np.cumsum(support_events)
+
+    selections: dict[int, ParameterSelection] = {}
+    for map_index, target in enumerate(maps):
+        support = int(cumulative_support[map_index])
+        ranked = []
+        for parameter_index, parameters in enumerate(candidates):
+            log_loss = (
+                None
+                if support == 0
+                else float(cumulative_loss[parameter_index, map_index] / support)
+            )
+            brier_score = (
+                None
+                if support == 0
+                else float(cumulative_brier[parameter_index, map_index] / support)
+            )
+            selection = ParameterSelection(
+                parameters=parameters,
+                support=support,
+                log_loss=log_loss,
+                brier_score=brier_score,
+            )
+            ranked.append(
+                (
+                    _candidate_sort_key(
+                        parameters,
+                        support=support,
+                        log_loss=log_loss,
+                        brier_score=brier_score,
+                    ),
+                    selection,
+                )
+            )
+        selections[target.match_id] = min(ranked, key=lambda value: value[0])[1]
+    return selections
+
+
 def select_team_rating_parameters(
     inner_targets: Sequence[RatingMapInput],
     *,
@@ -877,20 +1121,16 @@ def build_team_rating_walk_forward_runs(
         loaded.row.match_id: _earlier_training_corpus(maps, loaded.row.started_at)
         for loaded in corpus.maps
     }
-    candidate_probabilities: dict[tuple[TeamRatingParameters, int], float] = {}
-
-    def candidate_probability(
-        parameters: TeamRatingParameters,
-        target: RatingMapInput,
-    ) -> float:
-        key = (parameters, target.match_id)
-        cached = candidate_probabilities.get(key)
-        if cached is not None:
-            return cached
-        history = histories[target.match_id]
-        probability = _inner_candidate_probability(history, target, parameters)
-        candidate_probabilities[key] = probability
-        return probability
+    candidate_probabilities = _vectorized_candidate_probabilities(
+        maps,
+        candidates,
+        histories,
+    )
+    selections = _walk_forward_parameter_selections(
+        maps,
+        candidates,
+        candidate_probabilities,
+    )
 
     runs: list[TeamRatingWalkForwardRun] = []
     for loaded in targets:
@@ -898,14 +1138,7 @@ def build_team_rating_walk_forward_runs(
         assert loaded.prediction_cutoff is not None
         assert loaded.cutoff_source is not None
         history = _earlier_training_corpus(maps, loaded.prediction_cutoff)
-        for parameters in candidates:
-            for inner_target in history:
-                candidate_probability(parameters, inner_target)
-        selection = select_team_rating_parameters(
-            history,
-            candidate_probabilities=candidate_probabilities,
-            candidates=candidates,
-        )
+        selection = selections[target.match_id]
         config = _config(selection.parameters, history)
         artifact = build_team_rating_artifact(
             history,
@@ -1330,6 +1563,7 @@ def run_team_rating_backtest(
     dry_run: bool = False,
     checkpoint_latest: bool = False,
     candidates: Sequence[TeamRatingParameters] = TEAM_RATING_PARAMETER_GRID,
+    max_maps: int | None = None,
 ) -> TeamRatingBacktestReport:
     """Load, evaluate, and atomically persist formal Team Rating runs."""
 
@@ -1344,10 +1578,21 @@ def run_team_rating_backtest(
         raise ValueError(
             "formal Team Rating backtest only supports reconstructed walk-forward"
         )
+    if max_maps is not None and (
+        isinstance(max_maps, bool) or not isinstance(max_maps, int) or max_maps < 1
+    ):
+        raise ValueError("max_maps must be a positive integer")
     with storage.connection.transaction():
         corpus = load_team_rating_corpus(
             storage.connection,
             availability_mode=availability_mode,
+        )
+    if max_maps is not None:
+        selected_maps = corpus.maps[:max_maps]
+        corpus = TeamRatingCorpus(
+            corpus.availability_mode,
+            len(selected_maps),
+            selected_maps,
         )
     runs = build_team_rating_walk_forward_runs(corpus, candidates=candidates)
     checkpoint_run_ids = (runs[-1].run_id,) if checkpoint_latest and runs else ()
