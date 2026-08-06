@@ -379,6 +379,13 @@ def test_model_kind_schemas_are_fixed_exact_and_deterministic() -> None:
         "team_plus_rosh",
         "team_plus_draft_rosh",
         "team_plus_draft_rosh_clusters",
+        "draft_ablation_d1_values",
+        "draft_ablation_d2_hero_role",
+        "draft_ablation_d3_synergy_counter",
+        "draft_ablation_d4_scaling",
+        "draft_ablation_d5_proxies",
+        "draft_ablation_d6_values_missing",
+        "draft_ablation_d7_values_support_coverage",
     )
     assert all(len(value) == 64 for value in PREMATCH_FEATURE_SCHEMA_HASHES.values())
     with pytest.raises(ValueError, match="unsupported"):
