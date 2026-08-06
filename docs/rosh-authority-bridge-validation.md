@@ -38,7 +38,6 @@ the source database.
 | formal map linked | 694 |
 | ten heroes complete | 694 |
 | expected positions complete | 561 |
-| player coverage complete | 0 |
 | scorer/profile available | 0 |
 | input artifact available | 0 |
 | response artifact available | 0 |
@@ -51,13 +50,24 @@ Missing reasons:
 | Stage | Reason | Support |
 | --- | --- | ---: |
 | expected positions complete | `expected_positions_incomplete` | 133 |
-| player coverage complete | `player_coverage_incomplete` | 561 |
+| scorer/profile available | `scorer_profile_lineage_unavailable` | 561 |
 
-The existing full formal replay diagnostic remains consistent with the prior
-acceptance report: 2,655 exact-position targets were attempted and all lacked
-an available official run (`run_unavailable`). The strict bridge stops earlier
-when no legacy row has complete player coverage, so it produces zero bridge
-records and does not run an OOS comparison.
+The first strict blocker after hero/position completeness is therefore missing
+official scorer/profile lineage, not player coverage. None of the 561 rows has
+the versioned `authority_bridge` envelope that binds it to an official run and
+its artifacts, so the bridge produces zero records and does not run an OOS
+comparison.
+
+Player evidence was audited separately and did not change funnel support:
+
+| Optional player evidence | Support |
+| --- | ---: |
+| player IDs match formal map | 561 |
+| `player_coverage_incomplete` diagnostic | 561 |
+
+These are independent quality observations: the stored player IDs align with
+the formal maps, while the legacy coverage claim is incomplete. Neither result
+can make a hero/position snapshot available or unavailable.
 
 The source counts relevant to this work were unchanged before and after the
 read-only run:
@@ -70,11 +80,25 @@ rosh_run_match_links:           11
 
 ## Bridge Contract
 
+The three input boundaries are distinct:
+
+- **R.O.S.H. scorer input:** ten unique heroes, one expected position 1-5 per
+  side, the official scorer/profile version, archived request and response,
+  and cutoff-legal timing. Player identity is not a scorer input.
+- **Optional player identity evidence:** nullable radiant/dire player IDs and
+  nullable coverage count are retained for audit diagnostics. Missing,
+  incomplete, or mismatched player evidence never changes R.O.S.H. bridge
+  eligibility.
+- **Player-Hero model input:** player/account identity paired with a hero is a
+  separate historical adjustment input used by the Player-Hero path. It is not
+  authority for the pure hero/position R.O.S.H. lineup snapshot.
+
 Migration `20260806_0030` adds the append-only
 `rosh_authority_bridge_records` table. Each record binds:
 
 - legacy `score_key`, `match_id`, prediction cutoff, ten heroes and positions;
-- player coverage, active R.O.S.H. profile/formula/scorer hashes;
+- optional player IDs/coverage plus active R.O.S.H. profile/formula/scorer
+  hashes;
 - request and response artifact hashes;
 - `generated_at`, `available_at`, source match identity and map number;
 - canonical authority JSON and replayed Prematch R.O.S.H. snapshot JSON;
@@ -94,11 +118,14 @@ check. The source database was not used as a write target.
 
 | Check | Result |
 | --- | ---: |
-| 20-row final eligible audit | 20 |
+| 20 rows with no player IDs, final eligible | 20 |
+| 20-row matching player identity support | 0 (diagnostic only) |
 | interrupted 20-row transaction | rolled back: 0 records / 0 links |
 | first 20-row write | 20 inserted |
 | repeated 20-row write | 20 unchanged |
-| 100-row final eligible audit | 100 |
+| 100 rows with no player IDs, final eligible | 100 |
+| 100-row matching player identity support | 0 (diagnostic only) |
+| nullable player audit fields persisted | 100 |
 | expansion from 20 to 100 | 80 inserted, 20 unchanged |
 | final bridge records / links | 100 / 100 |
 | first and last snapshot replay | `available` / `available` |
@@ -106,12 +133,14 @@ check. The source database was not used as a write target.
 | append-only DELETE | rejected |
 | source database mutation | none |
 
-The isolated positive rows use the real official scorer, profile identity,
-request archive, response archive, result hash, and replay path. Their cutoff
-is intentionally after the archived historical response so this validation
-tests storage and replay mechanics; it is not evidence that historical
-responses were available before a real map start. The real source funnel above
-remains the authority for Prematch eligibility.
+The isolated positive rows have the same ten heroes and ten expected positions
+but deliberately contain no usable player IDs and have coverage `0`. They use
+the real official scorer, profile identity, request archive, response archive,
+result hash, and replay path, proving player evidence is non-blocking. Their
+cutoff is intentionally after the archived historical response so this
+validation tests storage and replay mechanics; it is not evidence that
+historical responses were available before a real map start. The real source
+funnel above remains the authority for Prematch eligibility.
 
 ## Model Decision
 

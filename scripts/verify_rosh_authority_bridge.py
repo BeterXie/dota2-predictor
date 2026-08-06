@@ -398,20 +398,18 @@ def _seed_runs_and_legacy(
                 source_name, source_week, source_as_of, player_stats_as_of,
                 formula_version, evidence_json, evidence_hash,
                 backtest_eligible, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'current_player_adjusted',
-                       10, 'stratz', ?, ?, ?, ?, ?, ?, 0, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 'pure',
+                       0, 'stratz', ?, ?, NULL, ?, ?, ?, 0, ?)""",
             (
                 score_key,
                 MATCH_ID,
                 json.dumps(RADIANT),
                 json.dumps(DIRE),
-                json.dumps(RADIANT_PLAYERS),
-                json.dumps(DIRE_PLAYERS),
-                result.relative_advantage,
+                json.dumps([None] * 5),
+                json.dumps([None] * 5),
                 result.relative_advantage,
                 result.relative_advantage,
                 DATE_TIME,
-                GENERATED_AT.isoformat(),
                 GENERATED_AT.isoformat(),
                 profile.formula_version,
                 json.dumps(evidence, separators=(",", ":"), sort_keys=True),
@@ -474,6 +472,15 @@ def verify(database_url: str) -> dict[str, object]:
             )
             if report_20.stages[-1].support != 20:
                 raise RuntimeError("20-row bridge audit did not remain fully eligible")
+            diagnostics_20 = {
+                row.reason: row.support
+                for row in report_20.player_identity_diagnostics
+            }
+            if report_20.player_identity_support != 0 or diagnostics_20 != {
+                "player_coverage_incomplete": 20,
+                "player_ids_unavailable": 20,
+            }:
+                raise RuntimeError("optional player evidence changed eligibility")
 
             def interrupt(stage: str, index: int) -> None:
                 if stage == "record" and index == 4:
@@ -512,6 +519,15 @@ def verify(database_url: str) -> dict[str, object]:
             )
             if report_100.stages[-1].support != 100:
                 raise RuntimeError("100-row bridge audit did not remain fully eligible")
+            diagnostics_100 = {
+                row.reason: row.support
+                for row in report_100.player_identity_diagnostics
+            }
+            if report_100.player_identity_support != 0 or diagnostics_100 != {
+                "player_coverage_incomplete": 100,
+                "player_ids_unavailable": 100,
+            }:
+                raise RuntimeError("100-row optional player audit disagrees")
             final_100 = persist_rosh_authority_bridge(session, report_100)
             first_snapshot = replay_rosh_authority_bridge_record(
                 session,
@@ -557,17 +573,33 @@ def verify(database_url: str) -> dict[str, object]:
                     session.execute("SELECT COUNT(*) FROM rosh_run_match_links").fetchone()[0]
                 ),
             }
+            optional_player_rows = int(
+                session.execute(
+                    """SELECT COUNT(*)
+                         FROM rosh_authority_bridge_records
+                        WHERE radiant_player_ids_json IS NULL
+                          AND dire_player_ids_json IS NULL
+                          AND player_coverage_count = 0"""
+                ).fetchone()[0]
+            )
+            if optional_player_rows != 100:
+                raise RuntimeError("optional player fields were not persisted canonically")
             session.close()
             result = {
                 "database": database_name,
                 "twenty": {
                     "eligible": report_20.stages[-1].support,
+                    "player_identity_support": report_20.player_identity_support,
+                    "player_identity_diagnostics": diagnostics_20,
                     "inserted": first_20.inserted_records,
                     "repeat_unchanged": repeated_20.unchanged_records,
                     "rollback": rollback_counts,
                 },
                 "hundred": {
                     "eligible": report_100.stages[-1].support,
+                    "player_identity_support": report_100.player_identity_support,
+                    "player_identity_diagnostics": diagnostics_100,
+                    "optional_player_rows": optional_player_rows,
                     "inserted": final_100.inserted_records,
                     "unchanged": final_100.unchanged_records,
                     "final_counts": final_counts,

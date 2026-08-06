@@ -48,7 +48,6 @@ _STAGES = (
     "formal_map_linked",
     "ten_heroes_complete",
     "expected_positions_complete",
-    "player_coverage_complete",
     "scorer_profile_available",
     "input_artifact_available",
     "response_artifact_available",
@@ -223,7 +222,9 @@ class RoshAuthorityBridgeRecord:
     match_id: int
     prediction_cutoff: str
     draft: Mapping[str, Any]
-    player_coverage_count: int
+    radiant_player_ids: tuple[int, ...] | None
+    dire_player_ids: tuple[int, ...] | None
+    player_coverage_count: int | None
     rosh_profile_id: str
     formula_version: str
     scorer_source_hash: str
@@ -248,6 +249,14 @@ class RoshAuthorityBridgeRecord:
             "match_id": self.match_id,
             "prediction_cutoff": self.prediction_cutoff,
             "draft": self.draft,
+            "radiant_player_ids": (
+                None
+                if self.radiant_player_ids is None
+                else list(self.radiant_player_ids)
+            ),
+            "dire_player_ids": (
+                None if self.dire_player_ids is None else list(self.dire_player_ids)
+            ),
             "player_coverage_count": self.player_coverage_count,
             "rosh_profile_id": self.rosh_profile_id,
             "formula_version": self.formula_version,
@@ -278,6 +287,8 @@ class RoshAuthorityBridgeReport:
     official_match_links: int
     stages: tuple[RoshBridgeStage, ...]
     missing_reasons: tuple[RoshBridgeMissingReason, ...]
+    player_identity_support: int
+    player_identity_diagnostics: tuple[RoshBridgeMissingReason, ...]
     snapshot_attempts: int
     snapshot_available: int
     eligible_records: tuple[RoshAuthorityBridgeRecord, ...]
@@ -364,11 +375,39 @@ def _positioned_heroes(target: DraftTarget) -> tuple[tuple[int, ...], tuple[int,
     return sides[0], sides[1]
 
 
-def _players(target: DraftTarget) -> tuple[int, ...]:
-    return tuple(
-        player.player_id
-        for team in (target.radiant, target.dire)
-        for player in team.players
+def _players_by_side(target: DraftTarget) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    return tuple(player.player_id for player in target.radiant.players), tuple(
+        player.player_id for player in target.dire.players
+    )
+
+
+def _audit_player_identity(
+    rows: Sequence[_LegacyRow],
+    targets: Mapping[int, DraftTarget],
+) -> tuple[int, tuple[RoshBridgeMissingReason, ...]]:
+    support = 0
+    diagnostics: Counter[str] = Counter()
+    for row in rows:
+        if row.player_coverage_count != 10:
+            diagnostics["player_coverage_incomplete"] += 1
+        if row.radiant_players is None or row.dire_players is None:
+            diagnostics["player_ids_unavailable"] += 1
+            continue
+        expected_radiant, expected_dire = _players_by_side(targets[row.match_id])
+        if (
+            set(row.radiant_players) != set(expected_radiant)
+            or set(row.dire_players) != set(expected_dire)
+        ):
+            diagnostics["player_identity_mismatch"] += 1
+            continue
+        support += 1
+    return support, tuple(
+        RoshBridgeMissingReason(
+            "optional_player_identity_evidence",
+            reason,
+            count,
+        )
+        for reason, count in sorted(diagnostics.items())
     )
 
 
@@ -507,6 +546,12 @@ def _record(
         "match_id": row.match_id,
         "prediction_cutoff": _timestamp(target.prediction_cutoff, "prediction_cutoff"),
         "draft": draft,
+        "radiant_player_ids": (
+            None if row.radiant_players is None else list(row.radiant_players)
+        ),
+        "dire_player_ids": (
+            None if row.dire_players is None else list(row.dire_players)
+        ),
         "player_coverage_count": row.player_coverage_count,
         "rosh_profile_id": run.run.rosh_profile_id,
         "formula_version": run.run.formula_version,
@@ -535,6 +580,8 @@ def _record(
         match_id=row.match_id,
         prediction_cutoff=payload["prediction_cutoff"],
         draft=draft,
+        radiant_player_ids=row.radiant_players,
+        dire_player_ids=row.dire_players,
         player_coverage_count=row.player_coverage_count,
         rosh_profile_id=run.run.rosh_profile_id,
         formula_version=run.run.formula_version,
@@ -581,7 +628,15 @@ def _audit_rows(
     links: Sequence[RoshRunMatchLink],
     artifact_root: Path,
     created_at: str,
-) -> tuple[tuple[RoshBridgeStage, ...], tuple[RoshBridgeMissingReason, ...], tuple[RoshAuthorityBridgeRecord, ...], int, int]:
+) -> tuple[
+    tuple[RoshBridgeStage, ...],
+    tuple[RoshBridgeMissingReason, ...],
+    int,
+    tuple[RoshBridgeMissingReason, ...],
+    tuple[RoshAuthorityBridgeRecord, ...],
+    int,
+    int,
+]:
     current = list(rows)
     stages: list[RoshBridgeStage] = [RoshBridgeStage("legacy_rows", len(current))]
     reasons: list[RoshBridgeMissingReason] = []
@@ -617,36 +672,29 @@ def _audit_rows(
         ),
         "ten_heroes_incomplete",
     )
+    def expected_positions(row: _LegacyRow) -> str | bool:
+        target = targets.get(row.match_id)
+        if target is None:
+            return "expected_positions_incomplete"
+        positioned = _positioned_heroes(target)
+        if positioned is None:
+            return "expected_positions_incomplete"
+        if (
+            set(row.radiant_heroes or ()) != set(positioned[0])
+            or set(row.dire_heroes or ()) != set(positioned[1])
+        ):
+            return "hero_identity_mismatch"
+        return True
+
     advance(
         "expected_positions_complete",
-        lambda row: (
-            "expected_positions_incomplete"
-            if row.match_id not in targets
-            or _positioned_heroes(targets[row.match_id]) is None
-            else True
-        ),
+        expected_positions,
         "expected_positions_incomplete",
     )
-    advance(
-        "player_coverage_complete",
-        lambda row: (
-            "player_coverage_incomplete"
-            if row.player_coverage_count != 10
-            or row.radiant_players is None
-            or row.dire_players is None
-            or row.match_id not in targets
-            or set((*row.radiant_players, *row.dire_players))
-            != set(_players(targets[row.match_id]))
-            else (
-                True
-                if set(row.radiant_heroes or ())
-                == set(_positioned_heroes(targets[row.match_id])[0])
-                and set(row.dire_heroes or ())
-                == set(_positioned_heroes(targets[row.match_id])[1])
-                else "hero_identity_mismatch"
-            )
-        ),
-        "player_coverage_incomplete",
+
+    player_identity_support, player_identity_diagnostics = _audit_player_identity(
+        current,
+        targets,
     )
 
     lineage_by_key: dict[str, Mapping[str, Any]] = {}
@@ -822,7 +870,15 @@ def _audit_rows(
         if isinstance(lineage_by_key[row.score_key].get("_record"), RoshAuthorityBridgeRecord)
     )
     stages.append(RoshBridgeStage("final_eligible", len(records)))
-    return tuple(stages), tuple(reasons), records, len(current), len(records)
+    return (
+        tuple(stages),
+        tuple(reasons),
+        player_identity_support,
+        player_identity_diagnostics,
+        records,
+        len(current),
+        len(records),
+    )
 
 
 def audit_rosh_authority_bridge(
@@ -866,7 +922,15 @@ def audit_rosh_authority_bridge(
     for run in run_map.values():
         links.extend(repository.get_match_links(run.run.run_id))
     now = _timestamp(created_at or datetime.now(_UTC), "created_at")
-    stages, reasons, records, _snapshot_attempts, snapshot_available = _audit_rows(
+    (
+        stages,
+        reasons,
+        player_identity_support,
+        player_identity_diagnostics,
+        records,
+        _snapshot_attempts,
+        snapshot_available,
+    ) = _audit_rows(
         rows,
         formal_ids=formal_ids,
         targets=targets,
@@ -883,6 +947,8 @@ def audit_rosh_authority_bridge(
         official_match_links=len(links),
         stages=stages,
         missing_reasons=reasons,
+        player_identity_support=player_identity_support,
+        player_identity_diagnostics=player_identity_diagnostics,
         snapshot_attempts=next(
             (stage.support for stage in stages if stage.stage == "cutoff_legal"),
             0,
@@ -902,6 +968,16 @@ def _insert_record(connection: PostgresSession, record: RoshAuthorityBridgeRecor
         record.match_id,
         record.prediction_cutoff,
         canonical_json_bytes(record.draft).decode("utf-8"),
+        (
+            None
+            if record.radiant_player_ids is None
+            else canonical_json_bytes(list(record.radiant_player_ids)).decode("utf-8")
+        ),
+        (
+            None
+            if record.dire_player_ids is None
+            else canonical_json_bytes(list(record.dire_player_ids)).decode("utf-8")
+        ),
         record.player_coverage_count,
         record.rosh_profile_id,
         record.formula_version,
@@ -930,13 +1006,14 @@ def _insert_record(connection: PostgresSession, record: RoshAuthorityBridgeRecor
     connection.execute(
         """INSERT INTO rosh_authority_bridge_records
            (bridge_key, bridge_version, legacy_score_key, run_id, match_id,
-            prediction_cutoff, draft_json, player_coverage_count,
-            rosh_profile_id, formula_version, scorer_source_hash,
+            prediction_cutoff, draft_json, radiant_player_ids_json,
+            dire_player_ids_json, player_coverage_count, rosh_profile_id,
+            formula_version, scorer_source_hash,
             canonical_profile_hash, input_artifact_hash, response_artifact_hash,
             generated_at, available_at, source, source_match_id, map_number,
             authority_json, snapshot_json, content_hash, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?)""",
         values,
     )
     return True
@@ -1087,6 +1164,24 @@ def report_as_markdown(report: RoshAuthorityBridgeReport) -> str:
     lines.extend(
         f"| {row.stage} | `{row.reason}` | {row.support} |"
         for row in report.missing_reasons
+    )
+    lines.extend(
+        (
+            "",
+            "## Optional Player Identity Evidence",
+            "",
+            "Player identity is not an input to the R.O.S.H. scorer and does not "
+            "affect final eligibility.",
+            "",
+            f"- Matching player identity support: {report.player_identity_support}",
+            "",
+            "| Diagnostic | Support |",
+            "| --- | ---: |",
+        )
+    )
+    lines.extend(
+        f"| `{row.reason}` | {row.support} |"
+        for row in report.player_identity_diagnostics
     )
     return "\n".join(lines) + "\n"
 

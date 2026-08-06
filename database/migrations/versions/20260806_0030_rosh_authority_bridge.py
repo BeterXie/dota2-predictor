@@ -43,7 +43,9 @@ def upgrade() -> None:
         ),
         sa.Column("prediction_cutoff", sa.Text(), nullable=False),
         sa.Column("draft_json", sa.Text(), nullable=False),
-        sa.Column("player_coverage_count", sa.Integer(), nullable=False),
+        sa.Column("radiant_player_ids_json", sa.Text()),
+        sa.Column("dire_player_ids_json", sa.Text()),
+        sa.Column("player_coverage_count", sa.Integer()),
         sa.Column("rosh_profile_id", sa.Text(), nullable=False),
         sa.Column("formula_version", sa.Text(), nullable=False),
         sa.Column("scorer_source_hash", sa.Text(), nullable=False),
@@ -67,7 +69,20 @@ def upgrade() -> None:
             "bridge_version = 'rosh-authority-bridge-v1'"
         ),
         sa.CheckConstraint("match_id > 0"),
-        sa.CheckConstraint("player_coverage_count = 10"),
+        sa.CheckConstraint(
+            "radiant_player_ids_json IS NULL OR "
+            "(jsonb_typeof(radiant_player_ids_json::jsonb) = 'array' AND "
+            "jsonb_array_length(radiant_player_ids_json::jsonb) = 5)"
+        ),
+        sa.CheckConstraint(
+            "dire_player_ids_json IS NULL OR "
+            "(jsonb_typeof(dire_player_ids_json::jsonb) = 'array' AND "
+            "jsonb_array_length(dire_player_ids_json::jsonb) = 5)"
+        ),
+        sa.CheckConstraint(
+            "player_coverage_count IS NULL OR "
+            "player_coverage_count BETWEEN 0 AND 10"
+        ),
         sa.CheckConstraint("length(trim(rosh_profile_id)) > 0"),
         sa.CheckConstraint("length(trim(formula_version)) > 0"),
         sa.CheckConstraint("scorer_source_hash ~ '^[0-9a-f]{64}$'"),
