@@ -108,7 +108,7 @@ def test_core_migration_and_transaction_contract(postgres_database_url: str) -> 
                 )
             ).one()
         assert count == 0
-        assert revision == "20260806_0029"
+        assert revision == "20260806_0030"
         assert live_versions == [12]
         assert runtime_contract == (
             1,

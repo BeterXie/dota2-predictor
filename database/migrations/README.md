@@ -8,11 +8,12 @@ alembic upgrade head
 ```
 
 The migration target is PostgreSQL-only runtime operation. Revision
-`20260806_0029` is the current head. It includes the core match,
+`20260806_0030` is the current head. It includes the core match,
 event-intelligence, live odds, strict mapping, draft, vision/Rosh, strategy,
 runtime monitor, settlement, research, Team Rating, and prematch prediction
 schemas with cutoff-aware lineage tracking and gate-failed calibration evidence.
-`live_schema_version` is 12 and the runtime contract is version 1.
+`live_schema_version` is 12 and the runtime contract is version 1. Revision
+`20260806_0030` adds the append-only R.O.S.H. authority bridge ledger.
 
 SQLite is accepted only as the read-only source for the one-time importer. Run
 a no-write inspection first:
