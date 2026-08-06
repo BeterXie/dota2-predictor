@@ -25,6 +25,11 @@ from event_intelligence.prematch_backtest import (
     build_prematch_walk_forward,
     load_prematch_corpus,
 )
+from event_intelligence.prematch_ablation import (
+    DRAFT_ABLATION_VARIANTS,
+    report_as_markdown as draft_ablation_as_markdown,
+    run_draft_ablation,
+)
 from event_intelligence.prematch_features import (
     PREMATCH_FEATURE_VERSION,
     PREMATCH_MODEL_KINDS,
@@ -209,6 +214,29 @@ def test_walk_forward_uses_only_earlier_usable_results_and_exposes_oos_data() ->
         row.model_kind == "team_plus_draft_rosh_clusters"
         for row in result.walk_forward_runs
     )
+
+
+def test_d0_d8_ablation_uses_one_cohort_and_never_persists() -> None:
+    report = run_draft_ablation(
+        _corpus(),
+        min_samples=4,
+        bootstrap_samples=20,
+    )
+
+    assert tuple(row.variant_id for row in report.variants) == tuple(
+        variant_id for variant_id, _label, _model_kind in DRAFT_ABLATION_VARIANTS
+    )
+    assert len(report.variants) == 9
+    assert len(report.comparisons) == 8
+    baseline_support = report.variants[0].predicted
+    assert baseline_support > 0
+    assert all(
+        row.paired_support == baseline_support for row in report.comparisons
+    )
+    assert report.variants[0].feature_count == 0
+    assert report.variants[-1].feature_count == 40
+    assert report.bootstrap_samples == 20
+    assert "Paired Against D0" in draft_ablation_as_markdown(report)
 
 
 def test_target_outcome_does_not_change_its_own_artifact_or_prediction() -> None:

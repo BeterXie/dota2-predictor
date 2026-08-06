@@ -203,7 +203,7 @@ def test_prematch_schema_has_tables_columns_indexes_and_triggers(
                 )
             ).scalars()
         )
-    assert revision == "20260806_0028"
+    assert revision == "20260806_0029"
     assert {
         "prematch_predictions_mutation_guard",
         "prematch_calibration_mode_guard",
@@ -255,6 +255,48 @@ def test_json_object_checks_preserve_jcs_numeric_text_and_reject_arrays(
                 connection,
                 model_hash="e" * 64,
                 artifact_json="[]",
+            )
+
+
+def test_corpus_rows_preserve_application_canonical_float_text(
+    postgres_engine: Engine,
+) -> None:
+    row_json = canonical_json_bytes(
+        {
+            "availability_mode": MODE,
+            "team_base_logit": 0.01617391412884206,
+        }
+    ).decode()
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                """INSERT INTO prematch_training_corpus_rows
+                       (row_hash, model_kind, row_json, created_at)
+                     VALUES (:row_hash, 'team_plus_draft_rosh', :row_json,
+                             '2026-08-06T00:00:00+00:00')"""
+            ),
+            {"row_hash": "f" * 64, "row_json": row_json},
+        )
+    with postgres_engine.connect() as connection:
+        stored = connection.execute(
+            text(
+                "SELECT row_json FROM prematch_training_corpus_rows "
+                "WHERE row_hash=:row_hash"
+            ),
+            {"row_hash": "f" * 64},
+        ).scalar_one()
+    assert stored == row_json
+
+    with pytest.raises(DBAPIError):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO prematch_training_corpus_rows
+                           (row_hash, model_kind, row_json, created_at)
+                         VALUES (:row_hash, 'team_only', '[]',
+                                 '2026-08-06T00:00:00+00:00')"""
+                ),
+                {"row_hash": "1" * 64},
             )
 
 

@@ -552,6 +552,7 @@ def _formal_fixture(
             "start_time": int(started.timestamp()),
             "duration": 40 * 60,
             "radiant_win": True,
+            "patch": 60,
             "radiant_team_id": 10,
             "dire_team_id": 20,
             "artifact_usable_at": (
@@ -600,6 +601,7 @@ def test_formal_loader_reconstructs_completion_but_never_promotes_to_prospective
     assert reconstructed.targets[0].prediction_cutoff == started
     assert reconstructed.maps[0].row.result_usable_at == completed
     assert reconstructed.maps[0].row.radiant_roster == RADIANT_ROSTER
+    assert reconstructed.maps[0].patch == 60
     assert reconstructed.maps[0].source_authority.artifact_id == base[
         "latest_raw_artifact_id"
     ]
@@ -754,6 +756,20 @@ def test_report_serialization_includes_metrics_parameters_and_gate() -> None:
     assert "Failed targets: 0" in markdown
     assert "Evaluation coverage: 0.666667" in markdown
     assert "## Baseline 90% Series-cluster Bootstrap Intervals" in markdown
+    assert "## Diagnostic Slices" in markdown
+    assert "## Probability Distribution" in markdown
+    assert "## Calibration Bins" in markdown
+    assert sum(row.support for row in report.probability_bins) == 2
+    assert sum(row.support for row in report.calibration_bins) == 2
+    assert {
+        (row.dimension, row.value)
+        for row in report.diagnostic_slices
+    } >= {
+        ("event", "event-a"),
+        ("month", "2026-01"),
+        ("patch", "unknown"),
+        ("team_experience", "new_team_involved"),
+    }
     assert "| constant_50 |" in markdown
     assert "  - 90% CI:" not in markdown
     assert f"`{report.gate.status}`" in markdown

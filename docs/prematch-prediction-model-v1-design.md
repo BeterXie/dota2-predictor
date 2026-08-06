@@ -179,6 +179,19 @@ The current shadow path can emit direction evidence or a rejection. It must not
 manufacture calibrated probability, edge, stake multiplier, paper order, or
 real-money execution.
 
+### Cluster Evidence Route
+
+The selected Cluster route is **prospective shadow only**. The published 7.41
+static resource may be attached only to prospective targets at or after its
+declared publication time. It must remain unavailable in
+`reconstructed_walk_forward`, so historical M6 Cluster support is expected to
+be zero.
+
+Historical Cluster OOS evaluation is deferred unless a separately versioned
+walk-forward resource is rebuilt from evidence available before every target
+cutoff. A current static resource must never be projected backward merely to
+increase reconstructed support.
+
 ## Schema, Artifact, Replay, And Lineage
 
 Every new feature snapshot and artifact must have:
