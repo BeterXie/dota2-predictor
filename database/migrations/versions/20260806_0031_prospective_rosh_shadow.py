@@ -92,14 +92,14 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "formula = "
-            "'logit(P1)=logit(P0)-beta_rosh*standardized_pure_rosh_score'"
+            "'logit(P1)=logit(P0)+beta_rosh*standardized_pure_rosh_score'"
         ),
         sa.CheckConstraint("jsonb_typeof(artifact_json::jsonb) = 'object'"),
         sa.CheckConstraint("length(trim(retrospective_formula_version)) > 0"),
         sa.CheckConstraint("length(trim(prospective_profile_id)) > 0"),
         sa.CheckConstraint("training_support = 513"),
         sa.CheckConstraint("score_scale > 0.0"),
-        sa.CheckConstraint("beta_rosh < 0.0"),
+        sa.CheckConstraint("beta_rosh > 0.0"),
         sa.CheckConstraint("fit_log_loss >= 0.0"),
         sa.CheckConstraint("retrospective_initialized IS TRUE"),
         sa.CheckConstraint("prospective_unvalidated IS TRUE"),
@@ -197,7 +197,7 @@ def upgrade() -> None:
             "p1_probability IS NULL OR "
             "(p1_probability > 0.0 AND p1_probability < 1.0)"
         ),
-        sa.CheckConstraint("beta_rosh < 0.0"),
+        sa.CheckConstraint("beta_rosh > 0.0"),
         sa.CheckConstraint("score_scale > 0.0"),
         sa.CheckConstraint("length(trim(team_rating_version)) > 0"),
         sa.CheckConstraint("length(trim(team_rating_artifact_version)) > 0"),
@@ -522,7 +522,7 @@ def upgrade() -> None:
                     expected_standardized :=
                         (NEW.pure_rosh_score - candidate_mean) / candidate_scale;
                     expected_contribution :=
-                        -candidate_beta * expected_standardized;
+                        candidate_beta * expected_standardized;
                     expected_probability := 1.0 / (
                         1.0 + exp(-(
                             ln(NEW.p0_probability / (1.0 - NEW.p0_probability)) +

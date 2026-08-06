@@ -195,6 +195,22 @@ def test_prospective_rosh_schema_is_independent_append_only_ledger(
         "rosh_available_at",
         "missing_reason",
     } <= prediction_columns
+    candidate_checks = " ".join(
+        str(row["sqltext"])
+        for row in inspector.get_check_constraints("prospective_rosh_candidates")
+    )
+    prediction_checks = " ".join(
+        str(row["sqltext"])
+        for row in inspector.get_check_constraints(
+            "prospective_rosh_shadow_predictions"
+        )
+    )
+    assert "beta_rosh > 0" in candidate_checks
+    assert "beta_rosh > 0" in prediction_checks
+    assert (
+        "logit(P1)=logit(P0)+beta_rosh*standardized_pure_rosh_score"
+        in candidate_checks
+    )
     with postgres_engine.connect() as connection:
         triggers = {
             row[0]
@@ -206,6 +222,12 @@ def test_prospective_rosh_schema_is_independent_append_only_ledger(
                 )
             )
         }
+        prediction_guard = connection.execute(
+            text(
+                "SELECT pg_get_functiondef("
+                "'validate_prospective_rosh_shadow_prediction()'::regprocedure)"
+            )
+        ).scalar_one()
     assert {
         "prospective_rosh_candidates_append_only",
         "prospective_rosh_shadow_predictions_insert_guard",
@@ -214,6 +236,8 @@ def test_prospective_rosh_schema_is_independent_append_only_ledger(
         "prospective_rosh_shadow_settlements_append_only",
         "prospective_rosh_shadow_evaluations_append_only",
     } <= triggers
+    assert "expected_contribution :=\n                        candidate_beta *" in prediction_guard
+    assert "expected_contribution :=\n                        -candidate_beta *" not in prediction_guard
 
 
 def test_runtime_is_idempotent_fail_closed_append_only_and_transactional(

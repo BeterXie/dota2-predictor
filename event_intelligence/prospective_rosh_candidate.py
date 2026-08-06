@@ -38,8 +38,9 @@ PROSPECTIVE_ROSH_PROFILE_ID = "legacy-dematus-pure-rosh-prospective-v1"
 PROSPECTIVE_ROSH_PROFILE_SCHEMA = "dematus-pure-rosh-profile/v1"
 PROSPECTIVE_ROSH_SCORER_FAMILY = "legacy_dematus_pure_lineup"
 PROSPECTIVE_ROSH_FORMULA = (
-    "logit(P1)=logit(P0)-beta_rosh*standardized_pure_rosh_score"
+    "logit(P1)=logit(P0)+beta_rosh*standardized_pure_rosh_score"
 )
+PREVIOUS_FROZEN_NEGATIVE_BETA = -0.6692263354789106
 PROSPECTIVE_ROSH_LABELS = (
     "retrospective_initialized",
     "prospective_unvalidated",
@@ -277,9 +278,9 @@ def _fit_beta(
 
     def objective(parameters: np.ndarray) -> tuple[float, np.ndarray]:
         beta = float(parameters[0])
-        logits = offsets - beta * scores
+        logits = offsets + beta * scores
         loss = float(np.mean(np.logaddexp(0.0, logits) - outcomes * logits))
-        gradient = np.asarray([np.mean((expit(logits) - outcomes) * (-scores))])
+        gradient = np.asarray([np.mean((expit(logits) - outcomes) * scores)])
         return loss, gradient
 
     result = minimize(
@@ -376,10 +377,42 @@ def freeze_prospective_rosh_candidate(
         evaluation_plan=PROSPECTIVE_EVALUATION_PLAN,
         artifact_hash="",
     )
-    return replace(
+    frozen_candidate = replace(
         candidate,
         artifact_hash=_hash(candidate.to_payload(include_hash=False)),
     )
+    verify_previous_parameterization_parity(values, frozen_candidate)
+    return frozen_candidate
+
+
+def verify_previous_parameterization_parity(
+    rows: Sequence[RetrospectiveRow],
+    candidate: ProspectiveRoshCandidate,
+) -> tuple[int, float]:
+    """Prove the positive-beta form preserves every frozen cohort prediction."""
+
+    values = _training_rows(rows)
+    if candidate.beta_rosh != -PREVIOUS_FROZEN_NEGATIVE_BETA:
+        raise ValueError("positive beta does not match the previous frozen magnitude")
+    maximum_delta = 0.0
+    for row in values:
+        standardized = (
+            row.pure_lineup_score - candidate.score_mean
+        ) / candidate.score_scale
+        previous_contribution = -PREVIOUS_FROZEN_NEGATIVE_BETA * standardized
+        current_contribution = candidate.beta_rosh * standardized
+        if previous_contribution != current_contribution:
+            raise ValueError("beta reparameterization changes a cohort contribution")
+        offset = logit(float(row.team_probability))
+        previous_probability = float(expit(offset + previous_contribution))
+        current_probability = float(expit(offset + current_contribution))
+        maximum_delta = max(
+            maximum_delta,
+            abs(previous_probability - current_probability),
+        )
+        if previous_probability != current_probability:
+            raise ValueError("beta reparameterization changes a cohort prediction")
+    return len(values), maximum_delta
 
 
 def verify_prospective_rosh_candidate(
@@ -398,7 +431,7 @@ def verify_prospective_rosh_candidate(
         or candidate.prospective_profile_id != PROSPECTIVE_ROSH_PROFILE_ID
         or candidate.training_support != 513
         or candidate.score_scale <= 0.0
-        or candidate.beta_rosh >= 0.0
+        or candidate.beta_rosh <= 0.0
         or len(candidate.folds) != 5
         or dict(candidate.evaluation_plan) != PROSPECTIVE_EVALUATION_PLAN
     ):
@@ -430,7 +463,7 @@ def verify_prospective_rosh_candidate(
             or row.test_support <= 0
             or row.train_support + row.test_support != candidate.training_support
             or row.train_scale <= 0.0
-            or row.beta_rosh >= 0.0
+            or row.beta_rosh <= 0.0
             for row in candidate.folds
         )
         or sum(row.test_support for row in candidate.folds)
@@ -471,7 +504,9 @@ def candidate_probability(
     if not 0.0 < p0 < 1.0:
         raise ValueError("team_probability must be strictly between zero and one")
     standardized = (score - candidate.score_mean) / candidate.score_scale
-    contribution = -candidate.beta_rosh * standardized
+    contribution = candidate.beta_rosh * standardized
+    if standardized == 0.0:
+        return p0, standardized, contribution
     probability = float(expit(logit(p0) + contribution))
     return probability, standardized, contribution
 
@@ -592,6 +627,7 @@ __all__ = [
     "PROSPECTIVE_ROSH_FORMULA",
     "PROSPECTIVE_ROSH_LABELS",
     "PROSPECTIVE_ROSH_PROFILE_ID",
+    "PREVIOUS_FROZEN_NEGATIVE_BETA",
     "PROSPECTIVE_ROSH_SCORER_FAMILY",
     "CandidateFold",
     "ProspectiveRoshCandidate",
@@ -600,5 +636,6 @@ __all__ = [
     "load_frozen_prospective_rosh_candidate",
     "load_prospective_rosh_candidate_json",
     "prospective_rosh_profile",
+    "verify_previous_parameterization_parity",
     "verify_prospective_rosh_candidate",
 ]

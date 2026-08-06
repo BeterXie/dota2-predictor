@@ -9,7 +9,9 @@ M0 = P_team
 
 logit(M1)
 = logit(P_team)
-  - beta_rosh * standardized_pure_rosh_score
+  + beta_rosh * standardized_pure_rosh_score
+
+beta_rosh > 0
 ```
 
 候选状态固定为：
@@ -34,7 +36,7 @@ Rating、Draft、Cluster、Player-Hero、Calibration 或 Deployment。
 | 字段 | 冻结值 |
 |---|---:|
 | paired training support | 513 |
-| `beta_rosh` | -0.6692263354789106 |
+| `beta_rosh` | 0.6692263354789106 |
 | score mean | 0.5471734892787526 |
 | score population scale | 12.485361284192061 |
 | full-sample fit log loss | 0.6182679503676233 |
@@ -42,31 +44,36 @@ Rating、Draft、Cluster、Player-Hero、Calibration 或 Deployment。
 | frozen at | 2026-08-06T14:15:00Z |
 | prospective start | 2026-08-06T14:30:00Z |
 
-五折中，在同一个减号参数化下得到：
+五折中，在同一个正系数参数化下得到：
 
 ```text
--0.5857440718760298
--0.6698525121972112
--0.6589956902179078
--0.7327795497885198
--0.7039008112726385
+0.5857440718760298
+0.6698525121972112
+0.6589956902179078
+0.7327795497885198
+0.7039008112726385
 ```
 
 因此五折范围为：
 
 ```text
-[-0.7327795497885198, -0.5857440718760298]
+[0.5857440718760298, 0.7327795497885198]
 ```
 
-这里的负号是有意的。retrospective 实现原来采用
-`logit(P1)=logit(P0)+positive_beta*z`；本候选遵守需求中的减号公式，所以冻结的
-`beta_rosh` 必须为负数。不能把正 beta 放入该减号公式，否则会反转信号方向。
+参数语义只保留一种表达：`contribution = beta_rosh * z`，然后将 contribution
+加到 Team Rating logit。正 standardized score 增加 Radiant P1，负 standardized
+score 降低 Radiant P1，score 等于 frozen mean 时 contribution 为 0 且 P1 精确等于
+P0。旧的“减去负 beta”表示已移除，避免双重负号误用。
+
+生成器在现有 513-row cohort 上逐行比较了旧表达和新表达：support 为 513，最大
+P1 absolute difference 为 `0.0`。这次只改变参数符号和公式表达，没有改变任何
+预测数值。
 
 冻结 artifact：
 
 ```text
 artifact hash:
-e34c8dcce4e26a0fff3d9e34967233e215377ba8aaae250cb1a5f149d6428f6a
+84c4506f63b7c5b745b32373b0cb405383f837c60eae3231cc3d688a0b36e09d
 
 training cohort hash:
 11e344fe7ace38befa701e9a554e9c4e82736f26ade370a8f00fa2be788be1c2
@@ -266,7 +273,9 @@ orders = none
 
 聚焦验证覆盖：
 
-- frozen candidate hash、真实参数和负 beta 符号；
+- frozen candidate hash、真实参数和正 beta 单一语义；
+- 513-row 新旧参数化逐行 P1 完全一致；
+- 正/负 score 方向和 frozen mean 中立点；
 - scorer/profile drift 拒绝；
 - 无 player identity 的十英雄+十位置 exact replay；
 - request/response artifact tamper 拒绝；
