@@ -111,7 +111,14 @@ def _finite(value: object, field: str) -> float:
 
 def _scorer_source_hash() -> str:
     path = Path(__file__).parents[1] / "prematch" / "stratz_rosh.py"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(_canonical_scorer_source_bytes(path.read_bytes())).hexdigest()
+
+
+def _canonical_scorer_source_bytes(source: bytes) -> bytes:
+    """Keep the frozen v1 source identity stable across Git checkout line endings."""
+
+    normalized = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return normalized.replace(b"\n", b"\r\n")
 
 
 def prospective_rosh_profile() -> dict[str, Any]:
