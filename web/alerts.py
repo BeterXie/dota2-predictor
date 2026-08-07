@@ -1,375 +1,99 @@
+"""Operational alerts for the retained live collection runtime."""
+
 from __future__ import annotations
 
 import json
-import math
-import os
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from database.session import PostgresSession
-
-from live_betting.notifications import (
-    EVENT_MONITOR_ALERT,
-    EVENT_MONITOR_RECOVERY,
-    MONITOR_TEMPLATE_VERSION,
-    decision_lineage_block_reason,
-    enqueue,
-)
 from live_betting.runtime_schema import verify_runtime_schema
 
-_OBSERVATION_AUDIT_SECONDS = 60
 
-_PAPER_SIGNAL_REQUIRED_COLUMNS = {
-    "shadow_orders": {
-        "order_key",
-        "raybet_match_id",
-        "strict_mapping_id",
-        "market_key",
-        "model_probability",
-        "market_probability",
-        "signal_price",
-        "signaled_at",
-        "signal_transport_at",
-        "status",
-    },
-    "shadow_map_attempts": {"order_key", "raybet_match_id", "map_number"},
-    "shadow_order_decision_lineage": {"order_key", "decision_key"},
-    "strategy_decisions": {
-        "decision_key",
-        "raybet_match_id",
-        "map_number",
-        "decided_at",
-        "underdog_side",
-        "eligible",
-        "model_probability",
-        "market_probability",
-        "strategy_version",
-        "input_ref",
-        "contributions_json",
-    },
-    "vision_derived_invalidations": {"dependent_type", "dependent_key"},
-    "vision_draft_anchors": {
-        "raybet_match_id",
-        "map_number",
-        "status",
-        "conflict_at",
-        "anchored_at",
-        "source_frame_ref",
-    },
-    "vision_draft_conflicts": {"raybet_match_id", "map_number", "captured_at"},
-    "strict_live_mapping_impacts": {"dependent_type", "dependent_key"},
-    "strict_live_map_mapping_invalidations": {"invalidation_id", "mapping_id"},
-    "strict_live_map_mappings": {
-        "mapping_id",
-        "raybet_match_id",
-        "map_number",
-        "acceptance_mode",
-        "automatic_approval_id",
-        "accepted_at",
-    },
-    "strict_live_automatic_evidence_approvals": {
-        "approval_id",
-        "source_mapping_id",
-        "approved_at",
-    },
-}
-
-_PAPER_SIGNAL_QUERY = """
-    SELECT orders.order_key, orders.raybet_match_id, orders.market_key,
-           orders.model_probability, orders.market_probability,
-           orders.signal_price, orders.signaled_at
-     FROM shadow_orders AS orders
-     WHERE orders.status='pending'
-       AND live_text_timestamp_utc(orders.signaled_at) IS NOT NULL
-       AND live_text_timestamp_utc(orders.signal_transport_at) IS NOT NULL
-       AND NOT EXISTS (
-             SELECT 1 FROM strict_live_mapping_impacts AS impact
-              WHERE impact.dependent_type='shadow_order'
-                AND impact.dependent_key=orders.order_key
-       )
-       AND (
-             orders.strict_mapping_id IS NOT NULL
-             AND EXISTS (
-                  SELECT 1
-                    FROM strict_live_map_mappings AS mapping
-                    JOIN shadow_map_attempts AS strict_attempt
-                      ON strict_attempt.order_key=orders.order_key
-                     AND strict_attempt.raybet_match_id=mapping.raybet_match_id
-                     AND strict_attempt.map_number=mapping.map_number
-                    LEFT JOIN strict_live_map_mapping_invalidations AS direct
-                      ON direct.mapping_id=mapping.mapping_id
-                    LEFT JOIN strict_live_automatic_evidence_approvals AS approval
-                      ON approval.approval_id=mapping.automatic_approval_id
-                    LEFT JOIN strict_live_map_mapping_invalidations AS source
-                      ON source.mapping_id=approval.source_mapping_id
-                   WHERE mapping.mapping_id=orders.strict_mapping_id
-                     AND mapping.raybet_match_id=orders.raybet_match_id
-                     AND live_text_timestamp_utc(mapping.accepted_at) IS NOT NULL
-                     AND live_text_timestamp_utc(mapping.accepted_at)<=
-                         live_text_timestamp_utc(orders.signal_transport_at)
-                     AND direct.invalidation_id IS NULL
-                     AND source.invalidation_id IS NULL
-                     AND mapping.acceptance_mode IN
-                         ('manual_exact', 'automatic_exact')
-                     AND (
-                           mapping.acceptance_mode='manual_exact'
-                           OR (
-                                approval.approval_id IS NOT NULL
-                                AND live_text_timestamp_utc(
-                                        approval.approved_at
-                                    ) IS NOT NULL
-                                AND live_text_timestamp_utc(approval.approved_at)<=
-                                    live_text_timestamp_utc(
-                                        orders.signal_transport_at
-                                    )
-                           )
-                     )
-             )
-       )
-       AND NOT EXISTS (
-             SELECT 1 FROM vision_derived_invalidations AS invalidation
-              WHERE invalidation.dependent_type='shadow_order'
-                AND invalidation.dependent_key=orders.order_key
-       )
-       AND EXISTS (
-             SELECT 1
-               FROM shadow_map_attempts AS attempt
-               JOIN vision_draft_anchors AS anchor
-                 ON anchor.raybet_match_id=attempt.raybet_match_id
-                AND anchor.map_number=attempt.map_number
-              WHERE attempt.order_key=orders.order_key
-                AND anchor.source_frame_ref!=''
-                AND live_text_timestamp_utc(anchor.anchored_at) IS NOT NULL
-                AND live_text_timestamp_utc(anchor.anchored_at)<=
-                    live_text_timestamp_utc(orders.signal_transport_at)
-                AND (
-                      anchor.status='anchored'
-                      OR (
-                           anchor.status='conflict'
-                           AND anchor.conflict_at IS NOT NULL
-                           AND live_text_timestamp_utc(anchor.conflict_at) IS NOT NULL
-                           AND live_text_timestamp_utc(anchor.conflict_at)>
-                               live_text_timestamp_utc(orders.signal_transport_at)
-                           AND NOT EXISTS (
-                                SELECT 1
-                                  FROM vision_draft_conflicts AS conflict
-                                 WHERE conflict.raybet_match_id=
-                                       anchor.raybet_match_id
-                                   AND conflict.map_number=anchor.map_number
-                                   AND (
-                                         live_text_timestamp_utc(
-                                             conflict.captured_at
-                                         ) IS NULL
-                                         OR live_text_timestamp_utc(
-                                                conflict.captured_at
-                                            )<=live_text_timestamp_utc(
-                                                orders.signal_transport_at
-                                            )
-                                   )
-                           )
-                      )
-                )
-       )
-"""
+_MONITORED_COMPONENTS = frozenset(
+    {
+        "raybet_worker",
+        "raybet_priority_odds_worker",
+        "raybet_full_odds_worker",
+        "strict_ingest_worker",
+        "stream_supervisor",
+        "vision_worker",
+    }
+)
 
 
 def reconcile_alerts(
     connection: PostgresSession,
     *,
     now: datetime | None = None,
-    grace_seconds: int = 30,
     health: Sequence[Mapping[str, Any]] | None = None,
-    email_recipient: str | None = None,
 ) -> list[dict[str, Any]]:
-    now = _aware(now or datetime.now(timezone.utc))
-    if grace_seconds < 0:
-        raise ValueError("grace_seconds must be non-negative")
+    observed = _aware(now or datetime.now(timezone.utc))
     verify_runtime_schema(connection)
-    email_recipient = (
-        str(email_recipient).strip()
-        if email_recipient is not None
-        else os.environ.get("DOTA2_ALERT_EMAIL_RECIPIENT", "").strip()
-    )
-    now_iso = now.isoformat()
+    conditions = _conditions(connection, health)
     with connection.transaction():
-        (
-            conditions,
-            operational_health_available,
-            paper_signal_available,
-        ) = _conditions(connection, health)
         for dedupe_key, condition in conditions.items():
-            active = connection.execute(
+            row = connection.execute(
                 """SELECT incident_id FROM monitor_alert_incidents
                     WHERE dedupe_key=? AND status='active'""",
                 (dedupe_key,),
             ).fetchone()
-            if active is not None:
-                incident_id = int(active[0])
-                latest_audit = connection.execute(
-                    """SELECT MAX(created_at) FROM monitor_alert_audit
-                        WHERE incident_id=? AND action IN ('opened', 'observed')""",
-                    (incident_id,),
-                ).fetchone()[0]
-                should_audit = (
-                    latest_audit is None
-                    or (now - _parse(latest_audit)).total_seconds()
-                    >= _OBSERVATION_AUDIT_SECONDS
-                )
+            if row is not None:
                 connection.execute(
                     """UPDATE monitor_alert_incidents
                           SET last_detected_at=?, severity=?, title=?, body=?,
-                              source_json=?,
-                              occurrence_count=occurrence_count+?
+                              source_json=?, occurrence_count=occurrence_count+1
                         WHERE incident_id=?""",
                     (
-                        now_iso,
+                        observed.isoformat(),
                         condition["severity"],
                         condition["title"],
                         condition["body"],
                         _json(condition["source"]),
-                        int(should_audit),
-                        incident_id,
+                        int(row[0]),
                     ),
                 )
-                if should_audit:
-                    _audit(
-                        connection,
-                        incident_id,
-                        "observed",
-                        "system",
-                        "condition persists",
-                        now,
-                    )
                 continue
-
-            first_detected = now
-            if condition["category"] == "operational" and grace_seconds:
-                candidate = connection.execute(
-                    "SELECT first_detected_at FROM monitor_alert_candidates WHERE dedupe_key=?",
-                    (dedupe_key,),
-                ).fetchone()
-                if candidate is None:
-                    connection.execute(
-                        """INSERT INTO monitor_alert_candidates
-                           (dedupe_key, first_detected_at, last_detected_at, payload_json)
-                           VALUES (?, ?, ?, ?)""",
-                        (dedupe_key, now_iso, now_iso, _json(condition)),
-                    )
-                    continue
-                first_detected = _parse(candidate[0])
-                connection.execute(
-                    """UPDATE monitor_alert_candidates
-                          SET last_detected_at=?, payload_json=? WHERE dedupe_key=?""",
-                    (now_iso, _json(condition), dedupe_key),
-                )
-                if (now - first_detected).total_seconds() < grace_seconds:
-                    continue
-                connection.execute(
-                    "DELETE FROM monitor_alert_candidates WHERE dedupe_key=?",
-                    (dedupe_key,),
-                )
-
-            episode = int(connection.execute(
-                """SELECT COALESCE(MAX(episode), 0) + 1
-                    FROM monitor_alert_incidents WHERE dedupe_key=?""",
-                (dedupe_key,),
-            ).fetchone()[0])
-            cursor = connection.execute(
+            inserted = connection.execute(
                 """INSERT INTO monitor_alert_incidents
                    (dedupe_key, episode, category, severity, title, body, status,
                     first_detected_at, opened_at, last_detected_at, source_json)
-                    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
-                    RETURNING incident_id""",
+                   VALUES (?,
+                           COALESCE((SELECT MAX(episode)+1 FROM monitor_alert_incidents
+                                      WHERE dedupe_key=?), 1),
+                           'operational', ?, ?, ?, 'active', ?, ?, ?, ?)
+                   RETURNING incident_id""",
                 (
                     dedupe_key,
-                    episode,
-                    condition["category"],
+                    dedupe_key,
                     condition["severity"],
                     condition["title"],
                     condition["body"],
-                    first_detected.isoformat(),
-                    now_iso,
-                    now_iso,
+                    observed.isoformat(),
+                    observed.isoformat(),
+                    observed.isoformat(),
                     _json(condition["source"]),
                 ),
-            )
-            inserted = cursor.fetchone()
+            ).fetchone()
             if inserted is None:
                 raise RuntimeError("alert incident insert did not return an identity")
-            incident_id = int(inserted[0])
-            _audit(connection, incident_id, "opened", "system", condition["body"], now)
-            _enqueue_email(
-                connection,
-                incident_id=incident_id,
-                event_type=EVENT_MONITOR_ALERT,
-                condition=condition,
-                now=now,
-                recipient=email_recipient,
-            )
+            _audit(connection, int(inserted[0]), "opened", "system", condition["body"], observed)
 
-        active_rows = connection.execute(
-            """SELECT incident_id, dedupe_key, category, severity, title, body,
-                      source_json
-                 FROM monitor_alert_incidents WHERE status='active'"""
+        active = connection.execute(
+            """SELECT incident_id, dedupe_key FROM monitor_alert_incidents
+                WHERE status='active' AND category='operational'"""
         ).fetchall()
-        for row in active_rows:
-            if str(row[1]) in conditions:
+        for incident_id, dedupe_key in active:
+            if str(dedupe_key) in conditions:
                 continue
-            if not _alert_source_is_available(
-                dedupe_key=str(row[1]),
-                category=str(row[2]),
-                operational_health_available=operational_health_available,
-                paper_signal_available=paper_signal_available,
-            ):
-                continue
-            incident_id = int(row[0])
             connection.execute(
                 """UPDATE monitor_alert_incidents
                       SET status='recovered', recovered_at=? WHERE incident_id=?""",
-                (now_iso, incident_id),
+                (observed.isoformat(), int(incident_id)),
             )
-            _audit(connection, incident_id, "recovered", "system", "condition cleared", now)
-            _enqueue_email(
-                connection,
-                incident_id=incident_id,
-                event_type=EVENT_MONITOR_RECOVERY,
-                condition={
-                    "category": str(row[2]),
-                    "severity": str(row[3]),
-                    "title": str(row[4]),
-                    "body": str(row[5]),
-                    "source": _alert_source(row[6], str(row[1])),
-                },
-                now=now,
-                recipient=email_recipient,
-            )
-        candidate_rows = connection.execute(
-            "SELECT dedupe_key, payload_json FROM monitor_alert_candidates"
-        ).fetchall()
-        for dedupe_key, payload_json in candidate_rows:
-            dedupe_key = str(dedupe_key)
-            if dedupe_key in conditions:
-                continue
-            category = "operational"
-            try:
-                payload = json.loads(str(payload_json))
-                if isinstance(payload, dict):
-                    category = str(payload.get("category") or category)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
-            if not _alert_source_is_available(
-                dedupe_key=dedupe_key,
-                category=category,
-                operational_health_available=operational_health_available,
-                paper_signal_available=paper_signal_available,
-            ):
-                continue
-            connection.execute(
-                "DELETE FROM monitor_alert_candidates WHERE dedupe_key=?",
-                (dedupe_key,),
-            )
+            _audit(connection, int(incident_id), "recovered", "system", "condition cleared", observed)
     return active_alerts(connection)
 
 
@@ -379,7 +103,8 @@ def active_alerts(connection: PostgresSession) -> list[dict[str, Any]]:
             """SELECT incident_id, dedupe_key, episode, category, severity, title,
                       body, first_detected_at, opened_at, last_detected_at,
                       acknowledged_at, acknowledged_by, source_json, occurrence_count
-                 FROM monitor_alert_incidents WHERE status='active'
+                 FROM monitor_alert_incidents
+                WHERE status='active' AND category='operational'
                 ORDER BY CASE WHEN acknowledged_at IS NULL THEN 0 ELSE 1 END,
                          CASE severity WHEN 'critical' THEN 0 ELSE 1 END,
                          opened_at DESC"""
@@ -391,7 +116,7 @@ def active_alerts(connection: PostgresSession) -> list[dict[str, Any]]:
             "incident_id": int(row[0]),
             "dedupe_key": str(row[1]),
             "episode": int(row[2]),
-            "category": str(row[3]),
+            "category": "operational",
             "severity": str(row[4]),
             "title": str(row[5]),
             "body": str(row[6]),
@@ -414,17 +139,18 @@ def acknowledge_alert(
     actor: str,
     acknowledged_at: datetime | None = None,
 ) -> bool:
-    acknowledged_at = _aware(acknowledged_at or datetime.now(timezone.utc))
-    actor = " ".join(str(actor).split())[:100]
-    if incident_id <= 0 or not actor:
+    observed = _aware(acknowledged_at or datetime.now(timezone.utc))
+    normalized_actor = " ".join(str(actor).split())[:100]
+    if incident_id <= 0 or not normalized_actor:
         raise ValueError("valid incident and actor are required")
     verify_runtime_schema(connection)
-    with connection:
+    with connection.transaction():
         changed = connection.execute(
             """UPDATE monitor_alert_incidents
                   SET acknowledged_at=?, acknowledged_by=?
-                WHERE incident_id=? AND status='active' AND acknowledged_at IS NULL""",
-            (acknowledged_at.isoformat(), actor, incident_id),
+                WHERE incident_id=? AND status='active' AND category='operational'
+                  AND acknowledged_at IS NULL""",
+            (observed.isoformat(), normalized_actor, incident_id),
         )
         if changed.rowcount != 1:
             return False
@@ -432,294 +158,39 @@ def acknowledge_alert(
             connection,
             incident_id,
             "acknowledged",
-            actor,
+            normalized_actor,
             "operator acknowledged incident",
-            acknowledged_at,
+            observed,
         )
-        return True
+    return True
 
 
 def _conditions(
     connection: PostgresSession,
     health: Sequence[Mapping[str, Any]] | None,
-) -> tuple[dict[str, dict[str, Any]], bool, bool]:
-    operational_health_available = True
-    operational_contract_failure: dict[str, dict[str, Any]] = {}
+) -> dict[str, dict[str, Any]]:
     if health is None:
-        try:
-            rows = connection.execute(
-                """SELECT component, status, last_error, last_heartbeat_at
-                    FROM service_health"""
-            ).fetchall()
-            health = [
-                {
-                    "component": row[0],
-                    "status": row[1],
-                    "last_error": row[2],
-                    "last_heartbeat_at": row[3],
-                }
-                for row in rows
-            ]
-        except SQLAlchemyError as exc:
-            health = []
-            operational_health_available = False
-            operational_contract_failure = _operational_health_contract_failure(
-                exc
-            )
-    monitored_workers = {
-        "raybet_worker",
-        "raybet_priority_odds_worker",
-        "raybet_full_odds_worker",
-        "strict_ingest_worker",
-        "historical_rosh_worker",
-        "mail_worker",
-    }
-    conditions: dict[str, dict[str, Any]] = {}
+        rows = connection.execute(
+            """SELECT component, status, last_error FROM service_health"""
+        ).fetchall()
+        health = [
+            {"component": row[0], "status": row[1], "last_error": row[2]}
+            for row in rows
+        ]
+    result: dict[str, dict[str, Any]] = {}
     for item in health:
         component = str(item.get("component") or "").strip()
         status = str(item.get("status") or "missing")
-        last_error = str(item.get("last_error") or status)
-        if (
-            component not in monitored_workers
-            or status in {"healthy", "starting"}
-            or (
-                component == "mail_worker"
-                and last_error == "configuration_missing"
-            )
-        ):
+        if component not in _MONITORED_COMPONENTS or status in {"healthy", "starting"}:
             continue
-        conditions[f"operational:{component}"] = {
-            "category": "operational",
+        error = str(item.get("last_error") or status)
+        result[f"operational:{component}"] = {
             "severity": "critical" if status in {"unhealthy", "stopped"} else "warning",
             "title": f"{component} 状态异常",
-            "body": last_error,
-            "source": {"component": component, "status": status, "last_error": last_error},
+            "body": error,
+            "source": {"component": component, "status": status, "last_error": error},
         }
-    paper_conditions, paper_signal_available = _paper_signal_conditions(connection)
-    conditions.update(operational_contract_failure)
-    conditions.update(paper_conditions)
-    return conditions, operational_health_available, paper_signal_available
-
-
-def _operational_health_contract_failure(
-    error: SQLAlchemyError,
-) -> dict[str, dict[str, Any]]:
-    issue = f"{type(error).__name__}: {error}"
-    return {
-        "operational:service_health_contract": {
-            "category": "operational",
-            "severity": "critical",
-            "title": "Service health data is unavailable",
-            "body": "operational health reconciliation suppressed: " + issue,
-            "source": {
-                "component": "service_health",
-                "status": "unavailable",
-                "reason": "query_failed",
-                "issues": [issue],
-            },
-        }
-    }
-
-
-def _alert_source_is_available(
-    *,
-    dedupe_key: str,
-    category: str,
-    operational_health_available: bool,
-    paper_signal_available: bool,
-) -> bool:
-    if category == "paper_signal" or dedupe_key == (
-        "operational:paper_signal_contract"
-    ):
-        return paper_signal_available
-    return operational_health_available
-
-
-def _paper_signal_conditions(
-    connection: PostgresSession,
-) -> tuple[dict[str, dict[str, Any]], bool]:
-    try:
-        schema_issues = _paper_signal_schema_issues(connection)
-    except SQLAlchemyError as exc:
-        return (
-            _paper_signal_contract_failure(
-                "schema_inspection_failed",
-                [f"{type(exc).__name__}: {exc}"],
-            ),
-            False,
-        )
-    if schema_issues:
-        return (
-            _paper_signal_contract_failure("schema_incomplete", schema_issues),
-            False,
-        )
-
-    try:
-        rows = connection.execute(_PAPER_SIGNAL_QUERY).fetchall()
-    except SQLAlchemyError as exc:
-        return (
-            _paper_signal_contract_failure(
-                "query_failed",
-                [f"{type(exc).__name__}: {exc}"],
-            ),
-            False,
-        )
-
-    signal_conditions: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        order_key = str(row[0])
-        lineage_issue = decision_lineage_block_reason(connection, order_key)
-        if lineage_issue is not None:
-            return (
-                _paper_signal_contract_failure(
-                    "decision_lineage_invalid",
-                    [f"order_key={order_key}: {lineage_issue}"],
-                ),
-                False,
-            )
-        try:
-            model_probability = _paper_signal_probability(
-                row[3], "model_probability"
-            )
-            market_probability = _paper_signal_probability(
-                row[4], "market_probability"
-            )
-            signal_price = _paper_signal_price(row[5])
-        except (TypeError, ValueError, OverflowError) as exc:
-            return (
-                _paper_signal_contract_failure(
-                    "invalid_payload",
-                    [f"order_key={order_key}: {exc}"],
-                ),
-                False,
-            )
-        signal_conditions[f"paper_signal:{order_key}"] = {
-            "category": "paper_signal",
-            "severity": "warning",
-            "title": f"纸面信号 {row[1]}",
-            "body": f"{row[2]} @ {signal_price:.2f}",
-            "source": {
-                "order_key": order_key,
-                "raybet_match_id": str(row[1]),
-                "market_key": str(row[2]),
-                "model_probability": model_probability,
-                "market_probability": market_probability,
-                "signal_price": signal_price,
-                "signaled_at": str(row[6]),
-            },
-        }
-    return signal_conditions, True
-
-
-def _alert_source(value: Any, dedupe_key: str) -> dict[str, Any]:
-    try:
-        source = json.loads(str(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        source = None
-    if isinstance(source, dict):
-        return source
-    return {"dedupe_key": dedupe_key}
-
-
-def _paper_signal_schema_issues(connection: PostgresSession) -> list[str]:
-    issues: list[str] = []
-    for relation, required_columns in _PAPER_SIGNAL_REQUIRED_COLUMNS.items():
-        relation_row = connection.execute(
-            """SELECT relation.relkind
-                 FROM pg_class AS relation
-                 JOIN pg_namespace AS namespace
-                   ON namespace.oid=relation.relnamespace
-                WHERE namespace.nspname=current_schema()
-                  AND relation.relkind IN ('r', 'p', 'v')
-                  AND relation.relname=?""",
-            (relation,),
-        ).fetchone()
-        if relation_row is None:
-            issues.append(f"missing_relation:{relation}")
-            continue
-        columns = {
-            str(row[0])
-            for row in connection.execute(
-                """SELECT column_name FROM information_schema.columns
-                    WHERE table_schema=current_schema() AND table_name=?""",
-                (relation,),
-            ).fetchall()
-        }
-        for column in sorted(required_columns - columns):
-            issues.append(f"missing_column:{relation}.{column}")
-    return issues
-
-
-def _paper_signal_contract_failure(
-    reason: str,
-    issues: Sequence[str],
-) -> dict[str, dict[str, Any]]:
-    issue_list = list(issues)
-    return {
-        "operational:paper_signal_contract": {
-            "category": "operational",
-            "severity": "critical",
-            "title": "纸面信号数据契约异常",
-            "body": "paper_signal suppressed: " + "; ".join(issue_list),
-            "source": {
-                "component": "paper_signal",
-                "status": "unavailable",
-                "reason": reason,
-                "issues": issue_list,
-            },
-        }
-    }
-
-
-def _paper_signal_probability(value: Any, field: str) -> float:
-    number = float(value)
-    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
-        raise ValueError(f"{field} must be finite and between 0 and 1")
-    return number
-
-
-def _paper_signal_price(value: Any) -> float:
-    number = float(value)
-    if not math.isfinite(number) or number <= 1.0:
-        raise ValueError("signal_price must be finite and greater than 1")
-    return number
-
-
-def _enqueue_email(
-    connection: PostgresSession,
-    *,
-    incident_id: int,
-    event_type: str,
-    condition: Mapping[str, Any],
-    now: datetime,
-    recipient: str,
-) -> None:
-    if not recipient:
-        return
-    source = condition["source"]
-    outbox_order_key = f"monitor-incident-{incident_id}"
-    if condition["category"] == "paper_signal" and isinstance(source, Mapping):
-        paper_order_key = str(source.get("order_key") or "").strip()
-        if paper_order_key:
-            outbox_order_key = paper_order_key
-    enqueue(
-        connection,
-        order_key=outbox_order_key,
-        event_type=event_type,
-        payload={
-            "incident_id": incident_id,
-            "category": condition["category"],
-            "severity": condition["severity"],
-            "title": condition["title"],
-            "body": condition["body"],
-            "source": source,
-            "event_type": event_type,
-        },
-        stats_cutoff_at=now,
-        created_at=now,
-        recipient=recipient,
-        template_version=MONITOR_TEMPLATE_VERSION,
-    )
+    return result
 
 
 def _audit(
@@ -737,16 +208,10 @@ def _audit(
     )
 
 
-
-
 def _aware(value: datetime) -> datetime:
-    if value.tzinfo is None:
+    if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("alert times must be timezone-aware")
     return value.astimezone(timezone.utc)
-
-
-def _parse(value: Any) -> datetime:
-    return _aware(datetime.fromisoformat(str(value)))
 
 
 def _json(value: Mapping[str, Any]) -> str:

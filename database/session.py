@@ -17,7 +17,7 @@ _WRITE_PREFIX = re.compile(r"^\s*(INSERT|UPDATE|DELETE|MERGE)\b", re.IGNORECASE)
 
 
 class DatabaseRow:
-    """Buffered row with sqlite-style numeric and named access."""
+    """Buffered row with positional and named access."""
 
     __slots__ = ("_index", "_keys", "_values")
 

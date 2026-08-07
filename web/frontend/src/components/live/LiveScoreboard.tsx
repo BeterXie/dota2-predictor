@@ -1,6 +1,6 @@
 import { ArrowSquareOut, Clock } from "@phosphor-icons/react";
 import { formatClock, formatDateTime } from "../../format";
-import type { MonitorMatch, VisionAnalysisData } from "../../types";
+import type { MonitorMatch } from "../../types";
 import { RelativeAge } from "../RelativeAge";
 import { LifecycleBadge } from "../StatusBadge";
 

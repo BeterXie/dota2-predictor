@@ -1,1 +1,1 @@
-# Module A: Data Fetcher — OpenDota API -> SQLite
+"""OpenDota ingestion into the PostgreSQL core store."""

@@ -1,6 +1,6 @@
 """Canonical identities for exact RayBet response storage.
 
-This module is deliberately independent of SQLite.  Online writers, offline
+Online writers, offline
 compaction, and audit code must use these functions so a response has one
 identity regardless of which path persisted it.
 """

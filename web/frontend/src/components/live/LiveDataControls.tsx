@@ -14,7 +14,7 @@ import {
   correctLiveGameSnapshot,
   createLiveDraftPrediction,
   fetchLiveDraftPrediction,
-  fetchPrematchHeroGrid,
+  fetchHeroGrid,
   saveLiveDraftMapping,
 } from "../../api";
 import { formatClock, formatDateTime, formatPercent } from "../../format";
@@ -31,6 +31,7 @@ import type {
 interface LiveDataControlsProps {
   csrfToken: string | null;
   detail: MatchDetail;
+  readOnly?: boolean;
 }
 
 const sides = ["radiant", "dire"] as const;
@@ -66,11 +67,11 @@ function contextSlots(detail: MatchDetail): LiveDraftSlot[] {
     side: teamIndex === 0 ? "radiant" as const : "dire" as const,
     position: index + 1,
     hero_id: 0,
-    player_id: team.players.find((player) => player.position === index + 1)?.player_id ?? null,
+    player_id: null,
   })));
 }
 
-export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
+export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDataControlsProps) {
   const [mapping, setMapping] = useState<LiveDraftMapping | null>(
     detail.draft_mapping || null,
   );
@@ -141,8 +142,6 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
   }, [
     detail.raybet_match_id,
     detail.current_map_number,
-    detail.draft_context?.teams[0]?.roster_match_id,
-    detail.draft_context?.teams[1]?.roster_match_id,
     detail.draft_mapping?.version,
     detail.latest_game_snapshot?.snapshot_id,
   ]);
@@ -215,7 +214,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
     if (heroCatalogLoaded || heroCatalogBusy) return;
     setHeroCatalogBusy(true);
     setHeroCatalogError(null);
-    void fetchPrematchHeroGrid().then((catalog) => {
+    void fetchHeroGrid().then((catalog) => {
       setHeroGrid(catalog);
       setHeroCatalogLoaded(true);
     }).catch((error: Error) => {
@@ -251,22 +250,6 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
       ...slot,
       side: slot.side === "radiant" ? "dire" : "radiant",
     })));
-  };
-
-  const selectPlayer = (side: Side, position: number, playerId: number | null) => {
-    setSlots((current) => {
-      const target = current.find((slot) => slot.side === side && slot.position === position);
-      if (!target) return current;
-      const previousPlayer = target.player_id;
-      return current.map((slot) => {
-        if (slot.side !== side) return slot;
-        if (slot.position === position) return { ...slot, player_id: playerId };
-        if (playerId !== null && slot.player_id === playerId) {
-          return { ...slot, player_id: previousPlayer };
-        }
-        return slot;
-      });
-    });
   };
 
   const saveMapping = async (event: FormEvent) => {
@@ -351,7 +334,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             <h2>本局阵容映射</h2>
             <p>{mapping
               ? `版本 ${mapping.version} · ${mapping.is_locked ? "已人工锁定" : "尚未锁定"} · ${formatDateTime(mapping.created_at)}`
-              : "等待人工确认英雄、位置与选手"}</p>
+              : "等待人工确认队伍、英雄与 1–5 号位"}</p>
           </div>
           <Lock size={19} aria-hidden="true" />
         </div>
@@ -371,13 +354,15 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
           {(detail.current_map_number || mapping || latest) && (
             <span className="live-form-message">第 {mapNumber} 局</span>
           )}
-          <Button
-            appearance="primary"
-            onClick={() => setEditorOpen(true)}
-            type="button"
-          >
-            {mapping ? "编辑阵容" : "录入阵容"}
-          </Button>
+          {!readOnly && (
+            <Button
+              appearance="primary"
+              onClick={() => setEditorOpen(true)}
+              type="button"
+            >
+              {mapping ? "编辑阵容" : "录入阵容"}
+            </Button>
+          )}
         </div>
         {detail.draft_context?.status !== "ready" && !mapping && (
           <div className="live-state-empty" role="status">
@@ -401,6 +386,8 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             <div><dt>因果状态</dt><dd>{prediction.causal_evidence.causal_status}</dd></div>
             <div><dt>生成时间</dt><dd>{formatDateTime(prediction.created_at)}</dd></div>
           </div>
+        ) : readOnly ? (
+          <div className="live-state-empty" role="status">该 mapping 没有保存预测。</div>
         ) : (
           <div className="live-draft-prediction-control">
             <label className="lock-toggle">
@@ -454,7 +441,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             <span>绝对总经济 OCR 尚未产生有效快照，可先人工纠正。</span>
           </div>
         )}
-        <div className="manual-state-grid">
+        {!readOnly && <div className="manual-state-grid">
           <NumericField
             label="比赛时间（秒）"
             onChange={(value) => setGameValues((current) => ({
@@ -495,14 +482,14 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             }))}
             value={gameValues.dire_kills}
           />
-        </div>
+        </div>}
         <div className="live-form-actions">
           {detail.latest_capture?.frame_url && (
             <a href={detail.latest_capture.frame_url} rel="noreferrer" target="_blank">
               查看最近截图
             </a>
           )}
-          <Button
+          {!readOnly && <Button
             disabled={
               !csrfToken
               || snapshotBusy
@@ -512,7 +499,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             type="submit"
           >
             {snapshotBusy ? "保存中" : "追加人工修正"}
-          </Button>
+          </Button>}
         </div>
         {snapshotMessage && <p className="live-form-message" role="status">{snapshotMessage}</p>}
         {snapshots.length > 1 && (
@@ -526,7 +513,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
         )}
       </form>
 
-      {editorOpen && (
+      {editorOpen && !readOnly && (
         <div
           aria-label="阵容录入"
           aria-modal="true"
@@ -540,7 +527,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             <div className="section-heading compact">
               <div>
                 <h2>{mapping ? "编辑本局阵容" : "录入本局阵容"}</h2>
-                <p>选择英雄，并确认系统按位置匹配的选手昵称。</p>
+                <p>选择双方英雄，并确认每个英雄的 1–5 号位。</p>
               </div>
               <button
                 aria-label="关闭阵容录入"
@@ -575,7 +562,6 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
                 heroesById={heroesById}
                 onClearHero={(position) => clearHero("radiant", position)}
                 onOpenPicker={(position) => openHeroPicker("radiant", position)}
-                onSelectPlayer={(position, playerId) => selectPlayer("radiant", position, playerId)}
                 side="radiant"
                 slots={slots.filter((slot) => slot.side === "radiant")}
                 team={teamForSide("radiant")}
@@ -585,7 +571,6 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
                 heroesById={heroesById}
                 onClearHero={(position) => clearHero("dire", position)}
                 onOpenPicker={(position) => openHeroPicker("dire", position)}
-                onSelectPlayer={(position, playerId) => selectPlayer("dire", position, playerId)}
                 side="dire"
                 slots={slots.filter((slot) => slot.side === "dire")}
                 team={teamForSide("dire")}
@@ -598,7 +583,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
                   onChange={(event) => setLocked(event.target.checked)}
                   type="checkbox"
                 />
-                锁定后允许进入策略
+                锁定后允许生成实时阵容预测
               </label>
               <Button
                 appearance="primary"
@@ -690,16 +675,13 @@ function DraftSummaryTeam({
   team: LiveDraftContextTeam | null;
 }) {
   const label = side === "radiant" ? "天辉" : "夜魇";
-  const players = [...(team?.players || [])]
-    .sort((left, right) => left.position - right.position)
-    .map((player) => player.player_name || `选手 ${player.player_id}`);
   return (
     <section className={`live-draft-summary-team ${side}`}>
       <header>
         <strong>{label} · {team?.team_name || "队伍待解析"}</strong>
         <span>{slots.filter((slot) => slot.hero_id > 0).length}/5</span>
       </header>
-      <p>{players.length > 0 ? players.join(" / ") : "选手昵称待同步"}</p>
+      <p>按 1–5 号位确认英雄</p>
     </section>
   );
 }
@@ -708,7 +690,6 @@ function DraftTeamLineup({
   heroesById,
   onClearHero,
   onOpenPicker,
-  onSelectPlayer,
   side,
   slots,
   team,
@@ -716,7 +697,6 @@ function DraftTeamLineup({
   heroesById: ReadonlyMap<number, PrematchHero>;
   onClearHero: (position: number) => void;
   onOpenPicker: (position: number) => void;
-  onSelectPlayer: (position: number, playerId: number | null) => void;
   side: Side;
   slots: LiveDraftSlot[];
   team: LiveDraftContextTeam | null;
@@ -727,14 +707,13 @@ function DraftTeamLineup({
       <header>
         <div>
           <h3>{label} · {team?.team_name || "队伍待解析"}</h3>
-          <small>{team?.roster_match_id ? `阵容依据 ${team.roster_match_id}` : "阵容依据待确认"}</small>
+          <small>位置由操作者确认</small>
         </div>
         <span>{slots.filter((slot) => slot.hero_id > 0).length}/5</span>
       </header>
       <div className="prematch-hero-slots">
         {[...slots].sort((left, right) => left.position - right.position).map((slot) => {
           const hero = heroesById.get(slot.hero_id) || null;
-          const player = team?.players.find((item) => item.player_id === slot.player_id) || null;
           return (
             <div className={slot.hero_id > 0 ? "filled" : ""} key={slot.position}>
               <button
@@ -759,26 +738,6 @@ function DraftTeamLineup({
                   <X size={15} />
                 </button>
               )}
-              <label className="live-player-select">
-                <span>选手</span>
-                <select
-                  aria-label={`${label} ${slot.position} 号位选手`}
-                  onChange={(event) => onSelectPlayer(
-                    slot.position,
-                    event.target.value ? Number(event.target.value) : null,
-                  )}
-                  value={slot.player_id ?? ""}
-                >
-                  <option value="">未确认</option>
-                  {(team?.players || []).map((option) => (
-                    <option key={option.player_id} value={option.player_id}>
-                      {option.player_name || `选手 ${option.player_id}`}
-                      {option.position === slot.position ? " · 默认" : ""}
-                    </option>
-                  ))}
-                </select>
-                {player && <small>{Math.round(player.confidence * 100)}% · {player.position_source}</small>}
-              </label>
             </div>
           );
         })}

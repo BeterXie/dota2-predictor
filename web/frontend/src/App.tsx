@@ -1,27 +1,6 @@
-import {
-  Button,
-  Popover,
-  PopoverSurface,
-  PopoverTrigger,
-  Switch,
-  Tab,
-  TabList,
-} from "@fluentui/react-components";
-import {
-  ArrowLeft,
-  Bell,
-  BellRinging,
-  Broadcast,
-  ChartLineUp,
-  ClockCounterClockwise,
-  Database,
-  GearSix,
-  Pulse,
-  ShieldCheck,
-  LockSimple,
-  SpeakerHigh,
-} from "@phosphor-icons/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Tab, TabList } from "@fluentui/react-components";
+import { Broadcast, ClockCounterClockwise, GearSix } from "@phosphor-icons/react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   acknowledgeAlert,
@@ -30,7 +9,6 @@ import {
   createAutomaticMapping,
   createControlSession,
   fetchBootstrap,
-  fetchControlComponents,
   fetchMappings,
   fetchMatchDetail,
   fetchMonitorHistory,
@@ -41,912 +19,188 @@ import { MatchRail } from "./components/MatchRail";
 import { MatchWorkspace } from "./components/MatchWorkspace";
 import { OperationsPanel } from "./components/OperationsPanel";
 import type {
-  ConnectionState,
   ControlComponent,
   ControlResult,
   ControlSession,
   MappingRecord,
   MatchDetail,
   MonitorMatch,
-  MonitorLifecycleCounts,
   MonitorSnapshot,
 } from "./types";
 
-type HistoryView = "replay" | "intelligence";
-type PrimaryView = "live" | "prematch" | "history" | "operations";
-type ViewMode = "live" | "prematch" | HistoryView | "operations";
 
-const LIVE_DETAIL_REFRESH_MS = 5_000;
+type ViewMode = "live" | "replay" | "operations";
 
-const IntelligenceDashboard = lazy(() =>
-  import("./components/IntelligenceDashboard").then((module) => ({
-    default: module.IntelligenceDashboard,
-  })),
-);
-
-const PrematchWorkspace = lazy(() =>
-  import("./components/PrematchWorkspace").then((module) => ({
-    default: module.PrematchWorkspace,
-  })),
-);
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<MonitorSnapshot | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(initialMonitorMatchId);
-  const [intelligenceMatchId, setIntelligenceMatchId] = useState<number | null>(
-    initialIntelligenceMatchId,
-  );
-  const [detail, setDetail] = useState<MatchDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [view, setView] = useState<ViewMode>(initialView);
-  const [historyMatches, setHistoryMatches] = useState<MonitorMatch[]>([]);
-  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
-  const [historyHasMore, setHistoryHasMore] = useState(false);
-  const [historyLoaded, setHistoryLoaded] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
-  const historyViewRef = useRef<HistoryView>(
-    view === "intelligence" ? "intelligence" : "replay",
-  );
+  const [snapshot, setSnapshot] = useState<MonitorSnapshot | null>(null);
+  const [history, setHistory] = useState<MonitorMatch[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<MatchDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [controlSession, setControlSession] = useState<ControlSession | null>(null);
   const [components, setComponents] = useState<ControlComponent[]>([]);
   const [controlBusy, setControlBusy] = useState<string | null>(null);
   const [controlMessage, setControlMessage] = useState<string | null>(null);
-  const [mappingState, setMappingState] = useState<{
-    matchId: string | null;
-    version: number;
-    records: MappingRecord[];
-  }>({ matchId: null, version: 0, records: [] });
-  const [mappingVersion, setMappingVersion] = useState(0);
-  const [soundEnabled, setSoundEnabled] = useState(
-    () => localStorage.getItem("dota2-monitor-sound") === "on",
-  );
-  const [browserAlerts, setBrowserAlerts] = useState(
-    () => localStorage.getItem("dota2-monitor-browser-alerts") === "on",
-  );
-  const cursorRef = useRef<string | undefined>(undefined);
-  const historyPageRequestRef = useRef<AbortController | null>(null);
-  const notifiedAlerts = useRef(new Set<number>());
-  const realtimeEnabled = view === "live" || view === "operations";
+  const [mappings, setMappings] = useState<MappingRecord[]>([]);
 
   useEffect(() => {
-    if (!realtimeEnabled || snapshot) return;
-    let controller: AbortController | null = null;
-    let retryTimer: number | null = null;
-    let disposed = false;
-    const load = () => {
-      controller = new AbortController();
-      fetchBootstrap(controller.signal)
-        .then((data) => {
-          if (disposed) return;
-          cursorRef.current = data.cursor;
-          setSnapshot(data);
-          setSelectedId((current) => {
-            if (view !== "operations") return current;
-            return current && data.matches.some((match) => match.raybet_match_id === current)
-              ? current
-              : preferredMatch(data.matches, "live");
-          });
-          setError(null);
-        })
-        .catch((reason: Error) => {
-          if (disposed || reason.name === "AbortError") return;
-          setError(reason.message || "无法加载监控数据");
-          setConnection("offline");
-          retryTimer = window.setTimeout(load, 5_000);
-        });
-    };
-    load();
-    return () => {
-      disposed = true;
-      controller?.abort();
-      if (retryTimer != null) window.clearTimeout(retryTimer);
-    };
-  }, [realtimeEnabled]);
-
-  useEffect(() => {
-    if (view !== "replay") return;
     const controller = new AbortController();
-    let disposed = false;
-    setHistoryLoading(true);
-    fetchMonitorHistory(null, controller.signal)
-      .then((page) => {
-        if (disposed) return;
-        if (page.has_more && !page.next_cursor) {
-          throw new Error("历史分页响应缺少游标");
-        }
-        setHistoryMatches(dedupeMatches(page.items));
-        setHistoryCursor(page.next_cursor);
-        setHistoryHasMore(page.has_more);
-        setHistoryLoaded(true);
-        setHistoryLoading(false);
-        setHistoryError(null);
-      })
-      .catch((reason: Error) => {
-        if (!disposed && reason.name !== "AbortError") {
-          setHistoryLoading(false);
-          setHistoryError(reason.message || "无法加载历史比赛");
-        }
-      });
-    return () => {
-      disposed = true;
-      controller.abort();
-    };
-  }, [view]);
-
-  useEffect(() => {
-    if (view === "replay") return;
-    historyPageRequestRef.current?.abort();
-    historyPageRequestRef.current = null;
-    setHistoryLoading(false);
-  }, [view]);
-
-  useEffect(() => () => {
-    historyPageRequestRef.current?.abort();
-    historyPageRequestRef.current = null;
-  }, []);
-
-  useEffect(() => {
-    if (view !== "operations" && view !== "live") {
-      setControlSession(null);
-      setComponents([]);
-      return;
-    }
-    let controller: AbortController | null = null;
-    let renewalTimer: number | null = null;
-    let disposed = false;
-    const establish = () => {
-      controller = new AbortController();
-      createControlSession(controller.signal)
-        .then((session) => {
-          if (disposed) return;
-          setControlSession(session);
-          setComponents(session.components);
-          const renewAfter = Math.max(5_000, (session.expires_in - 60) * 1_000);
-          renewalTimer = window.setTimeout(establish, renewAfter);
-        })
-        .catch((reason: Error) => {
-          if (disposed || reason.name === "AbortError") return;
-          setControlMessage("进程控制不可用，仅保留监控功能");
-          renewalTimer = window.setTimeout(establish, 5_000);
-        });
-    };
-    establish();
-    return () => {
-      disposed = true;
-      controller?.abort();
-      if (renewalTimer != null) window.clearTimeout(renewalTimer);
-    };
-  }, [view]);
-
-  useEffect(() => {
-    if (!controlSession) return;
-    if (view !== "operations") return;
-    const controller = new AbortController();
-    let disposed = false;
-    let refreshing = false;
-    const refresh = async () => {
-      if (refreshing) return;
-      refreshing = true;
-      try {
-        const next = await fetchControlComponents(
-          controlSession.csrf_token,
-          controller.signal,
-        );
-        if (!disposed) setComponents(next);
-      } catch (reason) {
-        if (!disposed && (!(reason instanceof Error) || reason.name !== "AbortError")) {
-          setComponents([]);
-          try {
-            const session = await createControlSession(controller.signal);
-            if (!disposed) {
-              setControlSession(session);
-              setComponents(session.components);
-            }
-          } catch (renewalReason) {
-            if (
-              !disposed
-              && (!(renewalReason instanceof Error) || renewalReason.name !== "AbortError")
-            ) {
-              setControlMessage("进程控制会话已失效，正在重试");
-            }
-          }
-        }
-      } finally {
-        refreshing = false;
-      }
-    };
-    const timer = window.setInterval(() => void refresh(), 5_000);
-    return () => {
-      disposed = true;
-      controller.abort();
-      window.clearInterval(timer);
-    };
-  }, [controlSession, view]);
-
-  useEffect(() => {
-    if (!snapshot || !realtimeEnabled) return;
     let source: EventSource | null = null;
-    let pollTimer: number | null = null;
-    let reconnectTimer: number | null = null;
-    let pollController: AbortController | null = null;
-    let pollGeneration = 0;
-    let disposed = false;
-
-    const cancelPoll = () => {
-      pollGeneration += 1;
-      pollController?.abort();
-      pollController = null;
-      if (pollTimer != null) {
-        window.clearInterval(pollTimer);
-        pollTimer = null;
-      }
-    };
-
-    const refreshFromPoll = async () => {
-      if (disposed || pollController !== null) return;
-      const generation = pollGeneration;
-      const controller = new AbortController();
-      pollController = controller;
-      try {
-        const data = await fetchBootstrap(controller.signal);
-        if (
-          disposed
-          || controller.signal.aborted
-          || generation !== pollGeneration
-          || pollController !== controller
-        ) return;
-        cursorRef.current = data.cursor;
-        setSnapshot(data);
+    fetchBootstrap(controller.signal).then((value) => {
+      setSnapshot(value);
+      setSelectedId((current) => current || preferredMatch(value.matches));
+      setError(null);
+      source = snapshotStream(value.cursor);
+      source.addEventListener("snapshot", (event) => {
+        const next = JSON.parse((event as MessageEvent<string>).data) as MonitorSnapshot;
+        setSnapshot(next);
         setError(null);
-      } catch (reason) {
-        if (
-          !disposed
-          && !controller.signal.aborted
-          && generation === pollGeneration
-          && pollController === controller
-        ) {
-          setError(errorText(reason, "轮询失败"));
-        }
-      } finally {
-        if (pollController === controller) pollController = null;
-      }
-    };
-
-    const poll = () => {
-      if (pollTimer != null) return;
-      setConnection("fallback");
-      pollTimer = window.setInterval(() => void refreshFromPoll(), 5_000);
-    };
-
-    const connect = () => {
-      if (disposed) return;
-      const connectedSource = snapshotStream(cursorRef.current);
-      source = connectedSource;
-      setConnection("connecting");
-      connectedSource.onopen = () => {
-        if (disposed || source !== connectedSource) return;
-        cancelPoll();
-        setConnection("live");
-      };
-      connectedSource.addEventListener("snapshot", (event) => {
-        if (disposed || source !== connectedSource) return;
-        cancelPoll();
-        const data = JSON.parse((event as MessageEvent<string>).data) as MonitorSnapshot;
-        cursorRef.current = data.cursor;
-        setSnapshot(data);
-        setError(null);
-        setConnection("live");
       });
-      connectedSource.onerror = () => {
-        if (disposed || source !== connectedSource) return;
-        connectedSource.close();
-        source = null;
-        poll();
-        if (reconnectTimer == null) {
-          reconnectTimer = window.setTimeout(() => {
-            reconnectTimer = null;
-            connect();
-          }, 10_000);
-        }
-      };
-    };
-
-    connect();
+      source.onerror = () => setError("实时事件流不可用，正在等待重新连接");
+    }).catch((reason: Error) => setError(reason.message || "无法加载实时赛事"));
     return () => {
-      disposed = true;
+      controller.abort();
       source?.close();
-      cancelPoll();
-      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
     };
-  }, [Boolean(snapshot), realtimeEnabled]);
-
-  useEffect(() => {
-    const syncMonitorLocation = () => {
-      const liveMatchId = liveMatchIdFromPath();
-      if (liveMatchId) {
-        setView("live");
-        setSelectedId(liveMatchId);
-        setIntelligenceMatchId(null);
-        setDetailError(null);
-        return;
-      }
-      const replayMatchId = replayMatchIdFromPath();
-      if (replayMatchId) {
-        historyViewRef.current = "replay";
-        setView("replay");
-        setSelectedId(replayMatchId);
-        setIntelligenceMatchId(null);
-        setDetailError(null);
-        return;
-      }
-      const intelligenceId = intelligenceMatchIdFromPath();
-      if (intelligenceId != null) {
-        historyViewRef.current = "intelligence";
-        setView("intelligence");
-        setSelectedId(null);
-        setIntelligenceMatchId(intelligenceId);
-        setDetailError(null);
-        return;
-      }
-      const pathname = normalizedPathname();
-      if (pathname === "/" || pathname === "/monitor") {
-        const next = initialView();
-        setView(next);
-        if (next === "replay" || next === "intelligence") {
-          historyViewRef.current = next;
-        }
-        if (next === "live" || next === "replay") setSelectedId(null);
-        if (next === "intelligence") setIntelligenceMatchId(null);
-        setDetailError(null);
-      }
-    };
-    window.addEventListener("popstate", syncMonitorLocation);
-    return () => window.removeEventListener("popstate", syncMonitorLocation);
   }, []);
 
   useEffect(() => {
-    if (!selectedId || (view !== "live" && view !== "replay")) {
-      setDetail(null);
-      setDetailLoading(false);
-      return;
-    }
-    let disposed = false;
-    let controller: AbortController | null = null;
-    let refreshTimer: number | null = null;
-
-    const load = async () => {
-      if (disposed || controller) return;
-      const request = new AbortController();
-      controller = request;
-      setDetailLoading(true);
-      try {
-        const data = await fetchMatchDetail(selectedId, request.signal);
-        if (disposed || request.signal.aborted) return;
-        setDetail(data);
-        setDetailError(null);
-      } catch (reason) {
-        if (
-          !disposed
-          && (!(reason instanceof Error) || reason.name !== "AbortError")
-        ) {
-          setDetailError(errorText(reason, "无法加载赛事详情"));
-        }
-      } finally {
-        if (controller === request) controller = null;
-        if (!disposed) {
-          setDetailLoading(false);
-          if (view === "live") {
-            refreshTimer = window.setTimeout(() => void load(), LIVE_DETAIL_REFRESH_MS);
-          }
-        }
-      }
-    };
-
-    void load();
-    return () => {
-      disposed = true;
-      controller?.abort();
-      if (refreshTimer != null) window.clearTimeout(refreshTimer);
-    };
-  }, [selectedId, view]);
+    if (view !== "replay") return undefined;
+    const controller = new AbortController();
+    fetchMonitorHistory(null, controller.signal).then((page) => {
+      setHistory(page.items);
+      setSelectedId((current) => current || page.items[0]?.raybet_match_id || null);
+    }).catch((reason: Error) => {
+      if (reason.name !== "AbortError") setError(reason.message || "无法加载历史赛事");
+    });
+    return () => controller.abort();
+  }, [view]);
 
   useEffect(() => {
-    if (view === "live" && snapshot) {
-      const visible = matchesForView(snapshot.matches, "live");
-      if (selectedId && !visible.some((match) => match.raybet_match_id === selectedId)) {
-        setSelectedId(null);
-        setDetailError(null);
-        window.history.replaceState(null, "", "/monitor");
-      }
-      return;
+    if (view !== "live" && view !== "operations") return undefined;
+    const controller = new AbortController();
+    createControlSession(controller.signal).then((session) => {
+      setControlSession(session);
+      setComponents(session.components);
+    }).catch(() => setControlMessage("进程控制不可用，监控仍保持只读"));
+    return () => controller.abort();
+  }, [view]);
+
+  useEffect(() => {
+    if (!selectedId || view === "operations") {
+      setDetail(null);
+      return undefined;
     }
-    if (view === "operations" && snapshot) {
-      if (!selectedId || !snapshot.matches.some((match) => match.raybet_match_id === selectedId)) {
-        setSelectedId(preferredMatch(snapshot.matches, "live"));
-      }
-      return;
-    }
-  }, [selectedId, snapshot, view]);
+    const controller = new AbortController();
+    setLoading(true);
+    fetchMatchDetail(selectedId, controller.signal).then((value) => {
+      setDetail(value);
+      setError(null);
+    }).catch((reason: Error) => {
+      if (reason.name !== "AbortError") setError(reason.message || "无法加载赛事详情");
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoading(false);
+    });
+    return () => controller.abort();
+  }, [selectedId, view, snapshot?.cursor]);
 
   useEffect(() => {
     if (!selectedId || view !== "operations") {
-      setMappingState({ matchId: null, version: mappingVersion, records: [] });
-      return;
-    }
-    let active = true;
-    const controller = new AbortController();
-    fetchMappings(selectedId, controller.signal)
-      .then((records) => {
-        if (active) {
-          setMappingState({ matchId: selectedId, version: mappingVersion, records });
-        }
-      })
-      .catch((reason: Error) => {
-        if (active && reason.name !== "AbortError") {
-          setMappingState({ matchId: selectedId, version: mappingVersion, records: [] });
-          setControlMessage("无法读取映射证据");
-        }
-      });
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [selectedId, mappingVersion, snapshot?.mapping_revision, view]);
-
-  useEffect(() => {
-    const active = snapshot?.alerts || [];
-    for (const alert of active) {
-      if (alert.acknowledged_at || notifiedAlerts.current.has(alert.incident_id)) continue;
-      notifiedAlerts.current.add(alert.incident_id);
-      if (browserAlerts && "Notification" in window && Notification.permission === "granted") {
-        new Notification(alert.title, { body: alert.body, tag: alert.dedupe_key });
-      }
-      if (soundEnabled) playAlertTone(alert.severity === "critical");
-    }
-  }, [browserAlerts, snapshot?.alerts, soundEnabled]);
-
-  const loadMoreHistory = async () => {
-    if (
-      historyPageRequestRef.current
-      || historyLoading
-      || (historyLoaded && !historyHasMore)
-    ) return;
-    const requestedCursor = historyLoaded ? historyCursor : null;
-    if (historyLoaded && !requestedCursor) {
-      setHistoryHasMore(false);
-      setHistoryError("历史分页游标已失效");
-      return;
+      setMappings([]);
+      return undefined;
     }
     const controller = new AbortController();
-    historyPageRequestRef.current = controller;
-    setHistoryLoading(true);
-    try {
-      const page = await fetchMonitorHistory(requestedCursor, controller.signal);
-      if (
-        controller.signal.aborted
-        || historyPageRequestRef.current !== controller
-      ) return;
-      if (
-        page.has_more
-        && (!page.next_cursor || page.next_cursor === requestedCursor)
-      ) {
-        setHistoryHasMore(false);
-        throw new Error("历史分页游标没有向前推进");
-      }
-      setHistoryMatches((current) => dedupeMatches([...current, ...page.items]));
-      setHistoryCursor(page.next_cursor);
-      setHistoryHasMore(page.has_more);
-      setHistoryLoaded(true);
-      setHistoryError(null);
-    } catch (reason) {
-      if (
-        historyPageRequestRef.current === controller
-        && (!(reason instanceof Error) || reason.name !== "AbortError")
-      ) {
-        setHistoryError(errorText(reason, "无法加载更多历史比赛"));
-      }
-    } finally {
-      if (historyPageRequestRef.current === controller) {
-        historyPageRequestRef.current = null;
-        setHistoryLoading(false);
-      }
-    }
-  };
+    fetchMappings(selectedId, controller.signal).then(setMappings).catch(() => {
+      setMappings([]);
+      setControlMessage("无法读取 strict mapping");
+    });
+    return () => controller.abort();
+  }, [selectedId, view, snapshot?.mapping_revision]);
 
-  const liveMatches = snapshot?.matches || [];
-  const matches = view === "replay" ? historyMatches : liveMatches;
-  const railMatches = view === "replay" || view === "live"
-    ? matchesForView(matches, view)
-    : [];
-  const selectedMatch = matches.find((match) => match.raybet_match_id === selectedId) || null;
-  const selectedDetail = detail?.raybet_match_id === selectedId ? detail : null;
-  const workspaceMatch = selectedMatch || selectedDetail;
-  const mappings = mappingState.matchId === selectedId && mappingState.version === mappingVersion
-    ? mappingState.records
-    : [];
-  const alertCount = useMemo(
-    () => (snapshot?.alerts || []).filter((item) => !item.acknowledged_at).length,
-    [snapshot?.alerts],
+  const matches = view === "replay" ? history : snapshot?.matches || [];
+  const visibleMatches = useMemo(
+    () => view === "replay"
+      ? matches.filter((match) => match.history_eligible)
+      : matches.filter((match) => match.lifecycle !== "ended"),
+    [matches, view],
   );
-  const viewSummary = snapshot && view !== "prematch"
-    ? summaryForView(snapshot.summary, view)
-    : null;
-  const historySummary = lifecycleCounts(historyMatches);
-  const displayedError = view === "prematch"
-    ? null
-    : view === "replay" ? historyError : error;
+  const selectedMatch = matches.find((match) => match.raybet_match_id === selectedId)
+    || detail
+    || null;
 
   const changeView = (next: ViewMode) => {
-    if (next === "replay" || next === "intelligence") {
-      historyViewRef.current = next;
-    }
     setView(next);
-    const query = new URLSearchParams(window.location.search);
-    if (next === "live" || next === "prematch") query.delete("view");
-    else query.set("view", next);
-    const search = query.toString();
-    const pathname = next === "prematch" ? "/prematch" : "/monitor";
-    window.history.replaceState(
-      null,
-      "",
-      `${pathname}${search ? `?${search}` : ""}${window.location.hash}`,
-    );
-    setIntelligenceMatchId(null);
-    if (next === "live" || next === "replay") {
-      setSelectedId(null);
-      setDetailError(null);
-    } else if (
-      next === "operations"
-      && snapshot
-      && !snapshot.matches.some((match) => match.raybet_match_id === selectedId)
-    ) {
-      setSelectedId(preferredMatch(snapshot.matches, "live"));
-    }
-  };
-
-  const changePrimaryView = (next: PrimaryView) => {
-    changeView(next === "history" ? historyViewRef.current : next);
-  };
-
-  const openLiveMatch = (matchId: string) => {
-    setSelectedId(matchId);
-    setDetailError(null);
-    window.history.pushState(
-      { liveDetailFromList: true },
-      "",
-      `/monitor/matches/${encodeURIComponent(matchId)}`,
-    );
-  };
-
-  const openReplayMatch = (matchId: string) => {
-    setSelectedId(matchId);
-    setDetailError(null);
-    window.history.pushState(
-      { replayDetailFromList: true },
-      "",
-      `/monitor/history/odds/${encodeURIComponent(matchId)}`,
-    );
-  };
-
-  const openIntelligenceMatch = (matchId: number) => {
-    setIntelligenceMatchId(matchId);
-    window.history.pushState(
-      { intelligenceDetailFromList: true },
-      "",
-      `/monitor/history/intelligence/${matchId}`,
-    );
-  };
-
-  const returnToLiveList = () => {
-    if (window.history.state?.liveDetailFromList) {
-      setSelectedId(null);
-      setDetailError(null);
-      window.history.back();
-      return;
-    }
-    window.history.replaceState(null, "", "/monitor");
     setSelectedId(null);
-    setDetailError(null);
+    setDetail(null);
+    const query = next === "live" ? "" : `?view=${next}`;
+    window.history.pushState(null, "", `/monitor${query}`);
   };
 
-  const returnToReplayList = () => {
-    if (window.history.state?.replayDetailFromList) {
-      setSelectedId(null);
-      setDetailError(null);
-      window.history.back();
-      return;
+  const requireControl = (): string | null => {
+    if (!controlSession) {
+      setControlMessage("控制会话不可用");
+      return null;
     }
-    window.history.replaceState(null, "", "/monitor?view=replay");
-    setSelectedId(null);
-    setDetailError(null);
+    return controlSession.csrf_token;
   };
-
-  const returnToIntelligenceList = () => {
-    if (window.history.state?.intelligenceDetailFromList) {
-      setIntelligenceMatchId(null);
-      window.history.back();
-      return;
-    }
-    window.history.replaceState(null, "", "/monitor?view=intelligence");
-    setIntelligenceMatchId(null);
-  };
-
-  const primaryView: PrimaryView = view === "live"
-    ? "live"
-    : view === "prematch" || view === "operations"
-      ? view
-      : "history";
 
   const runControl = async (
     component: ControlComponent["component"],
     action: ControlResult["action"],
   ) => {
-    if (!controlSession) return;
-    const componentLabel = components.find((item) => item.component === component)?.label || component;
-    const actionLabel = { start: "启动", stop: "停止", restart: "重启" }[action];
-    if (!window.confirm(`确认${actionLabel} ${componentLabel}？`)) return;
-    const busyKey = `${component}:${action}`;
-    setControlBusy(busyKey);
-    setControlMessage(null);
+    const token = requireControl();
+    if (!token) return;
+    setControlBusy(`${component}:${action}`);
     try {
-      const result = await controlComponent(component, action, controlSession.csrf_token);
-      setControlMessage(`${componentLabel}: ${result.result}`);
-      setComponents(await fetchControlComponents(controlSession.csrf_token));
+      const result = await controlComponent(component, action, token);
+      setControlMessage(result.detail || result.status);
+      const session = await createControlSession();
+      setControlSession(session);
+      setComponents(session.components);
     } catch (reason) {
-      setControlMessage(errorText(reason, "进程操作失败"));
+      setControlMessage(reason instanceof Error ? reason.message : "进程控制失败");
     } finally {
       setControlBusy(null);
     }
   };
 
-  const approveMapping = async (mappingId: number) => {
-    if (!controlSession || !window.confirm("确认该 exact 证据已人工核验，可用于同系列后续局？")) return;
-    setControlBusy(`mapping:${mappingId}:approve`);
+  const mutateMapping = async (operation: (token: string) => Promise<unknown>) => {
+    const token = requireControl();
+    if (!token || !selectedId) return;
     try {
-      await approveAutomaticMapping(mappingId, controlSession.csrf_token);
-      setControlMessage("自动 exact 证据已批准");
-      setMappingVersion((value) => value + 1);
+      await operation(token);
+      setMappings(await fetchMappings(selectedId));
     } catch (reason) {
-      setControlMessage(errorText(reason, "证据批准失败"));
-    } finally {
-      setControlBusy(null);
+      setControlMessage(reason instanceof Error ? reason.message : "mapping 操作失败");
     }
-  };
-
-  const invalidateSelectedMapping = async (mappingId: number) => {
-    if (!controlSession) return;
-    const reason = window.prompt("请输入失效原因（至少 5 个字符）");
-    if (!reason || reason.trim().length < 5) return;
-    if (!window.confirm("确认追加失效记录？旧映射和依赖结果会保留并标记受影响。")) return;
-    setControlBusy(`mapping:${mappingId}:invalidate`);
-    try {
-      await invalidateMapping(mappingId, reason.trim(), controlSession.csrf_token);
-      setControlMessage("映射已失效，依赖结果已标记");
-      setMappingVersion((value) => value + 1);
-    } catch (error) {
-      setControlMessage(errorText(error, "映射失效失败"));
-    } finally {
-      setControlBusy(null);
-    }
-  };
-
-  const addAutomaticMap = async (sourceMappingId: number, mapNumber: number) => {
-    if (!controlSession || !window.confirm(`确认使用已批准证据登记第 ${mapNumber} 局 automatic_exact？`)) return;
-    setControlBusy(`mapping:${sourceMappingId}:map:${mapNumber}`);
-    try {
-      await createAutomaticMapping(sourceMappingId, mapNumber, controlSession.csrf_token);
-      setControlMessage(`第 ${mapNumber} 局映射已登记`);
-      setMappingVersion((value) => value + 1);
-    } catch (error) {
-      setControlMessage(errorText(error, "自动映射失败"));
-    } finally {
-      setControlBusy(null);
-    }
-  };
-
-  const acknowledge = async (incidentId: number) => {
-    if (!controlSession) return;
-    try {
-      const result = await acknowledgeAlert(incidentId, controlSession.csrf_token);
-      if (!result.acknowledged) {
-        setControlMessage("告警状态已变化，等待下一次快照同步");
-        return;
-      }
-      setSnapshot((current) => current ? {
-        ...current,
-        alerts: current.alerts.map((item) => item.incident_id === incidentId
-          ? { ...item, acknowledged_at: new Date().toISOString(), acknowledged_by: "local-operator" }
-          : item),
-      } : current);
-    } catch (reason) {
-      setControlMessage(errorText(reason, "告警确认失败"));
-    }
-  };
-
-  const toggleBrowserAlerts = async (checked: boolean) => {
-    if (!checked) {
-      setBrowserAlerts(false);
-      localStorage.setItem("dota2-monitor-browser-alerts", "off");
-      return;
-    }
-    if (!("Notification" in window)) {
-      setControlMessage("当前浏览器不支持系统通知");
-      return;
-    }
-    const permission = await Notification.requestPermission();
-    const enabled = permission === "granted";
-    setBrowserAlerts(enabled);
-    localStorage.setItem("dota2-monitor-browser-alerts", enabled ? "on" : "off");
-    if (!enabled) setControlMessage("浏览器通知权限未授予");
-  };
-
-  const toggleSound = (checked: boolean) => {
-    setSoundEnabled(checked);
-    localStorage.setItem("dota2-monitor-sound", checked ? "on" : "off");
-    if (checked) playAlertTone(false);
   };
 
   return (
     <div className="app-shell">
-      <div className="app-header-stack">
-        <header className="topbar">
-        <div className="brand-lockup">
-          <div className="brand-mark"><Pulse size={21} weight="bold" aria-hidden="true" /></div>
-          <div>
-            <strong>Dota 2 比赛分析</strong>
-            <span>市场、阵容与策略结论</span>
-          </div>
+      <header className="app-header">
+        <div className="brand-block">
+          <Broadcast size={24} aria-hidden="true" />
+          <div><strong>Dota 2 实时阵容预测</strong><span>RayBet · HUD · Team Rating · R.O.S.H.</span></div>
         </div>
-
-        <TabList
-          aria-label="主视图"
-          selectedValue={primaryView}
-          onTabSelect={(_, data) => changePrimaryView(data.value as PrimaryView)}
-          size="small"
-        >
+        <TabList selectedValue={view} onTabSelect={(_, data) => changeView(data.value as ViewMode)}>
           <Tab icon={<Broadcast size={17} />} value="live">实时赛事</Tab>
-          <Tab icon={<ChartLineUp size={17} />} value="prematch">赛前分析</Tab>
-          <Tab icon={<ClockCounterClockwise size={17} />} value="history">历史复盘</Tab>
-          <Tab icon={<GearSix size={17} />} value="operations">系统状态</Tab>
+          <Tab icon={<ClockCounterClockwise size={17} />} value="replay">历史结果</Tab>
+          <Tab icon={<GearSix size={17} />} value="operations">运行控制</Tab>
         </TabList>
+      </header>
 
-        <div className="topbar-status">
-          {realtimeEnabled && <ConnectionBadge state={connection} />}
-          <span className="alert-count" title="未确认告警">
-            <Bell size={17} aria-hidden="true" />
-            {alertCount}
-          </span>
-          <Popover positioning="below-end" withArrow>
-            <PopoverTrigger disableButtonEnhancement>
-              <Button
-                appearance="subtle"
-                aria-label="偏好设置"
-                className="settings-trigger"
-                icon={<GearSix size={18} aria-hidden="true" />}
-              />
-            </PopoverTrigger>
-            <PopoverSurface aria-label="偏好设置" className="settings-popover">
-              <header>
-                <strong>偏好设置</strong>
-                <span>只影响此浏览器</span>
-              </header>
-              <label className="settings-row">
-                <span><SpeakerHigh size={17} aria-hidden="true" />声音提醒</span>
-                <Switch
-                  aria-label="声音告警"
-                  checked={soundEnabled}
-                  onChange={(_, data) => toggleSound(data.checked)}
-                />
-              </label>
-              <label className="settings-row">
-                <span><BellRinging size={17} aria-hidden="true" />系统通知</span>
-                <Switch
-                  aria-label="浏览器系统通知"
-                  checked={browserAlerts}
-                  onChange={(_, data) => void toggleBrowserAlerts(data.checked)}
-                />
-              </label>
-            </PopoverSurface>
-          </Popover>
-        </div>
-        </header>
-        <SafetyBoundaryBar snapshot={snapshot} />
-      </div>
-
-      {(view === "replay" || view === "intelligence") && (
-        <div className="history-mode-bar">
-          <TabList
-            aria-label="历史比赛内容"
-            selectedValue={view}
-            onTabSelect={(_, data) => changeView(data.value as HistoryView)}
-            size="small"
-          >
-            <Tab icon={<ClockCounterClockwise size={17} />} value="replay">赔率复盘</Tab>
-            <Tab icon={<Database size={17} />} value="intelligence">OpenDota 赛后情报</Tab>
-          </TabList>
-        </div>
-      )}
-
-      {view === "replay" ? (
-        <section className="summary-bar" aria-label="历史赔率加载摘要">
-          <SummaryItem
-            label="已加载历史"
-            value={historyMatches.length}
-          />
-          <SummaryItem
-            label="历史降级"
-            value={historySummary.degraded}
-            tone="warning"
-          />
-          <SummaryItem label="已完赛" value={historySummary.ended} />
-          <span className="snapshot-time">
-            {historyLoading
-              ? "正在加载"
-              : historyHasMore
-                ? "还有更多"
-                : historyLoaded ? "已全部加载" : "尚未加载"}
-          </span>
-        </section>
-      ) : view !== "intelligence" && view !== "prematch" && snapshot && (
-        <section className="summary-bar" aria-label="赛事与系统摘要">
-          {view === "operations" ? (
-            <>
-              <SummaryItem label="数据降级赛事" value={snapshot.summary.degraded} tone="warning" />
-              <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
-              <SummaryItem
-                label="活动告警"
-                value={alertCount}
-                tone={alertCount > 0 ? "critical" : undefined}
-              />
-            </>
-          ) : (
-            <>
-              <SummaryItem
-                label="滚球确认"
-                value={viewSummary?.live || 0}
-                tone="live"
-              />
-              <SummaryItem
-                label="数据降级"
-                value={viewSummary?.degraded || 0}
-                tone="warning"
-              />
-              <SummaryItem
-                label="即将开始"
-                value={viewSummary?.upcoming || 0}
-              />
-              <SummaryItem label="异常进程" value={snapshot.summary.unhealthy_components} tone="critical" />
-            </>
-          )}
-          <span className="snapshot-time">快照 {new Date(snapshot.generated_at).toLocaleTimeString("zh-CN", { hour12: false })}</span>
-        </section>
-      )}
-
-      {view !== "intelligence" && displayedError && (
-        <div className="global-error" role="alert">
-          <strong>{view === "replay" ? "历史赔率加载异常" : "监控连接异常"}</strong>
-          <span>{displayedError}</span>
-        </div>
-      )}
-
-      {view === "prematch" ? (
-        <Suspense fallback={<div className="view-loading" role="status">正在加载赛前预测</div>}>
-          <PrematchWorkspace />
-        </Suspense>
-      ) : view === "intelligence" ? (
-        <Suspense fallback={<div className="view-loading" role="status">正在加载赛后情报</div>}>
-          <IntelligenceDashboard
-            initialMatchId={intelligenceMatchId}
-            onMatchList={returnToIntelligenceList}
-            onMatchOpen={openIntelligenceMatch}
-          />
-        </Suspense>
-      ) : view === "operations" ? (
-        <div className="operations-view">
+      {error && <div className="global-error" role="alert">{error}</div>}
+      <div className="app-content">
+        <MatchRail
+          matches={visibleMatches}
+          mode={view === "replay" ? "history" : "live"}
+          onSelect={setSelectedId}
+          selectedId={selectedId}
+        />
+        {view === "operations" ? (
           <OperationsPanel
             alerts={snapshot?.alerts || []}
             busyKey={controlBusy}
@@ -956,321 +210,39 @@ export default function App() {
             health={snapshot?.health || []}
             mappings={mappings}
             match={selectedMatch}
-            onAcknowledge={acknowledge}
-            onApproveMapping={approveMapping}
-            onControl={runControl}
-            onCreateAutomaticMap={addAutomaticMap}
-            onInvalidateMapping={invalidateSelectedMapping}
+            onAcknowledge={(id) => {
+              const token = requireControl();
+              if (token) void acknowledgeAlert(id, token);
+            }}
+            onApproveMapping={(id) => void mutateMapping((token) => approveAutomaticMapping(id, token))}
+            onControl={(component, action) => void runControl(component, action)}
+            onCreateAutomaticMap={(id, map) => void mutateMapping((token) => createAutomaticMapping(id, map, token))}
+            onInvalidateMapping={(id) => void mutateMapping((token) => invalidateMapping(id, "operator_invalidated", token))}
           />
-        </div>
-      ) : view === "live" || view === "replay" ? (
-        selectedId ? (
-          <div className="live-detail-view">
-            <div className="live-detail-toolbar">
-              <button
-                aria-label={view === "replay" ? "返回赔率复盘列表" : "返回滚球列表"}
-                className="live-detail-back"
-                onClick={view === "replay" ? returnToReplayList : returnToLiveList}
-                type="button"
-              >
-                <ArrowLeft size={17} weight="bold" aria-hidden="true" />
-                <span>{view === "replay" ? "赔率复盘列表" : "滚球列表"}</span>
-              </button>
-              <div className="live-detail-context">
-                <strong>{workspaceMatch
-                  ? `${workspaceMatch.team_one || "队伍一"} vs ${workspaceMatch.team_two || "队伍二"}`
-                  : view === "replay" ? "赔率复盘详情" : "滚球赛事详情"}</strong>
-                <span>{workspaceMatch?.tournament || selectedId}</span>
-              </div>
-            </div>
-            {!workspaceMatch && detailLoading ? (
-              <div className="view-loading" role="status">正在加载赛事详情</div>
-            ) : (
-              <MatchWorkspace
-                csrfToken={controlSession?.csrf_token || null}
-                detail={selectedDetail}
-                error={detailError}
-                loading={detailLoading}
-                match={workspaceMatch}
-                replay={view === "replay"}
-              />
-            )}
-          </div>
         ) : (
-          <MatchRail
-            historyHasMore={view === "replay"
-              ? historyHasMore || (!historyLoaded && Boolean(historyError))
-              : undefined}
-            historyLoading={view === "replay" ? historyLoading : undefined}
-            matches={railMatches}
-            mode={view === "replay" ? "history" : "live"}
-            onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
-            onSelect={view === "replay" ? openReplayMatch : openLiveMatch}
-            selectedId={null}
-            variant="page"
+          <MatchWorkspace
+            csrfToken={controlSession?.csrf_token || null}
+            detail={detail}
+            error={error}
+            loading={loading}
+            match={selectedMatch}
+            replay={view === "replay"}
           />
-        )
-      ) : (
-        <div className="view-loading" role="status">正在加载视图</div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
 
-function errorText(reason: unknown, fallback: string): string {
-  return reason instanceof Error && reason.message ? reason.message : fallback;
-}
 
 function initialView(): ViewMode {
-  if (liveMatchIdFromPath()) return "live";
-  if (replayMatchIdFromPath()) return "replay";
-  if (intelligenceMatchIdFromPath() != null) return "intelligence";
-  if (window.location.pathname.replace(/\/+$/, "") === "/prematch") {
-    return "prematch";
-  }
-  const requested = new URLSearchParams(window.location.search).get("view");
-  return requested === "replay"
-    || requested === "intelligence"
-    || requested === "operations"
-    ? requested
-    : "live";
+  const value = new URLSearchParams(window.location.search).get("view");
+  return value === "replay" || value === "operations" ? value : "live";
 }
 
-function normalizedPathname(): string {
-  const normalized = window.location.pathname.replace(/\/+$/, "");
-  return normalized || "/";
-}
 
-function initialMonitorMatchId(): string | null {
-  return liveMatchIdFromPath() || replayMatchIdFromPath();
-}
-
-function initialIntelligenceMatchId(): number | null {
-  return intelligenceMatchIdFromPath();
-}
-
-function liveMatchIdFromPath(): string | null {
-  const match = normalizedPathname().match(/^\/monitor\/matches\/([^/]+)$/);
-  if (!match) return null;
-  try {
-    return decodeURIComponent(match[1]);
-  } catch {
-    return null;
-  }
-}
-
-function replayMatchIdFromPath(): string | null {
-  return decodedPathSegment(/^\/monitor\/history\/odds\/([^/]+)$/);
-}
-
-function intelligenceMatchIdFromPath(): number | null {
-  const raw = decodedPathSegment(/^\/monitor\/history\/intelligence\/([^/]+)$/);
-  if (!raw || !/^\d+$/.test(raw)) return null;
-  const matchId = Number(raw);
-  return Number.isSafeInteger(matchId) ? matchId : null;
-}
-
-function decodedPathSegment(pattern: RegExp): string | null {
-  const match = normalizedPathname().match(pattern);
-  if (!match) return null;
-  try {
-    return decodeURIComponent(match[1]);
-  } catch {
-    return null;
-  }
-}
-
-function playAlertTone(critical: boolean): void {
-  const AudioContextClass = window.AudioContext
-    || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!AudioContextClass) return;
-  const context = new AudioContextClass();
-  const oscillator = context.createOscillator();
-  const gain = context.createGain();
-  oscillator.type = "sine";
-  oscillator.frequency.value = critical ? 740 : 520;
-  gain.gain.setValueAtTime(0.0001, context.currentTime);
-  gain.gain.exponentialRampToValueAtTime(0.09, context.currentTime + 0.015);
-  gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.18);
-  oscillator.connect(gain).connect(context.destination);
-  oscillator.start();
-  oscillator.stop(context.currentTime + 0.2);
-  oscillator.addEventListener("ended", () => void context.close(), { once: true });
-}
-
-function preferredMatch(
-  matches: MonitorMatch[],
-  view: "live" | "replay",
-): string | null {
-  const preferred = view === "replay"
-    ? matches.find(isHistoricalMatch)
-    : matches.find((match) => isLiveEligible(match) && match.lifecycle === "live")
-      || matches.find((match) => isLiveEligible(match) && match.lifecycle === "degraded")
-      || matches.find((match) => isLiveEligible(match) && match.lifecycle === "upcoming");
-  return preferred?.raybet_match_id || null;
-}
-
-function dedupeMatches(matches: MonitorMatch[]): MonitorMatch[] {
-  const seen = new Set<string>();
-  return matches.filter((match) => {
-    if (seen.has(match.raybet_match_id)) return false;
-    seen.add(match.raybet_match_id);
-    return true;
-  });
-}
-
-function lifecycleCounts(matches: MonitorMatch[]): MonitorLifecycleCounts {
-  return {
-    total: matches.length,
-    upcoming: matches.filter((match) => match.lifecycle === "upcoming").length,
-    live: matches.filter((match) => match.lifecycle === "live").length,
-    degraded: matches.filter((match) => match.lifecycle === "degraded").length,
-    ended: matches.filter((match) => match.lifecycle === "ended").length,
-  };
-}
-
-function matchesForView(
-  matches: MonitorSnapshot["matches"],
-  view: "live" | "replay",
-): MonitorSnapshot["matches"] {
-  return matches.filter((match) => (
-    view === "replay" ? isHistoricalMatch(match) : isLiveEligible(match)
-  ));
-}
-
-function summaryForView(
-  summary: MonitorSnapshot["summary"],
-  view: ViewMode,
-): MonitorLifecycleCounts {
-  if (view === "replay") return summary.history_view;
-  if (view === "live") return summary.live_view;
-  return summary;
-}
-
-function isHistoricalMatch(match: MonitorSnapshot["matches"][number]): boolean {
-  return match.history_eligible === true;
-}
-
-function isLiveEligible(match: MonitorSnapshot["matches"][number]): boolean {
-  return match.history_eligible === false;
-}
-
-function SafetyBoundaryBar({ snapshot }: { snapshot: MonitorSnapshot | null }) {
-  const directStatus = snapshot?.capabilities?.direct_market_collection?.status;
-  const openDotaStatus = snapshot?.capabilities?.opendota_event_ingest?.status;
-  const historicalRoshStatus = snapshot?.capabilities?.historical_rosh?.status;
-  const facts = [
-    {
-      label: "直连市场",
-      status: capabilityLabel(directStatus),
-      tone: capabilityTone(directStatus),
-    },
-    {
-      label: "OpenDota 入库",
-      status: capabilityLabel(openDotaStatus),
-      tone: capabilityTone(openDotaStatus),
-    },
-    {
-      label: "历史肉山",
-      status: capabilityLabel(historicalRoshStatus),
-      tone: capabilityTone(historicalRoshStatus),
-    },
-  ] as const;
-  const abnormalFacts = facts.filter((fact) => fact.tone !== "positive");
-
-  return (
-    <section className="safety-boundary" aria-label="运行安全边界">
-      <div className="safety-boundary-mode">
-        <LockSimple size={17} weight="bold" aria-hidden="true" />
-        <strong>Paper Only</strong>
-        <span>不包含真实下注入口</span>
-      </div>
-      {snapshot && (
-        <div className="safety-boundary-facts">
-          {abnormalFacts.length === 0 ? (
-            <span className="safety-boundary-ok">
-              <ShieldCheck size={15} weight="fill" aria-hidden="true" />
-              系统边界正常
-            </span>
-          ) : abnormalFacts.map((fact) => (
-            <SafetyFact key={fact.label} {...fact} />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function SafetyFact({
-  label,
-  status,
-  tone,
-}: {
-  label: string;
-  status: string;
-  tone: "neutral" | "positive" | "warning" | "critical";
-}) {
-  return (
-    <span className={`safety-fact ${tone}`}>
-      <ShieldCheck size={14} aria-hidden="true" />
-      <span>{label}</span>
-      <strong>{status}</strong>
-    </span>
-  );
-}
-
-function capabilityLabel(status?: string): string {
-  if (!status) return "待加载";
-  const labels: Record<string, string> = {
-    ready: "就绪",
-    healthy: "健康",
-    delayed: "延迟",
-    stale: "过期",
-    missing: "缺失",
-    invalid: "无效",
-    unconfirmed: "待确认",
-    degraded: "降级",
-    unhealthy: "异常",
-    stopped: "未运行",
-  };
-  return labels[status] || status;
-}
-
-function capabilityTone(status?: string): "neutral" | "positive" | "warning" | "critical" {
-  if (!status) return "neutral";
-  if (status === "ready" || status === "healthy") return "positive";
-  if (status === "invalid" || status === "unhealthy") return "critical";
-  return "warning";
-}
-
-function ConnectionBadge({ state }: { state: ConnectionState }) {
-  const labels: Record<ConnectionState, string> = {
-    connecting: "正在连接",
-    live: "实时连接",
-    fallback: "数据延迟",
-    offline: "离线",
-  };
-  return (
-    <span className={`connection-badge ${state}`}>
-      <i aria-hidden="true" />
-      {labels[state]}
-    </span>
-  );
-}
-
-function SummaryItem({
-  label,
-  value,
-  tone = "neutral",
-}: {
-  label: string;
-  value: number;
-  tone?: "neutral" | "live" | "warning" | "critical";
-}) {
-  return (
-    <span className={`summary-item ${tone}`}>
-      <strong>{value}</strong>
-      {label}
-    </span>
-  );
+function preferredMatch(matches: MonitorMatch[]): string | null {
+  return matches.find((match) => match.lifecycle === "live")?.raybet_match_id
+    || matches.find((match) => match.lifecycle !== "ended")?.raybet_match_id
+    || null;
 }

@@ -394,40 +394,6 @@ def read_registered_vision_frame_bytes(
     return encoded
 
 
-def verify_bound_order_vision_frame(
-    connection: PostgresSession,
-    order_key: str,
-) -> VisionFrameReceipt:
-    """Reverify the exact frame identity shared by an order and its decision."""
-
-    row = connection.execute(
-        """SELECT orders.vision_source_frame_ref,
-                  orders.vision_source_frame_sha256,
-                  orders.vision_source_frame_bytes,
-                  decision.vision_source_frame_ref,
-                  decision.vision_source_frame_sha256,
-                  decision.vision_source_frame_bytes
-             FROM shadow_orders AS orders
-             JOIN shadow_order_decision_lineage AS lineage
-               ON lineage.order_key=orders.order_key
-             JOIN strategy_decisions AS decision
-               ON decision.decision_key=lineage.decision_key
-            WHERE orders.order_key=?""",
-        (order_key,),
-    ).fetchone()
-    if row is None or any(value is None for value in row):
-        raise RuntimeError("order vision frame authority is missing")
-    values = tuple(row)
-    if values[:3] != values[3:]:
-        raise RuntimeError("order vision frame authority differs from decision")
-    return verify_registered_vision_frame(
-        connection,
-        str(values[0]),
-        expected_sha256=str(values[1]),
-        expected_bytes=int(values[2]),
-    )
-
-
 def verify_vision_frame_registry(
     connection: PostgresSession,
     *,
@@ -664,7 +630,6 @@ __all__ = [
     "register_vision_frame_artifact",
     "relocate_vision_frame_artifacts",
     "retire_vision_frame_artifact",
-    "verify_bound_order_vision_frame",
     "verify_registered_vision_frame",
     "verify_vision_frame_registry",
     "verify_vision_frame_receipt",

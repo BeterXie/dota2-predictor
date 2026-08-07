@@ -573,7 +573,7 @@ def invalidate_strict_live_map_mapping(
     invalidated_by: str,
     invalidated_at: datetime,
 ) -> int:
-    """Append an invalidation and atomically quarantine impacted order outputs."""
+    """Append an immutable invalidation for one strict mapping."""
     mapping_id = _positive_integer(mapping_id, "mapping_id")
     reason = _required_text(reason, "reason")
     invalidated_by = _required_text(invalidated_by, "invalidated_by")
@@ -585,7 +585,7 @@ def invalidate_strict_live_map_mapping(
     if row is None:
         raise StrictMappingError("mapping_missing")
     try:
-        mapping = _mapping_from_row(row)
+        _mapping_from_row(row)
     except _FailClosed as failure:
         raise StrictMappingError(failure.reason) from failure
 
@@ -596,13 +596,7 @@ def invalidate_strict_live_map_mapping(
             (mapping_id,),
         ).fetchone()
         if existing is not None:
-            invalidation_id = int(existing[0])
-            _quarantine_mapping_order_dependents(
-                connection,
-                invalidation_id=invalidation_id,
-                recorded_at=recorded_at,
-            )
-            return invalidation_id
+            return int(existing[0])
         cursor = connection.execute(
             """INSERT INTO strict_live_map_mapping_invalidations
                (mapping_id, reason, invalidated_by, invalidated_at, recorded_at)
@@ -630,29 +624,6 @@ def invalidate_strict_live_map_mapping(
             invalidation_id = int(existing[0])
         else:
             invalidation_id = int(inserted[0])
-        _record_mapping_impacts(
-            connection,
-            mapping=mapping,
-            invalidation_id=invalidation_id,
-            reason=reason,
-            recorded_at=recorded_at,
-        )
-        if mapping.acceptance_mode == "manual_exact":
-            for automatic_mapping in _automatic_mappings_for_source(
-                connection, mapping.mapping_id
-            ):
-                _record_mapping_impacts(
-                    connection,
-                    mapping=automatic_mapping,
-                    invalidation_id=invalidation_id,
-                    reason=reason,
-                    recorded_at=recorded_at,
-                )
-        _quarantine_mapping_order_dependents(
-            connection,
-            invalidation_id=invalidation_id,
-            recorded_at=recorded_at,
-        )
         return invalidation_id
 
 
@@ -1411,166 +1382,6 @@ def _automatic_approval_id(
     if causal_reason is not None:
         raise _FailClosed(causal_reason)
     return int(row[0])
-
-
-def _record_mapping_impacts(
-    connection: PostgresSession,
-    *,
-    mapping: StrictLiveMapMapping,
-    invalidation_id: int,
-    reason: str,
-    recorded_at: datetime,
-) -> None:
-    dependents: set[tuple[str, str]] = set()
-    if _table_has_columns(
-        connection,
-        "strategy_decisions",
-        {"decision_key", "contributions_json", "raybet_match_id", "map_number"},
-    ):
-        rows = connection.execute(
-            """SELECT decision_key, contributions_json FROM strategy_decisions
-                WHERE raybet_match_id=? AND map_number=?""",
-            (mapping.raybet_match_id, mapping.map_number),
-        ).fetchall()
-        for row in rows:
-            try:
-                payload = json.loads(str(row[1]))
-                mapping_id = payload["__inputs__"]["strict_live_eligibility"][
-                    "mapping_refs"
-                ]["strict_mapping_id"]
-            except (KeyError, TypeError, json.JSONDecodeError):
-                continue
-            if mapping_id == mapping.mapping_id:
-                dependents.add(("strategy_decision", str(row[0])))
-    if _table_has_columns(
-        connection,
-        "research_live_predictions",
-        {"prediction_key", "strict_mapping_id"},
-    ):
-        dependents.update(
-            ("research_prediction", str(row[0]))
-            for row in connection.execute(
-                """SELECT prediction_key FROM research_live_predictions
-                    WHERE strict_mapping_id=?""",
-                (mapping.mapping_id,),
-            ).fetchall()
-        )
-    if _table_has_columns(
-        connection,
-        "shadow_orders",
-        {"order_key", "strict_mapping_id"},
-    ):
-        dependents.update(
-            ("shadow_order", str(row[0]))
-            for row in connection.execute(
-                """SELECT order_key FROM shadow_orders
-                    WHERE strict_mapping_id=?""",
-                (mapping.mapping_id,),
-            ).fetchall()
-        )
-    connection.executemany(
-        """INSERT INTO strict_live_mapping_impacts
-           (mapping_id, invalidation_id, dependent_type, dependent_key, reason,
-            recorded_at) VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT DO NOTHING""",
-        [
-            (
-                mapping.mapping_id,
-                invalidation_id,
-                dependent_type,
-                dependent_key,
-                reason,
-                recorded_at.isoformat(),
-            )
-            for dependent_type, dependent_key in sorted(dependents)
-        ],
-    )
-
-
-def _quarantine_mapping_order_dependents(
-    connection: PostgresSession,
-    *,
-    invalidation_id: int,
-    recorded_at: datetime,
-) -> None:
-    order_keys = tuple(
-        str(row[0])
-        for row in connection.execute(
-            """SELECT dependent_key FROM strict_live_mapping_impacts
-                WHERE invalidation_id=? AND dependent_type='shadow_order'
-                ORDER BY dependent_key""",
-            (invalidation_id,),
-        ).fetchall()
-    )
-    if not order_keys:
-        return
-
-    recorded_at_iso = recorded_at.isoformat()
-    block_reason = "strict_mapping_invalidated"
-    if _table_has_columns(connection, "settlements", {"order_key", "review_required"}):
-        connection.executemany(
-            """UPDATE settlements SET review_required=1
-                WHERE order_key=? AND review_required=0""",
-            ((order_key,) for order_key in order_keys),
-        )
-
-    if _table_has_columns(
-        connection,
-        "shadow_map_attempts",
-        {"order_key", "raybet_match_id", "map_number"},
-    ) and _table_has_columns(
-        connection,
-        "settlement_reconciliations",
-        {"raybet_match_id", "map_number", "status", "reason", "updated_at"},
-    ):
-        for order_key in order_keys:
-            connection.execute(
-                """UPDATE settlement_reconciliations
-                      SET status='manual_review', reason=?, updated_at=?
-                    WHERE status!='manual_review'
-                      AND (raybet_match_id, map_number) IN (
-                          SELECT raybet_match_id, map_number
-                            FROM shadow_map_attempts WHERE order_key=?
-                      )""",
-                (block_reason, recorded_at_iso, order_key),
-            )
-
-    outbox_columns = {
-        "outbox_id",
-        "order_key",
-        "event_type",
-        "status",
-        "lease_token",
-        "lease_until",
-        "last_error",
-        "updated_at",
-    }
-    if not _table_has_columns(connection, "notification_outbox", outbox_columns):
-        return
-    audit_available = _table_has_columns(
-        connection,
-        "notification_outbox_audit",
-        {"outbox_id", "action", "actor", "reason", "created_at"},
-    )
-    from .notifications import quarantine_outbox
-
-    for order_key in order_keys:
-        outbox_rows = connection.execute(
-            """SELECT outbox_id FROM notification_outbox
-                WHERE order_key=? AND status IN ('pending', 'leased')
-                ORDER BY outbox_id""",
-            (order_key,),
-        ).fetchall()
-        for row in outbox_rows:
-            outbox_id = int(row[0])
-            quarantine_outbox(
-                connection,
-                outbox_id=outbox_id,
-                reason=block_reason,
-                actor="strict_mapping_invalidation",
-                now=recorded_at,
-                record_audit=audit_available,
-            )
 
 
 def _automatic_mappings_for_source(

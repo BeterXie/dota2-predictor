@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 from dataclasses import dataclass
@@ -37,14 +36,7 @@ _REQUIRED_TABLES = frozenset(
         "vision_observation_invalidations",
         "vision_draft_anchors",
         "vision_draft_conflicts",
-        "strategy_decisions",
-        "prospective_draft_curves",
-        "prospective_draft_landmarks",
-        "research_live_predictions",
-        "shadow_orders",
-        "shadow_map_attempts",
-        "shadow_order_decision_lineage",
-        "settlements",
+        "live_game_snapshots",
     }
 )
 
@@ -265,224 +257,25 @@ def _registered_frame_paths(
     return by_ref, by_path, identities
 
 
-def _json_source_refs(raw: object) -> tuple[str, ...]:
-    try:
-        value = json.loads(str(raw))
-    except (RecursionError, TypeError, ValueError) as error:
-        raise RetentionSafetyError("retention lineage JSON is invalid") from error
-    refs: list[str] = []
-    stack = [value]
-    nodes = 0
-    while stack:
-        current = stack.pop()
-        nodes += 1
-        if nodes > 100_000:
-            raise RetentionSafetyError("retention lineage JSON is too large")
-        if isinstance(current, dict):
-            for key, child in current.items():
-                if key in {"source_frame_ref", "vision_ref"} and isinstance(
-                    child, str
-                ):
-                    refs.append(child)
-                else:
-                    stack.append(child)
-        elif isinstance(current, list):
-            stack.extend(current)
-    return tuple(refs)
-
-
-def _add_reference_keys(
-    output: set[str],
-    values: Iterable[object],
-    root: Path,
-    frame_paths: dict[str, str],
-) -> int:
-    before = len(output)
-    for value in values:
-        key = _reference_key(value, root, frame_paths)
-        if key is not None:
-            output.add(key)
-    return len(output) - before
-
-
-def _causal_observation_refs(
-    connection: PostgresSession,
-    *,
-    match_id: str,
-    map_number: int,
-    cutoff: str,
-    radiant_json: str | None = None,
-    dire_json: str | None = None,
-    window_seconds: int = 30,
-) -> tuple[str, ...]:
-    if window_seconds <= 0:
-        raise ValueError("window_seconds must be positive")
-    filters = [
-        "raybet_match_id=?",
-        "map_number=?",
-        "live_text_timestamp_utc(captured_at)<=live_text_timestamp_utc(?)",
-        "live_text_timestamp_utc(captured_at)>=live_text_timestamp_utc(?) "
-        "- (? * INTERVAL '1 second')",
-    ]
-    parameters: list[object] = [
-        match_id,
-        map_number,
-        cutoff,
-        cutoff,
-        window_seconds,
-    ]
-    if radiant_json is not None and dire_json is not None:
-        filters.extend(
-            [
-                "confirmed=1",
-                "screen_state='game'",
-                "radiant_hero_ids=?",
-                "dire_hero_ids=?",
-            ]
-        )
-        parameters.extend([radiant_json, dire_json])
-    rows = connection.execute(
-        f"""SELECT captured_at, source_frame_ref
-               FROM vision_observations
-              WHERE {' AND '.join(filters)}
-              ORDER BY live_text_timestamp_utc(captured_at) DESC, captured_at DESC""",
-        parameters,
-    ).fetchall()
-    if rows:
-        return tuple(str(row["source_frame_ref"]) for row in rows)
-    return tuple(
-        str(row[0])
-        for row in connection.execute(
-            """SELECT source_frame_ref FROM vision_observations
-                WHERE raybet_match_id=? AND map_number=?""",
-            (match_id, map_number),
-        )
-    )
-
-
 def _referenced_keys(
     connection: PostgresSession,
     root: Path,
     frame_paths: dict[str, str],
-    frame_identities: dict[str, tuple[str, int]],
 ) -> set[str]:
     protected: set[str] = set()
-    direct_rows = connection.execute(
+    rows = connection.execute(
         """SELECT source_frame_ref FROM vision_observation_invalidations
            UNION SELECT source_frame_ref FROM vision_draft_conflicts
            UNION SELECT source_frame_ref FROM vision_draft_anchors
            UNION SELECT team_side_source_frame_ref FROM vision_draft_anchors
                  WHERE team_side_source_frame_ref IS NOT NULL
-           UNION SELECT evidence_ref FROM settlements"""
+           UNION SELECT screenshot_path FROM live_game_snapshots
+                 WHERE screenshot_path IS NOT NULL"""
     ).fetchall()
-    _add_reference_keys(
-        protected, (row[0] for row in direct_rows), root, frame_paths
-    )
-    for table in ("strategy_decisions", "shadow_orders"):
-        for row in connection.execute(
-            f"""SELECT vision_source_frame_ref,
-                       vision_source_frame_sha256,
-                       vision_source_frame_bytes
-                  FROM {table}
-                 WHERE vision_source_frame_ref IS NOT NULL"""
-        ):
-            frame_ref = str(row[0])
-            identity = frame_identities.get(frame_ref)
-            if (
-                identity is not None
-                and row[1] is not None
-                and row[2] is not None
-                and identity == (str(row[1]), int(row[2]))
-            ):
-                protected.add(frame_paths[frame_ref])
-    curve_columns = {
-        str(row[0])
-        for row in connection.execute(
-            """SELECT column_name
-                 FROM information_schema.columns
-                WHERE table_schema=current_schema()
-                  AND table_name='prospective_draft_curves'"""
-        )
-    }
-    if "anchor_source_frame_ref" in curve_columns:
-        _add_reference_keys(
-            protected,
-            (
-                row[0]
-                for row in connection.execute(
-                    """SELECT anchor_source_frame_ref
-                         FROM prospective_draft_curves
-                        WHERE anchor_source_frame_ref IS NOT NULL"""
-                )
-            ),
-            root,
-            frame_paths,
-        )
-
-    for row in connection.execute(
-        """SELECT decision_key, raybet_match_id, map_number, decided_at,
-                  contributions_json
-             FROM strategy_decisions"""
-    ):
-        refs = _json_source_refs(row["contributions_json"])
-        added = _add_reference_keys(protected, refs, root, frame_paths)
-        if added == 0:
-            fallback = _causal_observation_refs(
-                connection,
-                match_id=str(row["raybet_match_id"]),
-                map_number=int(row["map_number"]),
-                cutoff=str(row["decided_at"]),
-            )
-            _add_reference_keys(protected, fallback, root, frame_paths)
-
-    for row in connection.execute(
-        """SELECT prediction.raybet_match_id, prediction.map_number,
-                  prediction.observed_at, prediction.radiant_hero_ids_json,
-                  prediction.dire_hero_ids_json
-             FROM research_live_predictions AS prediction"""
-    ):
-        refs = _causal_observation_refs(
-            connection,
-            match_id=str(row["raybet_match_id"]),
-            map_number=int(row["map_number"]),
-            cutoff=str(row["observed_at"]),
-            radiant_json=str(row["radiant_hero_ids_json"]),
-            dire_json=str(row["dire_hero_ids_json"]),
-        )
-        _add_reference_keys(protected, refs, root, frame_paths)
-
-    for row in connection.execute(
-        """SELECT curve.raybet_match_id, curve.map_number,
-                  curve.first_usable_at, landmark.input_refs_json
-             FROM prospective_draft_landmarks AS landmark
-             JOIN prospective_draft_curves AS curve
-               ON curve.curve_key=landmark.curve_key"""
-    ):
-        refs = _json_source_refs(row["input_refs_json"])
-        added = _add_reference_keys(protected, refs, root, frame_paths)
-        if added == 0:
-            fallback = _causal_observation_refs(
-                connection,
-                match_id=str(row["raybet_match_id"]),
-                map_number=int(row["map_number"]),
-                cutoff=str(row["first_usable_at"]),
-            )
-            _add_reference_keys(protected, fallback, root, frame_paths)
-
-    for row in connection.execute(
-        """SELECT orders.raybet_match_id, attempt.map_number,
-                  orders.signal_transport_at
-             FROM shadow_orders AS orders
-             JOIN shadow_map_attempts AS attempt
-               ON attempt.order_key=orders.order_key"""
-    ):
-        fallback = _causal_observation_refs(
-            connection,
-            match_id=str(row["raybet_match_id"]),
-            map_number=int(row["map_number"]),
-            cutoff=str(row["signal_transport_at"]),
-        )
-        _add_reference_keys(protected, fallback, root, frame_paths)
+    for row in rows:
+        key = _reference_key(row[0], root, frame_paths)
+        if key is not None:
+            protected.add(key)
     return protected
 
 
@@ -593,12 +386,10 @@ def prune_vision_evidence(
     with LiveBettingStore(database_url) as store, store.transaction():
         connection = store.connection
         _require_tables(connection)
-        frame_paths, registered_by_path, frame_identities = _registered_frame_paths(
+        frame_paths, registered_by_path, _frame_identities = _registered_frame_paths(
             connection, root
         )
-        referenced = _referenced_keys(
-            connection, root, frame_paths, frame_identities
-        )
+        referenced = _referenced_keys(connection, root, frame_paths)
         audit, captured_by_path, invalid_times = _observation_metadata(
             connection, root, available, frame_paths
         )

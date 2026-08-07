@@ -187,7 +187,7 @@ def test_monitor_api_uses_postgres_session(postgres_engine, tmp_path, monkeypatc
     assert detail.json()["raybet_match_id"] == "api-match"
 
 
-def test_control_uses_supervisor_heartbeat_and_configuration_authority(
+def test_control_uses_supervisor_heartbeat_authority(
     postgres_engine,
     tmp_path,
 ) -> None:
@@ -200,15 +200,6 @@ def test_control_uses_supervisor_heartbeat_and_configuration_authority(
         heartbeat_at=heartbeat,
         error_at=heartbeat,
         error="upstream_degraded",
-    )
-    record_health(
-        connection,
-        "mail_delivery",
-        "degraded",
-        heartbeat_at=heartbeat,
-        error_at=heartbeat,
-        error="configuration_missing",
-        details={"smtp_configured": False},
     )
 
     def unexpected_spawn(*_args, **_kwargs):
@@ -237,9 +228,6 @@ def test_control_uses_supervisor_heartbeat_and_configuration_authority(
     assert statuses["raybet_collector"]["started_at"] is not None
     assert statuses["raybet_collector"]["detail"] == "由 Supervisor 托管"
     assert statuses["raybet_collector"]["control_allowed"] is False
-    assert statuses["mail_worker"]["status"] == "stopped"
-    assert statuses["mail_worker"]["detail"] == "未配置"
-    assert statuses["mail_worker"]["control_allowed"] is False
     assert start["ok"] is False
     assert start["status"] == "running"
     assert start["detail"] == "由 Supervisor 托管"
@@ -357,34 +345,3 @@ def test_stale_prematch_leaves_live_view_after_four_hours(
     }
     assert "stale-prematch" in history_ids
     store.close()
-
-
-def test_unconfigured_mail_group_does_not_inflate_abnormal_count(
-    postgres_engine,
-) -> None:
-    connection = PostgresSession(postgres_engine)
-    baseline = build_monitor_snapshot(connection, now=NOW)["summary"][
-        "unhealthy_components"
-    ]
-    record_health(
-        connection,
-        "mail",
-        "unhealthy",
-        heartbeat_at=NOW,
-        error_at=NOW,
-        error="heartbeat_expired",
-    )
-    record_health(
-        connection,
-        "mail_delivery",
-        "degraded",
-        heartbeat_at=NOW,
-        error_at=NOW,
-        error="configuration_missing",
-        details={"smtp_configured": False},
-    )
-
-    summary = build_monitor_snapshot(connection, now=NOW)["summary"]
-
-    assert summary["unhealthy_components"] == baseline
-    connection.close()

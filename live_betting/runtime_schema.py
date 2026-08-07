@@ -16,13 +16,11 @@ RUNTIME_SCHEMA_CONTRACT_DIGEST = (
 )
 CONTROL_COMPONENT_NAMES = (
     "raybet_collector",
-    "mail_worker",
 )
 
 _REQUIRED_TABLES = frozenset(
     {
         "runtime_schema_version",
-        "notification_outbox",
         "monitor_process_registry",
         "monitor_control_audit",
         "monitor_alert_candidates",
@@ -34,14 +32,12 @@ _REQUIRED_TABLES = frozenset(
 )
 _REQUIRED_INDEXES = frozenset(
     {
-        "idx_notification_outbox_due",
         "idx_monitor_alert_active_key",
         "idx_monitor_alert_status_opened",
     }
 )
 _REQUIRED_TRIGGERS = frozenset(
     {
-        "notification_outbox_payload_immutable",
         "monitor_control_audit_no_update",
         "monitor_control_audit_no_delete",
         "monitor_alert_audit_no_update",

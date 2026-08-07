@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import unittest
-from argparse import Namespace
-from pathlib import Path
 
 from live_betting.postmatch_monitor import (
     VisionDraftIdentity,
     _opendota_matches_vision_identity,
-    resolve_data_paths,
 )
 
 
@@ -51,14 +48,6 @@ class OpenDotaExactIdentityTests(unittest.TestCase):
 
     def test_accepts_only_the_exact_partitioned_identity(self) -> None:
         self.assertTrue(self.matches(self.detail()))
-
-    def test_default_archive_follows_the_selected_database(self) -> None:
-        database = Path("candidate") / "postmatch.db"
-
-        args = resolve_data_paths(Namespace(database=database, archive_root=None))
-
-        self.assertEqual(args.database, database.resolve())
-        self.assertEqual(args.archive_root, database.resolve().parent / "raw-sources")
 
     def test_rejects_same_ten_heroes_on_swapped_sides(self) -> None:
         detail = self.detail()

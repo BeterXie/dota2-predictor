@@ -80,15 +80,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrency", type=_positive_int, default=3)
     parser.add_argument("--rate-limit", type=_positive_int, default=30)
     parser.add_argument(
-        "--coverage-report",
-        type=Path,
-    )
-    parser.add_argument(
-        "--defer-derived",
-        action="store_true",
-        help="archive and normalize matches without running derived data",
-    )
-    parser.add_argument(
         "--schema-prepared", action="store_true", help=argparse.SUPPRESS
     )
     return parser
@@ -100,11 +91,6 @@ def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
         if args.archive_root is not None
         else ROOT / "data" / "raw-sources"
     )
-    args.coverage_report = (
-        Path(args.coverage_report).resolve()
-        if args.coverage_report is not None
-        else ROOT / "data" / "reports" / "strict_event_coverage_latest.json"
-    )
     return args
 
 
@@ -113,10 +99,7 @@ class Runtime:
     ingestor: StrictEventIngestor
     scheduler: IngestScheduler
     close_callbacks: tuple[Callable[[], object], ...] = ()
-    database_url: str | None = None
     health_connection: PostgresSession | None = None
-    derived_pipeline: object | None = None
-    coverage_report: Path | None = None
 
     async def close(self) -> None:
         for callback in reversed(self.close_callbacks):
@@ -136,7 +119,6 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
             RegistryIngestAdapter,
         )
         from event_intelligence.registry import EventRegistry
-        from event_intelligence.incremental import StrictDerivedPipeline
         from event_intelligence.storage import IntelligenceStorage
     except (ImportError, ModuleNotFoundError) as error:
         raise RuntimeError(
@@ -182,12 +164,7 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
         ingestor,
         scheduler,
         callbacks,
-        database_url=args.database_url,
         health_connection=storage.connection,
-        derived_pipeline=(
-            None if args.defer_derived else StrictDerivedPipeline(storage)
-        ),
-        coverage_report=args.coverage_report,
     )
 
 
@@ -235,9 +212,6 @@ async def run(
                     report = await runtime.scheduler.run_due(
                         now, include_recent=not args.active
                     )
-                derived = _run_derived(runtime, report)
-                if _report_due(report, direct_one_shot):
-                    _write_coverage(runtime, now)
                 candidate_error = getattr(report, "candidate_error", None)
                 successful = _report_due(report, direct_one_shot)
                 _record_runtime_health(
@@ -245,7 +219,6 @@ async def run(
                     "degraded" if candidate_error else "healthy",
                     datetime.now(timezone.utc),
                     report=report,
-                    derived=derived,
                     successful=successful,
                     error=candidate_error,
                     error_at=getattr(report, "candidate_error_at", None),
@@ -271,31 +244,11 @@ async def run(
         await runtime.close()
 
 
-def _run_derived(runtime: Runtime, report: object) -> object | None:
-    pipeline = runtime.derived_pipeline
-    if pipeline is None:
-        return None
-    return pipeline.run(getattr(report, "changed_match_ids", ()))
-
-
 def _report_due(report: object, direct_one_shot: bool) -> bool:
     return direct_one_shot or any(
         bool(getattr(report, field, False))
         for field in ("active_polled", "recent_rescanned", "candidate_scanned")
     )
-
-
-def _write_coverage(runtime: Runtime, generated_at: datetime) -> None:
-    if runtime.coverage_report is None:
-        return
-    from event_intelligence.coverage import write_coverage_report
-
-    write_coverage_report(
-        runtime.database_url,
-        runtime.coverage_report,
-        generated_at=generated_at,
-    )
-
 
 def _record_runtime_health(
     runtime: Runtime,
@@ -303,7 +256,6 @@ def _record_runtime_health(
     heartbeat_at: datetime,
     *,
     report: object | None = None,
-    derived: object | None = None,
     successful: bool = False,
     error: BaseException | str | None = None,
     error_at: datetime | None = None,
@@ -315,7 +267,6 @@ def _record_runtime_health(
     details = {
         "source": "worker",
         "run": _report_payload(report),
-        "derived": _report_payload(derived),
     }
     error_text = None if error is None else str(error)
     record_health(

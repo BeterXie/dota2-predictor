@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import inspect
@@ -15,18 +16,73 @@ from event_intelligence.live_draft_prospective_bridge import (
     LiveDraftProspectiveBridgeRepository,
     generate_live_draft_prediction,
 )
-from event_intelligence.prospective_team_rating import ProspectiveTeamRatingRepository
+from event_intelligence.prospective_team_rating import (
+    ProspectiveTeamRatingRepository,
+    build_prospective_team_rating_seed,
+)
+from event_intelligence.raw_archive import canonical_json_bytes
+from event_intelligence.team_rating import TEAM_RATING_VERSION, TeamRatingConfig
 from live_betting.live_match_state import DraftSlotInput, save_live_draft_mapping
-from live_betting.stratz_rosh_client import StratzRoshError
-from tests.integration.postgres.test_prospective_rosh_operational_collector import (
-    FIXTURE,
-    FixtureTransport,
+from live_betting.stratz_rosh_client import (
+    FetchedLegacyRoshBatch,
+    StratzRoshError,
 )
-from tests.integration.postgres.test_prospective_team_rating_producer import (
-    TARGET_ORIGIN,
-    _seed_formal_data,
-    _store_seed,
+from prematch.stratz_rosh import build_rosh_query_requests
+
+
+UTC = timezone.utc
+TARGET_ORIGIN = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+SEED_CUTOFF = TARGET_ORIGIN - timedelta(days=1)
+FROZEN_AT = TARGET_ORIGIN - timedelta(hours=12)
+FIXTURE = Path(__file__).parents[2] / "fixtures" / "stratz-rosh.json"
+CONFIG = TeamRatingConfig(
+    initial_rating=1_500.0,
+    scale=400.0,
+    k_factor=16.0,
+    inactivity_half_life_days=180.0,
+    roster_carry_power=1.0,
+    radiant_side_logit=0.0,
+    config_version=TEAM_RATING_VERSION,
 )
+
+
+class FixtureTransport:
+    def __init__(self) -> None:
+        self.fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+    def fetch_legacy_lineup_batch(
+        self,
+        radiant_heroes: Any,
+        dire_heroes: Any,
+        *,
+        statistics_cutoff: datetime,
+    ) -> FetchedLegacyRoshBatch:
+        requests = build_rosh_query_requests(
+            (*radiant_heroes, *dire_heroes),
+            int(statistics_cutoff.timestamp()),
+        )
+        return FetchedLegacyRoshBatch(
+            request_bodies={
+                operation: canonical_json_bytes(payload)
+                for operation, payload in requests.items()
+            },
+            response_bodies={
+                operation: canonical_json_bytes(payload)
+                for operation, payload in self.fixture["responses"].items()
+            },
+            collected_at=statistics_cutoff + timedelta(seconds=1),
+        )
+
+
+def _store_seed(repository: ProspectiveTeamRatingRepository) -> None:
+    seed = build_prospective_team_rating_seed(
+        config=CONFIG,
+        source_results=(),
+        seed_as_of=SEED_CUTOFF,
+        seed_training_cutoff=SEED_CUTOFF,
+        frozen_at=FROZEN_AT,
+    )
+    assert repository.store_seed(seed)
 
 
 def _slots(*, reverse: bool = False) -> list[DraftSlotInput]:
@@ -55,11 +111,10 @@ def test_locked_live_draft_paired_and_p0_only_are_immutable(
     postgres_engine: Engine,
     tmp_path: Path,
 ) -> None:
-    _seed_formal_data(postgres_engine, history_count=5, target_count=0)
     session = PostgresSession(postgres_engine)
     lock_time = TARGET_ORIGIN - timedelta(minutes=30)
     try:
-        _store_seed(session, ProspectiveTeamRatingRepository(session))
+        _store_seed(ProspectiveTeamRatingRepository(session))
         session.execute(
             """INSERT INTO raybet_matches
                (raybet_match_id, status, raw_json, updated_at)

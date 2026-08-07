@@ -1,4 +1,4 @@
-"""Match completed maps to OpenDota by exact draft and settle shadow orders."""
+"""Bind completed maps to OpenDota and settle immutable live predictions."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ from database.session import DatabaseRow, PostgresSession
 from fetch.client import OpenDotaClient
 from fetch.postgres_store import CoreMatchStore
 from event_intelligence.ingest_adapters import PostgresIngestAdapter
+from event_intelligence.live_draft_prospective_bridge import (
+    LiveDraftProspectiveBridgeRepository,
+)
 from event_intelligence.raw_archive import (
     ArtifactReceipt,
     RawArchive,
@@ -34,12 +37,6 @@ from .direct_response_audit import (
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
 from .raybet import BASE_URL, RayBetClient, RayBetMapFinal, parse_raybet_map_final
-from .settlement import (
-    SettlementAuthorityError,
-    reconcile_map_winners,
-    record_settlement_authority_review,
-    settle_authoritative_order,
-)
 from .storage import LiveBettingStore
 from .strict_eligibility import query_strict_live_eligibility
 
@@ -741,172 +738,31 @@ def _latest_exact_raybet_final(
     return None
 
 
-def _winner_order_rows(
-    store: LiveBettingStore,
-    raybet_match_id: str,
-    map_number: int,
-    *,
-    include_conflicted: bool = False,
-) -> list[DatabaseRow]:
-    rows = store.connection.execute(
-        """SELECT o.order_key, o.odds_id, o.market_key, o.fill_price,
-                  o.signal_transport_at
-           FROM shadow_orders o JOIN shadow_map_attempts a ON a.order_key=o.order_key
-           LEFT JOIN settlements s ON s.order_key=o.order_key
-           WHERE a.raybet_match_id=? AND a.map_number=?
-             AND o.status='filled' AND s.order_key IS NULL""",
-        (raybet_match_id, map_number),
-    ).fetchall()
-    if include_conflicted:
-        return rows
-    return [
-        row
-        for row in rows
-        if store.order_block_reason(str(row["order_key"])) is None
-    ]
-
-
 def _causal_draft_cutoffs(
     store: LiveBettingStore,
     match_id: str,
     map_numbers: set[int],
 ) -> dict[int, datetime]:
-    """Return the latest valid dependent signal time for each map.
+    """Use immutable live prediction creation times as draft evidence cutoffs."""
 
-    Post-match alignment can be driven by a research-only prediction even when
-    no shadow order was filled.  Every dependent lineage is event-time gated;
-    an invalidated or no-longer-verifiable row cannot widen the cutoff.
-    """
     if not map_numbers:
         return {}
-    try:
-        rows = store.connection.execute(
-            """SELECT attempt.map_number, orders.order_key,
-                      orders.signal_transport_at
-                 FROM shadow_orders AS orders
-                 JOIN shadow_map_attempts AS attempt
-                   ON attempt.order_key=orders.order_key
-                WHERE attempt.raybet_match_id=? AND orders.status='filled'""",
-            (match_id,),
-        ).fetchall()
-    except SQLAlchemyError:
-        rows = []
+    rows = store.connection.execute(
+        """SELECT map_number, created_at
+             FROM live_draft_prospective_predictions
+            WHERE raybet_match_id=?
+            ORDER BY created_at, prediction_hash""",
+        (match_id,),
+    ).fetchall()
     output: dict[int, datetime] = {}
     for row in rows:
         map_number = int(row["map_number"])
         if map_number not in map_numbers:
             continue
-        try:
-            blocked = store.order_block_reason(str(row["order_key"]))
-        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
-            blocked = "causal_lineage_unverifiable"
-        if blocked is not None:
-            continue
-        cutoff = _parse_utc(row["signal_transport_at"])
+        cutoff = _parse_utc(row["created_at"])
         if cutoff is not None:
             output[map_number] = max(output.get(map_number, cutoff), cutoff)
-
-    try:
-        prediction_rows = store.connection.execute(
-            """SELECT prediction_key, map_number, observed_at,
-                      strict_mapping_id
-                 FROM research_live_predictions
-                WHERE raybet_match_id=?""",
-            (match_id,),
-        ).fetchall()
-    except SQLAlchemyError:
-        prediction_rows = []
-    for row in prediction_rows:
-        map_number = int(row["map_number"])
-        if map_number not in map_numbers:
-            continue
-        prediction_key = str(row["prediction_key"])
-        try:
-            invalidated = store.connection.execute(
-                """SELECT 1 FROM vision_derived_invalidations
-                    WHERE dependent_type='research_prediction'
-                      AND dependent_key=? LIMIT 1""",
-                (prediction_key,),
-            ).fetchone()
-        except SQLAlchemyError:
-            continue
-        if invalidated is not None:
-            continue
-        cutoff = _parse_utc(row["observed_at"])
-        if cutoff is None:
-            continue
-        if store._draft_conflict_at_or_before(match_id, map_number, cutoff):
-            continue
-        try:
-            eligibility = query_strict_live_eligibility(
-                store.connection,
-                raybet_match_id=match_id,
-                map_number=map_number,
-                transport_observed_at=cutoff,
-            )
-        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
-            continue
-        if (
-            not eligibility.eligible
-            or eligibility.mapping is None
-            or eligibility.mapping.mapping_id != row["strict_mapping_id"]
-        ):
-            continue
-        output[map_number] = max(output.get(map_number, cutoff), cutoff)
-
-    try:
-        decision_rows = store.connection.execute(
-            """SELECT decision_key, map_number, decided_at,
-                      contributions_json
-                 FROM strategy_decisions
-                WHERE raybet_match_id=?""",
-            (match_id,),
-        ).fetchall()
-    except SQLAlchemyError:
-        decision_rows = []
-    for row in decision_rows:
-        map_number = int(row["map_number"])
-        if map_number not in map_numbers:
-            continue
-        try:
-            invalidated = store.connection.execute(
-                """SELECT 1 FROM vision_derived_invalidations
-                    WHERE dependent_type='strategy_decision'
-                      AND dependent_key=? LIMIT 1""",
-                (str(row["decision_key"]),),
-            ).fetchone()
-        except SQLAlchemyError:
-            continue
-        if invalidated is not None:
-            continue
-        cutoff = _parse_utc(row["decided_at"])
-        if cutoff is None:
-            continue
-        if store._draft_conflict_at_or_before(match_id, map_number, cutoff):
-            continue
-        try:
-            contributions = json.loads(str(row["contributions_json"]))
-            mapping_id = contributions["__inputs__"]["strict_live_eligibility"][
-                "mapping_refs"
-            ]["strict_mapping_id"]
-            eligibility = query_strict_live_eligibility(
-                store.connection,
-                raybet_match_id=match_id,
-                map_number=map_number,
-                transport_observed_at=cutoff,
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError,
-                SQLAlchemyError, OverflowError):
-            continue
-        if (
-            not eligibility.eligible
-            or eligibility.mapping is None
-            or eligibility.mapping.mapping_id != mapping_id
-        ):
-            continue
-        output[map_number] = max(output.get(map_number, cutoff), cutoff)
     return output
-
 
 class _ReadOnlyCausalStore(LiveBettingStore):
     """Bind the worker's read-only causal gates to an existing web snapshot."""
@@ -948,36 +804,23 @@ def has_trusted_confirmed_draft(
     return bool(drafts.get(map_number))
 
 
-def _settle_winner_orders(
-    store: LiveBettingStore,
-    result: StoredMapResult,
-    rows: list[DatabaseRow] | None = None,
-) -> tuple[int, tuple[str, ...]]:
-    rows = rows if rows is not None else _winner_order_rows(
-        store, result.raybet_match_id, result.map_number
-    )
-    count = 0
-    failures: list[str] = []
-    for row in rows:
-        order_key = str(row["order_key"])
-        try:
-            count += int(settle_authoritative_order(store, order_key))
-        except SettlementAuthorityError as error:
-            failures.append(error.reason)
-            record_settlement_authority_review(
-                store.connection,
-                order_key,
-                error.reason,
-                actor="postmatch_monitor",
-            )
-            store.insert_settlement_review(
-                order_key,
-                settled_at=result.settled_at,
-                evidence_ref=result.evidence_ref,
-                reason=error.reason,
-                actor="postmatch_monitor",
-            )
-    return count, tuple(failures)
+def reconcile_map_winners(
+    *,
+    raybet_status: str,
+    raybet_winner: str | None,
+    opendota_winner: str | None,
+) -> tuple[str, str]:
+    if raybet_status == "conflict":
+        return "manual_review", "raybet_final_conflict"
+    if raybet_status != "confirmed" or raybet_winner is None:
+        return "pending", "raybet_final_missing"
+    if raybet_winner not in {"team_one", "team_two"}:
+        return "manual_review", "raybet_winner_invalid"
+    if opendota_winner not in {"team_one", "team_two"}:
+        return "pending", "opendota_winner_missing"
+    if raybet_winner != opendota_winner:
+        return "manual_review", "winner_conflict"
+    return "confirmed", "sources_consistent"
 
 
 def _reconcile_and_settle(
@@ -987,7 +830,8 @@ def _reconcile_and_settle(
     *,
     expected_strict_mapping_id: int | None = None,
 ) -> dict[str, object]:
-    """Atomically persist source evidence, resolution, settlement, and outbox."""
+    """Persist official map authority and settle immutable live predictions."""
+
     with store.transaction():
         try:
             eligibility = query_strict_live_eligibility(
@@ -1009,43 +853,10 @@ def _reconcile_and_settle(
         ):
             return {
                 "status": "strict_mapping_unverified",
-                "orders_settled": 0,
+                "predictions_settled": 0,
             }
+
         strict_mapping_id = eligibility.mapping.mapping_id
-        # Re-read the order and draft state under the write lock.  A conflict
-        # arriving between a preflight read and settlement must not turn into
-        # an automatic result.
-        all_rows = _winner_order_rows(
-            store, result.raybet_match_id, result.map_number,
-            include_conflicted=True,
-        )
-        lineage_rows = store.connection.execute(
-            """SELECT orders.order_key, orders.signal_transport_at,
-                      settlement.review_required, settlement.result
-                 FROM shadow_orders AS orders
-                 JOIN shadow_map_attempts AS attempt
-                   ON attempt.order_key=orders.order_key
-                 LEFT JOIN settlements AS settlement
-                   ON settlement.order_key=orders.order_key
-                WHERE attempt.raybet_match_id=? AND attempt.map_number=?""",
-            (result.raybet_match_id, result.map_number),
-        ).fetchall()
-        blocked_rows = []
-        for row in all_rows:
-            if store.order_block_reason(str(row["order_key"])) is not None:
-                blocked_rows.append(row)
-        blocked_reason = None
-        for row in lineage_rows:
-            candidate = store.order_block_reason(str(row["order_key"]))
-            if candidate is not None:
-                blocked_reason = candidate
-                break
-        blocked_lineage = blocked_reason is not None
-        existing_review = any(
-            bool(row["review_required"]) or str(row["result"] or "") == "review"
-            for row in lineage_rows
-        )
-        rows = [row for row in all_rows if row not in blocked_rows]
         status, reason = reconcile_map_winners(
             raybet_status=raybet_final.status,
             raybet_winner=raybet_final.winner_side,
@@ -1053,39 +864,19 @@ def _reconcile_and_settle(
         )
         if raybet_final.status != "confirmed":
             reason = raybet_final.reason
-        elif blocked_rows or blocked_lineage:
-            status, reason = (
-                "manual_review",
-                blocked_reason or "vision_draft_conflict",
-            )
-        elif existing_review:
-            status, reason = "manual_review", "existing_settlement_review"
-        elif status == "confirmed":
-            for row in rows:
-                parts = str(row["market_key"]).split("|", 3)
-                if len(parts) != 4:
-                    status, reason = "manual_review", "order_market_identity_invalid"
-                    break
-                market_type, period, side, line = parts
-                fill_price = row["fill_price"]
-                if (
-                    market_type != "winner"
-                    or period != f"map_{result.map_number}"
-                    or side not in {"team_one", "team_two"}
-                    or line
-                    or isinstance(fill_price, bool)
-                    or not isinstance(fill_price, (int, float))
-                    or not float(fill_price) > 1.0
-                ):
-                    status, reason = "manual_review", "order_market_identity_invalid"
-                    break
-                selection_won = raybet_final.selection_won(str(row["odds_id"]))
-                if selection_won is None:
-                    status, reason = "pending", "raybet_order_outcome_missing"
-                    break
-                if selection_won != (side == raybet_final.winner_side):
-                    status, reason = "manual_review", "raybet_order_outcome_conflict"
-                    break
+
+        stored = store.connection.execute(
+            """SELECT strict_mapping_id, dota_match_id, winner_side
+                 FROM map_results
+                WHERE raybet_match_id=? AND map_number=?""",
+            (result.raybet_match_id, result.map_number),
+        ).fetchone()
+        if stored is not None and tuple(stored) != (
+            strict_mapping_id,
+            result.dota_match_id,
+            result.winner_side,
+        ):
+            status, reason = "manual_review", "stored_map_result_conflict"
 
         reconciliation_ref = (
             f"settlement-reconciliation:{result.raybet_match_id}:map:{result.map_number}"
@@ -1106,26 +897,6 @@ def _reconcile_and_settle(
             "team_two_kills": result.team_two_kills,
             "duration_seconds": result.duration_seconds,
         }
-        reconciliation_authority = {
-            "raybet_observed_at": (
-                raybet_final.observed_at or result.settled_at
-            ),
-            "opendota_observed_at": (
-                result.opendota_observed_at or result.settled_at
-            ),
-            "opendota_first_usable_at": (
-                result.opendota_first_usable_at or result.settled_at
-            ),
-            "raybet_audit_key": raybet_final.audit_key,
-            "raybet_transport_key": raybet_final.transport_key,
-            "raybet_response_state_hash": raybet_final.response_state_hash,
-            "raybet_response_artifact_hash": (
-                raybet_final.response_artifact_hash
-            ),
-            "opendota_artifact_id": result.opendota_artifact_id,
-            "opendota_observation_id": result.opendota_observation_id,
-            "opendota_content_hash": result.opendota_content_hash,
-        }
         reconciliation = store.record_settlement_reconciliation(
             raybet_match_id=result.raybet_match_id,
             map_number=result.map_number,
@@ -1140,102 +911,46 @@ def _reconcile_and_settle(
             opendota_facts=opendota_facts,
             status=status,
             reason=reason,
-            **reconciliation_authority,
+            raybet_observed_at=raybet_final.observed_at or result.settled_at,
+            opendota_observed_at=result.opendota_observed_at or result.settled_at,
+            opendota_first_usable_at=(
+                result.opendota_first_usable_at or result.settled_at
+            ),
+            raybet_audit_key=raybet_final.audit_key,
+            raybet_transport_key=raybet_final.transport_key,
+            raybet_response_state_hash=raybet_final.response_state_hash,
+            raybet_response_artifact_hash=raybet_final.response_artifact_hash,
+            opendota_artifact_id=result.opendota_artifact_id,
+            opendota_observation_id=result.opendota_observation_id,
+            opendota_content_hash=result.opendota_content_hash,
         )
         effective_status = str(reconciliation["status"])
-        if effective_status == "manual_review":
-            review_reason = str(reconciliation["reason"] or reason)
-            for row in all_rows:
-                store.insert_settlement_review(
-                    str(row["order_key"]),
-                    settled_at=result.settled_at,
-                    evidence_ref=reconciliation_ref,
-                    reason=review_reason,
-                    actor="postmatch_monitor",
-                )
-            return {"status": "manual_review", "orders_settled": 0}
         if effective_status != "confirmed":
-            return {"status": "pending", "orders_settled": 0}
+            return {"status": effective_status, "predictions_settled": 0}
 
-        reconciled_result = replace(result, evidence_ref=reconciliation_ref)
-        stored = store.connection.execute(
-            """SELECT strict_mapping_id, dota_match_id, winner_side FROM map_results
-                WHERE raybet_match_id=? AND map_number=?""",
-            (result.raybet_match_id, result.map_number),
-        ).fetchone()
-        if stored is not None and tuple(stored) != (
-            strict_mapping_id,
-            result.dota_match_id,
-            result.winner_side,
-        ):
-            reconciliation = store.record_settlement_reconciliation(
-                raybet_match_id=result.raybet_match_id,
-                map_number=result.map_number,
-                strict_mapping_id=strict_mapping_id,
-                dota_match_id=result.dota_match_id,
-                raybet_status=raybet_final.status,
-                raybet_winner_side=raybet_final.winner_side,
-                opendota_winner_side=result.winner_side,
-                raybet_evidence_ref=raybet_final.evidence_ref,
-                opendota_evidence_ref=result.evidence_ref,
-                raybet_facts=raybet_facts,
-                opendota_facts=opendota_facts,
-                status="manual_review",
-                reason="stored_map_result_conflict",
-                **reconciliation_authority,
-            )
-            assert reconciliation["status"] == "manual_review"
-            return {"status": "manual_review", "orders_settled": 0}
         if stored is None and not store.insert_map_result(
-            reconciled_result, strict_mapping_id=strict_mapping_id
+            replace(result, evidence_ref=reconciliation_ref),
+            strict_mapping_id=strict_mapping_id,
         ):
-            reconciliation = store.record_settlement_reconciliation(
-                raybet_match_id=result.raybet_match_id,
-                map_number=result.map_number,
-                strict_mapping_id=strict_mapping_id,
-                dota_match_id=result.dota_match_id,
-                raybet_status=raybet_final.status,
-                raybet_winner_side=raybet_final.winner_side,
-                opendota_winner_side=result.winner_side,
-                raybet_evidence_ref=raybet_final.evidence_ref,
-                opendota_evidence_ref=result.evidence_ref,
-                raybet_facts=raybet_facts,
-                opendota_facts=opendota_facts,
-                status="manual_review",
-                reason="map_result_persistence_conflict",
-                **reconciliation_authority,
-            )
-            assert reconciliation["status"] == "manual_review"
-            for row in all_rows:
-                store.insert_settlement_review(
-                    str(row["order_key"]),
-                    settled_at=result.settled_at,
-                    evidence_ref=reconciliation_ref,
-                    reason="map_result_persistence_conflict",
-                    actor="postmatch_monitor",
-                )
-            return {"status": "manual_review", "orders_settled": 0}
-        settled, authority_failures = _settle_winner_orders(
-            store, reconciled_result, rows
-        )
-        if authority_failures:
-            reason = authority_failures[0]
-            store.connection.execute(
-                """UPDATE settlement_reconciliations
-                      SET status='manual_review', reason=?, updated_at=?
-                    WHERE raybet_match_id=? AND map_number=?
-                      AND strict_mapping_id=?""",
-                (
-                    reason,
-                    result.settled_at.isoformat(),
-                    result.raybet_match_id,
-                    result.map_number,
-                    strict_mapping_id,
-                ),
-            )
-            return {"status": "manual_review", "orders_settled": 0}
-        return {"status": "confirmed", "orders_settled": settled}
+            return {"status": "manual_review", "predictions_settled": 0}
 
+    predictions = store.connection.execute(
+        """SELECT prediction_hash
+             FROM live_draft_prospective_predictions
+            WHERE raybet_match_id=? AND map_number=?
+            ORDER BY created_at, prediction_hash""",
+        (result.raybet_match_id, result.map_number),
+    ).fetchall()
+    repository = LiveDraftProspectiveBridgeRepository(store.connection)
+    settled = sum(
+        repository.settle_prediction(
+            str(row["prediction_hash"]),
+            settled_at=result.settled_at,
+        )
+        is not None
+        for row in predictions
+    )
+    return {"status": "confirmed", "predictions_settled": settled}
 
 async def label_once(
     store: LiveBettingStore, client: OpenDotaClient, raw_archive: RawArchive,
@@ -1461,8 +1176,7 @@ async def label_once(
         if len(matches) > 1
     )
     if ambiguous_maps:
-        quarantine_time = datetime.now(timezone.utc)
-        quarantined_at = quarantine_time.isoformat()
+        quarantined_at = datetime.now(timezone.utc).isoformat()
         with store.transaction():
             for map_number in sorted(ambiguous_maps):
                 store.connection.execute(
@@ -1475,33 +1189,6 @@ async def label_once(
                         WHERE raybet_match_id=? AND map_number=?""",
                     (quarantined_at, match_id, map_number),
                 )
-                store.connection.execute(
-                    """UPDATE settlements SET review_required=1
-                        WHERE order_key IN (
-                            SELECT order_key FROM shadow_map_attempts
-                             WHERE raybet_match_id=? AND map_number=?
-                        )""",
-                    (match_id, map_number),
-                )
-                outbox_rows = store.connection.execute(
-                    """SELECT outbox.outbox_id
-                         FROM notification_outbox AS outbox
-                         JOIN shadow_map_attempts AS attempt
-                           ON attempt.order_key=outbox.order_key
-                        WHERE attempt.raybet_match_id=?
-                          AND attempt.map_number=?
-                          AND outbox.event_type='settled'
-                          AND outbox.status IN ('pending', 'leased')""",
-                    (match_id, map_number),
-                ).fetchall()
-                for outbox_row in outbox_rows:
-                    outbox_id = int(outbox_row["outbox_id"])
-                    store.quarantine_notification(
-                        outbox_id=outbox_id,
-                        reason="opendota_map_identity_ambiguous",
-                        actor="postmatch_identity",
-                        now=quarantine_time,
-                    )
         return {
             "status": "opendota_map_identity_ambiguous",
             "ambiguous_maps": sorted(ambiguous_maps),
@@ -1580,11 +1267,11 @@ async def label_once(
             pending += 1
         elif outcome["status"] == "manual_review":
             manual_review += 1
-        settled += int(outcome["orders_settled"])
+        settled += int(outcome["predictions_settled"])
     return {
         "status": "labeled",
         "maps": labeled,
-        "orders_settled": settled,
+        "predictions_settled": settled,
         "settlement_pending": pending,
         "settlement_manual_review": manual_review,
     }

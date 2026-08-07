@@ -27,7 +27,7 @@ from event_intelligence.live_draft_prospective_bridge import (
     generate_live_draft_prediction,
 )
 
-from .. import intelligence, monitoring, queries
+from .. import monitoring, queries
 from .control import _COOKIE_NAME
 from .mappings import _require_control
 
@@ -298,22 +298,6 @@ def correct_game_snapshot(
             raise HTTPException(status_code=422, detail=str(error)) from error
     finally:
         connection.close()
-
-
-@router.get("/matches/{raybet_match_id}/maps/{map_number}/postmatch")
-def postmatch_detail(
-    raybet_match_id: str,
-    map_number: int = Path(ge=1),
-    max_points: int = Query(1200, ge=100, le=5000),
-) -> dict[str, object]:
-    detail = intelligence.get_raybet_postmatch(
-        raybet_match_id,
-        map_number,
-        max_points=max_points,
-    )
-    if detail is None:
-        raise HTTPException(status_code=404, detail="RayBet match not found")
-    return detail
 
 
 @router.get("/matches/{raybet_match_id}/vision-frames/{frame_digest}.jpg")

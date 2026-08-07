@@ -3,18 +3,11 @@
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from database.session import PostgresSession
-
-
-_TEAM_NAME_EDGE_WORDS = frozenset({"esport", "esports", "gaming", "team"})
-_TEAM_NAME_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
-_TEAM_ACTIVITY_DISAMBIGUATION_GAP_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -32,7 +25,7 @@ def live_draft_context(
     *,
     as_of: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """Resolve the two canonical teams and their latest known positional rosters."""
+    """Resolve the two canonical teams without guessing roster identities."""
     match_id = _required_text(raybet_match_id, "raybet_match_id")
     match = connection.execute(
         """SELECT team_one, team_two, raw_json
@@ -41,12 +34,11 @@ def live_draft_context(
     ).fetchone()
     if match is None:
         return None
-    cutoff = int(_aware_utc(as_of or datetime.now(timezone.utc)).timestamp())
+    _aware_utc(as_of or datetime.now(timezone.utc))
     teams, source = _draft_context_teams(
         connection,
         match_id,
         match,
-        cutoff_epoch=cutoff,
     )
     if len(teams) != 2 or teams[0]["team_id"] == teams[1]["team_id"]:
         return {
@@ -59,17 +51,7 @@ def live_draft_context(
         "status": "ready",
         "reason": "draft_context_ready",
         "source": source,
-        "teams": [
-            {
-                **team,
-                **_latest_positional_roster(
-                    connection,
-                    int(team["team_id"]),
-                    cutoff,
-                ),
-            }
-            for team in teams
-        ],
+        "teams": teams,
     }
 
 
@@ -77,8 +59,6 @@ def _draft_context_teams(
     connection: PostgresSession,
     match_id: str,
     match: Any,
-    *,
-    cutoff_epoch: int,
 ) -> tuple[list[dict[str, Any]], str]:
     mapping = connection.execute(
         """SELECT mapping.canonical_team_one_id,
@@ -125,8 +105,6 @@ def _draft_context_teams(
     ).fetchall()
     identity_mappings = _raybet_identity_mappings(connection, ordered)
     used_identity_mapping = False
-    used_normalized_name = False
-    used_recent_activity = False
     result: list[dict[str, Any]] = []
     fallback_names = (str(match[0] or ""), str(match[1] or ""))
     for index, raw_team in enumerate(ordered):
@@ -151,38 +129,8 @@ def _draft_context_teams(
                 if str(row[1] or "").strip().casefold() in names
                 or str(row[2] or "").strip().casefold() in names
             ]
-            if not matches:
-                normalized_names = {
-                    normalized
-                    for value in names
-                    if (normalized := _normalized_team_name(value))
-                }
-                matches = [
-                    row
-                    for row in catalog
-                    if _normalized_team_name(row[1]) in normalized_names
-                    or _normalized_team_name(row[2]) in normalized_names
-                ]
-                used_normalized_name = bool(matches)
-            if len(matches) > 1:
-                recent_match = _recently_active_team(
-                    connection,
-                    matches,
-                    cutoff_epoch=cutoff_epoch,
-                )
-                if recent_match is not None:
-                    matches = [recent_match]
-                    used_recent_activity = True
         if len(matches) != 1:
-            return [], (
-                "raybet_recent_activity_v1"
-                if used_recent_activity
-                else (
-                    "raybet_normalized_name_v1"
-                    if used_normalized_name
-                    else "raybet_exact_name"
-                )
-            )
+            return [], "raybet_exact_name"
         result.append(
             {
                 "match_side": "team_one" if index == 0 else "team_two",
@@ -190,57 +138,7 @@ def _draft_context_teams(
                 "team_name": str(matches[0][1] or fallback_names[index]),
             }
         )
-    return result, (
-        "raybet_recent_activity_v1"
-        if used_recent_activity
-        else (
-            "raybet_identity_mapping_v2"
-            if used_identity_mapping
-            else (
-                "raybet_normalized_name_v1"
-                if used_normalized_name
-                else "raybet_exact_name"
-            )
-        )
-    )
-
-
-def _normalized_team_name(value: object) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    tokens = _TEAM_NAME_TOKEN.findall(text)
-    while tokens and tokens[0] in _TEAM_NAME_EDGE_WORDS:
-        tokens.pop(0)
-    while tokens and tokens[-1] in _TEAM_NAME_EDGE_WORDS:
-        tokens.pop()
-    return "".join(tokens)
-
-
-def _recently_active_team(
-    connection: PostgresSession,
-    candidates: list[Any],
-    *,
-    cutoff_epoch: int,
-) -> Any | None:
-    activity: list[tuple[int, Any]] = []
-    for candidate in candidates:
-        row = connection.execute(
-            """SELECT MAX(start_time)
-                 FROM matches
-                WHERE start_time<?
-                  AND (radiant_team_id=? OR dire_team_id=?)""",
-            (cutoff_epoch, int(candidate[0]), int(candidate[0])),
-        ).fetchone()
-        if row is None or row[0] is None:
-            return None
-        activity.append((int(row[0]), candidate))
-    activity.sort(key=lambda item: item[0], reverse=True)
-    if (
-        len(activity) < 2
-        or activity[0][0] - activity[1][0]
-        < _TEAM_ACTIVITY_DISAMBIGUATION_GAP_SECONDS
-    ):
-        return None
-    return activity[0][1]
+    return result, "raybet_identity_mapping_v2" if used_identity_mapping else "raybet_exact_name"
 
 
 def _raybet_identity_mappings(
@@ -264,106 +162,6 @@ def _raybet_identity_mappings(
         tuple(team_ids),
     ).fetchall()
     return {int(row[0]): int(row[1]) for row in rows}
-
-
-def _latest_positional_roster(
-    connection: PostgresSession,
-    team_id: int,
-    cutoff_epoch: int,
-) -> dict[str, Any]:
-    matches = connection.execute(
-        """SELECT match_id
-             FROM matches
-            WHERE start_time<? AND (radiant_team_id=? OR dire_team_id=?)
-            ORDER BY start_time DESC LIMIT 12""",
-        (cutoff_epoch, team_id, team_id),
-    ).fetchall()
-    roster_match_id: int | None = None
-    roster_rows: list[Any] = []
-    for match in matches:
-        rows = connection.execute(
-            """SELECT account_id, player_slot
-                 FROM match_players
-                WHERE match_id=? AND team_id=? AND account_id IS NOT NULL
-                ORDER BY player_slot""",
-            (int(match[0]), team_id),
-        ).fetchall()
-        account_ids = [int(row[0]) for row in rows]
-        if len(account_ids) == 5 and len(set(account_ids)) == 5:
-            roster_match_id = int(match[0])
-            roster_rows = list(rows)
-            break
-    if roster_match_id is None:
-        return {"roster_match_id": None, "players": []}
-
-    candidates: list[dict[str, Any]] = []
-    for account_id, player_slot in roster_rows:
-        role = connection.execute(
-            """SELECT assignment.position, assignment.confidence,
-                      assignment.assignment_source
-                 FROM player_role_assignments AS assignment
-                 JOIN matches AS historical
-                   ON historical.match_id=assignment.match_id
-                WHERE assignment.account_id=?
-                  AND assignment.position BETWEEN 1 AND 5
-                  AND historical.start_time<?
-                ORDER BY historical.start_time DESC,
-                         CASE assignment.purpose
-                              WHEN 'expected_position' THEN 0 ELSE 1 END,
-                         assignment.created_at DESC LIMIT 1""",
-            (int(account_id), cutoff_epoch),
-        ).fetchone()
-        candidates.append(
-            {
-                "player_id": int(account_id),
-                "player_name": _latest_player_name(connection, int(account_id)),
-                "player_slot": int(player_slot),
-                "position": int(role[0]) if role is not None else None,
-                "confidence": float(role[1]) if role is not None else 0.0,
-                "position_source": str(role[2]) if role is not None else "roster_order",
-            }
-        )
-
-    used_positions: set[int] = set()
-    unresolved: list[dict[str, Any]] = []
-    for player in sorted(
-        candidates,
-        key=lambda value: (-float(value["confidence"]), int(value["player_slot"])),
-    ):
-        position = player["position"]
-        if isinstance(position, int) and position not in used_positions:
-            used_positions.add(position)
-        else:
-            player["position"] = None
-            player["confidence"] = 0.0
-            player["position_source"] = "roster_order"
-            unresolved.append(player)
-    available = iter(sorted(set(range(1, 6)) - used_positions))
-    for player in sorted(unresolved, key=lambda value: int(value["player_slot"])):
-        player["position"] = next(available)
-    for player in candidates:
-        player.pop("player_slot")
-    return {
-        "roster_match_id": roster_match_id,
-        "players": sorted(candidates, key=lambda value: int(value["position"])),
-    }
-
-
-def _latest_player_name(
-    connection: PostgresSession,
-    account_id: int,
-) -> str | None:
-    row = connection.execute(
-        """SELECT COALESCE(
-                      NULLIF(facts_json::jsonb ->> 'name', ''),
-                      NULLIF(facts_json::jsonb ->> 'personaname', '')
-                  ) AS player_name
-             FROM player_map_facts
-            WHERE account_id=?
-            ORDER BY created_at DESC, fact_id DESC LIMIT 1""",
-        (account_id,),
-    ).fetchone()
-    return str(row[0]).strip() if row is not None and str(row[0]).strip() else None
 
 
 def save_live_draft_mapping(

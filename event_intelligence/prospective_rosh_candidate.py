@@ -6,24 +6,12 @@ import hashlib
 import hmac
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-
-import numpy as np
-from scipy.optimize import minimize
-from scipy.special import expit, logit
-from sklearn.model_selection import GroupKFold
+from typing import Any, Mapping
 
 from event_intelligence.raw_archive import canonical_json_bytes
-from event_intelligence.legacy_rosh_reconstruction import (
-    LEGACY_ROSH_FORMULA_VERSION,
-)
-from event_intelligence.rosh_retrospective_utility import (
-    CohortLoadResult,
-    RetrospectiveRow,
-)
 from prematch.stratz_rosh import (
     HEROES_META_POSITIONS_QUERY,
     HERO_STATS_BY_TIME_QUERY,
@@ -37,6 +25,7 @@ PROSPECTIVE_ROSH_ARTIFACT_VERSION = "prospective-rosh-candidate-artifact-v1"
 PROSPECTIVE_ROSH_PROFILE_ID = "legacy-dematus-pure-rosh-prospective-v1"
 PROSPECTIVE_ROSH_PROFILE_SCHEMA = "dematus-pure-rosh-profile/v1"
 PROSPECTIVE_ROSH_SCORER_FAMILY = "legacy_dematus_pure_lineup"
+LEGACY_ROSH_FORMULA_VERSION = "dematus-rosh-0e1e6651dd932055dee69c4fb44435774f619793"
 PROSPECTIVE_ROSH_FORMULA = (
     "logit(P1)=logit(P0)+beta_rosh*standardized_pure_rosh_score"
 )
@@ -227,201 +216,6 @@ class ProspectiveRoshCandidate:
         return canonical_json_bytes(self.to_payload())
 
 
-def _training_rows(rows: Sequence[RetrospectiveRow]) -> tuple[RetrospectiveRow, ...]:
-    values = tuple(
-        sorted(
-            rows,
-            key=lambda row: (
-                _utc(row.prediction_cutoff, "prediction_cutoff"),
-                row.match_id,
-            ),
-        )
-    )
-    if len(values) != 513:
-        raise ValueError("prospective candidate requires the frozen 513-map cohort")
-    if any(row.team_probability is None for row in values):
-        raise ValueError("candidate cohort must be completely paired")
-    if {row.formula_version for row in values} != {LEGACY_ROSH_FORMULA_VERSION}:
-        raise ValueError("candidate cohort formula identity is not frozen")
-    for row in values:
-        score = _finite(row.pure_lineup_score, "pure_lineup_score")
-        probability = _finite(row.team_probability, "team_probability")
-        if not 0.0 < probability < 1.0:
-            raise ValueError("candidate Team Rating probabilities must be interior")
-        if row.radiant_win not in (0, 1):
-            raise ValueError("candidate outcomes must be binary")
-        if score != row.pure_lineup_score:
-            raise ValueError("candidate score representation is not canonical")
-    return values
-
-
-def _cohort_hash(rows: Sequence[RetrospectiveRow]) -> str:
-    return _hash(
-        {
-            "domain": "prospective-rosh-candidate-training-cohort/v1",
-            "rows": [
-                {
-                    "match_id": row.match_id,
-                    "score_key": row.score_key,
-                    "formula_version": row.formula_version,
-                    "prediction_cutoff": row.prediction_cutoff.isoformat(),
-                    "series_key": row.series_key,
-                    "pure_lineup_score": row.pure_lineup_score,
-                    "team_probability": row.team_probability,
-                    "radiant_win": row.radiant_win,
-                }
-                for row in rows
-            ],
-        }
-    )
-
-
-def _fit_beta(
-    scores: np.ndarray,
-    probabilities: np.ndarray,
-    outcomes: np.ndarray,
-) -> tuple[float, float]:
-    offsets = logit(np.clip(probabilities, _EPSILON, 1.0 - _EPSILON))
-
-    def objective(parameters: np.ndarray) -> tuple[float, np.ndarray]:
-        beta = float(parameters[0])
-        logits = offsets + beta * scores
-        loss = float(np.mean(np.logaddexp(0.0, logits) - outcomes * logits))
-        gradient = np.asarray([np.mean((expit(logits) - outcomes) * scores)])
-        return loss, gradient
-
-    result = minimize(
-        objective,
-        np.zeros(1, dtype=np.float64),
-        jac=True,
-        method="L-BFGS-B",
-    )
-    if not result.success or not np.all(np.isfinite(result.x)):
-        raise RuntimeError(f"candidate beta fit failed: {result.message}")
-    return float(result.x[0]), float(result.fun)
-
-
-def _folds(rows: Sequence[RetrospectiveRow]) -> tuple[CandidateFold, ...]:
-    scores = np.asarray([row.pure_lineup_score for row in rows], dtype=np.float64)
-    probabilities = np.asarray([row.team_probability for row in rows], dtype=np.float64)
-    outcomes = np.asarray([row.radiant_win for row in rows], dtype=np.float64)
-    groups = np.asarray([row.series_key for row in rows], dtype=object)
-    result: list[CandidateFold] = []
-    for fold, (train, test) in enumerate(
-        GroupKFold(n_splits=5).split(scores, outcomes, groups),
-        1,
-    ):
-        train_mean = float(np.mean(scores[train]))
-        train_scale = float(np.std(scores[train]))
-        if train_scale <= 0.0:
-            raise ValueError("candidate fold scale is zero")
-        beta, _loss = _fit_beta(
-            (scores[train] - train_mean) / train_scale,
-            probabilities[train],
-            outcomes[train],
-        )
-        result.append(
-            CandidateFold(
-                fold=fold,
-                train_support=len(train),
-                test_support=len(test),
-                train_mean=train_mean,
-                train_scale=train_scale,
-                beta_rosh=beta,
-            )
-        )
-    return tuple(result)
-
-
-def freeze_prospective_rosh_candidate(
-    cohort: CohortLoadResult,
-    *,
-    frozen_at: datetime,
-    prospective_start_at: datetime,
-) -> ProspectiveRoshCandidate:
-    if not isinstance(cohort, CohortLoadResult):
-        raise ValueError("cohort must be a CohortLoadResult")
-    values = _training_rows(cohort.paired)
-    frozen = _utc(frozen_at, "frozen_at")
-    start = _utc(prospective_start_at, "prospective_start_at")
-    training_cutoff = max(
-        _utc(row.prediction_cutoff, "prediction_cutoff") for row in values
-    )
-    if frozen <= training_cutoff or start <= frozen:
-        raise ValueError("candidate must freeze after training and before collection")
-    scores = np.asarray([row.pure_lineup_score for row in values], dtype=np.float64)
-    probabilities = np.asarray([row.team_probability for row in values], dtype=np.float64)
-    outcomes = np.asarray([row.radiant_win for row in values], dtype=np.float64)
-    score_mean = float(np.mean(scores))
-    score_scale = float(np.std(scores))
-    if score_scale <= 0.0:
-        raise ValueError("candidate score scale is zero")
-    beta, fit_loss = _fit_beta(
-        (scores - score_mean) / score_scale,
-        probabilities,
-        outcomes,
-    )
-    profile = prospective_rosh_profile()
-    candidate = ProspectiveRoshCandidate(
-        artifact_version=PROSPECTIVE_ROSH_ARTIFACT_VERSION,
-        candidate_version=PROSPECTIVE_ROSH_CANDIDATE_VERSION,
-        formula=PROSPECTIVE_ROSH_FORMULA,
-        labels=PROSPECTIVE_ROSH_LABELS,
-        retrospective_formula_version=LEGACY_ROSH_FORMULA_VERSION,
-        prospective_profile_id=PROSPECTIVE_ROSH_PROFILE_ID,
-        prospective_profile_hash=str(profile["profile_hash"]),
-        scorer_source_hash=str(profile["scorer_source_hash"]),
-        training_support=len(values),
-        training_cohort_hash=_cohort_hash(values),
-        training_cutoff=training_cutoff,
-        frozen_at=frozen,
-        prospective_start_at=start,
-        score_mean=score_mean,
-        score_scale=score_scale,
-        beta_rosh=beta,
-        fit_log_loss=fit_loss,
-        folds=_folds(values),
-        evaluation_plan=PROSPECTIVE_EVALUATION_PLAN,
-        artifact_hash="",
-    )
-    frozen_candidate = replace(
-        candidate,
-        artifact_hash=_hash(candidate.to_payload(include_hash=False)),
-    )
-    verify_previous_parameterization_parity(values, frozen_candidate)
-    return frozen_candidate
-
-
-def verify_previous_parameterization_parity(
-    rows: Sequence[RetrospectiveRow],
-    candidate: ProspectiveRoshCandidate,
-) -> tuple[int, float]:
-    """Prove the positive-beta form preserves every frozen cohort prediction."""
-
-    values = _training_rows(rows)
-    if candidate.beta_rosh != -PREVIOUS_FROZEN_NEGATIVE_BETA:
-        raise ValueError("positive beta does not match the previous frozen magnitude")
-    maximum_delta = 0.0
-    for row in values:
-        standardized = (
-            row.pure_lineup_score - candidate.score_mean
-        ) / candidate.score_scale
-        previous_contribution = -PREVIOUS_FROZEN_NEGATIVE_BETA * standardized
-        current_contribution = candidate.beta_rosh * standardized
-        if previous_contribution != current_contribution:
-            raise ValueError("beta reparameterization changes a cohort contribution")
-        offset = logit(float(row.team_probability))
-        previous_probability = float(expit(offset + previous_contribution))
-        current_probability = float(expit(offset + current_contribution))
-        maximum_delta = max(
-            maximum_delta,
-            abs(previous_probability - current_probability),
-        )
-        if previous_probability != current_probability:
-            raise ValueError("beta reparameterization changes a cohort prediction")
-    return len(values), maximum_delta
-
-
 def verify_prospective_rosh_candidate(
     candidate: ProspectiveRoshCandidate,
     *,
@@ -514,7 +308,13 @@ def candidate_probability(
     contribution = candidate.beta_rosh * standardized
     if standardized == 0.0:
         return p0, standardized, contribution
-    probability = float(expit(logit(p0) + contribution))
+    offset = math.log(p0) - math.log1p(-p0)
+    combined = offset + contribution
+    probability = (
+        1.0 / (1.0 + math.exp(-combined))
+        if combined >= 0.0
+        else math.exp(combined) / (1.0 + math.exp(combined))
+    )
     return probability, standardized, contribution
 
 
@@ -639,10 +439,8 @@ __all__ = [
     "CandidateFold",
     "ProspectiveRoshCandidate",
     "candidate_probability",
-    "freeze_prospective_rosh_candidate",
     "load_frozen_prospective_rosh_candidate",
     "load_prospective_rosh_candidate_json",
     "prospective_rosh_profile",
-    "verify_previous_parameterization_parity",
     "verify_prospective_rosh_candidate",
 ]

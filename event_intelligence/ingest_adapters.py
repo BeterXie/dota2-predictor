@@ -1052,5 +1052,3 @@ class PostgresIngestAdapter:
 
 
 # Transitional import aliases; both names use PostgreSQL exclusively.
-SQLiteIngestStatus = PostgresIngestStatus
-SQLiteIngestAdapter = PostgresIngestAdapter

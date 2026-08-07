@@ -1,171 +1,131 @@
-# Dota 2 Match Predictor
+# Dota 2 Live Lineup Predictor
 
-Predict Dota 2 match outcomes from OpenDota history and operate a read-only
-RayBet monitoring and paper-strategy pipeline. PostgreSQL is the only runtime
-database. SQLite is accepted only as the source of a one-time historical import.
-
-`DESIGN.md` is the legacy module baseline, not the current acceptance source.
-See [live_betting/README.md](live_betting/README.md) for live operation and
-[docs/monitoring-console-operations-manual.md](docs/monitoring-console-operations-manual.md)
-for the Chinese monitoring-console guide. The parallel prematch model contract
-is documented in
-[docs/prematch-prediction-model-v1-design.md](docs/prematch-prediction-model-v1-design.md).
-
-## Project Structure
+This project has one product path:
 
 ```text
-dota2-predictor/
-|-- database/            # SQLAlchemy Core engine and Alembic migrations
-|-- fetch/               # Historical OpenDota ingestion and metadata
-|-- event_intelligence/  # Strict Tier-1 event registry and causal profiles
-|-- features/            # Offline feature generation
-|-- train/               # Model training and walk-forward evaluation
-|-- predict/             # Prematch prediction
-|-- live_betting/        # RayBet collection and shadow-only strategy
-|-- vision/              # Dota broadcast clock, draft, and side recognition
-|-- contracts/           # Versioned live-observation contracts
-|-- scripts/             # Ingestion, observation, labeling, and reporting CLIs
-|-- web/                 # FastAPI server and match browser
-`-- data/                # Raw snapshots, evidence, logs, and reports (ignored)
+RayBet live match
+-> signed stream or match link
+-> HLS frame capture
+-> HUD recognition or manual correction
+-> locked LiveDraftMapping with ten heroes and positions 1-5
+-> Team Rating P0
+-> frozen pure-lineup R.O.S.H. P1 when STRATZ evidence is available
+-> immutable prediction
+-> authoritative result binding and settlement
+-> historical result view
 ```
 
-## Quick Start
+PostgreSQL is the only runtime database. Odds remain visible in match details but
+are not inputs to P0 or P1. The prediction path does not consume kills, economy,
+experience, towers, Roshan state, score, game clock, or any other in-game state.
+
+## Runtime
 
 Use PowerShell 7 from the repository root:
 
 ```powershell
-Copy-Item .env.template .env
 python -m pip install -r requirements.txt
-docker compose up -d postgres
 
-$env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
+$env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
 python -m alembic upgrade head
-
-# Fetch historical matches and build the offline model.
-python -m fetch.main
-python -m features.main
-python -m train.main
-
-# Build the pre-match model consumed by predict.main.
-python -m prematch.train
-
-# Generate a prematch prediction.
-python -m predict.main --radiant 9247354 --dire 10150538
 ```
 
-Start the two normal long-running processes in separate PowerShell windows.
-Both inherit the same `DATABASE_URL`:
+Start RayBet collection and the local Web application in separate terminals:
 
 ```powershell
-# Window 1: service supervisor
-$env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
-$env:STRATZ_API_TOKEN = Read-Host -MaskInput "STRATZ API token"
-python scripts/run_dota_shadow_service.py
+$env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
+python -m live_betting.monitor --raw-dir data/live_betting/raw-v2 --interval 6 --list-interval 30
 
-# Window 2: Web and monitoring console
-$env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
+$env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
 python -m web.main
 ```
 
-After building `web/frontend`, open `http://127.0.0.1:8000/monitor`.
-The recurring supervisor manages historical Rosh by default. Odds collection
-and notifications start only when their explicit `--start-*` flags are
-supplied.
-
-The standard runtime is:
+Build the frontend, then open `http://127.0.0.1:8000/monitor`:
 
 ```powershell
-python scripts/run_dota_shadow_service.py `
-  --start-collector `
-  --start-strict-ingest
+Set-Location web/frontend
+npm install
+npm run build
 ```
 
-OpenDota strict ingest archives approved events and is part of the standard
-supervised runtime. Vision, live draft publishing, the paper strategy, and
-post-match labeling remain manual research commands. Their historical data
-remains readable. The system never exposes a real betting endpoint.
+The operations view controls only the RayBet collector. It also shows current
+service health, strict mappings, and operational alerts.
 
-## Optional Research Commands
+## Stream And HUD
 
-The supervisor and monitoring console do not start the following research
-workers. Run them only for an explicit offline or manual investigation. All
-commands use `DATABASE_URL`; `--database-url` is available when an explicit
-override is needed.
+Signed HLS URLs are process-local capabilities. Do not store them in commands,
+logs, database rows, artifacts, health details, or API responses.
+
+The stream supervisor discovers RayBet matches, refreshes signed HLS access,
+captures frames, and publishes HUD observations:
 
 ```powershell
-$env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
-$rawDir = "data/live_betting/raw-v2"
-$visionJsonl = "data/live_betting/live_observations"
-
-# Optional one-shot/read-only RayBet odds collection
-python -m live_betting.monitor `
-  --raw-dir $rawDir --interval 6 --list-interval 30
-
-# Visual observation supervisor
+$env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
 python scripts/supervise_raybet_streams.py
+```
 
-# Shadow strategy (paper orders only)
-python scripts/run_comeback_shadow.py --vision-jsonl $visionJsonl
+A single stream can be inspected directly:
 
-# Strict approved-event scheduler
+```powershell
+python scripts/watch_raybet_stream.py --help
+python scripts/capture_raybet_stream.py --help
+```
+
+The retained Vision path includes hero slots, game clock, kills, net worth,
+Radiant/Dire orientation, pause state, screen state, OCR, confidence diagnostics,
+multi-frame evidence, the frame registry, evidence retention, and manual
+correction. HUD values are display and audit evidence only; P0/P1 never read
+them.
+
+## Prediction
+
+In the live match detail:
+
+1. Confirm the two canonical teams.
+2. Confirm ten unique heroes and positions 1-5.
+3. Lock a `LiveDraftMapping`.
+4. Select **生成实时阵容预测** while the map has no authoritative end/result.
+5. Review immutable P0/P1 evidence.
+
+Team Rating P0 restores the frozen prospective seed and chronologically replays
+only authoritative results available before the mapping lock time. It excludes
+the target map and future results.
+
+P1 uses candidate
+`84c4506f63b7c5b745b32373b0cb405383f837c60eae3231cc3d688a0b36e09d`
+with profile `legacy-dematus-pure-rosh-prospective-v1`. STRATZ request and
+response bytes are stored as content-addressed gzip artifacts and replayed
+offline with the frozen legacy pure-lineup scorer. Missing or invalid R.O.S.H.
+evidence produces P0-only with a stable reason.
+
+Saving a corrected lineup creates a new mapping version. Existing predictions
+remain bound to the version that created them.
+
+## Results
+
+Formal results are ingested through the approved OpenDota event registry:
+
+```powershell
+$env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
 python scripts/run_strict_event_ingest.py
+python scripts/run_postmatch_labeler.py
 ```
 
-RayBet rows with provider `status=1` are sampled once after entering the
-two-hour prematch window and retained as audit-only transports. High-frequency
-collection starts when RayBet first reports `status=2`; prematch transports
-cannot become strategy, watermark, successor, or fill inputs.
-
-Fresh signed HLS URLs are process-local capabilities. Do not put them in
-commands, logs, health details, database rows, artifacts, or Web responses.
-
-## Database
-
-PostgreSQL schema changes are managed only by Alembic:
-
-```powershell
-python -m alembic current
-python -m alembic upgrade head
-```
-
-To import the historical SQLite database once, first run a no-write inspection,
-then perform the direct import:
-
-```powershell
-python scripts/migrate_sqlite_to_postgres.py `
-  --sqlite data/dota2.db `
-  --postgres $env:DATABASE_URL `
-  --dry-run `
-  --report data/postgres-import-dry-run.json
-
-python scripts/migrate_sqlite_to_postgres.py `
-  --sqlite data/dota2.db `
-  --postgres $env:DATABASE_URL `
-  --report data/postgres-import.json
-```
-
-The importer opens SQLite read-only, upgrades PostgreSQL to Alembic `head`,
-imports in dependency order, repairs identity sequences, and verifies row
-counts, critical hashes, decisions, orders, settlements, and active alerts.
-It does not create a SQLite backup.
+The postmatch labeler requires strict map identity and consistent RayBet and
+OpenDota winners before writing `map_results`. It then appends live prediction
+settlements. Predictions are never updated during settlement.
 
 ## Verification
 
 ```powershell
-$env:DATABASE_URL = "postgresql+psycopg://dota2:dota2_local@localhost:5432/dota2_predictor"
-python -m ruff check .
-python -m pytest -q -m "not legacy_sqlite" --ignore=tests/integration/postgres
+$ruff = (Get-Command ruff).Source
+& $ruff check .
+
+$env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
+python -m pytest -q --ignore=tests/integration/postgres
 python -m pytest tests/integration/postgres -q
 
 Set-Location web/frontend
 npm test
 npm run build
 ```
-
-Tests that still construct SQLite runtime files or exercise retired SQLite
-operations are explicitly marked `legacy_sqlite`. They remain discoverable and
-must be rewritten against the PostgreSQL integration harness before the marker
-is removed.
-
-Dogfood logs, screenshots, `*.tsbuildinfo`, and local import reports are
-generated evidence and must not be staged.

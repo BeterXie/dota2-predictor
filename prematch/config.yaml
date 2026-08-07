@@ -1,3 +1,0 @@
-models_dir: "../data/models"
-prematch_model: "../data/models/prematch_latest.pkl"
-predictions_dir: "../data/predictions"

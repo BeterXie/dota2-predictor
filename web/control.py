@@ -52,17 +52,6 @@ COMPONENTS: dict[str, ComponentSpec] = {
         supervisor_component="raybet_worker",
         supervisor_timeout_seconds=90.0,
     ),
-    "mail_worker": ComponentSpec(
-        "Mail worker",
-        (
-            "-u",
-            "scripts/run_notification_worker.py",
-            "--schema-prepared",
-        ),
-        supervisor_component="mail_worker",
-        supervisor_timeout_seconds=180.0,
-        configuration_component="mail_delivery",
-    ),
 }
 
 if tuple(COMPONENTS) != CONTROL_COMPONENT_NAMES:
