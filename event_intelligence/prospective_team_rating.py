@@ -162,6 +162,10 @@ def _result_order(value: AuthoritativeResult) -> tuple[datetime, datetime, int]:
     return usable, value.row.started_at, value.row.match_id
 
 
+def _rating_replay_order(value: AuthoritativeResult) -> tuple[datetime, datetime, int]:
+    return value.row.started_at, value.row.completed_at, value.row.match_id
+
+
 def canonical_authoritative_results(
     values: Sequence[AuthoritativeResult],
     *,
@@ -190,6 +194,48 @@ def canonical_authoritative_results(
     return tuple(sorted(by_match.values(), key=_result_order))
 
 
+def canonical_team_rating_replay_results(
+    values: Sequence[AuthoritativeResult],
+) -> tuple[AuthoritativeResult, ...]:
+    by_match: dict[int, AuthoritativeResult] = {}
+    for value in values:
+        if not isinstance(value, AuthoritativeResult):
+            raise ValueError("results must contain AuthoritativeResult values")
+        match_id = value.row.match_id
+        existing = by_match.get(match_id)
+        if existing is not None and existing != value:
+            raise ValueError(f"conflicting result authority for match {match_id}")
+        by_match[match_id] = value
+    ordered = tuple(sorted(by_match.values(), key=_rating_replay_order))
+    last_completed_by_team: dict[int, datetime] = {}
+    for value in ordered:
+        row = value.row
+        for team_id in (row.radiant_team_id, row.dire_team_id):
+            previous_completed = last_completed_by_team.get(team_id)
+            if previous_completed is not None and row.started_at < previous_completed:
+                raise ValueError("overlapping_team_match_chronology")
+        last_completed_by_team[row.radiant_team_id] = row.completed_at
+        last_completed_by_team[row.dire_team_id] = row.completed_at
+    return ordered
+
+
+def _replay_team_rating_results(
+    values: Sequence[AuthoritativeResult],
+    *,
+    update_cutoff: datetime,
+    config: TeamRatingConfig,
+) -> tuple[tuple[AuthoritativeResult, ...], tuple[TeamRatingState, ...]]:
+    cutoff = _utc(update_cutoff, "Team Rating replay cutoff")
+    ordered = canonical_team_rating_replay_results(values)
+    states: tuple[TeamRatingState, ...] = ()
+    for result in ordered:
+        usable_at = result.row.result_usable_at
+        if usable_at is None or usable_at > cutoff:
+            raise ValueError("result follows Team Rating replay cutoff")
+        states = update_team_ratings(states, result.row, cutoff, config)
+    return ordered, states
+
+
 @dataclass(frozen=True)
 class ProspectiveTeamRatingSeed:
     seed_hash: str
@@ -199,6 +245,8 @@ class ProspectiveTeamRatingSeed:
     seed_training_cutoff: datetime
     source_manifest: tuple[AuthoritativeResult, ...]
     source_manifest_hash: str
+    rating_replay_order: tuple[AuthoritativeResult, ...]
+    rating_replay_order_hash: str
     states: tuple[TeamRatingState, ...]
     state_hash: str
     artifact_json: str
@@ -227,6 +275,14 @@ class ProspectiveTeamRatingSeed:
             self,
             "source_manifest_hash",
             _sha256(self.source_manifest_hash, "source_manifest_hash"),
+        )
+        object.__setattr__(
+            self, "rating_replay_order", tuple(self.rating_replay_order)
+        )
+        object.__setattr__(
+            self,
+            "rating_replay_order_hash",
+            _sha256(self.rating_replay_order_hash, "rating_replay_order_hash"),
         )
         object.__setattr__(
             self, "states", canonical_rating_states(self.states)
@@ -260,14 +316,16 @@ def _build_prospective_team_rating_seed(
         after=None,
         cutoff=cutoff,
     )
-    states: tuple[TeamRatingState, ...] = ()
-    for result in ordered:
-        usable_at = result.row.result_usable_at
-        if usable_at is None:
-            raise AssertionError("validated seed result lacks availability")
-        states = update_team_ratings(states, result.row, usable_at, config)
+    replay_order, states = _replay_team_rating_results(
+        ordered,
+        update_cutoff=cutoff,
+        config=config,
+    )
     configuration_json = _canonical_json(config.to_payload())
     source_json = _canonical_json([result.to_payload() for result in ordered])
+    replay_json = _canonical_json(
+        [result.to_payload() for result in replay_order]
+    )
     state_json = _canonical_json(_state_payload(states))
     artifact_payload = {
         "version": PROSPECTIVE_TEAM_RATING_VERSION,
@@ -278,6 +336,8 @@ def _build_prospective_team_rating_seed(
         "seed_training_cutoff": cutoff.isoformat(),
         "source_manifest": [result.to_payload() for result in ordered],
         "source_manifest_hash": _hash_text(source_json),
+        "rating_replay_order": [result.to_payload() for result in replay_order],
+        "rating_replay_order_hash": _hash_text(replay_json),
         "states": _state_payload(states),
         "state_hash": _hash_text(state_json),
         "frozen_at": frozen.isoformat(),
@@ -292,6 +352,8 @@ def _build_prospective_team_rating_seed(
         seed_training_cutoff=cutoff,
         source_manifest=ordered,
         source_manifest_hash=_hash_text(source_json),
+        rating_replay_order=replay_order,
+        rating_replay_order_hash=_hash_text(replay_json),
         states=states,
         state_hash=_hash_text(state_json),
         artifact_json=artifact_json,
@@ -334,6 +396,39 @@ def verify_prospective_team_rating_seed(seed: ProspectiveTeamRatingSeed) -> None
         raise ValueError("prospective Team Rating seed exact replay disagrees")
 
 
+def rebuild_prospective_team_rating_state(
+    seed: ProspectiveTeamRatingSeed,
+    applied_results: Sequence[AuthoritativeResult],
+    *,
+    cutoff: datetime,
+    target_match_id: int | None,
+) -> tuple[
+    tuple[AuthoritativeResult, ...],
+    tuple[AuthoritativeResult, ...],
+    tuple[TeamRatingState, ...],
+]:
+    verify_prospective_team_rating_seed(seed)
+    cutoff_at = _utc(cutoff, "prospective Team Rating cutoff")
+    applied = canonical_authoritative_results(
+        applied_results,
+        after=seed.seed_as_of,
+        cutoff=cutoff_at,
+        target_match_id=target_match_id,
+    )
+    complete_authority = canonical_authoritative_results(
+        (*seed.source_manifest, *applied),
+        after=None,
+        cutoff=cutoff_at,
+        target_match_id=target_match_id,
+    )
+    replay_order, states = _replay_team_rating_results(
+        complete_authority,
+        update_cutoff=cutoff_at,
+        config=seed.config,
+    )
+    return applied, replay_order, states
+
+
 @dataclass(frozen=True)
 class ProspectiveTarget:
     target: TeamRatingTarget
@@ -368,6 +463,8 @@ class ProspectiveTeamRatingRun:
     base_state_hash: str
     base_states: tuple[TeamRatingState, ...]
     applied_results: tuple[AuthoritativeResult, ...]
+    rating_replay_order: tuple[AuthoritativeResult, ...]
+    rating_replay_order_hash: str
     state_before_target: tuple[TeamRatingState, ...]
     target: ProspectiveTarget
     prediction: TeamRatingPrediction
@@ -395,6 +492,14 @@ class ProspectiveTeamRatingRun:
             self, "base_states", canonical_rating_states(self.base_states)
         )
         object.__setattr__(self, "applied_results", tuple(self.applied_results))
+        object.__setattr__(
+            self, "rating_replay_order", tuple(self.rating_replay_order)
+        )
+        object.__setattr__(
+            self,
+            "rating_replay_order_hash",
+            _sha256(self.rating_replay_order_hash, "rating_replay_order_hash"),
+        )
         object.__setattr__(
             self,
             "state_before_target",
@@ -439,23 +544,20 @@ def _build_prospective_run(
     base_at = _utc(base_as_of, "base_as_of")
     if base_at > target.prediction_cutoff:
         raise ValueError("base state follows prospective cutoff")
-    if base_authority_hash is None:
-        if base_at != seed.seed_as_of or canonical_rating_states(base_states) != seed.states:
-            raise ValueError("initial prospective state must equal the frozen seed")
+    if (
+        base_authority_hash is not None
+        or base_at != seed.seed_as_of
+        or canonical_rating_states(base_states) != seed.states
+    ):
+        raise ValueError("prospective Team Rating must rebuild from the frozen seed authority")
     base = canonical_rating_states(base_states)
     base_hash = team_rating_state_hash(base)
-    ordered = canonical_authoritative_results(
+    ordered, replay_order, states = rebuild_prospective_team_rating_state(
+        seed,
         applied_results,
-        after=base_at,
         cutoff=target.prediction_cutoff,
         target_match_id=target.target.match_id,
     )
-    states = base
-    for result in ordered:
-        usable_at = result.row.result_usable_at
-        if usable_at is None:
-            raise AssertionError("validated applied result lacks availability")
-        states = update_team_ratings(states, result.row, usable_at, seed.config)
     prediction = predict_team_rating(
         states,
         target.target,
@@ -463,6 +565,9 @@ def _build_prospective_run(
         seed.config,
     )
     applied_json = _canonical_json([result.to_payload() for result in ordered])
+    replay_json = _canonical_json(
+        [result.to_payload() for result in replay_order]
+    )
     target_json = _canonical_json(target.to_payload())
     state_json = _canonical_json(_state_payload(states))
     configuration_json = _canonical_json(seed.config.to_payload())
@@ -474,6 +579,7 @@ def _build_prospective_run(
         "base_as_of": base_at.isoformat(),
         "base_state_hash": base_hash,
         "applied_result_manifest_hash": _hash_text(applied_json),
+        "rating_replay_order_hash": _hash_text(replay_json),
         "state_before_hash": _hash_text(state_json),
         "target_manifest_hash": _hash_text(target_json),
         "prediction_cutoff": target.prediction_cutoff.isoformat(),
@@ -493,6 +599,8 @@ def _build_prospective_run(
         "base_state_hash": base_hash,
         "applied_results": [result.to_payload() for result in ordered],
         "applied_result_manifest_hash": _hash_text(applied_json),
+        "rating_replay_order": [result.to_payload() for result in replay_order],
+        "rating_replay_order_hash": _hash_text(replay_json),
         "state_before_target": _state_payload(states),
         "state_before_hash": _hash_text(state_json),
         "target": target.to_payload(),
@@ -518,6 +626,8 @@ def _build_prospective_run(
         base_state_hash=base_hash,
         base_states=base,
         applied_results=ordered,
+        rating_replay_order=replay_order,
+        rating_replay_order_hash=_hash_text(replay_json),
         state_before_target=states,
         target=target,
         prediction=prediction,
@@ -591,6 +701,7 @@ def build_prospective_team_rating_storage_records(
                     [result.to_payload() for result in run.applied_results]
                 )
             ),
+            "rating_replay_order_hash": run.rating_replay_order_hash,
             "target_manifest_hash": _hash_text(
                 _canonical_json(run.target.to_payload())
             ),
@@ -714,6 +825,10 @@ def load_prospective_team_rating_seed_json(
             _result_from_payload(value) for value in row["source_manifest"]
         ),
         source_manifest_hash=row["source_manifest_hash"],
+        rating_replay_order=tuple(
+            _result_from_payload(value) for value in row["rating_replay_order"]
+        ),
+        rating_replay_order_hash=row["rating_replay_order_hash"],
         states=tuple(_state_from_payload(value) for value in row["states"]),
         state_hash=row["state_hash"],
         artifact_json=artifact_json,
@@ -944,34 +1059,9 @@ class ProspectiveTeamRatingRepository:
         prediction_cutoff: datetime,
     ) -> BaseState:
         cutoff = _utc(prediction_cutoff, "prediction_cutoff")
-        row = self.connection.execute(
-            """SELECT authority_hash, available_at,
-                      state_before_json, state_before_hash
-                 FROM prospective_team_rating_authorities
-                WHERE seed_hash=?
-                  AND configuration_hash=?
-                  AND live_text_timestamp_utc(prediction_cutoff)
-                      <= live_text_timestamp_utc(?)
-                ORDER BY live_text_timestamp_utc(prediction_cutoff) DESC,
-                         match_id DESC
-                LIMIT 1""",
-            (seed.seed_hash, seed.configuration_hash, cutoff.isoformat()),
-        ).fetchone()
-        if row is None:
-            return BaseState(None, seed.seed_as_of, seed.state_hash, seed.states)
-        state_json = str(row["state_before_json"])
-        if _hash_text(state_json) != row["state_before_hash"]:
-            raise ValueError("prospective Team Rating state hash disagrees")
-        values = json.loads(state_json)
-        states = tuple(_state_from_payload(value) for value in values)
-        if team_rating_state_hash(states) != row["state_before_hash"]:
-            raise ValueError("prospective Team Rating state replay disagrees")
-        return BaseState(
-            str(row["authority_hash"]),
-            _parse_utc(row["available_at"], "base available_at"),
-            str(row["state_before_hash"]),
-            states,
-        )
+        if seed.seed_as_of > cutoff:
+            raise ValueError("seed state follows prospective cutoff")
+        return BaseState(None, seed.seed_as_of, seed.state_hash, seed.states)
 
     def load_results(
         self,
@@ -979,7 +1069,7 @@ class ProspectiveTeamRatingRepository:
         after: datetime,
         cutoff: datetime,
         observed_at: datetime,
-        target_match_id: int,
+        target_match_id: int | None,
         allow_seed_observation: bool = False,
     ) -> tuple[AuthoritativeResult, ...]:
         after_at = _utc(after, "result lower bound")
@@ -990,11 +1080,18 @@ class ProspectiveTeamRatingRepository:
         availability_cutoff = (
             cutoff_at if allow_seed_observation else min(cutoff_at, observed)
         )
+        target_filter = "" if target_match_id is None else "AND result.match_id <> ?"
+        parameters: tuple[object, ...] = (
+            after_at.isoformat(),
+            availability_cutoff.isoformat(),
+        )
+        if target_match_id is not None:
+            parameters += (target_match_id,)
         rows = self.connection.execute(
-            """SELECT result.match_id, status.series_id, status.event_id,
-                      result.start_time, result.duration,
-                      result.radiant_team_id, result.dire_team_id,
-                      result.radiant_win, status.first_usable_at,
+            f"""SELECT result.match_id, status.series_id, status.event_id,
+                       result.start_time, result.duration,
+                       result.radiant_team_id, result.dire_team_id,
+                       result.radiant_win, status.first_usable_at,
                       status.latest_raw_content_hash
                  FROM formal_map_eligibility AS eligible
                  JOIN matches AS result ON result.match_id=eligible.match_id
@@ -1002,21 +1099,17 @@ class ProspectiveTeamRatingRepository:
                    ON status.match_id=result.match_id
                 WHERE live_text_timestamp_utc(status.first_usable_at)
                           > live_text_timestamp_utc(?)
-                  AND live_text_timestamp_utc(status.first_usable_at)
-                          <= live_text_timestamp_utc(?)
-                  AND result.match_id <> ?
-                  AND result.radiant_win IS NOT NULL
+                   AND live_text_timestamp_utc(status.first_usable_at)
+                           <= live_text_timestamp_utc(?)
+                   {target_filter}
+                   AND result.radiant_win IS NOT NULL
                   AND result.duration > 0
                   AND result.radiant_team_id IS NOT NULL
                   AND result.dire_team_id IS NOT NULL
                   AND status.latest_raw_content_hash IS NOT NULL
                 ORDER BY live_text_timestamp_utc(status.first_usable_at),
                          result.start_time, result.match_id""",
-            (
-                after_at.isoformat(),
-                availability_cutoff.isoformat(),
-                target_match_id,
-            ),
+            parameters,
         ).fetchall()
         player_rows = self.connection.execute(
             """SELECT player.match_id, player.account_id, player.is_radiant
@@ -1552,8 +1645,10 @@ __all__ = [
     "build_prospective_team_rating_seed",
     "build_prospective_team_rating_storage_records",
     "canonical_authoritative_results",
+    "canonical_team_rating_replay_results",
     "load_prospective_team_rating_seed_json",
     "produce_match",
+    "rebuild_prospective_team_rating_state",
     "run_producer_once",
     "team_rating_state_hash",
     "verify_prospective_team_rating_run",

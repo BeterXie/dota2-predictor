@@ -1,0 +1,9 @@
+{
+  "config_version": "team-rating-elo-v1",
+  "inactivity_half_life_days": 180.0,
+  "initial_rating": 1500.0,
+  "k_factor": 24.0,
+  "radiant_side_logit": 0.041210268646663106,
+  "roster_carry_power": 2.0,
+  "scale": 200.0
+}

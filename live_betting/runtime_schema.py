@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database.session import PostgresSession
 
 
-ALEMBIC_HEAD = "20260807_0033"
+ALEMBIC_HEAD = "20260807_0034"
 CURRENT_RUNTIME_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_CONTRACT_DIGEST = (
     "eb58ed6794cd39cdf4b9947a9132f2c2683cb20c769770586e3ca5c9f093beb9"
@@ -26,6 +26,8 @@ _REQUIRED_TABLES = frozenset(
         "monitor_process_registry",
         "monitor_control_audit",
         "monitor_alert_candidates",
+        "live_draft_prospective_predictions",
+        "live_draft_prospective_settlements",
         "monitor_alert_incidents",
         "monitor_alert_audit",
     }
