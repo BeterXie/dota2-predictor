@@ -254,7 +254,7 @@ def test_team_rating_schema_has_exact_tables_constraints_and_indexes(
                 )
             ).scalars()
         )
-    assert revision == "20260806_0031"
+    assert revision == "20260807_0032"
     assert TEAM_RATING_TRIGGERS <= triggers
 
 
