@@ -29,6 +29,8 @@ export interface VisionPoint {
   confirmed: number;
   clock_confidence: number;
   draft_confidence: number;
+  radiant_hero_ids?: number[];
+  dire_hero_ids?: number[];
   source_frame_ref?: string;
   frame_digest?: string | null;
   frame_url?: string | null;
@@ -100,6 +102,12 @@ export interface LiveDraftContext {
   reason: string;
   source: string;
   teams: LiveDraftContextTeam[];
+}
+
+export interface CanonicalTeam {
+  team_id: number;
+  team_name: string;
+  tag: string | null;
 }
 
 export interface LiveGameSnapshot {

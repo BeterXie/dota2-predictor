@@ -76,3 +76,24 @@ def get_hero_grid() -> dict[str, list[dict]]:
             "image_url": f"{IMG_BASE}/{key}.png" if key else "",
         })
     return grouped
+
+
+def get_team_grid() -> list[dict[str, object]]:
+    """Return canonical teams for explicit operator selection."""
+    rows = _safe_execute(
+        """SELECT team_id, name, tag
+             FROM teams
+            WHERE team_id > 0
+              AND (NULLIF(BTRIM(name), '') IS NOT NULL
+                   OR NULLIF(BTRIM(tag), '') IS NOT NULL)
+            ORDER BY COALESCE(NULLIF(BTRIM(name), ''), BTRIM(tag)), team_id""",
+        fetch="all",
+    )
+    return [
+        {
+            "team_id": int(row["team_id"]),
+            "team_name": str(row.get("name") or row.get("tag") or "").strip(),
+            "tag": str(row.get("tag") or "").strip() or None,
+        }
+        for row in rows
+    ]

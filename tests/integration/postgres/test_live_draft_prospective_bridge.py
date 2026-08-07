@@ -27,6 +27,7 @@ from live_betting.stratz_rosh_client import (
     FetchedLegacyRoshBatch,
     StratzRoshError,
 )
+from scripts.freeze_prospective_team_rating_seed import freeze_seed
 from prematch.stratz_rosh import build_rosh_query_requests
 
 
@@ -83,6 +84,32 @@ def _store_seed(repository: ProspectiveTeamRatingRepository) -> None:
         frozen_at=FROZEN_AT,
     )
     assert repository.store_seed(seed)
+
+
+def test_operational_seed_freezer_is_idempotent(postgres_engine) -> None:
+    session = PostgresSession(postgres_engine)
+    try:
+        first = freeze_seed(
+            session,
+            seed_cutoff=SEED_CUTOFF,
+            frozen_at=FROZEN_AT,
+        )
+        second = freeze_seed(
+            session,
+            seed_cutoff=SEED_CUTOFF,
+            frozen_at=FROZEN_AT,
+        )
+        stored = ProspectiveTeamRatingRepository(session).load_seed(TARGET_ORIGIN)
+    finally:
+        session.close()
+
+    assert first["status"] == "stored"
+    assert first["configuration_hash"] == (
+        "b527319ab1035d6cae6550820cd0854b467f845537d033909b4f2e45e706c19a"
+    )
+    assert second["status"] == "unchanged"
+    assert stored is not None
+    assert stored.seed_hash == first["seed_hash"]
 
 
 def _slots(*, reverse: bool = False) -> list[DraftSlotInput]:

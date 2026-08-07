@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
 
-from . import control, queries
+from . import queries
 from .routers import control as control_router
 from .routers import mappings, monitor
 
@@ -21,8 +21,8 @@ async def _lifespan(_: FastAPI):
     try:
         yield
     finally:
-        control.control_sessions.clear()
-        control.control_service.close()
+        control_router.control_sessions.clear()
+        control_router.control_service.close()
 
 
 app = FastAPI(
@@ -52,6 +52,11 @@ def favicon() -> Response:
 @app.get("/api/hero-grid", tags=["monitor"])
 def hero_grid() -> dict[str, object]:
     return queries.get_hero_grid()
+
+
+@app.get("/api/team-grid", tags=["monitor"])
+def team_grid() -> list[dict[str, object]]:
+    return queries.get_team_grid()
 
 
 @app.get("/monitor", include_in_schema=False)

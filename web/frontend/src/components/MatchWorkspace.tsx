@@ -28,6 +28,13 @@ export function MatchWorkspace({
   csrfToken = null,
 }: MatchWorkspaceProps) {
   if (!match) {
+    if (loading) {
+      return (
+        <main className="workspace">
+          <WorkspaceSkeleton />
+        </main>
+      );
+    }
     return (
       <main className="workspace workspace-empty">
         <ChartLineUp size={32} aria-hidden="true" />

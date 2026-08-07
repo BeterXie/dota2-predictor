@@ -1,4 +1,4 @@
-import { Input } from "@fluentui/react-components";
+import { Button, Input } from "@fluentui/react-components";
 import { CaretRight, MagnifyingGlass } from "@phosphor-icons/react";
 import { useMemo, useState } from "react";
 
@@ -8,14 +8,27 @@ import { LifecycleBadge } from "./StatusBadge";
 
 
 interface MatchRailProps {
+  hasMore?: boolean;
+  loadError?: string | null;
+  loadingMore?: boolean;
   matches: MonitorMatch[];
   mode: "live" | "history";
   selectedId: string | null;
+  onLoadMore?: () => void;
   onSelect: (matchId: string) => void;
 }
 
 
-export function MatchRail({ matches, mode, selectedId, onSelect }: MatchRailProps) {
+export function MatchRail({
+  hasMore = false,
+  loadError = null,
+  loadingMore = false,
+  matches,
+  mode,
+  onLoadMore,
+  onSelect,
+  selectedId,
+}: MatchRailProps) {
   const [query, setQuery] = useState("");
   const visible = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase("zh-CN");
@@ -66,7 +79,25 @@ export function MatchRail({ matches, mode, selectedId, onSelect }: MatchRailProp
             <CaretRight size={16} aria-hidden="true" />
           </button>
         ))}
-        {!visible.length && <div className="subtle-empty">暂无赛事</div>}
+        {!visible.length && (
+          <div className="subtle-empty">
+            {mode === "history" && loadingMore ? "正在加载历史赛事…" : "暂无赛事"}
+          </div>
+        )}
+        {mode === "history" && (hasMore || loadError) && (
+          <div className="rail-pagination">
+            {loadError && <p role="alert">{loadError}</p>}
+            {hasMore && onLoadMore && (
+              <Button
+                disabled={loadingMore}
+                onClick={onLoadMore}
+                type="button"
+              >
+                {loadingMore ? "正在加载…" : "加载更多历史赛事"}
+              </Button>
+            )}
+          </div>
+        )}
       </div>
     </aside>
   );

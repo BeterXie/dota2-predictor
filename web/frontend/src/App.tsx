@@ -36,6 +36,10 @@ export default function App() {
   const [view, setView] = useState<ViewMode>(initialView);
   const [snapshot, setSnapshot] = useState<MonitorSnapshot | null>(null);
   const [history, setHistory] = useState<MonitorMatch[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MatchDetail | null>(null);
   const [loading, setLoading] = useState(false);
@@ -69,10 +73,21 @@ export default function App() {
   useEffect(() => {
     if (view !== "replay") return undefined;
     const controller = new AbortController();
+    setHistoryLoading(true);
+    setHistoryError(null);
     fetchMonitorHistory(null, controller.signal).then((page) => {
-      setHistory(page.items);
+      if (page.has_more && !page.next_cursor) {
+        throw new Error("历史分页响应缺少游标");
+      }
+      setHistory(dedupeMatches(page.items));
+      setHistoryCursor(page.next_cursor);
+      setHistoryHasMore(page.has_more);
     }).catch((reason: Error) => {
-      if (reason.name !== "AbortError") setError(reason.message || "无法加载历史赛事");
+      if (reason.name !== "AbortError") {
+        setHistoryError(reason.message || "无法加载历史赛事");
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setHistoryLoading(false);
     });
     return () => controller.abort();
   }, [view]);
@@ -186,6 +201,26 @@ export default function App() {
     }
   };
 
+  const loadMoreHistory = async () => {
+    if (!historyHasMore || !historyCursor || historyLoading) return;
+    const requestedCursor = historyCursor;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const page = await fetchMonitorHistory(requestedCursor);
+      if (page.has_more && (!page.next_cursor || page.next_cursor === requestedCursor)) {
+        throw new Error("历史分页游标没有向前推进");
+      }
+      setHistory((current) => dedupeMatches([...current, ...page.items]));
+      setHistoryCursor(page.next_cursor);
+      setHistoryHasMore(page.has_more);
+    } catch (reason) {
+      setHistoryError(reason instanceof Error ? reason.message : "无法加载更多历史赛事");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -208,8 +243,12 @@ export default function App() {
       {error && <div className="global-error" role="alert">{error}</div>}
       <div className="app-content">
         <MatchRail
+          hasMore={view === "replay" && historyHasMore}
+          loadError={view === "replay" ? historyError : null}
+          loadingMore={view === "replay" && historyLoading}
           matches={visibleMatches}
           mode={view === "replay" ? "history" : "live"}
+          onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
           onSelect={setSelectedId}
           selectedId={selectedId}
         />
@@ -237,7 +276,7 @@ export default function App() {
             csrfToken={controlSession?.csrf_token || null}
             detail={detail}
             error={error}
-            loading={loading}
+            loading={loading || (view === "replay" && historyLoading && history.length === 0)}
             match={selectedMatch}
             replay={view === "replay"}
           />
@@ -258,4 +297,9 @@ function preferredMatch(matches: MonitorMatch[]): string | null {
   return matches.find((match) => match.lifecycle === "live")?.raybet_match_id
     || matches.find((match) => match.lifecycle !== "ended")?.raybet_match_id
     || null;
+}
+
+
+function dedupeMatches(matches: MonitorMatch[]): MonitorMatch[] {
+  return [...new Map(matches.map((match) => [match.raybet_match_id, match])).values()];
 }

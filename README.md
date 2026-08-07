@@ -91,6 +91,15 @@ Team Rating P0 restores the frozen prospective seed and chronologically replays
 only authoritative results available before the mapping lock time. It excludes
 the target map and future results.
 
+Freeze that seed once from the accepted Team Rating configuration before live
+collection starts. Run the dry-run first, then repeat without `--dry-run` after
+checking the reported support and hash:
+
+```powershell
+python scripts/freeze_prospective_team_rating_seed.py --seed-cutoff 2026-08-07T00:00:00+00:00 --dry-run
+python scripts/freeze_prospective_team_rating_seed.py --seed-cutoff 2026-08-07T00:00:00+00:00
+```
+
 P1 uses candidate
 `84c4506f63b7c5b745b32373b0cb405383f837c60eae3231cc3d688a0b36e09d`
 with profile `legacy-dematus-pure-rosh-prospective-v1`. STRATZ request and
