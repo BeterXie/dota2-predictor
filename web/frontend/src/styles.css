@@ -1604,6 +1604,40 @@ summary:focus-visible {
   min-width: 0;
 }
 
+.odds-chart-summary {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) repeat(2, minmax(150px, 1fr));
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.odds-chart-summary div {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-raised);
+}
+
+.odds-chart-summary dt {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.odds-chart-summary dd {
+  overflow: hidden;
+  margin: 3px 0 0;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .postmatch-section {
   margin-top: 12px;
   padding: 14px 16px 16px;
@@ -5412,6 +5446,15 @@ body {
 @media (max-width: 760px) {
   .live-team-selectors {
     grid-template-columns: 1fr;
+  }
+
+  .odds-chart-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .method-note {
+    max-width: 130px;
+    text-align: right;
   }
 }
 

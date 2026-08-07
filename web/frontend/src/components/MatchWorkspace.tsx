@@ -1,10 +1,16 @@
 import { Skeleton, SkeletonItem } from "@fluentui/react-components";
 import { ChartLineUp, WarningCircle } from "@phosphor-icons/react";
+import { lazy, Suspense } from "react";
 
 import { formatOdds, formatPercent } from "../format";
 import type { MatchDetail, MonitorMatch, VisionPoint } from "../types";
 import { LiveDataControls } from "./live/LiveDataControls";
 import { LiveScoreboard } from "./live/LiveScoreboard";
+
+
+const OddsProbabilityChart = lazy(() => import("./OddsProbabilityChart").then((module) => ({
+  default: module.OddsProbabilityChart,
+})));
 
 
 interface MatchWorkspaceProps {
@@ -86,6 +92,27 @@ export function MatchWorkspace({
           <WarningCircle size={18} aria-hidden="true" />
           <span>{error}</span>
         </div>
+      )}
+
+      {detail && (
+        <section className="workspace-section chart-section" aria-label="赔率概率柱状图">
+          <div className="section-heading compact">
+            <div>
+              <h2>赔率概率柱状图</h2>
+              <p>每根柱代表一次完整双方胜负盘；堆叠高度为 100%，用于比较市场方向随采集时间的变化。</p>
+            </div>
+            <span className="method-note">去水概率 · 不进入 P0/P1</span>
+          </div>
+          <Suspense fallback={<div className="chart-empty"><span>正在加载赔率图</span></div>}>
+            <OddsProbabilityChart
+              key={match.raybet_match_id}
+              preferredPeriod={winner?.period || null}
+              teamOne={match.team_one || "队伍一"}
+              teamTwo={match.team_two || "队伍二"}
+              timeline={detail.winner_timeline}
+            />
+          </Suspense>
+        </section>
       )}
 
       {loading && !detail ? <WorkspaceSkeleton /> : detail && (
