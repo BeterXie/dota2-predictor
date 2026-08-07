@@ -23,10 +23,16 @@ class Response:
         payload: dict[str, Any],
         status_code: int = 200,
         headers: dict[str, str] | None = None,
+        content: bytes | None = None,
     ) -> None:
         self.payload = payload
         self.status_code = status_code
         self.headers = headers or {}
+        self.content = (
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            if content is None
+            else content
+        )
 
     def json(self) -> dict[str, Any]:
         return self.payload
@@ -139,6 +145,53 @@ def historical_post(
         return Response(data["responses"][key])
 
     return post
+
+
+def test_legacy_lineup_batch_preserves_exact_request_and_response_bytes() -> None:
+    data = fixture()
+    collected_at = datetime(2026, 8, 7, 1, 2, 3, tzinfo=timezone.utc)
+    sent: list[bytes] = []
+    raw_by_operation: dict[str, bytes] = {}
+
+    def post(_url: str, **kwargs: Any) -> Response:
+        body = bytes(kwargs["data"])
+        sent.append(body)
+        payload = json.loads(body)
+        operation = payload["operationName"]
+        key = {
+            "HeroesMetaPositionsByWeek": "heroes_meta_positions",
+            "GetHeroStatsByTime": "hero_stats_by_time_bracket",
+            "Synergy": "synergy",
+        }[operation]
+        raw = ("  " + json.dumps(data["responses"][key]) + "\n").encode("utf-8")
+        raw_by_operation[key] = raw
+        return Response(data["responses"][key], content=raw)
+
+    result = StratzRoshClient(
+        "private-token",
+        post=post,
+        clock=lambda: collected_at,
+    ).fetch_legacy_lineup_batch(
+        data["radiant_heroes"],
+        data["dire_heroes"],
+        statistics_cutoff=collected_at - timedelta(seconds=30),
+    )
+
+    assert result.collected_at == collected_at
+    assert tuple(result.request_bodies) == (
+        "heroes_meta_positions",
+        "hero_stats_by_time_bracket",
+        "synergy",
+    )
+    assert tuple(result.response_bodies) == tuple(result.request_bodies)
+    assert list(result.request_bodies.values()) == sent
+    assert dict(result.response_bodies) == raw_by_operation
+    for body in sent:
+        payload = json.loads(body)
+        assert set(payload) == {"operationName", "query", "variables"}
+        assert payload["variables"].get("week", payload["variables"].get("currentWeek")) <= int(
+            (collected_at - timedelta(seconds=30)).timestamp()
+        )
 
 
 def test_historical_match_query_requests_player_identity_fields() -> None:

@@ -131,6 +131,15 @@ class OfficialRoshBatch:
     diagnostics: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class FetchedLegacyRoshBatch:
+    """Exact transport bytes for the frozen legacy pure-lineup operations."""
+
+    request_bodies: Mapping[str, bytes] = field(repr=False)
+    response_bodies: Mapping[str, bytes] = field(repr=False)
+    collected_at: datetime
+
+
 def resolve_stratz_api_token(
     environment: Mapping[str, str] | None = None,
 ) -> str | None:
@@ -437,6 +446,39 @@ class StratzRoshClient:
             evidence_hash=canonical_evidence_hash(evidence),
         )
 
+    def fetch_legacy_lineup_batch(
+        self,
+        radiant_heroes: Sequence[int],
+        dire_heroes: Sequence[int],
+        *,
+        statistics_cutoff: datetime,
+    ) -> FetchedLegacyRoshBatch:
+        """Fetch the three frozen legacy operations without losing transport bytes."""
+
+        radiant = _trusted_hero_slots(radiant_heroes, "radiant")
+        dire = _trusted_hero_slots(dire_heroes, "dire")
+        if set(radiant) & set(dire):
+            raise ValueError("radiant and dire hero IDs must not overlap")
+        cutoff = _utc(statistics_cutoff)
+        requests = build_rosh_query_requests(
+            (*radiant, *dire),
+            int(cutoff.timestamp()),
+        )
+        request_bodies: dict[str, bytes] = {}
+        response_bodies: dict[str, bytes] = {}
+        for operation, request in requests.items():
+            request_body = _legacy_request_body(request)
+            request_bodies[operation] = request_body
+            response_bodies[operation] = self._request_exact_bytes(
+                request,
+                request_body=request_body,
+            )
+        return FetchedLegacyRoshBatch(
+            request_bodies=MappingProxyType(request_bodies),
+            response_bodies=MappingProxyType(response_bodies),
+            collected_at=_utc(self._clock()),
+        )
+
     def _fetch_player_highlights(
         self,
         players: Sequence[Mapping[str, Any]],
@@ -727,6 +769,97 @@ class StratzRoshClient:
             )
         return payload
 
+    def _request_exact_bytes(
+        self,
+        request: Mapping[str, Any],
+        *,
+        request_body: bytes,
+    ) -> bytes:
+        """Execute one legacy request and return the exact validated response bytes."""
+
+        query = request.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise StratzRoshError("STRATZ GraphQL query is empty")
+        if self._stop_requested():
+            raise StratzRoshError(
+                "STRATZ request cancelled",
+                category="request_cancelled",
+            )
+        try:
+            response = self._post(
+                self.endpoint,
+                data=request_body,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+                impersonate="chrome120",
+                timeout=self.timeout_seconds,
+            )
+        except Exception as error:
+            raise StratzRoshError(
+                f"STRATZ request failed ({type(error).__name__})",
+                retryable=True,
+                category="network_failure",
+            ) from None
+        status = getattr(response, "status_code", None)
+        if status != 200:
+            retry_after = _retry_after_seconds(response)
+            retryable = status == 429 or (
+                type(status) is int and 500 <= status <= 599
+            )
+            category = (
+                "http_auth_failure"
+                if status in {401, 403}
+                else "http_429"
+                if status == 429
+                else "http_5xx"
+                if type(status) is int and 500 <= status <= 599
+                else "http_failure"
+            )
+            raise StratzRoshError(
+                f"STRATZ request returned HTTP {status}",
+                retryable=retryable,
+                retry_after_seconds=retry_after,
+                category=category,
+            )
+        raw = getattr(response, "content", None)
+        if not isinstance(raw, (bytes, bytearray)):
+            raise StratzRoshError(
+                "STRATZ response body is unavailable",
+                category="invalid_response",
+            )
+        response_body = bytes(raw)
+        try:
+            payload = json.loads(
+                response_body.decode("utf-8"),
+                parse_constant=_reject_non_finite_json_constant,
+            )
+        except (UnicodeError, ValueError):
+            raise StratzRoshError(
+                "STRATZ returned invalid JSON",
+                category="invalid_json",
+            ) from None
+        if not isinstance(payload, Mapping):
+            raise StratzRoshError(
+                "STRATZ returned a non-object response",
+                category="invalid_response",
+            )
+        if payload.get("errors"):
+            retryable, category = _graphql_retry_policy(payload.get("errors"))
+            raise StratzRoshError(
+                "STRATZ GraphQL request failed",
+                retryable=retryable,
+                retry_after_seconds=_retry_after_seconds(response),
+                category=category,
+            )
+        if not isinstance(payload.get("data"), Mapping):
+            raise StratzRoshError(
+                "STRATZ GraphQL response has no data",
+                category="invalid_response",
+            )
+        return response_body
+
 
 def _validate_official_plan_and_endpoint(
     plan: RoshRequestPlan,
@@ -749,6 +882,32 @@ def _validate_official_plan_and_endpoint(
             "STRATZ official endpoint failed profile validation",
             category="profile_drift",
         )
+
+
+def _legacy_request_body(request: Mapping[str, Any]) -> bytes:
+    query = request.get("query")
+    variables = request.get("variables")
+    if not isinstance(query, str) or not query.strip():
+        raise StratzRoshError("STRATZ GraphQL query is empty")
+    if not isinstance(variables, Mapping):
+        raise StratzRoshError("STRATZ GraphQL variables are invalid")
+    try:
+        return json.dumps(
+            {
+                "operationName": request.get("operation_name"),
+                "query": query,
+                "variables": dict(variables),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise StratzRoshError(
+            "STRATZ legacy request serialization failed",
+            category="profile_drift",
+        ) from None
 
 
 def _official_request_body(plan: RoshRequestPlan) -> bytes:

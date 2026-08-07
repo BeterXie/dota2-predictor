@@ -725,6 +725,8 @@ class SettledShadowRow:
     outcome: int | None
     event_id: str
     patch: int | None
+    causal_eligible: bool = True
+    causal_exclusion_reason: str | None = None
 
     @property
     def month(self) -> str:
@@ -904,6 +906,7 @@ def build_shadow_evaluation(
         if row.record_status == "paired"
         and row.p1_probability is not None
         and row.outcome is not None
+        and row.causal_eligible
     )
     if len(paired) < stage:
         raise ValueError(f"stage {stage} requires {stage} settled paired maps")
@@ -945,6 +948,19 @@ def build_shadow_evaluation(
         "candidate_labels": list(candidate.labels),
         "deployment_evidence": False,
         "candidate_mutation_allowed": False,
+        "causal_exclusions": [
+            {
+                "reason": reason,
+                "support": support,
+            }
+            for reason, support in sorted(
+                Counter(
+                    row.causal_exclusion_reason or "causal_audit_unavailable"
+                    for row in through_boundary
+                    if not row.causal_eligible
+                ).items()
+            )
+        ],
     }
     if stage == 20:
         report["acceptance_scope"] = [
@@ -1167,6 +1183,14 @@ class ProspectiveRoshShadowRepository:
     def store_prediction(self, record: ShadowPrediction) -> bool:
         verify_shadow_prediction(record)
         evidence = record.rosh_evidence
+        existing_identity = self.connection.execute(
+            """SELECT prediction_hash
+                 FROM prospective_rosh_shadow_predictions
+                WHERE candidate_hash=? AND match_id=?""",
+            (record.candidate_hash, record.match_id),
+        ).fetchone()
+        if existing_identity is not None and str(existing_identity[0]) != record.prediction_hash:
+            raise ValueError("immutable prospective R.O.S.H. match prediction conflict")
         return self._insert_or_match(
             table="prospective_rosh_shadow_predictions",
             key_column="prediction_hash",
@@ -1314,13 +1338,17 @@ class ProspectiveRoshShadowRepository:
                       prediction.rosh_formula_version,
                       prediction.rosh_scorer_source_hash,
                       settlement.eventual_radiant_win AS outcome,
+                      causal.causal_eligible,
+                      causal.exclusion_reason AS causal_exclusion_reason,
                       ingest.event_id, game.patch
                  FROM prospective_rosh_shadow_predictions AS prediction
                  JOIN match_ingest_status AS ingest
                    ON ingest.match_id=prediction.match_id
                  JOIN matches AS game ON game.match_id=prediction.match_id
-                 LEFT JOIN prospective_rosh_shadow_settlements AS settlement
-                   ON settlement.prediction_hash=prediction.prediction_hash
+                  LEFT JOIN prospective_rosh_shadow_settlements AS settlement
+                    ON settlement.prediction_hash=prediction.prediction_hash
+                  LEFT JOIN prospective_rosh_causal_audits AS causal
+                    ON causal.prediction_hash=prediction.prediction_hash
                 WHERE prediction.candidate_hash=?
                 ORDER BY live_text_timestamp_utc(prediction.prediction_cutoff),
                          prediction.match_id""",
@@ -1385,6 +1413,17 @@ class ProspectiveRoshShadowRepository:
                     ),
                     event_id=str(row["event_id"]),
                     patch=None if row["patch"] is None else int(row["patch"]),
+                    causal_eligible=(
+                        row["causal_eligible"] is not None
+                        and bool(row["causal_eligible"])
+                    ),
+                    causal_exclusion_reason=(
+                        "causal_audit_unavailable"
+                        if row["causal_eligible"] is None
+                        else None
+                        if row["causal_exclusion_reason"] is None
+                        else str(row["causal_exclusion_reason"])
+                    ),
                 )
             )
         return tuple(result)

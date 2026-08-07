@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from event_intelligence.prospective_rosh_candidate import (
+    _canonical_scorer_source_bytes,
     candidate_probability,
     load_frozen_prospective_rosh_candidate,
     load_prospective_rosh_candidate_json,
@@ -26,6 +28,20 @@ RESOURCE = (
     / "resources"
     / "prospective_rosh_candidate_v1.json"
 )
+
+
+def test_frozen_scorer_source_identity_is_checkout_line_ending_independent() -> None:
+    lf = b"first\nsecond\n"
+    crlf = b"first\r\nsecond\r\n"
+
+    assert _canonical_scorer_source_bytes(lf) == crlf
+    assert _canonical_scorer_source_bytes(crlf) == crlf
+    source = (Path(__file__).parents[1] / "prematch" / "stratz_rosh.py").read_bytes()
+    linux_checkout = source.replace(b"\r\n", b"\n")
+    frozen = json.loads(RESOURCE.read_text(encoding="utf-8"))
+    assert hashlib.sha256(_canonical_scorer_source_bytes(linux_checkout)).hexdigest() == (
+        frozen["scorer_source_hash"]
+    )
 
 
 def test_frozen_candidate_has_real_513_map_parameters_and_positive_sign() -> None:

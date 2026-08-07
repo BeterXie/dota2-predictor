@@ -17,7 +17,7 @@ from database.session import DatabaseResult, DatabaseRow, PostgresSession
 
 
 CURRENT_SCHEMA_VERSION = 10
-ALEMBIC_HEAD = "20260807_0032"
+ALEMBIC_HEAD = "20260807_0033"
 
 
 
