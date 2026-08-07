@@ -59,6 +59,7 @@ export function MatchWorkspace({
           label={match.team_one || "队伍一"}
           odds={winner?.prices?.team_one}
           probability={winner?.probabilities?.team_one}
+          side="one"
         />
         <div className="quote-context">
           <span>{replay ? "历史赛事" : "实时赛事"}</span>
@@ -69,6 +70,7 @@ export function MatchWorkspace({
           label={match.team_two || "队伍二"}
           odds={winner?.prices?.team_two}
           probability={winner?.probabilities?.team_two}
+          side="two"
         />
       </section>
 
@@ -94,13 +96,15 @@ function QuoteCell({
   label,
   odds,
   probability,
+  side,
 }: {
   label: string;
   odds: number | undefined;
   probability: number | undefined;
+  side: "one" | "two";
 }) {
   return (
-    <div className="quote-cell">
+    <div className={`quote-cell ${side}`}>
       <span>{label}</span>
       <strong>{formatOdds(odds)}</strong>
       <small>{probability == null ? "-" : formatPercent(probability)}</small>

@@ -33,7 +33,10 @@ export function MatchRail({ matches, mode, selectedId, onSelect }: MatchRailProp
   return (
     <aside className="match-rail" aria-label={mode === "history" ? "历史赛事" : "实时赛事"}>
       <header className="rail-header">
-        <div><strong>{mode === "history" ? "历史结果" : "实时赛事"}</strong><span>{visible.length}</span></div>
+        <div>
+          <h2>{mode === "history" ? "历史结果" : "实时赛事"}</h2>
+          <span className="rail-count">{visible.length}</span>
+        </div>
         <Input
           contentBefore={<MagnifyingGlass size={15} />}
           onChange={(_, data) => setQuery(data.value)}
@@ -44,6 +47,7 @@ export function MatchRail({ matches, mode, selectedId, onSelect }: MatchRailProp
       <div className="rail-groups">
         {visible.map((match) => (
           <button
+            aria-pressed={match.raybet_match_id === selectedId}
             className={match.raybet_match_id === selectedId ? "match-card selected" : "match-card"}
             key={match.raybet_match_id}
             onClick={() => onSelect(match.raybet_match_id)}

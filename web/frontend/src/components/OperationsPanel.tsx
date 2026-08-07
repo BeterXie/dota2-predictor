@@ -20,6 +20,15 @@ const RETAINED_HEALTH_COMPONENTS = new Set([
   "vision_worker",
 ]);
 
+const HEALTH_LABELS: Record<string, string> = {
+  postmatch_worker: "赛后结算",
+  raybet_full_odds_worker: "全量赔率采集",
+  raybet_priority_odds_worker: "优先赔率采集",
+  raybet_worker: "RayBet 主采集",
+  strict_ingest_worker: "正式赛果入库",
+  vision_worker: "直播 Vision",
+};
+
 
 interface OperationsPanelProps {
   alerts: AlertIncident[];
@@ -123,13 +132,20 @@ export function OperationsPanel({
 
       <section className="workspace-section">
         <div className="section-heading compact"><div><h2>运行健康</h2><p>直播、采集与 Vision 故障保持显式。</p></div></div>
-        <div className="worker-list">
+        <div className="worker-list health-list">
           {retainedHealth.map((item) => (
-            <div className="worker-row" key={item.component}>
-              {item.status === "healthy" ? <CheckCircle size={17} /> : <WarningCircle size={17} />}
-              <strong>{item.component}</strong><span>{item.last_error || item.status}</span>
+            <div className={`worker-row health-row ${item.status}`} key={item.component}>
+              <div className="health-identity">
+                {item.status === "healthy" ? <CheckCircle size={18} /> : <WarningCircle size={18} />}
+                <div>
+                  <strong>{HEALTH_LABELS[item.component] || item.component}</strong>
+                  <span>{item.component}</span>
+                </div>
+              </div>
+              <span className="health-status">{item.last_error || item.status}</span>
             </div>
           ))}
+          {!retainedHealth.length && <div className="subtle-empty compact">尚无 worker 健康上报</div>}
         </div>
       </section>
 
@@ -141,6 +157,9 @@ export function OperationsPanel({
             {!alert.acknowledged_at && <Button onClick={() => onAcknowledge(alert.incident_id)}>确认</Button>}
           </div>
         ))}
+        {!alerts.some((alert) => alert.category === "operational") && (
+          <div className="subtle-empty compact">当前没有 operational alert</div>
+        )}
       </section>
     </main>
   );

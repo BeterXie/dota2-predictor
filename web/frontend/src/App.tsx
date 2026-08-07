@@ -193,7 +193,12 @@ export default function App() {
           <Broadcast size={24} aria-hidden="true" />
           <div><strong>Dota 2 实时阵容预测</strong><span>RayBet · HUD · Team Rating · R.O.S.H.</span></div>
         </div>
-        <TabList selectedValue={view} onTabSelect={(_, data) => changeView(data.value as ViewMode)}>
+        <TabList
+          aria-label="产品导航"
+          className="primary-tabs"
+          selectedValue={view}
+          onTabSelect={(_, data) => changeView(data.value as ViewMode)}
+        >
           <Tab icon={<Broadcast size={17} />} value="live">实时赛事</Tab>
           <Tab icon={<ClockCounterClockwise size={17} />} value="replay">历史结果</Tab>
           <Tab icon={<GearSix size={17} />} value="operations">运行控制</Tab>
