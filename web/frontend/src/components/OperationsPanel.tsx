@@ -11,6 +11,16 @@ import type {
 } from "../types";
 
 
+const RETAINED_HEALTH_COMPONENTS = new Set([
+  "postmatch_worker",
+  "raybet_full_odds_worker",
+  "raybet_priority_odds_worker",
+  "raybet_worker",
+  "strict_ingest_worker",
+  "vision_worker",
+]);
+
+
 interface OperationsPanelProps {
   alerts: AlertIncident[];
   busyKey: string | null;
@@ -44,6 +54,9 @@ export function OperationsPanel({
   onInvalidateMapping,
 }: OperationsPanelProps) {
   const activeMappings = mappings.filter((mapping) => !mapping.invalidation);
+  const retainedHealth = health.filter((item) => (
+    RETAINED_HEALTH_COMPONENTS.has(item.component)
+  ));
   const manualSource = activeMappings.find((mapping) => (
     mapping.acceptance_mode === "manual_exact" && mapping.evidence_approval_id
   ));
@@ -111,7 +124,7 @@ export function OperationsPanel({
       <section className="workspace-section">
         <div className="section-heading compact"><div><h2>运行健康</h2><p>直播、采集与 Vision 故障保持显式。</p></div></div>
         <div className="worker-list">
-          {health.map((item) => (
+          {retainedHealth.map((item) => (
             <div className="worker-row" key={item.component}>
               {item.status === "healthy" ? <CheckCircle size={17} /> : <WarningCircle size={17} />}
               <strong>{item.component}</strong><span>{item.last_error || item.status}</span>

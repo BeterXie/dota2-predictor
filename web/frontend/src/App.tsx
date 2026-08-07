@@ -51,7 +51,6 @@ export default function App() {
     let source: EventSource | null = null;
     fetchBootstrap(controller.signal).then((value) => {
       setSnapshot(value);
-      setSelectedId((current) => current || preferredMatch(value.matches));
       setError(null);
       source = snapshotStream(value.cursor);
       source.addEventListener("snapshot", (event) => {
@@ -72,7 +71,6 @@ export default function App() {
     const controller = new AbortController();
     fetchMonitorHistory(null, controller.signal).then((page) => {
       setHistory(page.items);
-      setSelectedId((current) => current || page.items[0]?.raybet_match_id || null);
     }).catch((reason: Error) => {
       if (reason.name !== "AbortError") setError(reason.message || "无法加载历史赛事");
     });
@@ -127,6 +125,16 @@ export default function App() {
       : matches.filter((match) => match.lifecycle !== "ended"),
     [matches, view],
   );
+  useEffect(() => {
+    setSelectedId((current) => {
+      if (current && visibleMatches.some((match) => match.raybet_match_id === current)) {
+        return current;
+      }
+      return view === "replay"
+        ? visibleMatches[0]?.raybet_match_id || null
+        : preferredMatch(visibleMatches);
+    });
+  }, [view, visibleMatches]);
   const selectedMatch = matches.find((match) => match.raybet_match_id === selectedId)
     || detail
     || null;

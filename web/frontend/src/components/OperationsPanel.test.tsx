@@ -37,7 +37,32 @@ describe("OperationsPanel", () => {
           }]}
           controlMessage={null}
           controlsEnabled
-          health={[]}
+          health={[
+            {
+              component: "raybet_worker",
+              status: "healthy",
+              reported_status: "healthy",
+              freshness: "fresh",
+              age_seconds: 1,
+              last_heartbeat_at: "2026-08-07T10:01:00+00:00",
+              last_success_at: "2026-08-07T10:01:00+00:00",
+              last_error_at: null,
+              last_error: null,
+              details: {},
+            },
+            {
+              component: "draft_publisher",
+              status: "unhealthy",
+              reported_status: "healthy",
+              freshness: "stale",
+              age_seconds: 3600,
+              last_heartbeat_at: "2026-08-07T09:01:00+00:00",
+              last_success_at: "2026-08-07T09:01:00+00:00",
+              last_error_at: null,
+              last_error: null,
+              details: {},
+            },
+          ]}
           mappings={[]}
           match={null}
           onAcknowledge={vi.fn()}
@@ -50,7 +75,9 @@ describe("OperationsPanel", () => {
     );
 
     expect(screen.getByText("RayBet collector")).toBeInTheDocument();
+    expect(screen.getByText("raybet_worker")).toBeInTheDocument();
     expect(screen.getByText("RayBet stale")).toBeInTheDocument();
+    expect(screen.queryByText("draft_publisher")).not.toBeInTheDocument();
     expect(screen.queryByText("Mail worker")).not.toBeInTheDocument();
   });
 });

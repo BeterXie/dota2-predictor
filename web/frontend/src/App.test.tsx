@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { MonitorMatch, MonitorSnapshot } from "./types";
@@ -69,6 +69,13 @@ const snapshot: MonitorSnapshot = {
   },
 };
 
+const historyMatch: MonitorMatch = {
+  ...match,
+  raybet_match_id: "history-1",
+  lifecycle: "ended",
+  history_eligible: true,
+};
+
 describe("App", () => {
   beforeEach(() => {
     window.history.replaceState(null, "", "/monitor");
@@ -78,6 +85,11 @@ describe("App", () => {
       winner_timeline: [],
       vision: [],
       markets: [],
+    });
+    api.fetchMonitorHistory.mockResolvedValue({
+      items: [historyMatch],
+      next_cursor: null,
+      has_more: false,
     });
     api.createControlSession.mockResolvedValue({
       csrf_token: "csrf",
@@ -98,5 +110,17 @@ describe("App", () => {
     expect(screen.getByText("Dota 2 实时阵容预测")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("live-1")).toBeInTheDocument());
     await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
+  });
+
+  it("restores the preferred live match after visiting history", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("tab", { name: "历史结果" }));
+    await waitFor(() => expect(screen.getByText("workspace-history-1")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("tab", { name: "实时赛事" }));
+    await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
+    expect(screen.queryByText("empty-workspace")).not.toBeInTheDocument();
   });
 });
