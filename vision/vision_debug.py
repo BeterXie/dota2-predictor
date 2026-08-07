@@ -24,7 +24,12 @@ class VisionDebugSink:
         self.minimum_interval = minimum_interval
         self.maximum_events = maximum_events
         self._last_written: dict[str, float] = {}
-        self._event_count = 0
+        self._event_count = self._existing_event_count()
+
+    def _existing_event_count(self) -> int:
+        if not self.root.exists():
+            return 0
+        return sum(1 for _ in self.root.rglob("metadata.json"))
 
     @staticmethod
     def _serializable(value: object) -> object:
@@ -55,14 +60,15 @@ class VisionDebugSink:
         diagnostics: object,
         hero_regions: Iterable[object] = (),
     ) -> bool:
-        if self._event_count >= self.maximum_events:
-            return False
         now = time.time()
         key = f"{layout_name or 'unknown'}:{reason}"
         previous = self._last_written.get(key)
         if previous is not None and now - previous < self.minimum_interval:
             return False
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.size == 0:
+            return False
+        self._event_count = max(self._event_count, self._existing_event_count())
+        if self._event_count >= self.maximum_events:
             return False
 
         stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))

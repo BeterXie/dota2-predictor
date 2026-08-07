@@ -1,12 +1,124 @@
 from __future__ import annotations
 
-import numpy as np
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
 
 from vision.frame_quality import FrameQualityTracker
-from vision.layout_tracker import LayoutTracker
 from vision.hero_recognizer import DraftReading, HeroSlotDiagnostic
-from vision.stable_runtime import StableDraftTracker
+from vision.layout_tracker import LayoutTracker, StableLayoutState
+from vision.scoreboard_reader import ReplayGateReading
+from vision.stable_runtime import (
+    StableDraftTracker,
+    StableHudReader,
+    StableHeroRecognizer,
+    StableHLSStreamCapture,
+    freeze_untrusted_draft_tracking,
+    freeze_untrusted_live_hud_tracking,
+    install_stable_runtime,
+)
+from vision.vision_debug import VisionDebugSink
+
+
+def _draft_reading(
+    hero_ids: tuple[int, ...] = tuple(range(1, 11)),
+) -> DraftReading:
+    diagnostics = tuple(
+        HeroSlotDiagnostic(
+            "radiant" if index < 5 else "dire",
+            index % 5 + 1,
+            hero_id,
+            0.90,
+            0.70,
+            0.20,
+            True,
+            "accepted",
+            crop_hash=f"{index + 1:016x}",
+        )
+        for index, hero_id in enumerate(hero_ids)
+    )
+    return DraftReading((), (), 0.90, diagnostics)
+
+
+def _lock_draft(tracker: StableDraftTracker) -> DraftReading:
+    reading = _draft_reading()
+    locked = None
+    expected_states = ("observing", "provisional", "locked")
+    for step in range(3):
+        locked = tracker.update(
+            reading,
+            observed_at=float(step),
+            source_frame_hash=f"frame-{step}",
+        )
+        assert all(
+            status.state == expected_states[step] for status in tracker.slot_statuses
+        )
+    assert locked is not None
+    return locked
+
+
+class _FakeVideoCapture:
+    def __init__(self, images: list[np.ndarray]) -> None:
+        self.images = iter(images)
+
+    def set(self, *_: object) -> bool:
+        return True
+
+    def read(self) -> tuple[bool, np.ndarray]:
+        return True, next(self.images)
+
+    def release(self) -> None:
+        pass
+
+
+def test_same_stream_distinct_frames_are_distinct_evidence() -> None:
+    images = []
+    for value in (10, 20, 30):
+        image = np.full((24, 32, 3), value, dtype=np.uint8)
+        images.append(image)
+    native_capture = _FakeVideoCapture(images)
+    capture = StableHLSStreamCapture(
+        "https://play.ehome.gg/live/example.m3u8",
+        capture_factory=lambda _: native_capture,
+    )
+
+    frames = [capture.read() for _ in range(3)]
+    assert len({frame.source_hash for frame in frames}) == 1
+    assert len({frame.frame_hash for frame in frames}) == 3
+
+    tracker = StableDraftTracker(
+        confirmations=2,
+        minimum_evidence_interval=1.0,
+        minimum_lock_interval=1.0,
+    )
+    locked = None
+    for step, frame in enumerate(frames):
+        locked = tracker.update(
+            _draft_reading(),
+            observed_at=float(step),
+            source_frame_hash=frame.frame_hash,
+        )
+    assert locked is not None
+
+
+def test_exact_frozen_frame_does_not_add_independent_evidence() -> None:
+    tracker = StableDraftTracker(
+        confirmations=2,
+        minimum_evidence_interval=1.0,
+        minimum_lock_interval=1.0,
+    )
+
+    for step in range(3):
+        assert tracker.update(
+            _draft_reading(),
+            observed_at=float(step),
+            source_frame_hash="identical-frame",
+            game_clock_seconds=100 + step,
+        ) is None
+
+    assert all(status.duplicate_evidence_count == 2 for status in tracker.slot_statuses)
 
 
 def test_layout_tracker_survives_short_detection_dropouts() -> None:
@@ -25,6 +137,24 @@ def test_layout_tracker_survives_short_detection_dropouts() -> None:
     recovered = tracker.update({name: 0.93})
     assert recovered.layout_name == name
     assert recovered.state == "locked"
+
+
+def test_single_layout_miss_does_not_reset_locked_draft() -> None:
+    layout_tracker = LayoutTracker(acquire_confirmations=1, grace_frames=2)
+    draft_tracker = StableDraftTracker(
+        confirmations=2,
+        minimum_evidence_interval=1.0,
+        minimum_lock_interval=1.0,
+    )
+    locked = _lock_draft(draft_tracker)
+
+    name = "epl_s39_live_1080p"
+    assert layout_tracker.update({name: 0.96}).layout_name == name
+    missed = layout_tracker.update({name: 0.0})
+
+    assert missed.layout_name == name
+    assert missed.state == "degraded"
+    assert draft_tracker.current_draft == locked
 
 
 def test_layout_tracker_requires_sustained_challenger() -> None:
@@ -57,79 +187,183 @@ def test_frame_quality_detects_exact_freeze() -> None:
     assert frozen.reason == "frozen_frame"
 
 
-def test_draft_tracker_accepts_progressing_clock_on_same_stream_identity() -> None:
-    tracker = StableDraftTracker(confirmations=2)
-    draft = DraftReading(
-        (1, 2, 3, 4, 5),
-        (6, 7, 8, 9, 10),
-        0.95,
-    )
-
-    assert tracker.update(
-        draft,
-        observed_at=0.0,
-        source_frame_hash="same-stream",
-        game_clock_seconds=100,
-    ) is None
-    assert tracker.update(
-        draft,
-        observed_at=3.0,
-        source_frame_hash="same-stream",
-        game_clock_seconds=103,
-    ) is None
-    locked = tracker.update(
-        draft,
-        observed_at=6.0,
-        source_frame_hash="same-stream",
-        game_clock_seconds=106,
-    )
-    assert locked is not None
-    assert locked.radiant_hero_ids == (1, 2, 3, 4, 5)
-    assert locked.dire_hero_ids == (6, 7, 8, 9, 10)
-
-
-def test_draft_tracker_static_crop_can_reach_default_support() -> None:
+def test_static_crop_can_accumulate_temporal_evidence_and_lock() -> None:
     tracker = StableDraftTracker(
         minimum_evidence_interval=1.0,
-        minimum_lock_interval=5.0,
+        minimum_lock_interval=2.0,
     )
-    diagnostics = tuple(
-        HeroSlotDiagnostic(
-            "radiant" if index < 5 else "dire",
-            index % 5 + 1,
-            index + 1,
-            0.90,
-            0.70,
-            0.20,
-            True,
-            "accepted",
-            crop_hash=f"{index + 1:016x}",
-        )
-        for index in range(10)
-    )
-    reading = DraftReading((), (), 0.90, diagnostics)
-
-    for step in range(5):
-        assert tracker.update(
-            reading,
-            observed_at=float(step),
-            source_frame_hash=f"frame-{step}",
-            game_clock_seconds=100 + step,
-        ) is None
+    reading = _draft_reading()
 
     locked = None
-    for step in range(5, 11):
+    for step in range(7):
         locked = tracker.update(
             reading,
             observed_at=float(step),
             source_frame_hash=f"frame-{step}",
-            game_clock_seconds=100 + step,
+            game_clock_seconds=100,
         )
-        if locked is not None:
-            break
+
     assert locked is not None
     assert locked.radiant_hero_ids == (1, 2, 3, 4, 5)
     assert locked.dire_hero_ids == (6, 7, 8, 9, 10)
+    assert all(status.state == "locked" for status in tracker.slot_statuses)
+
+
+def test_replay_freezes_locked_lineup_and_live_tracking_resumes() -> None:
+    tracker = StableDraftTracker(
+        confirmations=2,
+        minimum_evidence_interval=1.0,
+        minimum_lock_interval=1.0,
+    )
+    locked = _lock_draft(tracker)
+
+    assert not freeze_untrusted_live_hud_tracking(ReplayGateReading("replay", 0.99))
+    assert freeze_untrusted_draft_tracking(tracker, locked) == locked
+
+    assert freeze_untrusted_live_hud_tracking(ReplayGateReading("live", 0.99))
+    resumed = tracker.update(
+        _draft_reading(),
+        observed_at=3.0,
+        source_frame_hash="frame-after-replay",
+    )
+    assert resumed == locked
+
+
+def test_stable_runtime_installs_replay_freeze_adapters() -> None:
+    watcher_module = SimpleNamespace()
+    install_stable_runtime(watcher_module)
+
+    assert watcher_module.allow_live_hud_tracking is freeze_untrusted_live_hud_tracking
+    assert watcher_module.draft_during_untrusted is freeze_untrusted_draft_tracking
+
+
+def test_locked_lineup_survives_strong_ocr_jitter() -> None:
+    tracker = StableDraftTracker(
+        confirmations=2,
+        minimum_evidence_interval=1.0,
+        minimum_lock_interval=1.0,
+    )
+    locked = _lock_draft(tracker)
+    jittered_ids = (11, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+    for step in range(3, 7):
+        current = tracker.update(
+            _draft_reading(jittered_ids),
+            observed_at=float(step),
+            source_frame_hash=f"jitter-{step}",
+        )
+        assert current == locked
+
+    assert tracker.slot_statuses[0].state == "locked"
+    assert tracker.slot_statuses[0].strong_conflict_count == 4
+
+
+class _HeroRegion:
+    def __init__(self, index: int) -> None:
+        self.index = index
+
+    def crop(self, _: np.ndarray) -> np.ndarray:
+        return np.full((2, 2, 3), self.index, dtype=np.uint8)
+
+
+def test_global_hero_assignment_never_duplicates_heroes() -> None:
+    recognizer = StableHeroRecognizer.__new__(StableHeroRecognizer)
+    regions = tuple(_HeroRegion(index) for index in range(10))
+    recognizer.layout = SimpleNamespace(
+        radiant_heroes=regions[:5],
+        dire_heroes=regions[5:],
+    )
+    recognizer.ids = np.arange(1, 11, dtype=np.int32)
+
+    def score_crop(crop: np.ndarray) -> SimpleNamespace:
+        index = int(crop[0, 0, 0])
+        scores = np.full(10, 0.10, dtype=np.float64)
+        scores[index] = 0.99
+        if index == 1:
+            scores[0] = 0.96
+            scores[1] = 0.94
+        return SimpleNamespace(
+            combined=scores,
+            phash=scores,
+            histogram=scores,
+            pixel=scores,
+            variants=np.asarray([str(hero_id) for hero_id in range(1, 11)]),
+            variant_counts=np.ones(10, dtype=np.int32),
+            crop_hash=f"{index + 1:016x}",
+        )
+
+    recognizer._score_crop = score_crop
+    draft = recognizer.read(np.zeros((2, 2, 3), dtype=np.uint8))
+    heroes = draft.radiant_hero_ids + draft.dire_hero_ids
+
+    assert heroes == tuple(range(1, 11))
+    assert len(set(heroes)) == 10
+    assert draft.slot_diagnostics[1].best_hero_id == 2
+
+
+def test_debug_capture_is_rate_limited_and_bounded_across_restarts(
+    tmp_path: Path,
+) -> None:
+    image = np.full((24, 32, 3), 100, dtype=np.uint8)
+    sink = VisionDebugSink(tmp_path, minimum_interval=30.0, maximum_events=1)
+
+    assert sink.record(
+        image,
+        reason="draft_unconfirmed",
+        layout_name="standard",
+        diagnostics={"blocker": "draft_unconfirmed"},
+    )
+    assert not sink.record(
+        image,
+        reason="draft_unconfirmed",
+        layout_name="standard",
+        diagnostics={"blocker": "draft_unconfirmed"},
+    )
+
+    restarted = VisionDebugSink(tmp_path, minimum_interval=0.0, maximum_events=1)
+    assert not restarted.record(
+        image,
+        reason="clock_unconfirmed",
+        layout_name="standard",
+        diagnostics={"blocker": "clock_unconfirmed"},
+    )
+
+
+def test_layout_switching_is_captured_with_tracker_diagnostics() -> None:
+    recorded: dict[str, object] = {}
+
+    class _DebugSink:
+        def record(self, _: np.ndarray, **payload: object) -> bool:
+            recorded.update(payload)
+            return True
+
+    reader = SimpleNamespace(
+        debug_sink=_DebugSink(),
+        last_frame_quality=None,
+        last_layout_state=StableLayoutState(
+            "epl_s39_live_1080p",
+            0.40,
+            "switching",
+            challenger_name="wxc_gotf_2026_live_1080p",
+            challenger_confidence=0.96,
+            consecutive_support=2,
+        ),
+    )
+    reading = SimpleNamespace(
+        diagnostics=SimpleNamespace(blocker_code="ready", draft_failed_slots=()),
+        selection=SimpleNamespace(layout=None, layout_name="epl_s39_live_1080p"),
+    )
+
+    StableHudReader._debug(
+        reader,
+        np.full((24, 32, 3), 100, dtype=np.uint8),
+        reading,
+    )
+
+    assert recorded["reason"] == "layout_switching"
+    diagnostics = recorded["diagnostics"]
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["layout_tracker"] == reader.last_layout_state
 
 
 def test_stable_supervisor_targets_stable_watcher() -> None:
@@ -138,8 +372,30 @@ def test_stable_supervisor_targets_stable_watcher() -> None:
     command = stable_watcher_command(
         "postgresql://example",
         "42",
-        Path("/tmp/output"),
-        Path("/tmp/evidence"),
+        Path("output"),
+        Path("evidence"),
     )
-    assert command[1].endswith("scripts/watch_raybet_stream_stable.py")
+    assert Path(command[1]).name == "watch_raybet_stream_stable.py"
     assert "--refresh-url" in command
+
+
+def test_stable_supervisor_installs_stable_command_before_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.supervise_raybet_streams_stable as stable_supervisor
+
+    original = stable_supervisor.supervisor.watcher_command
+    monkeypatch.setattr(stable_supervisor.supervisor, "watcher_command", original)
+
+    def fake_main() -> int:
+        command = stable_supervisor.supervisor.watcher_command(
+            "postgresql://example",
+            "42",
+            Path("output"),
+            Path("evidence"),
+        )
+        assert Path(command[1]).name == "watch_raybet_stream_stable.py"
+        return 17
+
+    monkeypatch.setattr(stable_supervisor.supervisor, "main", fake_main)
+    assert stable_supervisor.main() == 17

@@ -13,7 +13,6 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
-import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -77,17 +76,23 @@ def broadcast_layout_scores(image: np.ndarray) -> dict[str, float]:
 
 
 class StableHLSStreamCapture(HLSStreamCapture):
-    """Use content identity for evidence while preserving reconnect semantics."""
+    """Add content identity without replacing the stream-source identity."""
 
     @staticmethod
-    def _frame_identity(image: np.ndarray) -> str:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        thumb = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA)
-        return hashlib.blake2b(thumb.tobytes(), digest_size=8).hexdigest()
+    def _frame_identity(image: np.ndarray, stream_identity: str) -> str:
+        contiguous = np.ascontiguousarray(image)
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(stream_identity.encode())
+        digest.update(str((contiguous.shape, contiguous.dtype)).encode())
+        digest.update(contiguous.data)
+        return digest.hexdigest()
 
     def read(self, *, timeout: float = 20.0) -> StreamFrame:
         frame = super().read(timeout=timeout)
-        return replace(frame, source_hash=self._frame_identity(frame.image))
+        return replace(
+            frame,
+            frame_hash=self._frame_identity(frame.image, frame.source_hash),
+        )
 
 
 class StableDraftTracker(DraftTracker):
@@ -112,6 +117,12 @@ class StableDraftTracker(DraftTracker):
             return False
 
         if (
+            previous.source_frame_hash is not None
+            and evidence.source_frame_hash is not None
+        ):
+            return previous.source_frame_hash != evidence.source_frame_hash
+
+        if (
             previous.game_clock_seconds is not None
             and evidence.game_clock_seconds is not None
         ):
@@ -120,19 +131,28 @@ class StableDraftTracker(DraftTracker):
             if evidence.game_clock_seconds < previous.game_clock_seconds:
                 return False
 
-        if (
-            previous.source_frame_hash is not None
-            and evidence.source_frame_hash is not None
-            and previous.source_frame_hash == evidence.source_frame_hash
-        ):
-            return False
-
         if previous.crop_hash is None or evidence.crop_hash is None:
             return True
         return (
             self._hash_distance(previous.crop_hash, evidence.crop_hash)
             > self.maximum_similar_hash_distance
         )
+
+    def _apply_independent_evidence(
+        self, slot: _TrackedSlot, evidence: SlotCandidateEvidence
+    ) -> None:
+        if slot.state != "locked":
+            super()._apply_independent_evidence(slot, evidence)
+            return
+
+        # A Dota lineup cannot change during one map.  Once a slot is locked,
+        # conflicting OCR observations are diagnostics, not a state transition.
+        if evidence.hero_id == slot.hero_id:
+            slot.evidence.append(evidence)
+            if self._is_high_quality(evidence):
+                slot.strong_conflict_count = 0
+        elif self._is_high_quality(evidence):
+            slot.strong_conflict_count += 1
 
 
 class StableHeroRecognizer(HeroRecognizer):
@@ -341,8 +361,14 @@ class StableHudReader(HudReader):
             if self.last_frame_quality is not None and not self.last_frame_quality.usable
             else None
         )
+        layout_reason = (
+            f"layout_{self.last_layout_state.state}"
+            if self.last_layout_state.state in {"degraded", "switching"}
+            else None
+        )
         if (
             quality_reason is None
+            and layout_reason is None
             and diagnostics.blocker_code == "ready"
             and not diagnostics.draft_failed_slots
         ):
@@ -351,9 +377,13 @@ class StableHudReader(HudReader):
         hero_regions = () if layout is None else layout.radiant_heroes + layout.dire_heroes
         self.debug_sink.record(
             image,
-            reason=quality_reason or diagnostics.blocker_code,
+            reason=quality_reason or layout_reason or diagnostics.blocker_code,
             layout_name=reading.selection.layout_name,
-            diagnostics=diagnostics,
+            diagnostics={
+                "hud": diagnostics,
+                "layout_tracker": self.last_layout_state,
+                "frame_quality": self.last_frame_quality,
+            },
             hero_regions=hero_regions,
         )
 
@@ -428,6 +458,14 @@ def freeze_untrusted_live_hud_tracking(
     return replay_gate.status == "live"
 
 
+def freeze_untrusted_draft_tracking(
+    draft_tracker: DraftTracker,
+    last_draft: DraftReading | None,
+) -> DraftReading | None:
+    """Keep a locked map lineup while live HUD publication is frozen."""
+    return draft_tracker.current_draft or last_draft
+
+
 def install_stable_runtime(watcher_module: object) -> None:
     """Install stable adapters into ``scripts.watch_raybet_stream`` in-process."""
     setattr(watcher_module, "HudReader", StableHudReader)
@@ -437,4 +475,9 @@ def install_stable_runtime(watcher_module: object) -> None:
         watcher_module,
         "allow_live_hud_tracking",
         freeze_untrusted_live_hud_tracking,
+    )
+    setattr(
+        watcher_module,
+        "draft_during_untrusted",
+        freeze_untrusted_draft_tracking,
     )

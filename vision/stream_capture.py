@@ -17,6 +17,7 @@ class StreamFrame:
     captured_at: float
     source_hash: str
     sequence: int
+    frame_hash: str | None = None
 
 
 class HLSStreamCapture:

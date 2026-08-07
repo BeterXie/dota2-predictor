@@ -7,18 +7,20 @@ it does not add a database migration.
 ## What is included
 
 - sticky layout selection with acquisition, grace and challenger hysteresis;
-- content-derived frame identity so repeated evidence is no longer keyed by the
-  HLS URL hash;
-- a DraftTracker fix that treats a progressing game clock as independent
-  evidence even when the stream identity is unchanged;
+- separate stream-source and content-derived frame identities so repeated
+  evidence is no longer keyed by the HLS URL hash;
+- a DraftTracker fix that accepts time-separated, content-distinct frames even
+  when the hero crop and game clock remain visually stable;
 - ten-slot global hero assignment using the existing hero feature scores and
   SciPy Hungarian assignment;
 - HUD perception that continues to read clock, score, net-worth and heroes on
   replay/untrusted frames while publication remains fail-closed;
-- freeze semantics for replay/untrusted frames: accumulated trackers are not
-  reset by the stable launcher;
+- freeze semantics for replay/untrusted frames: accumulated trackers and locked
+  lineups are not reset by the stable launcher, and OCR conflicts cannot mutate
+  a locked lineup within one map;
 - frame-quality/freeze diagnostics;
-- optional rate-limited failure-frame and hero-crop capture;
+- optional rate-limited failure-frame and hero-crop capture with an event cap
+  that survives watcher restarts;
 - a JSONL corpus evaluator and regression tests for the stability state
   machines.
 

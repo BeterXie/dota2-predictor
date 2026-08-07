@@ -545,6 +545,14 @@ def allow_live_hud_tracking(
     return False
 
 
+def draft_during_untrusted(
+    draft_tracker: DraftTracker,
+    last_draft: DraftReading | None,
+) -> DraftReading | None:
+    del draft_tracker, last_draft
+    return None
+
+
 def _should_persist_frame(
     previous: LiveObservation | None,
     current: LiveObservation,
@@ -915,7 +923,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     advantage_tracker=advantage_tracker,
                     draft_tracker=draft_tracker,
                 ):
-                    last_draft = None
+                    last_draft = draft_during_untrusted(draft_tracker, last_draft)
                     outside_game_frames += 1
                     confirmed_scoreboard = None
                     confirmed_advantage = None
@@ -1042,7 +1050,9 @@ def _run_cli(args: argparse.Namespace) -> int:
                         last_clock,
                     ),
                     observed_at=frame.captured_at,
-                    source_frame_hash=frame.source_hash,
+                    source_frame_hash=(
+                        getattr(frame, "frame_hash", None) or frame.source_hash
+                    ),
                     game_clock_seconds=(
                         confirmed_clock.seconds
                         if confirmed_clock is not None
