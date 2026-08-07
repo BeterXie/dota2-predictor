@@ -9,6 +9,7 @@ interface LiveScoreboardProps {
   trustedVision: { game_clock_seconds?: number | null; map_number?: number | null } | null;
   now?: number;
   oddsObservedAt: string | null;
+  oddsAgePrefix: string;
   oddsSnapshotLabel: string | null;
   watchLink: { kind: WatchLink["kind"]; url: string } | null;
 }
@@ -18,6 +19,7 @@ export function LiveScoreboard({
   trustedVision,
   now,
   oddsObservedAt,
+  oddsAgePrefix,
   oddsSnapshotLabel,
   watchLink,
 }: LiveScoreboardProps) {
@@ -56,7 +58,7 @@ export function LiveScoreboard({
               icon={<Clock size={14} />}
               now={now}
               observedAt={oddsObservedAt}
-              prefix="赔率 "
+              prefix={oddsAgePrefix}
               staleAfterSeconds={60}
             />
           )}

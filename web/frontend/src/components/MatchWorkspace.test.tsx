@@ -196,6 +196,29 @@ describe("MatchWorkspace", () => {
     expect(screen.queryByRole("button", { name: "追加人工修正" })).not.toBeInTheDocument();
   });
 
+  it("shows the complete prematch snapshot while live odds are pending", async () => {
+    const prematchDetail: MatchDetail = {
+      ...detail,
+      winner: null,
+      winner_timeline: [],
+      prematch_winner: {
+        observed_at: "2026-08-07T10:09:00+00:00",
+        period: "map_1",
+        complete: true,
+        prices: { team_one: 1.65, team_two: 2.19 },
+        probabilities: { team_one: 0.5703125, team_two: 0.4296875 },
+      },
+    };
+
+    renderWorkspace(false, prematchDetail);
+
+    expect(screen.getByText("赛前快照")).toBeInTheDocument();
+    expect(screen.getByText(/赛前赔率/)).toBeInTheDocument();
+    expect(screen.getByText("1.65")).toBeInTheDocument();
+    expect(screen.getByText("2.19")).toBeInTheDocument();
+    expect(screen.queryByText("赔率 未收到")).not.toBeInTheDocument();
+  });
+
   it("lets the operator select canonical teams and apply the HUD lineup", async () => {
     const editableDetail: MatchDetail = {
       ...detail,

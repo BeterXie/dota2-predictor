@@ -20,6 +20,8 @@ interface ProbabilityChartProps {
   teamOne: string;
   teamTwo: string;
   preferredPeriod?: string | null;
+  emptyTitle?: string;
+  emptyDescription?: string;
 }
 
 
@@ -44,6 +46,8 @@ export function ProbabilityChart({
   teamOne,
   teamTwo,
   preferredPeriod = null,
+  emptyTitle = "暂无完整胜负盘快照",
+  emptyDescription = "只有同一采集时刻同时存在双方有效赔率时才计算并展示去水概率",
 }: ProbabilityChartProps) {
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
@@ -175,8 +179,8 @@ export function ProbabilityChart({
   if (!points.length) {
     return (
       <div className="chart-empty" role="status">
-        <span>暂无完整胜负盘快照</span>
-        <small>只有同一采集时刻同时存在双方有效赔率时才计算并展示去水概率</small>
+        <span>{emptyTitle}</span>
+        <small>{emptyDescription}</small>
       </div>
     );
   }

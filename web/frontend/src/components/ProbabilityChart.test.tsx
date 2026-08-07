@@ -68,6 +68,23 @@ describe("ProbabilityChart", () => {
     expect(screen.queryByTestId("probability-chart-canvas")).not.toBeInTheDocument();
   });
 
+  it("distinguishes a retained prematch snapshot from a missing live trend", () => {
+    render(
+      <ProbabilityChart
+        emptyDescription="上方已显示最近一次完整赛前胜负盘"
+        emptyTitle="实时走势尚未开始"
+        teamOne="Aurora"
+        teamTwo="Beacon"
+        timeline={[]}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("实时走势尚未开始");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "上方已显示最近一次完整赛前胜负盘",
+    );
+  });
+
   it("breaks the line across collection gaps longer than 150 seconds", () => {
     const points = [
       ["2026-08-07T10:00:00Z", 0.54],
