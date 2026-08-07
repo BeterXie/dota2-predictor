@@ -43,7 +43,7 @@ const ATTRIBUTE_LABELS: Record<Attribute, string> = {
   int: "智力",
   all: "全才",
 };
-const PREDICTION_CONFIRMATION = "本次预测只使用已锁定阵容，未使用击杀、经济、经验、防御塔、肉山或其他游戏内状态。";
+const PREDICTION_CONFIRMATION = "本次模型只使用队伍历史与已锁定阵容，不使用击杀、经济、经验、防御塔、肉山、实时赔率或其他游戏内状态。";
 
 function blankSlots(): LiveDraftSlot[] {
   return sides.flatMap((side) => Array.from({ length: 5 }, (_, index) => ({
@@ -417,7 +417,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
               onClick={() => void generatePrediction()}
               type="button"
             >
-              {predictionBusy ? "生成中…" : "生成阵容预测"}
+              {predictionBusy ? "生成中…" : "生成实时阵容预测"}
             </Button>
           </div>
         )}

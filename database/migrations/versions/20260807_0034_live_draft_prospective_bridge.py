@@ -321,12 +321,18 @@ def upgrade() -> None:
             DECLARE
                 prediction_row live_draft_prospective_predictions%ROWTYPE;
                 actual_start timestamptz;
+                actual_end timestamptz;
+                result_usable timestamptz;
                 expected_status text;
                 expected_reason text;
             BEGIN
                 SELECT * INTO prediction_row FROM live_draft_prospective_predictions
                  WHERE prediction_hash=NEW.prediction_hash;
-                SELECT to_timestamp(match_row.start_time) INTO actual_start
+                SELECT to_timestamp(match_row.start_time),
+                       to_timestamp(match_row.start_time) +
+                           make_interval(secs => match_row.duration),
+                       live_text_timestamp_utc(result.first_usable_at)
+                  INTO actual_start, actual_end, result_usable
                   FROM map_results AS result
                   JOIN matches AS match_row ON match_row.match_id=result.dota_match_id
                  WHERE result.raybet_match_id=prediction_row.raybet_match_id
@@ -336,23 +342,20 @@ def upgrade() -> None:
                    AND result.winner_side=CASE NEW.winner_side
                        WHEN 'radiant' THEN 'team_one' ELSE 'team_two' END;
                 IF prediction_row.prediction_hash IS NULL OR actual_start IS NULL OR
-                   actual_start <> live_text_timestamp_utc(NEW.authoritative_actual_start)
+                   actual_end IS NULL OR result_usable IS NULL OR
+                   actual_start <> live_text_timestamp_utc(NEW.authoritative_actual_start) OR
+                   result_usable <> live_text_timestamp_utc(NEW.result_usable_at)
                 THEN
                     RAISE EXCEPTION 'live draft settlement authority disagrees';
                 END IF;
-                IF prediction_row.causal_status='ineligible' OR
-                   live_text_timestamp_utc(prediction_row.created_at) >= actual_start
-                THEN
+                IF live_text_timestamp_utc(prediction_row.created_at) >= actual_end THEN
                     expected_status := 'ineligible';
-                    expected_reason := CASE
-                        WHEN prediction_row.causal_status='ineligible'
-                        THEN prediction_row.causal_reason
-                        ELSE 'prediction_not_before_authoritative_actual_start' END;
-                ELSIF prediction_row.causal_status='eligible' THEN
-                    expected_status := 'eligible'; expected_reason := NULL;
+                    expected_reason := 'prediction_not_before_authoritative_end';
+                ELSIF live_text_timestamp_utc(prediction_row.created_at) >= result_usable THEN
+                    expected_status := 'ineligible';
+                    expected_reason := 'prediction_not_before_result_first_usable_at';
                 ELSE
-                    expected_status := 'unverified';
-                    expected_reason := prediction_row.causal_reason;
+                    expected_status := 'eligible'; expected_reason := NULL;
                 END IF;
                 IF NEW.post_settlement_causal_status <> expected_status OR
                    NEW.post_settlement_causal_reason IS DISTINCT FROM expected_reason

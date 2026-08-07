@@ -60,6 +60,12 @@ def test_locked_live_draft_paired_and_p0_only_are_immutable(
     lock_time = TARGET_ORIGIN - timedelta(minutes=30)
     try:
         _store_seed(session, ProspectiveTeamRatingRepository(session))
+        session.execute(
+            """INSERT INTO raybet_matches
+               (raybet_match_id, status, raw_json, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            ("raybet-live-bridge", "2", "{}", lock_time.isoformat()),
+        )
         first_mapping = save_live_draft_mapping(
             session,
             raybet_match_id="raybet-live-bridge",
@@ -80,7 +86,8 @@ def test_locked_live_draft_paired_and_p0_only_are_immutable(
             operator_identity="local-operator",
             confirmation_text=LOCK_CONFIRMATION,
             confirmed_at=lock_time + timedelta(seconds=2),
-            draft_state_marker="draft_complete",
+            game_clock_seconds=120,
+            draft_state_marker="in_game",
         )
         repeated = generate_live_draft_prediction(
             repository,
@@ -102,6 +109,10 @@ def test_locked_live_draft_paired_and_p0_only_are_immutable(
         assert repeated["status"] == "unchanged"
         assert repeated["prediction"]["prediction_hash"] == paired["prediction"]["prediction_hash"]
 
+        session.execute(
+            "UPDATE raybet_matches SET status=? WHERE raybet_match_id=?",
+            ("unknown", "raybet-live-bridge"),
+        )
         second_mapping = save_live_draft_mapping(
             session,
             raybet_match_id="raybet-live-bridge",
@@ -126,6 +137,34 @@ def test_locked_live_draft_paired_and_p0_only_are_immutable(
         assert p0_only["prediction"]["record_status"] == "p0_only"
         assert p0_only["prediction"]["missing_reason"] == "prospective_rosh_evidence_unavailable"
         assert p0_only["prediction"]["causal_evidence"]["causal_status"] == "unverified"
+
+        session.execute(
+            "UPDATE raybet_matches SET status=? WHERE raybet_match_id=?",
+            ("completed", "raybet-live-bridge"),
+        )
+        third_mapping = save_live_draft_mapping(
+            session,
+            raybet_match_id="raybet-live-bridge",
+            map_number=1,
+            slots=_slots(),
+            is_locked=True,
+            actor="local-operator",
+            created_at=lock_time + timedelta(minutes=2),
+        )
+        with pytest.raises(ValueError, match="match_lifecycle_ended"):
+            generate_live_draft_prediction(
+                repository,
+                FailingTransport(),
+                artifact_root=tmp_path / "artifacts",
+                raybet_match_id="raybet-live-bridge",
+                map_number=1,
+                mapping_version=third_mapping["version"],
+                operator_identity="local-operator",
+                confirmation_text=LOCK_CONFIRMATION,
+                confirmed_at=lock_time + timedelta(minutes=2, seconds=2),
+                game_clock_seconds=240,
+                draft_state_marker="in_game",
+            )
         assert session.execute(
             "SELECT COUNT(*) FROM live_draft_prospective_predictions"
         ).scalar_one() == 2

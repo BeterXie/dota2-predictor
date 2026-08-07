@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -45,10 +45,26 @@ FROZEN_CANDIDATE_HASH = (
     "84c4506f63b7c5b745b32373b0cb405383f837c60eae3231cc3d688a0b36e09d"
 )
 LOCK_CONFIRMATION = (
-    "本次预测只使用已锁定阵容，未使用击杀、经济、经验、防御塔、肉山或其他游戏内状态。"
+    "本次模型只使用队伍历史与已锁定阵容，不使用击杀、经济、经验、防御塔、肉山、实时赔率或其他游戏内状态。"
 )
 _DRAFT_MARKERS = frozenset({"draft", "draft_complete", "pre_game"})
-_GAMEPLAY_MARKERS = frozenset({"gameplay", "in_game", "post_game"})
+_ACTIVE_MATCH_STATUSES = frozenset(
+    {"1", "2", "open", "active", "running", "upcoming", "scheduled", "not_started"}
+)
+_ENDED_MATCH_STATUSES = frozenset(
+    {
+        "3",
+        "5",
+        "ended",
+        "completed",
+        "cancelled",
+        "void",
+        "abandoned",
+        "finished",
+        "settled",
+        "closed",
+    }
+)
 
 
 class LegacyRoshTransport(Protocol):
@@ -306,16 +322,15 @@ def _causal_status(
     live_state_input_used: bool,
     game_clock_seconds: int | None,
     draft_state_marker: str | None,
+    lifecycle_status: str | None,
 ) -> tuple[str, str | None]:
     if live_state_input_used:
-        return "ineligible", "live_state_input_used"
-    if game_clock_seconds is not None and game_clock_seconds > 0:
-        return "ineligible", "positive_game_clock_observed"
-    if draft_state_marker in _GAMEPLAY_MARKERS:
-        return "ineligible", "gameplay_state_observed"
-    if draft_state_marker in _DRAFT_MARKERS and game_clock_seconds in {None, 0}:
+        return "unverified", "live_state_input_claimed"
+    if lifecycle_status in _ACTIVE_MATCH_STATUSES:
         return "eligible", None
-    return "unverified", "draft_lock_timing_evidence_insufficient"
+    if lifecycle_status is None or lifecycle_status not in _ENDED_MATCH_STATUSES:
+        return "unverified", "lifecycle_status_unverified"
+    raise ValueError("match_lifecycle_ended")
 
 
 def _team_state(states: Sequence[TeamRatingState], team_id: int, initial: float) -> TeamRatingState:
@@ -366,6 +381,34 @@ class LiveDraftProspectiveBridgeRepository:
         }
         canonical_mapping_hash(mapping)
         return mapping
+
+    def validate_prediction_target(self, raybet_match_id: str, map_number: int) -> str | None:
+        result = self.connection.execute(
+            """SELECT 1 FROM map_results
+                WHERE raybet_match_id=? AND map_number=? LIMIT 1""",
+            (raybet_match_id, map_number),
+        ).fetchone()
+        if result is not None:
+            raise ValueError("authoritative_result_already_exists")
+        settlement = self.connection.execute(
+            """SELECT 1
+                 FROM live_draft_prospective_settlements AS settlement
+                 JOIN live_draft_prospective_predictions AS prediction
+                   ON prediction.prediction_hash=settlement.prediction_hash
+                WHERE prediction.raybet_match_id=? AND prediction.map_number=?
+                LIMIT 1""",
+            (raybet_match_id, map_number),
+        ).fetchone()
+        if settlement is not None:
+            raise ValueError("live_draft_prediction_already_settled")
+        row = self.connection.execute(
+            """SELECT status FROM raybet_matches WHERE raybet_match_id=?""",
+            (raybet_match_id,),
+        ).fetchone()
+        status = None if row is None or row[0] is None else str(row[0]).strip().casefold()
+        if status in _ENDED_MATCH_STATUSES:
+            raise ValueError("match_lifecycle_ended")
+        return status
 
     def build_p0(
         self,
@@ -566,7 +609,7 @@ class LiveDraftProspectiveBridgeRepository:
                       result.dota_match_id, result.winner_side,
                       result.first_usable_at, evidence.opendota_content_hash,
                       mapping.canonical_team_one_id, mapping.canonical_team_two_id,
-                      target.start_time
+                      target.start_time, target.duration
                  FROM live_draft_prospective_predictions AS prediction
                  JOIN map_results AS result
                    ON result.raybet_match_id=prediction.raybet_match_id
@@ -590,19 +633,20 @@ class LiveDraftProspectiveBridgeRepository:
         winning_team = team_one_id if str(row[9]) == "team_one" else team_two_id
         winner_side = "radiant" if winning_team == radiant_team_id else "dire"
         actual_start = datetime.fromtimestamp(int(row[14]), UTC)
+        duration_seconds = int(row[15])
+        if duration_seconds <= 0:
+            raise ValueError("authoritative match duration is unavailable")
+        authoritative_end = actual_start + timedelta(seconds=duration_seconds)
         prediction_created = _parse_utc(row[6], "prediction created_at")
-        initial_status = str(row[4])
-        initial_reason = None if row[5] is None else str(row[5])
-        if initial_status == "ineligible":
-            causal_status, causal_reason = "ineligible", initial_reason
-        elif prediction_created >= actual_start:
-            causal_status = "ineligible"
-            causal_reason = "prediction_not_before_authoritative_actual_start"
-        elif initial_status == "eligible":
-            causal_status, causal_reason = "eligible", None
-        else:
-            causal_status, causal_reason = "unverified", initial_reason
         result_usable_at = _parse_utc(row[10], "result_usable_at")
+        if prediction_created >= authoritative_end:
+            causal_status = "ineligible"
+            causal_reason = "prediction_not_before_authoritative_end"
+        elif prediction_created >= result_usable_at:
+            causal_status = "ineligible"
+            causal_reason = "prediction_not_before_result_first_usable_at"
+        else:
+            causal_status, causal_reason = "eligible", None
         if result_usable_at > settled:
             raise ValueError("settlement result is not yet authoritative")
         payload: dict[str, object] = {
@@ -683,6 +727,7 @@ def generate_live_draft_prediction(
     if confirmed < locked_at:
         raise ValueError("confirmation cannot precede operator lock")
     existing = repository.load_prediction(raybet_match_id, map_number, mapping_version)
+    lifecycle_status = repository.validate_prediction_target(raybet_match_id, map_number)
     if existing is not None:
         return {"status": "unchanged", "prediction": existing}
     p0 = repository.build_p0(mapping, observed_at=confirmed)
@@ -754,6 +799,7 @@ def generate_live_draft_prediction(
         live_state_input_used=bool(live_state_input_used),
         game_clock_seconds=effective_clock,
         draft_state_marker=marker,
+        lifecycle_status=lifecycle_status,
     )
     radiant_team_id = int(radiant_slots[0]["team_id"])
     dire_team_id = int(dire_slots[0]["team_id"])

@@ -614,7 +614,7 @@ describe("MatchWorkspace", () => {
       "match-1", 3, 1, expect.any(AbortSignal),
     ));
     expect(createLiveDraftPredictionMock).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "生成阵容预测" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "生成实时阵容预测" })).toBeDisabled();
     expect(screen.queryByText("stratz-rosh-web-2026-07-28-v2")).not.toBeInTheDocument();
   });
 
@@ -634,8 +634,8 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText(/本次预测只使用已锁定阵容/));
-    fireEvent.click(screen.getByRole("button", { name: "生成阵容预测" }));
+    fireEvent.click(screen.getByText(/本次模型只使用队伍历史与已锁定阵容/));
+    fireEvent.click(screen.getByRole("button", { name: "生成实时阵容预测" }));
     await waitFor(() => expect(createLiveDraftPredictionMock).toHaveBeenCalledWith(
       "match-1", 3, 1, "csrf", null,
     ));
@@ -699,8 +699,8 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText(/本次预测只使用已锁定阵容/));
-    fireEvent.click(screen.getByRole("button", { name: "生成阵容预测" }));
+    fireEvent.click(screen.getByText(/本次模型只使用队伍历史与已锁定阵容/));
+    fireEvent.click(screen.getByRole("button", { name: "生成实时阵容预测" }));
 
     expect(await screen.findByText("55.0%")).toBeInTheDocument();
     expect(screen.getByText("P0-only")).toBeInTheDocument();
@@ -740,8 +740,8 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText(/本次预测只使用已锁定阵容/));
-    fireEvent.click(screen.getByRole("button", { name: "生成阵容预测" }));
+    fireEvent.click(screen.getByText(/本次模型只使用队伍历史与已锁定阵容/));
+    fireEvent.click(screen.getByRole("button", { name: "生成实时阵容预测" }));
     expect(await screen.findByText("prospective_team_rating_seed_unavailable"))
       .toBeInTheDocument();
   });

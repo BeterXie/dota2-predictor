@@ -123,27 +123,32 @@ def test_live_p0_uses_team_identity_and_frozen_state_not_draft_or_live_state() -
     assert "odds" not in str(artifact).lower()
 
 
-def test_causal_status_requires_draft_evidence_and_excludes_gameplay() -> None:
+def test_causal_status_allows_positive_game_clock_for_active_match() -> None:
     assert _causal_status(
         live_state_input_used=False,
-        game_clock_seconds=None,
-        draft_state_marker="draft_complete",
+        game_clock_seconds=1,
+        draft_state_marker="in_game",
+        lifecycle_status="2",
     ) == ("eligible", None)
     assert _causal_status(
         live_state_input_used=False,
         game_clock_seconds=None,
         draft_state_marker=None,
+        lifecycle_status=None,
     )[0] == "unverified"
     assert _causal_status(
-        live_state_input_used=False,
-        game_clock_seconds=1,
-        draft_state_marker="draft_complete",
-    )[0] == "ineligible"
-    assert _causal_status(
         live_state_input_used=True,
-        game_clock_seconds=0,
+        game_clock_seconds=600,
         draft_state_marker="draft_complete",
-    )[0] == "ineligible"
+        lifecycle_status="running",
+    )[0] == "unverified"
+    with pytest.raises(ValueError, match="lifecycle_ended"):
+        _causal_status(
+            live_state_input_used=False,
+            game_clock_seconds=600,
+            draft_state_marker="in_game",
+            lifecycle_status="completed",
+        )
 
 
 class _NoSeedRepository:
@@ -152,6 +157,9 @@ class _NoSeedRepository:
 
     def load_prediction(self, *_args: object) -> None:
         return None
+
+    def validate_prediction_target(self, *_args: object) -> str:
+        return "2"
 
     def build_p0(self, *_args: object, **_kwargs: object) -> None:
         return None
@@ -238,9 +246,60 @@ class _Result:
         return self.row
 
 
+class _TargetValidationConnection:
+    def __init__(
+        self,
+        *,
+        result_exists: bool = False,
+        settlement_exists: bool = False,
+        lifecycle_status: str | None = None,
+    ) -> None:
+        self.result_exists = result_exists
+        self.settlement_exists = settlement_exists
+        self.lifecycle_status = lifecycle_status
+
+    def execute(self, sql: str, _parameters: object = None) -> _Result:
+        if "FROM map_results" in sql:
+            return _Result((1,) if self.result_exists else None)
+        if "FROM live_draft_prospective_settlements" in sql:
+            return _Result((1,) if self.settlement_exists else None)
+        if "FROM raybet_matches" in sql:
+            return _Result(None if self.lifecycle_status is None else (self.lifecycle_status,))
+        raise AssertionError(f"unexpected query: {sql}")
+
+
+def test_prediction_target_rejects_only_authoritative_end_evidence() -> None:
+    active = LiveDraftProspectiveBridgeRepository(
+        _TargetValidationConnection(lifecycle_status="running")  # type: ignore[arg-type]
+    )
+    unknown = LiveDraftProspectiveBridgeRepository(
+        _TargetValidationConnection()  # type: ignore[arg-type]
+    )
+    assert active.validate_prediction_target("match", 1) == "running"
+    assert unknown.validate_prediction_target("match", 1) is None
+
+    for connection, reason in (
+        (_TargetValidationConnection(result_exists=True), "authoritative_result"),
+        (_TargetValidationConnection(settlement_exists=True), "already_settled"),
+        (_TargetValidationConnection(lifecycle_status="abandoned"), "lifecycle_ended"),
+    ):
+        repository = LiveDraftProspectiveBridgeRepository(connection)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match=reason):
+            repository.validate_prediction_target("match", 1)
+
+
 class _SettlementConnection:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        prediction_created_at: str = "2026-08-08T08:30:00+00:00",
+        result_usable_at: str = "2026-08-08T10:00:00+00:00",
+        duration_seconds: int = 7200,
+    ) -> None:
         self.statements: list[str] = []
+        self.prediction_created_at = prediction_created_at
+        self.result_usable_at = result_usable_at
+        self.duration_seconds = duration_seconds
 
     def execute(self, sql: str, _parameters: object = None) -> _Result:
         self.statements.append(sql)
@@ -253,15 +312,16 @@ class _SettlementConnection:
                     20,
                     "eligible",
                     None,
-                    "2026-08-08T07:59:00+00:00",
+                    self.prediction_created_at,
                     7,
                     9_000_000_001,
                     "team_one",
-                    "2026-08-08T10:00:00+00:00",
+                    self.result_usable_at,
                     "f" * 64,
                     10,
                     20,
                     int(datetime(2026, 8, 8, 8, 0, tzinfo=UTC).timestamp()),
+                    self.duration_seconds,
                 )
             )
         if "SELECT settlement_hash" in sql:
@@ -287,3 +347,38 @@ def test_settlement_is_append_only_and_keeps_prediction_unchanged() -> None:
     assert settlement["post_settlement_causal_status"] == "eligible"
     assert any("INSERT INTO live_draft_prospective_settlements" in sql for sql in connection.statements)
     assert not any("UPDATE live_draft_prospective_predictions" in sql for sql in connection.statements)
+
+
+@pytest.mark.parametrize(
+    ("connection", "reason"),
+    [
+        (
+            _SettlementConnection(
+                prediction_created_at="2026-08-08T09:00:00+00:00",
+                duration_seconds=3600,
+            ),
+            "prediction_not_before_authoritative_end",
+        ),
+        (
+            _SettlementConnection(
+                prediction_created_at="2026-08-08T09:30:00+00:00",
+                result_usable_at="2026-08-08T09:00:00+00:00",
+            ),
+            "prediction_not_before_result_first_usable_at",
+        ),
+    ],
+)
+def test_settlement_audit_uses_end_and_result_availability_only(
+    connection: _SettlementConnection,
+    reason: str,
+) -> None:
+    settlement = LiveDraftProspectiveBridgeRepository(  # type: ignore[arg-type]
+        connection
+    ).settle_prediction(
+        "a" * 64,
+        settled_at=datetime(2026, 8, 8, 10, 1, tzinfo=UTC),
+    )
+
+    assert settlement is not None
+    assert settlement["post_settlement_causal_status"] == "ineligible"
+    assert settlement["post_settlement_causal_reason"] == reason

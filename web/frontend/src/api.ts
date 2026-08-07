@@ -137,7 +137,7 @@ export function createLiveDraftPrediction(
     {
       mapping_version: mappingVersion,
       operator_identity: "local-operator",
-      confirmation_text: "本次预测只使用已锁定阵容，未使用击杀、经济、经验、防御塔、肉山或其他游戏内状态。",
+      confirmation_text: "本次模型只使用队伍历史与已锁定阵容，不使用击杀、经济、经验、防御塔、肉山、实时赔率或其他游戏内状态。",
       game_clock_seconds: gameClockSeconds,
       vision_frame_timestamp: null,
       draft_state_marker: "draft_complete",
