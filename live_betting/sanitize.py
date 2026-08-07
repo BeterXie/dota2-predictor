@@ -130,6 +130,38 @@ def verified_public_stream_url(value: object) -> str | None:
     return urlunsplit(("https", hostname, parsed.path, "", ""))
 
 
+def verified_ephemeral_stream_url(value: object) -> str | None:
+    """Validate a short-lived RayBet HLS capability without persisting it."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        return None
+    if "\\" in value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        decoded_path = unquote(parsed.path, errors="strict")
+    except (UnicodeError, ValueError):
+        return None
+    hostname = parsed.hostname.casefold() if parsed.hostname is not None else None
+    segments = decoded_path.split("/")
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname not in PUBLIC_STREAM_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or not decoded_path.casefold().endswith(".m3u8")
+        or any(segment in {".", ".."} for segment in segments)
+        or any(character in decoded_path for character in ("?", "#", "\x00", "\\"))
+    ):
+        return None
+    return value
+
+
 def public_stream_evidence(value: object) -> dict[str, str] | None:
     url = verified_public_stream_url(value)
     if url is None:
@@ -232,5 +264,6 @@ __all__ = [
     "sanitize_public_url",
     "sanitize_raybet_payload",
     "stored_public_stream_url",
+    "verified_ephemeral_stream_url",
     "verified_public_stream_url",
 ]

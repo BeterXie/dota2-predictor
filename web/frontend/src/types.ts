@@ -129,7 +129,7 @@ export interface LiveGameSnapshot {
 }
 
 export interface WatchLink {
-  kind: "public_stream" | "match_page" | "none";
+  kind: "public_stream" | "stream_resolver" | "match_page" | "none";
   availability: "available" | "unavailable";
   url: string | null;
   reason: string;

@@ -11,6 +11,7 @@ from live_betting.storage import LiveBettingStore
 from web import queries
 from web.app import app
 from web.control import ControlService
+from web.routers import monitor as monitor_router
 from web.monitoring import (
     build_monitor_snapshot,
     monitor_history_page,
@@ -63,6 +64,12 @@ def test_monitor_list_detail_and_history_use_postgres(postgres_engine, tmp_path)
     assert detail is not None
     assert detail["raybet_match_id"] == "live-match"
     assert detail["lifecycle"] in {"live", "degraded"}
+    assert detail["watch_link"] == {
+        "kind": "stream_resolver",
+        "availability": "available",
+        "url": "/api/monitor/matches/live-match/live-stream",
+        "reason": "fresh_stream_resolution_available",
+    }
 
     history = monitor_history_page(store.connection, now=NOW)
     assert [item["raybet_match_id"] for item in history["items"]] == [
@@ -173,10 +180,20 @@ def test_monitor_api_uses_postgres_session(postgres_engine, tmp_path, monkeypatc
     store.close()
 
     monkeypatch.setattr(queries, "get_db", lambda: PostgresSession(postgres_engine))
+    stream_url = "https://play.ehome.gg/live/api-match.m3u8?expires=1&sig=test"
+    monkeypatch.setattr(
+        monitor_router,
+        "_fresh_live_stream_url",
+        lambda match_id: stream_url if match_id == "api-match" else None,
+    )
 
     with TestClient(app) as client:
         bootstrap = client.get("/api/monitor/bootstrap")
         detail = client.get("/api/monitor/matches/api-match")
+        stream = client.get(
+            "/api/monitor/matches/api-match/live-stream",
+            follow_redirects=False,
+        )
 
     assert bootstrap.status_code == 200
     assert any(
@@ -185,6 +202,10 @@ def test_monitor_api_uses_postgres_session(postgres_engine, tmp_path, monkeypatc
     )
     assert detail.status_code == 200
     assert detail.json()["raybet_match_id"] == "api-match"
+    assert stream.status_code == 307
+    assert stream.headers["location"] == stream_url
+    assert stream.headers["cache-control"] == "no-store"
+    assert stream.headers["referrer-policy"] == "no-referrer"
 
 
 def test_control_uses_supervisor_heartbeat_authority(

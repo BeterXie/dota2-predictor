@@ -28,6 +28,12 @@ const match: MonitorMatch = {
   updated_at: "2026-08-07T10:10:00+00:00",
   lifecycle: "live",
   history_eligible: false,
+  watch_link: {
+    kind: "stream_resolver",
+    availability: "available",
+    url: "/api/monitor/matches/raybet-1/live-stream",
+    reason: "fresh_stream_resolution_available",
+  },
   winner: null,
   latest_vision: {
     captured_at: "2026-08-07T10:09:00+00:00",
@@ -167,6 +173,13 @@ describe("MatchWorkspace", () => {
   it("keeps HUD evidence and the locked live prediction action", async () => {
     renderWorkspace();
 
+    const watchLink = screen.getByRole("link", { name: "观看直播" });
+    expect(watchLink).toHaveAttribute(
+      "href",
+      "/api/monitor/matches/raybet-1/live-stream",
+    );
+    expect(watchLink).toHaveAttribute("target", "_blank");
+    expect(watchLink).toHaveAttribute("rel", "noreferrer");
     expect(screen.getByText("HUD 与 Vision 证据")).toBeInTheDocument();
     expect(screen.getByText("7:00")).toBeInTheDocument();
     await waitFor(() => {

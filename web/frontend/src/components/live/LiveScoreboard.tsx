@@ -1,6 +1,6 @@
 import { ArrowSquareOut, Clock } from "@phosphor-icons/react";
 import { formatClock, formatDateTime } from "../../format";
-import type { MonitorMatch } from "../../types";
+import type { MonitorMatch, WatchLink } from "../../types";
 import { RelativeAge } from "../RelativeAge";
 import { LifecycleBadge } from "../StatusBadge";
 
@@ -10,7 +10,7 @@ interface LiveScoreboardProps {
   now?: number;
   oddsObservedAt: string | null;
   oddsSnapshotLabel: string | null;
-  watchLink: { kind: string; url: string } | null;
+  watchLink: { kind: WatchLink["kind"]; url: string } | null;
 }
 
 export function LiveScoreboard({
@@ -41,8 +41,8 @@ export function LiveScoreboard({
               target="_blank"
               rel="noreferrer"
             >
-              <ArrowSquareOut size={15} />
-              {watchLink.kind === "match_page" ? "打开比赛页" : "打开直播"}
+              <ArrowSquareOut aria-hidden="true" size={15} />
+              观看直播
             </a>
           )}
           {oddsSnapshotLabel ? (

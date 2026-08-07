@@ -1379,6 +1379,17 @@ def _watch_link(
             "url": public_stream,
             "reason": "verified_unsigned_stream",
         }
+    if str(row["status"] or "").strip().casefold() in _OPEN_MATCH_STATUSES:
+        return {
+            "kind": "stream_resolver",
+            "availability": "available",
+            "url": (
+                "/api/monitor/matches/"
+                f"{url_quote(str(row['raybet_match_id']), safe='')}"
+                "/live-stream"
+            ),
+            "reason": "fresh_stream_resolution_available",
+        }
     return {
         "kind": "none",
         "availability": "unavailable",
