@@ -432,7 +432,7 @@ def _require_exact_row(
         raise ValueError(conflict)
 
 
-def _state_snapshot_record(
+def build_team_rating_state_snapshot_record(
     run_id: str,
     as_of: datetime,
     state: TeamRatingState,
@@ -628,7 +628,9 @@ def build_team_rating_storage_records(
         status=prediction_status,
     )
     snapshots = tuple(
-        _state_snapshot_record(run_id, artifact.training_cutoff, state)
+        build_team_rating_state_snapshot_record(
+            run_id, artifact.training_cutoff, state
+        )
         for state in artifact.state_before_target
     )
     return run_record, prediction_record, snapshots
@@ -676,15 +678,19 @@ def _stored_snapshot(
     ).fetchone()
 
 
-def persist_team_rating_runs(
+def persist_team_rating_storage_records(
     connection: PostgresSession,
-    runs: Sequence[TeamRatingWalkForwardRun],
+    records: Sequence[TeamRatingStorageRecords],
     *,
     dry_run: bool = False,
     checkpoint_run_ids: Collection[str] = (),
     created_at: datetime | None = None,
 ) -> TeamRatingPersistenceCounts:
-    """Atomically insert exact Team Rating rows or reject identity conflicts."""
+    """Atomically insert pre-validated Team Rating rows.
+
+    Callers must use a mode-specific builder before reaching this low-level
+    persistence function. Database authority guards remain the final boundary.
+    """
 
     if not isinstance(dry_run, bool):
         raise ValueError("dry_run must be boolean")
@@ -692,14 +698,13 @@ def persist_team_rating_runs(
         datetime.now(UTC) if created_at is None else created_at,
         "created_at",
     ).isoformat()
-    records = _normalize_storage_records(
-        tuple(build_team_rating_storage_records(run) for run in runs)
-    )
+    normalized_records = _normalize_storage_records(records)
     requested_checkpoints = {
         _sha256(run_id, "checkpoint run_id") for run_id in checkpoint_run_ids
     }
     available_run_ids = {
-        run_record.run_id for run_record, _prediction, _states in records
+        run_record.run_id
+        for run_record, _prediction, _states in normalized_records
     }
     unknown = sorted(requested_checkpoints - available_run_ids)
     if unknown:
@@ -711,7 +716,7 @@ def persist_team_rating_runs(
     inserted_predictions = unchanged_predictions = 0
     inserted_snapshots = unchanged_snapshots = 0
     with connection.transaction():
-        for run_record, prediction_record, snapshot_records in records:
+        for run_record, prediction_record, snapshot_records in normalized_records:
             existing_run = _stored_run(connection, run_record)
             if existing_run is not None:
                 _require_exact_row(
@@ -846,11 +851,33 @@ def persist_team_rating_runs(
     )
 
 
+def persist_team_rating_runs(
+    connection: PostgresSession,
+    runs: Sequence[TeamRatingWalkForwardRun],
+    *,
+    dry_run: bool = False,
+    checkpoint_run_ids: Collection[str] = (),
+    created_at: datetime | None = None,
+) -> TeamRatingPersistenceCounts:
+    """Validate and atomically persist reconstructed walk-forward runs."""
+
+    records = tuple(build_team_rating_storage_records(run) for run in runs)
+    return persist_team_rating_storage_records(
+        connection,
+        records,
+        dry_run=dry_run,
+        checkpoint_run_ids=checkpoint_run_ids,
+        created_at=created_at,
+    )
+
+
 __all__ = [
     "TeamRatingPersistenceCounts",
     "TeamRatingPredictionRecord",
     "TeamRatingRunRecord",
     "TeamRatingStateSnapshotRecord",
+    "build_team_rating_state_snapshot_record",
     "build_team_rating_storage_records",
     "persist_team_rating_runs",
+    "persist_team_rating_storage_records",
 ]
