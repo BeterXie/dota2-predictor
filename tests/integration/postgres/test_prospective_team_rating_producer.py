@@ -457,7 +457,7 @@ def test_rosh_dependency_records_missing_p0_without_p1(
         session.close()
 
 
-def test_state_recovery_uses_previous_available_at_not_later_cutoff(
+def test_full_rebuild_uses_seed_base_and_cumulative_postseed_authority(
     postgres_engine: Engine,
 ) -> None:
     _history, target_ids = _seed_formal_data(
@@ -466,7 +466,7 @@ def test_state_recovery_uses_previous_available_at_not_later_cutoff(
         target_count=2,
     )
     result_id = 8_500_000_000
-    result_started = TARGET_ORIGIN - timedelta(hours=2)
+    result_started = HISTORY_ORIGIN - timedelta(hours=2)
     result_usable = TARGET_ORIGIN - timedelta(minutes=1)
     with postgres_engine.begin() as connection:
         connection.execute(
@@ -523,12 +523,14 @@ def test_state_recovery_uses_previous_available_at_not_later_cutoff(
             now=TARGET_ORIGIN + timedelta(minutes=3),
         ).status == "produced"
         second = session.execute(
-            """SELECT base_as_of, applied_result_manifest_json
+            """SELECT base_as_of, applied_result_manifest_json, artifact_json
                 FROM prospective_team_rating_authorities WHERE match_id=?""",
             (target_ids[1],),
         ).fetchone()
-        assert second["base_as_of"] == first_observed.isoformat()
+        assert second["base_as_of"] == SEED_CUTOFF.isoformat()
         manifest = json.loads(second["applied_result_manifest_json"])
         assert [row["result"]["match_id"] for row in manifest] == [result_id]
+        replay_order = json.loads(second["artifact_json"])["rating_replay_order"]
+        assert replay_order[0]["result"]["match_id"] == result_id
     finally:
         session.close()

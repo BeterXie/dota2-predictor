@@ -26,6 +26,7 @@ from event_intelligence.prospective_rosh_shadow import (
 from event_intelligence.prospective_team_rating import (
     AuthoritativeResult,
     ProspectiveTeamRatingRepository,
+    rebuild_prospective_team_rating_state,
     team_rating_state_hash,
 )
 from event_intelligence.raw_archive import canonical_json_bytes
@@ -33,7 +34,6 @@ from event_intelligence.team_rating import (
     TeamRatingState,
     effective_team_rating,
     team_rating_probability,
-    update_team_ratings,
 )
 from live_betting.rosh_parity import ExactByteArtifactStore
 from live_betting.stratz_rosh_client import StratzRoshClient, StratzRoshError
@@ -173,6 +173,7 @@ class LiveTeamRatingP0:
     base_state_hash: str
     applied_results: tuple[AuthoritativeResult, ...]
     applied_result_manifest_hash: str
+    rating_replay_order_hash: str
     state_before_hash: str
     training_input_hash: str
     radiant_rating: float
@@ -193,6 +194,7 @@ class LiveTeamRatingP0:
             "base_state_hash": self.base_state_hash,
             "applied_results": [row.to_payload() for row in self.applied_results],
             "applied_result_manifest_hash": self.applied_result_manifest_hash,
+            "rating_replay_order_hash": self.rating_replay_order_hash,
             "state_before_hash": self.state_before_hash,
             "training_input_hash": self.training_input_hash,
             "radiant_rating": self.radiant_rating,
@@ -384,15 +386,12 @@ class LiveDraftProspectiveBridgeRepository:
             target_match_id=None,
             allow_seed_observation=True,
         )
-        states = base.states
-        for result in results:
-            assert result.row.result_usable_at is not None
-            states = update_team_ratings(
-                states,
-                result.row,
-                result.row.result_usable_at,
-                seed.config,
-            )
+        results, replay_order, states = rebuild_prospective_team_rating_state(
+            seed,
+            results,
+            cutoff=cutoff,
+            target_match_id=None,
+        )
         payload = _mapping_payload(mapping)
         slots = payload["slots"]
         assert isinstance(slots, list)
@@ -404,12 +403,15 @@ class LiveDraftProspectiveBridgeRepository:
         dire_rating, _ = effective_team_rating(dire_state, (), cutoff, seed.config)
         probability = team_rating_probability(radiant_rating, dire_rating, seed.config)
         manifest = [result.to_payload() for result in results]
+        replay_manifest = [result.to_payload() for result in replay_order]
+        replay_hash = _hash(replay_manifest)
         state_hash = team_rating_state_hash(states)
         training_input_hash = _hash(
             {
                 "seed_hash": seed.seed_hash,
                 "base_state_hash": base.state_hash,
                 "applied_results": manifest,
+                "rating_replay_order_hash": replay_hash,
                 "operator_locked_at": cutoff.isoformat(),
             }
         )
@@ -421,6 +423,7 @@ class LiveDraftProspectiveBridgeRepository:
             base_state_hash=base.state_hash,
             applied_results=results,
             applied_result_manifest_hash=_hash(manifest),
+            rating_replay_order_hash=replay_hash,
             state_before_hash=state_hash,
             training_input_hash=training_input_hash,
             radiant_rating=radiant_rating,

@@ -397,6 +397,7 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
             <div><dt>Team Rating P0</dt><dd>{formatPercent(prediction.p0_probability)}</dd></div>
             <div><dt>R.O.S.H. P1</dt><dd>{prediction.p1_probability == null ? "P0-only" : formatPercent(prediction.p1_probability)}</dd></div>
             <div><dt>Pure score</dt><dd>{prediction.pure_rosh_score?.toFixed(4) ?? "-"}</dd></div>
+            {prediction.missing_reason && <div><dt>缺失原因</dt><dd>{prediction.missing_reason}</dd></div>}
             <div><dt>因果状态</dt><dd>{prediction.causal_evidence.causal_status}</dd></div>
             <div><dt>生成时间</dt><dd>{formatDateTime(prediction.created_at)}</dd></div>
           </div>

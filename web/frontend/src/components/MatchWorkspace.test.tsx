@@ -14,6 +14,7 @@ import type {
   MatchDetail,
   MonitorMatch,
   LiveDraftProspectivePrediction,
+  RoshAnalysisRunResponse,
   RoshLineupScoresData,
   StrategyAnalysisData,
   StrategyDecision,
@@ -22,6 +23,7 @@ import type {
 
 const createLiveDraftPredictionMock = vi.hoisted(() => vi.fn());
 const fetchLiveDraftPredictionMock = vi.hoisted(() => vi.fn());
+const fetchRoshAnalysisRecordsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
@@ -29,6 +31,7 @@ vi.mock("../api", async (importOriginal) => {
     ...actual,
     createLiveDraftPrediction: createLiveDraftPredictionMock,
     fetchLiveDraftPrediction: fetchLiveDraftPredictionMock,
+    fetchRoshAnalysisRecords: fetchRoshAnalysisRecordsMock,
   };
 });
 vi.mock("@fluentui/react-components", () => ({
@@ -527,6 +530,44 @@ function liveDraftPrediction(): LiveDraftProspectivePrediction {
   };
 }
 
+function roshAnalysisResponse(relativeAdvantage = 5.2): RoshAnalysisRunResponse {
+  return {
+    schema: "rosh-analysis-run/v1",
+    run_id: "run-1",
+    status: "succeeded",
+    mode: "explicit_draft",
+    match_id: null,
+    date_time: Math.floor(Date.parse("2026-07-16T12:01:00+00:00") / 1_000),
+    draft_hash: "a".repeat(64),
+    rosh_profile_id: "stratz-rosh-web-2026-07-28-v2",
+    formula_version: "dematus-rosh-v1",
+    request_profile_hash: "b".repeat(64),
+    upstream_bundle_hash: "c".repeat(64),
+    scorer_source_hash: "d".repeat(64),
+    canonical_profile_hash: "e".repeat(64),
+    serialization_version: "canonical-json-v1",
+    evidence_hash: "f".repeat(64),
+    collected_at: "2026-07-16T12:02:00+00:00",
+    radiant_team_score: 12.1,
+    dire_team_score: 6.9,
+    relative_advantage: relativeAdvantage,
+    hero_components: ["RADIANT", "DIRE"].flatMap((team_side, sideIndex) => (
+      Array.from({ length: 5 }, (_, index) => ({
+        team_side: team_side as "RADIANT" | "DIRE",
+        position_id: index + 1,
+        hero_id: sideIndex * 5 + index + 1,
+        position_base_diff: 0,
+        same_team_synergy: 0,
+        opponent_matchup_synergy: 0,
+        raw_score: 0,
+        display_score: 0,
+      }))
+    )),
+    minute_points: [],
+    error_code: null,
+  };
+}
+
 function analysisWithSingleDecision(decision: StrategyDecision): MatchAnalysis {
   const analysis = matchAnalysis();
   analysis.strategy.data!.decisions = [decision];
@@ -548,6 +589,12 @@ describe("MatchWorkspace", () => {
     fetchLiveDraftPredictionMock.mockReset();
     fetchLiveDraftPredictionMock.mockResolvedValue({ status: "not_found", prediction: null });
     createLiveDraftPredictionMock.mockReset();
+    fetchRoshAnalysisRecordsMock.mockReset();
+    fetchRoshAnalysisRecordsMock.mockResolvedValue({
+      query_source: "raybet",
+      query_match_id: "match-1",
+      records: [],
+    });
   });
   afterEach(cleanup);
 
@@ -595,6 +642,70 @@ describe("MatchWorkspace", () => {
     expect(await screen.findByText("55.0%")).toBeInTheDocument();
     expect(screen.getByText("61.0%")).toBeInTheDocument();
     expect(screen.getByText("eligible")).toBeInTheDocument();
+  });
+
+  it("keeps linked official IDs visible as read-only evidence", async () => {
+    fetchRoshAnalysisRecordsMock.mockResolvedValueOnce({
+      query_source: "raybet",
+      query_match_id: "match-1",
+      records: [{
+        run: roshAnalysisResponse(-30.6),
+        links: [
+          { source: "raybet", source_match_id: "match-1", map_number: 3 },
+          { source: "opendota", source_match_id: "8904322271" },
+          { source: "stratz", source_match_id: "8904322271" },
+        ],
+      }],
+    });
+
+    render(
+      <MatchWorkspace
+        detail={detailWithLockedDraft()}
+        error={null}
+        loading={false}
+        match={match}
+        replay={false}
+      />,
+    );
+
+    expect(await screen.findByText("Rosh 分析记录")).toBeInTheDocument();
+    expect(screen.getByText(/RAYBET match-1 · 第 3 局/)).toBeInTheDocument();
+    expect(screen.getByText(/OPENDOTA 8904322271/)).toBeInTheDocument();
+    expect(screen.getByText(/STRATZ 8904322271/)).toBeInTheDocument();
+    expect(createLiveDraftPredictionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps P0 visible when prospective R.O.S.H. evidence is unavailable", async () => {
+    createLiveDraftPredictionMock.mockResolvedValueOnce({
+      status: "created",
+      prediction: {
+        ...liveDraftPrediction(),
+        record_status: "p0_only",
+        p1_probability: null,
+        pure_rosh_score: null,
+        standardized_rosh_score: null,
+        rosh_logit_contribution: null,
+        missing_reason: "prospective_rosh_evidence_unavailable",
+      },
+    });
+    render(
+      <MatchWorkspace
+        csrfToken="csrf"
+        detail={detailWithLockedDraft()}
+        error={null}
+        loading={false}
+        match={match}
+        replay={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/本次预测只使用已锁定阵容/));
+    fireEvent.click(screen.getByRole("button", { name: "生成阵容预测" }));
+
+    expect(await screen.findByText("55.0%")).toBeInTheDocument();
+    expect(screen.getByText("P0-only")).toBeInTheDocument();
+    expect(screen.getByText("prospective_rosh_evidence_unavailable"))
+      .toBeInTheDocument();
   });
 
   it("does not run prematch Rosh analysis until the live draft is locked", () => {

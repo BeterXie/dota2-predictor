@@ -22,7 +22,9 @@ import {
   X,
   XCircle,
 } from "@phosphor-icons/react";
-import { lazy, Suspense, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+
+import { fetchRoshAnalysisRecords } from "../api";
 import {
   formatClock,
   formatDateTime,
@@ -47,6 +49,7 @@ import type {
   MatchDetail,
   MonitorMatch,
   OddsAnalysisData,
+  RoshAnalysisRecord,
   RoshLineupScoresData,
   StrategyAnalysisData,
   StrategyComebackEntryInput,
@@ -298,6 +301,11 @@ export function MatchWorkspace({
 
 type FunnelTone = "pass" | "blocked" | "waiting" | "invalid";
 
+function roshDirectionText(score: number): string {
+  if (score === 0) return "双方阵容接近均势";
+  return `${score > 0 ? "天辉" : "夜魇"} +${Math.abs(score).toFixed(2)}`;
+}
+
 function CurrentStrategyOverview({
   detail,
   error,
@@ -307,6 +315,25 @@ function CurrentStrategyOverview({
   error: string | null;
   match: MonitorMatch;
 }) {
+  const recordMatchId = detail?.draft_mapping?.is_locked
+    ? detail.draft_mapping.raybet_match_id
+    : null;
+  const [roshRecords, setRoshRecords] = useState<RoshAnalysisRecord[]>([]);
+
+  useEffect(() => {
+    if (!recordMatchId) {
+      setRoshRecords([]);
+      return;
+    }
+    const controller = new AbortController();
+    void fetchRoshAnalysisRecords("raybet", recordMatchId, controller.signal)
+      .then((page) => setRoshRecords(page.records))
+      .catch(() => {
+        if (!controller.signal.aborted) setRoshRecords([]);
+      });
+    return () => controller.abort();
+  }, [recordMatchId]);
+
   const strategy = normalizeStrategySection(
     sectionOrFallback(detail?.analysis?.strategy, error),
   );
@@ -449,11 +476,41 @@ function CurrentStrategyOverview({
           tone={verdictTone}
         />
       </div>
+      {roshRecords.length > 0 && <RoshRecordTable records={roshRecords} />}
       <DecisionDeltaPanel
         decisions={decisions}
         teamOne={match.team_one}
         teamTwo={match.team_two}
       />
+    </section>
+  );
+}
+
+function RoshRecordTable({ records }: { records: RoshAnalysisRecord[] }) {
+  return (
+    <section className="rosh-records" aria-label="Rosh 分析记录">
+      <header>
+        <strong>Rosh 分析记录</strong>
+        <span>{records.length} 条 · 只读历史证据</span>
+      </header>
+      <div className="rosh-record-table-scroll">
+        <table className="rosh-record-table">
+          <thead><tr><th>关联比赛 ID</th><th>方向</th><th>模式</th><th>记录时间</th><th>Run</th></tr></thead>
+          <tbody>
+            {records.map(({ links, run }) => (
+              <tr key={run.run_id}>
+                <td>{links.map((link) => (
+                  `${link.source.toUpperCase()} ${link.source_match_id}${link.map_number ? ` · 第 ${link.map_number} 局` : ""}`
+                )).join(" / ")}</td>
+                <td>{run.relative_advantage == null ? "不可用" : roshDirectionText(run.relative_advantage)}</td>
+                <td>{run.mode === "historical_match" ? "历史比赛" : "锁定阵容"}</td>
+                <td>{formatDateTime(run.collected_at)}</td>
+                <td><code>{run.run_id.slice(0, 12)}</code></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

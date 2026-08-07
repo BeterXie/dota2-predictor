@@ -68,13 +68,14 @@ version and cannot overwrite the old prediction.
 ## Team Rating P0
 
 The P0 cutoff is `operator_locked_at`. The live-specific builder does not create
-a fake formal target or a reconstructed prediction. It restores the latest
-legal state for the frozen prospective seed, then applies only formal results
-whose authoritative `first_usable_at` is no later than the lock time. It uses an
-empty current roster so heroes, players, OCR, and live state cannot affect P0.
+a fake formal target or a reconstructed prediction. For every P0 it rebuilds
+from the frozen seed authority plus every post-seed formal result whose
+authoritative `first_usable_at` is no later than the lock time. It uses an empty
+current roster so heroes, players, OCR, and live state cannot affect P0.
 
-The accepted fixed configuration was taken from the final legal reconstructed
-Team Rating run, not from the most frequent walk-forward grid choice:
+The accepted fixed configuration is the last causally selected fixed config,
+not a prospectively validated config and not the most frequent walk-forward
+grid choice:
 
 ```json
 {
@@ -93,24 +94,81 @@ The tracked artifact is
 canonical configuration hash is
 `b527319ab1035d6cae6550820cd0854b467f845537d033909b4f2e45e706c19a`.
 
-The operational database contains zero prospective Team Rating seeds. The
-read-only seed dry-run loaded 3,932 authoritative results and wrote zero rows,
-but failed closed at input 97:
+Operational lineage inspection found exactly one reconstructed run with that
+config hash: run
+`30142d714950c803d13ef70cfebce40de1dc6263dda35b3e8fa406e5a278652c`.
+It is the latest trained reconstructed selection, with target/training cutoff
+`2026-08-04T16:36:58Z`. Its last ordered training source was available at
+`2026-08-04T16:35:10.684150Z`; the target result became available only at
+`2026-08-04T17:50:57.346903Z`. This establishes causal parameter-selection
+lineage only. It does not establish prospective effectiveness.
+
+### Authority order and rating replay order
+
+The seed and every prospective P0 keep two different canonical orders:
 
 ```text
-rating cutoff cannot precede last_observed_at
-previous match 8784700248 completed 2026-04-24T20:21:37Z
-previous result usable 2026-07-13T12:26:09.977647Z
-current match 8784597508 started 2026-04-24T18:23:21Z
-current result usable 2026-07-13T12:26:10.250873Z
+authority manifest:
+result_usable_at -> started_at -> match_id
+
+Team Rating replay:
+started_at -> completed_at -> match_id
 ```
 
-The authoritative availability order is causal, but these two backfilled
-results arrive in the reverse of map time, and the current seed replay refuses
-to move a team rating clock backward. This task does not change Team Rating or
-select a different cutoff. Until a separately reviewed seed construction fix is
-approved and a seed is explicitly frozen, the page returns the stable blocker
-`prospective_team_rating_seed_unavailable`. It never falls back to a
+The authority manifest proves that every included result was available by the
+cutoff. Only after that validation is complete is the same set reordered for
+Elo replay. Replay starts from an empty state and passes one uniform seed or P0
+cutoff to the unchanged Team Rating math. It never substitutes availability for
+match time, clamps timestamps, skips a late backfill, or admits a result that
+became available after the cutoff.
+
+The seed artifact stores both manifests and both hashes. Exact verification
+rechecks cutoff eligibility, canonical replay order, per-team chronology, the
+empty-state replay, config identity, final state hash, and content-addressed seed
+hash. A team's next map must not start before its previous map completed;
+violations fail closed as `overlapping_team_match_chronology`. Simultaneous maps
+between different teams are valid.
+
+Prospective runs use the simple full-rebuild path. They combine the immutable
+seed source manifest with the complete cutoff-eligible post-seed authority set,
+then replay the cumulative set chronologically from an empty state. Previous P0
+snapshots are not incremental bases. Consequently, a newly available historical
+result that predates an existing state automatically causes a deterministic full
+rebuild and cannot silently corrupt the rating clock.
+
+### Operational read-only seed dry-run
+
+The operational database remains at `20260807_0033` and still contains zero
+prospective Team Rating seeds. A `READ ONLY` transaction at cutoff
+`2026-08-07T09:22:08.309653Z` produced:
+
+```text
+available authority results: 3932
+excluded after cutoff: 0
+duplicates: 0
+adjacent availability-order chronology inversions: 480
+replay maps: 3932
+distinct teams: 102
+team chronology overlaps: 0
+first replay match: 8142981335 at 2025-01-24T09:00:52Z
+last replay match: 8930736914 at 2026-08-05T14:55:22Z
+source manifest hash: 25c820cda4839f04240e87bfc5c91d6033df74fb9cfc41f0c68e5878c9c5cd19
+replay order hash: 1303f6f4f5a0204eaad7c8ae0914033d0fe3268cb6f6187e1734d6037c6d5b7f
+final state hash: 7148c4b27525a894541099487f26ab32d05b74874420992acdd8d7a1368f1259
+prospective seed hash: 3c2bd8d45ceefae1818789acf5467b5f70f4feb04ea9fae765ea2b79c0378f3f
+repeated replay identical: true
+database writes: 0
+```
+
+Matches `8784700248` and `8784597508` are present in both manifests with their
+original timestamps. Input 97 no longer fails, and neither match is skipped.
+Reversing the source input produced the same manifest, replay, state, and seed
+hashes. The 480 inversion count is the number of adjacent rows in availability
+order whose chronological key moves backward; it is diagnostic only and does
+not change authority eligibility.
+
+No seed was frozen. Until a separate explicit freeze occurs, the page still
+returns `prospective_team_rating_seed_unavailable` and never falls back to a
 reconstructed P0.
 
 ## Frozen R.O.S.H. P1
@@ -183,13 +241,15 @@ No new frontend route, workspace, selector, or OCR UI was introduced.
 ## Verification
 
 - Ruff: full repository passes;
-- non-PostgreSQL CI suite: 819 passed, 17 skipped, 1,201 deselected;
+- non-PostgreSQL CI suite: 830 passed, 17 skipped, 1,201 deselected;
 - PostgreSQL integration suite: 130 passed;
-- frontend suite: 222 passed;
+- frontend suite: 224 passed;
 - production frontend build passes;
-- focused Python unit tests: locked/unlocked mapping, duplicate hero and
-  position rejection, no-player mapping, P0 lineup/live-state independence,
-  seed blocker, frozen candidate, and causal classification;
+- prospective replay tests cover availability/chronology agreement, late
+  backfill, the two operational regression matches, cutoff and target exclusion,
+  duplicate authority, deterministic ties, overlap rejection, full rebuild,
+  exact replay, tamper rejection, unchanged reconstructed replay, fixed config
+  identity, P0 input isolation, and the no-seed blocker;
 - isolated PostgreSQL 0034 round-trip: paired P0/P1, exact artifacts/replay,
   STRATZ-failure P0-only, idempotency, new mapping version preservation,
   append-only rejection, and absence of an official ID column in prediction;
@@ -197,7 +257,28 @@ No new frontend route, workspace, selector, or OCR UI was introduced.
   confirmation, saved P0/P1 display, unlocked blocker, and seed blocker;
 - Alembic has one head: `20260807_0034`.
 
-The remaining operational blocker is the absent prospective Team Rating seed,
-with the seed dry-run ordering failure above. No operational migration, seed
-freeze, real collector, 5-map acceptance, 20-map gate, calibration, deployment,
-causal promotion, or order action was performed.
+### Frontend count audit
+
+The earlier drop from 224 to 222 was real: it was not a skip or test-discovery
+failure. Removing the automatic official-v2 call removed five tests and added
+three, for a net loss of two. The removed tests were:
+
+- `reuses the prematch Rosh analysis for a complete locked live draft`;
+- `reuses a matching RayBet record and shows every linked official ID`;
+- `does not call external Rosh analysis from replay`;
+- `does not call external Rosh analysis for an ended match`;
+- `reports STRATZ rate limiting without falling back to an unknown direction`.
+
+The automatic-call, replay, and ended-match expectations are intentionally
+retired because `MatchWorkspace` no longer imports or invokes the official-v2
+create API. They are replaced by explicit-confirmation, frozen paired P0/P1,
+and stable seed-blocker tests. The still-valid linked official-ID behavior is
+restored as a read-only evidence test. The old automatic 429 test is replaced by
+a P0-only test that proves Team Rating remains visible with
+`prospective_rosh_evidence_unavailable`. The full frontend suite is therefore
+back to 224 tests without reinstating automatic official-v2 execution.
+
+The remaining operational blocker is only the absent explicitly frozen
+prospective Team Rating seed. No operational migration, seed freeze, real
+collector, 5-map acceptance, 20-map gate, calibration, deployment, causal
+promotion, or order action was performed.

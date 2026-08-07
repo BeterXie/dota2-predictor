@@ -17,6 +17,7 @@ from event_intelligence.live_draft_prospective_bridge import (
 )
 from event_intelligence.prospective_team_rating import ProspectiveTeamRatingRepository
 from live_betting.live_match_state import DraftSlotInput, save_live_draft_mapping
+from live_betting.stratz_rosh_client import StratzRoshError
 from tests.integration.postgres.test_prospective_rosh_operational_collector import (
     FIXTURE,
     FixtureTransport,
@@ -47,7 +48,7 @@ def _slots(*, reverse: bool = False) -> list[DraftSlotInput]:
 
 class FailingTransport:
     def fetch_legacy_lineup_batch(self, *_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("STRATZ unavailable")
+        raise StratzRoshError("STRATZ unavailable")
 
 
 def test_locked_live_draft_paired_and_p0_only_are_immutable(

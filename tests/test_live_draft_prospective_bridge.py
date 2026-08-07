@@ -14,10 +14,13 @@ from event_intelligence.live_draft_prospective_bridge import (
     canonical_mapping_hash,
     generate_live_draft_prediction,
 )
+from event_intelligence.prospective_team_rating import (
+    build_prospective_team_rating_seed,
+)
 from event_intelligence.prospective_rosh_candidate import (
     load_frozen_prospective_rosh_candidate,
 )
-from event_intelligence.team_rating import TeamRatingConfig, TeamRatingState
+from event_intelligence.team_rating import TeamRatingConfig
 
 
 UTC = timezone.utc
@@ -75,20 +78,18 @@ class _TeamRepository:
             radiant_side_logit=0.041210268646663106,
             config_version="team-rating-elo-v1",
         )
-        self.seed = SimpleNamespace(
-            seed_hash="1" * 64,
-            configuration_hash="2" * 64,
+        self.seed = build_prospective_team_rating_seed(
             config=config,
-        )
-        states = (
-            TeamRatingState(10, 1600.0, 25, (), LOCKED_AT - timedelta(days=1)),
-            TeamRatingState(20, 1450.0, 20, (), LOCKED_AT - timedelta(days=1)),
+            source_results=(),
+            seed_as_of=LOCKED_AT - timedelta(days=2),
+            seed_training_cutoff=LOCKED_AT - timedelta(days=2),
+            frozen_at=LOCKED_AT - timedelta(days=1),
         )
         self.base = SimpleNamespace(
             authority_hash=None,
-            as_of=LOCKED_AT - timedelta(days=1),
-            state_hash="3" * 64,
-            states=states,
+            as_of=self.seed.seed_as_of,
+            state_hash=self.seed.state_hash,
+            states=self.seed.states,
         )
 
     def load_seed(self, _cutoff: datetime) -> object:
