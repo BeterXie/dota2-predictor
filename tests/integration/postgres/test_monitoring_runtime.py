@@ -305,6 +305,11 @@ def test_ended_match_timeline_collapses_unchanged_final_transport(
 
     assert [point["observed_at"] for point in timeline] == [first.isoformat()]
     assert timeline[0]["prices"] == {"team_one": 1.8, "team_two": 2.0}
+    assert timeline[0]["probabilities"] == {
+        "team_one": 0.52631579,
+        "team_two": 0.47368421,
+    }
+    assert sum(timeline[0]["probabilities"].values()) == 1.0
     assert summary["winner"]["observed_at"] == first.isoformat()
     assert detail is not None
     assert detail["winner"]["observed_at"] == first.isoformat()

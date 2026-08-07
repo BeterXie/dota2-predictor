@@ -1,4 +1,4 @@
-import { BarChart } from "echarts/charts";
+import { LineChart } from "echarts/charts";
 import {
   DataZoomComponent,
   GridComponent,
@@ -9,13 +9,13 @@ import * as echarts from "echarts/core";
 import type { EChartsCoreOption } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import ReactEChartsCore from "echarts-for-react/lib/core";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { formatClock, formatDateTime, formatPercent } from "../format";
 import type { WinnerTimelinePoint } from "../types";
 
 
-interface OddsProbabilityChartProps {
+interface ProbabilityChartProps {
   timeline: WinnerTimelinePoint[];
   teamOne: string;
   teamTwo: string;
@@ -23,8 +23,14 @@ interface OddsProbabilityChartProps {
 }
 
 
+type SeriesPoint = [number, number | null];
+
+const GAP_BREAK_MS = 150_000;
+const PROBABILITY_SUM_TOLERANCE = 1e-6;
+
+
 echarts.use([
-  BarChart,
+  LineChart,
   DataZoomComponent,
   GridComponent,
   LegendComponent,
@@ -33,26 +39,49 @@ echarts.use([
 ]);
 
 
-export function OddsProbabilityChart({
+export function ProbabilityChart({
   timeline,
   teamOne,
   teamTwo,
   preferredPeriod = null,
-}: OddsProbabilityChartProps) {
+}: ProbabilityChartProps) {
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
+  const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const resizeChartRef = useRef<(() => void) | null>(null);
   const periods = useMemo(
     () => Array.from(new Set(timeline.map((point) => point.period))),
     [timeline],
   );
-  const period = resolveOddsPeriod(periods, selectedPeriod, preferredPeriod);
+  const period = resolveProbabilityPeriod(periods, selectedPeriod, preferredPeriod);
   const points = useMemo(
     () => timeline
       .filter((point) => !period || point.period === period)
-      .filter(validPoint)
+      .filter(isCompleteDeVigPoint)
       .sort((left, right) => Date.parse(left.observed_at) - Date.parse(right.observed_at)),
     [period, timeline],
   );
   const latest = points.at(-1) || null;
+
+  useEffect(() => {
+    const container = chartContainerRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return undefined;
+    let animationFrame: number | null = null;
+    const resize = () => {
+      if (animationFrame != null) window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        resizeChartRef.current?.();
+      });
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(container);
+    window.addEventListener("resize", resize);
+    resize();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", resize);
+      if (animationFrame != null) window.cancelAnimationFrame(animationFrame);
+    };
+  }, []);
 
   const option = useMemo<EChartsCoreOption>(() => ({
     animation: false,
@@ -66,8 +95,8 @@ export function OddsProbabilityChart({
     legend: {
       top: 0,
       left: 0,
-      itemHeight: 9,
-      itemWidth: 9,
+      itemHeight: 3,
+      itemWidth: 18,
       textStyle: {
         color: "#b8c2c9",
         fontFamily: "Segoe UI Variable",
@@ -76,7 +105,6 @@ export function OddsProbabilityChart({
     },
     tooltip: {
       trigger: "axis",
-      axisPointer: { type: "shadow" },
       backgroundColor: "#11171c",
       borderColor: "#465560",
       textStyle: {
@@ -87,16 +115,11 @@ export function OddsProbabilityChart({
       formatter: (rawParams: unknown) => probabilityTooltip(rawParams, points),
     },
     xAxis: {
-      type: "category",
-      data: points.map((point) => point.observed_at),
+      type: "time",
       axisLine: { lineStyle: { color: "#465560" } },
       axisTick: { show: false },
-      axisLabel: {
-        color: "#9ba8b1",
-        fontSize: 10,
-        hideOverlap: true,
-        formatter: (value: string) => compactTimestamp(value),
-      },
+      axisLabel: { color: "#9ba8b1", fontSize: 10, hideOverlap: true },
+      splitLine: { show: false },
     },
     yAxis: {
       type: "value",
@@ -126,19 +149,25 @@ export function OddsProbabilityChart({
     series: [
       {
         name: teamOne || "队伍一",
-        type: "bar",
-        stack: "probability",
-        barMaxWidth: 28,
-        data: points.map((point) => point.probabilities.team_one),
+        type: "line",
+        step: "end",
+        showSymbol: true,
+        symbolSize: 5,
+        connectNulls: false,
+        data: withGaps(points, "team_one"),
+        lineStyle: { width: 2, color: "#55c7bb" },
         itemStyle: { color: "#55c7bb" },
       },
       {
         name: teamTwo || "队伍二",
-        type: "bar",
-        stack: "probability",
-        barMaxWidth: 28,
-        data: points.map((point) => point.probabilities.team_two),
-        itemStyle: { color: "#ef8b79", borderRadius: [3, 3, 0, 0] },
+        type: "line",
+        step: "end",
+        showSymbol: true,
+        symbolSize: 5,
+        connectNulls: false,
+        data: withGaps(points, "team_two"),
+        lineStyle: { width: 2, color: "#ef8b79" },
+        itemStyle: { color: "#ef8b79" },
       },
     ],
   }), [points, teamOne, teamTwo]);
@@ -147,7 +176,7 @@ export function OddsProbabilityChart({
     return (
       <div className="chart-empty" role="status">
         <span>暂无完整胜负盘快照</span>
-        <small>只有同一采集时刻同时存在双方赔率时才生成柱状图</small>
+        <small>只有同一采集时刻同时存在双方有效赔率时才计算并展示去水概率</small>
       </div>
     );
   }
@@ -159,7 +188,7 @@ export function OddsProbabilityChart({
           <label className="period-select">
             <span>局数</span>
             <select
-              aria-label="赔率图局数"
+              aria-label="市场概率走势局数"
               onChange={(event) => setSelectedPeriod(event.target.value)}
               value={period || ""}
             >
@@ -170,9 +199,9 @@ export function OddsProbabilityChart({
           </label>
         </div>
       )}
-      <dl className="odds-chart-summary" aria-label="赔率柱状图文字摘要">
+      <dl className="probability-chart-summary" aria-label="市场概率走势文字摘要">
         <div>
-          <dt>样本范围</dt>
+          <dt>完整胜负盘</dt>
           <dd>{points.length} 次 · {formatDateTime(points[0].observed_at)} 至 {formatDateTime(latest?.observed_at)}</dd>
         </div>
         <div>
@@ -184,11 +213,22 @@ export function OddsProbabilityChart({
           <dd>{formatPercent(latest?.probabilities.team_two)}</dd>
         </div>
       </dl>
-      <div className="probability-chart-canvas" aria-hidden="true">
+      <div
+        aria-hidden="true"
+        className="probability-chart-canvas"
+        ref={chartContainerRef}
+      >
         <ReactEChartsCore
           echarts={echarts}
           lazyUpdate
           notMerge
+          onChartReady={(instance) => {
+            resizeChartRef.current = () => {
+              const width = chartContainerRef.current?.clientWidth || 0;
+              if (width > 0) instance.resize({ width });
+            };
+            resizeChartRef.current();
+          }}
           option={option}
           style={{ height: 260 }}
         />
@@ -198,7 +238,7 @@ export function OddsProbabilityChart({
 }
 
 
-export function resolveOddsPeriod(
+export function resolveProbabilityPeriod(
   periods: string[],
   selectedPeriod: string | null,
   preferredPeriod: string | null,
@@ -209,14 +249,38 @@ export function resolveOddsPeriod(
 }
 
 
-function validPoint(point: WinnerTimelinePoint): boolean {
+export function isCompleteDeVigPoint(point: WinnerTimelinePoint): boolean {
+  const prices = [point.prices.team_one, point.prices.team_two];
+  const probabilities = [
+    point.probabilities.team_one,
+    point.probabilities.team_two,
+  ];
   return Number.isFinite(Date.parse(point.observed_at))
-    && Number.isFinite(point.probabilities.team_one)
-    && Number.isFinite(point.probabilities.team_two)
-    && point.probabilities.team_one >= 0
-    && point.probabilities.team_one <= 1
-    && point.probabilities.team_two >= 0
-    && point.probabilities.team_two <= 1;
+    && prices.every((price) => Number.isFinite(price) && price > 1)
+    && probabilities.every((probability) => (
+      Number.isFinite(probability) && probability >= 0 && probability <= 1
+    ))
+    && Math.abs(probabilities[0] + probabilities[1] - 1)
+      <= PROBABILITY_SUM_TOLERANCE;
+}
+
+
+export function withGaps(
+  points: WinnerTimelinePoint[],
+  side: "team_one" | "team_two",
+): SeriesPoint[] {
+  const output: SeriesPoint[] = [];
+  let previousTime: number | null = null;
+  for (const point of points) {
+    const time = Date.parse(point.observed_at);
+    if (!Number.isFinite(time)) continue;
+    if (previousTime != null && time - previousTime > GAP_BREAK_MS) {
+      output.push([previousTime + 1, null], [time - 1, null]);
+    }
+    output.push([time, point.probabilities[side]]);
+    previousTime = time;
+  }
+  return output;
 }
 
 
@@ -225,35 +289,26 @@ function probabilityTooltip(
   points: WinnerTimelinePoint[],
 ): string {
   const params = Array.isArray(rawParams) ? rawParams : [rawParams];
-  const first = params[0] as { dataIndex?: number } | undefined;
-  const point = typeof first?.dataIndex === "number" ? points[first.dataIndex] : null;
+  const first = params[0] as { value?: [number, number] } | undefined;
+  const timestamp = first?.value?.[0];
+  if (typeof timestamp !== "number") return "";
+  const point = points.find((candidate) => Date.parse(candidate.observed_at) === timestamp);
   if (!point) return "";
   const lines = [`<strong>${formatDateTime(point.observed_at)}</strong>`];
   if (point.game_clock_seconds != null) {
     lines.push(`比赛时钟 ${formatClock(point.game_clock_seconds)}`);
   }
-  for (const entry of params as Array<{
-    marker?: string;
-    seriesName?: string;
-    value?: number;
-  }>) {
-    if (typeof entry.value !== "number") continue;
-    lines.push(`${entry.marker || ""}${entry.seriesName || ""} ${formatPercent(entry.value)}`);
-  }
+  lines.push(
+    `${teamMarker(params, 0)}${String((params[0] as { seriesName?: string }).seriesName || "")} ${formatPercent(point.probabilities.team_one)}`,
+    `${teamMarker(params, 1)}${String((params[1] as { seriesName?: string } | undefined)?.seriesName || "")} ${formatPercent(point.probabilities.team_two)}`,
+  );
   return lines.join("<br />");
 }
 
 
-function compactTimestamp(value: string): string {
-  const parsed = new Date(value);
-  if (!Number.isFinite(parsed.getTime())) return "-";
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(parsed);
+function teamMarker(params: unknown[], index: number): string {
+  const entry = params[index] as { marker?: string } | undefined;
+  return entry?.marker || "";
 }
 
 

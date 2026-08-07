@@ -1602,16 +1602,18 @@ summary:focus-visible {
 
 .probability-chart-canvas {
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
-.odds-chart-summary {
+.probability-chart-summary {
   display: grid;
   grid-template-columns: minmax(220px, 1.5fr) repeat(2, minmax(150px, 1fr));
   gap: 8px;
   margin: 10px 0 4px;
 }
 
-.odds-chart-summary div {
+.probability-chart-summary div {
   min-width: 0;
   padding: 8px 10px;
   border: 1px solid var(--border);
@@ -1619,7 +1621,7 @@ summary:focus-visible {
   background: var(--surface-raised);
 }
 
-.odds-chart-summary dt {
+.probability-chart-summary dt {
   overflow: hidden;
   color: var(--text-dim);
   font-size: 10px;
@@ -1627,7 +1629,7 @@ summary:focus-visible {
   white-space: nowrap;
 }
 
-.odds-chart-summary dd {
+.probability-chart-summary dd {
   overflow: hidden;
   margin: 3px 0 0;
   color: var(--text);
@@ -5448,7 +5450,7 @@ body {
     grid-template-columns: 1fr;
   }
 
-  .odds-chart-summary {
+  .probability-chart-summary {
     grid-template-columns: 1fr;
   }
 

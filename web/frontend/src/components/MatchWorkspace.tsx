@@ -8,8 +8,8 @@ import { LiveDataControls } from "./live/LiveDataControls";
 import { LiveScoreboard } from "./live/LiveScoreboard";
 
 
-const OddsProbabilityChart = lazy(() => import("./OddsProbabilityChart").then((module) => ({
-  default: module.OddsProbabilityChart,
+const ProbabilityChart = lazy(() => import("./ProbabilityChart").then((module) => ({
+  default: module.ProbabilityChart,
 })));
 
 
@@ -95,16 +95,16 @@ export function MatchWorkspace({
       )}
 
       {detail && (
-        <section className="workspace-section chart-section" aria-label="赔率概率柱状图">
+        <section className="workspace-section chart-section" aria-label="市场概率走势">
           <div className="section-heading compact">
             <div>
-              <h2>赔率概率柱状图</h2>
-              <p>每根柱代表一次完整双方胜负盘；堆叠高度为 100%，用于比较市场方向随采集时间的变化。</p>
+              <h2>市场概率走势</h2>
+              <p>每个点来自同一采集时刻的完整双方胜负盘；纵轴为去水概率，超过 150 秒的数据空档会断开曲线。</p>
             </div>
             <span className="method-note">去水概率 · 不进入 P0/P1</span>
           </div>
-          <Suspense fallback={<div className="chart-empty"><span>正在加载赔率图</span></div>}>
-            <OddsProbabilityChart
+          <Suspense fallback={<div className="chart-empty"><span>正在加载概率走势</span></div>}>
+            <ProbabilityChart
               key={match.raybet_match_id}
               preferredPeriod={winner?.period || null}
               teamOne={match.team_one || "队伍一"}
