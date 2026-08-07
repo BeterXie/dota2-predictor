@@ -12,6 +12,8 @@ import type { FormEvent } from "react";
 
 import {
   correctLiveGameSnapshot,
+  createLiveDraftPrediction,
+  fetchLiveDraftPrediction,
   fetchPrematchHeroGrid,
   saveLiveDraftMapping,
 } from "../../api";
@@ -19,6 +21,7 @@ import { formatClock, formatDateTime, formatPercent } from "../../format";
 import type {
   LiveDraftContextTeam,
   LiveDraftMapping,
+  LiveDraftProspectivePrediction,
   LiveDraftSlot,
   MatchDetail,
   PrematchHero,
@@ -40,6 +43,7 @@ const ATTRIBUTE_LABELS: Record<Attribute, string> = {
   int: "智力",
   all: "全才",
 };
+const PREDICTION_CONFIRMATION = "本次预测只使用已锁定阵容，未使用击杀、经济、经验、防御塔、肉山或其他游戏内状态。";
 
 function blankSlots(): LiveDraftSlot[] {
   return sides.flatMap((side) => Array.from({ length: 5 }, (_, index) => ({
@@ -85,6 +89,11 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
   const [editorOpen, setEditorOpen] = useState(false);
   const [mappingBusy, setMappingBusy] = useState(false);
   const [mappingMessage, setMappingMessage] = useState<string | null>(null);
+  const [prediction, setPrediction] = useState<LiveDraftProspectivePrediction | null>(null);
+  const [previousPrediction, setPreviousPrediction] = useState<LiveDraftProspectivePrediction | null>(null);
+  const [predictionConfirmed, setPredictionConfirmed] = useState(false);
+  const [predictionBusy, setPredictionBusy] = useState(false);
+  const [predictionMessage, setPredictionMessage] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState(detail.game_snapshots || []);
   const latest = snapshots.at(-1) || detail.latest_game_snapshot || null;
   const [gameValues, setGameValues] = useState({
@@ -137,6 +146,28 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
     detail.draft_mapping?.version,
     detail.latest_game_snapshot?.snapshot_id,
   ]);
+
+  useEffect(() => {
+    if (!mapping?.is_locked) {
+      setPrediction(null);
+      setPredictionMessage(null);
+      return undefined;
+    }
+    const controller = new AbortController();
+    void fetchLiveDraftPrediction(
+      detail.raybet_match_id,
+      mapping.map_number,
+      mapping.version,
+      controller.signal,
+    ).then((response) => {
+      setPrediction((current) => current ?? response.prediction);
+    }).catch((error) => {
+      if (!controller.signal.aborted) {
+        setPredictionMessage(error instanceof Error ? error.message : "阵容预测读取失败");
+      }
+    });
+    return () => controller.abort();
+  }, [detail.raybet_match_id, mapping?.is_locked, mapping?.map_number, mapping?.version]);
 
   const validSlots = useMemo(() => (
     slots.length === 10
@@ -251,6 +282,11 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
         locked,
         csrfToken,
       );
+      if (prediction && prediction.identity.mapping_version !== saved.version) {
+        setPreviousPrediction(prediction);
+      }
+      setPrediction(null);
+      setPredictionConfirmed(false);
       setMapping(saved);
       setSlots(saved.slots);
       setLocked(saved.is_locked);
@@ -260,6 +296,29 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
       setMappingMessage(error instanceof Error ? error.message : "阵容保存失败");
     } finally {
       setMappingBusy(false);
+    }
+  };
+
+  const generatePrediction = async () => {
+    if (!csrfToken || !mapping?.is_locked || !predictionConfirmed) return;
+    setPredictionBusy(true);
+    setPredictionMessage(null);
+    try {
+      const response = await createLiveDraftPrediction(
+        detail.raybet_match_id,
+        mapping.map_number,
+        mapping.version,
+        csrfToken,
+        latest?.game_time_seconds ?? null,
+      );
+      setPrediction(response.prediction);
+      setPredictionMessage(response.status === "blocked"
+        ? response.missing_reason || "阵容预测前置条件不可用"
+        : response.status === "unchanged" ? "已复用不可变预测" : "阵容预测已保存");
+    } catch (error) {
+      setPredictionMessage(error instanceof Error ? error.message : "阵容预测失败");
+    } finally {
+      setPredictionBusy(false);
     }
   };
 
@@ -327,6 +386,46 @@ export function LiveDataControls({ csrfToken, detail }: LiveDataControlsProps) {
           </div>
         )}
         {mappingMessage && <p className="live-form-message" role="status">{mappingMessage}</p>}
+        {!mapping?.is_locked ? (
+          <div className="live-state-empty" role="status">
+            <WarningCircle size={18} aria-hidden="true" />
+            <span>请先确认并锁定阵容。</span>
+          </div>
+        ) : prediction ? (
+          <div className="live-state-summary" aria-label="阵容 prospective shadow 预测">
+            <div><dt>Mapping</dt><dd>v{prediction.identity.mapping_version}</dd></div>
+            <div><dt>Team Rating P0</dt><dd>{formatPercent(prediction.p0_probability)}</dd></div>
+            <div><dt>R.O.S.H. P1</dt><dd>{prediction.p1_probability == null ? "P0-only" : formatPercent(prediction.p1_probability)}</dd></div>
+            <div><dt>Pure score</dt><dd>{prediction.pure_rosh_score?.toFixed(4) ?? "-"}</dd></div>
+            <div><dt>因果状态</dt><dd>{prediction.causal_evidence.causal_status}</dd></div>
+            <div><dt>生成时间</dt><dd>{formatDateTime(prediction.created_at)}</dd></div>
+          </div>
+        ) : (
+          <div className="live-draft-prediction-control">
+            <label className="lock-toggle">
+              <input
+                checked={predictionConfirmed}
+                onChange={(event) => setPredictionConfirmed(event.target.checked)}
+                type="checkbox"
+              />
+              {PREDICTION_CONFIRMATION}
+            </label>
+            <Button
+              appearance="primary"
+              disabled={!csrfToken || !predictionConfirmed || predictionBusy}
+              onClick={() => void generatePrediction()}
+              type="button"
+            >
+              {predictionBusy ? "生成中…" : "生成阵容预测"}
+            </Button>
+          </div>
+        )}
+        {previousPrediction && mapping && previousPrediction.identity.mapping_version !== mapping.version && (
+          <p className="live-form-message" role="status">
+            旧预测绑定 mapping v{previousPrediction.identity.mapping_version}；当前为 v{mapping.version}，不会覆盖旧记录。
+          </p>
+        )}
+        {predictionMessage && <p className="live-form-message" role="status">{predictionMessage}</p>}
       </section>
 
       <form className="workspace-section live-state-panel" onSubmit={saveSnapshot}>

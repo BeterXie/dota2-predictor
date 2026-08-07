@@ -13,23 +13,22 @@ import type {
   MatchAnalysis,
   MatchDetail,
   MonitorMatch,
-  RoshAnalysisRequest,
-  RoshAnalysisRunResponse,
+  LiveDraftProspectivePrediction,
   RoshLineupScoresData,
   StrategyAnalysisData,
   StrategyDecision,
   VisionAnalysisData,
 } from "../types";
 
-const createRoshAnalysisMock = vi.hoisted(() => vi.fn());
-const fetchRoshAnalysisRecordsMock = vi.hoisted(() => vi.fn());
+const createLiveDraftPredictionMock = vi.hoisted(() => vi.fn());
+const fetchLiveDraftPredictionMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
   return {
     ...actual,
-    createRoshAnalysis: createRoshAnalysisMock,
-    fetchRoshAnalysisRecords: fetchRoshAnalysisRecordsMock,
+    createLiveDraftPrediction: createLiveDraftPredictionMock,
+    fetchLiveDraftPrediction: fetchLiveDraftPredictionMock,
   };
 });
 vi.mock("@fluentui/react-components", () => ({
@@ -496,41 +495,35 @@ function detailWithLockedDraft(isLocked = true): MatchDetail {
   return value;
 }
 
-function roshAnalysisResponse(relativeAdvantage = 5.2): RoshAnalysisRunResponse {
+function liveDraftPrediction(): LiveDraftProspectivePrediction {
   return {
-    schema: "rosh-analysis-run/v1",
-    run_id: "run-1",
-    status: "succeeded",
-    mode: "explicit_draft",
-    match_id: null,
-    date_time: Math.floor(Date.parse("2026-07-16T12:01:00+00:00") / 1_000),
-    draft_hash: "a".repeat(64),
-    rosh_profile_id: "stratz-rosh-web-2026-07-28-v2",
-    formula_version: "dematus-rosh-v1",
-    request_profile_hash: "b".repeat(64),
-    upstream_bundle_hash: "c".repeat(64),
-    scorer_source_hash: "d".repeat(64),
-    canonical_profile_hash: "e".repeat(64),
-    serialization_version: "canonical-json-v1",
-    evidence_hash: "f".repeat(64),
-    collected_at: "2026-07-16T12:02:00+00:00",
-    radiant_team_score: 12.1,
-    dire_team_score: 6.9,
-    relative_advantage: relativeAdvantage,
-    hero_components: ["RADIANT", "DIRE"].flatMap((team_side, sideIndex) => (
-      Array.from({ length: 5 }, (_, index) => ({
-        team_side: team_side as "RADIANT" | "DIRE",
-        position_id: index + 1,
-        hero_id: sideIndex * 5 + index + 1,
-        position_base_diff: 0,
-        same_team_synergy: 0,
-        opponent_matchup_synergy: 0,
-        raw_score: 0,
-        display_score: 0,
-      }))
-    )),
-    minute_points: [],
-    error_code: null,
+    prediction_hash: "a".repeat(64),
+    version: "live-draft-prospective-bridge-v1",
+    identity: {
+      raybet_match_id: "match-1",
+      map_number: 3,
+      mapping_version: 1,
+      mapping_hash: "b".repeat(64),
+    },
+    operator_locked_at: "2026-07-16T12:01:00+00:00",
+    confirmed_at: "2026-07-16T12:01:01+00:00",
+    record_status: "paired",
+    p0_probability: 0.55,
+    p1_probability: 0.61,
+    pure_rosh_score: 5.2,
+    standardized_rosh_score: 0.5,
+    rosh_logit_contribution: 0.33,
+    missing_reason: null,
+    candidate_hash: "84c4506f63b7c5b745b32373b0cb405383f837c60eae3231cc3d688a0b36e09d",
+    causal_evidence: {
+      game_clock_seconds: null,
+      vision_frame_timestamp: null,
+      draft_state_marker: "draft_complete",
+      live_state_input_used: false,
+      causal_status: "eligible",
+      causal_reason: null,
+    },
+    created_at: "2026-07-16T12:01:02+00:00",
   };
 }
 
@@ -552,29 +545,16 @@ function sourceRow(label: string): HTMLElement {
 
 describe("MatchWorkspace", () => {
   beforeEach(() => {
-    fetchRoshAnalysisRecordsMock.mockReset();
-    fetchRoshAnalysisRecordsMock.mockResolvedValue({
-      query_source: "raybet",
-      query_match_id: "match-1",
-      records: [],
-    });
-    createRoshAnalysisMock.mockReset();
-    createRoshAnalysisMock.mockImplementation((
-      _payload: RoshAnalysisRequest,
-      signal?: AbortSignal,
-    ): Promise<RoshAnalysisRunResponse> => new Promise((_resolve, reject) => {
-      const abort = () => reject(new DOMException("aborted", "AbortError"));
-      if (signal?.aborted) abort();
-      else signal?.addEventListener("abort", abort, { once: true });
-    }));
+    fetchLiveDraftPredictionMock.mockReset();
+    fetchLiveDraftPredictionMock.mockResolvedValue({ status: "not_found", prediction: null });
+    createLiveDraftPredictionMock.mockReset();
   });
   afterEach(cleanup);
 
-  it("reuses the prematch Rosh analysis for a complete locked live draft", async () => {
-    createRoshAnalysisMock.mockResolvedValueOnce(roshAnalysisResponse(5.2));
-
+  it("never auto-runs official-v2 and requires explicit confirmation", async () => {
     render(
       <MatchWorkspace
+        csrfToken="csrf"
         detail={detailWithLockedDraft()}
         error={null}
         loading={false}
@@ -583,46 +563,22 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    await waitFor(() => expect(createRoshAnalysisMock).toHaveBeenCalledTimes(1));
-    expect(createRoshAnalysisMock.mock.calls[0][0]).toEqual({
-      mode: "explicit_draft",
-      date_time: Math.floor(Date.parse("2026-07-16T12:01:00+00:00") / 1_000),
-      bracket_ids: ["IMMORTAL"],
-      rosh_profile_id: "stratz-rosh-web-2026-07-28-v2",
-      radiant: [1, 2, 3, 4, 5].map((hero_id, index) => ({
-        hero_id,
-        position_id: index + 1,
-      })),
-      dire: [6, 7, 8, 9, 10].map((hero_id, index) => ({
-        hero_id,
-        position_id: index + 1,
-      })),
-      match_links: [{
-        source: "raybet",
-        source_match_id: "match-1",
-        map_number: 3,
-      }],
-    });
-    expect((await screen.findAllByText("天辉 +5.20")).length).toBeGreaterThan(0);
+    await waitFor(() => expect(fetchLiveDraftPredictionMock).toHaveBeenCalledWith(
+      "match-1", 3, 1, expect.any(AbortSignal),
+    ));
+    expect(createLiveDraftPredictionMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "生成阵容预测" })).toBeDisabled();
+    expect(screen.queryByText("stratz-rosh-web-2026-07-28-v2")).not.toBeInTheDocument();
   });
 
-  it("reuses a matching RayBet record and shows every linked official ID", async () => {
-    const run = roshAnalysisResponse(-30.6);
-    fetchRoshAnalysisRecordsMock.mockResolvedValueOnce({
-      query_source: "raybet",
-      query_match_id: "match-1",
-      records: [{
-        run,
-        links: [
-          { source: "raybet", source_match_id: "match-1", map_number: 3 },
-          { source: "opendota", source_match_id: "8904322271" },
-          { source: "stratz", source_match_id: "8904322271" },
-        ],
-      }],
+  it("creates and displays the frozen paired P0/P1 only after confirmation", async () => {
+    createLiveDraftPredictionMock.mockResolvedValueOnce({
+      status: "created",
+      prediction: liveDraftPrediction(),
     });
-
     render(
       <MatchWorkspace
+        csrfToken="csrf"
         detail={detailWithLockedDraft()}
         error={null}
         loading={false}
@@ -631,12 +587,14 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    expect((await screen.findAllByText("夜魇 +30.60")).length).toBeGreaterThan(0);
-    expect(createRoshAnalysisMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Rosh 分析记录")).toBeInTheDocument();
-    expect(screen.getByText(/RAYBET match-1 · 第 3 局/)).toBeInTheDocument();
-    expect(screen.getByText(/OPENDOTA 8904322271/)).toBeInTheDocument();
-    expect(screen.getByText(/STRATZ 8904322271/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText(/本次预测只使用已锁定阵容/));
+    fireEvent.click(screen.getByRole("button", { name: "生成阵容预测" }));
+    await waitFor(() => expect(createLiveDraftPredictionMock).toHaveBeenCalledWith(
+      "match-1", 3, 1, "csrf", null,
+    ));
+    expect(await screen.findByText("55.0%")).toBeInTheDocument();
+    expect(screen.getByText("61.0%")).toBeInTheDocument();
+    expect(screen.getByText("eligible")).toBeInTheDocument();
   });
 
   it("does not run prematch Rosh analysis until the live draft is locked", () => {
@@ -650,47 +608,19 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    expect(createRoshAnalysisMock).not.toHaveBeenCalled();
-    expect(screen.getByText("锁定阵容后开始赛前 Rosh 分析")).toBeInTheDocument();
+    expect(createLiveDraftPredictionMock).not.toHaveBeenCalled();
+    expect(screen.getByText("请先确认并锁定阵容。")).toBeInTheDocument();
   });
 
-  it("does not call external Rosh analysis from replay", () => {
+  it("shows the stable seed blocker without calling an alternate prediction path", async () => {
+    createLiveDraftPredictionMock.mockResolvedValueOnce({
+      status: "blocked",
+      prediction: null,
+      missing_reason: "prospective_team_rating_seed_unavailable",
+    });
     render(
       <MatchWorkspace
-        detail={detailWithLockedDraft()}
-        error={null}
-        loading={false}
-        match={match}
-        replay
-      />,
-    );
-
-    expect(createRoshAnalysisMock).not.toHaveBeenCalled();
-    expect(screen.getByText("回放不触发外部 Rosh 分析")).toBeInTheDocument();
-  });
-
-  it("does not call external Rosh analysis for an ended match", () => {
-    const value = detailWithLockedDraft();
-    value.lifecycle = "ended";
-    render(
-      <MatchWorkspace
-        detail={value}
-        error={null}
-        loading={false}
-        match={{ ...match, lifecycle: "ended" }}
-        replay={false}
-      />,
-    );
-
-    expect(createRoshAnalysisMock).not.toHaveBeenCalled();
-    expect(screen.getByText("仅实时比赛自动分析")).toBeInTheDocument();
-  });
-
-  it("reports STRATZ rate limiting without falling back to an unknown direction", async () => {
-    createRoshAnalysisMock.mockRejectedValueOnce(new Error("STRATZ HTTP 429"));
-
-    render(
-      <MatchWorkspace
+        csrfToken="csrf"
         detail={detailWithLockedDraft()}
         error={null}
         loading={false}
@@ -699,9 +629,10 @@ describe("MatchWorkspace", () => {
       />,
     );
 
-    expect(await screen.findByText("赛前 Rosh 暂不可用：STRATZ 上游限流"))
+    fireEvent.click(screen.getByText(/本次预测只使用已锁定阵容/));
+    fireEvent.click(screen.getByRole("button", { name: "生成阵容预测" }));
+    expect(await screen.findByText("prospective_team_rating_seed_unavailable"))
       .toBeInTheDocument();
-    expect(screen.queryByText("方向不可判")).not.toBeInTheDocument();
   });
 
   it("keeps the decision surface primary and technical evidence collapsed", () => {

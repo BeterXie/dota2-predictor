@@ -9,6 +9,7 @@ import type {
   IntelligencePlayerPage,
   IntelligenceTeamPage,
   LiveDraftMapping,
+  LiveDraftPredictionResponse,
   LiveDraftSlot,
   LiveGameSnapshot,
   MappingRecord,
@@ -108,6 +109,40 @@ export function saveLiveDraftMapping(
     `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/draft-mapping`,
     csrfToken,
     { slots, is_locked: isLocked, actor: "local-operator" },
+  );
+}
+
+export function fetchLiveDraftPrediction(
+  matchId: string,
+  mapNumber: number,
+  mappingVersion: number,
+  signal?: AbortSignal,
+): Promise<LiveDraftPredictionResponse> {
+  return getJson<LiveDraftPredictionResponse>(
+    `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/draft-prediction?mapping_version=${mappingVersion}`,
+    signal,
+  );
+}
+
+export function createLiveDraftPrediction(
+  matchId: string,
+  mapNumber: number,
+  mappingVersion: number,
+  csrfToken: string,
+  gameClockSeconds: number | null,
+): Promise<LiveDraftPredictionResponse> {
+  return mutateJson<LiveDraftPredictionResponse>(
+    `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/draft-prediction`,
+    csrfToken,
+    {
+      mapping_version: mappingVersion,
+      operator_identity: "local-operator",
+      confirmation_text: "本次预测只使用已锁定阵容，未使用击杀、经济、经验、防御塔、肉山或其他游戏内状态。",
+      game_clock_seconds: gameClockSeconds,
+      vision_frame_timestamp: null,
+      draft_state_marker: "draft_complete",
+      live_state_input_used: false,
+    },
   );
 }
 

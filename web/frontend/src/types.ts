@@ -65,6 +65,42 @@ export interface LiveDraftMapping {
   slots: LiveDraftSlot[];
 }
 
+export interface LiveDraftProspectivePrediction {
+  prediction_hash: string;
+  version: "live-draft-prospective-bridge-v1";
+  identity: {
+    raybet_match_id: string;
+    map_number: number;
+    mapping_version: number;
+    mapping_hash: string;
+  };
+  operator_locked_at: string;
+  confirmed_at: string;
+  record_status: "paired" | "p0_only";
+  p0_probability: number;
+  p1_probability: number | null;
+  pure_rosh_score: number | null;
+  standardized_rosh_score: number | null;
+  rosh_logit_contribution: number | null;
+  missing_reason: string | null;
+  candidate_hash: string;
+  causal_evidence: {
+    game_clock_seconds: number | null;
+    vision_frame_timestamp: string | null;
+    draft_state_marker: string | null;
+    live_state_input_used: boolean;
+    causal_status: "eligible" | "unverified" | "ineligible";
+    causal_reason: string | null;
+  };
+  created_at: string;
+}
+
+export interface LiveDraftPredictionResponse {
+  status: "available" | "not_found" | "blocked" | "created" | "unchanged";
+  prediction: LiveDraftProspectivePrediction | null;
+  missing_reason?: string | null;
+}
+
 export interface LiveDraftContextPlayer {
   player_id: number;
   player_name: string | null;

@@ -979,7 +979,7 @@ class ProspectiveTeamRatingRepository:
         after: datetime,
         cutoff: datetime,
         observed_at: datetime,
-        target_match_id: int,
+        target_match_id: int | None,
         allow_seed_observation: bool = False,
     ) -> tuple[AuthoritativeResult, ...]:
         after_at = _utc(after, "result lower bound")
@@ -990,11 +990,18 @@ class ProspectiveTeamRatingRepository:
         availability_cutoff = (
             cutoff_at if allow_seed_observation else min(cutoff_at, observed)
         )
+        target_filter = "" if target_match_id is None else "AND result.match_id <> ?"
+        parameters: tuple[object, ...] = (
+            after_at.isoformat(),
+            availability_cutoff.isoformat(),
+        )
+        if target_match_id is not None:
+            parameters += (target_match_id,)
         rows = self.connection.execute(
-            """SELECT result.match_id, status.series_id, status.event_id,
-                      result.start_time, result.duration,
-                      result.radiant_team_id, result.dire_team_id,
-                      result.radiant_win, status.first_usable_at,
+            f"""SELECT result.match_id, status.series_id, status.event_id,
+                       result.start_time, result.duration,
+                       result.radiant_team_id, result.dire_team_id,
+                       result.radiant_win, status.first_usable_at,
                       status.latest_raw_content_hash
                  FROM formal_map_eligibility AS eligible
                  JOIN matches AS result ON result.match_id=eligible.match_id
@@ -1002,21 +1009,17 @@ class ProspectiveTeamRatingRepository:
                    ON status.match_id=result.match_id
                 WHERE live_text_timestamp_utc(status.first_usable_at)
                           > live_text_timestamp_utc(?)
-                  AND live_text_timestamp_utc(status.first_usable_at)
-                          <= live_text_timestamp_utc(?)
-                  AND result.match_id <> ?
-                  AND result.radiant_win IS NOT NULL
+                   AND live_text_timestamp_utc(status.first_usable_at)
+                           <= live_text_timestamp_utc(?)
+                   {target_filter}
+                   AND result.radiant_win IS NOT NULL
                   AND result.duration > 0
                   AND result.radiant_team_id IS NOT NULL
                   AND result.dire_team_id IS NOT NULL
                   AND status.latest_raw_content_hash IS NOT NULL
                 ORDER BY live_text_timestamp_utc(status.first_usable_at),
                          result.start_time, result.match_id""",
-            (
-                after_at.isoformat(),
-                availability_cutoff.isoformat(),
-                target_match_id,
-            ),
+            parameters,
         ).fetchall()
         player_rows = self.connection.execute(
             """SELECT player.match_id, player.account_id, player.is_radiant

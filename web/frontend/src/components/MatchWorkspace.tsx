@@ -22,9 +22,7 @@ import {
   X,
   XCircle,
 } from "@phosphor-icons/react";
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
-
-import { createRoshAnalysis, fetchRoshAnalysisRecords } from "../api";
+import { lazy, Suspense, useMemo, useState } from "react";
 import {
   formatClock,
   formatDateTime,
@@ -45,13 +43,10 @@ import type {
   LineupCurveData,
   LineupCurvePoint,
   LineupSide,
-  LiveDraftMapping,
   LivePlayerIdentityData,
   MatchDetail,
   MonitorMatch,
   OddsAnalysisData,
-  RoshAnalysisRecord,
-  RoshAnalysisRequest,
   RoshLineupScoresData,
   StrategyAnalysisData,
   StrategyComebackEntryInput,
@@ -224,7 +219,7 @@ export function MatchWorkspace({
           </div>
         )}
 
-          <CurrentStrategyOverview detail={detail} error={error} match={match} replay={replay} />
+          <CurrentStrategyOverview detail={detail} error={error} match={match} />
       </section>
 
       {loading && !detail ? (
@@ -303,230 +298,15 @@ export function MatchWorkspace({
 
 type FunnelTone = "pass" | "blocked" | "waiting" | "invalid";
 
-function lockedDraftRoshRequestKey(mapping: LiveDraftMapping | null): string | null {
-  if (!mapping?.is_locked || !Array.isArray(mapping.slots) || mapping.slots.length !== 10) {
-    return null;
-  }
-  const slotsFor = (side: "radiant" | "dire") => {
-    const slots = mapping.slots
-      .filter((slot) => slot.side === side)
-      .sort((left, right) => left.position - right.position);
-    if (
-      slots.length !== 5
-      || slots.some((slot, index) => (
-        slot.position !== index + 1
-        || !Number.isInteger(slot.hero_id)
-        || slot.hero_id <= 0
-      ))
-    ) return null;
-    return slots.map((slot) => ({ hero_id: slot.hero_id, position_id: slot.position }));
-  };
-  const radiant = slotsFor("radiant");
-  const dire = slotsFor("dire");
-  if (!radiant || !dire || new Set([...radiant, ...dire].map((slot) => slot.hero_id)).size !== 10) {
-    return null;
-  }
-  const createdAt = Date.parse(mapping.created_at);
-  if (!Number.isFinite(createdAt)) return null;
-
-  return JSON.stringify({
-    mode: "explicit_draft",
-    date_time: Math.floor(createdAt / 1_000),
-    bracket_ids: ["IMMORTAL"],
-    rosh_profile_id: "stratz-rosh-web-2026-07-28-v2",
-    radiant,
-    dire,
-    match_links: [{
-      source: "raybet",
-      source_match_id: mapping.raybet_match_id,
-      map_number: mapping.map_number,
-    }],
-  } satisfies RoshAnalysisRequest);
-}
-
-function lockedDraftRoshUnavailableText(
-  mapping: LiveDraftMapping | null,
-  enabled: boolean,
-  replay: boolean,
-): string {
-  if (!enabled) return replay ? "回放不触发外部 Rosh 分析" : "仅实时比赛自动分析";
-  if (!mapping) return "等待已锁定阵容";
-  if (!mapping.is_locked) return "锁定阵容后开始赛前 Rosh 分析";
-  return "阵容不完整，需两边各 5 个位置";
-}
-
-function roshAnalysisErrorText(reason: unknown): string {
-  const message = reason instanceof Error ? reason.message : String(reason || "");
-  if (/\b429\b|rate[_ -]?limit|too many requests|限流/i.test(message)) {
-    return "赛前 Rosh 暂不可用：STRATZ 上游限流";
-  }
-  return message ? `赛前 Rosh 暂不可用：${message}` : "赛前 Rosh 暂不可用";
-}
-
-function roshDirectionText(score: number): string {
-  if (score === 0) return "双方阵容接近均势";
-  return `${score > 0 ? "天辉" : "夜魇"} +${Math.abs(score).toFixed(2)}`;
-}
-
-function roshRunMatchesRequest(
-  record: RoshAnalysisRecord,
-  request: RoshAnalysisRequest,
-): boolean {
-  if (
-    record.run.status !== "succeeded"
-    || record.run.rosh_profile_id !== request.rosh_profile_id
-    || record.run.hero_components.length !== 10
-  ) return false;
-  const actual = new Map(record.run.hero_components.map((slot) => [
-    `${slot.team_side}:${slot.position_id}`,
-    slot.hero_id,
-  ]));
-  return (request.radiant || []).every((slot) => (
-    actual.get(`RADIANT:${slot.position_id}`) === slot.hero_id
-  )) && (request.dire || []).every((slot) => (
-    actual.get(`DIRE:${slot.position_id}`) === slot.hero_id
-  ));
-}
-
 function CurrentStrategyOverview({
   detail,
   error,
   match,
-  replay,
 }: {
   detail: MatchDetail | null;
   error: string | null;
   match: MonitorMatch;
-  replay: boolean;
 }) {
-  const roshRequestKey = lockedDraftRoshRequestKey(detail?.draft_mapping || null);
-  const roshEnabled = !replay && detail?.lifecycle === "live";
-  const [directRosh, setDirectRosh] = useState<{
-    error: string | null;
-    records: RoshAnalysisRecord[];
-    requestKey: string | null;
-    score: number | null;
-    status: "idle" | "loading" | "available" | "error";
-  }>({ error: null, records: [], requestKey: null, score: null, status: "idle" });
-
-  useEffect(() => {
-    if (!roshRequestKey) {
-      setDirectRosh({
-        error: null,
-        records: [],
-        requestKey: null,
-        score: null,
-        status: "idle",
-      });
-      return;
-    }
-
-    const controller = new AbortController();
-    const request = JSON.parse(roshRequestKey) as RoshAnalysisRequest;
-    const raybetLink = request.match_links?.find((link) => link.source === "raybet");
-    setDirectRosh({
-      error: null,
-      records: [],
-      requestKey: roshRequestKey,
-      score: null,
-      status: roshEnabled ? "loading" : "idle",
-    });
-    void (async () => {
-      let records: RoshAnalysisRecord[] = [];
-      if (raybetLink) {
-        try {
-          const page = await fetchRoshAnalysisRecords(
-            "raybet",
-            raybetLink.source_match_id,
-            controller.signal,
-          );
-          records = page.records;
-        } catch (reason) {
-          if (controller.signal.aborted) return;
-          if (!roshEnabled) {
-            setDirectRosh({
-              error: roshAnalysisErrorText(reason),
-              records: [],
-              requestKey: roshRequestKey,
-              score: null,
-              status: "error",
-            });
-            return;
-          }
-        }
-      }
-      if (controller.signal.aborted) return;
-      const existing = records.find((record) => roshRunMatchesRequest(record, request));
-      if (existing) {
-        setDirectRosh({
-          error: null,
-          records,
-          requestKey: roshRequestKey,
-          score: existing.run.relative_advantage,
-          status: "available",
-        });
-        return;
-      }
-      if (!roshEnabled) {
-        setDirectRosh({
-          error: null,
-          records,
-          requestKey: roshRequestKey,
-          score: null,
-          status: "idle",
-        });
-        return;
-      }
-
-      try {
-        const result = await createRoshAnalysis(request, controller.signal);
-        if (controller.signal.aborted) return;
-        const score = result.relative_advantage;
-        if (result.status !== "succeeded" || score == null || !Number.isFinite(score)) {
-          setDirectRosh({
-            error: roshAnalysisErrorText(result.error_code || "分析结果没有可用方向"),
-            records,
-            requestKey: roshRequestKey,
-            score: null,
-            status: "error",
-          });
-          return;
-        }
-        const newRecord: RoshAnalysisRecord = {
-          run: result,
-          links: request.match_links || [],
-        };
-        setDirectRosh({
-          error: null,
-          records: [newRecord, ...records.filter((record) => record.run.run_id !== result.run_id)],
-          requestKey: roshRequestKey,
-          score,
-          status: "available",
-        });
-      } catch (reason) {
-        if (controller.signal.aborted) return;
-        setDirectRosh({
-          error: roshAnalysisErrorText(reason),
-          records,
-          requestKey: roshRequestKey,
-          score: null,
-          status: "error",
-        });
-      }
-    })();
-
-    return () => controller.abort();
-  }, [roshEnabled, roshRequestKey]);
-
-  const currentDirectRosh = directRosh.requestKey === roshRequestKey
-    ? directRosh
-    : {
-        error: null,
-        records: [],
-        requestKey: roshRequestKey,
-        score: null,
-        status: roshEnabled && roshRequestKey ? "loading" as const : "idle" as const,
-      };
   const strategy = normalizeStrategySection(
     sectionOrFallback(detail?.analysis?.strategy, error),
   );
@@ -584,22 +364,11 @@ function CurrentStrategyOverview({
     ? "invalid"
     : entry ? (entry.eligible ? "pass" : "blocked") : "waiting";
   const roshProbability = entry?.rosh_underdog_probability ?? null;
-  const directRoshScore = currentDirectRosh.status === "available"
-    ? currentDirectRosh.score
-    : null;
-  const roshTone: FunnelTone = directRoshScore != null
-    ? "pass"
-    : malformedV4 ? "invalid"
+  const roshTone: FunnelTone = malformedV4 ? "invalid"
       : roshProbability == null ? "waiting" : roshProbability > 0.5 ? "pass" : "blocked";
-  const roshDetail = directRoshScore != null
-    ? roshDirectionText(directRoshScore)
-    : roshProbability != null
+  const roshDetail = roshProbability != null
       ? `${formatPercent(roshProbability)} ${roshProbability > 0.5 ? "支持弱势方" : "不支持弱势方"}`
-      : currentDirectRosh.status === "loading"
-        ? "正在复用赛前 Rosh 分析"
-        : currentDirectRosh.status === "error"
-          ? currentDirectRosh.error || "赛前 Rosh 暂不可用"
-          : lockedDraftRoshUnavailableText(detail?.draft_mapping || null, roshEnabled, replay);
+      : "阵容 prospective shadow 请在本局阵容映射区域显式生成";
   const scanText = strategy.data
     ? `扫描 ${strategy.data.scanned_count} 条 · 显示 ${strategy.data.displayed_count} 条 · 唯一排除 ${strategy.data.excluded_decision_count} 条`
     : "尚无可信策略输出";
@@ -680,43 +449,11 @@ function CurrentStrategyOverview({
           tone={verdictTone}
         />
       </div>
-      {currentDirectRosh.records.length > 0 && (
-        <RoshRecordTable records={currentDirectRosh.records} />
-      )}
       <DecisionDeltaPanel
         decisions={decisions}
         teamOne={match.team_one}
         teamTwo={match.team_two}
       />
-    </section>
-  );
-}
-
-function RoshRecordTable({ records }: { records: RoshAnalysisRecord[] }) {
-  return (
-    <section className="rosh-records" aria-label="Rosh 分析记录">
-      <header>
-        <strong>Rosh 分析记录</strong>
-        <span>{records.length} 条 · 可按比赛 ID 直接复用</span>
-      </header>
-      <div className="rosh-record-table-scroll">
-        <table className="rosh-record-table">
-          <thead><tr><th>关联比赛 ID</th><th>方向</th><th>模式</th><th>记录时间</th><th>Run</th></tr></thead>
-          <tbody>
-            {records.map(({ links, run }) => (
-              <tr key={run.run_id}>
-                <td>{links.map((link) => (
-                  `${link.source.toUpperCase()} ${link.source_match_id}${link.map_number ? ` · 第 ${link.map_number} 局` : ""}`
-                )).join(" / ")}</td>
-                <td>{run.relative_advantage == null ? "不可用" : roshDirectionText(run.relative_advantage)}</td>
-                <td>{run.mode === "historical_match" ? "历史比赛" : "锁定阵容"}</td>
-                <td>{formatDateTime(run.collected_at)}</td>
-                <td><code>{run.run_id.slice(0, 12)}</code></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
     </section>
   );
 }

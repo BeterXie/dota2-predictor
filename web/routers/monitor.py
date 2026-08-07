@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 
 from datetime import datetime, timezone
@@ -19,6 +20,11 @@ from live_betting.live_match_state import (
     DraftSlotInput,
     append_live_game_snapshot,
     save_live_draft_mapping,
+)
+from event_intelligence.live_draft_prospective_bridge import (
+    LOCK_CONFIRMATION,
+    LiveDraftProspectiveBridgeRepository,
+    generate_live_draft_prediction,
 )
 
 from .. import intelligence, monitoring, queries
@@ -53,6 +59,17 @@ class CorrectGameSnapshotRequest(BaseModel):
     radiant_kills: int | None = Field(default=None, ge=0)
     dire_kills: int | None = Field(default=None, ge=0)
     actor: str = Field(default="local-operator", min_length=1, max_length=100)
+
+
+class LiveDraftPredictionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mapping_version: int = Field(gt=0)
+    operator_identity: str = Field(default="local-operator", min_length=1, max_length=100)
+    confirmation_text: str
+    game_clock_seconds: int | None = Field(default=None, ge=0)
+    vision_frame_timestamp: datetime | None = None
+    draft_state_marker: str | None = Field(default=None, max_length=64)
+    live_state_input_used: bool = False
 
 
 def _build_snapshot() -> dict[str, object]:
@@ -180,6 +197,66 @@ def save_draft_mapping(
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        connection.close()
+
+
+@router.get("/matches/{raybet_match_id}/maps/{map_number}/draft-prediction")
+def get_live_draft_prediction(
+    raybet_match_id: str,
+    map_number: int = Path(ge=1, le=5),
+    mapping_version: int = Query(gt=0),
+) -> dict[str, object]:
+    connection = queries.get_db()
+    try:
+        prediction = LiveDraftProspectiveBridgeRepository(connection).load_prediction(
+            raybet_match_id,
+            map_number,
+            mapping_version,
+        )
+        return {
+            "status": "available" if prediction is not None else "not_found",
+            "prediction": prediction,
+        }
+    finally:
+        connection.close()
+
+
+@router.post("/matches/{raybet_match_id}/maps/{map_number}/draft-prediction")
+def create_live_draft_prediction(
+    raybet_match_id: str,
+    payload: LiveDraftPredictionRequest,
+    request: Request,
+    map_number: int = Path(ge=1, le=5),
+    session_id: str | None = Cookie(default=None, alias=_COOKIE_NAME),
+    csrf_token: str | None = Header(default=None, alias="X-Monitor-CSRF"),
+) -> dict[str, object]:
+    _require_control(request, session_id, csrf_token)
+    if payload.confirmation_text != LOCK_CONFIRMATION:
+        raise HTTPException(status_code=422, detail="Frozen lock confirmation is required")
+    connection = queries.get_db()
+    try:
+        try:
+            return generate_live_draft_prediction(
+                LiveDraftProspectiveBridgeRepository(connection),
+                artifact_root=os.environ.get(
+                    "LIVE_DRAFT_PROSPECTIVE_ARTIFACT_ROOT",
+                    "dogfood-output/live-draft-prospective-artifacts",
+                ),
+                raybet_match_id=raybet_match_id,
+                map_number=map_number,
+                mapping_version=payload.mapping_version,
+                operator_identity=payload.operator_identity,
+                confirmation_text=payload.confirmation_text,
+                confirmed_at=datetime.now(timezone.utc),
+                game_clock_seconds=payload.game_clock_seconds,
+                vision_frame_timestamp=payload.vision_frame_timestamp,
+                draft_state_marker=payload.draft_state_marker,
+                live_state_input_used=payload.live_state_input_used,
+            )
+        except ValueError as error:
+            status = 409 if "immutable" in str(error) else 422
+            raise HTTPException(status_code=status, detail=str(error)) from error
     finally:
         connection.close()
 
