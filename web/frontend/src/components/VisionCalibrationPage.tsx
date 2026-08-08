@@ -257,7 +257,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
         <div>
           <span className="vision-kicker"><Flask size={16} /> REAL-FRAME CALIBRATION</span>
           <h1>Vision 训练与校正</h1>
-          <p>先选择赛事 UI profile，再校正其中一场比赛；同 profile 的后续比赛可以复用候选并继续做留出验证。</p>
+          <p>先选择赛事 UI profile，再检查并校正真实帧样本；同 profile 的后续比赛可以复用候选并继续做留出验证。</p>
         </div>
         <div className="vision-boundary" role="note">
           <LockKey size={18} />
@@ -277,9 +277,9 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
         </section>
       ) : (
         <div className="vision-calibration-grid">
-          <section className="vision-event-queue" aria-label="Vision debug events">
+          <section className="vision-event-queue" aria-label="Vision 校正样本">
             <header>
-              <div><h2>待校正比赛</h2><span>{visibleEvents.length} retained</span></div>
+              <div><h2>待校正样本</h2><span>{visibleEvents.length} 个样本</span></div>
               <label className="vision-profile-selector">
                 <span>赛事 UI profile</span>
                 <select
@@ -290,31 +290,43 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                   <option value="all">全部赛事 UI</option>
                   {profiles.map((profile) => (
                     <option key={profile.profile_id} value={profile.profile_id}>
-                      {profile.layout || profile.profile_id} · {profile.event_count} 场
+                      {profile.layout || profile.profile_id} · {profile.event_count} 个样本
                     </option>
                   ))}
                 </select>
               </label>
               <p className="vision-profile-summary">
                 {selectedProfile
-                  ? `${selectedProfile.layout || selectedProfile.profile_id}：${selectedProfile.labeled_event_count} 场已标注，${selectedProfile.candidate_count} 个候选可复用`
+                  ? `${selectedProfile.layout || selectedProfile.profile_id}：${selectedProfile.labeled_event_count} 个样本已标注，${selectedProfile.candidate_count} 个候选可复用`
                   : "先选择赛事 UI；同 profile 后续比赛可复用同一候选，不必重复构建。"}
               </p>
             </header>
             <div className="vision-event-list">
-              {visibleEvents.map((item) => (
-                <button
-                  className={item.event_id === selectedId ? "vision-event selected" : "vision-event"}
-                  key={item.event_id}
-                  onClick={() => setSelectedId(item.event_id)}
-                  type="button"
-                >
-                  <span className="vision-event-time">{formatTime(item.captured_at)}</span>
-                  <strong>{item.reason}</strong>
-                  <span>{item.layout || "unsupported layout"}</span>
-                  <small>{item.label ? "已标注" : `${item.crop_count}/10 crops`} · {item.replay_gate_status || "gate unknown"}</small>
-                </button>
-              ))}
+              {visibleEvents.map((item) => {
+                const savedMatchId = item.label?.raybet_match_id?.trim();
+                const observation = data.observation_files.find((row) => (
+                  savedMatchId
+                  && observationMatchId(row.name, row.raybet_match_id) === savedMatchId
+                ));
+                const matchTitle = observation?.display_name
+                  || (savedMatchId ? `RayBet ${savedMatchId}` : "未关联比赛");
+                const mapLabel = item.label?.map_number ? `Map ${item.label.map_number}` : "Map 未标注";
+                return (
+                  <button
+                    className={item.event_id === selectedId ? "vision-event selected" : "vision-event"}
+                    key={item.event_id}
+                    onClick={() => setSelectedId(item.event_id)}
+                    type="button"
+                  >
+                    <span className="vision-event-time">{formatTime(item.captured_at)}</span>
+                    <strong>{matchTitle}</strong>
+                    <span>{mapLabel} · 采集原因：{item.reason}</span>
+                    <small>
+                      UI: {item.layout || "unsupported layout"} · {item.label ? "已标注" : `${item.crop_count}/10 crops`} · 帧状态：{item.replay_gate_status || "unknown"}
+                    </small>
+                  </button>
+                );
+              })}
             </div>
           </section>
 

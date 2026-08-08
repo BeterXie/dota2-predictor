@@ -1,5 +1,5 @@
 import { FluentProvider, webDarkTheme } from "@fluentui/react-components";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -184,6 +184,17 @@ describe("VisionCalibrationPage", () => {
       ],
     });
     renderPage();
+
+    const sampleQueue = await screen.findByRole("region", { name: "Vision 校正样本" });
+    expect(within(sampleQueue).getByRole("heading", { name: "待校正样本" })).toBeInTheDocument();
+    expect(within(sampleQueue).getByText("1 个样本")).toBeInTheDocument();
+    expect(within(sampleQueue).getByText(
+      "官方 Match ID 8123456789 · Team A vs Team B · The International 2026",
+    )).toBeInTheDocument();
+    expect(within(sampleQueue).getByText("Map 1 · 采集原因：ambiguous_match")).toBeInTheDocument();
+    expect(within(sampleQueue).getByText(
+      "UI: standard_dota_hud_1080p · 已标注 · 帧状态：live",
+    )).toBeInTheDocument();
 
     const selector = await screen.findByRole("combobox", { name: "Observation JSONL" });
     expect(selector).toHaveValue("");
