@@ -7,9 +7,12 @@ from typing import Literal
 from fastapi import APIRouter, Cookie, Header, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.exc import SQLAlchemyError
 
 from vision.calibration import VisionCalibrationService
 
+from .. import queries
+from ..match_identity import observation_file_metadata
 from .control import _COOKIE_NAME, _require_loopback
 from .mappings import _require_control
 
@@ -59,9 +62,26 @@ def bootstrap(
 ) -> dict[str, object]:
     _require_loopback(request)
     try:
-        return calibration_service.bootstrap(limit=limit)
+        result = calibration_service.bootstrap(limit=limit)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    observation_files = result.get("observation_files")
+    if not isinstance(observation_files, list) or not observation_files:
+        return result
+    connection = queries.get_db()
+    try:
+        try:
+            for item in observation_files:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    continue
+                metadata = observation_file_metadata(connection, str(item["name"]))
+                if metadata is not None:
+                    item.update(metadata)
+        except SQLAlchemyError:
+            pass
+    finally:
+        connection.close()
+    return result
 
 
 @router.get("/events/{event_id}/assets/{asset_name}", include_in_schema=False)

@@ -38,6 +38,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database.session import DatabaseRow, PostgresSession
 
 from .alerts import active_alerts
+from .match_identity import match_display_name, observation_file_name
 
 
 _LOCAL_TIMEZONE = timezone(timedelta(hours=8))
@@ -1288,8 +1289,18 @@ def _monitor_match(
         checked_at=now,
     )
     watch_link = _watch_link(connection, row)
+    official_match_id = _official_match_id(connection, match_id)
     return {
         "raybet_match_id": match_id,
+        "official_match_id": official_match_id,
+        "display_name": match_display_name(
+            raybet_match_id=match_id,
+            official_match_id=official_match_id,
+            team_one=str(row["team_one"] or "") or None,
+            team_two=str(row["team_two"] or "") or None,
+            tournament=str(row["tournament"] or "") or None,
+        ),
+        "observation_file": observation_file_name(match_id),
         "tournament": row["tournament"],
         "team_one": row["team_one"],
         "team_two": row["team_two"],
@@ -1317,6 +1328,27 @@ def _monitor_match(
             "vision": vision_readiness,
         },
     }
+
+
+def _official_match_id(
+    connection: PostgresSession,
+    raybet_match_id: str,
+) -> str | None:
+    row = connection.execute(
+        """SELECT provider_match_id
+             FROM match_links
+            WHERE raybet_match_id=?
+              AND provider IN ('opendota', 'stratz')
+              AND status='accepted'
+            ORDER BY CASE provider
+                       WHEN 'stratz' THEN 0
+                       WHEN 'opendota' THEN 1
+                       ELSE 2
+                     END
+            LIMIT 1""",
+        (raybet_match_id,),
+    ).fetchone()
+    return str(row["provider_match_id"]) if row is not None else None
 
 
 def _provider_current_map_number(row: DatabaseRow) -> int | None:

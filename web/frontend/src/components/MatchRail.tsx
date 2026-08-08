@@ -33,7 +33,14 @@ export function MatchRail({
   const visible = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase("zh-CN");
     const filtered = needle
-      ? matches.filter((match) => [match.tournament, match.team_one, match.team_two]
+      ? matches.filter((match) => [
+        match.raybet_match_id,
+        match.official_match_id,
+        match.display_name,
+        match.tournament,
+        match.team_one,
+        match.team_two,
+      ]
         .some((value) => value?.toLocaleLowerCase("zh-CN").includes(needle)))
       : matches;
     return [...filtered].sort((left, right) => {
@@ -66,7 +73,9 @@ export function MatchRail({
             onClick={() => onSelect(match.raybet_match_id)}
             type="button"
           >
-            <span className="tournament-name">{match.tournament || "未知赛事"}</span>
+            <span className="tournament-name" title={match.display_name || undefined}>
+              {match.display_name || match.tournament || "未知赛事"}
+            </span>
             <LifecycleBadge lifecycle={match.lifecycle} />
             <div className="match-teams">
               <span>{match.team_one || "队伍一"}</span>

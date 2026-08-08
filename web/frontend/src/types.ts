@@ -137,6 +137,9 @@ export interface WatchLink {
 
 export interface MonitorMatch {
   raybet_match_id: string;
+  official_match_id?: string | null;
+  display_name?: string | null;
+  observation_file?: string | null;
   tournament: string;
   team_one: string;
   team_two: string;
@@ -393,7 +396,13 @@ export interface VisionCalibrationBootstrap {
   profiles: VisionCalibrationProfile[];
   candidates: VisionCalibrationCandidate[];
   evaluations: VisionCalibrationEvaluation[];
-  observation_files: Array<{ name: string; bytes: number }>;
+  observation_files: Array<{
+    name: string;
+    bytes: number;
+    raybet_match_id?: string;
+    official_match_id?: string | null;
+    display_name?: string;
+  }>;
   observation_root: string;
   layout_profiles: string[];
   production_feature_path: string;

@@ -105,7 +105,7 @@ export function OperationsPanel({
 
       <section className="workspace-section">
         <div className="section-heading compact">
-          <div><h2>Strict mapping</h2><p>{match ? `RayBet #${match.raybet_match_id}` : "请先选择赛事"}</p></div>
+          <div><h2>Strict mapping</h2><p>{match ? match.display_name || `RayBet #${match.raybet_match_id}` : "请先选择赛事"}</p></div>
         </div>
         {activeMappings.map((mapping) => (
           <div className="mapping-row" key={mapping.mapping_id}>

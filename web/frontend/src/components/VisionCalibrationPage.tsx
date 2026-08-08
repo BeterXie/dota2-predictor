@@ -341,7 +341,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                       {data.observation_files.length ? "选择序列" : "没有可用序列"}
                     </option>
                     {data.observation_files.map((item) => (
-                      <option key={item.name} value={item.name}>{item.name}</option>
+                      <option key={item.name} value={item.name}>{item.display_name || item.name}</option>
                     ))}
                   </select>
                   <small className="vision-field-help" id="vision-observation-help">

@@ -56,7 +56,13 @@ const bootstrap: VisionCalibrationBootstrap = {
   }],
   candidates: [],
   evaluations: [],
-  observation_files: [{ name: "holdout.jsonl", bytes: 2048 }],
+  observation_files: [{
+    name: "holdout.jsonl",
+    bytes: 2048,
+    raybet_match_id: "38417147",
+    official_match_id: "8123456789",
+    display_name: "官方 Match ID 8123456789 · Team A vs Team B · The International 2026",
+  }],
   observation_root: "C:\\vision-corpus\\vision_observations",
   layout_profiles: ["standard_dota_hud_1080p"],
   production_feature_path: "vision/templates/hero_features.npz",
@@ -108,6 +114,16 @@ describe("VisionCalibrationPage", () => {
     expect(screen.getAllByAltText(/英雄 crop$/)).toHaveLength(10);
     expect(screen.getByText("R1")).toBeInTheDocument();
     expect(screen.getByText("D5")).toBeInTheDocument();
+  });
+
+  it("shows match metadata while keeping the physical Observation filename", async () => {
+    renderPage();
+
+    const selector = await screen.findByRole("combobox", { name: "Observation JSONL" });
+    expect(selector).toHaveValue("holdout.jsonl");
+    expect(screen.getByRole("option", {
+      name: "官方 Match ID 8123456789 · Team A vs Team B · The International 2026",
+    })).toHaveValue("holdout.jsonl");
   });
 
   it("explains why Observation JSONL is unavailable when the corpus is empty", async () => {
