@@ -1,12 +1,24 @@
-import { Button, Spinner } from "@fluentui/react-components";
 import {
+  Button,
+  Skeleton,
+  SkeletonItem,
+  Tab,
+  TabList,
+  Tooltip,
+} from "@fluentui/react-components";
+import {
+  ArrowCounterClockwise,
+  ArrowLeft,
+  ArrowRight,
+  ArrowsOutSimple,
   CheckCircle,
-  Flask,
   ImageSquare,
   LockKey,
+  MagnifyingGlassMinus,
+  MagnifyingGlassPlus,
   WarningCircle,
 } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   buildVisionCalibrationCandidate,
@@ -28,6 +40,9 @@ interface VisionCalibrationPageProps {
 }
 
 
+type CalibrationPanel = "truth" | "candidate" | "evaluation";
+
+
 export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps) {
   const [data, setData] = useState<VisionCalibrationBootstrap | null>(null);
   const [heroes, setHeroes] = useState<PrematchHero[]>([]);
@@ -41,10 +56,14 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   const [observationFile, setObservationFile] = useState("");
   const [layoutProfile, setLayoutProfile] = useState("");
   const [mode, setMode] = useState<"perception" | "runtime">("perception");
+  const [activePanel, setActivePanel] = useState<CalibrationPanel>("truth");
+  const [frameScale, setFrameScale] = useState(1);
+  const [focusedSlot, setFocusedSlot] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"label" | "candidate" | "evaluation" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const frameStageRef = useRef<HTMLDivElement>(null);
 
   const reload = async (signal?: AbortSignal) => {
     const value = await fetchVisionCalibration(signal);
@@ -114,6 +133,8 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
         : relatedCandidate?.candidate_id || ""
     ));
     setObservationFile("");
+    setFrameScale(1);
+    setFocusedSlot(null);
     setError(null);
     setMessage(null);
   }, [data?.candidates, data?.layout_profiles, event]);
@@ -184,6 +205,25 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   else if (!matchingObservationFiles.length) evaluationDisabledReason = "当前比赛没有可用的 Observation JSONL。";
   else if (!layoutMatchesLabel) evaluationDisabledReason = "Layout profile 必须与真值标签一致。";
 
+  const selectedEventIndex = visibleEvents.findIndex((item) => item.event_id === selectedId);
+  const currentProfileLabel = event?.profile_id
+    || selectedProfile?.profile_id
+    || (profileId === "all" ? "全部赛事 UI" : profileId);
+  const pendingCount = visibleEvents.filter((item) => !item.label).length;
+
+  const selectRelativeSample = (offset: number) => {
+    const next = visibleEvents[selectedEventIndex + offset];
+    if (next) setSelectedId(next.event_id);
+  };
+
+  const openFrameFullscreen = async () => {
+    try {
+      await frameStageRef.current?.requestFullscreen();
+    } catch {
+      setError("浏览器无法打开全屏预览");
+    }
+  };
+
   const saveLabel = async () => {
     if (!csrfToken || !event || !truthReady || !labelContextReady) return;
     setBusy("label");
@@ -248,20 +288,29 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   };
 
   if (loading) {
-    return <main className="vision-calibration-loading"><Spinner label="正在读取 Vision corpus" /></main>;
+    return <CalibrationSkeleton />;
   }
 
   return (
     <main className="vision-calibration-page">
-      <header className="vision-calibration-header">
-        <div>
-          <span className="vision-kicker"><Flask size={16} /> REAL-FRAME CALIBRATION</span>
-          <h1>Vision 训练与校正</h1>
-          <p>先选择赛事 UI profile，再检查并校正真实帧样本；同 profile 的后续比赛可以复用候选并继续做留出验证。</p>
+      <header className="vision-workbench-header">
+        <div className="vision-page-title">
+          <h1>Vision 校正</h1>
+          <p>训练 HUD 识别模板并验证真实直播帧</p>
         </div>
-        <div className="vision-boundary" role="note">
-          <LockKey size={18} />
-          <div><strong>生产边界锁定</strong><span>{data?.candidate_boundary}</span></div>
+        <dl className="vision-page-status">
+          <div>
+            <dt>当前 Profile</dt>
+            <dd title={currentProfileLabel}>{currentProfileLabel}</dd>
+          </div>
+          <div>
+            <dt>待处理</dt>
+            <dd>{pendingCount}</dd>
+          </div>
+        </dl>
+        <div className="vision-boundary-badge" role="note" title={data?.candidate_boundary}>
+          <LockKey size={16} aria-hidden="true" />
+          <span>生产边界已锁定</span>
         </div>
       </header>
 
@@ -278,8 +327,11 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
       ) : (
         <div className="vision-calibration-grid">
           <section className="vision-event-queue" aria-label="Vision 校正样本">
-            <header>
-              <div><h2>待校正样本</h2><span>{visibleEvents.length} 个样本</span></div>
+            <header className="vision-queue-header">
+              <div className="vision-queue-title">
+                <div><h2>校正队列</h2><p>真实帧样本</p></div>
+                <span>{visibleEvents.length}</span>
+              </div>
               <label className="vision-profile-selector">
                 <span>赛事 UI profile</span>
                 <select
@@ -298,7 +350,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
               <p className="vision-profile-summary">
                 {selectedProfile
                   ? `${selectedProfile.layout || selectedProfile.profile_id}：${selectedProfile.labeled_event_count} 个样本已标注，${selectedProfile.candidate_count} 个候选可复用`
-                  : "先选择赛事 UI；同 profile 后续比赛可复用同一候选，不必重复构建。"}
+                  : "同一 UI profile 可以复用候选模板。"}
               </p>
             </header>
             <div className="vision-event-list">
@@ -316,14 +368,18 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                     className={item.event_id === selectedId ? "vision-event selected" : "vision-event"}
                     key={item.event_id}
                     onClick={() => setSelectedId(item.event_id)}
+                    title={`${matchTitle} | ${item.reason} | ${item.profile_id}`}
                     type="button"
                   >
-                    <span className="vision-event-time">{formatTime(item.captured_at)}</span>
+                    <span className="vision-event-topline">
+                      <time className="vision-event-time">{formatTime(item.captured_at)}</time>
+                      <span className={item.label ? "vision-event-state labeled" : "vision-event-state"}>
+                        {item.label ? "已校正" : "待校正"}
+                      </span>
+                    </span>
                     <strong>{matchTitle}</strong>
-                    <span>{mapLabel} · 采集原因：{item.reason}</span>
-                    <small>
-                      UI: {item.layout || "unsupported layout"} · {item.label ? "已标注" : `${item.crop_count}/10 crops`} · 帧状态：{item.replay_gate_status || "unknown"}
-                    </small>
+                    <span className="vision-event-reason">{mapLabel} · {item.reason}</span>
+                    <small title={item.profile_id}>{item.profile_id}</small>
                   </button>
                 );
               })}
@@ -332,112 +388,271 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
 
           {event && (
             <section className="vision-inspector">
-              <header className="vision-section-heading">
-                <div><h2>帧与槽位检查</h2><p>{event.relative_path} · profile: {event.profile_id}</p></div>
-                <dl>
-                  <div><dt>screen</dt><dd>{event.screen_state || "—"}</dd></div>
-                  <div><dt>layout</dt><dd>{event.layout_state || "—"}</dd></div>
-                  <div><dt>blocker</dt><dd>{event.blocker_code || event.reason}</dd></div>
-                </dl>
+              <header className="vision-inspector-header">
+                <div>
+                  <h2>视觉样本</h2>
+                  <p>{formatTime(event.captured_at)}</p>
+                </div>
+                <div className="vision-frame-toolbar" aria-label="帧预览工具">
+                  <Tooltip content="上一样本" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="上一样本"
+                      disabled={selectedEventIndex <= 0}
+                      icon={<ArrowLeft size={17} />}
+                      onClick={() => selectRelativeSample(-1)}
+                      size="small"
+                    />
+                  </Tooltip>
+                  <Tooltip content="下一样本" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="下一样本"
+                      disabled={selectedEventIndex < 0 || selectedEventIndex >= visibleEvents.length - 1}
+                      icon={<ArrowRight size={17} />}
+                      onClick={() => selectRelativeSample(1)}
+                      size="small"
+                    />
+                  </Tooltip>
+                  <span className="vision-toolbar-divider" />
+                  <Tooltip content="缩小" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="缩小帧"
+                      disabled={frameScale <= 0.75}
+                      icon={<MagnifyingGlassMinus size={17} />}
+                      onClick={() => setFrameScale((current) => Math.max(0.75, current - 0.25))}
+                      size="small"
+                    />
+                  </Tooltip>
+                  <span className="vision-zoom-value">{Math.round(frameScale * 100)}%</span>
+                  <Tooltip content="放大" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="放大帧"
+                      disabled={frameScale >= 2}
+                      icon={<MagnifyingGlassPlus size={17} />}
+                      onClick={() => setFrameScale((current) => Math.min(2, current + 0.25))}
+                      size="small"
+                    />
+                  </Tooltip>
+                  <Tooltip content="重置缩放" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="重置缩放"
+                      icon={<ArrowCounterClockwise size={17} />}
+                      onClick={() => setFrameScale(1)}
+                      size="small"
+                    />
+                  </Tooltip>
+                  <Tooltip content="全屏预览" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="全屏预览"
+                      icon={<ArrowsOutSimple size={17} />}
+                      onClick={() => void openFrameFullscreen()}
+                      size="small"
+                    />
+                  </Tooltip>
+                </div>
               </header>
-              <img className="vision-full-frame" src={event.frame_url} alt="选中 Vision debug event 的完整直播帧" />
-              <div className="vision-crop-grid">
-                {event.crop_urls.map((url, index) => {
-                  const diagnostic = event.slot_diagnostics[index];
-                  return (
-                    <figure key={url}>
-                      <img src={url} alt={`${index < 5 ? "Radiant" : "Dire"} ${index % 5 + 1} 英雄 crop`} />
-                      <figcaption>
-                        <strong>{index < 5 ? "R" : "D"}{index % 5 + 1}</strong>
-                        <span>#{diagnostic?.best_hero_id || "—"}</span>
-                        <small>{diagnostic ? `${diagnostic.best_score.toFixed(3)} / Δ${diagnostic.margin.toFixed(3)}` : "no diagnostic"}</small>
-                      </figcaption>
-                    </figure>
-                  );
-                })}
+              <div className="vision-frame-meta" aria-label="帧状态">
+                <span>Screen <strong>{event.screen_state || "-"}</strong></span>
+                <span>Layout <strong>{event.layout_state || "-"}</strong></span>
+                <span>Blocker <strong>{event.blocker_code || event.reason}</strong></span>
               </div>
+              <div className="vision-frame-stage" ref={frameStageRef}>
+                <div className="vision-frame-canvas" style={{ width: `${frameScale * 100}%` }}>
+                  <img className="vision-full-frame" src={event.frame_url} alt="选中 Vision 校正样本的完整直播帧" />
+                </div>
+              </div>
+
+              <section className="vision-slot-section" aria-label="HUD 槽位识别">
+                <header>
+                  <div><h3>HUD 槽位识别</h3><p>当前帧每个英雄槽位的最佳识别结果</p></div>
+                  <span>{event.crop_count}/10 crops</span>
+                </header>
+                <div className="vision-team-groups">
+                  {(["Radiant", "Dire"] as const).map((side, sideIndex) => {
+                    const start = sideIndex * 5;
+                    return (
+                      <section className={`vision-team-group ${side.toLowerCase()}`} key={side}>
+                        <header><h4>{side}</h4><span>5 个槽位</span></header>
+                        <div className="vision-crop-grid">
+                          {event.crop_urls.slice(start, start + 5).map((url, localIndex) => {
+                            const index = start + localIndex;
+                            const diagnostic = event.slot_diagnostics[index];
+                            const hero = heroes.find((item) => item.hero_id === diagnostic?.best_hero_id);
+                            const truthMatch = typeof truth[index] === "number"
+                              && truth[index] === diagnostic?.best_hero_id;
+                            return (
+                              <button
+                                aria-label={`${side} slot ${localIndex + 1} 识别结果`}
+                                aria-pressed={focusedSlot === index}
+                                className={focusedSlot === index ? "vision-crop selected" : "vision-crop"}
+                                key={url}
+                                onClick={() => setFocusedSlot(index)}
+                                type="button"
+                              >
+                                <img src={url} alt={`${side} ${localIndex + 1} 英雄 crop`} />
+                                <span className="vision-crop-body">
+                                  <span className="vision-crop-heading">
+                                    <span className="vision-slot-id">{side === "Radiant" ? "R" : "D"}{localIndex + 1}</span>
+                                    {truthMatch && <CheckCircle size={15} weight="fill" aria-label="与真值一致" />}
+                                  </span>
+                                  <strong>{hero?.localized_name || `Hero #${diagnostic?.best_hero_id || "-"}`}</strong>
+                                  <small>Hero ID #{diagnostic?.best_hero_id || "-"}</small>
+                                  <span className="vision-crop-metrics">
+                                    <span>置信度 <strong>{diagnostic ? formatPercent(diagnostic.best_score) : "-"}</strong></span>
+                                    <span>差值 <strong>{diagnostic ? diagnostic.margin.toFixed(3) : "-"}</strong></span>
+                                  </span>
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    );
+                  })}
+                </div>
+              </section>
             </section>
           )}
 
           {event && (
             <aside className="vision-calibration-form">
-              <section>
-                <div className="vision-section-heading compact"><div><h2>HUD 真值</h2><p>从左到右：Radiant 1–5，Dire 1–5。</p></div></div>
-                <div className="vision-truth-grid">
-                  {truth.map((value, index) => (
-                    <label key={`${event.event_id}-${index}`}>
-                      <span>{index < 5 ? "Radiant" : "Dire"} {index % 5 + 1}</span>
-                      <select
-                        aria-label={`${index < 5 ? "Radiant" : "Dire"} slot ${index % 5 + 1}`}
-                        onChange={(change) => {
-                          clearFeedback();
-                          setTruth((current) => current.map((item, itemIndex) => (
-                            itemIndex === index ? Number(change.target.value) || "" : item
-                          )));
-                        }}
-                        value={value}
-                      >
-                        <option value="">选择英雄</option>
-                        {heroes.map((hero) => <option key={hero.hero_id} value={hero.hero_id}>{hero.localized_name} · #{hero.hero_id}</option>)}
-                      </select>
-                    </label>
-                  ))}
-                </div>
-                <div className="vision-context-fields">
-                  <label><span>RayBet match ID</span><input onChange={(change) => { clearFeedback(); setMatchId(change.target.value); }} value={matchId} /></label>
-                  <label><span>Map</span><input max="5" min="1" onChange={(change) => { clearFeedback(); setMapNumber(change.target.value); }} type="number" value={mapNumber} /></label>
-                </div>
-                <label className="vision-note"><span>标注说明</span><textarea onChange={(change) => setNote(change.target.value)} rows={2} value={note} /></label>
-                {!truthReady && <p className="vision-disabled-reason">需要十个互不重复的英雄真值。</p>}
-                {truthReady && !labelContextReady && <p className="vision-disabled-reason">需要 RayBet match ID 和 1–5 的 Map 编号。</p>}
-                <Button disabled={!csrfToken || !truthReady || !labelContextReady || busy !== null} onClick={() => void saveLabel()}>
-                  {busy === "label" ? "正在保存…" : "保存真值标签"}
-                </Button>
-              </section>
+              <header className="vision-workflow-header">
+                <div><h2>校正流程</h2><p>标注、构建并验证候选模板</p></div>
+                <span>{event.label ? "已标注" : "待标注"}</span>
+              </header>
+              <TabList
+                aria-label="校正流程"
+                className="vision-workflow-tabs"
+                onTabSelect={(_, tabData) => setActivePanel(tabData.value as CalibrationPanel)}
+                selectedValue={activePanel}
+                size="small"
+              >
+                <Tab value="truth">真实值</Tab>
+                <Tab value="candidate">候选模板</Tab>
+                <Tab value="evaluation">留出评估</Tab>
+              </TabList>
 
-              <section>
-                <div className="vision-section-heading compact"><div><h2>候选模板</h2><p>仅替换隔离候选中的十个 base portrait。</p></div></div>
-                <Button disabled={!csrfToken || !event.label || !labelInputsSaved || event.crop_count !== 10 || busy !== null} onClick={() => void buildCandidate()}>
-                  {busy === "candidate" ? "正在构建…" : "从当前标签构建候选"}
-                </Button>
-                {!event.label && <p className="vision-disabled-reason">先保存当前事件的真值标签。</p>}
-                {event.label && !labelInputsSaved && <p className="vision-disabled-reason">先保存当前真值、比赛和 Map 的修改。</p>}
-              </section>
-
-              <section>
-                <div className="vision-section-heading compact"><div><h2>留出评估</h2><p>默认 perception；runtime 会执行 OCR 与 trust gates。</p></div></div>
-                <label><span>候选包（可复用同 UI profile）</span><select onChange={(change) => { clearFeedback(); setCandidateId(change.target.value); }} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
-                <label>
-                  <span>Observation JSONL</span>
-                  <select
-                    aria-label="Observation JSONL"
-                    aria-describedby="vision-observation-help"
-                    disabled={!matchingObservationFiles.length}
-                    onChange={(change) => { clearFeedback(); setObservationFile(change.target.value); }}
-                    value={observationFile}
-                  >
-                    <option value="">
-                      {matchingObservationFiles.length ? "选择序列" : "当前比赛没有可用序列"}
-                    </option>
-                    {matchingObservationFiles.map((item) => (
-                      <option key={item.name} value={item.name}>{item.display_name || item.name}</option>
+              {activePanel === "truth" && (
+                <section className="vision-workflow-panel" aria-label="真实值">
+                  <div className="vision-panel-heading"><h3>HUD 真实值</h3><p>按画面从左到右保存双方阵容。</p></div>
+                  <div className="vision-truth-teams">
+                    {(["Radiant", "Dire"] as const).map((side, sideIndex) => (
+                      <fieldset className={`vision-truth-team ${side.toLowerCase()}`} key={side}>
+                        <legend>{side}</legend>
+                        {truth.slice(sideIndex * 5, sideIndex * 5 + 5).map((value, localIndex) => {
+                          const index = sideIndex * 5 + localIndex;
+                          return (
+                            <label key={`${event.event_id}-${index}`}>
+                              <span>{localIndex + 1}</span>
+                              <select
+                                aria-label={`${side} slot ${localIndex + 1}`}
+                                onChange={(change) => {
+                                  clearFeedback();
+                                  setTruth((current) => current.map((item, itemIndex) => (
+                                    itemIndex === index ? Number(change.target.value) || "" : item
+                                  )));
+                                }}
+                                onFocus={() => setFocusedSlot(index)}
+                                value={value}
+                              >
+                                <option value="">选择英雄</option>
+                                {heroes.map((hero) => <option key={hero.hero_id} value={hero.hero_id}>{hero.localized_name} · #{hero.hero_id}</option>)}
+                              </select>
+                            </label>
+                          );
+                        })}
+                      </fieldset>
                     ))}
-                  </select>
-                  <small className="vision-field-help" id="vision-observation-help">
-                    {matchingObservationFiles.length
-                      ? `正在读取 ${data.observation_root}`
-                      : `没有与当前已保存 RayBet match ID 匹配的 JSONL：${data.observation_root}`}
-                  </small>
-                </label>
-                <label><span>Layout profile</span><select onChange={(change) => { clearFeedback(); setLayoutProfile(change.target.value); }} value={layoutProfile}>{data.layout_profiles.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
-                <label><span>评估模式</span><select onChange={(change) => { clearFeedback(); setMode(change.target.value as "perception" | "runtime"); }} value={mode}><option value="perception">Perception only</option><option value="runtime">Runtime faithful</option></select></label>
-                <Button disabled={!canEvaluate || busy !== null} onClick={() => void runEvaluation()}>
-                  {busy === "evaluation" ? "正在评估…" : "运行留出评估"}
-                </Button>
-                {evaluationDisabledReason && <p className="vision-disabled-reason">{evaluationDisabledReason}</p>}
-              </section>
+                  </div>
+                  <div className="vision-context-fields">
+                    <label><span>RayBet match ID</span><input onChange={(change) => { clearFeedback(); setMatchId(change.target.value); }} value={matchId} /></label>
+                    <label><span>Map</span><input max="5" min="1" onChange={(change) => { clearFeedback(); setMapNumber(change.target.value); }} type="number" value={mapNumber} /></label>
+                  </div>
+                  <label className="vision-note"><span>标注说明</span><textarea onChange={(change) => setNote(change.target.value)} rows={2} value={note} /></label>
+                  {!truthReady && <p className="vision-disabled-reason">需要十个互不重复的英雄真实值。</p>}
+                  {truthReady && !labelContextReady && <p className="vision-disabled-reason">需要 RayBet match ID 和 1-5 的 Map 编号。</p>}
+                  <Button
+                    appearance="primary"
+                    className="vision-primary-action"
+                    disabled={!csrfToken || !truthReady || !labelContextReady || busy !== null}
+                    onClick={() => void saveLabel()}
+                  >
+                    {busy === "label" ? "正在保存…" : "保存真实值标签"}
+                  </Button>
+                </section>
+              )}
 
-              <EvaluationResults rows={currentEvaluations} />
+              {activePanel === "candidate" && (
+                <section className="vision-workflow-panel" aria-label="候选模板">
+                  <div className="vision-panel-heading"><h3>候选模板</h3><p>只更新隔离候选包，不覆盖生产模板。</p></div>
+                  <dl className="vision-workflow-summary">
+                    <div><dt>当前标签</dt><dd>{event.label ? formatTime(event.label.updated_at) : "尚未保存"}</dd></div>
+                    <div><dt>UI Profile</dt><dd title={event.profile_id}>{event.profile_id}</dd></div>
+                    <div><dt>可复用候选</dt><dd>{relatedCandidates.length}</dd></div>
+                    <div><dt>生产模板</dt><dd>保持不变</dd></div>
+                  </dl>
+                  <Button
+                    appearance="secondary"
+                    className="vision-secondary-action"
+                    disabled={!csrfToken || !event.label || !labelInputsSaved || event.crop_count !== 10 || busy !== null}
+                    onClick={() => void buildCandidate()}
+                  >
+                    {busy === "candidate" ? "正在构建…" : "从当前标签构建候选"}
+                  </Button>
+                  {!event.label && <p className="vision-disabled-reason">先保存当前样本的真实值标签。</p>}
+                  {event.label && !labelInputsSaved && <p className="vision-disabled-reason">先保存当前真实值、比赛和 Map 的修改。</p>}
+                </section>
+              )}
+
+              {activePanel === "evaluation" && (
+                <section className="vision-workflow-panel" aria-label="留出评估">
+                  <div className="vision-panel-heading"><h3>留出评估</h3><p>使用另一段真实序列验证最终锁定。</p></div>
+                  <label><span>候选包</span><select onChange={(change) => { clearFeedback(); setCandidateId(change.target.value); }} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
+                  <label>
+                    <span>Observation 序列</span>
+                    <select
+                      aria-label="Observation JSONL"
+                      disabled={!matchingObservationFiles.length}
+                      onChange={(change) => { clearFeedback(); setObservationFile(change.target.value); }}
+                      value={observationFile}
+                    >
+                      <option value="">
+                        {matchingObservationFiles.length ? "选择序列" : "当前比赛没有可用序列"}
+                      </option>
+                      {matchingObservationFiles.map((item) => (
+                        <option key={item.name} value={item.name}>{item.display_name || item.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <details className="vision-advanced-settings">
+                    <summary>高级信息</summary>
+                    <div>
+                      <label><span>Layout profile</span><select onChange={(change) => { clearFeedback(); setLayoutProfile(change.target.value); }} value={layoutProfile}>{data.layout_profiles.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+                      <label><span>评估模式</span><select onChange={(change) => { clearFeedback(); setMode(change.target.value as "perception" | "runtime"); }} value={mode}><option value="perception">Perception only</option><option value="runtime">Runtime faithful</option></select></label>
+                      <dl>
+                        <div><dt>Observation 文件</dt><dd>{observationFile || "未选择"}</dd></div>
+                        <div><dt>Observation 路径</dt><dd>{data.observation_root}</dd></div>
+                        <div><dt>生产特征包</dt><dd>{data.production_feature_path}</dd></div>
+                      </dl>
+                    </div>
+                  </details>
+                  <Button
+                    appearance="primary"
+                    className="vision-primary-action"
+                    disabled={!canEvaluate || busy !== null}
+                    onClick={() => void runEvaluation()}
+                  >
+                    {busy === "evaluation" ? "正在评估…" : "运行留出评估"}
+                  </Button>
+                  {evaluationDisabledReason && <p className="vision-disabled-reason">{evaluationDisabledReason}</p>}
+                  <EvaluationResults rows={currentEvaluations} />
+                </section>
+              )}
             </aside>
           )}
         </div>
@@ -447,22 +662,46 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
 }
 
 
+function CalibrationSkeleton() {
+  return (
+    <main className="vision-calibration-page vision-calibration-skeleton" aria-label="正在加载 Vision 校正工作台">
+      <Skeleton className="vision-skeleton-header">
+        <SkeletonItem shape="rectangle" size={32} />
+        <SkeletonItem shape="rectangle" size={16} />
+      </Skeleton>
+      <div className="vision-calibration-grid">
+        <Skeleton className="vision-skeleton-rail"><SkeletonItem shape="rectangle" size={128} /></Skeleton>
+        <Skeleton className="vision-skeleton-frame"><SkeletonItem shape="rectangle" size={128} /></Skeleton>
+        <Skeleton className="vision-skeleton-panel"><SkeletonItem shape="rectangle" size={128} /></Skeleton>
+      </div>
+    </main>
+  );
+}
+
+
 function EvaluationResults({ rows }: { rows: VisionCalibrationEvaluation[] }) {
   return (
-    <section>
-      <div className="vision-section-heading compact"><div><h2>最近结果</h2><p>错误锁优先于平均分。</p></div></div>
-      {!rows.length && <p className="vision-disabled-reason">当前选择尚无评估结果。</p>}
+    <section className="vision-results" aria-label="最近评估">
+      <header><h3>最近评估</h3><span>{rows.length ? `${rows.length} 条` : "暂无结果"}</span></header>
+      {!rows.length && <p className="vision-result-empty">当前标签与候选还没有评估结果。</p>}
       <div className="vision-evaluation-list">
-        {rows.slice(0, 6).map((row) => (
-          <article className={row.wrong_lock_count ? "failed" : "passed"} key={row.evaluation_id}>
-            <header><strong>正确锁定 / 总锁定：{row.final_correct_locked_slots} / {row.final_locked_slots}</strong><span>{row.mode}</span></header>
-            <dl>
-              <div><dt>wrong locks</dt><dd>{row.wrong_lock_count}</dd></div>
-              <div><dt>precision</dt><dd>{formatPercent(row.accepted_precision)}</dd></div>
-              <div><dt>post-lock</dt><dd>{formatPercent(row.exact_post_lock_rate)}</dd></div>
+        {rows.slice(0, 6).map((row, index) => (
+          <article className={`${row.wrong_lock_count ? "failed" : "passed"}${index === 0 ? " latest" : ""}`} key={row.evaluation_id}>
+            <header>
+              <div><span>{index === 0 ? "最新结果" : formatTime(row.created_at)}</span><strong>{row.final_correct_locked_slots} / {row.final_locked_slots}</strong><small>正确锁定 / 总锁定</small></div>
+              <span className="vision-result-state">{row.wrong_lock_count ? "需要检查" : "通过"}</span>
+            </header>
+            <dl className="vision-result-metrics">
+              <div><dt>Precision</dt><dd>{formatPercent(row.accepted_precision)}</dd></div>
+              <div><dt>Post-lock</dt><dd>{formatPercent(row.exact_post_lock_rate)}</dd></div>
+              <div><dt>错误锁定</dt><dd>{row.wrong_lock_count}</dd></div>
             </dl>
-            <small>{formatTime(row.created_at)} · Map {row.map_number} · 锁定延迟 {formatLatency(row.lock_latency_seconds)}</small>
-            <small>{row.observation_file}</small>
+            <footer>
+              <span>{formatTime(row.created_at)}</span>
+              <span>Map {row.map_number}</span>
+              <span>锁定延迟 {formatLatency(row.lock_latency_seconds)}</span>
+            </footer>
+            <details className="vision-result-technical"><summary>技术详情</summary><code>{row.mode} | {row.observation_file}</code></details>
           </article>
         ))}
       </div>

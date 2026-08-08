@@ -160,13 +160,17 @@ describe("VisionCalibrationPage", () => {
   it("renders the full frame and ten ordered crops", async () => {
     renderPage();
 
-    expect(await screen.findByAltText("选中 Vision debug event 的完整直播帧")).toHaveAttribute(
+    const frame = await screen.findByAltText("选中 Vision 校正样本的完整直播帧");
+    expect(frame).toHaveAttribute(
       "src",
       event.frame_url,
     );
     expect(screen.getAllByAltText(/英雄 crop$/)).toHaveLength(10);
     expect(screen.getByText("R1")).toBeInTheDocument();
     expect(screen.getByText("D5")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "上一样本" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "放大帧" }));
+    expect(frame.closest(".vision-frame-canvas")).toHaveStyle({ width: "125%" });
   });
 
   it("lists only matching Observation metadata without selecting a sequence", async () => {
@@ -186,16 +190,16 @@ describe("VisionCalibrationPage", () => {
     renderPage();
 
     const sampleQueue = await screen.findByRole("region", { name: "Vision 校正样本" });
-    expect(within(sampleQueue).getByRole("heading", { name: "待校正样本" })).toBeInTheDocument();
-    expect(within(sampleQueue).getByText("1 个样本")).toBeInTheDocument();
+    expect(within(sampleQueue).getByRole("heading", { name: "校正队列" })).toBeInTheDocument();
+    expect(within(sampleQueue).getByText("真实帧样本")).toBeInTheDocument();
     expect(within(sampleQueue).getByText(
       "官方 Match ID 8123456789 · Team A vs Team B · The International 2026",
     )).toBeInTheDocument();
-    expect(within(sampleQueue).getByText("Map 1 · 采集原因：ambiguous_match")).toBeInTheDocument();
-    expect(within(sampleQueue).getByText(
-      "UI: standard_dota_hud_1080p · 已标注 · 帧状态：live",
-    )).toBeInTheDocument();
+    expect(within(sampleQueue).getByText("Map 1 · ambiguous_match")).toBeInTheDocument();
+    expect(within(sampleQueue).getByText("已校正")).toBeInTheDocument();
+    expect(within(sampleQueue).getByText("standard_dota_hud_1080p")).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("tab", { name: "留出评估" }));
     const selector = await screen.findByRole("combobox", { name: "Observation JSONL" });
     expect(selector).toHaveValue("");
     expect(screen.getByRole("option", {
@@ -211,6 +215,7 @@ describe("VisionCalibrationPage", () => {
     });
     renderPage();
 
+    fireEvent.click(await screen.findByRole("tab", { name: "留出评估" }));
     const selector = await screen.findByRole("combobox", { name: "Observation JSONL" });
     expect(selector).toBeDisabled();
     expect(screen.getByText("当前比赛没有可用序列")).toBeInTheDocument();
@@ -219,7 +224,7 @@ describe("VisionCalibrationPage", () => {
 
   it("requires ten unique heroes and saves the HUD-order truth with CSRF", async () => {
     renderPage();
-    const save = await screen.findByRole("button", { name: "保存真值标签" });
+    const save = await screen.findByRole("button", { name: "保存真实值标签" });
     expect(save).toBeDisabled();
 
     fireEvent.change(screen.getByLabelText("RayBet match ID"), { target: { value: "38417147" } });
@@ -228,7 +233,7 @@ describe("VisionCalibrationPage", () => {
 
     fireEvent.change(screen.getByLabelText("Dire slot 5"), { target: { value: "1" } });
     expect(save).toBeDisabled();
-    expect(screen.getByText("需要十个互不重复的英雄真值。")).toBeInTheDocument();
+    expect(screen.getByText("需要十个互不重复的英雄真实值。")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Dire slot 5"), { target: { value: "10" } });
     api.saveVisionCalibrationLabel.mockResolvedValue({
@@ -257,6 +262,7 @@ describe("VisionCalibrationPage", () => {
     });
     renderPage();
 
+    fireEvent.click(await screen.findByRole("tab", { name: "留出评估" }));
     const run = await screen.findByRole("button", { name: "运行留出评估" });
     expect(run).toBeDisabled();
 
@@ -265,15 +271,21 @@ describe("VisionCalibrationPage", () => {
     });
     expect(run).toBeEnabled();
 
+    fireEvent.click(screen.getByRole("tab", { name: "真实值" }));
     fireEvent.change(screen.getByLabelText("Map"), { target: { value: "2" } });
-    expect(run).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("tab", { name: "留出评估" }));
+    expect(screen.getByRole("button", { name: "运行留出评估" })).toBeDisabled();
     expect(screen.getByText("比赛、Map 或英雄真值有未保存的修改。")).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("tab", { name: "真实值" }));
     fireEvent.change(screen.getByLabelText("Map"), { target: { value: "1" } });
+
+    fireEvent.click(screen.getByRole("tab", { name: "留出评估" }));
     fireEvent.change(screen.getByLabelText("Layout profile"), {
       target: { value: "wxc_gotf_2026_live_1080p" },
     });
-    expect(run).toBeDisabled();
+    expect(screen.getByRole("button", { name: "运行留出评估" })).toBeDisabled();
     expect(screen.getByText("Layout profile 必须与真值标签一致。")).toBeInTheDocument();
   });
 
@@ -303,18 +315,24 @@ describe("VisionCalibrationPage", () => {
     api.runVisionCalibrationEvaluation.mockResolvedValue(evaluation);
     renderPage();
 
-    expect(await screen.findByText("生产边界锁定")).toBeInTheDocument();
-    expect(screen.getByText("正确锁定 / 总锁定：9 / 10")).toBeInTheDocument();
-    expect(screen.getByText("wrong locks")).toBeInTheDocument();
-    expect(screen.getByText(/Map 1 · 锁定延迟 4.2 秒/)).toBeInTheDocument();
+    expect(await screen.findByText("生产边界已锁定")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "留出评估" }));
+    const results = screen.getByRole("region", { name: "最近评估" });
+    expect(within(results).getByText("9 / 10")).toBeInTheDocument();
+    expect(within(results).getByText("正确锁定 / 总锁定")).toBeInTheDocument();
+    expect(within(results).getByText("错误锁定")).toBeInTheDocument();
+    expect(within(results).getByText("Map 1")).toBeInTheDocument();
+    expect(within(results).getByText("锁定延迟 4.2 秒")).toBeInTheDocument();
     expect(screen.queryByText("38416111.jsonl")).not.toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("tab", { name: "候选模板" }));
     fireEvent.click(screen.getByRole("button", { name: "从当前标签构建候选" }));
     await waitFor(() => expect(api.buildVisionCalibrationCandidate).toHaveBeenCalledWith(
       event.event_id,
       "csrf",
     ));
 
+    fireEvent.click(screen.getByRole("tab", { name: "留出评估" }));
     fireEvent.change(screen.getByRole("combobox", { name: "Observation JSONL" }), {
       target: { value: "holdout.jsonl" },
     });

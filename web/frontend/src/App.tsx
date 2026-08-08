@@ -229,7 +229,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
+      <header className={view === "vision" ? "app-header vision-header-mode" : "app-header"}>
         <div className="brand-block">
           <Broadcast size={24} aria-hidden="true" />
           <div><strong>Dota 2 实时阵容预测</strong><span>RayBet · HUD · Team Rating · R.O.S.H.</span></div>
