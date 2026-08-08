@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_LIST_CACHE_TTL_SECONDS = 60.0
 PREMATCH_COLLECTION_LEAD_TIME = timedelta(hours=2)
+SCHEDULED_LIVE_FALLBACK_RETENTION = timedelta(hours=12)
 RAYBET_SCHEDULE_TIMEZONE = timezone(timedelta(hours=8))
 ODDS_BACKOFF_INITIAL_SECONDS = 3.0
 ODDS_BACKOFF_MAX_SECONDS = 300.0
@@ -621,6 +622,74 @@ def _fetch_odds(
     return client.match_odds(match_id)
 
 
+def _scheduled_start_utc(list_row: dict[str, Any]) -> datetime | None:
+    raw_start = list_row.get("start_time")
+    if isinstance(raw_start, datetime):
+        scheduled_at = raw_start
+    elif isinstance(raw_start, str):
+        start_text = raw_start.strip()
+        try:
+            if len(start_text) == 19:
+                scheduled_at = datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S")
+                scheduled_at = scheduled_at.replace(tzinfo=RAYBET_SCHEDULE_TIMEZONE)
+            elif len(start_text) == 25:
+                scheduled_at = datetime.fromisoformat(start_text)
+            else:
+                return None
+        except ValueError:
+            return None
+    else:
+        return None
+    if scheduled_at.tzinfo is None or scheduled_at.utcoffset() is None:
+        return None
+    return scheduled_at.astimezone(timezone.utc)
+
+
+def _scheduled_live_fallback_due(
+    list_row: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    if str(list_row.get("status") or "") != "1":
+        return False
+    scheduled_at = _scheduled_start_utc(list_row)
+    if scheduled_at is None:
+        return False
+    elapsed = now.astimezone(timezone.utc) - scheduled_at
+    return timedelta(0) <= elapsed <= SCHEDULED_LIVE_FALLBACK_RETENTION
+
+
+def _scheduled_live_fallback_rows(
+    store: LiveBettingStore,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    checked_at = now or utc_now()
+    if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+        raise ValueError("scheduled live fallback clock must be timezone-aware")
+    checked_at = checked_at.astimezone(timezone.utc)
+    rows = store.connection.execute(
+        """SELECT raybet_match_id, scheduled_at, status
+             FROM raybet_matches
+            WHERE COALESCE(CAST(status AS TEXT), '') IN ('1', '2')"""
+    ).fetchall()
+    fallback_rows: list[dict[str, Any]] = []
+    for row in rows:
+        match_id = str(row["raybet_match_id"] or "")
+        fallback = {
+            "id": match_id,
+            "status": str(row["status"] or ""),
+            "start_time": str(row["scheduled_at"] or ""),
+            "_force_live_poll": True,
+        }
+        scheduled_at = _scheduled_start_utc(fallback)
+        if not match_id.isdigit() or scheduled_at is None:
+            continue
+        if _scheduled_live_fallback_due(fallback, now=checked_at):
+            fallback_rows.append(fallback)
+    return fallback_rows
+
+
 def _prematch_collection_due(
     store: LiveBettingStore,
     match_id: str,
@@ -630,23 +699,9 @@ def _prematch_collection_due(
 ) -> bool:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("prematch collection clock must be timezone-aware")
-    raw_start = list_row.get("start_time")
-    if not isinstance(raw_start, str):
+    scheduled_at = _scheduled_start_utc(list_row)
+    if scheduled_at is None:
         return False
-    start_text = raw_start.strip()
-    try:
-        if len(start_text) == 19:
-            scheduled_at = datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S")
-            scheduled_at = scheduled_at.replace(tzinfo=RAYBET_SCHEDULE_TIMEZONE)
-        elif len(start_text) == 25:
-            scheduled_at = datetime.fromisoformat(start_text)
-        else:
-            return False
-    except ValueError:
-        return False
-    if scheduled_at.tzinfo is None or scheduled_at.utcoffset() is None:
-        return False
-    scheduled_at = scheduled_at.astimezone(timezone.utc)
     now_utc = now.astimezone(timezone.utc)
     until_start = scheduled_at - now_utc
     if not timedelta(0) < until_start <= PREMATCH_COLLECTION_LEAD_TIME:
@@ -816,7 +871,10 @@ def _partition_live_rows(
         match_id = str(row.get("id") or "") if isinstance(row, dict) else ""
         if (
             match_id in priority_match_ids
-            and str(row.get("status") or "") == "2"
+            and (
+                str(row.get("status") or "") == "2"
+                or row.get("_force_live_poll") is True
+            )
         ):
             priority.append(row)
         else:
@@ -830,7 +888,30 @@ def _odds_channel_rows(
     *,
     priority_available: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    live_rows = _live_rows_snapshot()
+    live_rows = list(_live_rows_snapshot())
+    checked_at = utc_now()
+    for index, row in enumerate(live_rows):
+        if _scheduled_live_fallback_due(row, now=checked_at):
+            live_rows[index] = {
+                **row,
+                "_force_live_poll": True,
+            }
+    positions = {
+        str(row.get("id") or ""): index
+        for index, row in enumerate(live_rows)
+        if isinstance(row, dict) and str(row.get("id") or "").isdigit()
+    }
+    for fallback in _scheduled_live_fallback_rows(store):
+        match_id = str(fallback["id"])
+        position = positions.get(match_id)
+        if position is None:
+            positions[match_id] = len(live_rows)
+            live_rows.append(fallback)
+            continue
+        live_rows[position] = {
+            **live_rows[position],
+            "_force_live_poll": True,
+        }
     priority, full = _partition_live_rows(
         live_rows,
         _active_priority_match_ids(store),
@@ -1233,7 +1314,10 @@ def collect_once(
             if not match_id.isdigit():
                 raise ValueError("live match list id is invalid")
             request_identity = f"{endpoint}?match_id={match_id}"
-            is_prematch = str(list_row.get("status") or "") == "1"
+            is_prematch = (
+                str(list_row.get("status") or "") == "1"
+                and list_row.get("_force_live_poll") is not True
+            )
             if is_prematch and not _prematch_collection_due(
                 store, match_id, list_row, now=collection_now
             ):
