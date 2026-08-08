@@ -366,6 +366,20 @@ class ControlService:
         spec = COMPONENTS[component]
         if spec.supervisor_component is None:
             return None
+        registry = self._registry_row(connection, component)
+        if registry is not None and registry["status"] == "running":
+            try:
+                process = self._process(int(registry["pid"]))
+                recorded_at = registry["process_created_at"]
+                if recorded_at is not None and abs(
+                    float(process.create_time()) - float(recorded_at)
+                ) > 1e-3:
+                    return None
+            except (KeyError, psutil.Error, OSError, TypeError, ValueError):
+                # A dead registered process leaves a fresh heartbeat behind
+                # until the supervisor timeout.  Do not mistake that stale
+                # row for an externally managed process.
+                return None
         row = connection.execute(
             "SELECT last_heartbeat_at FROM service_health WHERE component=?",
             (spec.supervisor_component,),

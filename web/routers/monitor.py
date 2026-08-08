@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 
 from datetime import datetime, timezone
@@ -37,6 +38,9 @@ from .mappings import _require_control
 
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
 logger = logging.getLogger(__name__)
+_SNAPSHOT_CACHE_TTL_SECONDS = 5.0
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_snapshot_cache: tuple[float, dict[str, object]] | None = None
 
 _WATCHABLE_PROVIDER_STATUSES = {
     "1",
@@ -90,18 +94,31 @@ def _build_snapshot() -> dict[str, object]:
     """Build one monitor snapshot off the async event loop."""
     connection = queries.get_db()
     try:
-        return monitoring.build_monitor_snapshot(connection)
+        with connection.transaction():
+            return monitoring.build_monitor_snapshot(connection)
     finally:
         connection.close()
+
+
+def _cached_snapshot() -> dict[str, object]:
+    """Share one bounded database snapshot across simultaneous SSE clients."""
+
+    global _snapshot_cache
+    now = time.monotonic()
+    with _SNAPSHOT_CACHE_LOCK:
+        if (
+            _snapshot_cache is not None
+            and now - _snapshot_cache[0] < _SNAPSHOT_CACHE_TTL_SECONDS
+        ):
+            return _snapshot_cache[1]
+        snapshot = _build_snapshot()
+        _snapshot_cache = (time.monotonic(), snapshot)
+        return snapshot
 
 
 @router.get("/bootstrap")
 def bootstrap() -> dict[str, object]:
-    connection = queries.get_db()
-    try:
-        return monitoring.build_monitor_snapshot(connection)
-    finally:
-        connection.close()
+    return _cached_snapshot()
 
 
 @router.get("/health")
@@ -478,7 +495,7 @@ async def events(
         nonlocal previous
         last_heartbeat = time.monotonic()
         while not await request.is_disconnected():
-            snapshot = await asyncio.to_thread(_build_snapshot)
+            snapshot = await asyncio.to_thread(_cached_snapshot)
             current = str(snapshot["cursor"])
             if current != previous:
                 payload = json.dumps(
@@ -492,7 +509,7 @@ async def events(
             elif time.monotonic() - last_heartbeat >= 15:
                 yield ": heartbeat\n\n"
                 last_heartbeat = time.monotonic()
-            await asyncio.sleep(1)
+            await asyncio.sleep(_SNAPSHOT_CACHE_TTL_SECONDS)
 
     return StreamingResponse(
         stream(),

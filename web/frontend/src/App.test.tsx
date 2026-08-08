@@ -176,5 +176,6 @@ describe("App", () => {
 
     expect(await screen.findByText("vision-calibration-csrf")).toBeInTheDocument();
     expect(api.fetchBootstrap).not.toHaveBeenCalled();
+    expect(api.snapshotStream).not.toHaveBeenCalled();
   });
 });
