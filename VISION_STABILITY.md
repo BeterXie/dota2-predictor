@@ -29,6 +29,11 @@ it does not add a database migration.
 
 ## Run
 
+When the local operator console is started with `python -m web.main`, it
+automatically starts the Stable Vision supervisor after PostgreSQL runtime
+schema verification and stops the Web-owned supervisor during shutdown. Do not
+run another Stable or legacy supervisor alongside it.
+
 Use the stabilized entry point instead of the legacy watcher:
 
 ```bash
