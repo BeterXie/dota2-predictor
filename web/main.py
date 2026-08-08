@@ -94,16 +94,29 @@ def main(argv: Sequence[str] | None = None) -> None:
     with LiveBettingStore(database_url) as store:
         store.init_schema()
         verify_runtime_schema(store.connection)
+        from .routers.control import control_service
+
+        vision_result = control_service.ensure_started(
+            store.connection,
+            "vision_supervisor",
+        )
     logging.getLogger("web").info(
         "PostgreSQL database configured from %s", source
     )
-
-    uvicorn.run(
-        "web.app:app",
-        host=host,
-        port=port,
-        reload=reload,
+    logging.getLogger("web").info(
+        "Stable Vision startup: %s",
+        vision_result.get("detail") or vision_result.get("status"),
     )
+
+    try:
+        uvicorn.run(
+            "web.app:app",
+            host=host,
+            port=port,
+            reload=reload,
+        )
+    finally:
+        control_service.close()
 
 
 if __name__ == "__main__":

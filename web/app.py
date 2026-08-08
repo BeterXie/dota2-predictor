@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from . import queries
 from .routers import control as control_router
-from .routers import mappings, monitor
+from .routers import mappings, monitor, vision_calibration
 
 
 MONITOR_DIST_DIR = Path(__file__).parent / "frontend" / "dist"
@@ -34,6 +34,7 @@ app = FastAPI(
 app.include_router(monitor.router)
 app.include_router(control_router.router)
 app.include_router(mappings.router)
+app.include_router(vision_calibration.router)
 
 
 @app.get("/", include_in_schema=False)

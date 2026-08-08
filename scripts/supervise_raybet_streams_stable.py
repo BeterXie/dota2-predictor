@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -39,6 +40,10 @@ def stable_watcher_command(
 
 
 def main() -> int:
+    os.environ.setdefault(
+        "VISION_DEBUG_DIR",
+        str(ROOT / "data" / "live_betting" / "vision_debug"),
+    )
     supervisor.watcher_command = stable_watcher_command
     return supervisor.main()
 

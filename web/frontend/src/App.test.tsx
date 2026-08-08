@@ -42,6 +42,11 @@ vi.mock("./components/MatchWorkspace", () => ({
 vi.mock("./components/OperationsPanel", () => ({
   OperationsPanel: () => <main>operations</main>,
 }));
+vi.mock("./components/VisionCalibrationPage", () => ({
+  VisionCalibrationPage: ({ csrfToken }: { csrfToken: string | null }) => (
+    <main>vision-calibration-{csrfToken || "readonly"}</main>
+  ),
+}));
 
 import App from "./App";
 
@@ -155,5 +160,21 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("history-2")).toBeInTheDocument());
     expect(screen.getByText("history-1")).toBeInTheDocument();
     expect(api.fetchMonitorHistory).toHaveBeenLastCalledWith("cursor-2");
+  });
+
+  it("opens Vision calibration as a standalone page without the match rail", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Vision 校正" }));
+    expect(await screen.findByText("vision-calibration-csrf")).toBeInTheDocument();
+    expect(screen.queryByText("live-1")).not.toBeInTheDocument();
+  });
+
+  it("supports the direct Vision calibration route", async () => {
+    window.history.replaceState(null, "", "/monitor?view=vision");
+    render(<App />);
+
+    expect(await screen.findByText("vision-calibration-csrf")).toBeInTheDocument();
+    expect(api.fetchBootstrap).not.toHaveBeenCalled();
   });
 });

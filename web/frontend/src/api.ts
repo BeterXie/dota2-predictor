@@ -12,6 +12,10 @@ import type {
   MonitorHistoryPage,
   MonitorSnapshot,
   PrematchHeroGrid,
+  VisionCalibrationBootstrap,
+  VisionCalibrationCandidate,
+  VisionCalibrationEvaluation,
+  VisionCalibrationLabel,
 } from "./types";
 
 
@@ -235,4 +239,55 @@ export function fetchHeroGrid(signal?: AbortSignal): Promise<PrematchHeroGrid> {
 
 export function fetchTeamGrid(signal?: AbortSignal): Promise<CanonicalTeam[]> {
   return getJson("/api/team-grid", signal);
+}
+
+
+export function fetchVisionCalibration(
+  signal?: AbortSignal,
+): Promise<VisionCalibrationBootstrap> {
+  return getJson("/api/vision-calibration/bootstrap", signal);
+}
+
+
+export function saveVisionCalibrationLabel(
+  eventId: string,
+  payload: {
+    hero_ids: number[];
+    raybet_match_id: string | null;
+    map_number: number | null;
+    note: string | null;
+  },
+  csrfToken: string,
+): Promise<VisionCalibrationLabel> {
+  return mutateJson(
+    `/api/vision-calibration/events/${encodeURIComponent(eventId)}/label`,
+    csrfToken,
+    payload,
+  );
+}
+
+
+export function buildVisionCalibrationCandidate(
+  labelId: string,
+  csrfToken: string,
+): Promise<VisionCalibrationCandidate> {
+  return mutateJson("/api/vision-calibration/candidates", csrfToken, {
+    label_id: labelId,
+  });
+}
+
+
+export function runVisionCalibrationEvaluation(
+  payload: {
+    label_id: string;
+    candidate_id: string;
+    observation_file: string;
+    layout_profile: string;
+    mode: "perception" | "runtime";
+    captured_after: string | null;
+    captured_before: string | null;
+  },
+  csrfToken: string,
+): Promise<VisionCalibrationEvaluation> {
+  return mutateJson("/api/vision-calibration/evaluations", csrfToken, payload);
 }

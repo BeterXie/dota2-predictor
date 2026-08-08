@@ -26,15 +26,26 @@ describe("OperationsPanel", () => {
             occurrence_count: 1,
           }]}
           busyKey={null}
-          components={[{
-            component: "raybet_collector",
-            label: "RayBet collector",
-            status: "stopped",
-            pid: null,
-            started_at: null,
-            detail: null,
-            control_allowed: true,
-          }]}
+          components={[
+            {
+              component: "raybet_collector",
+              label: "RayBet collector",
+              status: "stopped",
+              pid: null,
+              started_at: null,
+              detail: null,
+              control_allowed: true,
+            },
+            {
+              component: "vision_supervisor",
+              label: "Stable Vision",
+              status: "running",
+              pid: 321,
+              started_at: "2026-08-07T10:01:00+00:00",
+              detail: "started",
+              control_allowed: true,
+            },
+          ]}
           controlMessage={null}
           controlsEnabled
           health={[
@@ -75,6 +86,7 @@ describe("OperationsPanel", () => {
     );
 
     expect(screen.getByText("RayBet collector")).toBeInTheDocument();
+    expect(screen.getByText("Stable Vision")).toBeInTheDocument();
     expect(screen.getByText("raybet_worker")).toBeInTheDocument();
     expect(screen.getByText("RayBet stale")).toBeInTheDocument();
     expect(screen.queryByText("draft_publisher")).not.toBeInTheDocument();

@@ -52,6 +52,16 @@ COMPONENTS: dict[str, ComponentSpec] = {
         supervisor_component="raybet_worker",
         supervisor_timeout_seconds=90.0,
     ),
+    "vision_supervisor": ComponentSpec(
+        "Stable Vision",
+        (
+            "-u",
+            "{stable_vision_supervisor}",
+            "--schema-prepared",
+        ),
+        supervisor_component="vision_worker",
+        supervisor_timeout_seconds=90.0,
+    ),
 }
 
 if tuple(COMPONENTS) != CONTROL_COMPONENT_NAMES:
@@ -80,6 +90,9 @@ class ControlService:
         root = self.project_dir / "data" / "live_betting"
         values = {
             "odds_raw_root": str(root / "raw-v2"),
+            "stable_vision_supervisor": str(
+                self.project_dir / "scripts" / "supervise_raybet_streams_stable.py"
+            ),
         }
         return [
             self.python_executable,
@@ -93,6 +106,17 @@ class ControlService:
                 self._status(connection, component, spec)
                 for component, spec in COMPONENTS.items()
             ]
+
+    def ensure_started(
+        self,
+        connection: PostgresSession,
+        component: str,
+    ) -> dict[str, object]:
+        if component not in COMPONENTS:
+            raise KeyError(component)
+        verify_runtime_schema(connection)
+        with self._lock, connection.transaction():
+            return self._start(connection, component)
 
     def execute(
         self,

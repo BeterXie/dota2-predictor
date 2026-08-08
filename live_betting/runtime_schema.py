@@ -16,6 +16,7 @@ RUNTIME_SCHEMA_CONTRACT_DIGEST = (
 )
 CONTROL_COMPONENT_NAMES = (
     "raybet_collector",
+    "vision_supervisor",
 )
 
 _REQUIRED_TABLES = frozenset(

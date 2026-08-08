@@ -221,7 +221,7 @@ export interface AlertIncident {
 }
 
 export interface ControlComponent {
-  component: "raybet_collector";
+  component: "raybet_collector" | "vision_supervisor";
   label: string;
   status: "running" | "stopped" | "identity_mismatch" | "identity_unverifiable";
   pid: number | null;
@@ -312,3 +312,85 @@ export interface PrematchHero {
 }
 
 export type PrematchHeroGrid = Record<"str" | "agi" | "int" | "all", PrematchHero[]>;
+
+export interface VisionCalibrationLabel {
+  label_id: string;
+  event_id: string;
+  event_relative_path: string;
+  layout: string | null;
+  hero_ids: number[];
+  raybet_match_id: string | null;
+  map_number: number | null;
+  note: string | null;
+  updated_at: string;
+}
+
+export interface VisionSlotDiagnostic {
+  side: "radiant" | "dire";
+  slot: number;
+  accepted: boolean;
+  best_hero_id: number | null;
+  best_score: number;
+  margin: number;
+  reason: string;
+}
+
+export interface VisionCalibrationEvent {
+  event_id: string;
+  relative_path: string;
+  captured_at: string;
+  layout: string | null;
+  reason: string;
+  blocker_code: string | null;
+  screen_state: string | null;
+  replay_gate_status: string | null;
+  layout_state: string | null;
+  quality_reason: string | null;
+  quality_usable: boolean | null;
+  crop_count: number;
+  frame_url: string;
+  crop_urls: string[];
+  slot_diagnostics: VisionSlotDiagnostic[];
+  label: VisionCalibrationLabel | null;
+}
+
+export interface VisionCalibrationCandidate {
+  candidate_id: string;
+  label_id: string;
+  layout: string | null;
+  hero_ids: number[];
+  created_at: string;
+  feature_sha256: string;
+  production_feature_sha256: string;
+  promoted: false;
+}
+
+export interface VisionCalibrationEvaluation {
+  evaluation_id: string;
+  label_id: string;
+  candidate_id: string;
+  observation_file: string;
+  layout_profile: string;
+  mode: "perception" | "runtime";
+  created_at: string;
+  total_files: number;
+  trackable_frames: number;
+  best_candidate_accuracy: number;
+  accepted_precision: number;
+  final_locked_slots: number;
+  final_correct_locked_slots: number;
+  wrong_lock_count: number;
+  lock_latency_seconds: number | null;
+  exact_post_lock_rate: number;
+  candidate_feature_sha256: string;
+}
+
+export interface VisionCalibrationBootstrap {
+  events: VisionCalibrationEvent[];
+  candidates: VisionCalibrationCandidate[];
+  evaluations: VisionCalibrationEvaluation[];
+  observation_files: Array<{ name: string; bytes: number }>;
+  layout_profiles: string[];
+  production_feature_path: string;
+  candidate_boundary: string;
+}

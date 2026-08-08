@@ -30,7 +30,9 @@ $env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
 python -m alembic upgrade head
 ```
 
-Start RayBet collection and the local Web application in separate terminals:
+Start RayBet collection and the local Web application in separate terminals.
+The Web entry point starts the Stable Vision supervisor automatically and owns
+its lifecycle:
 
 ```powershell
 $env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
@@ -48,28 +50,40 @@ npm install
 npm run build
 ```
 
-The operations view controls only the RayBet collector. It also shows current
-service health, strict mappings, and operational alerts.
+The operations view controls the RayBet collector and Stable Vision. It also
+shows current service health, strict mappings, and operational alerts.
+
+Open `http://127.0.0.1:8000/monitor?view=vision` for the real-frame Vision
+calibration workflow. It labels retained debug frames, builds filesystem-backed
+candidate feature packs, and evaluates them against retained observation JSONL.
+Candidates are isolated under `data/live_betting/vision_calibration` and are
+never promoted to `vision/templates/hero_features.npz` automatically.
 
 ## Stream And HUD
 
 Signed HLS URLs are process-local capabilities. Do not store them in commands,
 logs, database rows, artifacts, health details, or API responses.
 
-The stream supervisor discovers RayBet matches, refreshes signed HLS access,
-captures frames, and publishes HUD observations:
+The Stable Vision supervisor discovers RayBet matches, refreshes signed HLS
+access, captures frames, publishes HUD observations, and retains bounded debug
+frames/crops for calibration. `python -m web.main` already starts it. For a
+standalone diagnostics run, stop the Web-owned Vision component first and run:
 
 ```powershell
 $env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
-python scripts/supervise_raybet_streams.py
+python scripts/supervise_raybet_streams_stable.py --schema-prepared
 ```
 
-A single stream can be inspected directly:
+A single stream can be inspected directly with the Stable watcher:
 
 ```powershell
-python scripts/watch_raybet_stream.py --help
+python scripts/watch_raybet_stream_stable.py --help
 python scripts/capture_raybet_stream.py --help
 ```
+
+Do not run the legacy supervisor, a standalone Stable supervisor, and the
+Web-owned Stable supervisor at the same time. They would compete for the same
+matches and diagnostics paths.
 
 The retained Vision path includes hero slots, game clock, kills, net worth,
 Radiant/Dire orientation, pause state, screen state, OCR, confidence diagnostics,

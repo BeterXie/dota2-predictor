@@ -1,5 +1,5 @@
 import { Tab, TabList } from "@fluentui/react-components";
-import { Broadcast, ClockCounterClockwise, GearSix } from "@phosphor-icons/react";
+import { Broadcast, ClockCounterClockwise, Flask, GearSix } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -18,6 +18,7 @@ import {
 import { MatchRail } from "./components/MatchRail";
 import { MatchWorkspace } from "./components/MatchWorkspace";
 import { OperationsPanel } from "./components/OperationsPanel";
+import { VisionCalibrationPage } from "./components/VisionCalibrationPage";
 import type {
   ControlComponent,
   ControlResult,
@@ -29,7 +30,7 @@ import type {
 } from "./types";
 
 
-type ViewMode = "live" | "replay" | "operations";
+type ViewMode = "live" | "replay" | "operations" | "vision";
 
 
 export default function App() {
@@ -51,6 +52,10 @@ export default function App() {
   const [mappings, setMappings] = useState<MappingRecord[]>([]);
 
   useEffect(() => {
+    if (view === "vision") {
+      setError(null);
+      return undefined;
+    }
     const controller = new AbortController();
     let source: EventSource | null = null;
     fetchBootstrap(controller.signal).then((value) => {
@@ -68,7 +73,7 @@ export default function App() {
       controller.abort();
       source?.close();
     };
-  }, []);
+  }, [view]);
 
   useEffect(() => {
     if (view !== "replay") return undefined;
@@ -93,7 +98,7 @@ export default function App() {
   }, [view]);
 
   useEffect(() => {
-    if (view !== "live" && view !== "operations") return undefined;
+    if (view !== "live" && view !== "operations" && view !== "vision") return undefined;
     const controller = new AbortController();
     createControlSession(controller.signal).then((session) => {
       setControlSession(session);
@@ -103,7 +108,7 @@ export default function App() {
   }, [view]);
 
   useEffect(() => {
-    if (!selectedId || view === "operations") {
+    if (!selectedId || view === "operations" || view === "vision") {
       setDetail(null);
       return undefined;
     }
@@ -145,6 +150,7 @@ export default function App() {
       if (current && visibleMatches.some((match) => match.raybet_match_id === current)) {
         return current;
       }
+      if (view === "vision") return null;
       return view === "replay"
         ? visibleMatches[0]?.raybet_match_id || null
         : preferredMatch(visibleMatches);
@@ -237,12 +243,13 @@ export default function App() {
           <Tab icon={<Broadcast size={17} />} value="live">实时赛事</Tab>
           <Tab icon={<ClockCounterClockwise size={17} />} value="replay">历史结果</Tab>
           <Tab icon={<GearSix size={17} />} value="operations">运行控制</Tab>
+          <Tab icon={<Flask size={17} />} value="vision">Vision 校正</Tab>
         </TabList>
       </header>
 
       {error && <div className="global-error" role="alert">{error}</div>}
-      <div className="app-content">
-        <MatchRail
+      <div className={view === "vision" ? "app-content vision-mode" : "app-content"}>
+        {view !== "vision" && <MatchRail
           hasMore={view === "replay" && historyHasMore}
           loadError={view === "replay" ? historyError : null}
           loadingMore={view === "replay" && historyLoading}
@@ -251,8 +258,10 @@ export default function App() {
           onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
           onSelect={setSelectedId}
           selectedId={selectedId}
-        />
-        {view === "operations" ? (
+        />}
+        {view === "vision" ? (
+          <VisionCalibrationPage csrfToken={controlSession?.csrf_token || null} />
+        ) : view === "operations" ? (
           <OperationsPanel
             alerts={snapshot?.alerts || []}
             busyKey={controlBusy}
@@ -289,7 +298,7 @@ export default function App() {
 
 function initialView(): ViewMode {
   const value = new URLSearchParams(window.location.search).get("view");
-  return value === "replay" || value === "operations" ? value : "live";
+  return value === "replay" || value === "operations" || value === "vision" ? value : "live";
 }
 
 
