@@ -6080,6 +6080,13 @@ body {
   font-weight: 650;
 }
 
+.vision-field-help {
+  overflow-wrap: anywhere;
+  color: var(--text-dim);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
 .vision-calibration-form select,
 .vision-calibration-form input,
 .vision-calibration-form textarea {

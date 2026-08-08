@@ -328,7 +328,28 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
               <section>
                 <div className="vision-section-heading compact"><div><h2>留出评估</h2><p>默认 perception；runtime 会执行 OCR 与 trust gates。</p></div></div>
                 <label><span>候选包（可复用同 UI profile）</span><select onChange={(change) => setCandidateId(change.target.value)} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
-                <label><span>Observation JSONL</span><select onChange={(change) => setObservationFile(change.target.value)} value={observationFile}><option value="">选择序列</option>{data.observation_files.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+                <label>
+                  <span>Observation JSONL</span>
+                  <select
+                    aria-label="Observation JSONL"
+                    aria-describedby="vision-observation-help"
+                    disabled={!data.observation_files.length}
+                    onChange={(change) => setObservationFile(change.target.value)}
+                    value={observationFile}
+                  >
+                    <option value="">
+                      {data.observation_files.length ? "选择序列" : "没有可用序列"}
+                    </option>
+                    {data.observation_files.map((item) => (
+                      <option key={item.name} value={item.name}>{item.name}</option>
+                    ))}
+                  </select>
+                  <small className="vision-field-help" id="vision-observation-help">
+                    {data.observation_files.length
+                      ? `正在读取 ${data.observation_root}`
+                      : `目录中还没有 JSONL：${data.observation_root}。Stable watcher 采集到直播帧后刷新页面。`}
+                  </small>
+                </label>
                 <label><span>Layout profile</span><select onChange={(change) => setLayoutProfile(change.target.value)} value={layoutProfile}>{data.layout_profiles.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
                 <label><span>评估模式</span><select onChange={(change) => setMode(change.target.value as "perception" | "runtime")} value={mode}><option value="perception">Perception only</option><option value="runtime">Runtime faithful</option></select></label>
                 <Button disabled={!canEvaluate || busy !== null} onClick={() => void runEvaluation()}>

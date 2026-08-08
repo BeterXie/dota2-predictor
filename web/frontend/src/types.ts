@@ -394,6 +394,7 @@ export interface VisionCalibrationBootstrap {
   candidates: VisionCalibrationCandidate[];
   evaluations: VisionCalibrationEvaluation[];
   observation_files: Array<{ name: string; bytes: number }>;
+  observation_root: string;
   layout_profiles: string[];
   production_feature_path: string;
   candidate_boundary: string;

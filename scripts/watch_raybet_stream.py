@@ -782,9 +782,15 @@ def _write_capture_heartbeat(
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
     root = ROOT / "data" / "live_betting"
+    configured_output_dir = os.environ.get("VISION_OBSERVATION_DIR", "").strip()
     if args.output is None or args.evidence_dir is None:
         if args.output is None:
-            args.output = root / "vision_observations" / f"{args.match_id}.jsonl"
+            output_dir = (
+                Path(configured_output_dir).expanduser().resolve()
+                if configured_output_dir
+                else root / "vision_observations"
+            )
+            args.output = output_dir / f"{args.match_id}.jsonl"
         if args.evidence_dir is None:
             args.evidence_dir = root / "vision_evidence"
     args.output = Path(args.output).resolve()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -785,9 +786,12 @@ def startable_matches(
 
 def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
     root = ROOT / "data" / "live_betting"
+    configured_output_dir = os.environ.get("VISION_OBSERVATION_DIR", "").strip()
     args.output_dir = (
         args.output_dir.resolve()
         if args.output_dir is not None
+        else Path(configured_output_dir).expanduser().resolve()
+        if configured_output_dir
         else root / "vision_observations"
     )
     args.evidence_dir = (

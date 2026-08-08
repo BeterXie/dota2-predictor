@@ -57,6 +57,7 @@ const bootstrap: VisionCalibrationBootstrap = {
   candidates: [],
   evaluations: [],
   observation_files: [{ name: "holdout.jsonl", bytes: 2048 }],
+  observation_root: "C:\\vision-corpus\\vision_observations",
   layout_profiles: ["standard_dota_hud_1080p"],
   production_feature_path: "vision/templates/hero_features.npz",
   candidate_boundary: "Candidates never overwrite production.",
@@ -107,6 +108,19 @@ describe("VisionCalibrationPage", () => {
     expect(screen.getAllByAltText(/英雄 crop$/)).toHaveLength(10);
     expect(screen.getByText("R1")).toBeInTheDocument();
     expect(screen.getByText("D5")).toBeInTheDocument();
+  });
+
+  it("explains why Observation JSONL is unavailable when the corpus is empty", async () => {
+    api.fetchVisionCalibration.mockResolvedValue({
+      ...bootstrap,
+      observation_files: [],
+    });
+    renderPage();
+
+    const selector = await screen.findByRole("combobox", { name: "Observation JSONL" });
+    expect(selector).toBeDisabled();
+    expect(screen.getByText("没有可用序列")).toBeInTheDocument();
+    expect(screen.getByText(/C:\\vision-corpus\\vision_observations/)).toBeInTheDocument();
   });
 
   it("requires ten unique heroes and saves the HUD-order truth with CSRF", async () => {

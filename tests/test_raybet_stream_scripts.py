@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
 
+from scripts import supervise_raybet_streams, watch_raybet_stream
 from scripts.supervise_raybet_streams import watcher_command
 from scripts.watch_raybet_stream import (
     _sanitized_stream_location,
@@ -45,6 +47,24 @@ def test_supervisor_starts_the_retained_hls_watcher(tmp_path: Path) -> None:
     assert command[command.index("--match-id") + 1] == "raybet-1"
     assert "--refresh-url" in command
     assert "--evidence-dir" in command
+
+
+def test_observation_directory_is_shared_by_supervisor_and_direct_watcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation_root = tmp_path / "shared-observations"
+    monkeypatch.setenv("VISION_OBSERVATION_DIR", str(observation_root))
+
+    supervisor_args = supervise_raybet_streams.resolve_data_paths(
+        argparse.Namespace(output_dir=None, evidence_dir=None, log_dir=None)
+    )
+    watcher_args = watch_raybet_stream.resolve_data_paths(
+        argparse.Namespace(match_id="38417147", output=None, evidence_dir=None)
+    )
+
+    assert supervisor_args.output_dir == observation_root.resolve()
+    assert watcher_args.output == observation_root.resolve() / "38417147.jsonl"
 
 
 class _LiveMatchConnection:

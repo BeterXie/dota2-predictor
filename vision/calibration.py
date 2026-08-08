@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,12 +35,21 @@ class VisionCalibrationService:
         project_root: Path,
         *,
         feature_path: Path = DEFAULT_FEATURE_PATH,
+        observation_root: Path | None = None,
     ) -> None:
         data_root = project_root.resolve() / "data" / "live_betting"
+        configured_observation_root = os.environ.get("VISION_OBSERVATION_DIR", "").strip()
+        resolved_observation_root = (
+            observation_root
+            if observation_root is not None
+            else Path(configured_observation_root)
+            if configured_observation_root
+            else data_root / "vision_observations"
+        ).expanduser().resolve()
         self.paths = CalibrationPaths(
             debug_root=data_root / "vision_debug",
             calibration_root=data_root / "vision_calibration",
-            observation_root=data_root / "vision_observations",
+            observation_root=resolved_observation_root,
         )
         self.feature_path = feature_path.resolve()
 
@@ -52,6 +62,7 @@ class VisionCalibrationService:
             "candidates": candidates,
             "evaluations": self._evaluations(),
             "observation_files": self._observation_files(),
+            "observation_root": str(self.paths.observation_root),
             "layout_profiles": sorted(_LAYOUTS),
             "production_feature_path": str(self.feature_path),
             "candidate_boundary": (

@@ -149,6 +149,30 @@ def test_calibration_skips_malformed_debug_metadata(tmp_path: Path) -> None:
     assert len(service.bootstrap()["events"]) == 1
 
 
+def test_calibration_uses_shared_observation_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    observation_root = tmp_path / "shared" / "vision_observations"
+    observation_root.mkdir(parents=True)
+    (observation_root / "38417147.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("VISION_OBSERVATION_DIR", str(observation_root))
+
+    service = VisionCalibrationService(tmp_path / "project", feature_path=feature_path)
+    bootstrap = service.bootstrap()
+
+    assert service.paths.observation_root == observation_root.resolve()
+    assert bootstrap["observation_root"] == str(observation_root.resolve())
+    assert bootstrap["observation_files"] == [
+        {
+            "name": "38417147.jsonl",
+            "bytes": (observation_root / "38417147.jsonl").stat().st_size,
+        }
+    ]
+
+
 def test_calibration_rejects_candidate_from_another_ui_profile(tmp_path: Path) -> None:
     feature_path = tmp_path / "features.npz"
     _feature_pack(feature_path)
