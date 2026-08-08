@@ -50,7 +50,11 @@ def test_mutation_requires_control_session_and_csrf(
 ) -> None:
     monkeypatch.setattr(vision_calibration, "calibration_service", StubCalibrationService())
     with _client() as client:
-        payload = {"hero_ids": list(range(1, 11))}
+        payload = {
+            "hero_ids": list(range(1, 11)),
+            "raybet_match_id": "38416120",
+            "map_number": 2,
+        }
         forbidden = client.post(
             "/api/vision-calibration/events/0123456789abcdef0123/label",
             json=payload,
@@ -66,3 +70,5 @@ def test_mutation_requires_control_session_and_csrf(
         )
         assert accepted.status_code == 200
         assert accepted.json()["event_id"] == "0123456789abcdef0123"
+        assert accepted.json()["raybet_match_id"] == "38416120"
+        assert accepted.json()["map_number"] == 2

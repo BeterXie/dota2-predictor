@@ -22,6 +22,32 @@ import type {
 const MONITOR_API = "/api/monitor";
 
 
+async function responseError(response: Response, fallback: string): Promise<Error> {
+  const text = await response.text();
+  if (text) {
+    try {
+      const payload = JSON.parse(text) as { detail?: unknown };
+      if (typeof payload.detail === "string" && payload.detail) {
+        return new Error(payload.detail);
+      }
+      if (Array.isArray(payload.detail)) {
+        const messages = payload.detail
+          .map((item) => (
+            item && typeof item === "object" && "msg" in item
+              ? String(item.msg)
+              : ""
+          ))
+          .filter(Boolean);
+        if (messages.length) return new Error(messages.join("；"));
+      }
+    } catch {
+      // Non-JSON responses are still useful as a last-resort error message.
+    }
+  }
+  return new Error(text || fallback);
+}
+
+
 async function getJson<T>(
   url: string,
   signal?: AbortSignal,
@@ -32,8 +58,7 @@ async function getJson<T>(
     headers: { Accept: "application/json", ...headers },
   });
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `请求失败 (${response.status})`);
+    throw await responseError(response, `请求失败 (${response.status})`);
   }
   return response.json() as Promise<T>;
 }
@@ -54,8 +79,7 @@ async function mutateJson<T>(
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `操作失败 (${response.status})`);
+    throw await responseError(response, `操作失败 (${response.status})`);
   }
   return response.json() as Promise<T>;
 }
@@ -253,8 +277,8 @@ export function saveVisionCalibrationLabel(
   eventId: string,
   payload: {
     hero_ids: number[];
-    raybet_match_id: string | null;
-    map_number: number | null;
+    raybet_match_id: string;
+    map_number: number;
     note: string | null;
   },
   csrfToken: string,

@@ -53,15 +53,16 @@ class EvidenceSample:
 def _observation_samples(
     observation_jsonl: Path,
     *,
+    map_number: int | None = None,
     captured_after: float | None = None,
     captured_before: float | None = None,
 ) -> tuple[list[EvidenceSample], dict[str, object]]:
-    samples: list[EvidenceSample] = []
+    if map_number is not None and map_number <= 0:
+        raise ValueError("map_number must be positive")
     raybet_match_ids: set[str] = set()
-    map_numbers: set[int] = set()
-    missing_frames = 0
+    source_map_numbers: set[int] = set()
     invalid_rows = 0
-    selected_clocks: list[int | None] = []
+    parsed_rows: list[tuple[dict[str, object], float, int | None, int | None]] = []
 
     try:
         lines = observation_jsonl.read_text(encoding="utf-8").splitlines()
@@ -84,13 +85,18 @@ def _observation_samples(
         match_id = row.get("raybet_match_id")
         if match_id is not None:
             raybet_match_ids.add(str(match_id))
-        map_number = row.get("map_number")
-        if map_number is not None:
+        raw_map_number = row.get("map_number")
+        source_map_number = None
+        if raw_map_number is not None:
             try:
-                map_numbers.add(int(map_number))
+                source_map_number = int(raw_map_number)
             except (TypeError, ValueError):
                 invalid_rows += 1
                 continue
+            if source_map_number <= 0:
+                invalid_rows += 1
+                continue
+            source_map_numbers.add(source_map_number)
 
         try:
             observed_at = datetime.fromisoformat(
@@ -100,10 +106,74 @@ def _observation_samples(
             raise ValueError(
                 f"invalid captured_at_utc on JSONL row {line_number}"
             ) from error
+        clock_value = row.get("game_clock_seconds")
+        try:
+            clock = None if clock_value is None else int(clock_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"invalid game_clock_seconds on JSONL row {line_number}"
+            ) from error
+        parsed_rows.append((row, observed_at, clock, source_map_number))
+
+    if len(raybet_match_ids) != 1:
+        raise ValueError("observation JSONL must contain exactly one RayBet match")
+
+    segmented_rows: list[
+        tuple[dict[str, object], float, int | None, int | None]
+    ] = []
+    inferred_map_number: int | None = None
+    previous_clock: int | None = None
+    clock_reset_count = 0
+    available_map_numbers: set[int] = set()
+    for row, observed_at, clock, source_map_number in parsed_rows:
+        if inferred_map_number is None and source_map_number is not None:
+            inferred_map_number = source_map_number
+        clock_reset = (
+            clock is not None
+            and previous_clock is not None
+            and clock < previous_clock - 180
+        )
+        if clock_reset:
+            clock_reset_count += 1
+            inferred_map_number = max(
+                source_map_number or 0,
+                (inferred_map_number or 0) + 1,
+            )
+        elif source_map_number is not None and (
+            inferred_map_number is None or source_map_number > inferred_map_number
+        ):
+            inferred_map_number = source_map_number
+        if clock is not None:
+            previous_clock = clock
+        if inferred_map_number is not None:
+            available_map_numbers.add(inferred_map_number)
+        segmented_rows.append((row, observed_at, clock, inferred_map_number))
+
+    if map_number is None:
+        if len(available_map_numbers) > 1:
+            raise ValueError(
+                "observation JSONL contains multiple map segments; select a map number"
+            )
+        selected_map_number = next(iter(available_map_numbers), None)
+    else:
+        selected_map_number = map_number
+        if selected_map_number not in available_map_numbers:
+            raise ValueError(
+                f"observation JSONL has no Map {selected_map_number} segment"
+            )
+
+    samples: list[EvidenceSample] = []
+    missing_frames = 0
+    selected_rows = 0
+    selected_clocks: list[int | None] = []
+    for row, observed_at, clock, inferred_row_map in segmented_rows:
+        if inferred_row_map != selected_map_number:
+            continue
         if captured_after is not None and observed_at < captured_after:
             continue
         if captured_before is not None and observed_at >= captured_before:
             continue
+        selected_rows += 1
         digest_value = row.get("source_frame_sha256")
         path_value = row.get("source_frame_path")
         if not digest_value or not path_value:
@@ -113,13 +183,6 @@ def _observation_samples(
         if not path.is_file():
             missing_frames += 1
             continue
-        clock_value = row.get("game_clock_seconds")
-        try:
-            clock = None if clock_value is None else int(clock_value)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                f"invalid game_clock_seconds on JSONL row {line_number}"
-            ) from error
         selected_clocks.append(clock)
         samples.append(
             EvidenceSample(
@@ -131,19 +194,26 @@ def _observation_samples(
             )
         )
 
-    if len(raybet_match_ids) != 1:
-        raise ValueError("observation JSONL must contain exactly one RayBet match")
-    if len(map_numbers) > 1:
-        raise ValueError("observation JSONL spans multiple numbered maps")
     if not samples:
-        raise ValueError("observation JSONL has no retained Vision evidence frames")
+        suffix = (
+            f" for Map {selected_map_number}"
+            if selected_map_number is not None
+            else ""
+        )
+        raise ValueError(
+            f"observation JSONL has no retained Vision evidence frames{suffix}"
+        )
     _validate_single_map_clocks(selected_clocks)
     return samples, {
         "source": "observation_jsonl",
         "observation_jsonl": str(observation_jsonl.resolve()),
         "raybet_match_id": next(iter(raybet_match_ids)),
-        "map_numbers": sorted(map_numbers),
+        "map_numbers": sorted(available_map_numbers),
+        "source_map_numbers": sorted(source_map_numbers),
+        "selected_map_number": selected_map_number,
+        "clock_reset_count": clock_reset_count,
         "jsonl_rows": len(lines),
+        "selected_jsonl_rows": selected_rows,
         "retained_frames": len(samples),
         "missing_frames": missing_frames,
         "invalid_rows": invalid_rows,
@@ -935,7 +1005,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.perception_only and not args.stable:
         parser.error("--perception-only requires --stable")
-    database_mode = any(
+    database_mode = args.observation_jsonl is None and any(
         value is not None
         for value in (
             args.raybet_match_id,
@@ -946,6 +1016,17 @@ def main() -> int:
     )
     if args.observation_jsonl is not None and database_mode:
         parser.error("--observation-jsonl cannot be combined with database mapping mode")
+    if args.observation_jsonl is not None and any(
+        value is not None
+        for value in (
+            args.raybet_match_id,
+            args.opendota_match_id,
+            args.mapping_source,
+            args.team_one_id,
+            args.team_two_id,
+        )
+    ):
+        parser.error("--observation-jsonl cannot be combined with database mapping mode")
     if args.observation_jsonl is not None and args.truth_hero_ids is None:
         parser.error("--observation-jsonl requires --truth-hero-ids")
     if args.observation_jsonl is None and args.truth_hero_ids is not None:
@@ -953,6 +1034,7 @@ def main() -> int:
     if args.observation_jsonl is not None:
         samples, context = _observation_samples(
             args.observation_jsonl,
+            map_number=args.map_number,
             captured_after=(
                 args.captured_after.timestamp()
                 if args.captured_after is not None

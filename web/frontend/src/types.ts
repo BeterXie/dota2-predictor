@@ -376,6 +376,8 @@ export interface VisionCalibrationEvaluation {
   label_id: string;
   candidate_id: string;
   observation_file: string;
+  raybet_match_id?: string;
+  map_number?: number;
   layout_profile: string;
   mode: "perception" | "runtime";
   created_at: string;

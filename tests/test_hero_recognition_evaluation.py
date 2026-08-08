@@ -320,6 +320,65 @@ def test_observation_jsonl_loads_retained_frames_and_context(tmp_path: Path) -> 
     assert context["missing_frames"] == 1
 
 
+def test_observation_jsonl_selects_map_inferred_from_clock_reset(tmp_path: Path) -> None:
+    frame_paths = []
+    for index in range(4):
+        frame_path = tmp_path / f"frame-{index}.jpg"
+        frame_path.write_bytes(b"frame")
+        frame_paths.append(frame_path)
+    observation_path = tmp_path / "38416120.jsonl"
+    rows = [
+        {
+            "raybet_match_id": "38416120",
+            "map_number": 1,
+            "captured_at_utc": f"2026-08-01T00:00:0{index}Z",
+            "game_clock_seconds": clock,
+            "source_frame_sha256": f"frame-{index}",
+            "source_frame_path": str(frame_paths[index]),
+        }
+        for index, clock in enumerate((1820, 1830, 44, 54))
+    ]
+    observation_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    samples, context = _observation_samples(observation_path, map_number=2)
+
+    assert [sample.path for sample in samples] == frame_paths[2:]
+    assert context["map_numbers"] == [1, 2]
+    assert context["source_map_numbers"] == [1]
+    assert context["selected_map_number"] == 2
+    assert context["clock_reset_count"] == 1
+    assert context["selected_jsonl_rows"] == 2
+
+
+def test_observation_jsonl_requires_map_for_multiple_inferred_segments(
+    tmp_path: Path,
+) -> None:
+    frame_path = tmp_path / "frame.jpg"
+    frame_path.write_bytes(b"frame")
+    observation_path = tmp_path / "38416120.jsonl"
+    rows = [
+        {
+            "raybet_match_id": "38416120",
+            "map_number": 1,
+            "captured_at_utc": f"2026-08-01T00:00:0{index}Z",
+            "game_clock_seconds": clock,
+            "source_frame_sha256": f"frame-{index}",
+            "source_frame_path": str(frame_path),
+        }
+        for index, clock in enumerate((1820, 44))
+    ]
+    observation_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="multiple map segments"):
+        _observation_samples(observation_path)
+
+
 def test_cli_evaluates_observation_jsonl_with_explicit_truth(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

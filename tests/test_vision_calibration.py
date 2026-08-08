@@ -126,6 +126,23 @@ def test_calibration_rejects_duplicate_truth_and_unknown_assets(tmp_path: Path) 
         service.read_event_asset(event_id, "metadata.json")
 
 
+def test_calibration_requires_match_and_map_context_for_label(tmp_path: Path) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    _debug_event(tmp_path)
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    event_id = str(service.bootstrap()["events"][0]["event_id"])
+
+    with pytest.raises(ValueError, match="RayBet match ID and map number"):
+        service.save_label(
+            event_id,
+            hero_ids=tuple(range(1, 11)),
+            raybet_match_id=None,
+            map_number=None,
+            note=None,
+        )
+
+
 def test_calibration_skips_malformed_debug_metadata(tmp_path: Path) -> None:
     feature_path = tmp_path / "features.npz"
     _feature_pack(feature_path)
@@ -182,8 +199,8 @@ def test_calibration_rejects_candidate_from_another_ui_profile(tmp_path: Path) -
     service.save_label(
         event_id,
         hero_ids=tuple(range(1, 11)),
-        raybet_match_id=None,
-        map_number=None,
+        raybet_match_id="42",
+        map_number=1,
         note=None,
     )
     candidate = service.build_candidate(event_id)
@@ -301,11 +318,13 @@ def test_calibration_evaluation_persists_truth_metrics(
     observation_path.write_text("{}\n", encoding="utf-8")
     sample = EvidenceSample(tmp_path / "frame.jpg", 0.0, "frame")
 
-    monkeypatch.setattr(
-        evaluator,
-        "_observation_samples",
-        lambda *_args, **_kwargs: ([sample], {"raybet_match_id": "42"}),
-    )
+    observation_options: dict[str, object] = {}
+
+    def fake_observation_samples(*_args: object, **kwargs: object) -> tuple[list[EvidenceSample], dict[str, object]]:
+        observation_options.update(kwargs)
+        return [sample], {"raybet_match_id": "42"}
+
+    monkeypatch.setattr(evaluator, "_observation_samples", fake_observation_samples)
     monkeypatch.setattr(
         evaluator,
         "evaluate",
@@ -334,4 +353,69 @@ def test_calibration_evaluation_persists_truth_metrics(
 
     assert result["final_correct_locked_slots"] == 10
     assert result["wrong_lock_count"] == 0
+    assert result["raybet_match_id"] == "42"
+    assert result["map_number"] == 1
+    assert observation_options["map_number"] == 1
     assert len(service.bootstrap()["evaluations"]) == 1
+
+
+def test_calibration_evaluation_rejects_observation_from_another_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    _debug_event(tmp_path)
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    event_id = str(service.bootstrap()["events"][0]["event_id"])
+    service.save_label(
+        event_id,
+        hero_ids=tuple(range(1, 11)),
+        raybet_match_id="42",
+        map_number=1,
+        note=None,
+    )
+    candidate = service.build_candidate(event_id)
+    service.paths.observation_root.mkdir(parents=True)
+    observation_path = service.paths.observation_root / "other.jsonl"
+    observation_path.write_text("{}\n", encoding="utf-8")
+    sample = EvidenceSample(tmp_path / "frame.jpg", 0.0, "frame")
+    monkeypatch.setattr(
+        evaluator,
+        "_observation_samples",
+        lambda *_args, **_kwargs: ([sample], {"raybet_match_id": "different"}),
+    )
+
+    with pytest.raises(ValueError, match="different RayBet match"):
+        service.run_evaluation(
+            label_id=event_id,
+            candidate_id=str(candidate["candidate_id"]),
+            observation_file=observation_path.name,
+            layout_profile="standard_dota_hud_1080p",
+            mode="perception",
+        )
+
+
+def test_calibration_evaluation_rejects_layout_mismatch(tmp_path: Path) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    _debug_event(tmp_path)
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    event_id = str(service.bootstrap()["events"][0]["event_id"])
+    service.save_label(
+        event_id,
+        hero_ids=tuple(range(1, 11)),
+        raybet_match_id="42",
+        map_number=1,
+        note=None,
+    )
+    candidate = service.build_candidate(event_id)
+
+    with pytest.raises(ValueError, match="layout must match"):
+        service.run_evaluation(
+            label_id=event_id,
+            candidate_id=str(candidate["candidate_id"]),
+            observation_file="42.jsonl",
+            layout_profile="wxc_gotf_2026_live_1080p",
+            mode="perception",
+        )

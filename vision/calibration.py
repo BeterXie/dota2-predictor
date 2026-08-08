@@ -85,6 +85,11 @@ class VisionCalibrationService:
             or any(hero_id <= 0 for hero_id in hero_ids)
         ):
             raise ValueError("calibration truth requires ten unique HUD-order heroes")
+        normalized_match_id = str(raybet_match_id or "").strip()
+        if not normalized_match_id or type(map_number) is not int or map_number <= 0:
+            raise ValueError(
+                "calibration label requires a RayBet match ID and map number"
+            )
         event = self._event(event_id)
         now = datetime.now(timezone.utc).isoformat()
         label = {
@@ -94,7 +99,7 @@ class VisionCalibrationService:
             "layout": event["layout"],
             "profile_id": event["profile_id"],
             "hero_ids": list(hero_ids),
-            "raybet_match_id": raybet_match_id,
+            "raybet_match_id": normalized_match_id,
             "map_number": map_number,
             "note": note,
             "updated_at": now,
@@ -194,6 +199,14 @@ class VisionCalibrationService:
         )
         if candidate_profile != label_profile:
             raise ValueError("candidate does not belong to the selected UI profile")
+        if layout_profile != label_profile:
+            raise ValueError("evaluation layout must match the labeled UI profile")
+        raybet_match_id = str(label.get("raybet_match_id") or "").strip()
+        map_number = label.get("map_number")
+        if not raybet_match_id or type(map_number) is not int or map_number <= 0:
+            raise ValueError(
+                "calibration label requires a RayBet match ID and map number"
+            )
         observation_path = self._observation_path(observation_file)
         feature_path = (
             self.paths.calibration_root / "candidates" / f"{candidate_id}.npz"
@@ -210,9 +223,14 @@ class VisionCalibrationService:
         before = self._timestamp(captured_before)
         samples, context = _observation_samples(
             observation_path,
+            map_number=map_number,
             captured_after=after,
             captured_before=before,
         )
+        if context.get("raybet_match_id") != raybet_match_id:
+            raise ValueError(
+                "observation JSONL belongs to a different RayBet match"
+            )
         report = evaluate(
             self.paths.observation_root,
             feature_path,
@@ -222,6 +240,8 @@ class VisionCalibrationService:
                 **context,
                 "label_id": label_id,
                 "candidate_id": candidate_id,
+                "raybet_match_id": raybet_match_id,
+                "map_number": map_number,
             },
             stable=True,
             layout_profile=layout_profile,
@@ -236,6 +256,8 @@ class VisionCalibrationService:
             "label_id": label_id,
             "candidate_id": candidate_id,
             "observation_file": observation_file,
+            "raybet_match_id": raybet_match_id,
+            "map_number": map_number,
             "layout_profile": layout_profile,
             "mode": mode,
             "created_at": datetime.now(timezone.utc).isoformat(),

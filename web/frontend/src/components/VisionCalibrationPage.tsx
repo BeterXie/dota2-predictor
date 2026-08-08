@@ -54,7 +54,6 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
         ? current
         : value.events[0]?.event_id || null
     ));
-    setObservationFile((current) => current || value.observation_files[0]?.name || "");
   };
 
   useEffect(() => {
@@ -105,32 +104,95 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     setMapNumber(event.label?.map_number?.toString() || "");
     setNote(event.label?.note || "");
     setLayoutProfile(event.layout || data?.layout_profiles[0] || "");
-    const relatedCandidate = data?.candidates.find((item) => item.label_id === event.event_id);
-    setCandidateId(relatedCandidate?.candidate_id || "");
+    const relatedCandidate = data?.candidates.find((item) => item.label_id === event.event_id)
+      || data?.candidates.find((item) => item.profile_id === event.profile_id);
+    setCandidateId((current) => (
+      current && data?.candidates.some((item) => (
+        item.candidate_id === current && item.profile_id === event.profile_id
+      ))
+        ? current
+        : relatedCandidate?.candidate_id || ""
+    ));
+    setObservationFile("");
+    setError(null);
     setMessage(null);
   }, [data?.candidates, data?.layout_profiles, event]);
 
   const truthReady = truth.every((value) => typeof value === "number")
     && new Set(truth).size === 10;
+  const parsedMapNumber = Number(mapNumber);
+  const labelContextReady = Boolean(
+    matchId.trim()
+    && Number.isInteger(parsedMapNumber)
+    && parsedMapNumber >= 1
+    && parsedMapNumber <= 5,
+  );
+  const labelInputsSaved = Boolean(
+    event?.label
+    && labelContextReady
+    && event.label.raybet_match_id === matchId.trim()
+    && event.label.map_number === parsedMapNumber
+    && event.label.hero_ids.length === truth.length
+    && truth.every((heroId, index) => heroId === event.label?.hero_ids[index]),
+  );
   const relatedCandidates = data?.candidates.filter((item) => item.profile_id === event?.profile_id) || [];
   const selectedCandidate = relatedCandidates.find((item) => item.candidate_id === candidateId);
+  const matchingObservationFiles = useMemo(() => {
+    const savedMatchId = event?.label?.raybet_match_id?.trim();
+    if (!savedMatchId) return [];
+    return data?.observation_files.filter((item) => (
+      observationMatchId(item.name, item.raybet_match_id) === savedMatchId
+    )) || [];
+  }, [data?.observation_files, event?.label?.raybet_match_id]);
+  const selectedObservation = matchingObservationFiles.find((item) => item.name === observationFile);
+  const layoutMatchesLabel = Boolean(
+    event?.label?.profile_id && layoutProfile === event.label.profile_id,
+  );
   const canEvaluate = Boolean(
     csrfToken
-    && event?.label
+    && labelInputsSaved
     && selectedCandidate
-    && observationFile
-    && layoutProfile,
+    && selectedObservation
+    && layoutMatchesLabel,
   );
+  const currentEvaluations = useMemo(() => {
+    if (!event?.label || !selectedCandidate || !labelInputsSaved) return [];
+    const savedMatchId = event.label.raybet_match_id;
+    const savedMapNumber = event.label.map_number;
+    return data?.evaluations.filter((row) => (
+      row.label_id === event.label?.label_id
+      && row.candidate_id === selectedCandidate.candidate_id
+      && observationMatchId(row.observation_file, row.raybet_match_id) === savedMatchId
+      && row.map_number === savedMapNumber
+    )) || [];
+  }, [data?.evaluations, event?.label, labelInputsSaved, selectedCandidate]);
+
+  useEffect(() => {
+    if (observationFile && !matchingObservationFiles.some((item) => item.name === observationFile)) {
+      setObservationFile("");
+    }
+  }, [matchingObservationFiles, observationFile]);
+
+  const clearFeedback = () => {
+    setError(null);
+    setMessage(null);
+  };
+
+  let evaluationDisabledReason: string | null = null;
+  if (!event?.label) evaluationDisabledReason = "先保存当前事件的真值标签。";
+  else if (!labelInputsSaved) evaluationDisabledReason = "比赛、Map 或英雄真值有未保存的修改。";
+  else if (!matchingObservationFiles.length) evaluationDisabledReason = "当前比赛没有可用的 Observation JSONL。";
+  else if (!layoutMatchesLabel) evaluationDisabledReason = "Layout profile 必须与真值标签一致。";
 
   const saveLabel = async () => {
-    if (!csrfToken || !event || !truthReady) return;
+    if (!csrfToken || !event || !truthReady || !labelContextReady) return;
     setBusy("label");
     setError(null);
     try {
       await saveVisionCalibrationLabel(event.event_id, {
         hero_ids: truth as number[],
-        raybet_match_id: matchId.trim() || null,
-        map_number: mapNumber ? Number(mapNumber) : null,
+        raybet_match_id: matchId.trim(),
+        map_number: parsedMapNumber,
         note: note.trim() || null,
       }, csrfToken);
       await reload();
@@ -143,7 +205,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   };
 
   const buildCandidate = async () => {
-    if (!csrfToken || !event?.label) return;
+    if (!csrfToken || !event?.label || !labelInputsSaved) return;
     setBusy("candidate");
     setError(null);
     try {
@@ -159,14 +221,14 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   };
 
   const runEvaluation = async () => {
-    if (!csrfToken || !event?.label || !canEvaluate) return;
+    if (!csrfToken || !event?.label || !selectedObservation || !canEvaluate) return;
     setBusy("evaluation");
     setError(null);
     try {
       const result = await runVisionCalibrationEvaluation({
         label_id: event.label.label_id,
         candidate_id: candidateId,
-        observation_file: observationFile,
+        observation_file: selectedObservation.name,
         layout_profile: layoutProfile,
         mode,
         captured_after: null,
@@ -295,9 +357,12 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                       <span>{index < 5 ? "Radiant" : "Dire"} {index % 5 + 1}</span>
                       <select
                         aria-label={`${index < 5 ? "Radiant" : "Dire"} slot ${index % 5 + 1}`}
-                        onChange={(change) => setTruth((current) => current.map((item, itemIndex) => (
-                          itemIndex === index ? Number(change.target.value) || "" : item
-                        )))}
+                        onChange={(change) => {
+                          clearFeedback();
+                          setTruth((current) => current.map((item, itemIndex) => (
+                            itemIndex === index ? Number(change.target.value) || "" : item
+                          )));
+                        }}
                         value={value}
                       >
                         <option value="">选择英雄</option>
@@ -307,57 +372,60 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                   ))}
                 </div>
                 <div className="vision-context-fields">
-                  <label><span>RayBet match ID</span><input onChange={(change) => setMatchId(change.target.value)} value={matchId} /></label>
-                  <label><span>Map</span><input max="5" min="1" onChange={(change) => setMapNumber(change.target.value)} type="number" value={mapNumber} /></label>
+                  <label><span>RayBet match ID</span><input onChange={(change) => { clearFeedback(); setMatchId(change.target.value); }} value={matchId} /></label>
+                  <label><span>Map</span><input max="5" min="1" onChange={(change) => { clearFeedback(); setMapNumber(change.target.value); }} type="number" value={mapNumber} /></label>
                 </div>
                 <label className="vision-note"><span>标注说明</span><textarea onChange={(change) => setNote(change.target.value)} rows={2} value={note} /></label>
                 {!truthReady && <p className="vision-disabled-reason">需要十个互不重复的英雄真值。</p>}
-                <Button disabled={!csrfToken || !truthReady || busy !== null} onClick={() => void saveLabel()}>
+                {truthReady && !labelContextReady && <p className="vision-disabled-reason">需要 RayBet match ID 和 1–5 的 Map 编号。</p>}
+                <Button disabled={!csrfToken || !truthReady || !labelContextReady || busy !== null} onClick={() => void saveLabel()}>
                   {busy === "label" ? "正在保存…" : "保存真值标签"}
                 </Button>
               </section>
 
               <section>
                 <div className="vision-section-heading compact"><div><h2>候选模板</h2><p>仅替换隔离候选中的十个 base portrait。</p></div></div>
-                <Button disabled={!csrfToken || !event.label || event.crop_count !== 10 || busy !== null} onClick={() => void buildCandidate()}>
+                <Button disabled={!csrfToken || !event.label || !labelInputsSaved || event.crop_count !== 10 || busy !== null} onClick={() => void buildCandidate()}>
                   {busy === "candidate" ? "正在构建…" : "从当前标签构建候选"}
                 </Button>
                 {!event.label && <p className="vision-disabled-reason">先保存当前事件的真值标签。</p>}
+                {event.label && !labelInputsSaved && <p className="vision-disabled-reason">先保存当前真值、比赛和 Map 的修改。</p>}
               </section>
 
               <section>
                 <div className="vision-section-heading compact"><div><h2>留出评估</h2><p>默认 perception；runtime 会执行 OCR 与 trust gates。</p></div></div>
-                <label><span>候选包（可复用同 UI profile）</span><select onChange={(change) => setCandidateId(change.target.value)} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
+                <label><span>候选包（可复用同 UI profile）</span><select onChange={(change) => { clearFeedback(); setCandidateId(change.target.value); }} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
                 <label>
                   <span>Observation JSONL</span>
                   <select
                     aria-label="Observation JSONL"
                     aria-describedby="vision-observation-help"
-                    disabled={!data.observation_files.length}
-                    onChange={(change) => setObservationFile(change.target.value)}
+                    disabled={!matchingObservationFiles.length}
+                    onChange={(change) => { clearFeedback(); setObservationFile(change.target.value); }}
                     value={observationFile}
                   >
                     <option value="">
-                      {data.observation_files.length ? "选择序列" : "没有可用序列"}
+                      {matchingObservationFiles.length ? "选择序列" : "当前比赛没有可用序列"}
                     </option>
-                    {data.observation_files.map((item) => (
+                    {matchingObservationFiles.map((item) => (
                       <option key={item.name} value={item.name}>{item.display_name || item.name}</option>
                     ))}
                   </select>
                   <small className="vision-field-help" id="vision-observation-help">
-                    {data.observation_files.length
+                    {matchingObservationFiles.length
                       ? `正在读取 ${data.observation_root}`
-                      : `目录中还没有 JSONL：${data.observation_root}。Stable watcher 采集到直播帧后刷新页面。`}
+                      : `没有与当前已保存 RayBet match ID 匹配的 JSONL：${data.observation_root}`}
                   </small>
                 </label>
-                <label><span>Layout profile</span><select onChange={(change) => setLayoutProfile(change.target.value)} value={layoutProfile}>{data.layout_profiles.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
-                <label><span>评估模式</span><select onChange={(change) => setMode(change.target.value as "perception" | "runtime")} value={mode}><option value="perception">Perception only</option><option value="runtime">Runtime faithful</option></select></label>
+                <label><span>Layout profile</span><select onChange={(change) => { clearFeedback(); setLayoutProfile(change.target.value); }} value={layoutProfile}>{data.layout_profiles.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+                <label><span>评估模式</span><select onChange={(change) => { clearFeedback(); setMode(change.target.value as "perception" | "runtime"); }} value={mode}><option value="perception">Perception only</option><option value="runtime">Runtime faithful</option></select></label>
                 <Button disabled={!canEvaluate || busy !== null} onClick={() => void runEvaluation()}>
                   {busy === "evaluation" ? "正在评估…" : "运行留出评估"}
                 </Button>
+                {evaluationDisabledReason && <p className="vision-disabled-reason">{evaluationDisabledReason}</p>}
               </section>
 
-              <EvaluationResults rows={data.evaluations} />
+              <EvaluationResults rows={currentEvaluations} />
             </aside>
           )}
         </div>
@@ -371,16 +439,17 @@ function EvaluationResults({ rows }: { rows: VisionCalibrationEvaluation[] }) {
   return (
     <section>
       <div className="vision-section-heading compact"><div><h2>最近结果</h2><p>错误锁优先于平均分。</p></div></div>
-      {!rows.length && <p className="vision-disabled-reason">尚无评估结果。</p>}
+      {!rows.length && <p className="vision-disabled-reason">当前选择尚无评估结果。</p>}
       <div className="vision-evaluation-list">
         {rows.slice(0, 6).map((row) => (
           <article className={row.wrong_lock_count ? "failed" : "passed"} key={row.evaluation_id}>
-            <header><strong>{row.final_correct_locked_slots}/10 locked</strong><span>{row.mode}</span></header>
+            <header><strong>正确锁定 / 总锁定：{row.final_correct_locked_slots} / {row.final_locked_slots}</strong><span>{row.mode}</span></header>
             <dl>
               <div><dt>wrong locks</dt><dd>{row.wrong_lock_count}</dd></div>
               <div><dt>precision</dt><dd>{formatPercent(row.accepted_precision)}</dd></div>
               <div><dt>post-lock</dt><dd>{formatPercent(row.exact_post_lock_rate)}</dd></div>
             </dl>
+            <small>{formatTime(row.created_at)} · Map {row.map_number} · 锁定延迟 {formatLatency(row.lock_latency_seconds)}</small>
             <small>{row.observation_file}</small>
           </article>
         ))}
@@ -403,4 +472,15 @@ function formatTime(value: string): string {
 
 function formatPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
+}
+
+
+function formatLatency(value: number | null): string {
+  return value === null ? "未锁定" : `${value.toFixed(1)} 秒`;
+}
+
+
+function observationMatchId(filename: string, explicitMatchId?: string): string {
+  if (explicitMatchId) return String(explicitMatchId).trim();
+  return filename.toLowerCase().endsWith(".jsonl") ? filename.slice(0, -6) : "";
 }

@@ -25,8 +25,8 @@ class SaveCalibrationLabelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hero_ids: list[int] = Field(min_length=10, max_length=10)
-    raybet_match_id: str | None = Field(default=None, min_length=1, max_length=64)
-    map_number: int | None = Field(default=None, ge=1, le=5)
+    raybet_match_id: str = Field(min_length=1, max_length=64)
+    map_number: int = Field(ge=1, le=5)
     note: str | None = Field(default=None, max_length=500)
 
     @field_validator("hero_ids")
