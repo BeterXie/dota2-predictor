@@ -23,14 +23,19 @@ def _feature_pack(path: Path) -> None:
     )
 
 
-def _debug_event(project_root: Path) -> Path:
+def _debug_event(
+    project_root: Path,
+    *,
+    event_name: str = "20260808T120000_ambiguous_match",
+    captured_at: float = 1_785_600_000.0,
+) -> Path:
     event_root = (
         project_root
         / "data"
         / "live_betting"
         / "vision_debug"
         / "standard_dota_hud_1080p"
-        / "20260808T120000_ambiguous_match"
+        / event_name
     )
     event_root.mkdir(parents=True)
     frame = np.full((1080, 1920, 3), 80, dtype=np.uint8)
@@ -45,7 +50,7 @@ def _debug_event(project_root: Path) -> Path:
     (event_root / "metadata.json").write_text(
         json.dumps(
             {
-                "captured_at": 1_785_600_000.0,
+                "captured_at": captured_at,
                 "reason": "ambiguous_match",
                 "layout": "standard_dota_hud_1080p",
                 "hero_crops": crops,
@@ -77,6 +82,7 @@ def test_calibration_labels_real_event_and_builds_isolated_candidate(
     bootstrap = service.bootstrap()
     event = bootstrap["events"][0]
     assert event["crop_count"] == 10
+    assert event["profile_id"] == "standard_dota_hud_1080p"
     event_id = str(event["event_id"])
     label = service.save_label(
         event_id,
@@ -88,6 +94,7 @@ def test_calibration_labels_real_event_and_builds_isolated_candidate(
     candidate = service.build_candidate(str(label["label_id"]))
 
     assert candidate["promoted"] is False
+    assert candidate["profile_id"] == "standard_dota_hud_1080p"
     assert candidate["production_feature_sha256"] != candidate["feature_sha256"]
     candidate_path = (
         service.paths.calibration_root
@@ -142,7 +149,7 @@ def test_calibration_skips_malformed_debug_metadata(tmp_path: Path) -> None:
     assert len(service.bootstrap()["events"]) == 1
 
 
-def test_calibration_rejects_candidate_from_another_label(tmp_path: Path) -> None:
+def test_calibration_rejects_candidate_from_another_ui_profile(tmp_path: Path) -> None:
     feature_path = tmp_path / "features.npz"
     _feature_pack(feature_path)
     _debug_event(tmp_path)
@@ -162,10 +169,10 @@ def test_calibration_rejects_candidate_from_another_label(tmp_path: Path) -> Non
         / f"{candidate['candidate_id']}.json"
     )
     payload = json.loads(candidate_path.read_text(encoding="utf-8"))
-    payload["label_id"] = "fedcba9876543210fedc"
+    payload["profile_id"] = "wxc_gotf_2026_live_1080p"
     candidate_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="does not belong"):
+    with pytest.raises(ValueError, match="UI profile"):
         service.run_evaluation(
             label_id=event_id,
             candidate_id=str(candidate["candidate_id"]),
@@ -173,6 +180,78 @@ def test_calibration_rejects_candidate_from_another_label(tmp_path: Path) -> Non
             layout_profile="standard_dota_hud_1080p",
             mode="perception",
         )
+
+
+def test_calibration_candidate_reuses_across_matches_in_same_ui_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    _debug_event(tmp_path, event_name="20260808T120000_match_one")
+    _debug_event(
+        tmp_path,
+        event_name="20260808T120100_match_two",
+        captured_at=1_785_600_060.0,
+    )
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    events = service.bootstrap()["events"]
+    ids = {str(event["relative_path"]).split("/")[-1]: str(event["event_id"]) for event in events}
+    first_id = ids["20260808T120000_match_one"]
+    second_id = ids["20260808T120100_match_two"]
+    service.save_label(
+        first_id,
+        hero_ids=tuple(range(1, 11)),
+        raybet_match_id="match-one",
+        map_number=1,
+        note=None,
+    )
+    service.save_label(
+        second_id,
+        hero_ids=tuple(range(11, 21)),
+        raybet_match_id="match-two",
+        map_number=1,
+        note=None,
+    )
+    candidate = service.build_candidate(first_id)
+    observation_root = service.paths.observation_root
+    observation_root.mkdir(parents=True)
+    observation_path = observation_root / "holdout.jsonl"
+    observation_path.write_text("{}\n", encoding="utf-8")
+    sample = EvidenceSample(tmp_path / "frame.jpg", 0.0, "frame")
+    monkeypatch.setattr(
+        evaluator,
+        "_observation_samples",
+        lambda *_args, **_kwargs: ([sample], {"raybet_match_id": "match-two"}),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate",
+        lambda *_args, **_kwargs: {
+            "total_files": 1,
+            "trackable_frames": 1,
+            "truth_evaluation": {
+                "best_candidate_accuracy": 1.0,
+                "accepted_precision": 1.0,
+                "final_locked_slots": 10,
+                "final_correct_locked_slots": 10,
+                "wrong_lock_count": 0,
+                "lock_latency_seconds": 1.0,
+                "exact_post_lock_rate": 1.0,
+            },
+        },
+    )
+
+    result = service.run_evaluation(
+        label_id=second_id,
+        candidate_id=str(candidate["candidate_id"]),
+        observation_file=observation_path.name,
+        layout_profile="standard_dota_hud_1080p",
+        mode="perception",
+    )
+
+    assert result["label_id"] == second_id
+    assert result["candidate_id"] == candidate["candidate_id"]
 
 
 def test_calibration_evaluation_persists_truth_metrics(

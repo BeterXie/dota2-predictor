@@ -32,6 +32,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   const [data, setData] = useState<VisionCalibrationBootstrap | null>(null);
   const [heroes, setHeroes] = useState<PrematchHero[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [profileId, setProfileId] = useState("all");
   const [truth, setTruth] = useState<Array<number | "">>(Array(10).fill(""));
   const [matchId, setMatchId] = useState("");
   const [mapNumber, setMapNumber] = useState("");
@@ -53,7 +54,6 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
         ? current
         : value.events[0]?.event_id || null
     ));
-    setCandidateId((current) => current || value.candidates[0]?.candidate_id || "");
     setObservationFile((current) => current || value.observation_files[0]?.name || "");
   };
 
@@ -75,6 +75,23 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     return () => controller.abort();
   }, []);
 
+  const profiles = data?.profiles || [];
+  const visibleEvents = useMemo(
+    () => data?.events.filter((item) => profileId === "all" || item.profile_id === profileId) || [],
+    [data?.events, profileId],
+  );
+  const selectedProfile = profiles.find((item) => item.profile_id === profileId) || null;
+
+  useEffect(() => {
+    if (profileId !== "all" && !profiles.some((item) => item.profile_id === profileId)) {
+      setProfileId("all");
+      return;
+    }
+    if (!selectedId || !visibleEvents.some((item) => item.event_id === selectedId)) {
+      setSelectedId(visibleEvents[0]?.event_id || null);
+    }
+  }, [profileId, profiles, selectedId, visibleEvents]);
+
   const event = useMemo(
     () => data?.events.find((item) => item.event_id === selectedId) || null,
     [data?.events, selectedId],
@@ -95,7 +112,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
 
   const truthReady = truth.every((value) => typeof value === "number")
     && new Set(truth).size === 10;
-  const relatedCandidates = data?.candidates.filter((item) => item.label_id === event?.event_id) || [];
+  const relatedCandidates = data?.candidates.filter((item) => item.profile_id === event?.profile_id) || [];
   const selectedCandidate = relatedCandidates.find((item) => item.candidate_id === candidateId);
   const canEvaluate = Boolean(
     csrfToken
@@ -178,7 +195,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
         <div>
           <span className="vision-kicker"><Flask size={16} /> REAL-FRAME CALIBRATION</span>
           <h1>Vision 训练与校正</h1>
-          <p>检查真实失败帧、校正 HUD 顺序真值、生成隔离候选，并用留出序列验证时序锁定。</p>
+          <p>先选择赛事 UI profile，再校正其中一场比赛；同 profile 的后续比赛可以复用候选并继续做留出验证。</p>
         </div>
         <div className="vision-boundary" role="note">
           <LockKey size={18} />
@@ -199,9 +216,31 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
       ) : (
         <div className="vision-calibration-grid">
           <section className="vision-event-queue" aria-label="Vision debug events">
-            <header><div><h2>待校正事件</h2><span>{data.events.length} retained</span></div></header>
+            <header>
+              <div><h2>待校正比赛</h2><span>{visibleEvents.length} retained</span></div>
+              <label className="vision-profile-selector">
+                <span>赛事 UI profile</span>
+                <select
+                  aria-label="赛事 UI profile"
+                  onChange={(change) => setProfileId(change.target.value)}
+                  value={profileId}
+                >
+                  <option value="all">全部赛事 UI</option>
+                  {profiles.map((profile) => (
+                    <option key={profile.profile_id} value={profile.profile_id}>
+                      {profile.layout || profile.profile_id} · {profile.event_count} 场
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="vision-profile-summary">
+                {selectedProfile
+                  ? `${selectedProfile.layout || selectedProfile.profile_id}：${selectedProfile.labeled_event_count} 场已标注，${selectedProfile.candidate_count} 个候选可复用`
+                  : "先选择赛事 UI；同 profile 后续比赛可复用同一候选，不必重复构建。"}
+              </p>
+            </header>
             <div className="vision-event-list">
-              {data.events.map((item) => (
+              {visibleEvents.map((item) => (
                 <button
                   className={item.event_id === selectedId ? "vision-event selected" : "vision-event"}
                   key={item.event_id}
@@ -220,7 +259,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
           {event && (
             <section className="vision-inspector">
               <header className="vision-section-heading">
-                <div><h2>帧与槽位检查</h2><p>{event.relative_path}</p></div>
+                <div><h2>帧与槽位检查</h2><p>{event.relative_path} · profile: {event.profile_id}</p></div>
                 <dl>
                   <div><dt>screen</dt><dd>{event.screen_state || "—"}</dd></div>
                   <div><dt>layout</dt><dd>{event.layout_state || "—"}</dd></div>
@@ -288,7 +327,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
 
               <section>
                 <div className="vision-section-heading compact"><div><h2>留出评估</h2><p>默认 perception；runtime 会执行 OCR 与 trust gates。</p></div></div>
-                <label><span>候选包</span><select onChange={(change) => setCandidateId(change.target.value)} value={candidateId}><option value="">选择当前标签的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
+                <label><span>候选包（可复用同 UI profile）</span><select onChange={(change) => setCandidateId(change.target.value)} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
                 <label><span>Observation JSONL</span><select onChange={(change) => setObservationFile(change.target.value)} value={observationFile}><option value="">选择序列</option>{data.observation_files.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
                 <label><span>Layout profile</span><select onChange={(change) => setLayoutProfile(change.target.value)} value={layoutProfile}>{data.layout_profiles.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
                 <label><span>评估模式</span><select onChange={(change) => setMode(change.target.value as "perception" | "runtime")} value={mode}><option value="perception">Perception only</option><option value="runtime">Runtime faithful</option></select></label>

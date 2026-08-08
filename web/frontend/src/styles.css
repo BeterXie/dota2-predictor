@@ -5833,6 +5833,37 @@ body {
   gap: 12px;
 }
 
+.vision-profile-selector {
+  display: grid;
+  gap: 5px;
+  margin-top: 10px;
+}
+
+.vision-profile-selector span {
+  color: var(--text-dim);
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.vision-profile-selector select {
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--text);
+  background: #0b1118;
+  font: inherit;
+  font-size: 10px;
+}
+
+.vision-profile-summary {
+  margin: 8px 0 0;
+  color: var(--text-dim);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
 .vision-event-queue h2,
 .vision-section-heading h2 {
   color: var(--text);

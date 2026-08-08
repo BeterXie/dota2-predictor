@@ -21,6 +21,7 @@ const event: VisionCalibrationEvent = {
   relative_path: "standard/event-1",
   captured_at: "2026-08-08T12:00:00+00:00",
   layout: "standard_dota_hud_1080p",
+  profile_id: "standard_dota_hud_1080p",
   reason: "ambiguous_match",
   blocker_code: "draft_incomplete",
   screen_state: "game",
@@ -45,6 +46,14 @@ const event: VisionCalibrationEvent = {
 
 const bootstrap: VisionCalibrationBootstrap = {
   events: [event],
+  profiles: [{
+    profile_id: "standard_dota_hud_1080p",
+    layout: "standard_dota_hud_1080p",
+    event_count: 1,
+    labeled_event_count: 0,
+    candidate_count: 0,
+    latest_captured_at: event.captured_at,
+  }],
   candidates: [],
   evaluations: [],
   observation_files: [{ name: "holdout.jsonl", bytes: 2048 }],
@@ -115,6 +124,7 @@ describe("VisionCalibrationPage", () => {
       event_id: event.event_id,
       event_relative_path: event.relative_path,
       layout: event.layout,
+      profile_id: event.profile_id,
       hero_ids: Array.from({ length: 10 }, (_, index) => index + 1),
       raybet_match_id: null,
       map_number: null,
@@ -136,6 +146,7 @@ describe("VisionCalibrationPage", () => {
       event_id: event.event_id,
       event_relative_path: event.relative_path,
       layout: event.layout,
+      profile_id: event.profile_id,
       hero_ids: Array.from({ length: 10 }, (_, index) => index + 1),
       raybet_match_id: "42",
       map_number: 1,
@@ -144,8 +155,9 @@ describe("VisionCalibrationPage", () => {
     };
     const candidate = {
       candidate_id: `candidate-${event.event_id}-deadbeef`,
-      label_id: event.event_id,
+      label_id: "source-event-from-same-profile",
       layout: event.layout,
+      profile_id: event.profile_id,
       hero_ids: label.hero_ids,
       created_at: "2026-08-08T12:11:00+00:00",
       feature_sha256: "a".repeat(64),
@@ -174,6 +186,14 @@ describe("VisionCalibrationPage", () => {
     api.fetchVisionCalibration.mockResolvedValue({
       ...bootstrap,
       events: [{ ...event, label }],
+      profiles: [{
+        profile_id: event.profile_id,
+        layout: event.layout,
+        event_count: 1,
+        labeled_event_count: 1,
+        candidate_count: 1,
+        latest_captured_at: event.captured_at,
+      }],
       candidates: [candidate],
       evaluations: [evaluation],
     });

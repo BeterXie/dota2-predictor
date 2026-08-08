@@ -54,7 +54,17 @@ The operations view controls the RayBet collector and Stable Vision. It also
 shows current service health, strict mappings, and operational alerts.
 
 Open `http://127.0.0.1:8000/monitor?view=vision` for the real-frame Vision
-calibration workflow. It labels retained debug frames, builds filesystem-backed
+calibration workflow. The page first groups retained matches by their detected
+赛事 UI profile (the stable broadcast layout, such as
+`wxc_gotf_2026_live_1080p`). Select a match inside that profile, correct one
+match's ten HUD-order heroes, and build a candidate once. Later matches in the
+same UI profile can reuse that candidate for evaluation; each match still gets
+its own truth label when measuring hero-lock accuracy.
+
+The profile grouping is filesystem-backed and does not require a database
+migration. Stable Runtime already keeps the selected broadcast layout sticky,
+so subsequent matches with the same UI profile do not need a new layout setup.
+The calibration page labels retained debug frames, builds filesystem-backed
 candidate feature packs, and evaluates them against retained observation JSONL.
 Candidates are isolated under `data/live_betting/vision_calibration` and are
 never promoted to `vision/templates/hero_features.npz` automatically.

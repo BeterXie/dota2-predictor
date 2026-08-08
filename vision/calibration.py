@@ -45,9 +45,11 @@ class VisionCalibrationService:
 
     def bootstrap(self, *, limit: int = 100) -> dict[str, object]:
         events = self._events(limit=limit)
+        candidates = self._candidates()
         return {
             "events": events,
-            "candidates": self._candidates(),
+            "profiles": self._profiles(events, candidates),
+            "candidates": candidates,
             "evaluations": self._evaluations(),
             "observation_files": self._observation_files(),
             "layout_profiles": sorted(_LAYOUTS),
@@ -79,6 +81,7 @@ class VisionCalibrationService:
             "event_id": event_id,
             "event_relative_path": event["relative_path"],
             "layout": event["layout"],
+            "profile_id": event["profile_id"],
             "hero_ids": list(hero_ids),
             "raybet_match_id": raybet_match_id,
             "map_number": map_number,
@@ -147,6 +150,7 @@ class VisionCalibrationService:
             "candidate_id": candidate_id,
             "label_id": label_id,
             "layout": label["layout"],
+            "profile_id": self._profile_id(label.get("layout")),
             "hero_ids": list(hero_ids),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "feature_sha256": self._sha256(feature_path),
@@ -173,8 +177,12 @@ class VisionCalibrationService:
             raise ValueError("evaluation mode must be perception or runtime")
         label = self._label(label_id)
         candidate = self._candidate(candidate_id)
-        if candidate.get("label_id") != label_id:
-            raise ValueError("candidate does not belong to the selected calibration label")
+        label_profile = self._profile_id(label.get("layout"))
+        candidate_profile = self._profile_id(
+            candidate.get("profile_id") or candidate.get("layout")
+        )
+        if candidate_profile != label_profile:
+            raise ValueError("candidate does not belong to the selected UI profile")
         observation_path = self._observation_path(observation_file)
         feature_path = (
             self.paths.calibration_root / "candidates" / f"{candidate_id}.npz"
@@ -325,6 +333,7 @@ class VisionCalibrationService:
             "event_path": str(event_path),
             "captured_at": captured_at_iso,
             "layout": payload.get("layout"),
+            "profile_id": self._profile_id(payload.get("layout")),
             "reason": str(payload.get("reason") or "unknown"),
             "blocker_code": hud.get("blocker_code"),
             "screen_state": hud.get("screen_state"),
@@ -353,6 +362,56 @@ class VisionCalibrationService:
             key=lambda row: str(row.get("created_at") or ""),
             reverse=True,
         )
+
+    @classmethod
+    def _profiles(
+        cls,
+        events: list[dict[str, object]],
+        candidates: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        profiles: dict[str, dict[str, object]] = {}
+        for event in events:
+            profile_id = str(event["profile_id"])
+            profile = profiles.setdefault(
+                profile_id,
+                {
+                    "profile_id": profile_id,
+                    "layout": event.get("layout"),
+                    "event_count": 0,
+                    "labeled_event_count": 0,
+                    "candidate_count": 0,
+                    "latest_captured_at": event.get("captured_at"),
+                },
+            )
+            profile["event_count"] = int(profile["event_count"]) + 1
+            if event.get("label") is not None:
+                profile["labeled_event_count"] = int(profile["labeled_event_count"]) + 1
+            if str(event.get("captured_at") or "") > str(profile["latest_captured_at"] or ""):
+                profile["latest_captured_at"] = event.get("captured_at")
+
+        for candidate in candidates:
+            profile_id = cls._profile_id(
+                candidate.get("profile_id") or candidate.get("layout")
+            )
+            profile = profiles.setdefault(
+                profile_id,
+                {
+                    "profile_id": profile_id,
+                    "layout": candidate.get("layout"),
+                    "event_count": 0,
+                    "labeled_event_count": 0,
+                    "candidate_count": 0,
+                    "latest_captured_at": None,
+                },
+            )
+            profile["candidate_count"] = int(profile["candidate_count"]) + 1
+
+        return sorted(profiles.values(), key=lambda row: str(row["profile_id"]))
+
+    @staticmethod
+    def _profile_id(layout: object) -> str:
+        value = str(layout or "unknown").strip()
+        return value if value in _LAYOUTS else "unknown"
 
     def _candidate(self, candidate_id: str) -> dict[str, object]:
         if re.fullmatch(r"[a-z0-9-]{1,200}", candidate_id) is None:

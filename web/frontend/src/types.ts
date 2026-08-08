@@ -318,6 +318,7 @@ export interface VisionCalibrationLabel {
   event_id: string;
   event_relative_path: string;
   layout: string | null;
+  profile_id: string;
   hero_ids: number[];
   raybet_match_id: string | null;
   map_number: number | null;
@@ -340,6 +341,7 @@ export interface VisionCalibrationEvent {
   relative_path: string;
   captured_at: string;
   layout: string | null;
+  profile_id: string;
   reason: string;
   blocker_code: string | null;
   screen_state: string | null;
@@ -358,6 +360,7 @@ export interface VisionCalibrationCandidate {
   candidate_id: string;
   label_id: string;
   layout: string | null;
+  profile_id: string;
   hero_ids: number[];
   created_at: string;
   feature_sha256: string;
@@ -387,10 +390,20 @@ export interface VisionCalibrationEvaluation {
 
 export interface VisionCalibrationBootstrap {
   events: VisionCalibrationEvent[];
+  profiles: VisionCalibrationProfile[];
   candidates: VisionCalibrationCandidate[];
   evaluations: VisionCalibrationEvaluation[];
   observation_files: Array<{ name: string; bytes: number }>;
   layout_profiles: string[];
   production_feature_path: string;
   candidate_boundary: string;
+}
+
+export interface VisionCalibrationProfile {
+  profile_id: string;
+  layout: string | null;
+  event_count: number;
+  labeled_event_count: number;
+  candidate_count: number;
+  latest_captured_at: string | null;
 }
