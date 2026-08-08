@@ -22,10 +22,21 @@ if str(ROOT) not in sys.path:
 
 from vision.hero_recognizer import (  # noqa: E402
     DEFAULT_FEATURE_PATH,
+    DraftReading,
     DraftTracker,
     HeroRecognizer,
 )
+from vision.frame_quality import FrameQualityTracker  # noqa: E402
 from vision.layout_selector import select_broadcast_layout  # noqa: E402
+from vision.layout_tracker import LayoutTracker  # noqa: E402
+from vision.scoreboard_reader import ScoreboardReader  # noqa: E402
+from vision.screen_state import classify_screen_state  # noqa: E402
+from vision.stable_runtime import (  # noqa: E402
+    StableDraftTracker,
+    StableHeroRecognizer,
+    _LAYOUTS,
+    broadcast_layout_scores,
+)
 from database.engine import build_engine  # noqa: E402
 from shared.environment import load_environment_file  # noqa: E402
 
@@ -36,6 +47,117 @@ class EvidenceSample:
     observed_at: float
     source_frame_hash: str | None = None
     game_clock_seconds: int | None = None
+    target_identity_confirmed: bool | None = None
+
+
+def _observation_samples(
+    observation_jsonl: Path,
+    *,
+    captured_after: float | None = None,
+    captured_before: float | None = None,
+) -> tuple[list[EvidenceSample], dict[str, object]]:
+    samples: list[EvidenceSample] = []
+    raybet_match_ids: set[str] = set()
+    map_numbers: set[int] = set()
+    missing_frames = 0
+    invalid_rows = 0
+    selected_clocks: list[int | None] = []
+
+    try:
+        lines = observation_jsonl.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ValueError(f"unable to read observation JSONL: {observation_jsonl}") from error
+
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"invalid observation JSONL row {line_number}: {observation_jsonl}"
+            ) from error
+        if not isinstance(row, dict):
+            invalid_rows += 1
+            continue
+
+        match_id = row.get("raybet_match_id")
+        if match_id is not None:
+            raybet_match_ids.add(str(match_id))
+        map_number = row.get("map_number")
+        if map_number is not None:
+            try:
+                map_numbers.add(int(map_number))
+            except (TypeError, ValueError):
+                invalid_rows += 1
+                continue
+
+        try:
+            observed_at = datetime.fromisoformat(
+                str(row["captured_at_utc"]).replace("Z", "+00:00")
+            ).timestamp()
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"invalid captured_at_utc on JSONL row {line_number}"
+            ) from error
+        if captured_after is not None and observed_at < captured_after:
+            continue
+        if captured_before is not None and observed_at >= captured_before:
+            continue
+        digest_value = row.get("source_frame_sha256")
+        path_value = row.get("source_frame_path")
+        if not digest_value or not path_value:
+            missing_frames += 1
+            continue
+        path = Path(str(path_value))
+        if not path.is_file():
+            missing_frames += 1
+            continue
+        clock_value = row.get("game_clock_seconds")
+        try:
+            clock = None if clock_value is None else int(clock_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"invalid game_clock_seconds on JSONL row {line_number}"
+            ) from error
+        selected_clocks.append(clock)
+        samples.append(
+            EvidenceSample(
+                path,
+                observed_at,
+                str(digest_value),
+                clock,
+                bool(row.get("radiant_team_side")),
+            )
+        )
+
+    if len(raybet_match_ids) != 1:
+        raise ValueError("observation JSONL must contain exactly one RayBet match")
+    if len(map_numbers) > 1:
+        raise ValueError("observation JSONL spans multiple numbered maps")
+    if not samples:
+        raise ValueError("observation JSONL has no retained Vision evidence frames")
+    _validate_single_map_clocks(selected_clocks)
+    return samples, {
+        "source": "observation_jsonl",
+        "observation_jsonl": str(observation_jsonl.resolve()),
+        "raybet_match_id": next(iter(raybet_match_ids)),
+        "map_numbers": sorted(map_numbers),
+        "jsonl_rows": len(lines),
+        "retained_frames": len(samples),
+        "missing_frames": missing_frames,
+        "invalid_rows": invalid_rows,
+        "captured_after": (
+            datetime.fromtimestamp(captured_after).astimezone().isoformat()
+            if captured_after is not None
+            else None
+        ),
+        "captured_before": (
+            datetime.fromtimestamp(captured_before).astimezone().isoformat()
+            if captured_before is not None
+            else None
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -247,7 +369,8 @@ def _database_samples(
             observations = connection.execute(
                 text(
                     """
-                    SELECT captured_at, game_clock_seconds, source_frame_sha256
+                    SELECT captured_at, game_clock_seconds, source_frame_sha256,
+                           radiant_team_side
                     FROM vision_observations
                     WHERE raybet_match_id = :raybet_match_id
                       AND map_number = :map_number
@@ -304,6 +427,7 @@ def _database_samples(
                 observed_at,
                 digest,
                 selected_clocks[-1],
+                row["radiant_team_side"] is not None,
             )
         )
     if not samples:
@@ -365,13 +489,26 @@ def evaluate(
     samples: list[EvidenceSample] | None = None,
     truth_hero_ids: tuple[int, ...] | None = None,
     truth_context: dict[str, object] | None = None,
+    stable: bool = False,
+    layout_profile: str | None = None,
+    runtime_gates: bool = True,
 ) -> dict[str, object]:
     samples = samples if samples is not None else _directory_samples(evidence_dir)
     if truth_hero_ids is not None and len(truth_hero_ids) != 10:
         raise ValueError("truth_hero_ids must contain exactly ten heroes")
+    if truth_hero_ids is not None and len(set(truth_hero_ids)) != 10:
+        raise ValueError("truth_hero_ids must contain ten unique heroes")
     layout_counts: Counter[str] = Counter()
+    scene_counts: Counter[str] = Counter()
+    replay_gate_counts: Counter[str] = Counter()
+    tracking_blocker_counts: Counter[str] = Counter()
+    if layout_profile is not None and layout_profile not in _LAYOUTS:
+        raise ValueError(f"unsupported layout profile: {layout_profile}")
     readers: dict[str, HeroRecognizer] = {}
-    tracker = DraftTracker()
+    scoreboard_readers: dict[str, ScoreboardReader] = {}
+    tracker = StableDraftTracker() if stable else DraftTracker()
+    layout_tracker = LayoutTracker() if stable and layout_profile is None else None
+    frame_quality_tracker = FrameQualityTracker() if stable else None
     active_layout_name: str | None = None
     slot_rows: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
     frame_rows: list[dict[str, object]] = []
@@ -383,6 +520,14 @@ def evaluate(
     variant_counts: dict[int, int] = {}
     previous_tracker_slots = tracker.slot_statuses
     wrong_locks: list[dict[str, object]] = []
+    tracker_confirmation_index: int | None = None
+    tracker_confirmation_at: float | None = None
+    tracker_confirmation_trackable_index: int | None = None
+    first_trackable_at: float | None = None
+    trackable_frame_count = 0
+    exact_post_lock_frames = 0
+    post_lock_frames = 0
+    layout_switches: list[dict[str, object]] = []
 
     for sample in samples:
         path = sample.path
@@ -390,28 +535,108 @@ def evaluate(
         if image is None:
             layout_counts["unreadable"] += 1
             continue
-        selection = select_broadcast_layout(image)
-        layout_name = selection.layout_name or "unsupported"
+        if layout_profile is not None:
+            layout = _LAYOUTS[layout_profile]
+            layout_name = layout.name
+        elif layout_tracker is not None:
+            layout_state = layout_tracker.update(broadcast_layout_scores(image))
+            layout = _LAYOUTS.get(layout_state.layout_name or "")
+            layout_name = layout.name if layout is not None else "unsupported"
+        else:
+            selection = select_broadcast_layout(image)
+            layout = selection.layout
+            layout_name = selection.layout_name or "unsupported"
         layout_counts[layout_name] += 1
-        if active_layout_name != selection.layout_name:
+        if stable:
+            if (
+                layout is not None
+                and active_layout_name is not None
+                and active_layout_name != layout_name
+            ):
+                layout_switches.append(
+                    {
+                        "file": path.name,
+                        "from": active_layout_name,
+                        "to": layout_name,
+                    }
+                )
+                tracker.reset()
+                previous_tracker_slots = tracker.slot_statuses
+            if layout is not None:
+                active_layout_name = layout_name
+        elif active_layout_name != (layout.name if layout is not None else None):
             tracker.reset()
             previous_tracker_slots = tracker.slot_statuses
-        active_layout_name = selection.layout_name
-        if selection.layout is None:
+            active_layout_name = layout.name if layout is not None else None
+        if layout is None:
             continue
+        if stable and runtime_gates:
+            screen_state, _ = classify_screen_state(image, layout)
+            scene_counts[screen_state] += 1
+            scoreboard_reader = scoreboard_readers.get(layout_name)
+            if scoreboard_reader is None:
+                scoreboard_reader = ScoreboardReader(layout)
+                scoreboard_readers[layout_name] = scoreboard_reader
+            replay_gate = scoreboard_reader.read_replay_gate(image)
+            replay_gate_counts[replay_gate.status] += 1
+            assert frame_quality_tracker is not None
+            quality = frame_quality_tracker.assess(image)
+            target_identity_confirmed = sample.target_identity_confirmed is not False
+            if screen_state != "game":
+                tracking_blocker = "screen_not_game"
+            elif replay_gate.status != "live":
+                tracking_blocker = f"replay_gate_{replay_gate.status}"
+            elif not quality.usable:
+                tracking_blocker = quality.reason or "frame_quality_unusable"
+            elif not target_identity_confirmed:
+                tracking_blocker = "target_identity_unconfirmed"
+            else:
+                tracking_blocker = None
+            tracking_blocker_counts[tracking_blocker or "trackable"] += 1
+            trackable = tracking_blocker is None
+        else:
+            screen_state = "unfiltered"
+            target_identity_confirmed = sample.target_identity_confirmed is not False
+            tracking_blocker = None
+            trackable = True
+        if trackable:
+            if first_trackable_at is None:
+                first_trackable_at = sample.observed_at
+            trackable_frame_count += 1
         reader = readers.get(layout_name)
         if reader is None:
-            reader = HeroRecognizer(feature_path, selection.layout)
+            reader_type = StableHeroRecognizer if stable else HeroRecognizer
+            reader = reader_type(feature_path, layout)
             readers[layout_name] = reader
         reading = reader.read(image)
-        confirmed = tracker.update(
-            reading,
-            observed_at=sample.observed_at,
-            source_frame_hash=sample.source_frame_hash,
-            game_clock_seconds=sample.game_clock_seconds,
-        )
+        if stable and runtime_gates and trackable:
+            max_seconds = layout.draft_recognition_max_clock_seconds
+            tracking_reading = (
+                DraftReading((), (), 0.0)
+                if max_seconds is not None
+                and (
+                    sample.game_clock_seconds is None
+                    or sample.game_clock_seconds > max_seconds
+                )
+                else reading
+            )
+            confirmed = tracker.update(
+                tracking_reading,
+                observed_at=sample.observed_at,
+                source_frame_hash=sample.source_frame_hash,
+                game_clock_seconds=sample.game_clock_seconds,
+            )
+        elif stable and runtime_gates:
+            confirmed = tracker.current_draft
+        else:
+            confirmed = tracker.update(
+                reading,
+                observed_at=sample.observed_at,
+                source_frame_hash=sample.source_frame_hash,
+                game_clock_seconds=sample.game_clock_seconds,
+            )
         accepted = 0
-        regions = selection.layout.radiant_heroes + selection.layout.dire_heroes
+        regions = layout.radiant_heroes + layout.dire_heroes
         for index, diagnostic in enumerate(reading.slot_diagnostics):
             key = f"{diagnostic.side}_{diagnostic.slot}"
             row = {
@@ -477,10 +702,25 @@ def evaluate(
                         }
                     )
         previous_tracker_slots = tracker_slots
+        if confirmed is not None and tracker_confirmation_index is None:
+            tracker_confirmation_index = len(frame_rows)
+            tracker_confirmation_at = sample.observed_at
+            tracker_confirmation_trackable_index = trackable_frame_count - 1
+        if tracker_confirmation_index is not None:
+            post_lock_frames += 1
+            if truth_hero_ids is not None and confirmed is not None:
+                exact_post_lock_frames += int(
+                    confirmed.radiant_hero_ids + confirmed.dire_hero_ids
+                    == truth_hero_ids
+                )
         frame_rows.append(
             {
                 "file": path.name,
                 "layout": layout_name,
+                "screen_state": screen_state,
+                "target_identity_confirmed": target_identity_confirmed,
+                "tracking_blocker": tracking_blocker,
+                "trackable": trackable,
                 "recognized_slots": accepted,
                 "complete": len(reading.radiant_hero_ids) == 5
                 and len(reading.dire_hero_ids) == 5,
@@ -546,17 +786,29 @@ def evaluate(
         None,
     )
     report: dict[str, object] = {
+        "runtime": "stable" if stable else "legacy",
+        "evaluation_mode": "runtime" if stable and runtime_gates else "perception",
+        "layout_profile": layout_profile or "auto",
         "evidence_dir": str(evidence_dir.resolve()),
         "feature_path": str(feature_path.resolve()),
         "thresholds": {"minimum_score": 0.62, "minimum_margin": 0.025},
         "total_files": len(samples),
         "layout_counts": dict(sorted(layout_counts.items())),
+        "scene_counts": dict(sorted(scene_counts.items())),
+        "replay_gate_counts": dict(sorted(replay_gate_counts.items())),
+        "tracking_blocker_counts": dict(sorted(tracking_blocker_counts.items())),
         "evaluated_frames": len(frame_rows),
+        "trackable_frames": sum(bool(row["trackable"]) for row in frame_rows),
+        "target_identity_confirmed_frames": sum(
+            bool(row["target_identity_confirmed"]) for row in frame_rows
+        ),
         "complete_frames": sum(bool(row["complete"]) for row in frame_rows),
         "tracker_confirmed_frames": sum(
             bool(row["tracker_confirmed"]) for row in frame_rows
         ),
         "first_tracker_confirmation": first_tracker_confirmation,
+        "layout_switch_count": len(layout_switches),
+        "layout_switches": layout_switches,
         "mean_recognized_slots": _mean(
             [float(row["recognized_slots"]) for row in frame_rows]
         ),
@@ -631,6 +883,17 @@ def evaluate(
                 if item.state == "locked"
             ],
             "draft_ready": tracker.current_draft is not None,
+            "lock_frame_index": tracker_confirmation_index,
+            "lock_trackable_frame_index": tracker_confirmation_trackable_index,
+            "lock_latency_seconds": (
+                round(tracker_confirmation_at - first_trackable_at, 6)
+                if tracker_confirmation_at is not None
+                and first_trackable_at is not None
+                else None
+            ),
+            "post_lock_frames": post_lock_frames,
+            "exact_post_lock_frames": exact_post_lock_frames,
+            "exact_post_lock_rate": _rate(exact_post_lock_frames, post_lock_frames),
             "best_candidate_confusion": rendered_confusion(best_confusion),
             "accepted_confusion": rendered_confusion(accepted_confusion),
             "tracker_lock_confusion": rendered_confusion(tracker_confusion),
@@ -646,6 +909,11 @@ def main() -> int:
         default=ROOT / "data" / "live_betting" / "live_evidence",
     )
     parser.add_argument("--features", type=Path, default=DEFAULT_FEATURE_PATH)
+    parser.add_argument("--stable", action="store_true")
+    parser.add_argument("--perception-only", action="store_true")
+    parser.add_argument("--layout-profile", choices=tuple(sorted(_LAYOUTS)))
+    parser.add_argument("--observation-jsonl", type=Path)
+    parser.add_argument("--truth-hero-ids", type=int, nargs=10)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--database-url")
     parser.add_argument("--raybet-match-id")
@@ -665,6 +933,8 @@ def main() -> int:
         default=ROOT / "data" / "live_betting" / "vision_evidence",
     )
     args = parser.parse_args()
+    if args.perception_only and not args.stable:
+        parser.error("--perception-only requires --stable")
     database_mode = any(
         value is not None
         for value in (
@@ -674,7 +944,37 @@ def main() -> int:
             args.mapping_source,
         )
     )
-    if database_mode:
+    if args.observation_jsonl is not None and database_mode:
+        parser.error("--observation-jsonl cannot be combined with database mapping mode")
+    if args.observation_jsonl is not None and args.truth_hero_ids is None:
+        parser.error("--observation-jsonl requires --truth-hero-ids")
+    if args.observation_jsonl is None and args.truth_hero_ids is not None:
+        parser.error("--truth-hero-ids requires --observation-jsonl")
+    if args.observation_jsonl is not None:
+        samples, context = _observation_samples(
+            args.observation_jsonl,
+            captured_after=(
+                args.captured_after.timestamp()
+                if args.captured_after is not None
+                else None
+            ),
+            captured_before=(
+                args.captured_before.timestamp()
+                if args.captured_before is not None
+                else None
+            ),
+        )
+        report = evaluate(
+            args.evidence_dir,
+            args.features,
+            samples=samples,
+            truth_hero_ids=tuple(args.truth_hero_ids),
+            truth_context=context,
+            stable=args.stable,
+            layout_profile=args.layout_profile,
+            runtime_gates=not args.perception_only,
+        )
+    elif database_mode:
         if (
             args.raybet_match_id is None
             or args.map_number is None
@@ -728,9 +1028,18 @@ def main() -> int:
                     else None
                 ),
             },
+            stable=args.stable,
+            layout_profile=args.layout_profile,
+            runtime_gates=not args.perception_only,
         )
     else:
-        report = evaluate(args.evidence_dir, args.features)
+        report = evaluate(
+            args.evidence_dir,
+            args.features,
+            stable=args.stable,
+            layout_profile=args.layout_profile,
+            runtime_gates=not args.perception_only,
+        )
     rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

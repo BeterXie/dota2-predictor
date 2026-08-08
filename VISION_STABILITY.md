@@ -18,6 +18,9 @@ it does not add a database migration.
 - freeze semantics for replay/untrusted frames: accumulated trackers and locked
   lineups are not reset by the stable launcher, and OCR conflicts cannot mutate
   a locked lineup within one map;
+- target-team gating: hero evidence remains frozen until the RayBet teams are
+  confirmed on the broadcast, so a waiting-room or preceding-match HUD cannot
+  poison the immutable lineup;
 - frame-quality/freeze diagnostics;
 - optional rate-limited failure-frame and hero-crop capture with an event cap
   that survives watcher restarts;
@@ -56,6 +59,11 @@ The stable entry point installs adapters in-process and then delegates argument
 parsing, persistence, RayBet identity checks, map progression, settlement-facing
 observations and heartbeat output to the existing watcher.
 
+If team-logo loading or matching is unavailable, the stable watcher deliberately
+keeps draft tracking frozen.  An operator may use `--radiant-side team_one` or
+`--radiant-side team_two` only when the target broadcast identity and side are
+known independently.
+
 ## Real-frame corpus
 
 Create a JSONL manifest next to captured frames.  Each row may contain:
@@ -68,6 +76,18 @@ Evaluate with:
 
 ```bash
 python scripts/evaluate_vision_stability.py path/to/manifest.jsonl
+```
+
+For a truth-anchored retained observation sequence, run the stable hero
+evaluator with exactly ten HUD-order hero IDs.  `--perception-only` skips OCR
+gates and is intended for template-bank experiments; omit it for a
+runtime-faithful gate replay.
+
+```bash
+python scripts/evaluate_hero_recognition.py --stable --perception-only \
+  --layout-profile standard_dota_hud_1080p \
+  --observation-jsonl path/to/observations.jsonl \
+  --truth-hero-ids 1 2 3 4 5 6 7 8 9 10
 ```
 
 ## Deliberate boundary

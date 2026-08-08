@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
+from pathlib import Path
 import sys
 from typing import Any
 
+import cv2
+import numpy as np
 import pytest
 
+import scripts.evaluate_hero_recognition as evaluator
+
 from scripts.evaluate_hero_recognition import (
+    EvidenceSample,
+    _observation_samples,
     _validate_exact_mapping,
     _validate_single_map_clocks,
     _render_variant_usage,
+    evaluate,
     main,
 )
+from vision.hero_recognizer import DraftReading
 
 
 def test_exact_mapping_accepts_reversed_radiant_team_order() -> None:
@@ -147,3 +157,210 @@ def test_variant_usage_reports_selection_and_truth_outcomes() -> None:
             "accepted_wrong": 0,
         },
     ]
+
+
+def test_cli_selects_stable_runtime_and_forced_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_evaluate(*_: object, **options: object) -> dict[str, object]:
+        captured.update(options)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(evaluator, "evaluate", fake_evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_hero_recognition.py",
+            "--stable",
+            "--perception-only",
+            "--layout-profile",
+            "wxc_gotf_2026_live_1080p",
+        ],
+    )
+
+    assert main() == 0
+    assert captured["stable"] is True
+    assert captured["runtime_gates"] is False
+    assert captured["layout_profile"] == "wxc_gotf_2026_live_1080p"
+    assert '"status": "ok"' in capsys.readouterr().out
+
+
+def test_perception_only_evaluation_does_not_run_ocr_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_path = tmp_path / "frame.jpg"
+    assert cv2.imwrite(
+        str(frame_path), np.full((1080, 1920, 3), 100, dtype=np.uint8)
+    )
+
+    class FakeRecognizer:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def read(self, _: np.ndarray) -> DraftReading:
+            return DraftReading((1, 2, 3, 4, 5), (6, 7, 8, 9, 10), 0.9)
+
+    def fail_scoreboard(*_: object, **__: object) -> None:
+        raise AssertionError("perception-only evaluation must not initialize OCR")
+
+    monkeypatch.setattr(evaluator, "StableHeroRecognizer", FakeRecognizer)
+    monkeypatch.setattr(evaluator, "ScoreboardReader", fail_scoreboard)
+
+    report = evaluate(
+        tmp_path,
+        tmp_path / "unused.npz",
+        samples=[EvidenceSample(frame_path, 0.0, "frame-1")],
+        stable=True,
+        layout_profile="wxc_gotf_2026_live_1080p",
+        runtime_gates=False,
+    )
+
+    assert report["evaluation_mode"] == "perception"
+    assert report["trackable_frames"] == 1
+
+
+def test_runtime_evaluation_freezes_until_target_identity_is_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_path = tmp_path / "frame.jpg"
+    assert cv2.imwrite(
+        str(frame_path), np.full((1080, 1920, 3), 100, dtype=np.uint8)
+    )
+    update_calls = 0
+
+    class FakeTracker:
+        slot_statuses: tuple[object, ...] = ()
+        current_draft = None
+
+        def reset(self) -> None:
+            pass
+
+        def update(self, *_: object, **__: object) -> None:
+            nonlocal update_calls
+            update_calls += 1
+
+    class FakeRecognizer:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def read(self, _: np.ndarray) -> DraftReading:
+            return DraftReading((), (), 0.0)
+
+    class FakeScoreboardReader:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def read_replay_gate(self, _: np.ndarray) -> object:
+            return type("ReplayGate", (), {"status": "live"})()
+
+    class FakeFrameQualityTracker:
+        def assess(self, _: np.ndarray) -> object:
+            return type("Quality", (), {"usable": True})()
+
+    monkeypatch.setattr(evaluator, "StableDraftTracker", FakeTracker)
+    monkeypatch.setattr(evaluator, "StableHeroRecognizer", FakeRecognizer)
+    monkeypatch.setattr(evaluator, "ScoreboardReader", FakeScoreboardReader)
+    monkeypatch.setattr(evaluator, "FrameQualityTracker", FakeFrameQualityTracker)
+    monkeypatch.setattr(evaluator, "classify_screen_state", lambda *_: ("game", 1.0))
+
+    report = evaluate(
+        tmp_path,
+        tmp_path / "unused.npz",
+        samples=[EvidenceSample(frame_path, 0.0, "frame-1", 30, False)],
+        stable=True,
+        layout_profile="wxc_gotf_2026_live_1080p",
+    )
+
+    assert update_calls == 0
+    assert report["target_identity_confirmed_frames"] == 0
+    assert report["trackable_frames"] == 0
+    assert report["tracking_blocker_counts"] == {"target_identity_unconfirmed": 1}
+
+
+def test_observation_jsonl_loads_retained_frames_and_context(tmp_path: Path) -> None:
+    frame_path = tmp_path / "frame.jpg"
+    frame_path.write_bytes(b"frame")
+    observation_path = tmp_path / "observations.jsonl"
+    rows = [
+        {
+            "raybet_match_id": "42",
+            "map_number": 1,
+            "captured_at_utc": "2026-08-01T00:00:00Z",
+            "game_clock_seconds": 30,
+            "source_frame_sha256": "abc",
+            "source_frame_path": str(frame_path),
+        },
+        {
+            "raybet_match_id": "42",
+            "map_number": None,
+            "captured_at_utc": "2026-08-01T00:00:01Z",
+            "game_clock_seconds": None,
+            "source_frame_sha256": None,
+            "source_frame_path": None,
+        },
+    ]
+    observation_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    samples, context = _observation_samples(observation_path)
+
+    assert samples == [
+        EvidenceSample(frame_path, 1_785_542_400.0, "abc", 30, False)
+    ]
+    assert context["raybet_match_id"] == "42"
+    assert context["map_numbers"] == [1]
+    assert context["retained_frames"] == 1
+    assert context["missing_frames"] == 1
+
+
+def test_cli_evaluates_observation_jsonl_with_explicit_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation_path = tmp_path / "observations.jsonl"
+    observation_path.write_text("{}\n", encoding="utf-8")
+    samples = [EvidenceSample(tmp_path / "frame.jpg", 0.0, "frame")]
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        evaluator,
+        "_observation_samples",
+        lambda _path, **_filters: (samples, {"source": "observation_jsonl"}),
+    )
+
+    def fake_evaluate(*_: object, **options: object) -> dict[str, object]:
+        captured.update(options)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(evaluator, "evaluate", fake_evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_hero_recognition.py",
+            "--stable",
+            "--observation-jsonl",
+            str(observation_path),
+            "--truth-hero-ids",
+            "51",
+            "77",
+            "65",
+            "123",
+            "53",
+            "36",
+            "74",
+            "96",
+            "7",
+            "3",
+        ],
+    )
+
+    assert main() == 0
+    assert captured["samples"] == samples
+    assert captured["truth_hero_ids"] == (51, 77, 65, 123, 53, 36, 74, 96, 7, 3)

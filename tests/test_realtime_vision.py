@@ -16,7 +16,11 @@ from live_betting.vision import read_jsonl
 from scripts.build_hero_features import build_hero_features
 from scripts.fetch_hero_portraits import valid_portrait_bytes
 from scripts.supervise_raybet_streams import _capture_heartbeat, _heartbeat_diagnostics
-from scripts.watch_raybet_stream import allow_live_hud_tracking, _write_capture_heartbeat
+from scripts.watch_raybet_stream import (
+    _write_capture_heartbeat,
+    allow_live_hud_tracking,
+    allow_target_draft_tracking,
+)
 from vision.clock_reader import ClockReader, ClockReading
 from vision.hero_recognizer import (
     DraftReading,
@@ -693,6 +697,10 @@ def test_replay_gate_pauses_draft_but_resets_live_hud_trackers() -> None:
         is None
     )
     assert draft.update(complete_draft, observed_at=9.0) is not None
+
+
+def test_legacy_draft_tracking_does_not_require_target_team_confirmation() -> None:
+    assert allow_target_draft_tracking(radiant_team_side=None)
 
 
 @pytest.mark.parametrize(

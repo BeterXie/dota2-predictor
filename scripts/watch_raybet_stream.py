@@ -553,6 +553,12 @@ def draft_during_untrusted(
     return None
 
 
+def allow_target_draft_tracking(*, radiant_team_side: str | None) -> bool:
+    """Legacy runtime does not gate draft tracking on target-team identity."""
+    del radiant_team_side
+    return True
+
+
 def _should_persist_frame(
     previous: LiveObservation | None,
     current: LiveObservation,
@@ -1042,30 +1048,36 @@ def _run_cli(args: argparse.Namespace) -> int:
                 else:
                     advantage_tracker.reset()
                     confirmed_advantage = None
-                confirmed_draft = draft_tracker.update(
-                    _draft_for_tracking(
-                        selection.layout,
-                        hud.draft,
-                        confirmed_clock,
-                        last_clock,
-                    ),
-                    observed_at=frame.captured_at,
-                    source_frame_hash=(
-                        getattr(frame, "frame_hash", None) or frame.source_hash
-                    ),
-                    game_clock_seconds=(
-                        confirmed_clock.seconds
-                        if confirmed_clock is not None
-                        else last_clock.seconds if last_clock is not None else None
-                    ),
-                )
                 if confirmed_clock is not None:
                     last_clock = confirmed_clock
-                last_draft = confirmed_draft
                 if radiant_team_side is None and side_reader is not None:
                     side = side_tracker.update(side_reader.read(frame.image))
                     if side is not None:
                         radiant_team_side = side.radiant_team_side
+                if allow_target_draft_tracking(
+                    radiant_team_side=radiant_team_side,
+                ):
+                    confirmed_draft = draft_tracker.update(
+                        _draft_for_tracking(
+                            selection.layout,
+                            hud.draft,
+                            confirmed_clock,
+                            last_clock,
+                        ),
+                        observed_at=frame.captured_at,
+                        source_frame_hash=(
+                            getattr(frame, "frame_hash", None) or frame.source_hash
+                        ),
+                        game_clock_seconds=(
+                            confirmed_clock.seconds
+                            if confirmed_clock is not None
+                            else last_clock.seconds if last_clock is not None else None
+                        ),
+                    )
+                    last_draft = confirmed_draft
+                else:
+                    confirmed_draft = None
+                    last_draft = draft_during_untrusted(draft_tracker, last_draft)
             else:
                 outside_game_frames += 1
                 scoreboard_tracker.reset()

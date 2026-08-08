@@ -466,6 +466,11 @@ def freeze_untrusted_draft_tracking(
     return draft_tracker.current_draft or last_draft
 
 
+def require_target_team_confirmation(*, radiant_team_side: str | None) -> bool:
+    """Do not let a preceding or unrelated broadcast poison an immutable lineup."""
+    return radiant_team_side is not None
+
+
 def install_stable_runtime(watcher_module: object) -> None:
     """Install stable adapters into ``scripts.watch_raybet_stream`` in-process."""
     setattr(watcher_module, "HudReader", StableHudReader)
@@ -480,4 +485,9 @@ def install_stable_runtime(watcher_module: object) -> None:
         watcher_module,
         "draft_during_untrusted",
         freeze_untrusted_draft_tracking,
+    )
+    setattr(
+        watcher_module,
+        "allow_target_draft_tracking",
+        require_target_team_confirmation,
     )

@@ -18,6 +18,7 @@ from vision.stable_runtime import (
     freeze_untrusted_draft_tracking,
     freeze_untrusted_live_hud_tracking,
     install_stable_runtime,
+    require_target_team_confirmation,
 )
 from vision.vision_debug import VisionDebugSink
 
@@ -235,6 +236,16 @@ def test_stable_runtime_installs_replay_freeze_adapters() -> None:
 
     assert watcher_module.allow_live_hud_tracking is freeze_untrusted_live_hud_tracking
     assert watcher_module.draft_during_untrusted is freeze_untrusted_draft_tracking
+    assert (
+        watcher_module.allow_target_draft_tracking
+        is require_target_team_confirmation
+    )
+
+
+def test_stable_draft_tracking_requires_confirmed_target_team() -> None:
+    assert not require_target_team_confirmation(radiant_team_side=None)
+    assert require_target_team_confirmation(radiant_team_side="team_one")
+    assert require_target_team_confirmation(radiant_team_side="team_two")
 
 
 def test_locked_lineup_survives_strong_ocr_jitter() -> None:
