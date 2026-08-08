@@ -19,8 +19,19 @@ const api = vi.hoisted(() => ({
 
 vi.mock("./api", () => api);
 vi.mock("./components/MatchRail", () => ({
-  MatchRail: ({ matches }: { matches: MonitorMatch[] }) => (
-    <nav>{matches.map((match) => <span key={match.raybet_match_id}>{match.raybet_match_id}</span>)}</nav>
+  MatchRail: ({
+    hasMore,
+    matches,
+    onLoadMore,
+  }: {
+    hasMore?: boolean;
+    matches: MonitorMatch[];
+    onLoadMore?: () => void;
+  }) => (
+    <nav>
+      {matches.map((match) => <span key={match.raybet_match_id}>{match.raybet_match_id}</span>)}
+      {hasMore && <button onClick={onLoadMore}>加载更多历史赛事</button>}
+    </nav>
   ),
 }));
 vi.mock("./components/MatchWorkspace", () => ({
@@ -75,9 +86,14 @@ const historyMatch: MonitorMatch = {
   lifecycle: "ended",
   history_eligible: true,
 };
+const historyMatch2: MonitorMatch = {
+  ...historyMatch,
+  raybet_match_id: "history-2",
+};
 
 describe("App", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     window.history.replaceState(null, "", "/monitor");
     api.fetchBootstrap.mockResolvedValue(snapshot);
     api.fetchMatchDetail.mockResolvedValue({
@@ -122,5 +138,22 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("tab", { name: "实时赛事" }));
     await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
     expect(screen.queryByText("empty-workspace")).not.toBeInTheDocument();
+  });
+
+  it("loads subsequent history pages without dropping the first page", async () => {
+    api.fetchMonitorHistory.mockImplementation((cursor?: string | null) => Promise.resolve(
+      cursor
+        ? { items: [historyMatch2], next_cursor: null, has_more: false }
+        : { items: [historyMatch], next_cursor: "cursor-2", has_more: true },
+    ));
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "历史结果" }));
+    await waitFor(() => expect(screen.getByText("history-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "加载更多历史赛事" }));
+
+    await waitFor(() => expect(screen.getByText("history-2")).toBeInTheDocument());
+    expect(screen.getByText("history-1")).toBeInTheDocument();
+    expect(api.fetchMonitorHistory).toHaveBeenLastCalledWith("cursor-2");
   });
 });

@@ -29,6 +29,8 @@ export interface VisionPoint {
   confirmed: number;
   clock_confidence: number;
   draft_confidence: number;
+  radiant_hero_ids?: number[];
+  dire_hero_ids?: number[];
   source_frame_ref?: string;
   frame_digest?: string | null;
   frame_url?: string | null;
@@ -102,6 +104,12 @@ export interface LiveDraftContext {
   teams: LiveDraftContextTeam[];
 }
 
+export interface CanonicalTeam {
+  team_id: number;
+  team_name: string;
+  tag: string | null;
+}
+
 export interface LiveGameSnapshot {
   snapshot_id: number;
   raybet_match_id: string;
@@ -121,7 +129,7 @@ export interface LiveGameSnapshot {
 }
 
 export interface WatchLink {
-  kind: "public_stream" | "match_page" | "none";
+  kind: "public_stream" | "stream_resolver" | "match_page" | "none";
   availability: "available" | "unavailable";
   url: string | null;
   reason: string;

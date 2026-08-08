@@ -153,7 +153,7 @@ def test_manual_draft_rejects_duplicate_heroes(postgres_engine, tmp_path) -> Non
     store.close()
 
 
-def test_live_draft_context_resolves_teams_and_players_without_manual_ids(
+def test_live_draft_context_resolves_exact_teams_without_player_rosters(
     postgres_engine,
     tmp_path,
 ) -> None:
@@ -214,16 +214,11 @@ def test_live_draft_context_resolves_teams_and_players_without_manual_ids(
     assert context["status"] == "ready"
     assert context["source"] == "raybet_exact_name"
     assert [team["team_id"] for team in context["teams"]] == [11, 22]
-    assert [
-        player["player_id"] for player in context["teams"][0]["players"]
-    ] == [1001, 1002, 1003, 1004, 1005]
-    assert [
-        player["position"] for player in context["teams"][1]["players"]
-    ] == [1, 2, 3, 4, 5]
+    assert all("players" not in team for team in context["teams"])
     store.close()
 
 
-def test_live_draft_context_resolves_unique_normalized_team_names(
+def test_live_draft_context_does_not_guess_normalized_team_names(
     postgres_engine,
     tmp_path,
 ) -> None:
@@ -262,9 +257,9 @@ def test_live_draft_context_resolves_unique_normalized_team_names(
     )
 
     assert context is not None
-    assert context["status"] == "ready"
-    assert context["source"] == "raybet_normalized_name_v1"
-    assert [team["team_id"] for team in context["teams"]] == [11, 22]
+    assert context["status"] == "unavailable"
+    assert context["source"] == "raybet_exact_name"
+    assert context["teams"] == []
     store.close()
 
 
@@ -312,12 +307,12 @@ def test_live_draft_context_rejects_ambiguous_normalized_team_names(
 
     assert context is not None
     assert context["status"] == "unavailable"
-    assert context["source"] == "raybet_normalized_name_v1"
+    assert context["source"] == "raybet_exact_name"
     assert context["teams"] == []
     store.close()
 
 
-def test_live_draft_context_resolves_reused_names_by_recent_activity(
+def test_live_draft_context_does_not_guess_reused_names_by_recent_activity(
     postgres_engine,
     tmp_path,
 ) -> None:
@@ -387,10 +382,9 @@ def test_live_draft_context_resolves_reused_names_by_recent_activity(
     )
 
     assert context is not None
-    assert context["status"] == "ready"
-    assert context["source"] == "raybet_recent_activity_v1"
-    assert [team["team_id"] for team in context["teams"]] == [12, 22]
-    assert [len(team["players"]) for team in context["teams"]] == [5, 5]
+    assert context["status"] == "unavailable"
+    assert context["source"] == "raybet_exact_name"
+    assert context["teams"] == []
     store.close()
 
 

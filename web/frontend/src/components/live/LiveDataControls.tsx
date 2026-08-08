@@ -15,10 +15,12 @@ import {
   createLiveDraftPrediction,
   fetchLiveDraftPrediction,
   fetchHeroGrid,
+  fetchTeamGrid,
   saveLiveDraftMapping,
 } from "../../api";
 import { formatClock, formatDateTime, formatPercent } from "../../format";
 import type {
+  CanonicalTeam,
   LiveDraftContextTeam,
   LiveDraftMapping,
   LiveDraftProspectivePrediction,
@@ -114,6 +116,10 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
   const [heroCatalogLoaded, setHeroCatalogLoaded] = useState(false);
   const [heroCatalogBusy, setHeroCatalogBusy] = useState(false);
   const [heroCatalogError, setHeroCatalogError] = useState<string | null>(null);
+  const [teamCatalog, setTeamCatalog] = useState<CanonicalTeam[]>([]);
+  const [teamCatalogLoaded, setTeamCatalogLoaded] = useState(false);
+  const [teamCatalogBusy, setTeamCatalogBusy] = useState(false);
+  const [teamCatalogError, setTeamCatalogError] = useState<string | null>(null);
   const [picker, setPicker] = useState<{ side: Side; position: number } | null>(null);
   const [attribute, setAttribute] = useState<Attribute>("str");
   const [heroSearch, setHeroSearch] = useState("");
@@ -172,7 +178,27 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
     slots.length === 10
     && slots.every((slot) => slot.team_id > 0 && slot.hero_id > 0)
     && new Set(slots.map((slot) => slot.hero_id)).size === 10
+    && slots.find((slot) => slot.side === "radiant")?.team_id
+      !== slots.find((slot) => slot.side === "dire")?.team_id
   ), [slots]);
+
+  useEffect(() => {
+    if (!editorOpen || teamCatalogLoaded || teamCatalogBusy) return undefined;
+    const controller = new AbortController();
+    setTeamCatalogBusy(true);
+    setTeamCatalogError(null);
+    void fetchTeamGrid(controller.signal).then((catalog) => {
+      setTeamCatalog(catalog);
+      setTeamCatalogLoaded(true);
+    }).catch((error: Error) => {
+      if (!controller.signal.aborted) {
+        setTeamCatalogError(error.message || "队伍目录加载失败");
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setTeamCatalogBusy(false);
+    });
+    return () => controller.abort();
+  }, [editorOpen, teamCatalogLoaded]);
 
   useEffect(() => {
     if (!picker) return undefined;
@@ -198,6 +224,18 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
     () => new Set(slots.filter((slot) => slot.hero_id > 0).map((slot) => slot.hero_id)),
     [slots],
   );
+  const hudLineup = useMemo(
+    () => completeHudLineup(detail, mapNumber),
+    [detail, mapNumber],
+  );
+  const selectableTeams = useMemo(() => {
+    const contextTeams = (detail.draft_context?.teams || []).map((team) => ({
+      team_id: team.team_id,
+      team_name: team.team_name,
+      tag: null,
+    }));
+    return teamCatalog.length > 0 ? teamCatalog : contextTeams;
+  }, [detail.draft_context?.teams, teamCatalog]);
   const pickerHeroId = picker
     ? slots.find((slot) => (
       slot.side === picker.side && slot.position === picker.position
@@ -206,11 +244,23 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
 
   const teamForSide = (side: Side): LiveDraftContextTeam | null => {
     const teamId = slots.find((slot) => slot.side === side)?.team_id;
-    return detail.draft_context?.teams.find((team) => team.team_id === teamId) || null;
+    const contextTeam = detail.draft_context?.teams.find((team) => team.team_id === teamId);
+    if (contextTeam) return contextTeam;
+    const selected = teamCatalog.find((team) => team.team_id === teamId);
+    return selected ? {
+      match_side: side === "radiant" ? "team_one" : "team_two",
+      team_id: selected.team_id,
+      team_name: selected.team_name,
+    } : null;
   };
 
-  const openHeroPicker = (side: Side, position: number) => {
-    setPicker({ side, position });
+  const setTeamForSide = (side: Side, teamId: number) => {
+    setSlots((current) => current.map((slot) => (
+      slot.side === side ? { ...slot, team_id: teamId } : slot
+    )));
+  };
+
+  const loadHeroCatalog = () => {
     if (heroCatalogLoaded || heroCatalogBusy) return;
     setHeroCatalogBusy(true);
     setHeroCatalogError(null);
@@ -220,6 +270,11 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
     }).catch((error: Error) => {
       setHeroCatalogError(error.message || "英雄目录加载失败");
     }).finally(() => setHeroCatalogBusy(false));
+  };
+
+  const openHeroPicker = (side: Side, position: number) => {
+    setPicker({ side, position });
+    loadHeroCatalog();
   };
 
   const closeHeroPicker = () => {
@@ -280,6 +335,16 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
     } finally {
       setMappingBusy(false);
     }
+  };
+
+  const applyHudLineup = () => {
+    if (!hudLineup) return;
+    setSlots((current) => current.map((slot) => ({
+      ...slot,
+      hero_id: hudLineup[slot.side][slot.position - 1],
+    })));
+    setMappingMessage("已应用当前地图的 HUD 十英雄识别，请确认 1–5 号位后保存");
+    loadHeroCatalog();
   };
 
   const generatePrediction = async () => {
@@ -367,7 +432,7 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
         {detail.draft_context?.status !== "ready" && !mapping && (
           <div className="live-state-empty" role="status">
             <WarningCircle size={18} aria-hidden="true" />
-            <span>当前赛事的 canonical 队伍或最近阵容尚未唯一解析，已禁止手录 ID。</span>
+            <span>当前赛事的 canonical 队伍尚未唯一解析，请在阵容录入中手动选择。</span>
           </div>
         )}
         {mappingMessage && <p className="live-form-message" role="status">{mappingMessage}</p>}
@@ -556,7 +621,37 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
               >
                 交换天辉 / 夜魇
               </Button>
+              {hudLineup && (
+                <Button
+                  icon={<Pulse size={17} />}
+                  onClick={applyHudLineup}
+                  type="button"
+                >
+                  应用 HUD 识别阵容
+                </Button>
+              )}
             </div>
+            <div className="live-team-selectors">
+              {sides.map((side) => (
+                <label className="live-field" key={side}>
+                  <span>{side === "radiant" ? "天辉 canonical 队伍" : "夜魇 canonical 队伍"}</span>
+                  <select
+                    aria-label={side === "radiant" ? "选择天辉队伍" : "选择夜魇队伍"}
+                    onChange={(event) => setTeamForSide(side, Number(event.target.value))}
+                    value={slots.find((slot) => slot.side === side)?.team_id || 0}
+                  >
+                    <option value={0}>请选择队伍</option>
+                    {selectableTeams.map((team) => (
+                      <option key={team.team_id} value={team.team_id}>
+                        {team.team_name}{team.tag ? ` · ${team.tag}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+            {teamCatalogBusy && <p className="live-form-message" role="status">正在加载 canonical 队伍目录…</p>}
+            {teamCatalogError && <p className="live-form-message" role="alert">{teamCatalogError}</p>}
             <div className="prematch-lineups live-draft-lineups">
               <DraftTeamLineup
                 heroesById={heroesById}
@@ -754,6 +849,28 @@ function HeroImage({ hero }: { hero: PrematchHero }) {
       {hero.localized_name.slice(0, 1)}
     </span>
   );
+}
+
+
+function completeHudLineup(
+  detail: MatchDetail,
+  mapNumber: number,
+): Record<Side, number[]> | null {
+  const point = [
+    detail.latest_capture,
+    detail.latest_vision,
+    ...[...detail.vision].reverse(),
+  ].find((candidate) => candidate?.map_number === mapNumber
+    && candidate.radiant_hero_ids?.length === 5
+    && candidate.dire_hero_ids?.length === 5);
+  if (!point?.radiant_hero_ids || !point.dire_hero_ids) return null;
+  const heroes = [...point.radiant_hero_ids, ...point.dire_hero_ids];
+  if (heroes.some((heroId) => !Number.isInteger(heroId) || heroId <= 0)) return null;
+  if (new Set(heroes).size !== 10) return null;
+  return {
+    radiant: point.radiant_hero_ids,
+    dire: point.dire_hero_ids,
+  };
 }
 
 function NumericField({

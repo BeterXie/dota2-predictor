@@ -1379,6 +1379,17 @@ def _watch_link(
             "url": public_stream,
             "reason": "verified_unsigned_stream",
         }
+    if str(row["status"] or "").strip().casefold() in _OPEN_MATCH_STATUSES:
+        return {
+            "kind": "stream_resolver",
+            "availability": "available",
+            "url": (
+                "/api/monitor/matches/"
+                f"{url_quote(str(row['raybet_match_id']), safe='')}"
+                "/live-stream"
+            ),
+            "reason": "fresh_stream_resolution_available",
+        }
     return {
         "kind": "none",
         "availability": "unavailable",
@@ -1794,6 +1805,8 @@ def _latest_capture_row(
                        observation.radiant_team_side,
                        observation.clock_confidence,
                        observation.draft_confidence,
+                       observation.radiant_hero_ids,
+                       observation.dire_hero_ids,
                        observation.source_frame_ref,
                        observation.screen_state,
                        observation.confirmed,
@@ -1878,6 +1891,8 @@ def _valid_vision_rows(
                                    observation.radiant_team_side,
                                    observation.clock_confidence,
                                    observation.draft_confidence,
+                                   observation.radiant_hero_ids,
+                                   observation.dire_hero_ids,
                                    observation.source_frame_ref,
                                    observation.screen_state,
                                    observation.confirmed,
@@ -1932,6 +1947,8 @@ def _valid_vision_rows(
 
 def _vision_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
     point = dict(row)
+    point["radiant_hero_ids"] = _vision_hero_ids(point.get("radiant_hero_ids"))
+    point["dire_hero_ids"] = _vision_hero_ids(point.get("dire_hero_ids"))
     point["dynamic_state_authority"] = True
     point["draft_authority"] = bool(point.get("confirmed"))
     digest = point.pop("_frame_digest", None)
@@ -1949,6 +1966,8 @@ def _vision_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
 
 def _capture_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
     point = dict(row)
+    point["radiant_hero_ids"] = _vision_hero_ids(point.get("radiant_hero_ids"))
+    point["dire_hero_ids"] = _vision_hero_ids(point.get("dire_hero_ids"))
     digest = point.pop("_frame_digest", None)
     point["strategy_authority"] = False
     if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -1961,6 +1980,17 @@ def _capture_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
         point["frame_digest"] = None
         point["frame_url"] = None
     return point
+
+
+def _vision_hero_ids(value: object) -> list[int]:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    heroes = [int(hero_id) for hero_id in parsed if type(hero_id) is int and hero_id > 0]
+    return heroes if len(heroes) == len(set(heroes)) and len(heroes) <= 5 else []
 
 
 def _freshness(

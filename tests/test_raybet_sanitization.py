@@ -5,6 +5,7 @@ from live_betting.sanitize import (
     public_stream_evidence,
     sanitize_raybet_payload,
     stored_public_stream_url,
+    verified_ephemeral_stream_url,
     verified_public_stream_url,
 )
 
@@ -21,10 +22,14 @@ def test_unsigned_public_hls_url_roundtrips_with_writer_provenance() -> None:
 
 
 def test_signed_hls_query_and_credentials_never_become_public_capabilities() -> None:
+    signed_url = "https://play.ehome.gg/live/match.m3u8?token=secret"
+
+    assert verified_public_stream_url(signed_url) is None
+    assert verified_ephemeral_stream_url(signed_url) == signed_url
     assert verified_public_stream_url(
-        "https://play.ehome.gg/live/match.m3u8?token=secret"
+        "https://user:password@play.ehome.gg/live/match.m3u8"
     ) is None
-    assert verified_public_stream_url(
+    assert verified_ephemeral_stream_url(
         "https://user:password@play.ehome.gg/live/match.m3u8"
     ) is None
 

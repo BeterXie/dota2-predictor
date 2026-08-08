@@ -1,6 +1,6 @@
 import { ArrowSquareOut, Clock } from "@phosphor-icons/react";
 import { formatClock, formatDateTime } from "../../format";
-import type { MonitorMatch } from "../../types";
+import type { MonitorMatch, WatchLink } from "../../types";
 import { RelativeAge } from "../RelativeAge";
 import { LifecycleBadge } from "../StatusBadge";
 
@@ -9,8 +9,9 @@ interface LiveScoreboardProps {
   trustedVision: { game_clock_seconds?: number | null; map_number?: number | null } | null;
   now?: number;
   oddsObservedAt: string | null;
+  oddsAgePrefix: string;
   oddsSnapshotLabel: string | null;
-  watchLink: { kind: string; url: string } | null;
+  watchLink: { kind: WatchLink["kind"]; url: string } | null;
 }
 
 export function LiveScoreboard({
@@ -18,6 +19,7 @@ export function LiveScoreboard({
   trustedVision,
   now,
   oddsObservedAt,
+  oddsAgePrefix,
   oddsSnapshotLabel,
   watchLink,
 }: LiveScoreboardProps) {
@@ -41,8 +43,8 @@ export function LiveScoreboard({
               target="_blank"
               rel="noreferrer"
             >
-              <ArrowSquareOut size={15} />
-              {watchLink.kind === "match_page" ? "打开比赛页" : "打开直播"}
+              <ArrowSquareOut aria-hidden="true" size={15} />
+              观看直播
             </a>
           )}
           {oddsSnapshotLabel ? (
@@ -56,7 +58,7 @@ export function LiveScoreboard({
               icon={<Clock size={14} />}
               now={now}
               observedAt={oddsObservedAt}
-              prefix="赔率 "
+              prefix={oddsAgePrefix}
               staleAfterSeconds={60}
             />
           )}

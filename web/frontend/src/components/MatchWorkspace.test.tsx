@@ -1,5 +1,5 @@
 import { FluentProvider, webDarkTheme } from "@fluentui/react-components";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { MatchDetail, MonitorMatch } from "../types";
@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
   createLiveDraftPrediction: vi.fn(),
   fetchHeroGrid: vi.fn(),
   fetchLiveDraftPrediction: vi.fn(),
+  fetchTeamGrid: vi.fn(),
   saveLiveDraftMapping: vi.fn(),
 }));
 
@@ -27,6 +28,12 @@ const match: MonitorMatch = {
   updated_at: "2026-08-07T10:10:00+00:00",
   lifecycle: "live",
   history_eligible: false,
+  watch_link: {
+    kind: "stream_resolver",
+    availability: "available",
+    url: "/api/monitor/matches/raybet-1/live-stream",
+    reason: "fresh_stream_resolution_available",
+  },
   winner: null,
   latest_vision: {
     captured_at: "2026-08-07T10:09:00+00:00",
@@ -37,6 +44,8 @@ const match: MonitorMatch = {
     confirmed: 1,
     clock_confidence: 0.98,
     draft_confidence: 0.99,
+    radiant_hero_ids: [1, 2, 3, 4, 5],
+    dire_hero_ids: [6, 7, 8, 9, 10],
   },
 };
 
@@ -93,12 +102,12 @@ const detail: MatchDetail = {
   }],
 };
 
-function renderWorkspace(replay = false) {
+function renderWorkspace(replay = false, currentDetail = detail) {
   return render(
     <FluentProvider theme={webDarkTheme}>
       <MatchWorkspace
         csrfToken="csrf"
-        detail={detail}
+        detail={currentDetail}
         error={null}
         loading={false}
         match={match}
@@ -110,13 +119,67 @@ function renderWorkspace(replay = false) {
 
 describe("MatchWorkspace", () => {
   beforeEach(() => {
-    api.fetchHeroGrid.mockResolvedValue({ str: [], agi: [], int: [], all: [] });
+    vi.clearAllMocks();
+    api.fetchHeroGrid.mockResolvedValue({
+      str: Array.from({ length: 10 }, (_, index) => ({
+        hero_id: index + 1,
+        localized_name: `Hero ${index + 1}`,
+        hero_key: `hero_${index + 1}`,
+        image_url: "",
+      })),
+      agi: [],
+      int: [],
+      all: [],
+    });
+    api.fetchTeamGrid.mockResolvedValue([
+      { team_id: 11, team_name: "Alpha", tag: "A" },
+      { team_id: 22, team_name: "Beta", tag: "B" },
+    ]);
     api.fetchLiveDraftPrediction.mockResolvedValue({ status: "not_found", prediction: null });
+    api.saveLiveDraftMapping.mockImplementation((
+      matchId: string,
+      mapNumber: number,
+      savedSlots: typeof slots,
+      isLocked: boolean,
+    ) => Promise.resolve({
+      raybet_match_id: matchId,
+      map_number: mapNumber,
+      version: 1,
+      source: "manual",
+      is_locked: isLocked,
+      created_by: "operator",
+      created_at: "2026-08-07T10:09:30+00:00",
+      slots: savedSlots,
+    }));
+  });
+
+  it("shows a loading skeleton before the first match arrives", () => {
+    render(
+      <FluentProvider theme={webDarkTheme}>
+        <MatchWorkspace
+          detail={null}
+          error={null}
+          loading
+          match={null}
+          replay
+        />
+      </FluentProvider>,
+    );
+
+    expect(screen.getByLabelText("正在加载赛事详情")).toBeInTheDocument();
+    expect(screen.queryByText("没有可显示的赛事")).not.toBeInTheDocument();
   });
 
   it("keeps HUD evidence and the locked live prediction action", async () => {
     renderWorkspace();
 
+    const watchLink = screen.getByRole("link", { name: "观看直播" });
+    expect(watchLink).toHaveAttribute(
+      "href",
+      "/api/monitor/matches/raybet-1/live-stream",
+    );
+    expect(watchLink).toHaveAttribute("target", "_blank");
+    expect(watchLink).toHaveAttribute("rel", "noreferrer");
     expect(screen.getByText("HUD 与 Vision 证据")).toBeInTheDocument();
     expect(screen.getByText("7:00")).toBeInTheDocument();
     await waitFor(() => {
@@ -131,5 +194,62 @@ describe("MatchWorkspace", () => {
     await waitFor(() => expect(api.fetchLiveDraftPrediction).toHaveBeenCalled());
     expect(screen.queryByRole("button", { name: "生成实时阵容预测" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "追加人工修正" })).not.toBeInTheDocument();
+  });
+
+  it("shows the complete prematch snapshot while live odds are pending", async () => {
+    const prematchDetail: MatchDetail = {
+      ...detail,
+      winner: null,
+      winner_timeline: [],
+      prematch_winner: {
+        observed_at: "2026-08-07T10:09:00+00:00",
+        period: "map_1",
+        complete: true,
+        prices: { team_one: 1.65, team_two: 2.19 },
+        probabilities: { team_one: 0.5703125, team_two: 0.4296875 },
+      },
+    };
+
+    renderWorkspace(false, prematchDetail);
+
+    expect(screen.getByText("赛前快照")).toBeInTheDocument();
+    expect(screen.getByText(/赛前赔率/)).toBeInTheDocument();
+    expect(screen.getByText("1.65")).toBeInTheDocument();
+    expect(screen.getByText("2.19")).toBeInTheDocument();
+    expect(screen.queryByText("赔率 未收到")).not.toBeInTheDocument();
+  });
+
+  it("lets the operator select canonical teams and apply the HUD lineup", async () => {
+    const editableDetail: MatchDetail = {
+      ...detail,
+      draft_mapping: null,
+      draft_context: {
+        status: "unavailable",
+        reason: "canonical_teams_unresolved",
+        source: "raybet_exact_name",
+        teams: [],
+      },
+    };
+    renderWorkspace(false, editableDetail);
+
+    fireEvent.click(screen.getByRole("button", { name: "录入阵容" }));
+    await waitFor(() => expect(screen.getAllByRole("option", { name: "Alpha · A" })).toHaveLength(2));
+    fireEvent.change(screen.getByRole("combobox", { name: "选择天辉队伍" }), {
+      target: { value: "11" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "选择夜魇队伍" }), {
+      target: { value: "22" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "应用 HUD 识别阵容" }));
+
+    await waitFor(() => expect(screen.getByText("Hero 1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("checkbox", { name: "锁定后允许生成实时阵容预测" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交阵容" }));
+
+    await waitFor(() => expect(api.saveLiveDraftMapping).toHaveBeenCalledTimes(1));
+    const savedSlots = api.saveLiveDraftMapping.mock.calls[0][2] as typeof slots;
+    expect(savedSlots.filter((slot) => slot.side === "radiant").map((slot) => slot.team_id))
+      .toEqual([11, 11, 11, 11, 11]);
+    expect(savedSlots.map((slot) => slot.hero_id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 });

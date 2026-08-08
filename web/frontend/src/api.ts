@@ -1,4 +1,5 @@
 import type {
+  CanonicalTeam,
   ControlComponent,
   ControlResult,
   ControlSession,
@@ -229,4 +230,9 @@ export function createAutomaticMapping(
 
 export function fetchHeroGrid(signal?: AbortSignal): Promise<PrematchHeroGrid> {
   return getJson("/api/hero-grid", signal);
+}
+
+
+export function fetchTeamGrid(signal?: AbortSignal): Promise<CanonicalTeam[]> {
+  return getJson("/api/team-grid", signal);
 }

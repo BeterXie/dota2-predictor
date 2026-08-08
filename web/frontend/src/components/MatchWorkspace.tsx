@@ -1,10 +1,16 @@
 import { Skeleton, SkeletonItem } from "@fluentui/react-components";
 import { ChartLineUp, WarningCircle } from "@phosphor-icons/react";
+import { lazy, Suspense } from "react";
 
 import { formatOdds, formatPercent } from "../format";
 import type { MatchDetail, MonitorMatch, VisionPoint } from "../types";
 import { LiveDataControls } from "./live/LiveDataControls";
 import { LiveScoreboard } from "./live/LiveScoreboard";
+
+
+const ProbabilityChart = lazy(() => import("./ProbabilityChart").then((module) => ({
+  default: module.ProbabilityChart,
+})));
 
 
 interface MatchWorkspaceProps {
@@ -28,6 +34,13 @@ export function MatchWorkspace({
   csrfToken = null,
 }: MatchWorkspaceProps) {
   if (!match) {
+    if (loading) {
+      return (
+        <main className="workspace">
+          <WorkspaceSkeleton />
+        </main>
+      );
+    }
     return (
       <main className="workspace workspace-empty">
         <ChartLineUp size={32} aria-hidden="true" />
@@ -38,7 +51,10 @@ export function MatchWorkspace({
   }
 
   const latestVision = latestVisionPoint(detail);
-  const winner = detail?.winner || match.winner;
+  const liveWinner = detail?.winner || match.winner;
+  const prematchWinner = liveWinner ? null : detail?.prematch_winner || null;
+  const winner = liveWinner || prematchWinner;
+  const isPrematchSnapshot = prematchWinner != null;
   const watchLink = match.watch_link?.availability === "available" && match.watch_link.url
     ? { kind: match.watch_link.kind, url: match.watch_link.url }
     : null;
@@ -49,6 +65,7 @@ export function MatchWorkspace({
         match={match}
         now={now}
         oddsObservedAt={winner?.observed_at || null}
+        oddsAgePrefix={isPrematchSnapshot ? "赛前赔率 " : "赔率 "}
         oddsSnapshotLabel={replay ? "历史归档" : null}
         trustedVision={latestVision}
         watchLink={watchLink}
@@ -62,7 +79,7 @@ export function MatchWorkspace({
           side="one"
         />
         <div className="quote-context">
-          <span>{replay ? "历史赛事" : "实时赛事"}</span>
+          <span>{replay ? "历史赛事" : isPrematchSnapshot ? "赛前快照" : "实时赛事"}</span>
           <strong>{latestVision?.map_number ? `第 ${latestVision.map_number} 局` : "局数待确认"}</strong>
           <small>赔率仅用于赛事详情展示，不进入 P0/P1</small>
         </div>
@@ -79,6 +96,31 @@ export function MatchWorkspace({
           <WarningCircle size={18} aria-hidden="true" />
           <span>{error}</span>
         </div>
+      )}
+
+      {detail && (
+        <section className="workspace-section chart-section" aria-label="市场概率走势">
+          <div className="section-heading compact">
+            <div>
+              <h2>市场概率走势</h2>
+              <p>每个点来自同一采集时刻的完整双方胜负盘；纵轴为去水概率，超过 150 秒的数据空档会断开曲线。</p>
+            </div>
+            <span className="method-note">去水概率 · 不进入 P0/P1</span>
+          </div>
+          <Suspense fallback={<div className="chart-empty"><span>正在加载概率走势</span></div>}>
+            <ProbabilityChart
+              key={match.raybet_match_id}
+              emptyDescription={isPrematchSnapshot
+                ? "上方已显示最近一次完整赛前胜负盘；比赛开始并收到新快照后绘制实时走势"
+                : undefined}
+              emptyTitle={isPrematchSnapshot ? "实时走势尚未开始" : undefined}
+              preferredPeriod={winner?.period || null}
+              teamOne={match.team_one || "队伍一"}
+              teamTwo={match.team_two || "队伍二"}
+              timeline={detail.winner_timeline}
+            />
+          </Suspense>
+        </section>
       )}
 
       {loading && !detail ? <WorkspaceSkeleton /> : detail && (
