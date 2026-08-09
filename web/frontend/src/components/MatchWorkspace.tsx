@@ -55,9 +55,7 @@ export function MatchWorkspace({
   const prematchWinner = liveWinner ? null : detail?.prematch_winner || null;
   const winner = liveWinner || prematchWinner;
   const isPrematchSnapshot = prematchWinner != null;
-  const watchLink = match.watch_link?.availability === "available" && match.watch_link.url
-    ? { kind: match.watch_link.kind, url: match.watch_link.url }
-    : null;
+  const watchLink = safeWatchLink(match.watch_link, match.raybet_match_id);
 
   return (
     <main className="workspace">
@@ -131,6 +129,21 @@ export function MatchWorkspace({
       )}
     </main>
   );
+}
+
+function safeWatchLink(link: MonitorMatch["watch_link"], raybetMatchId: string): {
+  kind: "public_stream" | "match_page" | "stream_resolver";
+  url: string;
+} | null {
+  if (!link || link.availability !== "available" || !link.url) return null;
+  if (link.kind === "stream_resolver") {
+    const expected = `/api/monitor/matches/${encodeURIComponent(raybetMatchId)}/live-stream`;
+    return link.url === expected ? { kind: link.kind, url: link.url } : null;
+  }
+  if (link.kind === "public_stream" || link.kind === "match_page") {
+    return { kind: link.kind, url: link.url };
+  }
+  return null;
 }
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 
+from web import monitoring
 from web.routers import monitor
 
 
@@ -37,6 +39,21 @@ def test_monitor_snapshot_uses_one_bounded_transaction(monkeypatch) -> None:
 
     assert snapshot["cursor"] == "cursor-1"
     assert connection.events == ["begin", "commit", "close"]
+
+
+def test_stream_resolver_is_only_exposed_for_live_dota_matches() -> None:
+    row = {
+        "raybet_match_id": "38422415",
+        "status": "2",
+        "raw_json": json.dumps({"game_id": 151}),
+    }
+
+    assert monitoring._stream_resolver_url(row) == (
+        "/api/monitor/matches/38422415/live-stream"
+    )
+    assert monitoring._stream_resolver_url({**row, "status": "1"}) is None
+    assert monitoring._stream_resolver_url({**row, "raw_json": '{"game_id": 152}'}) is None
+    assert monitoring._stream_resolver_url({**row, "raybet_match_id": "not-numeric"}) is None
 
 
 def test_monitor_sse_snapshot_cache_reuses_recent_build(monkeypatch) -> None:

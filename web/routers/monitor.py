@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import threading
 import time
@@ -23,7 +22,12 @@ from live_betting.live_match_state import (
     append_live_game_snapshot,
     save_live_draft_mapping,
 )
-from live_betting.raybet import DOTA2_GAME_ID, SITE_URL, RayBetClient
+from live_betting.raybet import (
+    DOTA2_GAME_ID,
+    RayBetClient,
+    RayBetProviderPayloadError,
+    RayBetProviderResponseError,
+)
 from live_betting.sanitize import verified_ephemeral_stream_url
 from event_intelligence.live_draft_prospective_bridge import (
     LOCK_CONFIRMATION,
@@ -37,21 +41,9 @@ from .mappings import _require_control
 
 
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
-logger = logging.getLogger(__name__)
 _SNAPSHOT_CACHE_TTL_SECONDS = 5.0
 _SNAPSHOT_CACHE_LOCK = threading.Lock()
 _snapshot_cache: tuple[float, dict[str, object]] | None = None
-
-_WATCHABLE_PROVIDER_STATUSES = {
-    "1",
-    "2",
-    "active",
-    "open",
-    "running",
-    "scheduled",
-    "upcoming",
-}
-
 
 class DraftSlotRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -145,28 +137,41 @@ def live_stream(raybet_match_id: str) -> RedirectResponse:
     connection = queries.get_db()
     try:
         row = connection.execute(
-            "SELECT status FROM raybet_matches WHERE raybet_match_id=?",
+            """SELECT raybet_match_id, tournament, team_one, team_two,
+                      scheduled_at, best_of, status, live_url, raw_json,
+                      updated_at
+                 FROM raybet_matches
+                WHERE raybet_match_id=?""",
             (raybet_match_id,),
         ).fetchone()
     finally:
         connection.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail="RayBet match not found")
     if (
-        str(row["status"] or "").strip().casefold()
-        not in _WATCHABLE_PROVIDER_STATUSES
+        row is None
+        or not monitoring.is_head_to_head_match_row(row)
+        or monitoring._stream_resolver_url(row) is None
     ):
-        raise HTTPException(status_code=409, detail="RayBet match is not watchable")
+        raise HTTPException(status_code=404, detail="Live stream not found")
 
-    target = SITE_URL
     try:
         target = _fresh_live_stream_url(raybet_match_id)
-    except Exception as error:
-        logger.warning(
-            "RayBet live stream fallback for match %s (%s)",
-            raybet_match_id,
-            type(error).__name__,
-        )
+    except (RayBetProviderPayloadError, RayBetProviderResponseError):
+        raise HTTPException(
+            status_code=502,
+            detail="RayBet stream response is invalid",
+        ) from None
+    except RuntimeError:
+        raise HTTPException(
+            status_code=404,
+            detail="Live stream is unavailable",
+        ) from None
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="RayBet stream resolver is unavailable",
+        ) from None
     return RedirectResponse(
         target,
         status_code=307,
@@ -187,10 +192,10 @@ def _fresh_live_stream_url(raybet_match_id: str) -> str:
         or type(result.get("game_id")) is not int
         or int(result["game_id"]) != DOTA2_GAME_ID
     ):
-        raise ValueError("RayBet stream identity mismatch")
+        raise HTTPException(status_code=404, detail="Live stream not found")
     stream_url = verified_ephemeral_stream_url(result.get("live_url"))
     if stream_url is None:
-        raise ValueError("RayBet live stream unavailable")
+        raise HTTPException(status_code=404, detail="Live stream is unavailable")
     return stream_url
 
 

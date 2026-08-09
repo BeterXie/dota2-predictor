@@ -19,6 +19,7 @@ from live_betting.live_match_state import (
     live_draft_context,
     live_game_snapshots,
 )
+from live_betting.raybet import DOTA2_GAME_ID
 from live_betting.raybet_state import (
     infer_current_map_number,
     raybet_match_is_live,
@@ -1411,15 +1412,12 @@ def _watch_link(
             "url": public_stream,
             "reason": "verified_unsigned_stream",
         }
-    if str(row["status"] or "").strip().casefold() in _OPEN_MATCH_STATUSES:
+    resolver_url = _stream_resolver_url(row)
+    if resolver_url is not None:
         return {
             "kind": "stream_resolver",
             "availability": "available",
-            "url": (
-                "/api/monitor/matches/"
-                f"{url_quote(str(row['raybet_match_id']), safe='')}"
-                "/live-stream"
-            ),
+            "url": resolver_url,
             "reason": "fresh_stream_resolution_available",
         }
     return {
@@ -1428,6 +1426,19 @@ def _watch_link(
         "url": None,
         "reason": "no_safe_entry",
     }
+
+
+def _stream_resolver_url(row: DatabaseRow) -> str | None:
+    match_id = str(row["raybet_match_id"] or "").strip()
+    if not match_id.isdigit() or str(row["status"] or "") != "2":
+        return None
+    try:
+        payload = json.loads(str(row["raw_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("game_id") != DOTA2_GAME_ID:
+        return None
+    return f"/api/monitor/matches/{url_quote(match_id, safe='')}/live-stream"
 
 
 def _captured_raybet_page_url(

@@ -102,7 +102,11 @@ const detail: MatchDetail = {
   }],
 };
 
-function renderWorkspace(replay = false, currentDetail = detail) {
+function renderWorkspace(
+  replay = false,
+  currentDetail = detail,
+  currentMatch = match,
+) {
   return render(
     <FluentProvider theme={webDarkTheme}>
       <MatchWorkspace
@@ -110,7 +114,7 @@ function renderWorkspace(replay = false, currentDetail = detail) {
         detail={currentDetail}
         error={null}
         loading={false}
-        match={match}
+        match={currentMatch}
         replay={replay}
       />
     </FluentProvider>,
@@ -186,6 +190,18 @@ describe("MatchWorkspace", () => {
       expect(screen.getByRole("button", { name: "生成实时阵容预测" })).toBeInTheDocument();
     });
     expect(screen.getByText(/不使用击杀、经济、经验/)).toBeInTheDocument();
+  });
+
+  it("does not render an untrusted stream resolver URL", () => {
+    renderWorkspace(false, detail, {
+      ...match,
+      watch_link: {
+        ...match.watch_link!,
+        url: "/api/monitor/matches/another-match/live-stream",
+      },
+    });
+
+    expect(screen.queryByRole("link", { name: "观看直播" })).not.toBeInTheDocument();
   });
 
   it("keeps historical replay read-only", async () => {

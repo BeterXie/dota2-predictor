@@ -27,6 +27,7 @@ NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 def _raybet_match(match_id: str, *, status: int, scheduled_at: datetime) -> dict:
     return {
         "id": match_id,
+        "game_id": 151,
         "tournament_name": "PostgreSQL Integration Cup",
         "start_time": scheduled_at.isoformat(),
         "round": "bo3",
@@ -44,7 +45,7 @@ def test_monitor_list_detail_and_history_use_postgres(postgres_engine, tmp_path)
         raw_archive_root=tmp_path / "raw",
     )
     store.upsert_raybet_match(
-        _raybet_match("live-match", status=2, scheduled_at=NOW - timedelta(hours=1)),
+        _raybet_match("1001", status=2, scheduled_at=NOW - timedelta(hours=1)),
         NOW,
     )
     store.upsert_raybet_match(
@@ -58,16 +59,16 @@ def test_monitor_list_detail_and_history_use_postgres(postgres_engine, tmp_path)
     store.connection.commit()
 
     matches = monitor_matches(store.connection, now=NOW)
-    assert any(item["raybet_match_id"] == "live-match" for item in matches)
+    assert any(item["raybet_match_id"] == "1001" for item in matches)
 
-    detail = monitor_match_detail(store.connection, "live-match", now=NOW)
+    detail = monitor_match_detail(store.connection, "1001", now=NOW)
     assert detail is not None
-    assert detail["raybet_match_id"] == "live-match"
+    assert detail["raybet_match_id"] == "1001"
     assert detail["lifecycle"] in {"live", "degraded"}
     assert detail["watch_link"] == {
         "kind": "stream_resolver",
         "availability": "available",
-        "url": "/api/monitor/matches/live-match/live-stream",
+        "url": "/api/monitor/matches/1001/live-stream",
         "reason": "fresh_stream_resolution_available",
     }
 
@@ -153,6 +154,12 @@ def test_near_start_prematch_snapshot_stays_visible_without_live_promotion(
         },
     }
     assert detail["readiness"]["odds"]["status"] == "missing"
+    assert detail["watch_link"] == {
+        "kind": "none",
+        "availability": "unavailable",
+        "url": None,
+        "reason": "no_safe_entry",
+    }
     assert detail["markets"] == []
     assert detail["winner_timeline"] == []
     assert store.connection.execute(
@@ -173,35 +180,35 @@ def test_monitor_api_uses_postgres_session(postgres_engine, tmp_path, monkeypatc
         raw_archive_root=tmp_path / "raw",
     )
     store.upsert_raybet_match(
-        _raybet_match("api-match", status=2, scheduled_at=NOW - timedelta(hours=1)),
+        _raybet_match("1002", status=2, scheduled_at=NOW - timedelta(hours=1)),
         NOW,
     )
     store.connection.commit()
     store.close()
 
     monkeypatch.setattr(queries, "get_db", lambda: PostgresSession(postgres_engine))
-    stream_url = "https://play.ehome.gg/live/api-match.m3u8?expires=1&sig=test"
+    stream_url = "https://play.ehome.gg/live/1002.m3u8?expires=1&sig=test"
     monkeypatch.setattr(
         monitor_router,
         "_fresh_live_stream_url",
-        lambda match_id: stream_url if match_id == "api-match" else None,
+        lambda match_id: stream_url if match_id == "1002" else None,
     )
 
     with TestClient(app) as client:
         bootstrap = client.get("/api/monitor/bootstrap")
-        detail = client.get("/api/monitor/matches/api-match")
+        detail = client.get("/api/monitor/matches/1002")
         stream = client.get(
-            "/api/monitor/matches/api-match/live-stream",
+            "/api/monitor/matches/1002/live-stream",
             follow_redirects=False,
         )
 
     assert bootstrap.status_code == 200
     assert any(
-        item["raybet_match_id"] == "api-match"
+        item["raybet_match_id"] == "1002"
         for item in bootstrap.json()["matches"]
     )
     assert detail.status_code == 200
-    assert detail.json()["raybet_match_id"] == "api-match"
+    assert detail.json()["raybet_match_id"] == "1002"
     assert stream.status_code == 307
     assert stream.headers["location"] == stream_url
     assert stream.headers["cache-control"] == "no-store"
