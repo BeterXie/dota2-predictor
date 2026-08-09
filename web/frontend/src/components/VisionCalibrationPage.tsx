@@ -60,6 +60,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   const [heroes, setHeroes] = useState<PrematchHero[]>([]);
   const [heroGrid, setHeroGrid] = useState<PrematchHeroGrid>({ str: [], agi: [], int: [], all: [] });
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
   const [profileId, setProfileId] = useState("all");
   const [truth, setTruth] = useState<Array<number | "">>(Array(10).fill(""));
   const [matchId, setMatchId] = useState("");
@@ -80,6 +81,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const frameStageRef = useRef<HTMLDivElement>(null);
+  const calibrationGridRef = useRef<HTMLDivElement>(null);
   const heroSearchRef = useRef<HTMLInputElement>(null);
 
   const reload = async (signal?: AbortSignal) => {
@@ -119,8 +121,14 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     [heroes],
   );
   const visibleEvents = useMemo(
-    () => data?.events.filter((item) => profileId === "all" || item.profile_id === profileId) || [],
-    [data?.events, profileId],
+    () => data?.events.filter((item) => (
+      (profileId === "all" || item.profile_id === profileId)
+      && (
+        selectedMatchId === null
+        || item.label?.raybet_match_id?.trim() === selectedMatchId
+      )
+    )) || [],
+    [data?.events, profileId, selectedMatchId],
   );
   const selectedProfile = profiles.find((item) => item.profile_id === profileId) || null;
 
@@ -283,6 +291,33 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     if (next) setSelectedId(next.event_id);
   };
 
+  const clearMatchSelection = () => {
+    setSelectedMatchId(null);
+    setMessage(null);
+  };
+
+  const selectMatchSummary = (summary: VisionMatchSummary) => {
+    clearFeedback();
+    const summaryMatchId = String(summary.raybet_match_id || summary.match_id).trim();
+    const relatedEvent = data?.events.find((item) => (
+      item.label?.raybet_match_id?.trim() === summaryMatchId
+    ));
+    setSelectedMatchId(summaryMatchId);
+    setSelectedId(relatedEvent?.event_id || null);
+    if (relatedEvent) {
+      setProfileId(relatedEvent.profile_id);
+      setActivePanel("evaluation");
+    } else {
+      const summaryProfile = summary.layout_profile || "";
+      setProfileId(profiles.some((item) => item.profile_id === summaryProfile) ? summaryProfile : "all");
+      setActivePanel("truth");
+      setMessage("该局已有采集汇总，但还没有关联到校正样本。");
+    }
+    window.setTimeout(() => {
+      calibrationGridRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
+  };
+
   const openFrameFullscreen = async () => {
     try {
       await frameStageRef.current?.requestFullscreen();
@@ -394,7 +429,14 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
             <span>{matchSummaries.length} 局</span>
           </header>
           <div className="vision-match-summary-grid">
-            {matchSummaries.map((summary) => <MatchSummaryCard key={summary.match_id} summary={summary} />)}
+            {matchSummaries.map((summary) => (
+              <MatchSummaryCard
+                key={summary.match_id}
+                onSelect={selectMatchSummary}
+                selected={selectedMatchId === String(summary.raybet_match_id || summary.match_id).trim()}
+                summary={summary}
+              />
+            ))}
           </div>
         </section>
       )}
@@ -407,7 +449,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
           <code>data/live_betting/vision_debug</code>
         </section>
       ) : (
-        <div className="vision-calibration-grid">
+        <div className="vision-calibration-grid" ref={calibrationGridRef}>
           <section className="vision-event-queue" aria-label="Vision 校正样本">
             <header className="vision-queue-header">
               <div className="vision-queue-title">
@@ -418,7 +460,10 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                 <span>赛事 UI profile</span>
                 <select
                   aria-label="赛事 UI profile"
-                  onChange={(change) => setProfileId(change.target.value)}
+                  onChange={(change) => {
+                    setSelectedMatchId(null);
+                    setProfileId(change.target.value);
+                  }}
                   value={profileId}
                 >
                   <option value="all">全部赛事 UI</option>
@@ -434,6 +479,20 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                   ? `${selectedProfile.layout || selectedProfile.profile_id}：${selectedProfile.labeled_event_count} 个样本已标注，${selectedProfile.candidate_count} 个候选可复用`
                   : "同一 UI profile 可以复用候选模板。"}
               </p>
+              {selectedMatchId && (
+                <div className="vision-match-filter">
+                  <span>RayBet {selectedMatchId}</span>
+                  <Tooltip content="清除比赛筛选" relationship="label">
+                    <Button
+                      appearance="subtle"
+                      aria-label="清除比赛筛选"
+                      icon={<X size={14} />}
+                      onClick={clearMatchSelection}
+                      size="small"
+                    />
+                  </Tooltip>
+                </div>
+              )}
             </header>
             <div className="vision-event-list">
               {visibleEvents.map((item) => {
@@ -465,6 +524,13 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                   </button>
                 );
               })}
+              {!visibleEvents.length && (
+                <div className="vision-queue-empty">
+                  <ImageSquare size={22} aria-hidden="true" />
+                  <strong>该比赛暂无关联校正样本</strong>
+                  <span>采集汇总仍然保留，可在产生可校正帧后继续标注。</span>
+                </div>
+              )}
             </div>
           </section>
 
@@ -820,13 +886,28 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
 }
 
 
-function MatchSummaryCard({ summary }: { summary: VisionMatchSummary }) {
+function MatchSummaryCard({
+  onSelect,
+  selected,
+  summary,
+}: {
+  onSelect: (summary: VisionMatchSummary) => void;
+  selected: boolean;
+  summary: VisionMatchSummary;
+}) {
   const maps = summary.maps.length ? summary.maps.map((map) => `Map ${map}`).join(" · ") : "Map 待识别";
   const title = summary.display_name || `RayBet ${summary.match_id}`;
   const stateClass = ["live", "draft", "preparing", "ending", "ended", "waiting", "archived"]
     .includes(summary.status) ? summary.status : "unknown";
   return (
-    <article className={`vision-match-summary ${stateClass}`}>
+    <article className={`vision-match-summary ${stateClass}${selected ? " selected" : ""}`}>
+      <button
+        aria-label={`打开 ${title} 的校正记录`}
+        aria-pressed={selected}
+        className="vision-match-summary-action"
+        onClick={() => onSelect(summary)}
+        type="button"
+      />
       <header>
         <div>
           <h3 title={title}>{title}</h3>

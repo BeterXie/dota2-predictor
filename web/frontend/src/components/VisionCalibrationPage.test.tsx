@@ -208,6 +208,37 @@ describe("VisionCalibrationPage", () => {
     expect(within(summary).getByText("BP 已确认")).toBeInTheDocument();
     expect(within(summary).getByText("开局已确认")).toBeInTheDocument();
     expect(within(summary).getByText("game_started")).toBeInTheDocument();
+    expect(within(summary).getByRole("button", {
+      name: "打开 官方 Match ID 8123456789 · Team A vs Team B · The International 2026 的校正记录",
+    })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("opens a match card on its retained label and evaluation history", async () => {
+    api.fetchVisionCalibration.mockResolvedValue({
+      ...bootstrap,
+      events: [{ ...event, label }],
+      profiles: [{
+        profile_id: event.profile_id,
+        layout: event.layout,
+        event_count: 1,
+        labeled_event_count: 1,
+        candidate_count: 1,
+        latest_captured_at: event.captured_at,
+      }],
+      candidates: [candidate],
+      evaluations: [evaluation],
+    });
+    renderPage();
+
+    const openMatch = await screen.findByRole("button", {
+      name: "打开 官方 Match ID 8123456789 · Team A vs Team B · The International 2026 的校正记录",
+    });
+    fireEvent.click(openMatch);
+
+    expect(openMatch).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("combobox", { name: "赛事 UI profile" })).toHaveValue(event.profile_id);
+    expect(screen.getByRole("tab", { name: "留出评估" })).toHaveAttribute("aria-selected", "true");
+    expect(within(screen.getByRole("region", { name: "最近评估" })).getByText("9 / 10")).toBeInTheDocument();
   });
 
   it("lists only matching Observation metadata without selecting a sequence", async () => {

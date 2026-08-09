@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -261,6 +262,42 @@ def test_calibration_skips_malformed_debug_metadata(tmp_path: Path) -> None:
     service = VisionCalibrationService(tmp_path, feature_path=feature_path)
 
     assert len(service.bootstrap()["events"]) == 1
+
+
+def test_calibration_keeps_labeled_events_outside_the_recent_limit(
+    tmp_path: Path,
+) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    older = _debug_event(
+        tmp_path,
+        event_name="20260808T120000_labeled",
+        captured_at=1_785_600_000.0,
+    )
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    event_id = str(service.bootstrap()["events"][0]["event_id"])
+    service.save_label(
+        event_id,
+        hero_ids=tuple(range(1, 11)),
+        raybet_match_id="42",
+        map_number=1,
+        note=None,
+    )
+    newer = _debug_event(
+        tmp_path,
+        event_name="20260809T120000_recent",
+        captured_at=1_785_686_400.0,
+    )
+    os.utime(older / "metadata.json", (1, 1))
+    os.utime(newer / "metadata.json", (2, 2))
+
+    bootstrap = service.bootstrap(limit=1)
+
+    names = [str(event["relative_path"]).split("/")[-1] for event in bootstrap["events"]]
+    assert names == ["20260809T120000_recent", "20260808T120000_labeled"]
+    profile = bootstrap["profiles"][0]
+    assert profile["event_count"] == 2
+    assert profile["labeled_event_count"] == 1
 
 
 def test_calibration_uses_shared_observation_directory(

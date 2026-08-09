@@ -366,13 +366,40 @@ class VisionCalibrationService:
             reverse=True,
         )
         events: list[dict[str, object]] = []
+        selected_paths: set[Path] = set()
         for path in paths:
             try:
-                events.append(self._event_from_path(path))
+                event = self._event_from_path(path)
             except (OSError, ValueError):
                 continue
+            events.append(event)
+            selected_paths.add(path.resolve())
             if len(events) >= limit:
                 break
+
+        label_root = self.paths.calibration_root / "labels"
+        if label_root.exists():
+            debug_root = self.paths.debug_root.resolve()
+            for label_path in sorted(label_root.glob("*.json")):
+                label = self._optional_json(label_path)
+                relative = label.get("event_relative_path") if label else None
+                if not isinstance(relative, str) or not relative.strip():
+                    continue
+                metadata_path = (debug_root / relative / "metadata.json").resolve()
+                try:
+                    metadata_path.relative_to(debug_root)
+                except ValueError:
+                    continue
+                if metadata_path in selected_paths or not metadata_path.is_file():
+                    continue
+                try:
+                    event = self._event_from_path(metadata_path)
+                except (OSError, ValueError):
+                    continue
+                if event.get("label") is None:
+                    continue
+                events.append(event)
+                selected_paths.add(metadata_path)
         return events
 
     def _event(self, event_id: str) -> dict[str, object]:

@@ -8419,12 +8419,42 @@ body {
 }
 
 .vision-match-summary {
+  position: relative;
   min-width: 0;
   padding: 13px;
   border: 1px solid var(--vision-border);
   border-left: 3px solid var(--vision-text-muted);
-  border-radius: 9px;
+  border-radius: 8px;
   background: var(--vision-bg-surface);
+  transition: border-color 0.18s ease, background-color 0.18s ease, transform 0.18s ease;
+}
+
+.vision-match-summary:hover {
+  background: var(--vision-bg-hover);
+  transform: translateY(-1px);
+}
+
+.vision-match-summary.selected {
+  border-color: var(--vision-accent);
+  border-left-color: var(--vision-accent);
+  background: var(--vision-accent-soft);
+  opacity: 1;
+}
+
+.vision-match-summary-action {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.vision-match-summary-action:focus-visible {
+  outline: 2px solid var(--vision-accent);
+  outline-offset: -2px;
 }
 
 .vision-match-summary.live,
@@ -8544,6 +8574,57 @@ body {
 .vision-match-summary > footer code {
   color: var(--vision-text-secondary);
   background: transparent;
+}
+
+.vision-match-filter {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 5px 5px 5px 9px;
+  border: 1px solid var(--vision-border-active);
+  border-radius: 7px;
+  color: var(--vision-text-secondary);
+  background: var(--vision-accent-soft);
+}
+
+.vision-match-filter > span {
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vision-match-filter button {
+  min-width: 28px;
+  width: 28px;
+  height: 28px;
+  color: var(--vision-text-secondary);
+}
+
+.vision-queue-empty {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  padding: 24px 16px;
+  color: var(--vision-text-muted);
+  text-align: center;
+}
+
+.vision-queue-empty strong {
+  color: var(--vision-text-secondary);
+  font-size: 12px;
+}
+
+.vision-queue-empty span {
+  max-width: 190px;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 /* Vision HUD truth avatar picker */
