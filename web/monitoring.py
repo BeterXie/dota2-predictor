@@ -391,23 +391,8 @@ def monitor_match_detail(
         raybet_match_id,
         limit=min(max_points, 1200),
     )
-    provider_is_prematch = (
-        str(summary["provider_status"]).casefold()
-        in _UPCOMING_MATCH_STATUSES
-    )
     return {
         **summary,
-        "prematch_winner": (
-            _current_winner(
-                connection,
-                raybet_match_id,
-                provider_status=str(summary["provider_status"]),
-                processing_status="audit_only",
-                transport_only=True,
-            )
-            if provider_is_prematch
-            else None
-        ),
         "winner_timeline": timeline,
         "vision": _vision_timeline(
             connection,
@@ -948,6 +933,8 @@ def _realtime_match_candidates(
     by_match: dict[str, tuple[int, DatabaseRow]] = {}
     for priority, rows in buckets:
         for row in rows:
+            if str(row["status"] or "").casefold() == "unlisted":
+                continue
             if not is_head_to_head_match_row(row):
                 continue
             match_id = str(row["raybet_match_id"])
@@ -1095,6 +1082,8 @@ def _history_candidate_window(
     raw_anchor: DatabaseRow | None = None
     for row in raw_rows[:_HISTORY_RAW_SCAN_LIMIT]:
         raw_anchor = row
+        if str(row["status"] or "").casefold() == "unlisted":
+            continue
         if is_head_to_head_match_row(row):
             candidates.append(row)
             if len(candidates) > _HISTORY_SCAN_LIMIT:
@@ -1281,6 +1270,17 @@ def _monitor_match(
             f"map_{current_map_number}" if current_map_number is not None else None
         ),
     )
+    prematch_winner = (
+        _current_winner(
+            connection,
+            match_id,
+            provider_status=str(row["status"] or ""),
+            processing_status="audit_only",
+            transport_only=True,
+        )
+        if str(row["status"] or "").casefold() in _UPCOMING_MATCH_STATUSES
+        else None
+    )
     history_eligible = _history_eligible(
         lifecycle,
         str(row["status"] or ""),
@@ -1320,6 +1320,7 @@ def _monitor_match(
         "history_eligible": history_eligible,
         "current_map_number": current_map_number,
         "winner": current_winner,
+        "prematch_winner": prematch_winner,
         "latest_vision": (
             _vision_point(latest_vision, match_id) if latest_vision else None
         ),

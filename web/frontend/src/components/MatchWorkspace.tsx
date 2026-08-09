@@ -59,42 +59,49 @@ export function MatchWorkspace({
 
   return (
     <main className="workspace">
-      <LiveScoreboard
-        match={match}
-        now={now}
-        oddsObservedAt={winner?.observed_at || null}
-        oddsAgePrefix={isPrematchSnapshot ? "赛前赔率 " : "赔率 "}
-        oddsSnapshotLabel={replay ? "历史归档" : null}
-        trustedVision={latestVision}
-        watchLink={watchLink}
-      />
+      <section
+        className={`match-decision-hero${isPrematchSnapshot ? " prematch" : ""}`}
+        aria-label={isPrematchSnapshot ? "赛前赛事概览" : "赛事与市场概览"}
+      >
+        <LiveScoreboard
+          match={match}
+          now={now}
+          oddsObservedAt={winner?.observed_at || null}
+          oddsAgePrefix={isPrematchSnapshot ? "赛前赔率 " : "赔率 "}
+          oddsSnapshotLabel={replay ? "历史归档" : null}
+          trustedVision={latestVision}
+          watchLink={watchLink}
+        />
 
-      <section className="quote-strip" aria-label="最新胜负盘">
-        <QuoteCell
-          label={match.team_one || "队伍一"}
-          odds={winner?.prices?.team_one}
-          probability={winner?.probabilities?.team_one}
-          side="one"
-        />
-        <div className="quote-context">
-          <span>{replay ? "历史赛事" : isPrematchSnapshot ? "赛前快照" : "实时赛事"}</span>
-          <strong>{latestVision?.map_number ? `第 ${latestVision.map_number} 局` : "局数待确认"}</strong>
-          <small>赔率仅用于赛事详情展示，不进入 P0/P1</small>
-        </div>
-        <QuoteCell
-          label={match.team_two || "队伍二"}
-          odds={winner?.prices?.team_two}
-          probability={winner?.probabilities?.team_two}
-          side="two"
-        />
+        <section className="quote-strip" aria-label="最新胜负盘">
+          <QuoteCell
+            label={match.team_one || "队伍一"}
+            odds={winner?.prices?.team_one}
+            probability={winner?.probabilities?.team_one}
+            side="one"
+          />
+          <div className="quote-context">
+            <span>{replay ? "历史赛事" : isPrematchSnapshot ? "赛前快照" : "实时赛事"}</span>
+            <strong>{latestVision?.map_number
+              ? `第 ${latestVision.map_number} 局`
+              : isPrematchSnapshot ? "等待开赛" : "局数待确认"}</strong>
+            <small>赔率仅用于赛事详情展示，不进入 P0/P1</small>
+          </div>
+          <QuoteCell
+            label={match.team_two || "队伍二"}
+            odds={winner?.prices?.team_two}
+            probability={winner?.probabilities?.team_two}
+            side="two"
+          />
+        </section>
+
+        {error && (
+          <div className="inline-error" role="alert">
+            <WarningCircle size={18} aria-hidden="true" />
+            <span>{error}</span>
+          </div>
+        )}
       </section>
-
-      {error && (
-        <div className="inline-error" role="alert">
-          <WarningCircle size={18} aria-hidden="true" />
-          <span>{error}</span>
-        </div>
-      )}
 
       {detail && (
         <section className="workspace-section chart-section" aria-label="市场概率走势">

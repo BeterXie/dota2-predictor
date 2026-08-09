@@ -43,6 +43,22 @@ class BuildCalibrationCandidateRequest(BaseModel):
     label_id: str = Field(min_length=20, max_length=20, pattern=r"^[a-f0-9]+$")
 
 
+class PromoteCalibrationCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation_ids: list[str] = Field(min_length=2, max_length=10)
+
+    @field_validator("evaluation_ids")
+    @classmethod
+    def valid_evaluation_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or any(
+            len(item) != 32 or any(char not in "0123456789abcdef" for char in item)
+            for item in value
+        ):
+            raise ValueError("evaluation_ids must be unique lowercase hex IDs")
+        return value
+
+
 class RunCalibrationEvaluationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,17 +82,32 @@ def bootstrap(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     observation_files = result.get("observation_files")
-    if not isinstance(observation_files, list) or not observation_files:
+    match_summaries = result.get("match_summaries")
+    if (
+        (not isinstance(observation_files, list) or not observation_files)
+        and (not isinstance(match_summaries, list) or not match_summaries)
+    ):
         return result
     connection = queries.get_db()
     try:
         try:
-            for item in observation_files:
-                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                    continue
-                metadata = observation_file_metadata(connection, str(item["name"]))
-                if metadata is not None:
-                    item.update(metadata)
+            if isinstance(observation_files, list):
+                for item in observation_files:
+                    if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                        continue
+                    metadata = observation_file_metadata(connection, str(item["name"]))
+                    if metadata is not None:
+                        item.update(metadata)
+            if isinstance(match_summaries, list):
+                for item in match_summaries:
+                    if not isinstance(item, dict):
+                        continue
+                    observation_file = item.get("observation_file")
+                    if not isinstance(observation_file, str):
+                        continue
+                    metadata = observation_file_metadata(connection, observation_file)
+                    if metadata is not None:
+                        item.update(metadata)
         except SQLAlchemyError:
             pass
     finally:
@@ -137,6 +168,26 @@ def build_candidate(
         return calibration_service.build_candidate(payload.label_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Calibration label not found") from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post("/candidates/{candidate_id}/promote")
+def promote_candidate(
+    payload: PromoteCalibrationCandidateRequest,
+    request: Request,
+    candidate_id: str = ApiPath(pattern=r"^[a-z0-9-]{1,200}$"),
+    session_id: str | None = Cookie(default=None, alias=_COOKIE_NAME),
+    csrf_token: str | None = Header(default=None, alias="X-Monitor-CSRF"),
+) -> dict[str, object]:
+    _require_control(request, session_id, csrf_token)
+    try:
+        return calibration_service.promote_candidate(
+            candidate_id,
+            evaluation_ids=tuple(payload.evaluation_ids),
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Calibration input missing") from None
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 

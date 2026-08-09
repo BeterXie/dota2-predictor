@@ -3,7 +3,7 @@ import type { Lifecycle, ReadinessStatus } from "./types";
 export const lifecycleLabel: Record<Lifecycle, string> = {
   live: "滚球确认",
   degraded: "数据降级",
-  upcoming: "即将开始",
+  upcoming: "赛前",
   ended: "已结束",
 };
 

@@ -49,6 +49,7 @@ from vision.scoreboard_reader import (
     ScoreboardReader,
     ScoreboardReading,
 )
+from vision.profile_features import promoted_profile_feature_path
 from vision.screen_state import classify_screen_state
 from vision.stream_capture import HLSStreamCapture, StreamFrame
 from vision.vision_debug import VisionDebugSink
@@ -307,10 +308,13 @@ class StableHudReader(HudReader):
         scoreboard = ScoreboardReader(layout, use_ocr=self.use_ocr)
         clock = ClockReader(layout, use_ocr=False)
         clock.ocr = scoreboard.ocr
+        feature_path = self.feature_path
+        if Path(feature_path).resolve() == DEFAULT_FEATURE_PATH.resolve():
+            feature_path = promoted_profile_feature_path(layout.name) or feature_path
         profile = _ProfileReaders(
             scoreboard=scoreboard,
             clock=clock,
-            heroes=StableHeroRecognizer(self.feature_path, layout),
+            heroes=StableHeroRecognizer(feature_path, layout),
         )
         self._profiles[layout.name] = profile
         return profile

@@ -109,6 +109,30 @@ const bootstrap: VisionCalibrationBootstrap = {
   }],
   candidates: [],
   evaluations: [],
+  match_summaries: [{
+    match_id: "38417147",
+    observation_file: "holdout.jsonl",
+    status: "live",
+    status_label: "比赛进行中",
+    phase: "game_started",
+    observation_count: 420,
+    evidence_frame_count: 38,
+    manifest_event_count: 40,
+    periodic_count: 36,
+    draft_started: true,
+    game_started: true,
+    ended_final: false,
+    first_captured_at: "2026-08-08T12:00:00+00:00",
+    last_captured_at: "2026-08-08T12:30:00+00:00",
+    latest_screen_state: "game",
+    layout_profile: "standard_dota_hud_1080p",
+    maps: [1],
+    capture_status: "producing_trusted",
+    heartbeat_fresh: true,
+    raybet_match_id: "38417147",
+    official_match_id: "8123456789",
+    display_name: "官方 Match ID 8123456789 · Team A vs Team B · The International 2026",
+  }],
   observation_files: [{
     name: "holdout.jsonl",
     bytes: 2048,
@@ -173,6 +197,19 @@ describe("VisionCalibrationPage", () => {
     expect(frame.closest(".vision-frame-canvas")).toHaveStyle({ width: "125%" });
   });
 
+  it("summarizes the Vision corpus once per match", async () => {
+    renderPage();
+
+    const summary = await screen.findByRole("region", { name: "比赛汇总" });
+    expect(within(summary).getByText("1 局")).toBeInTheDocument();
+    expect(within(summary).getByText("比赛进行中")).toBeInTheDocument();
+    expect(within(summary).getByText("420")).toBeInTheDocument();
+    expect(within(summary).getByText("38")).toBeInTheDocument();
+    expect(within(summary).getByText("BP 已确认")).toBeInTheDocument();
+    expect(within(summary).getByText("开局已确认")).toBeInTheDocument();
+    expect(within(summary).getByText("game_started")).toBeInTheDocument();
+  });
+
   it("lists only matching Observation metadata without selecting a sequence", async () => {
     api.fetchVisionCalibration.mockResolvedValue({
       ...bootstrap,
@@ -231,11 +268,15 @@ describe("VisionCalibrationPage", () => {
     fireEvent.change(screen.getByLabelText("Map"), { target: { value: "2" } });
     expect(save).toBeEnabled();
 
-    fireEvent.change(screen.getByLabelText("Dire slot 5"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "清除 Dire slot 5 英雄" }));
     expect(save).toBeDisabled();
     expect(screen.getByText("需要十个互不重复的英雄真实值。")).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("Dire slot 5"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "选择 Dire slot 5 英雄" }));
+    const picker = screen.getByRole("dialog", { name: "HUD 真实值英雄选择器" });
+    expect(within(picker).getByRole("button", { name: "选择英雄 Hero 1" })).toBeDisabled();
+    fireEvent.click(within(picker).getByRole("button", { name: "选择英雄 Hero 10" }));
+    expect(save).toBeEnabled();
     api.saveVisionCalibrationLabel.mockResolvedValue({
       ...label,
       map_number: 2,

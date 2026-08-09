@@ -32,12 +32,14 @@ from .raybet import (
     BASE_URL,
     DOTA2_GAME_ID,
     LIVE_MATCH_TYPES,
+    OPEN_MATCH_TYPES,
     PREMATCH_MATCH_TYPES,
     RayBetClient,
 )
 from .sanitize import sanitize_raybet_payload, verified_public_stream_url
 from .storage import LiveBettingStore
 from .strict_eligibility import (
+    RAYBET_MATCH_HEAD_TO_HEAD,
     RAYBET_MATCH_NON_HEAD_TO_HEAD,
     classify_raybet_match_format,
 )
@@ -385,19 +387,65 @@ def _refresh_live_list_cache(
     wall_clock: Callable[[], datetime],
 ) -> tuple[LiveListCache, bool]:
     try:
-        rows = _fetch_match_list(store, client, response_kind="live_match_list")
+        fetched_rows = _fetch_match_list(
+            store,
+            client,
+            response_kind="live_match_list",
+            match_types=OPEN_MATCH_TYPES,
+        )
     except Exception:
         if cache is None or cache.current_rows(monotonic_clock()) is None:
             raise
         return cache, True
+    rows = [
+        row
+        for row in fetched_rows
+        if classify_raybet_match_format(row) == RAYBET_MATCH_HEAD_TO_HEAD
+    ]
+    observed_at = wall_clock()
+    _sync_open_match_rows(store, rows, observed_at=observed_at)
     return (
         LiveListCache.create(
             rows,
-            fetched_at_utc=wall_clock(),
+            fetched_at_utc=observed_at,
             monotonic_now=monotonic_clock(),
         ),
         False,
     )
+
+
+def _sync_open_match_rows(
+    store: LiveBettingStore,
+    rows: list[dict[str, Any]],
+    *,
+    observed_at: datetime,
+) -> None:
+    """Persist the authoritative open list independently from odds polling."""
+
+    current_rows = [row for row in rows if isinstance(row, dict)]
+    current_ids = sorted(
+        {
+            str(row.get("id") or "")
+            for row in current_rows
+            if str(row.get("id") or "").isdigit()
+        }
+    )
+    with store.transaction():
+        if current_ids:
+            placeholders = ",".join("?" for _ in current_ids)
+            store.connection.execute(
+                f"""UPDATE raybet_matches SET status='unlisted'
+                     WHERE COALESCE(CAST(status AS TEXT), '') IN ('1', '2')
+                       AND raybet_match_id NOT IN ({placeholders})""",
+                tuple(current_ids),
+            )
+        else:
+            store.connection.execute(
+                """UPDATE raybet_matches SET status='unlisted'
+                     WHERE COALESCE(CAST(status AS TEXT), '') IN ('1', '2')"""
+            )
+        for row in current_rows:
+            store.upsert_raybet_match(row, observed_at)
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
@@ -650,7 +698,7 @@ def _scheduled_live_fallback_due(
     *,
     now: datetime,
 ) -> bool:
-    if str(list_row.get("status") or "") != "1":
+    if str(list_row.get("status") or "") not in {"1", "unlisted"}:
         return False
     scheduled_at = _scheduled_start_utc(list_row)
     if scheduled_at is None:
@@ -671,7 +719,7 @@ def _scheduled_live_fallback_rows(
     rows = store.connection.execute(
         """SELECT raybet_match_id, scheduled_at, status
              FROM raybet_matches
-            WHERE COALESCE(CAST(status AS TEXT), '') IN ('1', '2')"""
+            WHERE COALESCE(CAST(status AS TEXT), '') IN ('1', 'unlisted')"""
     ).fetchall()
     fallback_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -704,10 +752,23 @@ def _prematch_collection_due(
         return False
     now_utc = now.astimezone(timezone.utc)
     until_start = scheduled_at - now_utc
-    if not timedelta(0) < until_start <= PREMATCH_COLLECTION_LEAD_TIME:
+    if until_start <= timedelta(0):
         return False
 
-    window_start = scheduled_at - PREMATCH_COLLECTION_LEAD_TIME
+    # Keep one early quote available for the pre-match page even when the
+    # provider lists a match more than two hours before kickoff. The first
+    # quote is audit-only and cannot enter production odds inputs. Once the
+    # match reaches the normal lead window, refresh once within that window.
+    window_start = (
+        scheduled_at - PREMATCH_COLLECTION_LEAD_TIME
+        if until_start <= PREMATCH_COLLECTION_LEAD_TIME
+        else datetime(1970, 1, 1, tzinfo=timezone.utc)
+    )
+    window_end = (
+        scheduled_at
+        if until_start <= PREMATCH_COLLECTION_LEAD_TIME
+        else now_utc
+    )
     row = store.connection.execute(
         """SELECT 1 FROM direct_response_audit
              WHERE response_kind='live_odds'
@@ -720,7 +781,7 @@ def _prematch_collection_due(
                AND live_text_timestamp_utc(observed_at)<
                    live_text_timestamp_utc(?)
              LIMIT 1""",
-        (match_id, window_start.isoformat(), scheduled_at.isoformat()),
+        (match_id, window_start.isoformat(), window_end.isoformat()),
     ).fetchone()
     return row is None
 

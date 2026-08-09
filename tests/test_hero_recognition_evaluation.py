@@ -353,6 +353,41 @@ def test_observation_jsonl_selects_map_inferred_from_clock_reset(tmp_path: Path)
     assert context["selected_jsonl_rows"] == 2
 
 
+def test_observation_jsonl_prefers_multiple_explicit_map_segments_over_clock_noise(
+    tmp_path: Path,
+) -> None:
+    frame_paths = []
+    for index in range(4):
+        frame_path = tmp_path / f"frame-{index}.jpg"
+        frame_path.write_bytes(b"frame")
+        frame_paths.append(frame_path)
+    observation_path = tmp_path / "38422524.jsonl"
+    rows = [
+        {
+            "raybet_match_id": "38422524",
+            "map_number": map_number,
+            "captured_at_utc": f"2026-08-01T00:00:0{index}Z",
+            "game_clock_seconds": clock,
+            "source_frame_sha256": f"frame-{index}",
+            "source_frame_path": str(frame_paths[index]),
+        }
+        for index, (map_number, clock) in enumerate(
+            ((1, 1000), (1, 700), (2, 44), (2, 54))
+        )
+    ]
+    observation_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    samples, context = _observation_samples(observation_path, map_number=2)
+
+    assert [sample.path for sample in samples] == frame_paths[2:]
+    assert context["map_numbers"] == [1, 2]
+    assert context["source_map_numbers"] == [1, 2]
+    assert context["selected_jsonl_rows"] == 2
+
+
 def test_observation_jsonl_requires_map_for_multiple_inferred_segments(
     tmp_path: Path,
 ) -> None:

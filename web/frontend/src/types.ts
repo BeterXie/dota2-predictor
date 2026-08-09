@@ -154,6 +154,7 @@ export interface MonitorMatch {
   history_eligible: boolean;
   current_map_number?: number | null;
   winner: WinnerQuote | null;
+  prematch_winner?: WinnerQuote | null;
   latest_vision: VisionPoint | null;
 }
 
@@ -368,7 +369,7 @@ export interface VisionCalibrationCandidate {
   created_at: string;
   feature_sha256: string;
   production_feature_sha256: string;
-  promoted: false;
+  promoted: boolean;
 }
 
 export interface VisionCalibrationEvaluation {
@@ -393,11 +394,37 @@ export interface VisionCalibrationEvaluation {
   candidate_feature_sha256: string;
 }
 
+export interface VisionMatchSummary {
+  match_id: string;
+  observation_file: string | null;
+  status: string;
+  status_label: string;
+  phase: string;
+  observation_count: number;
+  evidence_frame_count: number;
+  manifest_event_count: number;
+  periodic_count: number;
+  draft_started: boolean;
+  game_started: boolean;
+  ended_final: boolean;
+  first_captured_at: string | null;
+  last_captured_at: string | null;
+  latest_screen_state: string | null;
+  layout_profile: string | null;
+  maps: number[];
+  capture_status: string | null;
+  heartbeat_fresh: boolean;
+  raybet_match_id?: string;
+  official_match_id?: string | null;
+  display_name?: string;
+}
+
 export interface VisionCalibrationBootstrap {
   events: VisionCalibrationEvent[];
   profiles: VisionCalibrationProfile[];
   candidates: VisionCalibrationCandidate[];
   evaluations: VisionCalibrationEvaluation[];
+  match_summaries: VisionMatchSummary[];
   observation_files: Array<{
     name: string;
     bytes: number;

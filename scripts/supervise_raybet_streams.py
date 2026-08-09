@@ -33,11 +33,17 @@ from live_betting.vision_retention import prune_vision_evidence  # noqa: E402
 
 OUTPUT_MAX_AGE = timedelta(seconds=90)
 WATCHER_STARTUP_GRACE = timedelta(seconds=90)
+RUNNING_HEARTBEAT_GRACE = timedelta(seconds=180)
+PREMATCH_WATCH_WINDOW = timedelta(minutes=30)
+PREMATCH_LATE_WINDOW = timedelta(hours=2)
+PREMATCH_PROBE_RETRY_DELAY = timedelta(seconds=60)
+RAYBET_SCHEDULE_TIMEZONE = timezone(timedelta(hours=8))
 RETENTION_INTERVAL_SECONDS = 60 * 60
 MAX_CONCURRENT_WATCHERS = 4
 WATCHER_MAX_START_FAILURES = 3
 WATCHER_RETRY_DELAYS = (timedelta(seconds=30), timedelta(seconds=60))
 VIDEO_SOURCE_PATHS = frozenset({"/live", "/video", "/playback", "/v2/video"})
+OPEN_RAYBET_STATUSES = frozenset({"1", "2"})
 
 Child = tuple[subprocess.Popen, object, object]
 OutputSignature = tuple[int, int]
@@ -133,6 +139,34 @@ def _capture_heartbeat(path: Path, match_id: str) -> dict[str, object] | None:
     else:
         return None
     return {**payload, "captured_at_value": captured_at.astimezone(timezone.utc)}
+
+
+def _retain_running_watchers(
+    active: set[str],
+    children: Mapping[str, Child],
+    output_dir: Path,
+    *,
+    now: datetime,
+) -> set[str]:
+    """Keep a child alive across a short provider metadata freshness gap."""
+
+    retained = set(active)
+    for match_id in children:
+        heartbeat = _capture_heartbeat(
+            _capture_heartbeat_path(output_dir, match_id), match_id
+        )
+        if heartbeat is None:
+            continue
+        captured_at = heartbeat.get("captured_at_value")
+        if not isinstance(captured_at, datetime):
+            continue
+        phase = str(heartbeat.get("capture_phase") or "")
+        if (
+            phase != "closed"
+            and timedelta(0) <= now - captured_at <= RUNNING_HEARTBEAT_GRACE
+        ):
+            retained.add(match_id)
+    return retained
 
 
 def _valid_v2_heartbeat(payload: Mapping[str, object]) -> bool:
@@ -531,19 +565,53 @@ def _exact_dota_live_payload(raw_json: object, match_id: str) -> bool:
         and str(payload.get("id") or "") == match_id
         and type(payload.get("game_id")) is int
         and payload["game_id"] == DOTA2_GAME_ID
-        and str(payload.get("status") or "") == "2"
+        and str(payload.get("status") or "") in OPEN_RAYBET_STATUSES
+    )
+
+
+def _parse_utc(value: object) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        if text.isdigit():
+            timestamp = float(text)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        if len(text) != 19 or parsed.strftime("%Y-%m-%d %H:%M:%S") != text:
+            return None
+        parsed = parsed.replace(tzinfo=RAYBET_SCHEDULE_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
+
+
+def _prematch_window_open(
+    scheduled_at: object, *, now: datetime
+) -> bool:
+    scheduled = _parse_utc(scheduled_at)
+    if scheduled is None:
+        return False
+    return (
+        scheduled - PREMATCH_WATCH_WINDOW
+        <= now
+        <= scheduled + PREMATCH_LATE_WINDOW
     )
 
 
 def active_match_evidence(
     database_url: str, *, now: datetime | None = None
 ) -> dict[str, str]:
-    """Select exact live Dota rows; stream evidence labels but does not gate probes."""
+    """Select exact Dota rows that are live or near-term pre-match candidates."""
     with LiveBettingStore(database_url) as store:
         connection = store.connection
         rows = connection.execute(
             """SELECT matches.raybet_match_id, matches.status,
                       matches.updated_at, matches.live_url, matches.raw_json,
+                      matches.scheduled_at,
                       (
                           SELECT events.captured_at
                             FROM browser_events AS events
@@ -570,18 +638,30 @@ def active_match_evidence(
             ),
         ).fetchall()
     evidence: dict[str, str] = {}
+    checked_at = now or datetime.now(timezone.utc)
     for row in rows:
         match_id = str(row[0])
-        if not raybet_match_is_live(row[1], row[2], now=now):
-            continue
         if not _exact_dota_live_payload(row[4], match_id):
             continue
-        if stored_public_stream_url(row[3], row[4]) is not None:
-            reason = "verified_public_stream"
-        elif row[5] is not None and raybet_match_is_live("2", row[5], now=now):
-            reason = "fresh_browser_video"
+        status = str(row[1]).strip().casefold()
+        stored_url = stored_public_stream_url(row[3], row[4])
+        if status == "2" and raybet_match_is_live(row[1], row[2], now=now):
+            if stored_url is not None:
+                reason = "verified_public_stream"
+            elif row[6] is not None and raybet_match_is_live("2", row[6], now=now):
+                reason = "fresh_browser_video"
+            else:
+                reason = "ephemeral_stream_refresh_probe"
+        elif status in {"1", "unlisted"} and _prematch_window_open(
+            row[5], now=checked_at
+        ):
+            reason = (
+                "prematch_verified_stream"
+                if stored_url is not None
+                else "prematch_ephemeral_stream_probe"
+            )
         else:
-            reason = "ephemeral_stream_refresh_probe"
+            continue
         evidence[match_id] = reason
     return dict(sorted(evidence.items()))
 
@@ -740,7 +820,17 @@ def watcher_retry_after_failure(
     produced_output: bool,
     failed_at: datetime,
     failure_reason: str | None = None,
+    persistent_probe: bool = False,
 ) -> WatcherRetryState:
+    if persistent_probe and not produced_output:
+        return WatcherRetryState(
+            attempts=1,
+            failure_reason=failure_reason or "source_refresh_failed",
+            last_exit_code=exit_code,
+            failed_at=failed_at,
+            retry_at=failed_at + PREMATCH_PROBE_RETRY_DELAY,
+            exhausted=False,
+        )
     attempts = 1 if previous is None or produced_output else previous.attempts + 1
     exhausted = attempts >= WATCHER_MAX_START_FAILURES
     reason = failure_reason or (
@@ -765,13 +855,24 @@ def startable_matches(
     retry_states: Mapping[str, WatcherRetryState],
     *,
     now: datetime,
+    evidence: Mapping[str, str] | None = None,
     max_concurrent: int = MAX_CONCURRENT_WATCHERS,
 ) -> list[str]:
     slots = max(0, max_concurrent - len(children))
     if slots == 0:
         return []
     result: list[str] = []
-    for match_id in sorted(active - set(children)):
+    priority = {
+        "verified_public_stream": 0,
+        "fresh_browser_video": 0,
+        "ephemeral_stream_refresh_probe": 0,
+        "prematch_verified_stream": 1,
+        "prematch_ephemeral_stream_probe": 2,
+    }
+    for match_id in sorted(
+        active - set(children),
+        key=lambda value: (priority.get((evidence or {}).get(value, ""), 2), value),
+    ):
         retry = retry_states.get(match_id)
         if retry is not None and (
             retry.exhausted
@@ -840,8 +941,14 @@ def _run_cli(args: argparse.Namespace) -> int:
     try:
         while True:
             try:
-                evidence = active_match_evidence(args.database_url)
-                active = set(evidence)
+                checked_at = datetime.now(timezone.utc)
+                evidence = active_match_evidence(args.database_url, now=checked_at)
+                active = _retain_running_watchers(
+                    set(evidence),
+                    children,
+                    args.output_dir,
+                    now=checked_at,
+                )
                 exited_output = {
                     match_id: (
                         _output_signature(args.output_dir / f"{match_id}.jsonl")
@@ -855,7 +962,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     if match_id in active and process.poll() is not None
                 }
                 exited = reap_children(children, active, child_authorities)
-                failed_at = datetime.now(timezone.utc)
+                failed_at = checked_at
                 for match_id, exit_code in exited.items():
                     if match_id not in active:
                         continue
@@ -864,6 +971,10 @@ def _run_cli(args: argparse.Namespace) -> int:
                         exit_code=exit_code,
                         produced_output=exited_output.get(match_id, False),
                         failed_at=failed_at,
+                        persistent_probe=(
+                            evidence.get(match_id)
+                            == "prematch_ephemeral_stream_probe"
+                        ),
                     )
                 for match_id in set(retry_states) - active:
                     retry_states.pop(match_id, None)
@@ -876,6 +987,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     children,
                     retry_states,
                     now=failed_at,
+                    evidence=evidence,
                 ):
                     stdout = (args.log_dir / f"{match_id}.stdout.log").open(
                         "a", encoding="utf-8"

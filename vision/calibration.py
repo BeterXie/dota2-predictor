@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ import numpy as np
 
 from vision.hero_recognizer import DEFAULT_FEATURE_PATH
 from vision.image_features import color_histogram, compute_phash
+from vision.profile_features import promoted_profile_feature_path
 from vision.stable_runtime import _LAYOUTS
 
 
@@ -25,10 +27,11 @@ class CalibrationPaths:
     debug_root: Path
     calibration_root: Path
     observation_root: Path
+    evidence_root: Path
 
 
 class VisionCalibrationService:
-    """Expose bounded corpus labeling and candidate evaluation without promotion."""
+    """Expose bounded labeling, evaluation, and explicit profile promotion."""
 
     def __init__(
         self,
@@ -50,6 +53,7 @@ class VisionCalibrationService:
             debug_root=data_root / "vision_debug",
             calibration_root=data_root / "vision_calibration",
             observation_root=resolved_observation_root,
+            evidence_root=data_root / "vision_evidence",
         )
         self.feature_path = feature_path.resolve()
 
@@ -62,11 +66,12 @@ class VisionCalibrationService:
             "candidates": candidates,
             "evaluations": self._evaluations(),
             "observation_files": self._observation_files(),
+            "match_summaries": self._match_summaries(),
             "observation_root": str(self.paths.observation_root),
             "layout_profiles": sorted(_LAYOUTS),
             "production_feature_path": str(self.feature_path),
             "candidate_boundary": (
-                "候选包仅作为隔离的校正产物保存，绝不会自动覆盖生产特征包。"
+                "候选包保持隔离；只有满足双留出评估门槛后，才可显式推广到对应 UI Profile。"
             ),
         }
 
@@ -175,6 +180,69 @@ class VisionCalibrationService:
         }
         self._write_json(candidate_root / f"{candidate_id}.json", candidate)
         return candidate
+
+    def promote_candidate(
+        self,
+        candidate_id: str,
+        *,
+        evaluation_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        unique_ids = tuple(dict.fromkeys(evaluation_ids))
+        if len(unique_ids) < 2:
+            raise ValueError("promotion requires two held-out perception evaluations")
+        candidate = self._candidate(candidate_id)
+        profile_id = self._profile_id(
+            candidate.get("profile_id") or candidate.get("layout")
+        )
+        if profile_id == "unknown":
+            raise ValueError("candidate profile is unsupported")
+        evaluations = [self._evaluation(evaluation_id) for evaluation_id in unique_ids]
+        for evaluation in evaluations:
+            if evaluation.get("candidate_id") != candidate_id:
+                raise ValueError("promotion evaluation belongs to another candidate")
+            if evaluation.get("mode") != "perception":
+                raise ValueError("promotion evidence must use perception mode")
+            if int(evaluation.get("total_files") or 0) < 20:
+                raise ValueError("promotion evaluation requires at least 20 frames")
+            if (
+                int(evaluation.get("final_locked_slots") or 0) != 10
+                or int(evaluation.get("final_correct_locked_slots") or 0) != 10
+                or int(evaluation.get("wrong_lock_count") or 0) != 0
+                or float(evaluation.get("accepted_precision") or 0.0) < 0.99
+                or float(evaluation.get("exact_post_lock_rate") or 0.0) < 0.99
+            ):
+                raise ValueError("promotion evaluation did not meet the safety gate")
+
+        candidate_root = self.paths.calibration_root / "candidates"
+        source = candidate_root / f"{candidate_id}.npz"
+        expected_hash = str(candidate.get("feature_sha256") or "")
+        if not source.is_file() or self._sha256(source) != expected_hash:
+            raise ValueError("candidate feature artifact failed integrity verification")
+
+        promoted_root = self.paths.calibration_root / "promoted"
+        promoted_root.mkdir(parents=True, exist_ok=True)
+        feature_path = promoted_root / f"{profile_id}.npz"
+        temporary = feature_path.with_suffix(".npz.part")
+        shutil.copyfile(source, temporary)
+        temporary.replace(feature_path)
+        manifest = {
+            "profile_id": profile_id,
+            "candidate_id": candidate_id,
+            "feature_sha256": expected_hash,
+            "evaluation_ids": list(unique_ids),
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "promoted": True,
+        }
+        self._write_json(promoted_root / f"{profile_id}.json", manifest)
+        if (
+            promoted_profile_feature_path(
+                profile_id,
+                calibration_root=self.paths.calibration_root,
+            )
+            != feature_path
+        ):
+            raise RuntimeError("promoted profile feature artifact is unavailable")
+        return manifest
 
     def run_evaluation(
         self,
@@ -455,6 +523,16 @@ class VisionCalibrationService:
             raise KeyError(candidate_id)
         return row
 
+    def _evaluation(self, evaluation_id: str) -> dict[str, object]:
+        if re.fullmatch(r"[a-f0-9]{32}", evaluation_id) is None:
+            raise ValueError("invalid evaluation identifier")
+        path = self.paths.calibration_root / "evaluations" / f"{evaluation_id}.json"
+        report = self._optional_json(path)
+        summary = report.get("calibration_summary") if report else None
+        if not isinstance(summary, dict) or summary.get("evaluation_id") != evaluation_id:
+            raise KeyError(evaluation_id)
+        return summary
+
     def _evaluations(self) -> list[dict[str, object]]:
         root = self.paths.calibration_root / "evaluations"
         if not root.exists():
@@ -478,6 +556,262 @@ class VisionCalibrationService:
             {"name": path.name, "bytes": path.stat().st_size}
             for path in sorted(self.paths.observation_root.glob("*.jsonl"))
         ]
+
+    def _match_summaries(self) -> list[dict[str, object]]:
+        """Build a read-only, one-row-per-game view of the Vision corpus.
+
+        Observation JSONL remains the source of truth and is intentionally not
+        changed.  The summary combines it with the optional capture heartbeat
+        and evidence manifest sidecars so operators can understand a whole
+        match without opening hundreds of individual frames.
+        """
+
+        if not self.paths.observation_root.exists():
+            return []
+
+        summaries: dict[str, dict[str, object]] = {}
+
+        def ensure(match_id: str, observation_file: str | None = None) -> dict[str, object]:
+            normalized = str(match_id or "").strip() or "unknown"
+            return summaries.setdefault(
+                normalized,
+                {
+                    "match_id": normalized,
+                    "observation_file": observation_file,
+                    "observation_count": 0,
+                    "evidence_frame_count": 0,
+                    "manifest_event_count": 0,
+                    "periodic_count": 0,
+                    "draft_started": False,
+                    "game_started": False,
+                    "ended_final": False,
+                    "maps": set(),
+                    "_evidence_refs": set(),
+                    "_first_dt": None,
+                    "_last_dt": None,
+                    "_latest_screen_state": None,
+                    "_latest_phase": None,
+                    "_heartbeat_phase": None,
+                    "_heartbeat_at": None,
+                    "_layout_profile": None,
+                    "_capture_status": None,
+                },
+            )
+
+        def parsed_timestamp(value: object) -> datetime | None:
+            if not isinstance(value, str) or not value.strip():
+                return None
+            try:
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            return parsed.astimezone(timezone.utc)
+
+        def touch_time(summary: dict[str, object], value: object) -> datetime | None:
+            parsed = parsed_timestamp(value)
+            if parsed is None:
+                return None
+            first = summary.get("_first_dt")
+            last = summary.get("_last_dt")
+            if not isinstance(first, datetime) or parsed < first:
+                summary["_first_dt"] = parsed
+            if not isinstance(last, datetime) or parsed >= last:
+                summary["_last_dt"] = parsed
+                screen_state = summary.get("_pending_screen_state")
+                phase = summary.get("_pending_phase")
+                if screen_state is not None:
+                    summary["_latest_screen_state"] = screen_state
+                if phase is not None:
+                    summary["_latest_phase"] = phase
+                summary.pop("_pending_screen_state", None)
+                summary.pop("_pending_phase", None)
+            return parsed
+
+        for path in sorted(self.paths.observation_root.glob("*.jsonl")):
+            rows: list[dict[str, object]] = []
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            payload = json.loads(line)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if isinstance(payload, dict):
+                            rows.append(payload)
+            except OSError:
+                continue
+            match_id = next(
+                (
+                    str(row.get("raybet_match_id")).strip()
+                    for row in rows
+                    if str(row.get("raybet_match_id") or "").strip()
+                ),
+                path.stem,
+            )
+            summary = ensure(match_id, path.name)
+            for row in rows:
+                summary["observation_count"] = int(summary["observation_count"]) + 1
+                captured_at = row.get("captured_at_utc") or row.get("captured_at")
+                source_ref = str(row.get("source_frame_ref") or "").strip()
+                if source_ref and (
+                    source_ref.startswith("vision-frame:")
+                    or row.get("source_frame_sha256")
+                ):
+                    refs = summary["_evidence_refs"]
+                    if isinstance(refs, set):
+                        refs.add(source_ref)
+                map_number = row.get("map_number")
+                if type(map_number) is int and map_number > 0:
+                    maps = summary["maps"]
+                    if isinstance(maps, set):
+                        maps.add(map_number)
+                summary["_pending_screen_state"] = row.get("screen_state")
+                touch_time(summary, captured_at)
+
+        for path in sorted(self.paths.evidence_root.glob("*.manifest.jsonl")):
+            match_id = path.name[: -len(".manifest.jsonl")]
+            summary = ensure(match_id, f"{match_id}.jsonl")
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            payload = json.loads(line)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+                        summary["manifest_event_count"] = int(summary["manifest_event_count"]) + 1
+                        event = str(payload.get("event") or "").strip()
+                        if event == "periodic_30s":
+                            summary["periodic_count"] = int(summary["periodic_count"]) + 1
+                        if event == "draft_started":
+                            summary["draft_started"] = True
+                        if event == "game_started":
+                            summary["game_started"] = True
+                        if event == "ended_final":
+                            summary["ended_final"] = True
+                        frame_ref = str(payload.get("frame_ref") or "").strip()
+                        if frame_ref:
+                            refs = summary["_evidence_refs"]
+                            if isinstance(refs, set):
+                                refs.add(frame_ref)
+                        map_number = payload.get("map_number")
+                        if type(map_number) is int and map_number > 0:
+                            maps = summary["maps"]
+                            if isinstance(maps, set):
+                                maps.add(map_number)
+                        summary["_pending_screen_state"] = payload.get("screen_state")
+                        summary["_pending_phase"] = payload.get("phase")
+                        touch_time(summary, payload.get("captured_at"))
+            except OSError:
+                continue
+
+        for path in sorted(self.paths.observation_root.glob("*.heartbeat.json")):
+            match_id = path.name[: -len(".heartbeat.json")]
+            summary = ensure(match_id, f"{match_id}.jsonl")
+            payload = self._optional_json(path)
+            if payload is None:
+                continue
+            phase = str(payload.get("capture_phase") or "").strip()
+            if phase:
+                summary["_heartbeat_phase"] = phase
+            status = str(payload.get("capture_status") or "").strip()
+            if status:
+                summary["_capture_status"] = status
+            layout = payload.get("layout")
+            if isinstance(layout, dict):
+                profile = str(layout.get("profile") or "").strip()
+                if profile:
+                    summary["_layout_profile"] = profile
+            screen = payload.get("screen")
+            if isinstance(screen, dict):
+                summary["_pending_screen_state"] = screen.get("state")
+            else:
+                summary["_pending_screen_state"] = payload.get("screen_state")
+            summary["_pending_phase"] = phase or None
+            heartbeat_at = touch_time(summary, payload.get("captured_at"))
+            if heartbeat_at is not None:
+                summary["_heartbeat_at"] = heartbeat_at
+
+        phase_labels = {
+            "waiting_for_stream": "等待直播流",
+            "draft_candidate": "BP 候选确认",
+            "draft_started": "BP 已开始",
+            "game_started": "比赛进行中",
+            "ended_grace": "结束宽限期",
+            "closed": "已结束",
+        }
+        status_for_phase = {
+            "waiting_for_stream": "waiting",
+            "draft_candidate": "preparing",
+            "draft_started": "draft",
+            "game_started": "live",
+            "ended_grace": "ending",
+            "closed": "ended",
+        }
+        result: list[dict[str, object]] = []
+        now = datetime.now(timezone.utc)
+        for summary in summaries.values():
+            phase = str(
+                summary.get("_heartbeat_phase")
+                or summary.get("_latest_phase")
+                or ("game_started" if summary.get("_latest_screen_state") == "game" else "waiting_for_stream")
+            )
+            if summary.get("ended_final"):
+                phase = "closed"
+            heartbeat_at = summary.get("_heartbeat_at")
+            heartbeat_fresh = bool(
+                isinstance(heartbeat_at, datetime)
+                and -15.0 <= (now - heartbeat_at).total_seconds() <= 180.0
+            )
+            status = (
+                "ended"
+                if phase == "closed"
+                else status_for_phase.get(phase, "unknown")
+                if heartbeat_fresh
+                else "archived"
+            )
+            status_label = (
+                "已结束"
+                if status == "ended"
+                else phase_labels.get(phase, "状态未知")
+                if heartbeat_fresh
+                else "历史观测"
+            )
+            first_dt = summary.get("_first_dt")
+            last_dt = summary.get("_last_dt")
+            refs = summary.get("_evidence_refs")
+            maps = summary.get("maps")
+            result.append(
+                {
+                    "match_id": summary["match_id"],
+                    "observation_file": summary.get("observation_file"),
+                    "status": status,
+                    "status_label": status_label,
+                    "phase": phase,
+                    "observation_count": summary["observation_count"],
+                    "evidence_frame_count": len(refs) if isinstance(refs, set) else 0,
+                    "manifest_event_count": summary["manifest_event_count"],
+                    "periodic_count": summary["periodic_count"],
+                    "draft_started": bool(summary["draft_started"]),
+                    "game_started": bool(summary["game_started"]),
+                    "ended_final": bool(summary["ended_final"]),
+                    "first_captured_at": first_dt.isoformat() if isinstance(first_dt, datetime) else None,
+                    "last_captured_at": last_dt.isoformat() if isinstance(last_dt, datetime) else None,
+                    "latest_screen_state": summary.get("_latest_screen_state"),
+                    "layout_profile": summary.get("_layout_profile"),
+                    "maps": sorted(maps) if isinstance(maps, set) else [],
+                    "capture_status": summary.get("_capture_status"),
+                    "heartbeat_fresh": heartbeat_fresh,
+                }
+            )
+        return sorted(
+            result,
+            key=lambda row: str(row.get("last_captured_at") or row.get("match_id") or ""),
+            reverse=True,
+        )
 
     def _observation_path(self, name: str) -> Path:
         if Path(name).name != name or not name.endswith(".jsonl"):

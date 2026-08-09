@@ -32,6 +32,8 @@ class BroadcastLayout:
     dire_heroes: tuple[NormalizedRegion, ...] = field(default_factory=tuple)
     radiant_team_logo: NormalizedRegion | None = None
     dire_team_logo: NormalizedRegion | None = None
+    radiant_team_name: NormalizedRegion | None = None
+    dire_team_name: NormalizedRegion | None = None
     radiant_kills: NormalizedRegion | None = None
     dire_kills: NormalizedRegion | None = None
     radiant_net_worth_advantage: NormalizedRegion | None = None
@@ -60,6 +62,8 @@ STANDARD_DOTA_HUD = BroadcastLayout(
     ),
     radiant_team_logo=NormalizedRegion(0.250, 0.0, 0.286, 0.060),
     dire_team_logo=NormalizedRegion(0.714, 0.0, 0.750, 0.060),
+    radiant_team_name=NormalizedRegion(0.010, 0.0, 0.240, 0.060),
+    dire_team_name=NormalizedRegion(0.760, 0.0, 0.990, 0.060),
     radiant_kills=NormalizedRegion(0.446, 0.008, 0.468, 0.052),
     dire_kills=NormalizedRegion(0.532, 0.008, 0.554, 0.052),
     radiant_net_worth_advantage=NormalizedRegion(0.452, 0.038, 0.478, 0.055),
@@ -128,7 +132,8 @@ EPL_MASTERS_LIVE = BroadcastLayout(
     scoreboard_strip=NormalizedRegion(0.300, 0.000, 0.700, 0.250),
     replay_status_regions=(),
     requires_geometry_confirmation=True,
-    draft_recognition_max_clock_seconds=180,
+    # Late watcher attachment must still recover the immutable map lineup.
+    draft_recognition_max_clock_seconds=None,
 )
 
 

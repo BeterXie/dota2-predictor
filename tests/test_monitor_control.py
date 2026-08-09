@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
+import pytest
 
 from web.control import COMPONENTS, ControlService
 
@@ -69,3 +70,85 @@ def test_stale_registered_supervisor_pid_does_not_trust_fresh_heartbeat(
     assert service._fresh_supervisor_heartbeat(
         _HeartbeatConnection(), "vision_supervisor"
     ) is None
+
+
+def test_stopped_supervisor_does_not_trust_heartbeat_from_before_stop(
+    tmp_path: Path,
+) -> None:
+    stopped_at = datetime.now(timezone.utc)
+
+    class Connection:
+        def execute(self, query: str, params: tuple[str, ...]):
+            if "monitor_process_registry" in query:
+                return _RowResult(
+                    {
+                        "status": "stopped",
+                        "pid": None,
+                        "process_created_at": None,
+                        "updated_at": stopped_at.isoformat(),
+                    }
+                )
+            if "service_health" in query:
+                return _RowResult(
+                    {
+                        "last_heartbeat_at": (
+                            stopped_at - timedelta(seconds=1)
+                        ).isoformat()
+                    }
+                )
+            raise AssertionError(query)
+
+    service = ControlService(project_dir=tmp_path)
+
+    assert service._fresh_supervisor_heartbeat(
+        Connection(), "vision_supervisor"
+    ) is None
+
+
+def test_deliberate_restart_ignores_just_stopped_supervisor_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 4242
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class InspectedProcess:
+        @staticmethod
+        def create_time() -> float:
+            return 123.0
+
+    class Connection:
+        @staticmethod
+        def execute(_query: str, _params: tuple[object, ...]) -> None:
+            return None
+
+    service = ControlService(
+        project_dir=tmp_path,
+        popen_factory=lambda *_args, **_kwargs: Process(),
+        process_factory=lambda _pid: InspectedProcess(),
+    )
+    monkeypatch.setattr(service, "_registry_row", lambda *_args: None)
+    monkeypatch.setattr(service, "_inspect", lambda *_args: ("stopped", None))
+    monkeypatch.setattr(service, "_configuration_missing", lambda *_args: False)
+    monkeypatch.setattr(
+        service,
+        "_fresh_supervisor_heartbeat",
+        lambda *_args: datetime.now(timezone.utc).isoformat(),
+    )
+
+    result = service._start(
+        Connection(),
+        "vision_supervisor",
+        ignore_supervisor_heartbeat=True,
+    )
+
+    assert result == {
+        "ok": True,
+        "status": "running",
+        "pid": 4242,
+        "detail": "started",
+    }

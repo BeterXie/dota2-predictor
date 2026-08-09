@@ -24,6 +24,9 @@ export function LiveScoreboard({
   watchLink,
 }: LiveScoreboardProps) {
   const isLive = match.lifecycle === "live";
+  const isPrematch = match.lifecycle === "upcoming"
+    || ["1", "upcoming", "scheduled", "not_started"]
+      .includes(match.provider_status.trim().toLowerCase());
   const gameClock = trustedVision?.game_clock_seconds;
   const mapNum = trustedVision?.map_number;
 
@@ -32,7 +35,7 @@ export function LiveScoreboard({
       <div className="scoreboard-topline">
         <div className="scoreboard-meta">
           <strong>{match.tournament || "未知赛事"}</strong>
-          <LifecycleBadge lifecycle={match.lifecycle} />
+          <LifecycleBadge lifecycle={isPrematch ? "upcoming" : match.lifecycle} />
           <span className="scoreboard-best-of">BO{match.best_of || "?"}</span>
         </div>
         <div className="scoreboard-actions">
@@ -73,7 +76,9 @@ export function LiveScoreboard({
         <div className="scoreboard-center">
           <div className={isLive ? "scoreboard-map live" : "scoreboard-map"}>
             {isLive && <span className="scoreboard-live-dot" />}
-            {mapNum ? `第 ${mapNum} 局` : match.winner?.period || "比分板"}
+            {mapNum
+              ? `第 ${mapNum} 局`
+              : isPrematch ? "等待开赛" : match.winner?.period || "比分板"}
             {gameClock != null && ` · ${formatClock(gameClock)}`}
           </div>
           <span className="scoreboard-time">

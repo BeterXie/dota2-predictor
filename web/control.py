@@ -149,7 +149,15 @@ class ControlService:
                 result = self._stop(connection, component)
             else:
                 stopped = self._stop(connection, component)
-                result = self._start(connection, component) if stopped["ok"] else stopped
+                result = (
+                    self._start(
+                        connection,
+                        component,
+                        ignore_supervisor_heartbeat=True,
+                    )
+                    if stopped["ok"]
+                    else stopped
+                )
             response = {
                 "component": component,
                 "action": action,
@@ -193,6 +201,8 @@ class ControlService:
         self,
         connection: PostgresSession,
         component: str,
+        *,
+        ignore_supervisor_heartbeat: bool = False,
     ) -> dict[str, object]:
         command = self.command_for(component)
         row = self._registry_row(connection, component)
@@ -216,7 +226,11 @@ class ControlService:
         supervisor_heartbeat = self._fresh_supervisor_heartbeat(
             connection, component
         )
-        if state == "stopped" and supervisor_heartbeat is not None:
+        if (
+            state == "stopped"
+            and supervisor_heartbeat is not None
+            and not ignore_supervisor_heartbeat
+        ):
             return {
                 "ok": False,
                 "status": "running",
@@ -389,6 +403,10 @@ class ControlService:
         heartbeat = self._parse_time(row["last_heartbeat_at"])
         if heartbeat is None:
             return None
+        if registry is not None and registry["status"] == "stopped":
+            stopped_at = self._parse_time(registry["updated_at"])
+            if stopped_at is not None and heartbeat <= stopped_at:
+                return None
         age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
         if not -5.0 <= age <= spec.supervisor_timeout_seconds:
             return None

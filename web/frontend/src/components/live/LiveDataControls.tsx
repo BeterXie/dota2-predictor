@@ -18,7 +18,7 @@ import {
   fetchTeamGrid,
   saveLiveDraftMapping,
 } from "../../api";
-import { formatClock, formatDateTime, formatPercent } from "../../format";
+import { formatClock, formatDateTime, formatOdds, formatPercent } from "../../format";
 import type {
   CanonicalTeam,
   LiveDraftContextTeam,
@@ -29,6 +29,7 @@ import type {
   PrematchHero,
   PrematchHeroGrid,
 } from "../../types";
+import { deriveLiveDraftValueDecision } from "./liveDraftValueDecision";
 
 interface LiveDataControlsProps {
   csrfToken: string | null;
@@ -124,6 +125,10 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
   const [attribute, setAttribute] = useState<Attribute>("str");
   const [heroSearch, setHeroSearch] = useState("");
   const heroSearchRef = useRef<HTMLInputElement>(null);
+  const valueDecision = useMemo(
+    () => deriveLiveDraftValueDecision(detail, mapping, prediction),
+    [detail, mapping, prediction],
+  );
 
   useEffect(() => {
     setMapping(detail.draft_mapping || null);
@@ -442,15 +447,45 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
             <span>请先确认并锁定阵容。</span>
           </div>
         ) : prediction ? (
-          <div className="live-state-summary" aria-label="阵容 prospective shadow 预测">
-            <div><dt>Mapping</dt><dd>v{prediction.identity.mapping_version}</dd></div>
-            <div><dt>Team Rating P0</dt><dd>{formatPercent(prediction.p0_probability)}</dd></div>
-            <div><dt>R.O.S.H. P1</dt><dd>{prediction.p1_probability == null ? "P0-only" : formatPercent(prediction.p1_probability)}</dd></div>
-            <div><dt>Pure score</dt><dd>{prediction.pure_rosh_score?.toFixed(4) ?? "-"}</dd></div>
-            {prediction.missing_reason && <div><dt>缺失原因</dt><dd>{prediction.missing_reason}</dd></div>}
-            <div><dt>因果状态</dt><dd>{prediction.causal_evidence.causal_status}</dd></div>
-            <div><dt>生成时间</dt><dd>{formatDateTime(prediction.created_at)}</dd></div>
-          </div>
+          <>
+            <div className="live-state-summary" aria-label="阵容 prospective shadow 预测">
+              <div><dt>Mapping</dt><dd>v{prediction.identity.mapping_version}</dd></div>
+              <div><dt>Team Rating P0</dt><dd>{formatPercent(prediction.p0_probability)}</dd></div>
+              <div><dt>R.O.S.H. P1</dt><dd>{prediction.p1_probability == null ? "P0-only" : formatPercent(prediction.p1_probability)}</dd></div>
+              <div><dt>Pure score</dt><dd>{prediction.pure_rosh_score?.toFixed(4) ?? "-"}</dd></div>
+              {prediction.missing_reason && <div><dt>缺失原因</dt><dd>{prediction.missing_reason}</dd></div>}
+              <div><dt>因果状态</dt><dd>{prediction.causal_evidence.causal_status}</dd></div>
+              <div><dt>生成时间</dt><dd>{formatDateTime(prediction.created_at)}</dd></div>
+            </div>
+            <div className="live-state-summary" aria-label="影子投注决策">
+              <div>
+                <dt>影子决策</dt>
+                <dd>{valueDecision.status === "candidate"
+                  ? "候选"
+                  : valueDecision.status === "no_bet" ? "不下注" : "等待"}</dd>
+              </div>
+              <div><dt>策略版本</dt><dd>{valueDecision.strategyVersion}</dd></div>
+              {valueDecision.selectedTeamName && (
+                <div><dt>选择</dt><dd>{valueDecision.selectedTeamName}</dd></div>
+              )}
+              {valueDecision.modelProbability != null && (
+                <div><dt>模型概率</dt><dd>{formatPercent(valueDecision.modelProbability)}</dd></div>
+              )}
+              {valueDecision.marketProbability != null && (
+                <div><dt>市场概率</dt><dd>{formatPercent(valueDecision.marketProbability)}</dd></div>
+              )}
+              {valueDecision.edge != null && (
+                <div><dt>价值差</dt><dd>{formatPercent(valueDecision.edge)}</dd></div>
+              )}
+              {valueDecision.price != null && (
+                <div><dt>当前赔率</dt><dd>{formatOdds(valueDecision.price)}</dd></div>
+              )}
+              <div><dt>原因</dt><dd>{valueDecision.reason}</dd></div>
+            </div>
+            <p className="live-form-message">
+              该决策仅比较不可变 P1 与当前地图完整胜负盘，不会回写 P0/P1，也不会提交真实投注。
+            </p>
+          </>
         ) : readOnly ? (
           <div className="live-state-empty" role="status">该 mapping 没有保存预测。</div>
         ) : (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -10,6 +11,7 @@ import pytest
 import scripts.evaluate_hero_recognition as evaluator
 from scripts.evaluate_hero_recognition import EvidenceSample
 from vision.calibration import VisionCalibrationService
+from vision.profile_features import promoted_profile_feature_path
 
 
 def _feature_pack(path: Path) -> None:
@@ -107,6 +109,101 @@ def test_calibration_labels_real_event_and_builds_isolated_candidate(
         assert np.count_nonzero(calibrated["hashes"]) > 0
 
 
+def test_calibration_promotes_only_two_safe_evaluations_to_its_profile(
+    tmp_path: Path,
+) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    _debug_event(tmp_path)
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    event_id = str(service.bootstrap()["events"][0]["event_id"])
+    label = service.save_label(
+        event_id,
+        hero_ids=tuple(range(1, 11)),
+        raybet_match_id="42",
+        map_number=1,
+        note=None,
+    )
+    candidate = service.build_candidate(str(label["label_id"]))
+    evaluation_ids = ("a" * 32, "b" * 32)
+    evaluation_root = service.paths.calibration_root / "evaluations"
+    evaluation_root.mkdir(parents=True)
+    for evaluation_id in evaluation_ids:
+        summary = {
+            "evaluation_id": evaluation_id,
+            "candidate_id": candidate["candidate_id"],
+            "mode": "perception",
+            "total_files": 20,
+            "final_locked_slots": 10,
+            "final_correct_locked_slots": 10,
+            "wrong_lock_count": 0,
+            "accepted_precision": 1.0,
+            "exact_post_lock_rate": 1.0,
+        }
+        (evaluation_root / f"{evaluation_id}.json").write_text(
+            json.dumps({"calibration_summary": summary}),
+            encoding="utf-8",
+        )
+
+    promoted = service.promote_candidate(
+        str(candidate["candidate_id"]),
+        evaluation_ids=evaluation_ids,
+    )
+
+    assert promoted["profile_id"] == "standard_dota_hud_1080p"
+    assert promoted_profile_feature_path(
+        "standard_dota_hud_1080p",
+        calibration_root=service.paths.calibration_root,
+    ).is_file()
+    assert (
+        promoted_profile_feature_path(
+            "wxc_gotf_2026_live_1080p",
+            calibration_root=service.paths.calibration_root,
+        )
+        is None
+    )
+
+
+def test_calibration_rejects_unsafe_profile_promotion(tmp_path: Path) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    _debug_event(tmp_path)
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    event_id = str(service.bootstrap()["events"][0]["event_id"])
+    label = service.save_label(
+        event_id,
+        hero_ids=tuple(range(1, 11)),
+        raybet_match_id="42",
+        map_number=1,
+        note=None,
+    )
+    candidate = service.build_candidate(str(label["label_id"]))
+    evaluation_root = service.paths.calibration_root / "evaluations"
+    evaluation_root.mkdir(parents=True)
+    for evaluation_id, wrong_locks in (("a" * 32, 0), ("b" * 32, 1)):
+        summary = {
+            "evaluation_id": evaluation_id,
+            "candidate_id": candidate["candidate_id"],
+            "mode": "perception",
+            "total_files": 20,
+            "final_locked_slots": 10,
+            "final_correct_locked_slots": 10 - wrong_locks,
+            "wrong_lock_count": wrong_locks,
+            "accepted_precision": 1.0,
+            "exact_post_lock_rate": 1.0,
+        }
+        (evaluation_root / f"{evaluation_id}.json").write_text(
+            json.dumps({"calibration_summary": summary}),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="safety gate"):
+        service.promote_candidate(
+            str(candidate["candidate_id"]),
+            evaluation_ids=("a" * 32, "b" * 32),
+        )
+
+
 def test_calibration_rejects_duplicate_truth_and_unknown_assets(tmp_path: Path) -> None:
     feature_path = tmp_path / "features.npz"
     _feature_pack(feature_path)
@@ -188,6 +285,110 @@ def test_calibration_uses_shared_observation_directory(
             "bytes": (observation_root / "38417147.jsonl").stat().st_size,
         }
     ]
+
+
+def test_calibration_summarizes_a_complete_match_corpus(tmp_path: Path) -> None:
+    feature_path = tmp_path / "features.npz"
+    _feature_pack(feature_path)
+    service = VisionCalibrationService(tmp_path, feature_path=feature_path)
+    service.paths.observation_root.mkdir(parents=True)
+    observation_path = service.paths.observation_root / "38422524.jsonl"
+    observation_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "raybet_match_id": "38422524",
+                        "captured_at_utc": "2026-08-09T13:40:00Z",
+                        "map_number": 1,
+                        "screen_state": "draft",
+                        "source_frame_ref": "vision-frame:sha256:first",
+                        "source_frame_sha256": "first",
+                    }
+                ),
+                "not-json",
+                json.dumps(
+                    {
+                        "raybet_match_id": "38422524",
+                        "captured_at_utc": "2026-08-09T13:41:00Z",
+                        "map_number": 1,
+                        "screen_state": "game",
+                        "source_frame_ref": "stream:one:2",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    service.paths.evidence_root.mkdir(parents=True)
+    (service.paths.evidence_root / "38422524.manifest.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "draft_started",
+                        "phase": "draft_started",
+                        "captured_at": "2026-08-09T13:40:00+00:00",
+                        "frame_ref": "vision-frame:sha256:first",
+                        "screen_state": "draft",
+                        "map_number": 1,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "game_started",
+                        "phase": "game_started",
+                        "captured_at": "2026-08-09T13:41:30+00:00",
+                        "frame_ref": "vision-frame:sha256:second",
+                        "screen_state": "game",
+                        "map_number": 1,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "periodic_30s",
+                        "phase": "game_started",
+                        "captured_at": "2026-08-09T13:42:00+00:00",
+                        "frame_ref": "vision-frame:sha256:third",
+                        "screen_state": "game",
+                        "map_number": 1,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (service.paths.observation_root / "38422524.heartbeat.json").write_text(
+        json.dumps(
+            {
+                "capture_phase": "game_started",
+                "capture_status": "producing_trusted",
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "layout": {"profile": "epl_masters_live_1080p"},
+                "screen": {"state": "game"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summaries = service.bootstrap()["match_summaries"]
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary["match_id"] == "38422524"
+    assert summary["status"] == "live"
+    assert summary["status_label"] == "比赛进行中"
+    assert summary["observation_count"] == 2
+    assert summary["evidence_frame_count"] == 3
+    assert summary["manifest_event_count"] == 3
+    assert summary["periodic_count"] == 1
+    assert summary["draft_started"] is True
+    assert summary["game_started"] is True
+    assert summary["maps"] == [1]
+    assert summary["layout_profile"] == "epl_masters_live_1080p"
+    assert summary["latest_screen_state"] == "game"
 
 
 def test_calibration_rejects_candidate_from_another_ui_profile(tmp_path: Path) -> None:

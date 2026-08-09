@@ -23,13 +23,19 @@ vi.mock("./components/MatchRail", () => ({
     hasMore,
     matches,
     onLoadMore,
+    onSelect,
   }: {
     hasMore?: boolean;
     matches: MonitorMatch[];
     onLoadMore?: () => void;
+    onSelect: (matchId: string) => void;
   }) => (
     <nav>
-      {matches.map((match) => <span key={match.raybet_match_id}>{match.raybet_match_id}</span>)}
+      {matches.map((match) => (
+        <button key={match.raybet_match_id} onClick={() => onSelect(match.raybet_match_id)}>
+          {match.raybet_match_id}
+        </button>
+      ))}
       {hasMore && <button onClick={onLoadMore}>加载更多历史赛事</button>}
     </nav>
   ),
@@ -129,18 +135,48 @@ describe("App", () => {
     render(<App />);
 
     expect(screen.getByText("Dota 2 实时阵容预测")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("live-1")).toBeInTheDocument());
+    fireEvent.click(await screen.findByRole("button", { name: "live-1" }));
     await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
   });
 
-  it("restores the preferred live match after visiting history", async () => {
+  it("keeps ended and history-eligible matches out of the realtime list", async () => {
+    api.fetchBootstrap.mockResolvedValue({
+      ...snapshot,
+      matches: [
+        match,
+        { ...historyMatch, raybet_match_id: "ended-in-snapshot" },
+        {
+          ...match,
+          raybet_match_id: "stale-prematch",
+          provider_status: "1",
+          lifecycle: "degraded",
+          history_eligible: true,
+        },
+      ],
+    });
+
     render(<App />);
 
+    expect(await screen.findByRole("button", { name: "live-1" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "ended-in-snapshot" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "stale-prematch" })).not.toBeInTheDocument();
+  });
+
+  it("returns to each section list before opening another match", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "live-1" }));
     await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("tab", { name: "历史结果" }));
+    const historyButton = await screen.findByRole("button", { name: "history-1" });
+    expect(screen.queryByText("workspace-history-1")).not.toBeInTheDocument();
+    fireEvent.click(historyButton);
     await waitFor(() => expect(screen.getByText("workspace-history-1")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("tab", { name: "实时赛事" }));
+    const liveButton = await screen.findByRole("button", { name: "live-1" });
+    expect(screen.queryByText("workspace-live-1")).not.toBeInTheDocument();
+    fireEvent.click(liveButton);
     await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
     expect(screen.queryByText("empty-workspace")).not.toBeInTheDocument();
   });

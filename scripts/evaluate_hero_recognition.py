@@ -125,8 +125,11 @@ def _observation_samples(
     previous_clock: int | None = None
     clock_reset_count = 0
     available_map_numbers: set[int] = set()
+    explicit_map_segments = len(source_map_numbers) > 1
     for row, observed_at, clock, source_map_number in parsed_rows:
-        if inferred_map_number is None and source_map_number is not None:
+        if explicit_map_segments and source_map_number is not None:
+            inferred_map_number = source_map_number
+        elif inferred_map_number is None and source_map_number is not None:
             inferred_map_number = source_map_number
         clock_reset = (
             clock is not None
@@ -135,10 +138,11 @@ def _observation_samples(
         )
         if clock_reset:
             clock_reset_count += 1
-            inferred_map_number = max(
-                source_map_number or 0,
-                (inferred_map_number or 0) + 1,
-            )
+            if not explicit_map_segments:
+                inferred_map_number = max(
+                    source_map_number or 0,
+                    (inferred_map_number or 0) + 1,
+                )
         elif source_map_number is not None and (
             inferred_map_number is None or source_map_number > inferred_map_number
         ):

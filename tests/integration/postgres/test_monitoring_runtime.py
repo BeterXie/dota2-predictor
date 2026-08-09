@@ -378,3 +378,39 @@ def test_stale_prematch_leaves_live_view_after_four_hours(
     }
     assert "stale-prematch" in history_ids
     store.close()
+
+
+def test_unlisted_match_is_hidden_from_monitor_lists(
+    postgres_engine,
+    tmp_path,
+) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    store.upsert_raybet_match(
+        _raybet_match(
+            "unlisted-match",
+            status=1,
+            scheduled_at=NOW + timedelta(hours=1),
+        ),
+        NOW,
+    )
+    store.connection.execute(
+        "UPDATE raybet_matches SET status='unlisted' WHERE raybet_match_id=?",
+        ("unlisted-match",),
+    )
+    store.connection.commit()
+
+    snapshot_ids = {
+        item["raybet_match_id"]
+        for item in build_monitor_snapshot(store.connection, now=NOW)["matches"]
+    }
+    history_ids = {
+        item["raybet_match_id"]
+        for item in monitor_history_page(store.connection, now=NOW)["items"]
+    }
+
+    assert "unlisted-match" not in snapshot_ids
+    assert "unlisted-match" not in history_ids
+    store.close()

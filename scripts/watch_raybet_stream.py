@@ -31,7 +31,6 @@ from live_betting.direct_response_audit import (  # noqa: E402
 )
 from live_betting.raybet_state import (  # noqa: E402
     infer_current_map_number,
-    raybet_match_is_live,
 )
 from live_betting.raybet import BASE_URL, RayBetClient  # noqa: E402
 from live_betting.sanitize import stored_public_stream_url  # noqa: E402
@@ -51,6 +50,11 @@ from vision.hud_reader import HudDiagnostics, HudReader  # noqa: E402
 from vision.layouts import BroadcastLayout  # noqa: E402
 from vision.map_state import ConfirmedClock, MapStateTracker  # noqa: E402
 from vision.observation_writer import ObservationWriter  # noqa: E402
+from vision.capture_lifecycle import (  # noqa: E402
+    CaptureLifecycle,
+    EvidenceTrigger,
+    load_manifest,
+)
 from vision.scoreboard_reader import (  # noqa: E402
     NetWorthAdvantageReading,
     NetWorthAdvantageTracker,
@@ -63,6 +67,10 @@ from vision.team_side import TeamSideRecognizer, TeamSideTracker  # noqa: E402
 
 
 COMPLETION_CHECK_INTERVAL = 15
+END_GRACE_SECONDS = 90.0
+TERMINAL_RAYBET_STATUSES = frozenset(
+    {"3", "4", "5", "closed", "ended", "finished", "settled"}
+)
 DEFAULT_FEATURES = ROOT / "vision" / "templates" / "hero_features.npz"
 ALLOWED_STREAM_HOSTS = frozenset(
     {
@@ -357,7 +365,24 @@ def match_source(
     if not row or (not row[0] and not refresh_url):
         raise ValueError(f"no live_url found for RayBet match {match_id}")
     if refresh_url:
-        url, payload = _fresh_stream_payload(database_url, match_id)
+        try:
+            url, payload = _fresh_stream_payload(database_url, match_id)
+        except Exception as error:
+            # A pre-match row may already contain a verified public HLS URL,
+            # while the signed odds URL is not issued until the broadcast is
+            # live.  Keep the safe stored URL as a bounded acquisition fallback.
+            if isinstance(error, ValueError) and "identity mismatch" in str(error):
+                raise
+            stored_url = stored_public_stream_url(row[0], row[1])
+            if stored_url is None:
+                raise
+            url = _validate_stream_url(
+                stored_url, description=f"stored live URL for RayBet match {match_id}"
+            )
+            try:
+                payload = json.loads(str(row[1] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
     else:
         stored_url = stored_public_stream_url(row[0], row[1])
         if stored_url is None:
@@ -386,6 +411,10 @@ def match_source(
             f"cannot determine a unique current map for RayBet match "
             f"{match_id}: {error}"
         ) from error
+    if map_number is None:
+        # Status 1 is an eligible pre-match waiting state.  The first map is
+        # the only safe default until RayBet publishes settled-map evidence.
+        map_number = 1 if str(row[3]).strip() == "1" else None
     if map_number is None or (best_of is not None and map_number > best_of):
         raise ValueError(
             f"cannot determine a unique current map for RayBet match {match_id}"
@@ -438,13 +467,30 @@ def resolve_source(
 def match_is_complete(
     database_url: str, match_id: str, *, now: datetime | None = None
 ) -> bool:
+    del now
     with LiveBettingStore(database_url) as store:
         connection = store.connection
         row = connection.execute(
-            "SELECT status, updated_at FROM raybet_matches WHERE raybet_match_id=?",
+            """SELECT status, updated_at, raw_json, best_of
+                 FROM raybet_matches WHERE raybet_match_id=?""",
             (match_id,),
         ).fetchone()
-        return not row or not raybet_match_is_live(row[0], row[1], now=now)
+        if not row:
+            return True
+        # Freshness is deliberately not used as an end signal.  A delayed
+        # provider refresh must enter the watcher grace path instead of
+        # terminating a perfectly healthy stream.
+        status = str(row[0]).strip().casefold()
+        if status in TERMINAL_RAYBET_STATUSES:
+            return True
+        if status != "2" or row[3] is None:
+            return False
+        try:
+            payload = json.loads(str(row[2] or "{}"))
+            best_of = int(row[3])
+            return infer_current_map_number(payload, best_of) is None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
 
 
 def completion_check_due(sample_count: int) -> bool:
@@ -566,20 +612,11 @@ def _should_persist_frame(
     captured_at: float,
     last_evidence_at: float,
     evidence_interval: float,
+    evidence_due: bool = False,
 ) -> bool:
-    """Persist every decision-capable observation and periodic barriers."""
-    important_change = (
-        previous is None
-        or previous.screen_state != current.screen_state
-        or (current.is_confirmed and not previous.is_confirmed)
-        or current.map_number != previous.map_number
-        or current.comeback_state != previous.comeback_state
-    )
-    return (
-        current.is_confirmed
-        or important_change
-        or captured_at - last_evidence_at >= evidence_interval
-    )
+    """Persist only when the lifecycle scheduler explicitly requests a frame."""
+    del previous, current, captured_at, last_evidence_at, evidence_interval
+    return evidence_due
 
 
 def _observation_persistence_decision(
@@ -589,6 +626,7 @@ def _observation_persistence_decision(
     captured_at: float,
     last_evidence_at: float,
     evidence_interval: float,
+    evidence_due: bool = False,
 ) -> tuple[bool, bool]:
     persist_frame = _should_persist_frame(
         previous,
@@ -596,6 +634,7 @@ def _observation_persistence_decision(
         captured_at=captured_at,
         last_evidence_at=last_evidence_at,
         evidence_interval=evidence_interval,
+        evidence_due=evidence_due,
     )
     return _meaningful(previous, current) or persist_frame, persist_frame
 
@@ -614,6 +653,45 @@ def _write_evidence_frame(
         return publish_vision_frame_bytes(evidence_root, encoded.tobytes())
     except (cv2.error, OSError, RuntimeError, ValueError) as error:
         raise OSError("failed to write content-addressed evidence frame") from error
+
+
+def _manifest_path(evidence_root: Path, match_id: str) -> Path:
+    return evidence_root / f"{match_id}.manifest.jsonl"
+
+
+def _write_manifest_event(
+    evidence_root: Path,
+    *,
+    match_id: str,
+    trigger: EvidenceTrigger,
+    captured_at: float,
+    receipt: VisionFrameReceipt,
+    screen_state: str,
+    confidence: float,
+    map_number: int | None,
+) -> None:
+    payload = {
+        "match_id": match_id,
+        "event": trigger.event,
+        "phase": trigger.phase,
+        "scheduled_at": datetime.fromtimestamp(
+            trigger.scheduled_at, timezone.utc
+        ).isoformat(),
+        "captured_at": datetime.fromtimestamp(
+            captured_at, timezone.utc
+        ).isoformat(),
+        "frame_ref": receipt.frame_ref,
+        "screen_state": screen_state,
+        "confidence": round(max(0.0, min(1.0, float(confidence))), 6),
+        "map_number": map_number,
+        "reason": trigger.reason,
+    }
+    path = _manifest_path(evidence_root, match_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def capture_heartbeat_path(output: Path) -> Path:
@@ -693,6 +771,7 @@ def _write_capture_heartbeat(
     diagnostics: HudDiagnostics,
     draft_slot_statuses: tuple[DraftSlotStatus, ...] = (),
     team_side_recognizer_status: str | None = None,
+    capture_phase: str | None = None,
 ) -> None:
     if capture_status not in {"producing_trusted", "capturing_partial"}:
         raise ValueError("capture heartbeat status is invalid")
@@ -705,6 +784,7 @@ def _write_capture_heartbeat(
         "match_id": match_id,
         "captured_at": captured_at.astimezone(timezone.utc).isoformat(),
         "capture_status": capture_status,
+        "capture_phase": capture_phase,
         "blocker_code": diagnostics.blocker_code,
         "layout": {
             "profile": diagnostics.layout_name,
@@ -885,18 +965,48 @@ def _run_cli(args: argparse.Namespace) -> int:
     sample_count = 0
     active_layout_name: str | None = None
     awaiting_series_completion = False
+    lifecycle = CaptureLifecycle(
+        evidence_interval=args.evidence_interval,
+        end_grace_seconds=END_GRACE_SECONDS,
+    )
+    lifecycle.restore(load_manifest(_manifest_path(evidence_dir, args.match_id)))
+    if lifecycle.phase == "waiting_for_stream" and output.exists():
+        try:
+            with output.open("r", encoding="utf-8") as handle:
+                recent_lines = list(handle)[-2000:]
+            for line in recent_lines:
+                try:
+                    prior = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if prior.get("screen_state") == "game":
+                    captured = datetime.fromisoformat(
+                        str(prior.get("captured_at_utc"))
+                    ).timestamp()
+                    lifecycle.restore_game_started(captured)
+        except (OSError, TypeError, ValueError):
+            pass
+    last_evidence_at = lifecycle.last_evidence_at or 0.0
+    last_frame = None
+    last_observation: LiveObservation | None = None
+    last_hud = None
 
     try:
         for frame in _native_safe_frames(
             url, interval=args.interval, count=args.count
         ):
             sample_count += 1
+            last_frame = frame
             if (
                 completion_check_due(sample_count)
                 and match_is_complete(args.database_url, args.match_id)
             ):
+                lifecycle.mark_provider_complete(frame.captured_at)
+            if lifecycle.should_close(frame.captured_at):
+                lifecycle.close()
                 break
             hud = hud_reader.read(frame.image)
+            last_hud = hud
             selection = hud.selection
             if (
                 selection.layout_name is not None
@@ -918,7 +1028,11 @@ def _run_cli(args: argparse.Namespace) -> int:
                     diagnostics=hud.diagnostics,
                     draft_slot_statuses=draft_tracker.slot_statuses,
                     team_side_recognizer_status=team_side_recognizer_status,
+                    capture_phase=lifecycle.phase,
                 )
+                if lifecycle.should_close(frame.captured_at):
+                    lifecycle.close()
+                    break
                 continue
             state = hud.screen_state
             confirmed_clock: ConfirmedClock | None = None
@@ -964,6 +1078,16 @@ def _run_cli(args: argparse.Namespace) -> int:
                             else "hud_replay_gate_untrusted"
                         ),
                     )
+                    triggers = lifecycle.observe(
+                        captured_at=frame.captured_at,
+                        screen_state=observation.screen_state,
+                        screen_confidence=hud.screen_confidence,
+                        layout_supported=selection.supported,
+                        replay_gate_status=replay_gate.status,
+                        game_clock_seconds=None,
+                        scoreboard_ready=False,
+                        map_number=None,
+                    )
                     append_observation, persist_frame = (
                         _observation_persistence_decision(
                             previous,
@@ -971,6 +1095,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                             captured_at=frame.captured_at,
                             last_evidence_at=last_evidence_at,
                             evidence_interval=args.evidence_interval,
+                            evidence_due=bool(triggers),
                         )
                     )
                     if append_observation:
@@ -981,9 +1106,21 @@ def _run_cli(args: argparse.Namespace) -> int:
                             observation.source_frame_bytes = receipt.byte_length
                             observation.source_frame_path = str(receipt.storage_path)
                             last_evidence_at = frame.captured_at
+                            for trigger in triggers:
+                                _write_manifest_event(
+                                    evidence_dir,
+                                    match_id=args.match_id,
+                                    trigger=trigger,
+                                    captured_at=frame.captured_at,
+                                    receipt=receipt,
+                                    screen_state=observation.screen_state,
+                                    confidence=hud.screen_confidence,
+                                    map_number=observation.map_number,
+                                )
                         writer.append(observation)
                         print(observation.model_dump_json())
                         previous = observation
+                        last_observation = observation
                     _write_capture_heartbeat(
                         output,
                         match_id=args.match_id,
@@ -992,6 +1129,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                         diagnostics=hud.diagnostics,
                         draft_slot_statuses=draft_tracker.slot_statuses,
                         team_side_recognizer_status=team_side_recognizer_status,
+                        capture_phase=lifecycle.phase,
                     )
                     continue
                 raw_clock = hud.clock
@@ -1006,6 +1144,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     next_map = _next_map_number(map_number, best_of)
                     if next_map is None:
                         awaiting_series_completion = True
+                        lifecycle.mark_provider_complete(frame.captured_at)
                         outside_game_frames = 0
                         last_draft = None
                         continue
@@ -1030,6 +1169,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     next_map = _next_map_number(map_number, best_of)
                     if next_map is None:
                         awaiting_series_completion = True
+                        lifecycle.mark_provider_complete(frame.captured_at)
                         outside_game_frames = 0
                         last_draft = None
                         continue
@@ -1084,6 +1224,27 @@ def _run_cli(args: argparse.Namespace) -> int:
                 else:
                     confirmed_draft = None
                     last_draft = draft_during_untrusted(draft_tracker, last_draft)
+            elif state == "draft":
+                outside_game_frames += 1
+                scoreboard_tracker.reset()
+                advantage_tracker.reset()
+                confirmed_scoreboard = None
+                confirmed_advantage = None
+                if allow_target_draft_tracking(
+                    radiant_team_side=radiant_team_side,
+                ):
+                    confirmed_draft = draft_tracker.update(
+                        hud.draft,
+                        observed_at=frame.captured_at,
+                        source_frame_hash=(
+                            getattr(frame, "frame_hash", None) or frame.source_hash
+                        ),
+                        game_clock_seconds=None,
+                    )
+                    last_draft = confirmed_draft or last_draft
+                else:
+                    confirmed_draft = None
+                    last_draft = draft_during_untrusted(draft_tracker, last_draft)
             else:
                 outside_game_frames += 1
                 scoreboard_tracker.reset()
@@ -1115,12 +1276,28 @@ def _run_cli(args: argparse.Namespace) -> int:
                     confirmed_advantage if state == "game" else None,
                 ),
             )
+            triggers = lifecycle.observe(
+                captured_at=frame.captured_at,
+                screen_state=state,
+                screen_confidence=hud.screen_confidence,
+                layout_supported=selection.supported,
+                replay_gate_status=hud.replay_gate.status,
+                game_clock_seconds=clock_seconds,
+                scoreboard_ready=(
+                    confirmed_scoreboard is not None
+                    and confirmed_scoreboard.radiant_kills is not None
+                    and confirmed_scoreboard.dire_kills is not None
+                ),
+                map_number=map_number if state == "game" else None,
+            )
+            evidence_due = bool(triggers)
             append_observation, persist_frame = _observation_persistence_decision(
                 previous,
                 observation,
                 captured_at=frame.captured_at,
                 last_evidence_at=last_evidence_at,
                 evidence_interval=args.evidence_interval,
+                evidence_due=evidence_due,
             )
             if append_observation:
                 if persist_frame:
@@ -1130,9 +1307,21 @@ def _run_cli(args: argparse.Namespace) -> int:
                     observation.source_frame_bytes = receipt.byte_length
                     observation.source_frame_path = str(receipt.storage_path)
                     last_evidence_at = frame.captured_at
+                    for trigger in triggers:
+                        _write_manifest_event(
+                            evidence_dir,
+                            match_id=args.match_id,
+                            trigger=trigger,
+                            captured_at=frame.captured_at,
+                            receipt=receipt,
+                            screen_state=observation.screen_state,
+                            confidence=hud.screen_confidence,
+                            map_number=observation.map_number,
+                        )
                 writer.append(observation)
                 print(observation.model_dump_json())
                 previous = observation
+                last_observation = observation
             _write_capture_heartbeat(
                 output,
                 match_id=args.match_id,
@@ -1151,12 +1340,36 @@ def _run_cli(args: argparse.Namespace) -> int:
                 ),
                 draft_slot_statuses=draft_tracker.slot_statuses,
                 team_side_recognizer_status=team_side_recognizer_status,
+                capture_phase=lifecycle.phase,
             )
+            if lifecycle.should_close(frame.captured_at):
+                lifecycle.close()
+                break
     except Exception as error:
         raise WatcherFailure(
             _watcher_error_category(error),
             _sanitized_stream_location(url),
         ) from None
+    if (
+        lifecycle.phase == "ended_grace"
+        and not lifecycle.final_emitted
+        and last_frame is not None
+    ):
+        captured_at = float(last_frame.captured_at)
+        receipt = _write_evidence_frame(evidence_dir, last_frame.image)
+        _write_manifest_event(
+            evidence_dir,
+            match_id=args.match_id,
+            trigger=EvidenceTrigger(
+                "ended_final", lifecycle.phase, captured_at, "provider_completed"
+            ),
+            captured_at=captured_at,
+            receipt=receipt,
+            screen_state=(last_observation.screen_state if last_observation else "unknown"),
+            confidence=(last_hud.screen_confidence if last_hud is not None else 0.0),
+            map_number=last_observation.map_number if last_observation else map_number,
+        )
+    lifecycle.close()
     return 0
 
 

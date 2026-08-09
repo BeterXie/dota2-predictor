@@ -1,5 +1,5 @@
 import { Tab, TabList } from "@fluentui/react-components";
-import { Broadcast, ClockCounterClockwise, Flask, GearSix } from "@phosphor-icons/react";
+import { ArrowLeft, Broadcast, ClockCounterClockwise, Flask, GearSix } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -142,7 +142,7 @@ export default function App() {
   const visibleMatches = useMemo(
     () => view === "replay"
       ? matches.filter((match) => match.history_eligible)
-      : matches.filter((match) => match.lifecycle !== "ended"),
+      : matches.filter((match) => match.lifecycle !== "ended" && !match.history_eligible),
     [matches, view],
   );
   useEffect(() => {
@@ -151,9 +151,7 @@ export default function App() {
         return current;
       }
       if (view === "vision") return null;
-      return view === "replay"
-        ? visibleMatches[0]?.raybet_match_id || null
-        : preferredMatch(visibleMatches);
+      return view === "operations" ? preferredMatch(visibleMatches) : null;
     });
   }, [view, visibleMatches]);
   const selectedMatch = matches.find((match) => match.raybet_match_id === selectedId)
@@ -248,46 +246,86 @@ export default function App() {
       </header>
 
       {error && <div className="global-error" role="alert">{error}</div>}
-      <div className={view === "vision" ? "app-content vision-mode" : "app-content"}>
-        {view !== "vision" && <MatchRail
-          hasMore={view === "replay" && historyHasMore}
-          loadError={view === "replay" ? historyError : null}
-          loadingMore={view === "replay" && historyLoading}
-          matches={visibleMatches}
-          mode={view === "replay" ? "history" : "live"}
-          onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
-          onSelect={setSelectedId}
-          selectedId={selectedId}
-        />}
+      <div className={[
+        "app-content",
+        view === "vision" ? "vision-mode" : "",
+        view === "live" || view === "replay"
+          ? selectedId ? "detail-mode" : "list-mode"
+          : "",
+      ].filter(Boolean).join(" ")}>
         {view === "vision" ? (
           <VisionCalibrationPage csrfToken={controlSession?.csrf_token || null} />
         ) : view === "operations" ? (
-          <OperationsPanel
-            alerts={snapshot?.alerts || []}
-            busyKey={controlBusy}
-            components={components}
-            controlMessage={controlMessage}
-            controlsEnabled={Boolean(controlSession)}
-            health={snapshot?.health || []}
-            mappings={mappings}
-            match={selectedMatch}
-            onAcknowledge={(id) => {
-              const token = requireControl();
-              if (token) void acknowledgeAlert(id, token);
-            }}
-            onApproveMapping={(id) => void mutateMapping((token) => approveAutomaticMapping(id, token))}
-            onControl={(component, action) => void runControl(component, action)}
-            onCreateAutomaticMap={(id, map) => void mutateMapping((token) => createAutomaticMapping(id, map, token))}
-            onInvalidateMapping={(id) => void mutateMapping((token) => invalidateMapping(id, "operator_invalidated", token))}
-          />
+          <>
+            <MatchRail
+              matches={visibleMatches}
+              mode="live"
+              onSelect={setSelectedId}
+              selectedId={selectedId}
+            />
+            <OperationsPanel
+              alerts={snapshot?.alerts || []}
+              busyKey={controlBusy}
+              components={components}
+              controlMessage={controlMessage}
+              controlsEnabled={Boolean(controlSession)}
+              health={snapshot?.health || []}
+              mappings={mappings}
+              match={selectedMatch}
+              onAcknowledge={(id) => {
+                const token = requireControl();
+                if (token) void acknowledgeAlert(id, token);
+              }}
+              onApproveMapping={(id) => void mutateMapping((token) => approveAutomaticMapping(id, token))}
+              onControl={(component, action) => void runControl(component, action)}
+              onCreateAutomaticMap={(id, map) => void mutateMapping((token) => createAutomaticMapping(id, map, token))}
+              onInvalidateMapping={(id) => void mutateMapping((token) => invalidateMapping(id, "operator_invalidated", token))}
+            />
+          </>
+        ) : selectedId ? (
+          <div className="live-detail-view">
+            <div className="live-detail-toolbar">
+              <button
+                aria-label={view === "replay" ? "返回历史结果列表" : "返回实时与赛前赛事列表"}
+                className="live-detail-back"
+                onClick={() => {
+                  setSelectedId(null);
+                  setDetail(null);
+                }}
+                type="button"
+              >
+                <ArrowLeft size={17} weight="bold" aria-hidden="true" />
+                <span>{view === "replay" ? "历史结果" : "赛事列表"}</span>
+              </button>
+              <div className="live-detail-context">
+                <strong>{selectedMatch
+                  ? `${selectedMatch.team_one || "队伍一"} vs ${selectedMatch.team_two || "队伍二"}`
+                  : "赛事详情"}</strong>
+                <span>{selectedMatch?.display_name
+                  || selectedMatch?.tournament
+                  || `RayBet ${selectedId}`}</span>
+              </div>
+            </div>
+            <MatchWorkspace
+              csrfToken={controlSession?.csrf_token || null}
+              detail={detail}
+              error={error}
+              loading={loading || (view === "replay" && historyLoading && history.length === 0)}
+              match={selectedMatch}
+              replay={view === "replay"}
+            />
+          </div>
         ) : (
-          <MatchWorkspace
-            csrfToken={controlSession?.csrf_token || null}
-            detail={detail}
-            error={error}
-            loading={loading || (view === "replay" && historyLoading && history.length === 0)}
-            match={selectedMatch}
-            replay={view === "replay"}
+          <MatchRail
+            hasMore={view === "replay" && historyHasMore}
+            loadError={view === "replay" ? historyError : null}
+            loadingMore={view === "replay" && historyLoading}
+            matches={visibleMatches}
+            mode={view === "replay" ? "history" : "live"}
+            onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
+            onSelect={setSelectedId}
+            selectedId={null}
+            variant="page"
           />
         )}
       </div>

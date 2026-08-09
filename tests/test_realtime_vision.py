@@ -253,7 +253,7 @@ def test_epl_layout_uses_portrait_insets_for_hero_recognition() -> None:
         0.7115,
         0.043,
     ))
-    assert EPL_MASTERS_LIVE.draft_recognition_max_clock_seconds == 180
+    assert EPL_MASTERS_LIVE.draft_recognition_max_clock_seconds is None
 
 
 def test_epl_scoreboard_strip_uses_positioned_ocr_results() -> None:
@@ -1728,6 +1728,71 @@ def test_team_side_rejects_different_unrelated_stable_images() -> None:
         np.hstack((left_unrelated, right_unrelated))
     )
     assert reading.radiant_team_side is None
+
+
+def test_team_side_uses_exact_two_name_ocr_when_broadcast_logo_changed() -> None:
+    class FakeTeamNameOcr:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, _image):
+            self.calls += 1
+            text, score = (("Level UP", 0.94), ("MOUZ", 0.83))[self.calls - 1]
+            return [[[0, 0], text, score]], None
+
+    circle, square = _logo("circle"), _logo("square")
+    layout = replace(
+        LOGO_LAYOUT,
+        radiant_team_name=LEFT,
+        dire_team_name=RIGHT,
+    )
+    recognizer = TeamSideRecognizer(
+        circle,
+        square,
+        layout,
+        team_names=("Level Up", "MOUZ"),
+        use_ocr=False,
+    )
+    recognizer.ocr = FakeTeamNameOcr()
+    unrelated = np.random.default_rng(99).integers(
+        0, 256, (80, 160, 3), dtype=np.uint8
+    )
+
+    reading = recognizer.read(unrelated)
+
+    assert reading.radiant_team_side == "team_one"
+    assert reading.confidence == pytest.approx(0.83)
+
+
+def test_team_side_name_ocr_requires_both_exact_confident_names() -> None:
+    class FakeTeamNameOcr:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, _image):
+            self.calls += 1
+            text, score = (("Level UP", 0.94), ("UNKNOWN", 0.99))[self.calls - 1]
+            return [[[0, 0], text, score]], None
+
+    circle, square = _logo("circle"), _logo("square")
+    layout = replace(
+        LOGO_LAYOUT,
+        radiant_team_name=LEFT,
+        dire_team_name=RIGHT,
+    )
+    recognizer = TeamSideRecognizer(
+        circle,
+        square,
+        layout,
+        team_names=("Level Up", "MOUZ"),
+        use_ocr=False,
+    )
+    recognizer.ocr = FakeTeamNameOcr()
+    unrelated = np.random.default_rng(100).integers(
+        0, 256, (80, 160, 3), dtype=np.uint8
+    )
+
+    assert recognizer.read(unrelated).radiant_team_side is None
 
 
 def test_team_side_database_prefers_team_tag_logo(monkeypatch) -> None:

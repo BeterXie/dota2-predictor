@@ -14,9 +14,11 @@ import {
   CheckCircle,
   ImageSquare,
   LockKey,
+  MagnifyingGlass,
   MagnifyingGlassMinus,
   MagnifyingGlassPlus,
   WarningCircle,
+  X,
 } from "@phosphor-icons/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -29,9 +31,11 @@ import {
 } from "../api";
 import type {
   PrematchHero,
+  PrematchHeroGrid,
   VisionCalibrationBootstrap,
   VisionCalibrationEvent,
   VisionCalibrationEvaluation,
+  VisionMatchSummary,
 } from "../types";
 
 
@@ -41,11 +45,20 @@ interface VisionCalibrationPageProps {
 
 
 type CalibrationPanel = "truth" | "candidate" | "evaluation";
+type HeroAttribute = keyof PrematchHeroGrid;
+
+const HERO_ATTRIBUTE_LABELS: Record<HeroAttribute, string> = {
+  str: "力量",
+  agi: "敏捷",
+  int: "智力",
+  all: "全才",
+};
 
 
 export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps) {
   const [data, setData] = useState<VisionCalibrationBootstrap | null>(null);
   const [heroes, setHeroes] = useState<PrematchHero[]>([]);
+  const [heroGrid, setHeroGrid] = useState<PrematchHeroGrid>({ str: [], agi: [], int: [], all: [] });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [profileId, setProfileId] = useState("all");
   const [truth, setTruth] = useState<Array<number | "">>(Array(10).fill(""));
@@ -59,11 +72,15 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   const [activePanel, setActivePanel] = useState<CalibrationPanel>("truth");
   const [frameScale, setFrameScale] = useState(1);
   const [focusedSlot, setFocusedSlot] = useState<number | null>(null);
+  const [heroPickerSlot, setHeroPickerSlot] = useState<number | null>(null);
+  const [heroAttribute, setHeroAttribute] = useState<HeroAttribute>("str");
+  const [heroSearch, setHeroSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"label" | "candidate" | "evaluation" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const frameStageRef = useRef<HTMLDivElement>(null);
+  const heroSearchRef = useRef<HTMLInputElement>(null);
 
   const reload = async (signal?: AbortSignal) => {
     const value = await fetchVisionCalibration(signal);
@@ -79,9 +96,11 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     const controller = new AbortController();
     Promise.all([reload(controller.signal), fetchHeroGrid(controller.signal)])
       .then(([, grid]) => {
-        setHeroes(Object.values(grid).flat().sort((one, two) => (
-          one.localized_name.localeCompare(two.localized_name)
-        )));
+        const catalog = Array.from(
+          new Map(Object.values(grid).flat().map((hero) => [hero.hero_id, hero])).values(),
+        ).sort((one, two) => one.localized_name.localeCompare(two.localized_name));
+        setHeroGrid(grid);
+        setHeroes(catalog);
         setError(null);
       })
       .catch((reason: Error) => {
@@ -94,6 +113,11 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   }, []);
 
   const profiles = data?.profiles || [];
+  const matchSummaries = data?.match_summaries || [];
+  const heroesById = useMemo(
+    () => new Map(heroes.map((hero) => [hero.hero_id, hero])),
+    [heroes],
+  );
   const visibleEvents = useMemo(
     () => data?.events.filter((item) => profileId === "all" || item.profile_id === profileId) || [],
     [data?.events, profileId],
@@ -135,9 +159,28 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     setObservationFile("");
     setFrameScale(1);
     setFocusedSlot(null);
+    setHeroPickerSlot(null);
+    setHeroSearch("");
     setError(null);
     setMessage(null);
   }, [data?.candidates, data?.layout_profiles, event]);
+
+  useEffect(() => {
+    if (heroPickerSlot === null) return undefined;
+    const timer = window.setTimeout(() => heroSearchRef.current?.focus(), 0);
+    return () => window.clearTimeout(timer);
+  }, [heroPickerSlot]);
+
+  const selectedTruthHeroIds = useMemo(
+    () => new Set(truth.filter((value): value is number => typeof value === "number")),
+    [truth],
+  );
+  const pickerHeroes = useMemo(() => {
+    const query = heroSearch.trim().toLocaleLowerCase("zh-CN");
+    return heroGrid[heroAttribute].filter((hero) => (
+      !query || hero.localized_name.toLocaleLowerCase("zh-CN").includes(query)
+    ));
+  }, [heroAttribute, heroGrid, heroSearch]);
 
   const truthReady = truth.every((value) => typeof value === "number")
     && new Set(truth).size === 10;
@@ -197,6 +240,30 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
   const clearFeedback = () => {
     setError(null);
     setMessage(null);
+  };
+
+  const openHeroPicker = (slot: number) => {
+    clearFeedback();
+    setFocusedSlot(slot);
+    setHeroPickerSlot(slot);
+  };
+
+  const closeHeroPicker = () => {
+    setHeroPickerSlot(null);
+    setHeroSearch("");
+  };
+
+  const selectTruthHero = (heroId: number) => {
+    if (heroPickerSlot === null) return;
+    setTruth((current) => current.map((value, index) => (
+      index === heroPickerSlot ? heroId : value
+    )));
+    closeHeroPicker();
+  };
+
+  const clearTruthHero = (slot: number) => {
+    clearFeedback();
+    setTruth((current) => current.map((value, index) => (index === slot ? "" : value)));
   };
 
   let evaluationDisabledReason: string | null = null;
@@ -317,6 +384,21 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
       {error && <div className="vision-feedback error" role="alert"><WarningCircle size={18} />{error}</div>}
       {message && <div className="vision-feedback success" role="status"><CheckCircle size={18} />{message}</div>}
 
+      {matchSummaries.length > 0 && (
+        <section className="vision-match-overview" aria-label="比赛汇总">
+          <header className="vision-match-overview-header">
+            <div>
+              <h2>比赛汇总</h2>
+              <p>按一局比赛查看采集完整度，再从下方帧级队列进行真值校正。</p>
+            </div>
+            <span>{matchSummaries.length} 局</span>
+          </header>
+          <div className="vision-match-summary-grid">
+            {matchSummaries.map((summary) => <MatchSummaryCard key={summary.match_id} summary={summary} />)}
+          </div>
+        </section>
+      )}
+
       {!data?.events.length ? (
         <section className="vision-empty-state">
           <ImageSquare size={32} />
@@ -329,7 +411,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
           <section className="vision-event-queue" aria-label="Vision 校正样本">
             <header className="vision-queue-header">
               <div className="vision-queue-title">
-                <div><h2>校正队列</h2><p>真实帧样本</p></div>
+                <div><h2>校正队列</h2><p>真实帧样本</p><small>逐帧选择，标注十英雄 HUD 真值</small></div>
                 <span>{visibleEvents.length}</span>
               </div>
               <label className="vision-profile-selector">
@@ -543,27 +625,40 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                   <div className="vision-truth-teams">
                     {(["Radiant", "Dire"] as const).map((side, sideIndex) => (
                       <fieldset className={`vision-truth-team ${side.toLowerCase()}`} key={side}>
-                        <legend>{side}</legend>
+                        <legend>{side} · 点击头像选择英雄</legend>
                         {truth.slice(sideIndex * 5, sideIndex * 5 + 5).map((value, localIndex) => {
                           const index = sideIndex * 5 + localIndex;
+                          const hero = typeof value === "number" ? heroesById.get(value) : null;
                           return (
-                            <label key={`${event.event_id}-${index}`}>
-                              <span>{localIndex + 1}</span>
-                              <select
-                                aria-label={`${side} slot ${localIndex + 1}`}
-                                onChange={(change) => {
-                                  clearFeedback();
-                                  setTruth((current) => current.map((item, itemIndex) => (
-                                    itemIndex === index ? Number(change.target.value) || "" : item
-                                  )));
-                                }}
-                                onFocus={() => setFocusedSlot(index)}
-                                value={value}
+                            <div className={hero ? "vision-truth-slot filled" : "vision-truth-slot"} key={`${event.event_id}-${index}`}>
+                              <button
+                                aria-label={`选择 ${side} slot ${localIndex + 1} 英雄`}
+                                className="vision-truth-slot-select"
+                                onClick={() => openHeroPicker(index)}
+                                type="button"
                               >
-                                <option value="">选择英雄</option>
-                                {heroes.map((hero) => <option key={hero.hero_id} value={hero.hero_id}>{hero.localized_name} · #{hero.hero_id}</option>)}
-                              </select>
-                            </label>
+                                <span className="vision-truth-slot-index">#{localIndex + 1}</span>
+                                {hero ? (
+                                  <img alt="" loading="lazy" src={hero.image_url} />
+                                ) : (
+                                  <span className="vision-truth-slot-placeholder"><ImageSquare size={18} /></span>
+                                )}
+                                <span className="vision-truth-slot-copy">
+                                  <strong>{hero?.localized_name || "选择英雄"}</strong>
+                                  <small>{hero ? `Hero ID #${hero.hero_id}` : "点击打开英雄头像"}</small>
+                                </span>
+                              </button>
+                              {hero && (
+                                <button
+                                  aria-label={`清除 ${side} slot ${localIndex + 1} 英雄`}
+                                  className="vision-truth-slot-clear"
+                                  onClick={() => clearTruthHero(index)}
+                                  type="button"
+                                >
+                                  <X size={14} />
+                                </button>
+                              )}
+                            </div>
                           );
                         })}
                       </fieldset>
@@ -657,7 +752,106 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
           )}
         </div>
       )}
+
+      {heroPickerSlot !== null && (
+        <div className="vision-hero-picker-backdrop" onMouseDown={(mouse) => {
+          if (mouse.currentTarget === mouse.target) closeHeroPicker();
+        }}>
+          <section aria-label="HUD 真实值英雄选择器" aria-modal="true" className="vision-hero-picker" role="dialog">
+            <header>
+              <div>
+                <strong>{heroPickerSlot < 5 ? "Radiant" : "Dire"} · 槽位 {(heroPickerSlot % 5) + 1}</strong>
+                <small>点击英雄头像后立即写入当前 HUD 真值槽位</small>
+              </div>
+              <button aria-label="关闭英雄选择器" onClick={closeHeroPicker} type="button"><X size={18} /></button>
+            </header>
+            <div className="vision-hero-picker-controls">
+              <div aria-label="英雄属性" role="tablist">
+                {(Object.keys(HERO_ATTRIBUTE_LABELS) as HeroAttribute[]).map((attribute) => (
+                  <button
+                    aria-selected={heroAttribute === attribute}
+                    className={heroAttribute === attribute ? "active" : ""}
+                    key={attribute}
+                    onClick={() => setHeroAttribute(attribute)}
+                    role="tab"
+                    type="button"
+                  >
+                    {HERO_ATTRIBUTE_LABELS[attribute]}
+                  </button>
+                ))}
+              </div>
+              <label className="vision-hero-search">
+                <MagnifyingGlass size={16} aria-hidden="true" />
+                <input
+                  aria-label="搜索英雄"
+                  onChange={(change) => setHeroSearch(change.target.value)}
+                  placeholder="搜索英雄"
+                  ref={heroSearchRef}
+                  value={heroSearch}
+                />
+              </label>
+            </div>
+            <div className="vision-hero-picker-grid">
+              {pickerHeroes.map((hero) => {
+                const currentHeroId = truth[heroPickerSlot];
+                const unavailable = selectedTruthHeroIds.has(hero.hero_id)
+                  && currentHeroId !== hero.hero_id;
+                return (
+                  <button
+                    aria-label={`选择英雄 ${hero.localized_name}`}
+                    className={currentHeroId === hero.hero_id ? "selected" : ""}
+                    disabled={unavailable}
+                    key={hero.hero_id}
+                    onClick={() => selectTruthHero(hero.hero_id)}
+                    type="button"
+                  >
+                    <img alt="" loading="lazy" src={hero.image_url} />
+                    <span>{hero.localized_name}</span>
+                  </button>
+                );
+              })}
+              {!pickerHeroes.length && <p>当前分类没有匹配的英雄</p>}
+            </div>
+          </section>
+        </div>
+      )}
     </main>
+  );
+}
+
+
+function MatchSummaryCard({ summary }: { summary: VisionMatchSummary }) {
+  const maps = summary.maps.length ? summary.maps.map((map) => `Map ${map}`).join(" · ") : "Map 待识别";
+  const title = summary.display_name || `RayBet ${summary.match_id}`;
+  const stateClass = ["live", "draft", "preparing", "ending", "ended", "waiting", "archived"]
+    .includes(summary.status) ? summary.status : "unknown";
+  return (
+    <article className={`vision-match-summary ${stateClass}`}>
+      <header>
+        <div>
+          <h3 title={title}>{title}</h3>
+          <p>RayBet {summary.match_id} · {maps}</p>
+        </div>
+        <span className="vision-match-state">{summary.status_label}</span>
+      </header>
+      <dl>
+        <div><dt>逐帧观测</dt><dd>{summary.observation_count}</dd></div>
+        <div><dt>证据帧</dt><dd>{summary.evidence_frame_count}</dd></div>
+        <div><dt>30 秒采样</dt><dd>{summary.periodic_count}</dd></div>
+        <div><dt>生命周期事件</dt><dd>{summary.manifest_event_count}</dd></div>
+      </dl>
+      <div className="vision-match-summary-tags">
+        <span>Screen {summary.latest_screen_state || "unknown"}</span>
+        <span>{summary.layout_profile || "Layout 待识别"}</span>
+        {summary.draft_started && <span className="confirmed">BP 已确认</span>}
+        {summary.game_started && <span className="confirmed">开局已确认</span>}
+        {summary.ended_final && <span className="confirmed">结束帧已保存</span>}
+      </div>
+      <footer>
+        <time>{formatMatchRange(summary.first_captured_at, summary.last_captured_at)}</time>
+        <code>{summary.phase}</code>
+      </footer>
+    </article>
   );
 }
 
@@ -728,6 +922,13 @@ function formatPercent(value: number): string {
 
 function formatLatency(value: number | null): string {
   return value === null ? "未锁定" : `${value.toFixed(1)} 秒`;
+}
+
+
+function formatMatchRange(first: string | null, last: string | null): string {
+  if (!first && !last) return "尚无有效时间戳";
+  if (!first || first === last) return formatTime(last || first || "");
+  return `${formatTime(first)} — ${formatTime(last || first)}`;
 }
 
 

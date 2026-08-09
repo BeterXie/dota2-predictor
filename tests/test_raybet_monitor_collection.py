@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,14 +27,106 @@ class _Connection:
         return _Rows(self._rows)
 
 
-def test_due_scheduled_match_is_retained_for_live_odds_polling() -> None:
+def test_live_list_refresh_persists_all_open_match_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2026, 8, 9, 11, 0, tzinfo=timezone.utc)
+    head_to_head = {
+        "id": "42",
+        "status": 1,
+        "team": [
+            {"pos": 1, "team_id": 101, "team_name": "Alpha"},
+            {"pos": 2, "team_id": 202, "team_name": "Beta"},
+        ],
+    }
+    provider_rows = [
+        head_to_head,
+        {"id": "99", "status": 1, "match_short_name": "Outright"},
+    ]
+    calls: dict[str, object] = {}
+
+    def fetch(
+        store: object,
+        client: object,
+        *,
+        response_kind: str,
+        match_types: tuple[int, ...],
+    ) -> list[dict[str, object]]:
+        calls["response_kind"] = response_kind
+        calls["match_types"] = match_types
+        return provider_rows
+
+    def sync(
+        store: object,
+        fetched_rows: list[dict[str, object]],
+        *,
+        observed_at: datetime,
+    ) -> None:
+        calls["rows"] = fetched_rows
+        calls["observed_at"] = observed_at
+
+    monkeypatch.setattr(monitor, "_fetch_match_list", fetch)
+    monkeypatch.setattr(monitor, "_sync_open_match_rows", sync)
+
+    cache, degraded = monitor._refresh_live_list_cache(
+        object(),
+        object(),
+        None,
+        monotonic_clock=lambda: 100.0,
+        wall_clock=lambda: observed_at,
+    )
+
+    assert degraded is False
+    assert list(cache.rows) == [head_to_head]
+    assert calls == {
+        "response_kind": "live_match_list",
+        "match_types": monitor.OPEN_MATCH_TYPES,
+        "rows": [head_to_head],
+        "observed_at": observed_at,
+    }
+
+
+def test_open_match_sync_upserts_current_rows_and_unlists_missing() -> None:
+    executed: list[tuple[str, tuple[str, ...]]] = []
+    upserted: list[tuple[str, datetime]] = []
+    observed_at = datetime(2026, 8, 9, 11, 0, tzinfo=timezone.utc)
+
+    class Connection:
+        def execute(
+            self,
+            query: str,
+            params: tuple[str, ...] = (),
+        ) -> None:
+            executed.append((query, params))
+
+    store = SimpleNamespace(
+        connection=Connection(),
+        transaction=nullcontext,
+        upsert_raybet_match=lambda row, updated_at: upserted.append(
+            (str(row["id"]), updated_at)
+        ),
+    )
+
+    monitor._sync_open_match_rows(
+        store,
+        [{"id": "43", "status": 1}, {"id": "42", "status": 1}],
+        observed_at=observed_at,
+    )
+
+    assert len(executed) == 1
+    assert "SET status='unlisted'" in executed[0][0]
+    assert executed[0][1] == ("42", "43")
+    assert upserted == [("43", observed_at), ("42", observed_at)]
+
+
+def test_due_scheduled_unlisted_match_is_retained_for_live_odds_polling() -> None:
     store = SimpleNamespace(
         connection=_Connection(
             [
                 {
                     "raybet_match_id": "42",
                     "scheduled_at": "2026-08-08 17:00:00",
-                    "status": "1",
+                    "status": "unlisted",
                 },
                 {
                     "raybet_match_id": "43",
@@ -57,11 +150,31 @@ def test_due_scheduled_match_is_retained_for_live_odds_polling() -> None:
     assert rows == [
         {
             "id": "42",
-            "status": "1",
+            "status": "unlisted",
             "start_time": "2026-08-08 17:00:00",
             "_force_live_poll": True,
         }
     ]
+
+
+def test_future_prematch_collects_one_initial_audit_snapshot() -> None:
+    class Connection:
+        def execute(self, query: str, params: tuple[str, ...]) -> SimpleNamespace:
+            assert "FROM direct_response_audit" in query
+            assert params[0] == "42"
+            return SimpleNamespace(fetchone=lambda: None)
+
+    store = SimpleNamespace(connection=Connection())
+    assert monitor._prematch_collection_due(
+        store,
+        "42",
+        {
+            "id": "42",
+            "status": "1",
+            "start_time": "2026-08-09 23:00:00",
+        },
+        now=datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc),
+    )
 
 
 def test_scheduled_fallback_can_use_priority_polling() -> None:

@@ -2,7 +2,11 @@ import { FluentProvider, webDarkTheme } from "@fluentui/react-components";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { MatchDetail, MonitorMatch } from "../types";
+import type {
+  LiveDraftProspectivePrediction,
+  MatchDetail,
+  MonitorMatch,
+} from "../types";
 
 const api = vi.hoisted(() => ({
   correctLiveGameSnapshot: vi.fn(),
@@ -102,6 +106,36 @@ const detail: MatchDetail = {
   }],
 };
 
+const pairedPrediction: LiveDraftProspectivePrediction = {
+  prediction_hash: "a".repeat(64),
+  version: "live-draft-prospective-bridge-v1",
+  identity: {
+    raybet_match_id: "raybet-1",
+    map_number: 1,
+    mapping_version: 1,
+    mapping_hash: "b".repeat(64),
+  },
+  operator_locked_at: "2026-08-07T10:08:00+00:00",
+  confirmed_at: "2026-08-07T10:08:01+00:00",
+  record_status: "paired",
+  p0_probability: 0.6,
+  p1_probability: 0.65,
+  pure_rosh_score: 1,
+  standardized_rosh_score: 0.5,
+  rosh_logit_contribution: 0.2,
+  missing_reason: null,
+  candidate_hash: "c".repeat(64),
+  causal_evidence: {
+    game_clock_seconds: null,
+    vision_frame_timestamp: null,
+    draft_state_marker: "draft_complete",
+    live_state_input_used: false,
+    causal_status: "eligible",
+    causal_reason: null,
+  },
+  created_at: "2026-08-07T10:08:02+00:00",
+};
+
 function renderWorkspace(
   replay = false,
   currentDetail = detail,
@@ -190,6 +224,27 @@ describe("MatchWorkspace", () => {
       expect(screen.getByRole("button", { name: "生成实时阵容预测" })).toBeInTheDocument();
     });
     expect(screen.getByText(/不使用击杀、经济、经验/)).toBeInTheDocument();
+  });
+
+  it("renders the paired P1 versus current-map odds as a shadow value decision", async () => {
+    api.fetchLiveDraftPrediction.mockResolvedValueOnce({
+      status: "available",
+      prediction: pairedPrediction,
+    });
+    const winner = {
+      observed_at: "2026-08-07T10:10:00+00:00",
+      period: "map_1",
+      complete: true,
+      prices: { team_one: 1.82, team_two: 2.08 },
+      probabilities: { team_one: 0.55, team_two: 0.45 },
+    };
+
+    renderWorkspace(false, { ...detail, winner }, { ...match, winner });
+
+    expect(await screen.findByLabelText("影子投注决策")).toBeInTheDocument();
+    expect(screen.getByText("候选")).toBeInTheDocument();
+    expect(screen.getByText("live-draft-value-shadow-v1")).toBeInTheDocument();
+    expect(screen.getByText(/不会提交真实投注/)).toBeInTheDocument();
   });
 
   it("does not render an untrusted stream resolver URL", () => {

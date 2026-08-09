@@ -17,7 +17,7 @@ from database.session import PostgresSession
 from live_betting.raybet import SITE_URL
 from live_betting.storage import LiveBettingStore
 from vision.image_features import compute_phash
-from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
+from vision.layouts import BroadcastLayout, NormalizedRegion, STANDARD_DOTA_HUD
 
 
 ALLOWED_TEAM_LOGO_HOSTS = frozenset(
@@ -182,18 +182,40 @@ class TeamSideRecognizerLoad:
 class TeamSideRecognizer:
     min_logo_similarity = 0.75
     min_assignment_margin = 0.04
+    min_team_name_confidence = 0.80
 
     def __init__(
         self,
         team_one_logo: np.ndarray,
         team_two_logo: np.ndarray,
         layout: BroadcastLayout = STANDARD_DOTA_HUD,
+        *,
+        team_names: tuple[str, str] | None = None,
+        use_ocr: bool = True,
     ) -> None:
         if layout.radiant_team_logo is None or layout.dire_team_logo is None:
             raise ValueError("layout does not define team logo regions")
         self.team_one_hash = compute_phash(_silhouette(team_one_logo), hash_size=8)
         self.team_two_hash = compute_phash(_silhouette(team_two_logo), hash_size=8)
         self.layout = layout
+        self.team_name_keys = (
+            tuple(_normalize(name) for name in team_names)
+            if team_names is not None
+            else None
+        )
+        self.ocr = None
+        if (
+            use_ocr
+            and self.team_name_keys is not None
+            and layout.radiant_team_name is not None
+            and layout.dire_team_name is not None
+        ):
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+
+                self.ocr = RapidOCR()
+            except ImportError:
+                pass
 
     @staticmethod
     def from_database(
@@ -256,13 +278,62 @@ class TeamSideRecognizer:
                     )
                 images.append(image)
         return TeamSideRecognizerLoad(
-            TeamSideRecognizer(images[0], images[1]),
+            TeamSideRecognizer(images[0], images[1], team_names=team_names),
             None,
         )
 
     @staticmethod
     def _similarity(one: np.ndarray, two: np.ndarray) -> float:
         return 1.0 - float(np.mean(one != two))
+
+    def _team_name_readings(
+        self,
+        image: np.ndarray,
+        region: NormalizedRegion | None,
+    ) -> tuple[tuple[str, float], ...]:
+        if self.ocr is None or region is None:
+            return ()
+        crop = region.crop(image)
+        if crop.size == 0:
+            return ()
+        enlarged = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        result, _ = self.ocr(enlarged)
+        readings = tuple(
+            (_normalize(str(item[1])), float(item[2]))
+            for item in result or ()
+            if len(item) >= 3 and _normalize(str(item[1]))
+        )
+        if len(readings) <= 1:
+            return readings
+        combined = (
+            "".join(text for text, _ in readings),
+            min(score for _, score in readings),
+        )
+        return readings + (combined,)
+
+    def _read_team_names(self, image: np.ndarray) -> TeamSideReading | None:
+        if self.team_name_keys is None:
+            return None
+        left = self._team_name_readings(image, self.layout.radiant_team_name)
+        right = self._team_name_readings(image, self.layout.dire_team_name)
+
+        def confidence(readings: tuple[tuple[str, float], ...], key: str) -> float:
+            return max((score for text, score in readings if text == key), default=0.0)
+
+        team_one, team_two = self.team_name_keys
+        direct = min(confidence(left, team_one), confidence(right, team_two))
+        swapped = min(confidence(left, team_two), confidence(right, team_one))
+        if (
+            direct >= self.min_team_name_confidence
+            and swapped < self.min_team_name_confidence
+        ):
+            return TeamSideReading("team_one", min(0.99, direct))
+        if (
+            swapped >= self.min_team_name_confidence
+            and direct < self.min_team_name_confidence
+        ):
+            return TeamSideReading("team_two", min(0.99, swapped))
+        return None
 
     def read(self, image: np.ndarray) -> TeamSideReading:
         left = compute_phash(
@@ -286,11 +357,17 @@ class TeamSideRecognizer:
             assignment_margins = (left_two - left_one, right_one - right_two)
         absolute_similarity = min(matched)
         if absolute_similarity < self.min_logo_similarity:
-            return TeamSideReading(None, min(0.89, absolute_similarity))
+            return self._read_team_names(image) or TeamSideReading(
+                None, min(0.89, absolute_similarity)
+            )
         if min(assignment_margins) < self.min_assignment_margin:
-            return TeamSideReading(None, min(0.89, 0.5 + margin * 2))
+            return self._read_team_names(image) or TeamSideReading(
+                None, min(0.89, 0.5 + margin * 2)
+            )
         if margin < self.min_assignment_margin * 2:
-            return TeamSideReading(None, min(0.89, 0.5 + margin * 2))
+            return self._read_team_names(image) or TeamSideReading(
+                None, min(0.89, 0.5 + margin * 2)
+            )
         return TeamSideReading(
             "team_one" if direct > swapped else "team_two",
             min(0.99, 0.80 + margin + absolute_similarity * 0.15),
