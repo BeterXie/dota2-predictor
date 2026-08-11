@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
+import re
+
 import cv2
 import numpy as np
 from scipy.fftpack import dct
 
 
-MAX_VARIANTS_PER_HERO = 4  # Includes the required base portrait.
-ALLOWED_HERO_VARIANT_NAMES = frozenset({"death", "dim", "inset08", "inset16"})
+MAX_VARIANTS_PER_HERO = 16  # Includes the required base portrait.
+ALLOWED_HERO_VARIANT_NAMES = frozenset(
+    {"arcana", "death", "dim", "inset08", "inset16", "persona"}
+)
+_DYNAMIC_HERO_VARIANT_NAME = re.compile(
+    r"(?:arcana|persona|style)[0-9]{2}|calibration_[0-9a-f]{12}"
+)
+
+
+def valid_hero_variant_name(name: str) -> bool:
+    return name in ALLOWED_HERO_VARIANT_NAMES or _DYNAMIC_HERO_VARIANT_NAME.fullmatch(
+        name
+    ) is not None
 
 
 def compute_phash(image: np.ndarray, hash_size: int = 8) -> np.ndarray:

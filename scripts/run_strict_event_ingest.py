@@ -7,10 +7,11 @@ import asyncio
 import json
 import logging
 import sys
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence, TypeVar
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +27,8 @@ from event_intelligence.scheduler import IngestScheduler  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 def _positive_int(value: str) -> int:
@@ -152,11 +155,13 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
         max_concurrency=args.max_concurrency,
     )
     scheduler = IngestScheduler(ingestor, store)
+    health_connection = PostgresSession(storage.engine)
     callbacks = tuple(
         callback
         for callback in (
-            getattr(client, "close", None),
             getattr(storage, "close", None),
+            getattr(health_connection, "close", None),
+            getattr(client, "close", None),
         )
         if callback is not None
     )
@@ -164,7 +169,7 @@ def build_default_runtime(args: argparse.Namespace) -> Runtime:
         ingestor,
         scheduler,
         callbacks,
-        health_connection=storage.connection,
+        health_connection=health_connection,
     )
 
 
@@ -201,16 +206,22 @@ async def run(
             now = datetime.now(timezone.utc)
             try:
                 if direct_one_shot:
-                    report = await runtime.ingestor.run_once(
-                        event_id=args.event,
-                        match_id=args.match,
-                        active_only=args.active,
-                        reconcile=args.reconcile,
-                        now=now,
+                    report = await _await_with_health_heartbeat(
+                        runtime,
+                        runtime.ingestor.run_once(
+                            event_id=args.event,
+                            match_id=args.match,
+                            active_only=args.active,
+                            reconcile=args.reconcile,
+                            now=now,
+                        ),
                     )
                 else:
-                    report = await runtime.scheduler.run_due(
-                        now, include_recent=not args.active
+                    report = await _await_with_health_heartbeat(
+                        runtime,
+                        runtime.scheduler.run_due(
+                            now, include_recent=not args.active
+                        ),
                     )
                 candidate_error = getattr(report, "candidate_error", None)
                 successful = _report_due(report, direct_one_shot)
@@ -242,6 +253,33 @@ async def run(
             await asyncio.sleep(args.interval)
     finally:
         await runtime.close()
+
+
+async def _await_with_health_heartbeat(
+    runtime: Runtime,
+    operation: Awaitable[_T],
+    *,
+    interval: float = _HEARTBEAT_INTERVAL_SECONDS,
+) -> _T:
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                _record_runtime_health(
+                    runtime,
+                    "starting",
+                    datetime.now(timezone.utc),
+                )
+            except Exception:
+                logger.exception("Failed to persist strict ingest progress heartbeat")
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        return await operation
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 def _report_due(report: object, direct_one_shot: bool) -> bool:

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
-from contracts.live_observation import COMEBACK_STATE_MIN_CONFIDENCE
+from contracts.live_observation import (
+    COMEBACK_STATE_MIN_CONFIDENCE,
+    DraftPlayerNames,
+)
 
 from .clock_reader import ClockReader, ClockReading
 from .hero_recognizer import (
@@ -16,8 +19,14 @@ from .hero_recognizer import (
     HeroRecognizer,
     HeroSlotDiagnostic,
 )
-from .layout_selector import LayoutSelection, select_broadcast_layout
+from .layout_selector import (
+    LayoutSelection,
+    draft_lineup_complete,
+    select_broadcast_layout,
+)
 from .layouts import BroadcastLayout
+from .player_name_reader import DraftPlayerNameReader
+from .profile_features import promoted_profile_feature_path
 from .screen_state import classify_screen_state
 from .scoreboard_reader import (
     NetWorthAdvantageReading,
@@ -37,6 +46,9 @@ class HudFrameReading:
     scoreboard: ScoreboardReading
     net_worth_advantage: NetWorthAdvantageReading
     draft: DraftReading
+    draft_player_names: DraftPlayerNames = field(
+        default_factory=DraftPlayerNames.unavailable
+    )
 
     @property
     def diagnostics(self) -> "HudDiagnostics":
@@ -225,6 +237,8 @@ class _ProfileReaders:
     scoreboard: ScoreboardReader
     clock: ClockReader
     heroes: HeroRecognizer
+    player_names: DraftPlayerNameReader
+    hero_features_ready: bool
 
 
 class HudReader:
@@ -248,10 +262,20 @@ class HudReader:
         clock = ClockReader(layout, use_ocr=False)
         # Reuse one OCR runtime for the positioned strip and small-region fallback.
         clock.ocr = scoreboard.ocr
+        feature_path = self.feature_path
+        hero_features_ready = True
+        if feature_path.resolve() == DEFAULT_FEATURE_PATH.resolve():
+            promoted = promoted_profile_feature_path(layout.name)
+            feature_path = promoted or feature_path
+            hero_features_ready = (
+                promoted is not None or not layout.draft_completion_cyan_regions
+            )
         profile = _ProfileReaders(
             scoreboard=scoreboard,
             clock=clock,
-            heroes=HeroRecognizer(self.feature_path, layout),
+            heroes=HeroRecognizer(feature_path, layout),
+            player_names=DraftPlayerNameReader(layout, ocr=scoreboard.ocr),
+            hero_features_ready=hero_features_ready,
         )
         self._profiles[layout.name] = profile
         return profile
@@ -276,6 +300,35 @@ class HudReader:
             )
         profile = self._profile(selection.layout)
         screen_state, screen_confidence = classify_screen_state(image, selection.layout)
+        if screen_state == "draft":
+            lineup_complete = draft_lineup_complete(image, selection.layout)
+            draft = (
+                profile.heroes.read(image)
+                if profile.hero_features_ready
+                and lineup_complete
+                else unavailable_draft
+            )
+            player_names = (
+                profile.player_names.read(image)
+                if lineup_complete
+                else DraftPlayerNames.unavailable("draft_lineup_incomplete")
+            )
+            player_names = profile.player_names.bind_heroes(
+                player_names,
+                draft.radiant_hero_ids,
+                draft.dire_hero_ids,
+            )
+            return HudFrameReading(
+                selection,
+                screen_state,
+                screen_confidence,
+                unavailable_gate,
+                unavailable_clock,
+                unavailable_scoreboard,
+                unavailable_advantage,
+                draft,
+                player_names,
+            )
         if screen_state != "game":
             return HudFrameReading(
                 selection,

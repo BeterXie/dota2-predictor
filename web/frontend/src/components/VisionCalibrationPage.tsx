@@ -351,10 +351,14 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
     setBusy("candidate");
     setError(null);
     try {
-      const candidate = await buildVisionCalibrationCandidate(event.label.label_id, csrfToken);
+      const candidate = await buildVisionCalibrationCandidate(
+        event.label.label_id,
+        candidateId || null,
+        csrfToken,
+      );
       await reload();
       setCandidateId(candidate.candidate_id);
-      setMessage("已生成隔离候选包；需要留出评估后才能讨论推广。");
+      setMessage(`已生成隔离候选包，新增 ${candidate.added_variant_count} 个外观模板；需要留出评估后才能讨论推广。`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "构建候选包失败");
     } finally {
@@ -757,6 +761,21 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
                     <div><dt>可复用候选</dt><dd>{relatedCandidates.length}</dd></div>
                     <div><dt>生产模板</dt><dd>保持不变</dd></div>
                   </dl>
+                  <label>
+                    <span>候选基线</span>
+                    <select
+                      aria-label="候选基线"
+                      onChange={(change) => { clearFeedback(); setCandidateId(change.target.value); }}
+                      value={candidateId}
+                    >
+                      <option value="">当前已推广 Profile 包</option>
+                      {relatedCandidates.map((item) => (
+                        <option key={item.candidate_id} value={item.candidate_id}>
+                          {formatTime(item.created_at)} · +{item.added_variant_count} 外观 · {item.promoted ? "已推广" : "隔离"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <Button
                     appearance="secondary"
                     className="vision-secondary-action"
@@ -773,7 +792,7 @@ export function VisionCalibrationPage({ csrfToken }: VisionCalibrationPageProps)
               {activePanel === "evaluation" && (
                 <section className="vision-workflow-panel" aria-label="留出评估">
                   <div className="vision-panel-heading"><h3>留出评估</h3><p>使用另一段真实序列验证最终锁定。</p></div>
-                  <label><span>候选包</span><select onChange={(change) => { clearFeedback(); setCandidateId(change.target.value); }} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{item.layout} · {formatTime(item.created_at)}</option>)}</select></label>
+                  <label><span>候选包</span><select onChange={(change) => { clearFeedback(); setCandidateId(change.target.value); }} value={candidateId}><option value="">选择当前 profile 的候选</option>{relatedCandidates.map((item) => <option key={item.candidate_id} value={item.candidate_id}>{formatTime(item.created_at)} · {item.promoted ? "已推广" : "隔离"}</option>)}</select></label>
                   <label>
                     <span>Observation 序列</span>
                     <select

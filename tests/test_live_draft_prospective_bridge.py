@@ -10,6 +10,7 @@ import event_intelligence.live_draft_prospective_bridge as bridge
 from event_intelligence.live_draft_prospective_bridge import (
     LOCK_CONFIRMATION,
     LiveDraftProspectiveBridgeRepository,
+    VisionDraftAuthority,
     _causal_status,
     canonical_mapping_hash,
     generate_live_draft_prediction,
@@ -65,6 +66,13 @@ def test_locked_mapping_hash_requires_exact_unique_ten_slot_authority() -> None:
     missing_position["slots"][4]["position"] = 4  # type: ignore[index]
     with pytest.raises(ValueError, match="unique"):
         canonical_mapping_hash(missing_position)
+
+
+def test_unsourced_manual_positions_cannot_enter_formal_analysis() -> None:
+    repository = object.__new__(LiveDraftProspectiveBridgeRepository)
+
+    with pytest.raises(ValueError, match="draft_position_authority_unverified"):
+        repository.validate_mapping_authority(_mapping())
 
 
 class _TeamRepository:
@@ -161,6 +169,17 @@ class _NoSeedRepository:
     def validate_prediction_target(self, *_args: object) -> str:
         return "2"
 
+    def validate_mapping_authority(
+        self,
+        *_args: object,
+    ) -> VisionDraftAuthority:
+        return VisionDraftAuthority(
+            captured_at=LOCKED_AT - timedelta(seconds=1),
+            game_clock_seconds=None,
+            screen_state="draft",
+            source_frame_ref="vision-frame:sha256:" + "a" * 64,
+        )
+
     def build_p0(self, *_args: object, **_kwargs: object) -> None:
         return None
 
@@ -189,6 +208,31 @@ def test_missing_prospective_seed_is_stable_blocker_without_network(
         "missing_reason": "prospective_team_rating_seed_unavailable",
         "prediction": None,
     }
+
+
+def test_missing_vision_authority_blocks_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class NoVisionRepository(_NoSeedRepository):
+        def validate_mapping_authority(self, *_args: object) -> VisionDraftAuthority:
+            raise ValueError("vision_draft_anchor_unavailable")
+
+    def forbidden_client() -> None:
+        raise AssertionError("STRATZ client must not run without Vision authority")
+
+    monkeypatch.setattr(bridge, "StratzRoshClient", forbidden_client)
+    with pytest.raises(ValueError, match="vision_draft_anchor_unavailable"):
+        generate_live_draft_prediction(
+            NoVisionRepository(),  # type: ignore[arg-type]
+            artifact_root=tmp_path,
+            raybet_match_id="raybet-live-1",
+            map_number=2,
+            mapping_version=3,
+            operator_identity="local-operator",
+            confirmation_text=LOCK_CONFIRMATION,
+            confirmed_at=LOCKED_AT + timedelta(seconds=1),
+        )
 
 
 class _ReadyRepository(_NoSeedRepository):

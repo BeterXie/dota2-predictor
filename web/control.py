@@ -111,12 +111,18 @@ class ControlService:
         self,
         connection: PostgresSession,
         component: str,
+        *,
+        ignore_supervisor_heartbeat: bool = False,
     ) -> dict[str, object]:
         if component not in COMPONENTS:
             raise KeyError(component)
         verify_runtime_schema(connection)
         with self._lock, connection.transaction():
-            return self._start(connection, component)
+            return self._start(
+                connection,
+                component,
+                ignore_supervisor_heartbeat=ignore_supervisor_heartbeat,
+            )
 
     def execute(
         self,
@@ -240,8 +246,6 @@ class ControlService:
         process = self._popen(
             command,
             cwd=str(self.project_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             env=os.environ.copy(),
         )

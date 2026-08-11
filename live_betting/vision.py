@@ -7,7 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from contracts.live_observation import ComebackState, LiveObservation, SCHEMA_VERSION
+from contracts.live_observation import (
+    ComebackState,
+    DraftPlayerNames,
+    LiveObservation,
+    SCHEMA_VERSION,
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,9 @@ class VisionObservation:
     source_frame_sha256: str | None = None
     source_frame_bytes: int | None = None
     source_frame_path: str | None = None
+    draft_player_names: DraftPlayerNames = field(
+        default_factory=DraftPlayerNames.unavailable
+    )
     comeback_state: VisionComebackState = field(
         default_factory=VisionComebackState.unavailable
     )
@@ -83,6 +91,25 @@ class VisionObservation:
             and all(type(hero_id) is int and hero_id > 0 for hero_id in heroes)
             and len(set(heroes)) == 10
             and self.clock_confidence >= 0.9
+            and self.draft_confidence >= 0.9
+            and isinstance(self.source_frame_ref, str)
+            and bool(self.source_frame_ref.strip())
+        )
+
+    @property
+    def is_draft_confirmed(self) -> bool:
+        heroes = self.radiant_hero_ids + self.dire_hero_ids
+        return (
+            self.map_number is not None
+            and self.screen_state == "draft"
+            and self.game_clock_seconds is None
+            and self.is_paused is None
+            and len(self.radiant_hero_ids) == 5
+            and len(self.dire_hero_ids) == 5
+            and all(type(hero_id) is int and hero_id > 0 for hero_id in heroes)
+            and len(set(heroes)) == 10
+            and self.radiant_team_side in {"team_one", "team_two"}
+            and self.clock_confidence == 0.0
             and self.draft_confidence >= 0.9
             and isinstance(self.source_frame_ref, str)
             and bool(self.source_frame_ref.strip())
@@ -105,7 +132,11 @@ class VisionObservation:
 
 def parse_observation(payload: dict) -> VisionObservation:
     schema_version = payload.get("schema_version")
-    if schema_version not in {1, 2, 3, SCHEMA_VERSION}:
+    if (
+        type(schema_version) is not int
+        or schema_version < 1
+        or schema_version > SCHEMA_VERSION
+    ):
         raise ValueError(f"unsupported vision schema: {payload.get('schema_version')}")
     normalized = dict(payload)
     if schema_version in {1, 2}:
@@ -145,6 +176,7 @@ def parse_observation(payload: dict) -> VisionObservation:
         source_frame_sha256=observation.source_frame_sha256,
         source_frame_bytes=observation.source_frame_bytes,
         source_frame_path=observation.source_frame_path,
+        draft_player_names=observation.draft_player_names,
         comeback_state=VisionComebackState.from_contract(
             observation.comeback_state
         ),

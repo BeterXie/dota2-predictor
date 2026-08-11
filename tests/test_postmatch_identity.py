@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from fetch.stratz_detail import StratzDetailError
 
 from live_betting.postmatch_monitor import (
     VisionDraftIdentity,
+    _archive_optional_stratz_enrichment,
     _opendota_matches_vision_identity,
+    _stratz_enrichment_health,
+    resolve_data_paths,
 )
 
 
@@ -96,6 +105,93 @@ class OpenDotaExactIdentityTests(unittest.TestCase):
                 detail = self.detail()
                 detail["leagueid"] = value
                 self.assertFalse(self.matches(detail))
+
+
+class PostmatchEnrichmentTests(unittest.TestCase):
+    def test_stratz_http_failure_is_structured_without_fake_artifact(self) -> None:
+        class Result:
+            @staticmethod
+            def fetchone() -> None:
+                return None
+
+        class Connection:
+            @staticmethod
+            def execute(*_args: object, **_kwargs: object) -> Result:
+                return Result()
+
+        class Client:
+            @staticmethod
+            async def get_match(_match_id: int) -> dict[str, object]:
+                raise StratzDetailError("STRATZ detail request returned HTTP 403")
+
+        class Archive:
+            @staticmethod
+            def archive_json(**_kwargs: object) -> None:
+                raise AssertionError("failed response must not create a primary artifact")
+
+        result = asyncio.run(
+            _archive_optional_stratz_enrichment(
+                SimpleNamespace(connection=Connection()),  # type: ignore[arg-type]
+                Client(),  # type: ignore[arg-type]
+                Archive(),  # type: ignore[arg-type]
+                9001,
+            )
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "match_id": 9001,
+                "status": "failed",
+                "reason": "stratz_http_403",
+                "attempted": True,
+            },
+        )
+
+    def test_stratz_enrichment_failures_degrade_worker_health_details(self) -> None:
+        health = _stratz_enrichment_health(
+            [
+                {
+                    "status": "display_already_synced",
+                    "stratz_enrichment": [
+                        {
+                            "match_id": 9001,
+                            "status": "failed",
+                            "reason": "stratz_http_403",
+                            "attempted": True,
+                        },
+                        {
+                            "match_id": 9002,
+                            "status": "available",
+                            "reason": "artifact_already_registered",
+                            "attempted": False,
+                        },
+                    ],
+                }
+            ],
+            configured=True,
+        )
+
+        self.assertEqual(health["attempted"], 1)
+        self.assertEqual(health["available"], 1)
+        self.assertEqual(health["failed"], 1)
+        self.assertEqual(health["failure_reasons"], ["stratz_http_403"])
+
+    def test_postmatch_archive_uses_configured_data_directory(self) -> None:
+        data_dir = Path.cwd() / "configured-data"
+        args = argparse.Namespace(archive_root=None)
+
+        resolved = resolve_data_paths(args, {"DATA_DIR": str(data_dir)})
+
+        self.assertEqual(resolved.archive_root, data_dir.resolve() / "raw-sources")
+
+    def test_explicit_postmatch_archive_root_overrides_data_directory(self) -> None:
+        archive_root = Path.cwd() / "explicit-raw"
+        args = argparse.Namespace(archive_root=archive_root)
+
+        resolved = resolve_data_paths(args, {"DATA_DIR": "ignored"})
+
+        self.assertEqual(resolved.archive_root, archive_root.resolve())
 
 
 if __name__ == "__main__":

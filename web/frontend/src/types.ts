@@ -51,8 +51,15 @@ export interface LiveDraftMapping {
   source: "manual" | "manual_correction";
   is_locked: boolean;
   created_by: string;
+  actor?: string;
+  evidence_source_url?: string | null;
+  authority_version?: "sourced-manual-draft-v1" | null;
   created_at: string;
   slots: LiveDraftSlot[];
+  prediction_automation?: LiveDraftPredictionResponse;
+  decision_checkpoint?: MapDecisionCheckpoint | null;
+  decision_checkpoint_status?: "available" | "blocked";
+  decision_checkpoint_missing_reason?: string | null;
 }
 
 export interface LiveDraftProspectivePrediction {
@@ -85,10 +92,66 @@ export interface LiveDraftProspectivePrediction {
   created_at: string;
 }
 
+export interface MapDecisionCheckpoint {
+  checkpoint_id: number;
+  raybet_match_id: string;
+  map_number: number;
+  mapping_version: number | null;
+  phase: "pregame" | "live";
+  checkpoint_minute: number;
+  strategy_version: "map-decision-shadow-v1";
+  decision: "bet_team_a" | "bet_team_b" | "skip";
+  assumed_stake_units: 1;
+  observed_price: number | null;
+  model_probability_team_one: number | null;
+  model_probability_team_two: number | null;
+  market_probability_team_one: number | null;
+  market_probability_team_two: number | null;
+  selected_edge: number | null;
+  odds_observation_key: string | null;
+  odds_group_id: string | null;
+  odds_observed_at: string | null;
+  odds_age_seconds: number | null;
+  odds_max_age_seconds: number;
+  vision_snapshot_id: number | null;
+  vision_source_frame_ref: string | null;
+  vision_captured_at: string | null;
+  vision_game_time_seconds: number | null;
+  vision_networth_lead: number | null;
+  vision_radiant_kills: number | null;
+  vision_dire_kills: number | null;
+  vision_age_seconds: number | null;
+  vision_max_age_seconds: number | null;
+  odds_vision_gap_seconds: number | null;
+  odds_vision_gap_max_seconds: number | null;
+  vision_trusted: boolean;
+  vision_replay: false;
+  input_versions: Record<string, unknown>;
+  feature_availability: Record<string, unknown>;
+  reason: string;
+  decided_at: string;
+  created_at: string;
+  evaluation_eligible: boolean;
+  evaluation_exclusion_reason: string | null;
+  settlement: {
+    settlement_id: number;
+    dota_match_id: number;
+    winner_side: "team_one" | "team_two";
+    outcome: "win" | "loss" | "skip";
+    gross_return_units: number;
+    profit_units: number;
+    result_source: "confirmed_map_result";
+    result_recorded_at: string;
+    settled_at: string;
+  } | null;
+}
+
 export interface LiveDraftPredictionResponse {
   status: "available" | "not_found" | "blocked" | "created" | "unchanged";
   prediction: LiveDraftProspectivePrediction | null;
   missing_reason?: string | null;
+  decision_checkpoint?: MapDecisionCheckpoint;
+  decision_checkpoints?: MapDecisionCheckpoint[];
 }
 
 export interface LiveDraftContextTeam {
@@ -128,6 +191,45 @@ export interface LiveGameSnapshot {
   created_at: string;
 }
 
+export interface LiveHudObservation {
+  status: "available" | "unavailable";
+  source: "vision_hud" | null;
+  observation_file: string;
+  captured_at: string;
+  map_number: number | null;
+  game_clock_seconds: number | null;
+  is_paused: boolean | null;
+  screen_state: string;
+  clock_confidence: number;
+  draft_confidence: number;
+  hud_confidence: number;
+  draft_confirmed: boolean;
+  radiant_hero_count: number;
+  dire_hero_count: number;
+  radiant_hero_ids: number[];
+  dire_hero_ids: number[];
+  radiant_kills: number | null;
+  dire_kills: number | null;
+  radiant_net_worth: number | null;
+  dire_net_worth: number | null;
+  net_worth_advantage_side: "radiant" | "dire" | null;
+  net_worth_advantage_min: number | null;
+  net_worth_advantage_max: number | null;
+  unavailable_reason: string | null;
+}
+
+export interface VisionRuntimeStatus {
+  worker_status: string;
+  freshness: "fresh" | "delayed" | "stale" | "missing";
+  observed_at: string | null;
+  map_number: number | null;
+  capture_state?: string | null;
+  reason?: string | null;
+  blocker_code?: string | null;
+  replay_gate_status?: string | null;
+  screen_state?: string | null;
+}
+
 export interface WatchLink {
   kind: "public_stream" | "stream_resolver" | "match_page" | "none";
   availability: "available" | "unavailable";
@@ -135,9 +237,28 @@ export interface WatchLink {
   reason: string;
 }
 
+export interface FreshnessReadiness {
+  status: ReadinessStatus;
+  observed_at: string | null;
+  age_seconds: number | null;
+}
+
+export interface MatchReadiness {
+  odds: FreshnessReadiness;
+  mapping: {
+    status: ReadinessStatus;
+    count: number;
+    total_count: number;
+    reasons: string[];
+  };
+  vision: FreshnessReadiness & {
+    reason?: "waiting_for_watch_window" | "stream_probe_pending";
+    watch_starts_at?: string | null;
+  };
+}
+
 export interface MonitorMatch {
   raybet_match_id: string;
-  official_match_id?: string | null;
   display_name?: string | null;
   observation_file?: string | null;
   tournament: string;
@@ -156,6 +277,7 @@ export interface MonitorMatch {
   winner: WinnerQuote | null;
   prematch_winner?: WinnerQuote | null;
   latest_vision: VisionPoint | null;
+  readiness?: MatchReadiness;
 }
 
 export interface WinnerTimelinePoint {
@@ -166,6 +288,38 @@ export interface WinnerTimelinePoint {
   status: Record<"team_one" | "team_two", string>;
   game_clock_seconds?: number | null;
   map_number?: number | null;
+}
+
+export interface OddsCoveragePhase {
+  status: "available" | "missing" | "pending";
+  complete_snapshot_count: number;
+  observation_count: number;
+  first_observed_at: string | null;
+  last_observed_at: string | null;
+  gap_count: number;
+  longest_gap_seconds: number | null;
+  periods: Array<{
+    period: string;
+    complete_snapshot_count: number;
+    observation_count: number;
+    first_observed_at: string;
+    last_observed_at: string;
+    gap_count: number;
+    longest_gap_seconds: number | null;
+  }>;
+}
+
+export interface OddsCoverageSummary {
+  source: "raybet_direct";
+  gap_threshold_seconds: number;
+  prematch: OddsCoveragePhase;
+  live: OddsCoveragePhase;
+  closing: {
+    status: "available" | "missing" | "pending" | "unconfirmed";
+    observed_at: string | null;
+    prices: Record<"team_one" | "team_two", number> | null;
+    probabilities: Record<"team_one" | "team_two", number> | null;
+  };
 }
 
 export interface MarketQuote {
@@ -182,17 +336,221 @@ export interface MarketQuote {
   supported: number;
 }
 
-export interface MatchDetail extends MonitorMatch {
+export type PostmatchAvailability = "available" | "partial" | "missing";
+
+export interface PostmatchHistoricalAverage {
+  sample_size: number;
+  source: "opendota_collected_history";
+  cutoff: "before_match_start";
+  sample_start_date: string;
+  sample_end_date: string;
+  kills: number | null;
+  deaths: number | null;
+  assists: number | null;
+  gold_per_min: number | null;
+  xp_per_min: number | null;
+  net_worth: number | null;
+  last_hits: number | null;
+  hero_damage: number | null;
+  tower_damage: number | null;
+}
+
+export interface PostmatchPlayer {
+  player_slot: number;
+  account_id: number | null;
+  player_name: string | null;
+  player_name_source: "opendota_name" | "opendota_personaname" | null;
+  side: "radiant" | "dire";
+  team_id: number | null;
+  hero_id: number;
+  hero_name: string;
+  hero_key: string;
+  kills: number | null;
+  deaths: number | null;
+  assists: number | null;
+  gold_per_min: number | null;
+  xp_per_min: number | null;
+  net_worth: number | null;
+  last_hits: number | null;
+  denies: number | null;
+  hero_damage: number | null;
+  hero_healing: number | null;
+  tower_damage: number | null;
+  level: number | null;
+  position: number | null;
+  position_source: "stratz" | null;
+  historical_average: PostmatchHistoricalAverage | null;
+  items: number[];
+}
+
+export interface PostmatchDraftAction {
+  order: number;
+  is_pick: boolean;
+  side: "radiant" | "dire";
+  hero_id: number;
+  hero_name: string;
+  hero_key: string;
+}
+
+export interface PostmatchGame {
+  map_number: number;
+  official_match_id: string;
+  identity_reason: "confirmed_map_result" | "raybet_explicit_map_time_unique";
+  identity_evidence: {
+    method: "confirmed_settlement_reconciliation" | "raybet_explicit_map_time_unique";
+    official_source: "confirmed_map_result" | "registered_opendota_match";
+    raybet_source?: string;
+    raybet_map_time?: string;
+    official_start_time?: string;
+    delta_seconds?: number;
+    maximum_delta_seconds?: number;
+    official_series_id?: number;
+    league_id?: number;
+  };
+  status: "available" | "linked_not_ingested";
+  source: "opendota";
+  enrichment: {
+    provider: "stratz";
+    status: "available" | "partial" | "not_available" | "invalid" | "blocked";
+    reason: string;
+    observed_at: string | null;
+  };
+  fetched_at: string | null;
+  result: {
+    radiant_team_id: number | null;
+    dire_team_id: number | null;
+    radiant_team_name: string | null;
+    dire_team_name: string | null;
+    radiant_win: boolean;
+    duration_seconds: number;
+    start_time: number | null;
+    league_id: number | null;
+    league_name: string | null;
+    radiant_score: number | null;
+    dire_score: number | null;
+  } | null;
+  players: PostmatchPlayer[];
+  draft: PostmatchDraftAction[];
+  advantages: {
+    gold: Array<{ minute: number; value: number }>;
+    xp: Array<{ minute: number; value: number }>;
+  };
+  objectives: Array<{
+    time_seconds: number | null;
+    type: string;
+    unit: string;
+    key: string;
+    player_slot: number | null;
+  }>;
+  teamfights: Array<{
+    start_time: number | null;
+    end_time: number | null;
+    last_death: number | null;
+    deaths: number | null;
+    kills: number;
+    damage: number;
+    healing: number;
+    gold_delta: number;
+    xp_delta: number;
+  }>;
+  availability: Record<
+    | "result"
+    | "players"
+    | "player_names"
+    | "historical_averages"
+    | "positions"
+    | "draft"
+    | "gold_advantage"
+    | "xp_advantage"
+    | "objectives"
+    | "teamfights",
+    PostmatchAvailability
+  >;
+}
+
+export interface PostmatchDetail {
+  status: "available" | "partial" | "waiting" | "review";
+  reason: string;
+  identity_source?: "map_results" | "raybet_explicit_map_time" | "waiting";
+  sources: {
+    canonical: {
+      provider: "opendota";
+      role: "canonical_postmatch";
+      status: string;
+      reason: string;
+    };
+    enhancement: {
+      provider: "stratz";
+      role: "optional_enrichment";
+      status: string;
+      reason: string;
+    };
+  };
+  games: PostmatchGame[];
+  unresolved_maps: Array<{
+    map_number: number;
+    status: string;
+    reason: string;
+    official_match_id: string | null;
+    updated_at: string | null;
+  }>;
+}
+
+export type MatchGameState = "scheduled" | "live" | "ended" | "unconfirmed";
+
+export interface MatchGameDetail {
+  game_id: string;
+  map_number: number;
+  period: string;
+  official_match_id: string | null;
+  link_status: "confirmed" | "unlinked";
+  link_reason: string;
+  play_evidence: Array<
+    | "locked_draft_mapping"
+    | "verified_game_frame"
+    | "trusted_game_snapshot"
+    | "raybet_final_market"
+    | "official_map_result"
+    | "provider_live_map"
+  >;
+  state: MatchGameState;
+  winner: WinnerQuote | null;
   prematch_winner?: WinnerQuote | null;
   winner_timeline: WinnerTimelinePoint[];
+  odds_coverage: OddsCoverageSummary;
   vision: VisionPoint[];
-  latest_capture?: VisionPoint | null;
-  draft_mapping?: LiveDraftMapping | null;
-  draft_context?: LiveDraftContext | null;
-  game_snapshots?: LiveGameSnapshot[];
-  latest_game_snapshot?: LiveGameSnapshot | null;
+  latest_vision: VisionPoint | null;
+  latest_capture: VisionPoint | null;
+  draft_mapping: LiveDraftMapping | null;
+  game_snapshots: LiveGameSnapshot[];
+  latest_game_snapshot: LiveGameSnapshot | null;
+  latest_hud_observation: LiveHudObservation | null;
+  vision_runtime: VisionRuntimeStatus | null;
+  markets: MarketQuote[];
+  postmatch: PostmatchDetail;
+  decision_checkpoints: MapDecisionCheckpoint[];
+}
+
+export interface MarketOnlyMapEvidence {
+  market_id: string;
+  map_number: number;
+  period: string;
+  status: "market_only";
+  reason: "no_play_evidence";
+  prematch_winner: WinnerQuote | null;
+  winner_timeline: WinnerTimelinePoint[];
+  odds_coverage: OddsCoverageSummary;
   markets: MarketQuote[];
 }
+
+export interface MatchDetail extends MonitorMatch {
+  draft_context: LiveDraftContext | null;
+  postmatch: PostmatchDetail;
+  games: MatchGameDetail[];
+  market_evidence: MarketOnlyMapEvidence[];
+}
+
+export type GameWorkspaceDetail = MatchDetail & MatchGameDetail;
 
 export interface HealthItem {
   component: string;
@@ -366,6 +724,9 @@ export interface VisionCalibrationCandidate {
   layout: string | null;
   profile_id: string;
   hero_ids: number[];
+  added_variant_count: number;
+  base_candidate_id?: string | null;
+  base_feature_sha256: string;
   created_at: string;
   feature_sha256: string;
   production_feature_sha256: string;

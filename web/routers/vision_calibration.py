@@ -41,6 +41,12 @@ class BuildCalibrationCandidateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     label_id: str = Field(min_length=20, max_length=20, pattern=r"^[a-f0-9]+$")
+    base_candidate_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-z0-9-]+$",
+    )
 
 
 class PromoteCalibrationCandidateRequest(BaseModel):
@@ -165,7 +171,10 @@ def build_candidate(
 ) -> dict[str, object]:
     _require_control(request, session_id, csrf_token)
     try:
-        return calibration_service.build_candidate(payload.label_id)
+        return calibration_service.build_candidate(
+            payload.label_id,
+            base_candidate_id=payload.base_candidate_id,
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="Calibration label not found") from None
     except ValueError as error:

@@ -10,10 +10,10 @@ from typing import Literal
 import cv2
 import numpy as np
 from vision.image_features import (
-    ALLOWED_HERO_VARIANT_NAMES,
     MAX_VARIANTS_PER_HERO,
     color_histogram,
     compute_phash,
+    valid_hero_variant_name,
 )
 from vision.layouts import BroadcastLayout, STANDARD_DOTA_HUD
 
@@ -143,8 +143,7 @@ class HeroRecognizer:
             if name != str(hero_id)
             and (
                 not name.startswith(f"{hero_id}__")
-                or name.removeprefix(f"{hero_id}__")
-                not in ALLOWED_HERO_VARIANT_NAMES
+                or not valid_hero_variant_name(name.removeprefix(f"{hero_id}__"))
             )
         ]
         if invalid_names:

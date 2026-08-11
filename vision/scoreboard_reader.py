@@ -317,13 +317,9 @@ class ScoreboardReader:
             return replay
         geometry_confidence = layout_match_confidence(image, self.layout)
         scoreboard = self._scoreboard_from_ocr(crop, result)
-        clock_confidence = max(
-            (
-                confidence
-                for text, confidence in readings
-                if re.fullmatch(r"-?\d{1,2}:\d{2}", text.strip())
-            ),
-            default=0.0,
+        positioned_clock = self.read_positioned_clock(image)
+        clock_confidence = (
+            positioned_clock.confidence if positioned_clock is not None else 0.0
         )
         if (
             geometry_confidence < COMEBACK_STATE_MIN_CONFIDENCE

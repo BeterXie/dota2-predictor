@@ -32,7 +32,7 @@ interface MatchRailProps {
   loadError?: string | null;
   loadingMore?: boolean;
   matches: MonitorMatch[];
-  mode: "live" | "history";
+  mode: "live" | "history" | "recap";
   selectedId: string | null;
   onLoadMore?: () => void;
   onSelect: (matchId: string) => void;
@@ -51,6 +51,8 @@ export function MatchRail({
   selectedId,
   variant = "rail",
 }: MatchRailProps) {
+  const historical = mode === "history" || mode === "recap";
+  const recap = mode === "recap";
   const [query, setQuery] = useState("");
   const [mobileExpanded, setMobileExpanded] = useState(false);
   const visible = useMemo(() => {
@@ -58,7 +60,6 @@ export function MatchRail({
     const filtered = needle
       ? matches.filter((match) => [
         match.raybet_match_id,
-        match.official_match_id,
         match.display_name,
         match.tournament,
         match.team_one,
@@ -78,11 +79,11 @@ export function MatchRail({
   return (
     <Root
       className={variant === "page"
-        ? "match-list-page"
+        ? `match-list-page${recap ? " recap-list" : ""}`
         : `match-rail${mobileExpanded ? " expanded" : ""}`}
       aria-label={variant === "page"
-        ? mode === "history" ? "历史赛事列表" : "实时与赛前赛事列表"
-        : mode === "history" ? "历史赛事" : "实时赛事"}
+        ? recap ? "比赛复盘赛事列表" : historical ? "历史赛事列表" : "实时与赛前赛事列表"
+        : recap ? "比赛复盘赛事" : historical ? "历史赛事" : "实时赛事"}
     >
       {variant === "rail" && (
         <button
@@ -91,7 +92,7 @@ export function MatchRail({
           onClick={() => setMobileExpanded((current) => !current)}
           type="button"
         >
-          <span>{mode === "history" ? "选择历史赛事" : "切换实时赛事"}</span>
+          <span>{recap ? "选择比赛" : historical ? "选择历史赛事" : "切换实时赛事"}</span>
           <strong>{selectedMatch?.team_one || "未选择"}</strong>
           <span>VS</span>
           <strong>{selectedMatch?.team_two || "未选择"}</strong>
@@ -101,7 +102,7 @@ export function MatchRail({
       <div className="rail-body">
         <header className="rail-header">
           <div>
-            <h2>{mode === "history" ? "历史结果" : "实时与赛前"}</h2>
+            <h2>{recap ? "比赛复盘" : historical ? "历史结果" : "实时与赛前"}</h2>
             <span className="rail-count">{visible.length} 场</span>
           </div>
           <Input
@@ -116,12 +117,12 @@ export function MatchRail({
 
         <nav
           className="match-groups"
-          aria-label={mode === "history" ? "历史赛事分组" : "实时与赛前赛事分组"}
+          aria-label={recap ? "比赛复盘赛事分组" : historical ? "历史赛事分组" : "实时与赛前赛事分组"}
         >
           {groups.map((group) => (
             <section className="match-group" key={group.key}>
               <div className="match-group-title">
-                <span>{GROUP_LABELS[group.key]}</span>
+                <span>{recap && group.key === "history" ? "最近结束" : GROUP_LABELS[group.key]}</span>
                 <span>{group.matches.length}</span>
               </div>
               <div className="match-group-items">
@@ -149,9 +150,9 @@ export function MatchRail({
                           <span className="tournament-name" title={match.tournament || "未知赛事"}>
                             {match.tournament || "未知赛事"}
                           </span>
-                          <small>{match.official_match_id
-                            ? `官方 Match ID ${match.official_match_id}`
-                            : `RayBet ${match.raybet_match_id}`}</small>
+                          <small>{recap
+                            ? formatDateTime(match.scheduled_at)
+                            : `RayBet Series ${match.raybet_match_id}`}</small>
                         </div>
                         <LifecycleBadge lifecycle={displayLifecycle} />
                       </div>
@@ -161,22 +162,26 @@ export function MatchRail({
                           <span className="versus">VS</span>
                           <span>{match.team_two || "队伍二"}</span>
                         </div>
-                        <small>{matchProgressLabel(match)}</small>
+                        {!recap && <small>{matchProgressLabel(match)}</small>}
                       </div>
                       <div className="match-row-market">
-                        <strong>{mode === "history"
+                        <strong>{recap
+                          ? "查看比赛复盘"
+                          : mode === "history"
                           ? "收盘快照"
                           : prematch ? "赛前快照" : "实时胜负盘"}</strong>
-                        <span>{quote
+                        <span>{recap
+                          ? "赛果、阵容与关键走势"
+                          : quote
                           ? "完整双方报价"
                           : prematch ? "进入详情查看最近报价" : "等待完整双方报价"}</span>
                       </div>
                       <div className="match-row-prices">
-                        <span>{formatOdds(quote?.prices?.team_one)}</span>
-                        <span>{formatOdds(quote?.prices?.team_two)}</span>
+                        <span>{recap ? match.best_of ? `BO${match.best_of}` : "赛制待确认" : formatOdds(quote?.prices?.team_one)}</span>
+                        {!recap && <span>{formatOdds(quote?.prices?.team_two)}</span>}
                         <RelativeAge
                           className="age"
-                          observedAt={observedAt}
+                          observedAt={recap ? match.updated_at : observedAt}
                           staleAfterSeconds={60}
                         />
                       </div>
@@ -193,11 +198,11 @@ export function MatchRail({
               <MagnifyingGlass size={24} aria-hidden="true" />
               <span>{query
                 ? "没有匹配的赛事"
-                : mode === "history" && loadingMore ? "正在加载历史赛事…" : "暂无赛事"}</span>
+                : historical && loadingMore ? "正在加载历史赛事…" : "暂无赛事"}</span>
             </div>
           )}
 
-          {mode === "history" && (hasMore || loadError) && (
+          {historical && (hasMore || loadError) && (
             <div className="rail-pagination">
               {loadError && <p role="alert">{loadError}</p>}
               {hasMore && onLoadMore && (
@@ -219,7 +224,7 @@ export function MatchRail({
 
 
 function matchGroup(match: MonitorMatch, mode: MatchRailProps["mode"]): MatchGroupKey {
-  if (mode === "history" || match.lifecycle === "ended") return "history";
+  if (mode === "history" || mode === "recap" || match.lifecycle === "ended") return "history";
   if (isPrematchMatch(match)) return "prematch";
   if (match.lifecycle === "live") return "live";
   return "degraded";

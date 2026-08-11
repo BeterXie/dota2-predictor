@@ -11,7 +11,7 @@ import httpx
 import numpy as np
 import pytest
 
-from contracts.live_observation import ComebackState, LiveObservation
+from contracts.live_observation import ComebackState, DraftPlayerNames, LiveObservation
 from live_betting.vision import read_jsonl
 from scripts.build_hero_features import build_hero_features
 from scripts.fetch_hero_portraits import valid_portrait_bytes
@@ -29,10 +29,19 @@ from vision.hero_recognizer import (
     HeroSlotDiagnostic,
 )
 from vision.hud_reader import HudFrameReading, HudReader
-from vision.image_features import color_histogram, compute_phash
-from vision.layout_selector import LayoutSelection, select_broadcast_layout
+from vision.image_features import (
+    MAX_VARIANTS_PER_HERO,
+    color_histogram,
+    compute_phash,
+)
+from vision.layout_selector import (
+    LayoutSelection,
+    draft_lineup_complete,
+    select_broadcast_layout,
+)
 from vision.layouts import (
     BroadcastLayout,
+    EPL_MASTERS_DRAFT,
     EPL_MASTERS_LIVE,
     EPL_S39_LIVE,
     NormalizedRegion,
@@ -81,6 +90,29 @@ def _synthetic_epl_hud() -> np.ndarray:
     cv2.rectangle(image, (1440, 0), (1469, 70), cyan, -1)
     cv2.rectangle(image, (1305, 918), (1651, 1079), (12, 12, 12), -1)
     cv2.rectangle(image, (1536, 928), (1612, 1079), cyan, -1)
+    return image
+
+
+def _synthetic_epl_draft(*, complete: bool = True) -> np.ndarray:
+    image = np.full((1080, 1920, 3), 70, dtype=np.uint8)
+    cyan = (255, 255, 0)
+    for region in (
+        EPL_MASTERS_DRAFT.draft_banner,
+        NormalizedRegion(1756 / 1920, 44 / 1080, 1781 / 1920, 101 / 1080),
+        NormalizedRegion(110 / 1920, 190 / 1080, 120 / 1920, 670 / 1080),
+        NormalizedRegion(1810 / 1920, 190 / 1080, 1820 / 1920, 670 / 1080),
+    ):
+        region.crop(image)[:] = cyan
+    for index, region in enumerate(
+        EPL_MASTERS_DRAFT.radiant_heroes + EPL_MASTERS_DRAFT.dire_heroes
+    ):
+        crop = region.crop(image)
+        crop[:] = np.random.default_rng(1000 + index).integers(
+            0, 255, crop.shape, dtype=np.uint8
+        )
+    if complete:
+        for region in EPL_MASTERS_DRAFT.draft_completion_cyan_regions:
+            region.crop(image)[:] = cyan
     return image
 
 
@@ -150,6 +182,143 @@ def test_epl_layout_requires_the_complete_hud_geometry() -> None:
     unsupported = select_broadcast_layout(image)
     assert unsupported.layout is None
     assert not unsupported.supported
+
+
+def test_epl_draft_layout_requires_its_complete_geometry() -> None:
+    image = _synthetic_epl_draft()
+
+    selection = select_broadcast_layout(image)
+
+    assert selection.layout == EPL_MASTERS_DRAFT
+    assert selection.confidence >= 0.9
+    assert classify_screen_state(image, EPL_MASTERS_DRAFT)[0] == "draft"
+
+    NormalizedRegion(
+        1810 / 1920, 190 / 1080, 1820 / 1920, 670 / 1080
+    ).crop(image)[:] = 70
+    assert select_broadcast_layout(image).layout != EPL_MASTERS_DRAFT
+
+
+def test_epl_live_and_plain_frames_do_not_select_the_draft_layout() -> None:
+    assert select_broadcast_layout(_synthetic_epl_hud()).layout == EPL_MASTERS_LIVE
+    plain = np.full((1080, 1920, 3), 70, dtype=np.uint8)
+    assert select_broadcast_layout(plain).layout != EPL_MASTERS_DRAFT
+
+
+def test_epl_draft_layout_uses_vertical_card_crops() -> None:
+    radiant = EPL_MASTERS_DRAFT.radiant_heroes
+    dire = EPL_MASTERS_DRAFT.dire_heroes
+
+    assert len(radiant) == len(dire) == 5
+    assert len(EPL_MASTERS_DRAFT.draft_completion_cyan_regions) == 10
+    assert (
+        radiant[0].left,
+        radiant[0].top,
+        radiant[0].right,
+        radiant[0].bottom,
+    ) == pytest.approx((39 / 1920, 778 / 1080, 173 / 1920, 951 / 1080))
+    assert (
+        dire[-1].left,
+        dire[-1].top,
+        dire[-1].right,
+        dire[-1].bottom,
+    ) == pytest.approx((1747 / 1920, 778 / 1080, 1881 / 1920, 951 / 1080))
+
+
+def test_epl_draft_requires_all_final_player_nameplates_before_recognition() -> None:
+    complete = _synthetic_epl_draft()
+    incomplete = _synthetic_epl_draft(complete=False)
+
+    assert draft_lineup_complete(complete, EPL_MASTERS_DRAFT)
+    assert not draft_lineup_complete(incomplete, EPL_MASTERS_DRAFT)
+
+
+def test_hud_reader_reads_heroes_from_a_draft_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = DraftReading(tuple(range(1, 6)), tuple(range(6, 11)), 0.95)
+
+    class HeroReader:
+        calls = 0
+
+        def read(self, _image: np.ndarray) -> DraftReading:
+            self.calls += 1
+            return expected
+
+    heroes = HeroReader()
+    reader = HudReader(use_ocr=False)
+    monkeypatch.setattr(
+        "vision.hud_reader.select_broadcast_layout",
+        lambda _image: LayoutSelection(EPL_MASTERS_DRAFT, 1.0, True),
+    )
+    monkeypatch.setattr(
+        reader,
+        "_profile",
+        lambda _layout: SimpleNamespace(
+            heroes=heroes,
+            player_names=SimpleNamespace(
+                read=lambda _image: DraftPlayerNames.unavailable("test_double"),
+                bind_heroes=lambda reading, *_hero_ids: reading,
+            ),
+            hero_features_ready=True,
+        ),
+    )
+
+    reading = reader.read(_synthetic_epl_draft())
+
+    assert reading.screen_state == "draft"
+    assert reading.draft == expected
+    assert heroes.calls == 1
+
+
+def test_hud_reader_skips_unfinished_draft_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HeroReader:
+        calls = 0
+
+        def read(self, _image: np.ndarray) -> DraftReading:
+            self.calls += 1
+            return DraftReading(tuple(range(1, 6)), tuple(range(6, 11)), 0.95)
+
+    heroes = HeroReader()
+    reader = HudReader(use_ocr=False)
+    monkeypatch.setattr(
+        "vision.hud_reader.select_broadcast_layout",
+        lambda _image: LayoutSelection(EPL_MASTERS_DRAFT, 1.0, True),
+    )
+    monkeypatch.setattr(
+        reader,
+        "_profile",
+        lambda _layout: SimpleNamespace(
+            heroes=heroes,
+            player_names=SimpleNamespace(
+                read=lambda _image: DraftPlayerNames.unavailable("test_double"),
+                bind_heroes=lambda reading, *_hero_ids: reading,
+            ),
+            hero_features_ready=True,
+        ),
+    )
+
+    reading = reader.read(_synthetic_epl_draft(complete=False))
+
+    assert reading.screen_state == "draft"
+    assert reading.draft.radiant_hero_ids == ()
+    assert reading.draft.dire_hero_ids == ()
+    assert heroes.calls == 0
+
+
+def test_hud_reader_requires_promoted_features_for_a_dedicated_draft_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vision.hud_reader.promoted_profile_feature_path",
+        lambda _profile_id: None,
+    )
+
+    profile = HudReader(use_ocr=False)._profile(EPL_MASTERS_DRAFT)
+
+    assert not profile.hero_features_ready
 
 
 def test_standard_layout_requires_its_own_complete_hud_geometry() -> None:
@@ -430,6 +599,32 @@ def _write_features(
     np.savez_compressed(path, **payload)
 
 
+def test_hud_reader_uses_promoted_portrait_variants_for_detected_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one = _portrait((20, 90, 180), "1")
+    one_arcana = _portrait((30, 170, 70), "A")
+    two = _portrait((170, 60, 20), "2")
+    promoted = tmp_path / "epl-promoted.npz"
+    _write_features(
+        promoted,
+        [one, one_arcana, two],
+        ids=[1, 1, 2],
+        variant_names=["1", "1__arcana", "2"],
+    )
+    monkeypatch.setattr(
+        "vision.hud_reader.promoted_profile_feature_path",
+        lambda profile_id: promoted if profile_id == EPL_MASTERS_LIVE.name else None,
+    )
+
+    profile = HudReader(use_ocr=False)._profile(EPL_MASTERS_LIVE)
+
+    assert profile.heroes.ids.tolist() == [1, 2]
+    assert profile.heroes.variant_names.tolist() == ["1", "1__arcana", "2"]
+    assert profile.heroes.recognize_crop(one_arcana).hero_id == 1
+
+
 def _logo(shape: str) -> np.ndarray:
     image = np.zeros((80, 80, 3), dtype=np.uint8)
     if shape == "circle":
@@ -607,6 +802,34 @@ def test_clock_tracker_recovers_only_after_confirming_a_forward_jump() -> None:
     assert recovered is not None
     assert recovered.seconds == 131
     assert not recovered.is_paused
+
+
+def test_clock_tracker_normalizes_unsigned_pregame_countdown() -> None:
+    tracker = MapStateTracker(confirmations=2, pause_frames=2)
+
+    assert tracker.update(ClockReading(3, 0.95, "0:03")) is None
+    pregame = tracker.update(ClockReading(2, 0.95, "0:02"))
+    assert pregame is not None and pregame.seconds == -2
+    pregame = tracker.update(ClockReading(1, 0.95, "0:01"))
+    assert pregame is not None and pregame.seconds == -1
+    horn = tracker.update(ClockReading(0, 0.95, "0:00"))
+    assert horn is not None and horn.seconds == 0
+
+    assert tracker.update(ClockReading(1, 0.95, "0:01")) is None
+    live = tracker.update(ClockReading(2, 0.95, "0:02"))
+    assert live is not None and live.seconds == 2
+    assert not tracker.frozen
+
+
+def test_clock_tracker_still_freezes_a_late_regression() -> None:
+    tracker = MapStateTracker(confirmations=2, pause_frames=2)
+    assert tracker.update(ClockReading(100, 0.95, "1:40")) is None
+    assert tracker.update(ClockReading(101, 0.95, "1:41")) is not None
+
+    assert tracker.update(ClockReading(90, 0.95, "1:30")) is None
+    assert tracker.update(ClockReading(89, 0.95, "1:29")) is None
+    assert tracker.frozen
+    assert tracker.update(ClockReading(102, 0.95, "1:42")) is None
 
 
 def test_black_frame_is_transition() -> None:
@@ -830,6 +1053,27 @@ def test_standard_live_gate_requires_hud_geometry_scoreboard_and_clock() -> None
     assert reader.read_replay_gate(image).status == "untrusted"
 
 
+def test_geometry_live_gate_accepts_clock_text_with_nonstandard_separator() -> None:
+    image = _synthetic_standard_hud()
+    reader = ScoreboardReader(STANDARD_DOTA_HUD, use_ocr=False)
+
+    class PositionedOcr:
+        def __call__(self, image, **kwargs):
+            del image, kwargs
+            return (
+                [
+                    [[[280, 10], [305, 10], [305, 30], [280, 30]], "6", 0.99],
+                    [[[445, 10], [465, 10], [465, 30], [445, 30]], "3", 0.98],
+                    [[[326, 23], [365, 23], [365, 36], [326, 36]], "13.27", 0.97],
+                ],
+                None,
+            )
+
+    reader.ocr = PositionedOcr()
+
+    assert reader.read_replay_gate(image).status == "live"
+
+
 def test_hud_diagnostics_reports_the_first_blocking_gate() -> None:
     unavailable = HudFrameReading(
         LayoutSelection(None, 0.4, False, "unsupported_layout"),
@@ -912,16 +1156,26 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
     _write_capture_heartbeat(
         output,
         match_id="42",
+        map_number=2,
         captured_at=datetime.now(timezone.utc),
         capture_status="capturing_partial",
         diagnostics=reading.diagnostics,
         draft_slot_statuses=DraftTracker().slot_statuses,
+        retention={
+            "map_sample_count": 4,
+            "retained_sample_count": 4,
+            "retained_sample_encoded_bytes": 4096,
+            "last_retained_at": datetime.now(timezone.utc).isoformat(),
+            "last_frame_ref": "vision-frame:sha256:" + "a" * 64,
+            "last_manifest_path": str(tmp_path / "frames.jsonl"),
+        },
     )
 
     parsed_v2 = _capture_heartbeat(output.with_suffix(".heartbeat.json"), "42")
     assert parsed_v2 is not None
     diagnostics = _heartbeat_diagnostics(parsed_v2)
     assert diagnostics["blocker_code"] == "net_worth_advantage_unconfirmed"
+    assert diagnostics["map_number"] == 2
     assert diagnostics["layout_profile"] == "epl_masters_live_1080p"
     assert diagnostics["layout_supported"] is True
     assert diagnostics["clock_seconds"] == 400
@@ -930,6 +1184,10 @@ def test_capture_heartbeat_v2_and_v1_are_read_by_supervisor(tmp_path: Path) -> N
     assert diagnostics["core_hud_ready"] is True
     assert diagnostics["net_worth_confirmed"] is False
     assert diagnostics["strategy_ready"] is False
+    assert diagnostics["retention"]["status"] == "complete"
+    assert diagnostics["retention"]["map_sample_count"] == 4
+    assert diagnostics["retention"]["retained_sample_count"] == 4
+    assert diagnostics["retention"]["automatic_deletion_enabled"] is False
     assert diagnostics["radiant_hero_count"] == 5
     assert diagnostics["dire_hero_count"] == 3
     assert len(parsed_v2["draft"]["slots"]) == 10
@@ -1006,22 +1264,23 @@ def test_exact_portrait_is_recognized(tmp_path: Path) -> None:
 
 def test_portrait_variants_compete_between_heroes(tmp_path: Path) -> None:
     one = _portrait((20, 90, 180), "1")
+    one_arcana = _portrait((30, 170, 70), "A")
     two = _portrait((170, 60, 20), "2")
     features = tmp_path / "features.npz"
     _write_features(
         features,
-        [one, one.copy(), two],
+        [one_arcana, one, two],
         ids=[1, 1, 2],
-        variant_names=["1__death", "1", "2"],
+        variant_names=["1__arcana", "1", "2"],
     )
 
     recognizer = HeroRecognizer(features, HERO_LAYOUT)
-    scored = recognizer._score_crop(one)
-    reading = recognizer.recognize_crop(one)
+    scored = recognizer._score_crop(one_arcana)
+    reading = recognizer.recognize_crop(one_arcana)
 
     assert recognizer.ids.tolist() == [1, 2]
     assert scored is not None and scored.combined.shape == (2,)
-    assert scored.variants.tolist() == ["1", "2"]
+    assert scored.variants.tolist() == ["1__arcana", "2"]
     assert scored.variant_counts.tolist() == [2, 1]
     assert reading.hero_id == 1
     assert reading.margin >= 0.025
@@ -1047,11 +1306,14 @@ def test_recognizer_rejects_untraceable_or_excessive_variants(
     with pytest.raises(ValueError, match="missing its base portrait"):
         HeroRecognizer(features, HERO_LAYOUT)
 
-    names = ["1", "1__death", "1__dim", "1__inset08", "1__inset16", "2"]
+    names = ["1"] + [
+        f"1__calibration_{index:012x}"
+        for index in range(MAX_VARIANTS_PER_HERO)
+    ] + ["2"]
     _write_features(
         features,
-        [one.copy() for _ in range(5)] + [two],
-        ids=[1, 1, 1, 1, 1, 2],
+        [one.copy() for _ in range(MAX_VARIANTS_PER_HERO + 1)] + [two],
+        ids=[1] * (MAX_VARIANTS_PER_HERO + 1) + [2],
         variant_names=names,
     )
     with pytest.raises(ValueError, match="template limit"):
@@ -1098,7 +1360,11 @@ def test_feature_build_rejects_uncontrolled_variant_names(
 def test_feature_build_limits_templates_per_hero(tmp_path: Path) -> None:
     source = tmp_path / "heroes"
     source.mkdir()
-    for name in ("1", "1__death", "1__dim", "1__inset08", "1__inset16"):
+    names = ["1"] + [
+        f"1__calibration_{index:012x}"
+        for index in range(MAX_VARIANTS_PER_HERO)
+    ]
+    for name in names:
         cv2.imwrite(str(source / f"{name}.png"), _portrait((20, 90, 180), name))
     (source / "heroes.json").write_text(
         json.dumps({"1": {"id": 1}}), encoding="utf-8"
@@ -1466,6 +1732,38 @@ def test_observation_contract_and_writer_are_consumer_compatible(
     assert parsed[0].comeback_state.unavailable_reason == "live_state_not_provided"
 
 
+def test_observation_writer_replays_jsonl_after_database_sink_failure(
+    tmp_path: Path,
+) -> None:
+    observation = LiveObservation(
+        raybet_match_id="42",
+        captured_at_utc=datetime.now(timezone.utc),
+        map_number=2,
+        game_clock_seconds=601,
+        is_paused=False,
+        radiant_hero_ids=[1, 2, 3, 4, 5],
+        dire_hero_ids=[6, 7, 8, 9, 10],
+        radiant_team_side="team_one",
+        clock_confidence=0.95,
+        draft_confidence=0.96,
+        source_frame_ref="frame.jpg",
+        screen_state="game",
+    )
+    path = tmp_path / "observations" / "42.jsonl"
+
+    def failing_sink(item: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        ObservationWriter(path, sink=failing_sink).append(observation)
+
+    persisted: list[object] = []
+    writer = ObservationWriter(path, sink=persisted.append)
+    assert writer.replay_to_sink() == 1
+    assert len(persisted) == 1
+    assert read_jsonl(path)[0].is_confirmed
+
+
 def test_available_comeback_state_round_trips_from_the_same_evidence_frame(
     tmp_path: Path,
 ) -> None:
@@ -1530,6 +1828,34 @@ def test_hud_confirmation_does_not_require_a_confirmed_draft(tmp_path: Path) -> 
     parsed = read_jsonl(path)[0]
     assert parsed.is_hud_confirmed
     assert not parsed.is_confirmed
+
+
+def test_complete_draft_has_authority_without_live_hud_authority() -> None:
+    observation = LiveObservation(
+        raybet_match_id="draft-series",
+        captured_at_utc=datetime.now(timezone.utc),
+        map_number=2,
+        radiant_hero_ids=[1, 2, 3, 4, 5],
+        dire_hero_ids=[6, 7, 8, 9, 10],
+        radiant_team_side="team_two",
+        draft_confidence=0.96,
+        source_frame_ref="draft-frame",
+        screen_state="draft",
+    )
+
+    assert observation.is_draft_confirmed
+    assert not observation.is_confirmed
+    assert not observation.is_hud_confirmed
+
+    assert not observation.model_copy(
+        update={"screen_state": "replay"}
+    ).is_draft_confirmed
+    assert not observation.model_copy(
+        update={"radiant_hero_ids": [1, 2, 3, 4]}
+    ).is_draft_confirmed
+    assert not observation.model_copy(
+        update={"radiant_team_side": None}
+    ).is_draft_confirmed
 
 
 def test_bucketed_net_worth_advantage_round_trips_without_exact_totals(
@@ -1795,6 +2121,78 @@ def test_team_side_name_ocr_requires_both_exact_confident_names() -> None:
     assert recognizer.read(unrelated).radiant_team_side is None
 
 
+def test_team_side_name_ocr_works_without_logo_templates() -> None:
+    class FakeTeamNameOcr:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, _image):
+            self.calls += 1
+            text, score = (("Level UP", 0.94), ("NAVI", 0.91))[self.calls - 1]
+            return [[[0, 0], text, score]], None
+
+    layout = replace(
+        LOGO_LAYOUT,
+        radiant_team_name=LEFT,
+        dire_team_name=RIGHT,
+    )
+    recognizer = TeamSideRecognizer(
+        None,
+        None,
+        layout,
+        team_names=("Level Up", "Na`Vi"),
+        use_ocr=False,
+    )
+    recognizer.ocr = FakeTeamNameOcr()
+
+    reading = recognizer.read(
+        np.random.default_rng(102).integers(0, 256, (80, 160, 3), dtype=np.uint8)
+    )
+
+    assert reading.radiant_team_side == "team_one"
+    assert reading.confidence == pytest.approx(0.91)
+
+
+def test_team_side_name_ocr_sorts_split_words_horizontally() -> None:
+    class FakeTeamNameOcr:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, _image):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    [[[70, 0], [100, 0], [100, 20], [70, 20]], "UP", 0.92],
+                    [[[5, 0], [60, 0], [60, 20], [5, 20]], "Level", 0.94],
+                ], None
+            return [
+                [[[4, 0], [50, 0], [50, 20], [4, 20]], "MOUZ", 0.93]
+            ], None
+
+    circle, square = _logo("circle"), _logo("square")
+    layout = replace(
+        LOGO_LAYOUT,
+        radiant_team_name=LEFT,
+        dire_team_name=RIGHT,
+    )
+    recognizer = TeamSideRecognizer(
+        circle,
+        square,
+        layout,
+        team_names=("Level Up", "MOUZ"),
+        use_ocr=False,
+    )
+    recognizer.ocr = FakeTeamNameOcr()
+    unrelated = np.random.default_rng(101).integers(
+        0, 256, (80, 160, 3), dtype=np.uint8
+    )
+
+    reading = recognizer.read(unrelated)
+
+    assert reading.radiant_team_side == "team_one"
+    assert reading.confidence == pytest.approx(0.92)
+
+
 def test_team_side_database_prefers_team_tag_logo(monkeypatch) -> None:
     _patch_logo_store(monkeypatch, with_team_logos=True)
     FakeHttpClient.responses = {
@@ -1867,9 +2265,20 @@ def test_team_side_database_degrades_when_all_logo_sources_fail(
         "https://www.ray086.com/file/fallback-two.png": error,
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+    monkeypatch.setattr(
+        TeamSideRecognizer,
+        "_ensure_ocr",
+        lambda self: setattr(self, "ocr", object()),
+    )
 
-    assert (
-        TeamSideRecognizer.from_database("postgresql+psycopg://test", "42") is None
+    loaded = TeamSideRecognizer.load_from_database(
+        "postgresql+psycopg://test",
+        "42",
+    )
+
+    assert loaded.recognizer is not None
+    assert loaded.error == (
+        "team_one_logo_invalid,team_two_logo_invalid:team_name_ocr_fallback"
     )
 
 
@@ -1883,14 +2292,21 @@ def test_team_side_database_rejects_html_logo_response(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+    monkeypatch.setattr(
+        TeamSideRecognizer,
+        "_ensure_ocr",
+        lambda self: setattr(self, "ocr", object()),
+    )
 
     loaded = TeamSideRecognizer.load_from_database(
         "postgresql+psycopg://test",
         "42",
     )
 
-    assert loaded.recognizer is None
-    assert loaded.error == "team_one_logo_invalid"
+    assert loaded.recognizer is not None
+    assert loaded.error == (
+        "team_one_logo_invalid,team_two_logo_invalid:team_name_ocr_fallback"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1943,10 +2359,40 @@ def test_team_side_revalidates_redirect_target(monkeypatch) -> None:
 def test_team_side_rejects_oversized_logo_response(monkeypatch) -> None:
     _patch_logo_store(monkeypatch, with_team_logos=False)
     fallback_one = "https://www.ray086.com/file/fallback-one.png"
+    fallback_two = "https://www.ray086.com/file/fallback-two.png"
     FakeHttpClient.responses = {
         fallback_one: b"x" * (MAX_TEAM_LOGO_BYTES + 1),
+        fallback_two: _png(_logo("square")),
     }
     monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+    monkeypatch.setattr(
+        TeamSideRecognizer,
+        "_ensure_ocr",
+        lambda self: setattr(self, "ocr", object()),
+    )
+
+    loaded = TeamSideRecognizer.load_from_database(
+        "postgresql+psycopg://test",
+        "42",
+    )
+
+    assert loaded.recognizer is not None
+    assert loaded.error == "team_one_logo_invalid:team_name_ocr_fallback"
+
+
+def test_team_side_logo_failure_stays_unavailable_without_name_ocr(
+    monkeypatch,
+) -> None:
+    _patch_logo_store(monkeypatch, with_team_logos=True)
+    error = httpx.ConnectError("offline")
+    FakeHttpClient.responses = {
+        "https://cdn.cloudflare.steamstatic.com/vp.png": error,
+        "https://cdn.cloudflare.steamstatic.com/xg.png": error,
+        "https://www.ray086.com/file/fallback-one.png": error,
+        "https://www.ray086.com/file/fallback-two.png": error,
+    }
+    monkeypatch.setattr("vision.team_side.httpx.Client", FakeHttpClient)
+    monkeypatch.setattr(TeamSideRecognizer, "_ensure_ocr", lambda self: None)
 
     loaded = TeamSideRecognizer.load_from_database(
         "postgresql+psycopg://test",
@@ -1954,4 +2400,4 @@ def test_team_side_rejects_oversized_logo_response(monkeypatch) -> None:
     )
 
     assert loaded.recognizer is None
-    assert loaded.error == "team_one_logo_invalid"
+    assert loaded.error == "team_one_logo_invalid,team_two_logo_invalid"

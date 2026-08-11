@@ -3,12 +3,64 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 
 
 LIVE_MATCH_STATUS = "2"
 LIVE_MATCH_MAX_AGE = timedelta(seconds=90)
 OPEN_ODDS_STATUSES = frozenset({"1", "open", "active", "running"})
+RAYBET_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def explicit_raybet_map_times(
+    payload: Mapping[str, Any],
+    best_of: int,
+) -> dict[int, datetime]:
+    teams = payload.get("team")
+    if not isinstance(teams, list) or len(teams) != 2:
+        return {}
+    controls: list[Mapping[str, Any]] = []
+    for team in teams:
+        if not isinstance(team, Mapping):
+            return {}
+        score = team.get("score")
+        manual = score.get("manualControlData") if isinstance(score, Mapping) else None
+        data = manual.get("data") if isinstance(manual, Mapping) else None
+        if not isinstance(data, Mapping):
+            return {}
+        controls.append(data)
+
+    output: dict[int, datetime] = {}
+    for map_number in range(1, best_of + 1):
+        entries = [control.get(str(map_number)) for control in controls]
+        if any(not isinstance(entry, Mapping) for entry in entries):
+            return {}
+        statuses = {entry.get("status") for entry in entries}
+        stamps = {str(entry.get("cmDate") or "").strip() for entry in entries}
+        if len(statuses) != 1 or len(stamps) != 1:
+            return {}
+        status = next(iter(statuses))
+        stamp = next(iter(stamps))
+        if type(status) is not int:
+            return {}
+        if status == 0 and not stamp:
+            if output and tuple(output) != tuple(range(1, map_number)):
+                return {}
+            continue
+        if status not in {1, 2} or not stamp:
+            return {}
+        try:
+            parsed = datetime.fromisoformat(stamp)
+        except ValueError:
+            return {}
+        if parsed.tzinfo is not None or parsed.strftime("%Y-%m-%d %H:%M:%S") != stamp:
+            return {}
+        output[map_number] = parsed.replace(tzinfo=RAYBET_TIMEZONE).astimezone(
+            timezone.utc
+        )
+    if tuple(output) != tuple(range(1, len(output) + 1)):
+        return {}
+    return output
 
 
 def _aware_utc(value: datetime | str | None) -> datetime | None:

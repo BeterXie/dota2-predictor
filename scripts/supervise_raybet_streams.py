@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -29,7 +30,6 @@ from live_betting.raybet_state import raybet_match_is_live  # noqa: E402
 from live_betting.sanitize import stored_public_stream_url  # noqa: E402
 from live_betting.process_control import terminate_subprocess_tree  # noqa: E402
 from live_betting.storage import LiveBettingStore  # noqa: E402
-from live_betting.vision_retention import prune_vision_evidence  # noqa: E402
 
 OUTPUT_MAX_AGE = timedelta(seconds=90)
 WATCHER_STARTUP_GRACE = timedelta(seconds=90)
@@ -38,10 +38,11 @@ PREMATCH_WATCH_WINDOW = timedelta(minutes=30)
 PREMATCH_LATE_WINDOW = timedelta(hours=2)
 PREMATCH_PROBE_RETRY_DELAY = timedelta(seconds=60)
 RAYBET_SCHEDULE_TIMEZONE = timezone(timedelta(hours=8))
-RETENTION_INTERVAL_SECONDS = 60 * 60
 MAX_CONCURRENT_WATCHERS = 4
 WATCHER_MAX_START_FAILURES = 3
 WATCHER_RETRY_DELAYS = (timedelta(seconds=30), timedelta(seconds=60))
+EVIDENCE_MIN_FREE_BYTES = 5 * 1024**3
+EVIDENCE_MIN_FREE_RATIO = 0.05
 VIDEO_SOURCE_PATHS = frozenset({"/live", "/video", "/playback", "/v2/video"})
 OPEN_RAYBET_STATUSES = frozenset({"1", "2"})
 
@@ -178,12 +179,17 @@ def _valid_v2_heartbeat(payload: Mapping[str, object]) -> bool:
     net_worth = payload.get("net_worth")
     draft = payload.get("draft")
     team_side = payload.get("team_side")
+    retention = payload.get("retention")
     groups = (layout, screen, replay_gate, clock, scoreboard, net_worth, draft)
     if (
         payload.get("capture_status") not in {"producing_trusted", "capturing_partial"}
         or not isinstance(payload.get("blocker_code"), str)
+        or isinstance(payload.get("map_number"), bool)
+        or not isinstance(payload.get("map_number"), int)
+        or not 1 <= int(payload["map_number"]) <= 10
         or not all(isinstance(group, dict) for group in groups)
         or (team_side is not None and not isinstance(team_side, dict))
+        or (retention is not None and not isinstance(retention, dict))
     ):
         return False
     assert isinstance(layout, dict)
@@ -196,6 +202,23 @@ def _valid_v2_heartbeat(payload: Mapping[str, object]) -> bool:
     team_side_confirmed = (
         team_side.get("confirmed") if isinstance(team_side, dict) else None
     )
+    if isinstance(retention, dict):
+        counts = (
+            retention.get("map_sample_count"),
+            retention.get("retained_sample_count"),
+            retention.get("retained_sample_encoded_bytes"),
+        )
+        if (
+            retention.get("status") not in {"complete", "gap"}
+            or retention.get("automatic_deletion_enabled") is not False
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in counts
+            )
+        ):
+            return False
     confidence_values = (
         layout.get("confidence"),
         screen.get("confidence"),
@@ -284,6 +307,7 @@ def _heartbeat_diagnostics(heartbeat: Mapping[str, object] | None) -> dict[str, 
     )
     return {
         "blocker_code": heartbeat.get("blocker_code"),
+        "map_number": heartbeat.get("map_number"),
         "layout_profile": layout.get("profile"),
         "layout_confidence": layout.get("confidence"),
         "layout_supported": layout.get("supported"),
@@ -308,6 +332,7 @@ def _heartbeat_diagnostics(heartbeat: Mapping[str, object] | None) -> dict[str, 
         "core_hud_ready": heartbeat.get("core_hud_ready"),
         "comeback_state_ready": heartbeat.get("comeback_state_ready"),
         "strategy_ready": heartbeat.get("strategy_ready"),
+        "retention": heartbeat.get("retention"),
     }
 
 
@@ -670,18 +695,41 @@ def active_matches(database_url: str, *, now: datetime | None = None) -> list[st
     return list(active_match_evidence(database_url, now=now))
 
 
-def run_evidence_retention(
-    database_url: str,
-    evidence_dir: Path,
-    active_match_ids: set[str],
-) -> dict[str, object]:
-    """Apply the fixed policy while excluding every currently active match."""
-    return prune_vision_evidence(
-        database_url,
-        evidence_dir,
-        excluded_match_ids=active_match_ids,
-        dry_run=False,
-    ).as_dict()
+def evidence_storage_health(evidence_dir: Path) -> dict[str, object]:
+    """Report capacity without deleting or relocating retained evidence."""
+    try:
+        usage = shutil.disk_usage(evidence_dir)
+    except OSError as error:
+        return {
+            "status": "error",
+            "root": str(evidence_dir),
+            "error_type": type(error).__name__,
+            "automatic_deletion_enabled": False,
+        }
+    if usage.total <= 0:
+        return {
+            "status": "error",
+            "root": str(evidence_dir),
+            "error_type": "InvalidDiskCapacity",
+            "automatic_deletion_enabled": False,
+        }
+    free_ratio = usage.free / usage.total
+    return {
+        "status": (
+            "healthy"
+            if usage.free >= EVIDENCE_MIN_FREE_BYTES
+            and free_ratio >= EVIDENCE_MIN_FREE_RATIO
+            else "low"
+        ),
+        "root": str(evidence_dir),
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "free_ratio": round(free_ratio, 6),
+        "minimum_free_bytes": EVIDENCE_MIN_FREE_BYTES,
+        "minimum_free_ratio": EVIDENCE_MIN_FREE_RATIO,
+        "automatic_deletion_enabled": False,
+    }
 
 
 def watcher_command(
@@ -833,9 +881,11 @@ def watcher_retry_after_failure(
         )
     attempts = 1 if previous is None or produced_output else previous.attempts + 1
     exhausted = attempts >= WATCHER_MAX_START_FAILURES
-    reason = failure_reason or (
-        "source_refresh_failed" if exit_code == 2 else "watcher_startup_failed"
-    )
+    reason = failure_reason or {
+        2: "source_refresh_failed",
+        4: "evidence_write_failed",
+        5: "observation_write_failed",
+    }.get(exit_code, "watcher_startup_failed")
     retry_at = None
     if not exhausted:
         retry_at = failed_at + WATCHER_RETRY_DELAYS[attempts - 1]
@@ -936,8 +986,6 @@ def _run_cli(args: argparse.Namespace) -> int:
     capture_baselines: dict[str, OutputSignature | None] = {}
     retry_states: dict[str, WatcherRetryState] = {}
     child_authorities: dict[str, object] = {}
-    last_retention_at: float | None = None
-    retention_details: dict[str, object] = {"status": "pending"}
     try:
         while True:
             try:
@@ -1047,21 +1095,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     child_authorities[match_id] = authority_context
                     children[match_id] = (process, stdout, stderr)
                     started_at[match_id] = datetime.now(timezone.utc)
-                monotonic_now = time.monotonic()
-                if (
-                    last_retention_at is None
-                    or monotonic_now - last_retention_at >= RETENTION_INTERVAL_SECONDS
-                ):
-                    last_retention_at = monotonic_now
-                    try:
-                        retention_details = run_evidence_retention(
-                            args.database_url, args.evidence_dir, active
-                        )
-                    except Exception as retention_error:
-                        retention_details = {
-                            "status": "error",
-                            "error_type": type(retention_error).__name__,
-                        }
+                storage_details = evidence_storage_health(args.evidence_dir)
                 status, details, error = supervisor_health(
                     active,
                     children,
@@ -1074,11 +1108,15 @@ def _run_cli(args: argparse.Namespace) -> int:
                 details["active_match_evidence"] = evidence
                 for match_id in details["producing_match_ids"]:
                     retry_states.pop(str(match_id), None)
-                details["evidence_retention"] = retention_details
-                if retention_details.get("status") == "error":
+                details["evidence_storage"] = storage_details
+                if storage_details.get("status") != "healthy":
                     if status == "healthy":
                         status = "degraded"
-                    error = error or "vision evidence retention failed"
+                    error = error or (
+                        "vision evidence storage low"
+                        if storage_details.get("status") == "low"
+                        else "vision evidence storage unavailable"
+                    )
                 record_supervisor_health(
                     args.database_url,
                     status,

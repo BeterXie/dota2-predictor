@@ -11,11 +11,13 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from contracts.live_observation import DraftPlayerNames
 from vision.clock_reader import ClockReader, ClockReading
 from vision.frame_quality import FrameQuality, FrameQualityTracker
 from vision.hero_recognizer import (
@@ -30,6 +32,8 @@ from vision.hero_recognizer import (
 from vision.hud_reader import HudFrameReading, HudReader, _ProfileReaders
 from vision.layout_selector import (
     LayoutSelection,
+    draft_lineup_complete,
+    epl_masters_draft_layout_confidence,
     epl_masters_layout_confidence,
     epl_s39_layout_confidence,
     standard_dota_hud_layout_confidence,
@@ -38,6 +42,7 @@ from vision.layout_selector import (
 from vision.layout_tracker import LayoutTracker, StableLayoutState
 from vision.layouts import (
     BroadcastLayout,
+    EPL_MASTERS_DRAFT,
     EPL_MASTERS_LIVE,
     EPL_S39_LIVE,
     STANDARD_DOTA_HUD,
@@ -50,6 +55,7 @@ from vision.scoreboard_reader import (
     ScoreboardReading,
 )
 from vision.profile_features import promoted_profile_feature_path
+from vision.player_name_reader import DraftPlayerNameReader
 from vision.screen_state import classify_screen_state
 from vision.stream_capture import HLSStreamCapture, StreamFrame
 from vision.vision_debug import VisionDebugSink
@@ -58,6 +64,7 @@ from vision.vision_debug import VisionDebugSink
 _LAYOUTS: dict[str, BroadcastLayout] = {
     layout.name: layout
     for layout in (
+        EPL_MASTERS_DRAFT,
         EPL_MASTERS_LIVE,
         EPL_S39_LIVE,
         WXC_GOTF_2026_LIVE,
@@ -69,6 +76,7 @@ _LAYOUTS: dict[str, BroadcastLayout] = {
 def broadcast_layout_scores(image: np.ndarray) -> dict[str, float]:
     """Return all supported layout scores rather than a single frame winner."""
     return {
+        EPL_MASTERS_DRAFT.name: epl_masters_draft_layout_confidence(image),
         EPL_MASTERS_LIVE.name: epl_masters_layout_confidence(image),
         EPL_S39_LIVE.name: epl_s39_layout_confidence(image),
         WXC_GOTF_2026_LIVE.name: wxc_gotf_2026_layout_confidence(image),
@@ -300,6 +308,22 @@ class StableHudReader(HudReader):
             )
         self.last_layout_state = StableLayoutState(None, 0.0, "unsupported")
         self.last_frame_quality: FrameQuality | None = None
+        self.debug_context: dict[str, object] | None = None
+
+    def set_debug_context(
+        self,
+        *,
+        raybet_match_id: str,
+        map_number: int,
+        captured_at_utc: datetime,
+        source_frame_ref: str,
+    ) -> None:
+        self.debug_context = {
+            "raybet_match_id": raybet_match_id,
+            "map_number": map_number,
+            "captured_at_utc": captured_at_utc,
+            "source_frame_ref": source_frame_ref,
+        }
 
     def _profile(self, layout: BroadcastLayout) -> _ProfileReaders:
         profile = self._profiles.get(layout.name)
@@ -309,12 +333,19 @@ class StableHudReader(HudReader):
         clock = ClockReader(layout, use_ocr=False)
         clock.ocr = scoreboard.ocr
         feature_path = self.feature_path
+        hero_features_ready = True
         if Path(feature_path).resolve() == DEFAULT_FEATURE_PATH.resolve():
-            feature_path = promoted_profile_feature_path(layout.name) or feature_path
+            promoted = promoted_profile_feature_path(layout.name)
+            feature_path = promoted or feature_path
+            hero_features_ready = (
+                promoted is not None or not layout.draft_completion_cyan_regions
+            )
         profile = _ProfileReaders(
             scoreboard=scoreboard,
             clock=clock,
             heroes=StableHeroRecognizer(feature_path, layout),
+            player_names=DraftPlayerNameReader(layout, ocr=scoreboard.ocr),
+            hero_features_ready=hero_features_ready,
         )
         self._profiles[layout.name] = profile
         return profile
@@ -343,6 +374,7 @@ class StableHudReader(HudReader):
         screen_confidence: float,
         *,
         draft: DraftReading | None = None,
+        draft_player_names: DraftPlayerNames | None = None,
         replay_gate: ReplayGateReading | None = None,
     ) -> HudFrameReading:
         return HudFrameReading(
@@ -354,6 +386,7 @@ class StableHudReader(HudReader):
             ScoreboardReading(None, None, 0.0),
             NetWorthAdvantageReading(None, None, None, 0.0),
             draft or DraftReading((), (), 0.0),
+            draft_player_names or DraftPlayerNames.unavailable(),
         )
 
     def _debug(self, image: np.ndarray, reading: HudFrameReading) -> None:
@@ -379,6 +412,7 @@ class StableHudReader(HudReader):
             return
         layout = reading.selection.layout
         hero_regions = () if layout is None else layout.radiant_heroes + layout.dire_heroes
+        context = getattr(self, "debug_context", None) or {}
         self.debug_sink.record(
             image,
             reason=quality_reason or layout_reason or diagnostics.blocker_code,
@@ -389,6 +423,10 @@ class StableHudReader(HudReader):
                 "frame_quality": self.last_frame_quality,
             },
             hero_regions=hero_regions,
+            raybet_match_id=context.get("raybet_match_id"),
+            map_number=context.get("map_number"),
+            captured_at_utc=context.get("captured_at_utc"),
+            source_frame_ref=context.get("source_frame_ref"),
         )
 
     def read(self, image: np.ndarray) -> HudFrameReading:
@@ -421,11 +459,29 @@ class StableHudReader(HudReader):
         if screen_state == "draft":
             # Draft-frame hero evidence remains observational.  The existing
             # watcher still decides whether/when it is promoted into live state.
+            lineup_complete = draft_lineup_complete(image, selection.layout)
+            draft = (
+                profile.heroes.read(image)
+                if profile.hero_features_ready
+                and lineup_complete
+                else DraftReading((), (), 0.0)
+            )
+            player_names = (
+                profile.player_names.read(image)
+                if lineup_complete
+                else DraftPlayerNames.unavailable("draft_lineup_incomplete")
+            )
+            player_names = profile.player_names.bind_heroes(
+                player_names,
+                draft.radiant_hero_ids,
+                draft.dire_hero_ids,
+            )
             reading = self._unavailable(
                 selection,
                 screen_state,
                 screen_confidence,
-                draft=profile.heroes.read(image),
+                draft=draft,
+                draft_player_names=player_names,
             )
             self._debug(image, reading)
             return reading

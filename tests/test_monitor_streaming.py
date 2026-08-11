@@ -56,6 +56,42 @@ def test_stream_resolver_is_only_exposed_for_live_dota_matches() -> None:
     assert monitoring._stream_resolver_url({**row, "raybet_match_id": "not-numeric"}) is None
 
 
+def test_series_game_details_exposes_explicit_non_hash_map_id(monkeypatch) -> None:
+    monkeypatch.setattr(monitoring, "_locked_draft_map_numbers", lambda *_args: set())
+    monkeypatch.setattr(monitoring, "latest_live_draft_mapping", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(monitoring, "latest_map_checkpoints", lambda *_args: [])
+
+    games, market_evidence = monitoring._series_game_details(
+        object(),
+        summary={
+            "raybet_match_id": "38422865",
+            "lifecycle": "live",
+            "current_map_number": None,
+        },
+        prematch_timeline=[],
+        collection_timeline=[],
+        vision=[{"map_number": 1, "observed_at": "2026-08-11T03:10:00+08:00"}],
+        latest_capture=None,
+        game_snapshots=[],
+        latest_huds={},
+        vision_runtime=None,
+        markets=[],
+        postmatch={
+            "status": "waiting",
+            "reason": "not_ingested",
+            "games": [],
+            "unresolved_maps": [],
+        },
+        raybet_final_map_numbers=set(),
+        max_points=100,
+    )
+
+    assert market_evidence == []
+    assert len(games) == 1
+    assert games[0]["game_id"] == "38422865:map_1"
+    assert games[0]["map_id"] == "38422865:map_1"
+
+
 def test_monitor_sse_snapshot_cache_reuses_recent_build(monkeypatch) -> None:
     clock = iter((100.0, 100.0, 102.0, 105.0, 105.0))
     builds: list[int] = []

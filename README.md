@@ -18,6 +18,9 @@ RayBet live match
 PostgreSQL is the only runtime database. Odds remain visible in match details but
 are not inputs to P0 or P1. The prediction path does not consume kills, economy,
 experience, towers, Roshan state, score, game clock, or any other in-game state.
+The separate shadow value recommendation layer compares trusted direct odds with
+the immutable P1 output, records its inputs and skip reasons in this repository's
+database, and never creates real orders.
 
 ## Runtime
 
@@ -29,6 +32,9 @@ python -m pip install -r requirements.txt
 $env:DATABASE_URL = Read-Host "PostgreSQL DATABASE_URL"
 python -m alembic upgrade head
 ```
+
+The expected Alembic head is `20260807_0035`; runtime services do not require a
+separate sibling repository or migration chain.
 
 Start RayBet collection and the local Web application in separate terminals.
 The Web entry point starts the Stable Vision supervisor automatically and owns
@@ -97,9 +103,10 @@ matches and diagnostics paths.
 
 The retained Vision path includes hero slots, game clock, kills, net worth,
 Radiant/Dire orientation, pause state, screen state, OCR, confidence diagnostics,
-multi-frame evidence, the frame registry, evidence retention, and manual
-correction. HUD values are display and audit evidence only; P0/P1 never read
-them.
+multi-frame evidence, per-Series/Map/time manifests, the frame registry, and
+manual correction. The supervisor reports remaining disk capacity and write
+failures but never deletes retained frames automatically. HUD values are display
+and audit evidence only; P0/P1 never read them.
 
 ## Prediction
 
@@ -162,3 +169,20 @@ Set-Location web/frontend
 npm test
 npm run build
 ```
+
+The final real-Series acceptance gate is read-only. It treats
+`(raybet_match_id, map_number)` as the Map identity, ignores unplayed market-only
+periods, and fails closed on extra production Maps, missing retained samples,
+unlinked Official Match IDs, incomplete R.O.S.H. inputs, missing checkpoints, or
+unsettled shadow decisions.
+
+```powershell
+python -m live_betting.series_acceptance --limit 10 --verify-frame-bytes
+
+$report = Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8000/api/monitor/acceptance?limit=10"
+$report.consecutive_accepted_series
+```
+
+Use `--require-complete` in an automated acceptance run. It exits non-zero until
+the newest three watched, ended RayBet Series pass every gate consecutively.

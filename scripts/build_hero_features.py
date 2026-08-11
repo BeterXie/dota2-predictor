@@ -16,10 +16,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vision.image_features import (  # noqa: E402
-    ALLOWED_HERO_VARIANT_NAMES,
     MAX_VARIANTS_PER_HERO,
     color_histogram,
     compute_phash,
+    valid_hero_variant_name,
 )
 
 
@@ -40,7 +40,7 @@ def build_hero_features(source: Path, output: Path) -> int:
     source_paths: dict[int, list[Path]] = {}
     for path in source.glob("*.png"):
         hero_id_text, separator, variant_name = path.stem.partition("__")
-        if separator and variant_name not in ALLOWED_HERO_VARIANT_NAMES:
+        if separator and not valid_hero_variant_name(variant_name):
             raise ValueError(f"invalid hero portrait filename: {path.name}")
         try:
             hero_id = int(hero_id_text)

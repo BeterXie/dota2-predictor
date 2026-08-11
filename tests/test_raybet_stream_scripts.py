@@ -4,19 +4,115 @@ import argparse
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
+from contracts.live_observation import LiveObservation
+from live_betting.vision_frame_registry import VisionFrameReceipt
 from scripts import supervise_raybet_streams, watch_raybet_stream
 from scripts.supervise_raybet_streams import watcher_command
 from scripts.watch_raybet_stream import (
+    _current_frame_starts_map,
+    current_frame_comeback_state,
+    _observation_map_number,
+    _resume_map_clock,
+    _sample_manifest_path,
     _sanitized_stream_location,
     _should_persist_frame,
     _validate_stream_url,
+    _write_sample_manifest,
     match_is_complete,
 )
 from web.routers import monitor as monitor_router
+from vision.map_state import ConfirmedClock
+
+
+@pytest.mark.parametrize(
+    ("screen_state", "map_started", "expected"),
+    [
+        ("draft", False, 3),
+        ("game", True, 3),
+        ("game", False, None),
+        ("replay", True, None),
+        ("unknown", True, None),
+        ("transition", True, None),
+    ],
+)
+def test_observation_map_number_is_retained_only_for_target_live_states(
+    screen_state: str,
+    map_started: bool,
+    expected: int | None,
+) -> None:
+    assert (
+        _observation_map_number(screen_state, 3, map_started=map_started) == expected
+    )
+
+
+def test_current_frame_starts_map_accepts_provider_start_after_clock_confirmation() -> None:
+    provider_started_at = datetime(2026, 8, 11, 14, 3, 24, tzinfo=timezone.utc)
+    captured_at = datetime(2026, 8, 11, 14, 5, 34, tzinfo=timezone.utc)
+    confirmed_clock = ConfirmedClock(
+        map_number=3,
+        seconds=2429,
+        is_paused=False,
+        confidence=0.98,
+    )
+
+    assert _current_frame_starts_map(
+        confirmed_clock,
+        provider_map_started_at=provider_started_at,
+        captured_at=captured_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("persisted_map", "expected_clock"),
+    [
+        (1, None),
+        (2, 900),
+        (3, None),
+    ],
+)
+def test_watcher_resume_never_overrides_provider_map_identity(
+    persisted_map: int,
+    expected_clock: int | None,
+) -> None:
+    persisted = ConfirmedClock(
+        map_number=persisted_map,
+        seconds=900,
+        is_paused=False,
+        confidence=0.96,
+    )
+
+    map_number, clock = _resume_map_clock(2, persisted, 3)
+
+    assert map_number == 2
+    assert (None if clock is None else clock.seconds) == expected_clock
+
+
+@pytest.mark.parametrize(
+    ("screen_state", "expected_reason"),
+    [
+        ("draft", "draft_in_progress"),
+        ("unknown", "screen_state_unknown"),
+        ("game", "hud_clock_unconfirmed"),
+    ],
+)
+def test_current_frame_comeback_state_reports_the_actual_unavailable_context(
+    screen_state: str,
+    expected_reason: str,
+) -> None:
+    state = current_frame_comeback_state(
+        None,
+        None,
+        None,
+        screen_state=screen_state,
+    )
+
+    assert state.status == "unavailable"
+    assert state.unavailable_reason == expected_reason
 
 
 def test_signed_hls_url_is_validated_without_leaking_query() -> None:
@@ -215,21 +311,144 @@ def test_prematch_ephemeral_probe_does_not_exhaust_before_stream_appears() -> No
     assert not live_retry.exhausted
 
 
-def test_confirmed_hud_does_not_bypass_lifecycle_evidence_scheduler() -> None:
+def test_evidence_storage_is_observed_without_automatic_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        supervise_raybet_streams.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=100 * 1024**3,
+            used=94 * 1024**3,
+            free=6 * 1024**3,
+        ),
+    )
+
+    status = supervise_raybet_streams.evidence_storage_health(tmp_path)
+
+    assert status["status"] == "healthy"
+    assert status["free_bytes"] == 6 * 1024**3
+    assert status["automatic_deletion_enabled"] is False
+
+
+def test_evidence_write_failure_has_a_distinct_supervisor_reason() -> None:
+    failed_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+    state = supervise_raybet_streams.watcher_retry_after_failure(
+        None,
+        exit_code=4,
+        produced_output=True,
+        failed_at=failed_at,
+    )
+
+    assert state.failure_reason == "evidence_write_failed"
+    assert watch_raybet_stream._watcher_error_category(
+        OSError("failed to write evidence manifest")
+    ) == "evidence_write_failed"
+    assert watch_raybet_stream._watcher_exit_code("evidence_write_failed") == 4
+
+
+def test_every_sample_with_an_explicit_map_identity_is_persisted() -> None:
+    mapped = LiveObservation(
+        raybet_match_id="42",
+        map_number=2,
+        captured_at_utc=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        source_frame_ref="stream:42:1",
+        screen_state="draft",
+    )
+    unassigned = mapped.model_copy(
+        update={"map_number": None, "source_frame_ref": "stream:42:2"}
+    )
+
+    assert _should_persist_frame(
+        None,
+        mapped,
+        captured_at=60.0,
+        last_evidence_at=0.0,
+        evidence_interval=30.0,
+    )
     assert not _should_persist_frame(
         None,
-        None,  # type: ignore[arg-type]
+        unassigned,
         captured_at=60.0,
         last_evidence_at=0.0,
         evidence_interval=30.0,
     )
     assert _should_persist_frame(
         None,
-        None,  # type: ignore[arg-type]
+        unassigned,
         captured_at=60.0,
         last_evidence_at=0.0,
         evidence_interval=30.0,
         evidence_due=True,
+    )
+
+
+def test_sample_manifest_is_partitioned_by_series_map_and_utc_day(
+    tmp_path: Path,
+) -> None:
+    captured_at = datetime(2026, 8, 11, 23, 59, tzinfo=timezone.utc)
+    digest = "a" * 64
+    receipt = VisionFrameReceipt(
+        frame_ref=f"vision-frame:sha256:{digest}",
+        content_sha256=digest,
+        byte_length=1234,
+        storage_path=tmp_path / "sha256" / "aa" / f"{digest}.jpg",
+    )
+    observation = LiveObservation(
+        raybet_match_id="38422865",
+        map_number=2,
+        captured_at_utc=captured_at,
+        game_clock_seconds=600,
+        radiant_team_side="team_one",
+        clock_confidence=0.96,
+        source_frame_ref=receipt.frame_ref,
+        source_frame_sha256=receipt.content_sha256,
+        source_frame_bytes=receipt.byte_length,
+        source_frame_path=str(receipt.storage_path),
+        screen_state="game",
+    )
+
+    path = _write_sample_manifest(
+        tmp_path,
+        observation=observation,
+        receipt=receipt,
+        lifecycle_events=(),
+    )
+    _write_sample_manifest(
+        tmp_path,
+        observation=observation.model_copy(
+            update={"captured_at_utc": captured_at + timedelta(seconds=1)}
+        ),
+        receipt=receipt,
+        lifecycle_events=(),
+    )
+
+    assert path == _sample_manifest_path(
+        tmp_path,
+        match_id="38422865",
+        map_number=2,
+        captured_at=captured_at,
+    )
+    assert path.relative_to(tmp_path).parts == (
+        "series",
+        "38422865",
+        "map_2",
+        "2026-08-11",
+        "frames.jsonl",
+    )
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["observation_identity"] == {
+        "raybet_match_id": "38422865",
+        "map_number": 2,
+        "captured_at": captured_at.isoformat(),
+        "source_frame_ref": receipt.frame_ref,
+    }
+    assert rows[0]["frame"]["content_sha256"] == digest
+    assert rows[0]["draft_player_names"]["unavailable_reason"] == (
+        "draft_player_names_not_observed"
     )
 
 
@@ -266,6 +485,66 @@ def test_watcher_closes_only_on_terminal_match_evidence(
     )
 
     assert match_is_complete("postgresql://example", "42") is expected
+
+
+def test_provider_series_state_reports_live_map_from_fresh_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json.dumps(
+        {
+            "id": "42",
+            "game_id": 151,
+            "status": "2",
+            "team": [
+                {
+                    "pos": 1,
+                    "team_id": 1,
+                    "score": {
+                        "r1": 1,
+                        "manualControlData": {"currentIndex": 3},
+                    },
+                },
+                {
+                    "pos": 2,
+                    "team_id": 2,
+                    "score": {
+                        "r1": 0,
+                        "manualControlData": {"currentIndex": 3},
+                    },
+                },
+            ],
+            "odds": [],
+        }
+    )
+
+    class Result:
+        @staticmethod
+        def fetchone() -> tuple[str, str, str, int]:
+            return "2", "2026-08-10T10:00:00+00:00", payload, 3
+
+    class Connection:
+        @staticmethod
+        def execute(_query: str, _params: tuple[str]) -> Result:
+            return Result()
+
+    class Store:
+        connection = Connection()
+
+        def __enter__(self) -> "Store":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        watch_raybet_stream,
+        "LiveBettingStore",
+        lambda _database_url: Store(),
+    )
+
+    assert watch_raybet_stream._provider_series_state(
+        "postgresql://example", "42"
+    ) == (3, False)
 
 
 def test_observation_directory_is_shared_by_supervisor_and_direct_watcher(

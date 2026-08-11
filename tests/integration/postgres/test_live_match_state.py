@@ -56,6 +56,7 @@ def test_manual_draft_versions_and_dynamic_snapshots_are_append_only(
         slots=_slots(last_hero_id=11),
         is_locked=True,
         actor="operator",
+        evidence_source_url="https://example.test/evidence/live-1/map-1",
         created_at=NOW + timedelta(seconds=1),
     )
 
@@ -63,6 +64,11 @@ def test_manual_draft_versions_and_dynamic_snapshots_are_append_only(
     assert first["is_locked"] is False
     assert second["version"] == 2
     assert second["is_locked"] is True
+    assert second["actor"] == "operator"
+    assert second["evidence_source_url"] == (
+        "https://example.test/evidence/live-1/map-1"
+    )
+    assert second["authority_version"] == "sourced-manual-draft-v1"
     assert second["slots"][-1]["hero_id"] == 11
     assert latest_live_draft_mapping(
         store.connection,
@@ -130,6 +136,33 @@ def test_manual_draft_versions_and_dynamic_snapshots_are_append_only(
                 "WHERE snapshot_id=?",
                 (manual["snapshot_id"],),
             )
+    store.close()
+
+
+def test_locked_manual_draft_requires_https_source(postgres_engine, tmp_path) -> None:
+    store = LiveBettingStore(
+        engine=postgres_engine,
+        raw_archive_root=tmp_path / "raw",
+    )
+    with pytest.raises(ValueError, match="evidence_source_url"):
+        save_live_draft_mapping(
+            store.connection,
+            raybet_match_id="live-source-required",
+            map_number=1,
+            slots=_slots(),
+            is_locked=True,
+            actor="operator",
+        )
+    with pytest.raises(ValueError, match="HTTPS URL"):
+        save_live_draft_mapping(
+            store.connection,
+            raybet_match_id="live-source-required",
+            map_number=1,
+            slots=_slots(),
+            is_locked=True,
+            actor="operator",
+            evidence_source_url="http://example.test/evidence",
+        )
     store.close()
 
 

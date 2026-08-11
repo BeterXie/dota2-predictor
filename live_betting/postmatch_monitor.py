@@ -7,6 +7,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +19,11 @@ from database.session import DatabaseRow, PostgresSession
 
 from fetch.client import OpenDotaClient
 from fetch.postgres_store import CoreMatchStore
+from fetch.stratz_detail import (
+    StratzDetailError,
+    StratzMatchDetailClient,
+    resolve_stratz_detail_token,
+)
 from event_intelligence.ingest_adapters import PostgresIngestAdapter
 from event_intelligence.live_draft_prospective_bridge import (
     LiveDraftProspectiveBridgeRepository,
@@ -36,13 +43,27 @@ from .direct_response_audit import (
 )
 from .health import record_health
 from .markets import normalized_state_hash, snapshots_from_payload
+from .official_map_identity import (
+    MAX_MAP_START_DELTA_SECONDS,
+    OfficialMapResultResolution,
+    _normalize_team,
+    _normalize_tournament,
+    resolve_exact_official_map_links,
+    resolve_verified_official_map_results,
+)
 from .raybet import BASE_URL, RayBetClient, RayBetMapFinal, parse_raybet_map_final
+from .raybet_state import explicit_raybet_map_times
 from .storage import LiveBettingStore
 from .strict_eligibility import query_strict_live_eligibility
 
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
+POSTMATCH_CANDIDATE_RETRY_SECONDS = 5 * 60
+_ENDED_SERIES_STATUSES = frozenset(
+    {"3", "4", "5", "closed", "completed", "ended", "finished", "settled"}
+)
+_OFFICIAL_MAP_EXCLUSION_VISION_REASON = "exact_official_series_excludes_map"
 
 
 @dataclass(frozen=True)
@@ -68,6 +89,532 @@ class VisionDraftIdentity:
     radiant_hero_ids: frozenset[int]
     dire_hero_ids: frozenset[int]
     radiant_team_side: str
+
+
+def _exact_candidate_league_id(
+    connection: PostgresSession,
+    tournament_name: object,
+) -> int | None:
+    normalized = _normalize_tournament(tournament_name)
+    if not normalized:
+        return None
+    rows = connection.execute(
+        """SELECT candidate.provider_event_id, candidate.canonical_name,
+                  league.name AS league_name
+             FROM event_candidates AS candidate
+             JOIN leagues AS league
+               ON league.leagueid=CASE
+                   WHEN candidate.provider_event_id ~ '^[1-9][0-9]*$'
+                   THEN CAST(candidate.provider_event_id AS BIGINT)
+               END
+            WHERE candidate.source='opendota_league_catalog'
+              AND candidate.provider_event_id ~ '^[1-9][0-9]*$'"""
+    ).fetchall()
+    league_ids = {
+        int(row["provider_event_id"])
+        for row in rows
+        if _normalize_tournament(row["canonical_name"]) == normalized
+        and _normalize_tournament(row["league_name"]) == normalized
+    }
+    return next(iter(league_ids)) if len(league_ids) == 1 else None
+
+
+def _candidate_summary_ids(
+    summaries: object,
+    *,
+    league_id: int,
+    map_times: Mapping[int, datetime],
+) -> tuple[int, ...]:
+    if not isinstance(summaries, list) or not map_times:
+        return ()
+    ids: set[int] = set()
+    for summary in summaries:
+        if not isinstance(summary, Mapping):
+            continue
+        match_id = summary.get("match_id")
+        start_time = summary.get("start_time")
+        series_id = summary.get("series_id")
+        if (
+            type(match_id) is not int
+            or match_id <= 0
+            or type(start_time) is not int
+            or start_time <= 0
+            or type(series_id) is not int
+            or series_id <= 0
+            or summary.get("leagueid") != league_id
+        ):
+            continue
+        if any(
+            abs(start_time - int(map_time.timestamp()))
+            <= MAX_MAP_START_DELTA_SECONDS
+            for map_time in map_times.values()
+        ):
+            ids.add(match_id)
+    return tuple(sorted(ids))
+
+
+def _detail_matches_candidate_series(
+    detail: object,
+    *,
+    match_id: int,
+    league_id: int,
+    map_times: Mapping[int, datetime],
+    team_names: frozenset[str],
+) -> bool:
+    if not isinstance(detail, Mapping):
+        return False
+    start_time = detail.get("start_time")
+    radiant = detail.get("radiant_team")
+    dire = detail.get("dire_team")
+    detail_teams = frozenset(
+        _normalize_team(team.get("name"))
+        for team in (radiant, dire)
+        if isinstance(team, Mapping)
+    )
+    return (
+        detail.get("match_id") == match_id
+        and detail.get("leagueid") == league_id
+        and type(detail.get("series_id")) is int
+        and int(detail["series_id"]) > 0
+        and type(start_time) is int
+        and start_time > 0
+        and type(detail.get("duration")) is int
+        and int(detail["duration"]) > 0
+        and type(detail.get("radiant_win")) is bool
+        and len(detail_teams) == 2
+        and detail_teams == team_names
+        and any(
+            abs(start_time - int(map_time.timestamp()))
+            <= MAX_MAP_START_DELTA_SECONDS
+            for map_time in map_times.values()
+        )
+    )
+
+
+def persist_verified_official_map_results(
+    store: LiveBettingStore,
+    raybet_match_id: str,
+    resolution: OfficialMapResultResolution | None = None,
+) -> dict[str, object]:
+    """Persist append-only Official result evidence without granting eligibility."""
+
+    resolved = resolution or resolve_verified_official_map_results(
+        store.connection,
+        raybet_match_id,
+    )
+    if resolved.status != "confirmed":
+        return {
+            "status": resolved.status,
+            "reason": resolved.reason,
+            "inserted": 0,
+            "unchanged": 0,
+            "map_numbers": list(resolved.map_numbers),
+        }
+    inserted = 0
+    unchanged = 0
+    with store.transaction():
+        for result in resolved.results:
+            facts_json = json.dumps(
+                result.facts(raybet_match_id),
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            conflicting = store.connection.execute(
+                """SELECT dota_match_id, winner_side
+                     FROM settlement_result_evidence
+                    WHERE raybet_match_id=? AND map_number=?
+                      AND source='opendota' AND status='confirmed'
+                      AND (dota_match_id!=? OR winner_side!=?)
+                    LIMIT 1""",
+                (
+                    raybet_match_id,
+                    result.map_number,
+                    result.dota_match_id,
+                    result.winner_side,
+                ),
+            ).fetchone()
+            if conflicting is not None:
+                raise ValueError(
+                    "verified official result conflicts with existing Map evidence"
+                )
+            cursor = store.connection.execute(
+                """INSERT INTO settlement_result_evidence
+                   (raybet_match_id, map_number, dota_match_id, source, status,
+                    winner_side, evidence_ref, facts_json, observed_at,
+                    first_usable_at, opendota_artifact_id,
+                    opendota_observation_id, opendota_content_hash)
+                   VALUES (?, ?, ?, 'opendota', 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
+                (
+                    raybet_match_id,
+                    result.map_number,
+                    result.dota_match_id,
+                    result.winner_side,
+                    result.evidence_ref,
+                    facts_json,
+                    result.observed_at.isoformat(),
+                    result.first_usable_at.isoformat(),
+                    result.artifact_id,
+                    result.observation_id,
+                    result.content_hash,
+                ),
+            )
+            inserted += int(cursor.rowcount == 1)
+            persisted = store.connection.execute(
+                """SELECT dota_match_id, status, winner_side, facts_json,
+                          observed_at, first_usable_at, opendota_artifact_id,
+                          opendota_observation_id, opendota_content_hash
+                     FROM settlement_result_evidence
+                    WHERE raybet_match_id=? AND map_number=?
+                      AND source='opendota' AND evidence_ref=?""",
+                (raybet_match_id, result.map_number, result.evidence_ref),
+            ).fetchone()
+            expected = (
+                result.dota_match_id,
+                "confirmed",
+                result.winner_side,
+                facts_json,
+                result.observed_at.isoformat(),
+                result.first_usable_at.isoformat(),
+                result.artifact_id,
+                result.observation_id,
+                result.content_hash,
+            )
+            if persisted is None or tuple(persisted) != expected:
+                raise ValueError("verified official result evidence was not persisted")
+            unchanged += int(cursor.rowcount == 0)
+    return {
+        "status": "confirmed",
+        "reason": resolved.reason,
+        "inserted": inserted,
+        "unchanged": unchanged,
+        "map_numbers": [result.map_number for result in resolved.results],
+    }
+
+
+async def sync_exact_postmatch_candidate(
+    store: LiveBettingStore,
+    client: OpenDotaClient,
+    raw_archive: RawArchive,
+    core_match_store: CoreMatchStore,
+    raybet_match_id: str,
+) -> dict[str, object]:
+    """Sync postmatch-only source rows without granting betting eligibility."""
+
+    resolution = resolve_exact_official_map_links(
+        store.connection,
+        raybet_match_id,
+    )
+    if resolution.status == "confirmed":
+        result_evidence = persist_verified_official_map_results(
+            store,
+            raybet_match_id,
+        )
+        if result_evidence["status"] != "confirmed":
+            return {
+                "status": "failed",
+                "reason": str(result_evidence["reason"]),
+                "raybet_match_id": raybet_match_id,
+                "details_synced": 0,
+                "attempted": False,
+                "official_result_evidence": result_evidence,
+            }
+        vision_audit = _invalidate_vision_observations_outside_official_maps(
+            store,
+            raybet_match_id,
+            resolution.map_numbers,
+        )
+        return {
+            "status": "confirmed",
+            "reason": resolution.reason,
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+            "official_result_evidence": result_evidence,
+            **vision_audit,
+        }
+    row = store.connection.execute(
+        """SELECT team_one, team_two, tournament, best_of, status, raw_json
+             FROM raybet_matches WHERE raybet_match_id=?""",
+        (raybet_match_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "status": "unlinked",
+            "reason": "raybet_series_not_found",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+        }
+    if str(row["status"] or "").strip().casefold() not in _ENDED_SERIES_STATUSES:
+        return {
+            "status": "unlinked",
+            "reason": "raybet_series_not_ended",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+        }
+    try:
+        best_of = int(row["best_of"])
+        payload = json.loads(str(row["raw_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+        best_of = 0
+    if not isinstance(payload, dict) or not 1 <= best_of <= 5:
+        return {
+            "status": "unlinked",
+            "reason": "raybet_map_time_invalid",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+        }
+    map_times = explicit_raybet_map_times(payload, best_of)
+    if not map_times:
+        return {
+            "status": "unlinked",
+            "reason": "raybet_explicit_map_time_unavailable",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+        }
+    tournament_name = payload.get("tournament_short_name") or row["tournament"]
+    league_id = _exact_candidate_league_id(store.connection, tournament_name)
+    if league_id is None:
+        return {
+            "status": "unlinked",
+            "reason": "unique_opendota_league_candidate_unavailable",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+        }
+    team_names = frozenset(
+        {_normalize_team(row["team_one"]), _normalize_team(row["team_two"])}
+    )
+    if len(team_names) != 2 or not all(team_names):
+        return {
+            "status": "unlinked",
+            "reason": "raybet_series_identity_invalid",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": False,
+        }
+    try:
+        summaries = await client.get_league_matches(league_id)
+    except Exception as error:
+        logger.warning(
+            "OpenDota postmatch candidate discovery failed for %s (%s)",
+            raybet_match_id,
+            type(error).__name__,
+        )
+        return {
+            "status": "failed",
+            "reason": "opendota_league_request_failed",
+            "raybet_match_id": raybet_match_id,
+            "details_synced": 0,
+            "attempted": True,
+        }
+    observed_at = datetime.now(timezone.utc)
+    endpoint = f"/api/leagues/{league_id}/matches"
+    raw_archive.archive_json(
+        source="opendota",
+        endpoint=endpoint,
+        request_identity=endpoint,
+        payload_bytes=canonical_json_bytes(summaries),
+        observed_at=observed_at,
+        match_id=None,
+        status_code=200,
+        first_usable_at=observed_at,
+    )
+    synced = 0
+    for match_id in _candidate_summary_ids(
+        summaries,
+        league_id=league_id,
+        map_times=map_times,
+    ):
+        try:
+            detail = await client.get_match(match_id)
+        except Exception as error:
+            logger.warning(
+                "OpenDota postmatch candidate detail failed for %s/%s (%s)",
+                raybet_match_id,
+                match_id,
+                type(error).__name__,
+            )
+            continue
+        if not _detail_matches_candidate_series(
+            detail,
+            match_id=match_id,
+            league_id=league_id,
+            map_times=map_times,
+            team_names=team_names,
+        ):
+            continue
+        detail_observed_at = datetime.now(timezone.utc)
+        detail_endpoint = f"/api/matches/{match_id}"
+        raw_archive.archive_json(
+            source="opendota",
+            endpoint=detail_endpoint,
+            request_identity=detail_endpoint,
+            payload_bytes=canonical_json_bytes(detail),
+            observed_at=detail_observed_at,
+            match_id=match_id,
+            status_code=200,
+            first_usable_at=detail_observed_at,
+        )
+        core_match_store.insert_match(dict(detail))
+        synced += 1
+    resolution = resolve_exact_official_map_links(
+        store.connection,
+        raybet_match_id,
+    )
+    result_evidence = persist_verified_official_map_results(
+        store,
+        raybet_match_id,
+    ) if resolution.status == "confirmed" else {
+        "status": resolution.status,
+        "reason": resolution.reason,
+        "inserted": 0,
+        "unchanged": 0,
+        "map_numbers": list(resolution.map_numbers),
+    }
+    vision_audit = _invalidate_vision_observations_outside_official_maps(
+        store,
+        raybet_match_id,
+        resolution.map_numbers if resolution.status == "confirmed" else (),
+    )
+    return {
+        "status": (
+            resolution.status
+            if result_evidence["status"] == "confirmed"
+            or resolution.status != "confirmed"
+            else "failed"
+        ),
+        "reason": (
+            resolution.reason
+            if result_evidence["status"] == "confirmed"
+            or resolution.status != "confirmed"
+            else str(result_evidence["reason"])
+        ),
+        "raybet_match_id": raybet_match_id,
+        "details_synced": synced,
+        "attempted": True,
+        "official_result_evidence": result_evidence,
+        **vision_audit,
+    }
+
+
+def _empty_vision_official_exclusion_audit() -> dict[str, object]:
+    return {
+        "vision_observation_invalidations": 0,
+        "vision_observation_deconfirmed": 0,
+        "vision_invalidated_map_numbers": [],
+    }
+
+
+def invalidate_vision_observations_excluded_by_exact_official_maps(
+    store: LiveBettingStore,
+    raybet_match_id: str,
+) -> dict[str, object]:
+    resolution = resolve_exact_official_map_links(
+        store.connection,
+        raybet_match_id,
+    )
+    if resolution.status != "confirmed":
+        return {
+            "status": resolution.status,
+            "reason": resolution.reason,
+            "raybet_match_id": raybet_match_id,
+            **_empty_vision_official_exclusion_audit(),
+        }
+    return {
+        "status": "confirmed",
+        "reason": resolution.reason,
+        "raybet_match_id": raybet_match_id,
+        **_invalidate_vision_observations_outside_official_maps(
+            store,
+            raybet_match_id,
+            resolution.map_numbers,
+        ),
+    }
+
+
+def _invalidate_vision_observations_outside_official_maps(
+    store: LiveBettingStore,
+    raybet_match_id: str,
+    actual_map_numbers: tuple[int, ...],
+) -> dict[str, object]:
+    actual_maps = {
+        int(map_number)
+        for map_number in actual_map_numbers
+        if type(map_number) is int and int(map_number) > 0
+    }
+    if not actual_maps:
+        return _empty_vision_official_exclusion_audit()
+
+    invalidated_at = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+    deconfirmed = 0
+    affected_maps: set[int] = set()
+    with store.transaction():
+        rows = store.connection.execute(
+            """SELECT observation.map_number, observation.captured_at,
+                      observation.source_frame_ref, observation.confirmed,
+                      invalidation.reason AS invalidation_reason
+                 FROM vision_observations AS observation
+                 LEFT JOIN vision_observation_invalidations AS invalidation
+                   ON invalidation.raybet_match_id=observation.raybet_match_id
+                  AND invalidation.captured_at=observation.captured_at
+                  AND invalidation.source_frame_ref=observation.source_frame_ref
+                WHERE observation.raybet_match_id=?
+                  AND observation.map_number IS NOT NULL
+                ORDER BY observation.map_number, observation.captured_at,
+                         observation.source_frame_ref""",
+            (raybet_match_id,),
+        ).fetchall()
+        for row in rows:
+            if type(row["map_number"]) is not int:
+                continue
+            map_number = int(row["map_number"])
+            if map_number in actual_maps:
+                continue
+            affected_maps.add(map_number)
+            key = (
+                raybet_match_id,
+                str(row["captured_at"]),
+                str(row["source_frame_ref"]),
+            )
+            if row["invalidation_reason"] is None:
+                cursor = store.connection.execute(
+                    """INSERT INTO vision_observation_invalidations
+                       (raybet_match_id, captured_at, source_frame_ref,
+                        invalidated_at, reason)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        *key,
+                        invalidated_at,
+                        _OFFICIAL_MAP_EXCLUSION_VISION_REASON,
+                    ),
+                )
+                inserted += int(cursor.rowcount == 1)
+            if int(row["confirmed"] or 0) == 1:
+                cursor = store.connection.execute(
+                    """UPDATE vision_observations
+                          SET confirmed=0
+                        WHERE raybet_match_id=?
+                          AND captured_at=?
+                          AND source_frame_ref=?
+                          AND confirmed=1""",
+                    key,
+                )
+                deconfirmed += max(int(cursor.rowcount or 0), 0)
+    return {
+        "vision_observation_invalidations": inserted,
+        "vision_observation_deconfirmed": deconfirmed,
+        "vision_invalidated_map_numbers": sorted(affected_maps),
+    }
 
 
 def _scheduled_timestamp(value: str | None) -> int:
@@ -952,10 +1499,79 @@ def _reconcile_and_settle(
     )
     return {"status": "confirmed", "predictions_settled": settled}
 
+
+async def _archive_optional_stratz_enrichment(
+    store: LiveBettingStore,
+    client: StratzMatchDetailClient,
+    raw_archive: RawArchive,
+    dota_match_id: int,
+) -> dict[str, object]:
+    existing = store.connection.execute(
+        """SELECT 1 FROM raw_source_artifacts
+            WHERE source='stratz' AND artifact_use='primary'
+              AND endpoint='/graphql/match-detail-enrichment'
+              AND match_id=?
+            LIMIT 1""",
+        (dota_match_id,),
+    ).fetchone()
+    if existing is not None:
+        return {
+            "match_id": dota_match_id,
+            "status": "available",
+            "reason": "artifact_already_registered",
+            "attempted": False,
+        }
+    try:
+        payload = await client.get_match(dota_match_id)
+        observed_at = datetime.now(timezone.utc)
+        raw_archive.archive_json(
+            source="stratz",
+            endpoint="/graphql/match-detail-enrichment",
+            request_identity=(
+                "https://api.stratz.com/graphql?match_id=" + str(dota_match_id)
+            ),
+            payload_bytes=canonical_json_bytes(payload),
+            observed_at=observed_at,
+            match_id=dota_match_id,
+            status_code=200,
+            first_usable_at=observed_at,
+        )
+    except StratzDetailError as error:
+        reason = _stratz_enrichment_failure_reason(error)
+        logger.warning(
+            "Optional STRATZ detail enrichment failed for match_id=%s (%s)",
+            dota_match_id,
+            reason,
+        )
+        return {
+            "match_id": dota_match_id,
+            "status": "failed",
+            "reason": reason,
+            "attempted": True,
+        }
+    return {
+        "match_id": dota_match_id,
+        "status": "available",
+        "reason": "artifact_registered",
+        "attempted": True,
+    }
+
+
+def _stratz_enrichment_failure_reason(error: StratzDetailError) -> str:
+    words = str(error).replace("(", " ").replace(")", " ").split()
+    status_code = next(
+        (word for word in words if len(word) == 3 and word.isascii() and word.isdigit()),
+        None,
+    )
+    return f"stratz_http_{status_code}" if status_code else "stratz_request_failed"
+
+
 async def label_once(
     store: LiveBettingStore, client: OpenDotaClient, raw_archive: RawArchive,
     match_id: str, team_id: int, team_side: str,
     raybet_client: RayBetClient | None = None,
+    core_match_store: CoreMatchStore | None = None,
+    stratz_client: StratzMatchDetailClient | None = None,
 ) -> dict[str, object]:
     match = store.connection.execute(
         """SELECT scheduled_at, raw_json, updated_at
@@ -1195,6 +1811,7 @@ async def label_once(
         }
 
     labeled = settled = pending = manual_review = 0
+    stratz_enrichment: list[dict[str, object]] = []
     for map_number in sorted(exact_candidates):
         dota_match_id, candidate = next(iter(exact_candidates[map_number].items()))
         detail, detail_receipt = candidate
@@ -1223,6 +1840,17 @@ async def label_once(
         ).rsplit(":", 1)[-1]
         if usable_receipt.content_sha256 != expected_content_hash:
             raise ValueError("OpenDota result evidence hash mismatch")
+        if core_match_store is not None:
+            core_match_store.insert_match(detail)
+        if stratz_client is not None:
+            stratz_enrichment.append(
+                await _archive_optional_stratz_enrichment(
+                    store,
+                    stratz_client,
+                    raw_archive,
+                    dota_match_id,
+                )
+            )
         result = StoredMapResult(
             match_id, map_number, dota_match_id, winner_side,
             team_one_kills, team_two_kills, duration,
@@ -1274,16 +1902,80 @@ async def label_once(
         "predictions_settled": settled,
         "settlement_pending": pending,
         "settlement_manual_review": manual_review,
+        "stratz_enrichment": stratz_enrichment,
     }
 
 
-def resolve_data_paths(args: argparse.Namespace) -> argparse.Namespace:
+def resolve_data_paths(
+    args: argparse.Namespace,
+    environment: Mapping[str, str] | None = None,
+) -> argparse.Namespace:
+    source = os.environ if environment is None else environment
+    configured_data_dir = str(source.get("DATA_DIR") or "").strip()
+    default_root = (
+        Path(configured_data_dir).resolve() / "raw-sources"
+        if configured_data_dir
+        else ROOT / "data" / "raw-sources"
+    )
     args.archive_root = (
         Path(args.archive_root).resolve()
         if args.archive_root is not None
-        else ROOT / "data" / "raw-sources"
+        else default_root
     )
     return args
+
+
+def _stratz_enrichment_health(
+    results: list[dict[str, object]],
+    *,
+    configured: bool,
+) -> dict[str, object]:
+    records = [
+        record
+        for result in results
+        for record in result.get("stratz_enrichment", [])
+        if isinstance(record, dict)
+    ]
+    failed = [record for record in records if record.get("status") == "failed"]
+    return {
+        "configured": configured,
+        "series_checked": len(results),
+        "records": len(records),
+        "attempted": sum(bool(record.get("attempted")) for record in records),
+        "available": sum(record.get("status") == "available" for record in records),
+        "failed": len(failed),
+        "failure_reasons": sorted(
+            {str(record.get("reason") or "stratz_request_failed") for record in failed}
+        ),
+    }
+
+
+def _postmatch_candidate_sync_health(
+    results: list[dict[str, object]],
+) -> dict[str, object]:
+    failed = [result for result in results if result.get("status") == "failed"]
+    evidence = [
+        result.get("official_result_evidence")
+        for result in results
+        if isinstance(result.get("official_result_evidence"), dict)
+    ]
+    return {
+        "series_checked": len(results),
+        "attempted": sum(bool(result.get("attempted")) for result in results),
+        "confirmed": sum(result.get("status") == "confirmed" for result in results),
+        "unlinked": sum(result.get("status") == "unlinked" for result in results),
+        "official_result_evidence_inserted": sum(
+            int(item.get("inserted") or 0) for item in evidence
+        ),
+        "official_result_evidence_unchanged": sum(
+            int(item.get("unchanged") or 0) for item in evidence
+        ),
+        "failed": len(failed),
+        "failure_reasons": sorted(
+            {str(result.get("reason") or "postmatch_candidate_sync_failed")
+             for result in failed}
+        ),
+    }
 
 
 def main() -> int:
@@ -1312,6 +2004,10 @@ def main() -> int:
     async def run() -> int:
         client = OpenDotaClient(rate_limit=30)
         raybet_client = RayBetClient()
+        stratz_token = resolve_stratz_detail_token()
+        stratz_client = (
+            StratzMatchDetailClient(stratz_token) if stratz_token is not None else None
+        )
         try:
             with LiveBettingStore(args.database_url) as store:
                 if not getattr(args, "schema_prepared", False):
@@ -1325,10 +2021,13 @@ def main() -> int:
                     registry,
                     CoreMatchStore(engine=store.engine),
                 )
+                core_match_store = ingest_store.core_match_store
                 raw_archive = RawArchive(
                     args.archive_root,
                     observation_sink=ingest_store.record_raw_artifact,
                 )
+                candidate_sync_attempts: dict[str, datetime] = {}
+                vision_exclusion_attempts: dict[str, datetime] = {}
                 started_at = datetime.now(timezone.utc)
                 record_health(
                     store.connection,
@@ -1340,7 +2039,136 @@ def main() -> int:
                 while True:
                     try:
                         if args.all:
-                            results = []
+                            settlement_results = []
+                            candidate_results = []
+                            vision_exclusion_results = []
+                            vision_exclusion_rows = store.connection.execute(
+                                """SELECT match_row.raybet_match_id,
+                                          match_row.scheduled_at
+                                     FROM raybet_matches AS match_row
+                                     JOIN vision_observations AS observation
+                                       ON observation.raybet_match_id=
+                                          match_row.raybet_match_id
+                                     LEFT JOIN vision_observation_invalidations
+                                          AS invalidation
+                                       ON invalidation.raybet_match_id=
+                                          observation.raybet_match_id
+                                      AND invalidation.captured_at=
+                                          observation.captured_at
+                                      AND invalidation.source_frame_ref=
+                                          observation.source_frame_ref
+                                    WHERE observation.map_number IS NOT NULL
+                                      AND invalidation.raybet_match_id IS NULL
+                                      AND lower(trim(match_row.status::text)) IN (
+                                          '3', '4', '5', 'closed', 'completed',
+                                          'ended', 'finished', 'settled'
+                                      )
+                                    GROUP BY match_row.raybet_match_id,
+                                             match_row.scheduled_at
+                                    ORDER BY match_row.scheduled_at DESC,
+                                             match_row.raybet_match_id DESC
+                                    LIMIT 50"""
+                            ).fetchall()
+                            vision_exclusion_checked_at = datetime.now(
+                                timezone.utc
+                            )
+                            for exclusion_row in vision_exclusion_rows:
+                                exclusion_match_id = str(
+                                    exclusion_row["raybet_match_id"]
+                                )
+                                previous_attempt = vision_exclusion_attempts.get(
+                                    exclusion_match_id
+                                )
+                                if (
+                                    previous_attempt is not None
+                                    and (
+                                        vision_exclusion_checked_at
+                                        - previous_attempt
+                                    ).total_seconds()
+                                    < POSTMATCH_CANDIDATE_RETRY_SECONDS
+                                ):
+                                    continue
+                                vision_exclusion_attempts[exclusion_match_id] = (
+                                    vision_exclusion_checked_at
+                                )
+                                exclusion_result = (
+                                    invalidate_vision_observations_excluded_by_exact_official_maps(
+                                        store,
+                                        exclusion_match_id,
+                                    )
+                                )
+                                if exclusion_result[
+                                    "vision_invalidated_map_numbers"
+                                ]:
+                                    vision_exclusion_results.append(
+                                        exclusion_result
+                                    )
+                            candidate_rows = store.connection.execute(
+                                """SELECT match_row.raybet_match_id,
+                                          match_row.scheduled_at,
+                                          EXISTS (
+                                              SELECT 1
+                                                FROM vision_observations AS observation
+                                               WHERE observation.raybet_match_id=
+                                                     match_row.raybet_match_id
+                                                 AND observation.confirmed=1
+                                          ) AS has_confirmed_vision
+                                     FROM raybet_matches AS match_row
+                                    WHERE lower(trim(match_row.status::text)) IN (
+                                          '3', '4', '5', 'closed', 'completed',
+                                          'ended', 'finished', 'settled'
+                                      )
+                                      AND NOT EXISTS (
+                                          SELECT 1
+                                            FROM settlement_result_evidence AS evidence
+                                           WHERE evidence.raybet_match_id=
+                                                 match_row.raybet_match_id
+                                             AND evidence.source='opendota'
+                                             AND evidence.status='confirmed'
+                                      )
+                                    ORDER BY match_row.scheduled_at DESC,
+                                             match_row.raybet_match_id DESC
+                                    LIMIT 50"""
+                            ).fetchall()
+                            candidate_checked_at = datetime.now(timezone.utc)
+                            for candidate_row in candidate_rows:
+                                candidate_match_id = str(
+                                    candidate_row["raybet_match_id"]
+                                )
+                                candidate_resolution = (
+                                    resolve_exact_official_map_links(
+                                        store.connection,
+                                        candidate_match_id,
+                                    )
+                                )
+                                if (
+                                    not bool(candidate_row["has_confirmed_vision"])
+                                    and candidate_resolution.status != "confirmed"
+                                ):
+                                    continue
+                                previous_attempt = candidate_sync_attempts.get(
+                                    candidate_match_id
+                                )
+                                if (
+                                    previous_attempt is not None
+                                    and (
+                                        candidate_checked_at - previous_attempt
+                                    ).total_seconds()
+                                    < POSTMATCH_CANDIDATE_RETRY_SECONDS
+                                ):
+                                    continue
+                                candidate_sync_attempts[candidate_match_id] = (
+                                    candidate_checked_at
+                                )
+                                candidate_results.append(
+                                    await sync_exact_postmatch_candidate(
+                                        store,
+                                        client,
+                                        raw_archive,
+                                        core_match_store,
+                                        candidate_match_id,
+                                    )
+                                )
                             rows = store.connection.execute(
                                 """SELECT DISTINCT r.raybet_match_id,
                                           mapping.canonical_team_one_id
@@ -1374,24 +2202,83 @@ def main() -> int:
                                     int(team_id),
                                     "team_one",
                                     raybet_client,
+                                    core_match_store,
+                                    stratz_client,
                                 )
-                                results.append({"match_id": match_id, **result})
-                            result = {"status": "batch", "matches": results}
+                                settlement_results.append(
+                                    {"match_id": match_id, **result}
+                                )
+                            result = {
+                                "status": "batch",
+                                "matches": settlement_results,
+                                "postmatch_candidates": candidate_results,
+                                "vision_official_exclusions": (
+                                    vision_exclusion_results
+                                ),
+                            }
+                            health_results = settlement_results
                         else:
                             result = await label_once(
                                 store, client, raw_archive, args.match_id,
                                 args.team_id, args.team_side, raybet_client,
+                                core_match_store,
+                                stratz_client,
                             )
+                            candidate_results = []
+                            health_results = [result]
                         succeeded_at = datetime.now(timezone.utc)
+                        stratz_health = _stratz_enrichment_health(
+                            health_results,
+                            configured=stratz_client is not None,
+                        )
+                        stratz_failed = int(stratz_health["failed"]) > 0
+                        candidate_sync_health = _postmatch_candidate_sync_health(
+                            candidate_results
+                        )
+                        vision_exclusion_invalidations = sum(
+                            int(
+                                result.get(
+                                    "vision_observation_invalidations",
+                                    0,
+                                )
+                            )
+                            for result in (
+                                vision_exclusion_results
+                                if args.all
+                                else []
+                            )
+                        )
+                        candidate_sync_failed = (
+                            int(candidate_sync_health["failed"]) > 0
+                        )
                         record_health(
                             store.connection,
                             "postmatch_worker",
-                            "healthy",
+                            (
+                                "degraded"
+                                if stratz_failed or candidate_sync_failed
+                                else "healthy"
+                            ),
                             heartbeat_at=succeeded_at,
                             success_at=succeeded_at,
+                            error_at=(
+                                succeeded_at
+                                if stratz_failed or candidate_sync_failed
+                                else None
+                            ),
+                            error=(
+                                "postmatch_source_sync_failed"
+                                if stratz_failed or candidate_sync_failed
+                                else None
+                            ),
                             details={
                                 "source": "worker",
                                 "run_status": result.get("status"),
+                                "stratz_enrichment": stratz_health,
+                                "postmatch_candidate_sync": candidate_sync_health,
+                                "vision_official_exclusion_invalidations": (
+                                    vision_exclusion_invalidations
+                                ),
                             },
                         )
                         print(json.dumps(result, ensure_ascii=False))
@@ -1415,6 +2302,8 @@ def main() -> int:
         finally:
             await client.close()
             raybet_client.close()
+            if stratz_client is not None:
+                await stratz_client.close()
 
     return asyncio.run(run())
 

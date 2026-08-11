@@ -110,12 +110,18 @@ export function saveLiveDraftMapping(
   mapNumber: number,
   slots: LiveDraftSlot[],
   isLocked: boolean,
+  evidenceSourceUrl: string | null,
   csrfToken: string,
 ): Promise<LiveDraftMapping> {
   return mutateJson(
     `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/draft-mapping`,
     csrfToken,
-    { slots, is_locked: isLocked, actor: "local-operator" },
+    {
+      slots,
+      is_locked: isLocked,
+      actor: "local-operator",
+      evidence_source_url: evidenceSourceUrl,
+    },
   );
 }
 
@@ -134,11 +140,10 @@ export function fetchLiveDraftPrediction(
 
 
 export function createLiveDraftPrediction(
-  matchId: string,
-  mapNumber: number,
-  mappingVersion: number,
-  csrfToken: string,
-  gameClockSeconds: number | null,
+    matchId: string,
+    mapNumber: number,
+    mappingVersion: number,
+    csrfToken: string,
 ): Promise<LiveDraftPredictionResponse> {
   return mutateJson(
     `${MONITOR_API}/matches/${encodeURIComponent(matchId)}/maps/${mapNumber}/draft-prediction`,
@@ -147,10 +152,6 @@ export function createLiveDraftPrediction(
       mapping_version: mappingVersion,
       operator_identity: "local-operator",
       confirmation_text: "本次模型只使用队伍历史与已锁定阵容，不使用击杀、经济、经验、防御塔、肉山、实时赔率或其他游戏内状态。",
-      game_clock_seconds: gameClockSeconds,
-      vision_frame_timestamp: null,
-      draft_state_marker: "draft_complete",
-      live_state_input_used: false,
     },
   );
 }
@@ -293,10 +294,12 @@ export function saveVisionCalibrationLabel(
 
 export function buildVisionCalibrationCandidate(
   labelId: string,
+  baseCandidateId: string | null,
   csrfToken: string,
 ): Promise<VisionCalibrationCandidate> {
   return mutateJson("/api/vision-calibration/candidates", csrfToken, {
     label_id: labelId,
+    base_candidate_id: baseCandidateId,
   });
 }
 

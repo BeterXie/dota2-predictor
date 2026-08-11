@@ -8,8 +8,10 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 COMEBACK_STATE_MIN_CONFIDENCE = 0.9
+MAP_START_EVIDENCE_WINDOW_SECONDS = 180
+PLAYER_NAME_MIN_CONFIDENCE = 0.7
 
 
 def is_canonical_net_worth_bucket(minimum: object, maximum: object) -> bool:
@@ -96,6 +98,108 @@ class ComebackState(BaseModel):
         return self
 
 
+class DraftPlayerNameplate(BaseModel):
+    """OCR evidence for one left-to-right draft card, not a role position."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    side: Literal["radiant", "dire"]
+    visual_slot: int = Field(ge=1, le=5)
+    source: Literal["vision_ocr"] = "vision_ocr"
+    hero_id: int | None = Field(default=None, gt=0)
+    raw_text: str | None = None
+    observed_text: str | None = None
+    verified_player_name: str | None = None
+    identity_source_url: str | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    unavailable_reason: str | None = "ocr_not_run"
+
+    @model_validator(mode="after")
+    def accepted_name_requires_confident_ocr(self) -> "DraftPlayerNameplate":
+        if self.raw_text is not None:
+            self.raw_text = " ".join(self.raw_text.split()) or None
+        if self.observed_text is not None:
+            self.observed_text = " ".join(self.observed_text.split()) or None
+        if self.verified_player_name is not None:
+            self.verified_player_name = (
+                " ".join(self.verified_player_name.split()) or None
+            )
+        if self.observed_text is not None:
+            if (
+                self.raw_text != self.observed_text
+                or self.confidence < PLAYER_NAME_MIN_CONFIDENCE
+                or self.unavailable_reason is not None
+            ):
+                raise ValueError(
+                    "observed player text requires matching confident OCR evidence"
+                )
+        elif not isinstance(self.unavailable_reason, str) or not self.unavailable_reason.strip():
+            raise ValueError("unavailable player nameplate requires a reason")
+        if self.verified_player_name is not None:
+            if (
+                self.verified_player_name != self.observed_text
+                or not isinstance(self.identity_source_url, str)
+                or not self.identity_source_url.startswith(("https://", "http://"))
+            ):
+                raise ValueError(
+                    "verified player name requires exact observed text and a source URL"
+                )
+        elif self.identity_source_url is not None:
+            raise ValueError("unverified player name cannot contain an identity source")
+        return self
+
+
+class DraftPlayerNames(BaseModel):
+    """Ten visual nameplates observed on one completed draft frame."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["available", "partial", "unavailable"] = "unavailable"
+    source: Literal["vision_ocr"] | None = None
+    slots: list[DraftPlayerNameplate] = Field(default_factory=list, max_length=10)
+    unavailable_reason: str | None = "draft_player_names_not_observed"
+
+    @classmethod
+    def unavailable(
+        cls, reason: str = "draft_player_names_not_observed"
+    ) -> "DraftPlayerNames":
+        return cls(unavailable_reason=reason)
+
+    @model_validator(mode="after")
+    def status_matches_slots(self) -> "DraftPlayerNames":
+        identities = {(slot.side, slot.visual_slot) for slot in self.slots}
+        if len(identities) != len(self.slots):
+            raise ValueError("draft player nameplate visual slots must be unique")
+        accepted = sum(slot.observed_text is not None for slot in self.slots)
+        if self.status == "available":
+            if (
+                self.source != "vision_ocr"
+                or len(self.slots) != 10
+                or accepted != 10
+                or self.unavailable_reason is not None
+            ):
+                raise ValueError("available draft player names require ten accepted slots")
+            return self
+        if self.status == "partial":
+            if (
+                self.source != "vision_ocr"
+                or len(self.slots) != 10
+                or not 0 < accepted < 10
+                or not isinstance(self.unavailable_reason, str)
+                or not self.unavailable_reason.strip()
+            ):
+                raise ValueError("partial draft player names require ten audited slots")
+            return self
+        if (
+            self.source not in ({None} if not self.slots else {"vision_ocr"})
+            or accepted != 0
+            or not isinstance(self.unavailable_reason, str)
+            or not self.unavailable_reason.strip()
+        ):
+            raise ValueError("unavailable draft player names cannot contain accepted names")
+        return self
+
+
 class LiveObservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -119,6 +223,9 @@ class LiveObservation(BaseModel):
     source_frame_bytes: int | None = Field(default=None, gt=0)
     source_frame_path: str | None = None
     screen_state: str = "unknown"
+    draft_player_names: DraftPlayerNames = Field(
+        default_factory=DraftPlayerNames.unavailable
+    )
     comeback_state: ComebackState = Field(default_factory=ComebackState.unavailable)
 
     @field_validator("captured_at_utc")
@@ -173,6 +280,26 @@ class LiveObservation(BaseModel):
             and len(self.dire_hero_ids) == 5
             and all(hero_id > 0 for hero_id in self.radiant_hero_ids + self.dire_hero_ids)
             and self.clock_confidence >= 0.9
+            and self.draft_confidence >= 0.9
+            and bool(self.source_frame_ref.strip())
+        )
+
+    @property
+    def is_draft_confirmed(self) -> bool:
+        """Confirm a complete BP frame without granting live HUD authority."""
+        return (
+            self.map_number is not None
+            and self.screen_state == "draft"
+            and self.game_clock_seconds is None
+            and self.is_paused is None
+            and len(self.radiant_hero_ids) == 5
+            and len(self.dire_hero_ids) == 5
+            and all(
+                hero_id > 0
+                for hero_id in self.radiant_hero_ids + self.dire_hero_ids
+            )
+            and self.radiant_team_side in {"team_one", "team_two"}
+            and self.clock_confidence == 0.0
             and self.draft_confidence >= 0.9
             and bool(self.source_frame_ref.strip())
         )

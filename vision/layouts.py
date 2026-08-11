@@ -46,6 +46,12 @@ class BroadcastLayout:
     replay_status_regions: tuple[NormalizedRegion, ...] = field(default_factory=tuple)
     requires_geometry_confirmation: bool = False
     draft_recognition_max_clock_seconds: int | None = None
+    draft_completion_cyan_regions: tuple[NormalizedRegion, ...] = field(
+        default_factory=tuple
+    )
+    draft_player_nameplates: tuple[NormalizedRegion, ...] = field(
+        default_factory=tuple
+    )
 
 
 STANDARD_DOTA_HUD = BroadcastLayout(
@@ -134,6 +140,50 @@ EPL_MASTERS_LIVE = BroadcastLayout(
     requires_geometry_confirmation=True,
     # Late watcher attachment must still recover the immutable map lineup.
     draft_recognition_max_clock_seconds=None,
+)
+
+
+def _epl_draft_card(left: int) -> NormalizedRegion:
+    return NormalizedRegion(
+        (left + 4) / 1920,
+        778 / 1080,
+        (left + 138) / 1920,
+        951 / 1080,
+    )
+
+
+def _epl_draft_nameplate(left: int) -> NormalizedRegion:
+    return NormalizedRegion(
+        (left + 4) / 1920,
+        950 / 1080,
+        (left + 138) / 1920,
+        983 / 1080,
+    )
+
+
+_EPL_DRAFT_CARD_LEFTS = (35, 185, 335, 485, 635, 1143, 1293, 1443, 1593, 1743)
+
+
+EPL_MASTERS_DRAFT = BroadcastLayout(
+    name="epl_masters_draft_1080p",
+    clock=NormalizedRegion(0.450, 0.900, 0.550, 0.970),
+    draft_banner=NormalizedRegion(140 / 1920, 48 / 1080, 163 / 1920, 100 / 1080),
+    radiant_heroes=tuple(_epl_draft_card(left) for left in (35, 185, 335, 485, 635)),
+    dire_heroes=tuple(
+        _epl_draft_card(left) for left in (1143, 1293, 1443, 1593, 1743)
+    ),
+    radiant_team_logo=NormalizedRegion(810 / 1920, 835 / 1080, 920 / 1920, 945 / 1080),
+    dire_team_logo=NormalizedRegion(1000 / 1920, 835 / 1080, 1110 / 1920, 945 / 1080),
+    radiant_team_name=NormalizedRegion(10 / 1920, 690 / 1080, 500 / 1920, 775 / 1080),
+    dire_team_name=NormalizedRegion(1580 / 1920, 690 / 1080, 1915 / 1920, 775 / 1080),
+    requires_geometry_confirmation=True,
+    draft_recognition_max_clock_seconds=None,
+    draft_completion_cyan_regions=tuple(
+        _epl_draft_nameplate(left) for left in _EPL_DRAFT_CARD_LEFTS
+    ),
+    draft_player_nameplates=tuple(
+        _epl_draft_nameplate(left) for left in _EPL_DRAFT_CARD_LEFTS
+    ),
 )
 
 

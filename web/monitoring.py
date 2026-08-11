@@ -3,29 +3,41 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import hmac
 import json
 import math
+import os
 import re
 import secrets
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote as url_quote
 
+from contracts.live_observation import MAP_START_EVIDENCE_WINDOW_SECONDS
 from live_betting.live_match_state import (
     latest_live_draft_mapping,
     live_draft_context,
     live_game_snapshots,
 )
-from live_betting.raybet import DOTA2_GAME_ID
+from live_betting.raybet import DOTA2_GAME_ID, parse_raybet_map_final
+from live_betting.map_decision_checkpoints import latest_map_checkpoints
+from live_betting.official_map_identity import (
+    ExactOfficialMapLink,
+    resolve_exact_official_map_links,
+)
 from live_betting.raybet_state import (
+    explicit_raybet_map_times,
     infer_current_map_number,
     raybet_match_is_live,
     raybet_odds_is_open,
 )
 from live_betting.sanitize import stored_public_stream_url
+from live_betting.vision import VisionObservation, parse_observation
 from live_betting.process_control import MARKET_SOURCE_POLICY
 from live_betting.strict_eligibility import (
     RAYBET_MATCH_HEAD_TO_HEAD,
@@ -37,8 +49,10 @@ from live_betting.vision_frame_registry import VISION_FRAME_REF_PREFIX
 from sqlalchemy.exc import SQLAlchemyError
 
 from database.session import DatabaseRow, PostgresSession
+from event_intelligence.raw_registry import verify_registered_raw_source_artifact
+from fetch.stratz_detail import StratzDetailError, stratz_player_positions
 
-from .alerts import active_alerts
+from .alerts import reconcile_alerts
 from .match_identity import match_display_name, observation_file_name
 
 
@@ -49,6 +63,7 @@ _ENDED_STATUS_SQL = (
     "lower(status) IN ('3', '5', 'closed', 'ended', 'finished', 'settled')"
 )
 _UPCOMING_MATCH_STATUSES = {"1", "upcoming", "scheduled", "not_started"}
+_VISION_PREMATCH_WATCH_WINDOW = timedelta(minutes=30)
 _HISTORY_SCHEDULE_GRACE = timedelta(hours=12)
 _PREMATCH_HISTORY_SCHEDULE_GRACE = timedelta(hours=4)
 _HISTORY_ACTIVITY_GRACE = timedelta(minutes=15)
@@ -58,21 +73,30 @@ _EXPECTED_HEALTH_COMPONENTS = {
     "strict_ingest_worker": 90.0,
 }
 _PRIMARY_HEALTH_COMPONENTS = {
-    "database",
-    "raybet",
     "raybet_worker",
     "raybet_priority_odds_worker",
     "raybet_full_odds_worker",
-    "strict_ingest",
     "strict_ingest_worker",
+    "postmatch_worker",
+    "map_decision_worker",
+    "vision_worker",
 }
 _RETIRED_HEALTH_COMPONENTS = {
+    "companion",
+    "database",
+    "draft_publisher",
+    "draft_publisher_worker",
     "historical_rosh",
     "historical_rosh_worker",
     "mail",
     "mail_worker",
     "mail_delivery",
+    "postmatch",
+    "raybet",
+    "shadow",
     "shadow_worker",
+    "strict_ingest",
+    "vision",
 }
 _RAYBET_PAGE_ORIGINS = frozenset(
     {"https://ray086.com", "https://www.ray086.com"}
@@ -80,6 +104,12 @@ _RAYBET_PAGE_ORIGINS = frozenset(
 _RAYBET_PAGE_PREFIXES = ("/sports/esports", "/esports", "/dota2")
 _RAYBET_PAGE_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 _MAX_VISION_TIMELINE_POINTS = 5_000
+_JSONL_REVERSE_CHUNK_BYTES = 1_048_576
+_ODDS_GAP_THRESHOLD_SECONDS = 150.0
+_MAP_PERIOD_PATTERN = re.compile(r"^map_([1-5])$")
+_DEFAULT_VISION_OBSERVATION_DIR = (
+    Path("data") / "live_betting" / "vision_observations"
+)
 _MATCH_COLUMN_NAMES = (
     "raybet_match_id",
     "tournament",
@@ -163,7 +193,12 @@ def derive_health(
         details = _json_object(row["details_json"])
         heartbeat = _parse_time(row["last_heartbeat_at"])
         age = max(0.0, (checked_at - heartbeat).total_seconds()) if heartbeat else None
-        limit = _EXPECTED_HEALTH_COMPONENTS.get(component, 120.0)
+        reported_limit = details.get("stale_after_seconds")
+        limit = (
+            float(reported_limit)
+            if isinstance(reported_limit, (int, float)) and reported_limit > 0
+            else _EXPECTED_HEALTH_COMPONENTS.get(component, 120.0)
+        )
         if heartbeat is None:
             status, freshness = "unhealthy", "missing"
         elif age is not None and age > limit * 2:
@@ -173,12 +208,7 @@ def derive_health(
         else:
             status = reported
             freshness = "fresh"
-        companion_informational = (
-            component == "companion" and details.get("configured") is False
-        )
-        if companion_informational:
-            status, freshness = "stopped", "informational"
-        elif reported == "stopped" and freshness == "fresh":
+        if reported == "stopped" and freshness == "fresh":
             status = "stopped"
 
         output.append(
@@ -206,7 +236,7 @@ def build_monitor_snapshot(
     checked_at = _aware_utc(now or utc_now())
     health = derive_health(connection, now=checked_at)
     matches = monitor_matches(connection, now=checked_at)
-    alerts = active_alerts(connection)
+    alerts = reconcile_alerts(connection, now=checked_at, health=health)
     all_counts = _lifecycle_counts(matches)
     live_view = [item for item in matches if not _is_historical_match(item)]
     history_view = [item for item in matches if _is_historical_match(item)]
@@ -244,11 +274,11 @@ def _monitor_capabilities(
     return {
         "direct_market_collection": {
             "required": True,
-            "status": statuses.get("raybet", "stopped"),
+            "status": statuses.get("raybet_worker", "stopped"),
         },
         "opendota_event_ingest": {
             "required": True,
-            "status": statuses.get("strict_ingest", "stopped"),
+            "status": statuses.get("strict_ingest_worker", "stopped"),
         },
     }
 
@@ -350,6 +380,14 @@ def monitor_match_detail(
     max_points: int = 1200,
 ) -> dict[str, Any] | None:
     checked_at = _aware_utc(now or utc_now())
+    if not connection.in_transaction:
+        with connection.transaction():
+            return monitor_match_detail(
+                connection,
+                raybet_match_id,
+                now=checked_at,
+                max_points=max_points,
+            )
     row = connection.execute(
         """SELECT raybet_match_id, tournament, team_one, team_two,
                   scheduled_at, best_of, status, live_url, raw_json, updated_at
@@ -359,28 +397,33 @@ def monitor_match_detail(
     if row is None or not is_head_to_head_match_row(row):
         return None
     summary = _monitor_match(connection, row, checked_at)
-    timeline = winner_timeline(
+    maximum_live_map = (
+        int(summary["current_map_number"])
+        if summary["lifecycle"] in {"live", "degraded"}
+        and type(summary.get("current_map_number")) is int
+        else None
+    )
+    collection_timeline = winner_timeline(
         connection,
         raybet_match_id,
-        max_points=max_points,
+        max_points=None,
         as_of=checked_at,
+        deduplicate_ended=False,
     )
-    if summary["lifecycle"] == "ended" and timeline:
-        summary["winner"] = {
-            **(
-                summary["winner"]
-                if isinstance(summary.get("winner"), dict)
-                else {}
-            ),
-            **timeline[-1],
-            "complete": True,
-        }
+    prematch_timeline = winner_timeline(
+        connection,
+        raybet_match_id,
+        max_points=None,
+        as_of=checked_at,
+        processing_status="audit_only",
+        deduplicate_ended=False,
+    )
     latest_capture = _latest_capture_row(
         connection,
         raybet_match_id,
         now=checked_at,
+        maximum_map_number=maximum_live_map,
     )
-    draft_mapping = latest_live_draft_mapping(connection, raybet_match_id)
     draft_context = live_draft_context(
         connection,
         raybet_match_id,
@@ -391,30 +434,762 @@ def monitor_match_detail(
         raybet_match_id,
         limit=min(max_points, 1200),
     )
+    if maximum_live_map is not None:
+        game_snapshots = [
+            snapshot
+            for snapshot in game_snapshots
+            if type(snapshot.get("map_number")) is int
+            and int(snapshot["map_number"]) <= maximum_live_map
+        ]
+    vision = _vision_timeline(
+        connection,
+        raybet_match_id,
+        now=checked_at,
+        max_points=min(
+            _MAX_VISION_TIMELINE_POINTS,
+            max_points * max(1, int(row["best_of"] or 1)),
+        ),
+        maximum_map_number=maximum_live_map,
+    )
+    latest_capture_point = (
+        _capture_point(latest_capture, raybet_match_id)
+        if latest_capture is not None
+        else None
+    )
+    latest_huds = _latest_hud_observations(
+        raybet_match_id,
+        now=checked_at,
+        valid_vision_points=vision,
+        maximum_map_number=maximum_live_map,
+    )
+    vision_runtime = _vision_runtime_status(
+        connection,
+        raybet_match_id,
+        now=checked_at,
+    )
+    if (
+        maximum_live_map is not None
+        and vision_runtime is not None
+        and type(vision_runtime.get("map_number")) is int
+        and int(vision_runtime["map_number"]) > maximum_live_map
+    ):
+        vision_runtime = None
+    markets = current_markets(connection, raybet_match_id, as_of=checked_at)
+    postmatch = _postmatch_detail(connection, raybet_match_id)
+    raybet_final_map_numbers = _confirmed_raybet_final_map_numbers(row)
+    games, market_evidence = _series_game_details(
+        connection,
+        summary=summary,
+        prematch_timeline=prematch_timeline,
+        collection_timeline=collection_timeline,
+        vision=vision,
+        latest_capture=latest_capture_point,
+        game_snapshots=game_snapshots,
+        latest_huds=latest_huds,
+        vision_runtime=vision_runtime,
+        markets=markets,
+        postmatch=postmatch,
+        raybet_final_map_numbers=raybet_final_map_numbers,
+        max_points=max_points,
+    )
     return {
         **summary,
-        "winner_timeline": timeline,
-        "vision": _vision_timeline(
+        "draft_context": draft_context,
+        "postmatch": postmatch,
+        "games": games,
+        "market_evidence": market_evidence,
+    }
+
+
+def _postmatch_detail(
+    connection: PostgresSession,
+    raybet_match_id: str,
+) -> dict[str, Any]:
+    """Project exact OpenDota map links without mixing provider authority."""
+
+    linked_rows = connection.execute(
+        """SELECT result.map_number, result.dota_match_id,
+                  result.winner_side, result.team_one_kills,
+                  result.team_two_kills, result.duration_seconds,
+                  result.settled_at, match.radiant_team_id,
+                  match.dire_team_id, match.radiant_win, match.duration,
+                  match.start_time, match.leagueid, match.radiant_score,
+                  match.dire_score, match.fetched_at,
+                  radiant.name AS radiant_team_name,
+                  dire.name AS dire_team_name, league.name AS league_name
+             FROM map_results AS result
+             LEFT JOIN matches AS match ON match.match_id=result.dota_match_id
+             LEFT JOIN teams AS radiant ON radiant.team_id=match.radiant_team_id
+             LEFT JOIN teams AS dire ON dire.team_id=match.dire_team_id
+             LEFT JOIN leagues AS league ON league.leagueid=match.leagueid
+            WHERE result.raybet_match_id=?
+            ORDER BY result.map_number""",
+        (raybet_match_id,),
+    ).fetchall()
+    reconciliation_rows = connection.execute(
+        """SELECT map_number, status, reason, dota_match_id, updated_at
+             FROM settlement_reconciliations
+            WHERE raybet_match_id=?
+            ORDER BY map_number""",
+        (raybet_match_id,),
+    ).fetchall()
+
+    exact_resolution = None
+    exact_evidence: dict[int, dict[str, object]] = {}
+    if not linked_rows and not reconciliation_rows:
+        exact_resolution = resolve_exact_official_map_links(
             connection,
             raybet_match_id,
-            now=checked_at,
-            max_points=max_points,
-        ),
-        "latest_capture": (
-            _capture_point(latest_capture, raybet_match_id)
-            if latest_capture is not None
+        )
+        if exact_resolution.status == "confirmed":
+            linked_rows = _resolved_official_postmatch_rows(
+                connection,
+                exact_resolution.links,
+            )
+            exact_evidence = {
+                link.map_number: link.evidence()
+                for link in exact_resolution.links
+            }
+    identity_source = (
+        "map_results"
+        if linked_rows and not exact_evidence
+        else "raybet_explicit_map_time"
+        if linked_rows
+        else "waiting"
+    )
+
+    games = []
+    for linked_row in linked_rows:
+        if linked_row["dota_match_id"] is None:
+            continue
+        game = _postmatch_game(connection, linked_row)
+        map_number = int(game["map_number"])
+        evidence = exact_evidence.get(map_number)
+        game["identity_reason"] = (
+            "raybet_explicit_map_time_unique"
+            if evidence is not None
+            else "confirmed_map_result"
+        )
+        game["identity_evidence"] = evidence or {
+            "method": "confirmed_settlement_reconciliation",
+            "official_source": "confirmed_map_result",
+        }
+        games.append(game)
+    unresolved = [
+        {
+            "map_number": int(row["map_number"]),
+            "status": str(row["status"]),
+            "reason": str(row["reason"] or ""),
+            "official_match_id": (
+                str(row["dota_match_id"])
+                if row["dota_match_id"] is not None
+                else None
+            ),
+            "updated_at": row["updated_at"],
+        }
+        for row in reconciliation_rows
+        if str(row["status"]) != "confirmed"
+    ]
+    if (
+        not unresolved
+        and not games
+        and exact_resolution is not None
+        and exact_resolution.map_numbers
+    ):
+        unresolved = [
+            {
+                "map_number": map_number,
+                "status": "unlinked",
+                "reason": exact_resolution.reason,
+                "official_match_id": None,
+                "updated_at": None,
+            }
+            for map_number in exact_resolution.map_numbers
+        ]
+    has_review = any(row["status"] == "manual_review" for row in unresolved)
+    has_ingested_game = any(game["status"] == "available" for game in games)
+    enrichment_statuses = {
+        str(game["enrichment"]["status"])
+        for game in games
+        if isinstance(game.get("enrichment"), dict)
+    }
+    if "available" in enrichment_statuses:
+        stratz_status, stratz_reason = "available", "player_positions_available"
+    elif "blocked" in enrichment_statuses:
+        blocker_reasons = {
+            str(game["enrichment"].get("reason") or "optional_enrichment_source_blocked")
+            for game in games
+            if isinstance(game.get("enrichment"), dict)
+            and game["enrichment"].get("status") == "blocked"
+        }
+        stratz_status = "blocked"
+        stratz_reason = (
+            next(iter(blocker_reasons))
+            if len(blocker_reasons) == 1
+            else "optional_enrichment_source_blocked"
+        )
+    elif "invalid" in enrichment_statuses:
+        stratz_status, stratz_reason = "invalid", "optional_enrichment_invalid"
+    elif "partial" in enrichment_statuses:
+        stratz_status, stratz_reason = "partial", "player_positions_missing"
+    else:
+        stratz_status, stratz_reason = (
+            "not_available",
+            "optional_enrichment_not_ingested",
+        )
+    if games and unresolved:
+        status, reason = "partial", "some_maps_unresolved"
+    elif games:
+        status, reason = (
+            "available",
+            "exact_opendota_maps_available",
+        )
+    elif has_review:
+        status, reason = "review", "postmatch_identity_requires_review"
+    else:
+        status, reason = "waiting", "exact_opendota_map_not_available"
+
+    opendota_status = (
+        "available"
+        if has_ingested_game
+        else "linked_not_ingested"
+        if games
+        else "waiting_for_exact_link"
+    )
+    return {
+        "status": status,
+        "reason": reason,
+        "identity_source": identity_source,
+        "sources": {
+            "canonical": {
+                "provider": "opendota",
+                "role": "canonical_postmatch",
+                "status": opendota_status,
+                "reason": (
+                    "exact_map_details_available"
+                    if has_ingested_game
+                    else "exact_map_detail_not_ingested"
+                    if games
+                    else "exact_map_link_not_confirmed"
+                ),
+            },
+            "enhancement": {
+                "provider": "stratz",
+                "role": "optional_enrichment",
+                "status": stratz_status,
+                "reason": stratz_reason,
+            },
+        },
+        "games": games,
+        "unresolved_maps": unresolved,
+    }
+
+
+def _resolved_official_postmatch_rows(
+    connection: PostgresSession,
+    links: tuple[ExactOfficialMapLink, ...],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for link in links:
+        row = connection.execute(
+            """SELECT ? AS map_number, match.match_id AS dota_match_id,
+                      match.radiant_team_id, match.dire_team_id,
+                      match.radiant_win, match.duration, match.start_time,
+                      match.leagueid, match.radiant_score, match.dire_score,
+                      match.fetched_at, radiant.name AS radiant_team_name,
+                      dire.name AS dire_team_name, league.name AS league_name
+                 FROM matches AS match
+                 LEFT JOIN teams AS radiant
+                   ON radiant.team_id=match.radiant_team_id
+                 LEFT JOIN teams AS dire ON dire.team_id=match.dire_team_id
+                 LEFT JOIN leagues AS league ON league.leagueid=match.leagueid
+                WHERE match.match_id=? AND match.series_id=?
+                  AND match.leagueid=?""",
+            (
+                link.map_number,
+                link.dota_match_id,
+                link.official_series_id,
+                link.league_id,
+            ),
+        ).fetchone()
+        if row is None:
+            return []
+        rows.append(dict(row))
+    return rows
+
+
+def _postmatch_game(
+    connection: PostgresSession,
+    row: DatabaseRow,
+) -> dict[str, Any]:
+    match_id = int(row["dota_match_id"])
+    stratz_positions, stratz_enrichment = _stratz_enrichment(
+        connection,
+        match_id,
+    )
+    player_rows = connection.execute(
+        """SELECT player.player_slot, player.account_id, player.is_radiant,
+                  player.team_id, player.hero_id, hero.localized_name AS hero_name,
+                  hero.hero_key, player.kills, player.deaths, player.assists,
+                  player.gold_per_min, player.xp_per_min, player.net_worth,
+                  player.last_hits, player.denies, player.hero_damage,
+                  player.hero_healing, player.tower_damage, player.level,
+                  player.item_0, player.item_1,
+                  player.item_2, player.item_3, player.item_4, player.item_5
+             FROM match_players AS player
+             LEFT JOIN heroes AS hero ON hero.hero_id=player.hero_id
+            WHERE player.match_id=?
+            ORDER BY player.player_slot""",
+        (match_id,),
+    ).fetchall()
+    player_identities = _opendota_player_identities(connection, match_id)
+    historical_averages = _player_historical_averages(
+        connection,
+        player_rows,
+        before_start_time=row["start_time"],
+    )
+    players = [
+        _postmatch_player(
+            player,
+            stratz_positions,
+            player_identities,
+            historical_averages,
+        )
+        for player in player_rows
+        if player["player_slot"] is not None and player["hero_id"] is not None
+    ]
+    draft = [
+        {
+            "order": int(action["ord"]),
+            "is_pick": bool(action["is_pick"]),
+            "side": "radiant" if int(action["team"]) == 0 else "dire",
+            "hero_id": int(action["hero_id"]),
+            "hero_name": str(action["hero_name"] or f"Hero {action['hero_id']}"),
+            "hero_key": str(action["hero_key"] or ""),
+        }
+        for action in connection.execute(
+            """SELECT draft.ord, draft.is_pick, draft.team, draft.hero_id,
+                      hero.localized_name AS hero_name, hero.hero_key
+                 FROM picks_bans AS draft
+                 LEFT JOIN heroes AS hero ON hero.hero_id=draft.hero_id
+                WHERE draft.match_id=?
+                ORDER BY draft.ord""",
+            (match_id,),
+        ).fetchall()
+        if action["ord"] is not None
+        and action["team"] in (0, 1)
+        and action["hero_id"] is not None
+    ]
+    gold = _advantage_points(connection, "gold_advantage", match_id)
+    xp = _advantage_points(connection, "xp_advantage", match_id)
+    objectives = [
+        {
+            "time_seconds": objective["time"],
+            "type": str(objective["type"] or ""),
+            "unit": str(objective["unit"] or ""),
+            "key": str(objective["key"] or ""),
+            "player_slot": objective["player_slot"],
+        }
+        for objective in connection.execute(
+            """SELECT time, type, unit, key, player_slot
+                 FROM objectives WHERE match_id=? ORDER BY time, id""",
+            (match_id,),
+        ).fetchall()
+    ]
+    teamfights = [
+        {
+            "start_time": fight["start_time"],
+            "end_time": fight["end_time"],
+            "last_death": fight["last_death"],
+            "deaths": fight["deaths"],
+            "kills": int(fight["kills"] or 0),
+            "damage": int(fight["damage"] or 0),
+            "healing": int(fight["healing"] or 0),
+            "gold_delta": int(fight["gold_delta"] or 0),
+            "xp_delta": int(fight["xp_delta"] or 0),
+        }
+        for fight in connection.execute(
+            """SELECT fight.id, fight.start_time, fight.end_time,
+                      fight.last_death, fight.deaths,
+                      SUM(player.kills) AS kills,
+                      SUM(player.damage) AS damage,
+                      SUM(player.healing) AS healing,
+                      SUM(player.gold_delta) AS gold_delta,
+                      SUM(player.xp_delta) AS xp_delta
+                 FROM teamfights AS fight
+                 LEFT JOIN teamfight_players AS player
+                   ON player.teamfight_id=fight.id
+                WHERE fight.match_id=?
+                GROUP BY fight.id, fight.start_time, fight.end_time,
+                         fight.last_death, fight.deaths
+                ORDER BY fight.start_time, fight.id""",
+            (match_id,),
+        ).fetchall()
+    ]
+    core_available = row["radiant_win"] is not None and row["duration"] is not None
+    named_players = sum(player["player_name"] is not None for player in players)
+    history_eligible = sum(player["account_id"] is not None for player in players)
+    players_with_history = sum(
+        player["historical_average"] is not None for player in players
+    )
+    positioned_players = sum(player["position"] is not None for player in players)
+    return {
+        "map_number": int(row["map_number"]),
+        "official_match_id": str(match_id),
+        "status": "available" if core_available else "linked_not_ingested",
+        "source": "opendota",
+        "enrichment": stratz_enrichment,
+        "fetched_at": row["fetched_at"],
+        "result": (
+            {
+                "radiant_team_id": row["radiant_team_id"],
+                "dire_team_id": row["dire_team_id"],
+                "radiant_team_name": row["radiant_team_name"],
+                "dire_team_name": row["dire_team_name"],
+                "radiant_win": bool(row["radiant_win"]),
+                "duration_seconds": int(row["duration"]),
+                "start_time": row["start_time"],
+                "league_id": row["leagueid"],
+                "league_name": row["league_name"],
+                "radiant_score": row["radiant_score"],
+                "dire_score": row["dire_score"],
+            }
+            if core_available
             else None
         ),
-        "draft_mapping": draft_mapping,
-        "draft_context": draft_context,
-        "game_snapshots": game_snapshots,
-        "latest_game_snapshot": game_snapshots[-1] if game_snapshots else None,
-        "markets": current_markets(
-            connection,
-            raybet_match_id,
-            as_of=checked_at,
-        ),
+        "players": players,
+        "draft": draft,
+        "advantages": {"gold": gold, "xp": xp},
+        "objectives": objectives,
+        "teamfights": teamfights,
+        "availability": {
+            "result": "available" if core_available else "missing",
+            "players": _row_availability(len(players), expected=10),
+            "player_names": (
+                _row_availability(named_players, expected=len(players))
+                if players
+                else "missing"
+            ),
+            "historical_averages": (
+                _row_availability(players_with_history, expected=history_eligible)
+                if history_eligible
+                else "missing"
+            ),
+            "positions": (
+                _row_availability(positioned_players, expected=len(players))
+                if players
+                else "missing"
+            ),
+            "draft": "available" if draft else "missing",
+            "gold_advantage": "available" if gold else "missing",
+            "xp_advantage": "available" if xp else "missing",
+            "objectives": "available" if objectives else "missing",
+            "teamfights": "available" if teamfights else "missing",
+        },
     }
+
+
+def _postmatch_player(
+    player: DatabaseRow,
+    stratz_positions: dict[tuple[int, int], int],
+    player_identities: dict[tuple[int, int], dict[str, str]],
+    historical_averages: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    account_id = (
+        int(player["account_id"])
+        if type(player["account_id"]) is int and int(player["account_id"]) > 0
+        else None
+    )
+    hero_id = int(player["hero_id"])
+    player_slot = int(player["player_slot"])
+    player_identity = player_identities.get((player_slot, hero_id), {})
+    stratz_position = (
+        stratz_positions.get((account_id, hero_id))
+        if account_id is not None
+        else None
+    )
+    return {
+        "player_slot": player_slot,
+        "account_id": account_id,
+        "player_name": player_identity.get("name"),
+        "player_name_source": player_identity.get("source"),
+        "side": "radiant" if bool(player["is_radiant"]) else "dire",
+        "team_id": int(player["team_id"]) if player["team_id"] is not None else None,
+        "hero_id": hero_id,
+        "hero_name": str(player["hero_name"] or f"Hero {hero_id}"),
+        "hero_key": str(player["hero_key"] or ""),
+        "kills": player["kills"],
+        "deaths": player["deaths"],
+        "assists": player["assists"],
+        "gold_per_min": player["gold_per_min"],
+        "xp_per_min": player["xp_per_min"],
+        "net_worth": player["net_worth"],
+        "last_hits": player["last_hits"],
+        "denies": player["denies"],
+        "hero_damage": player["hero_damage"],
+        "hero_healing": player["hero_healing"],
+        "tower_damage": player["tower_damage"],
+        "level": player["level"],
+        # OpenDota lane_role is a lane classification, not a farm-priority
+        # position.  Only STRATZ's explicit POSITION_1..POSITION_5 value is
+        # allowed into the player-facing role field.
+        "position": stratz_position,
+        "position_source": "stratz" if stratz_position is not None else None,
+        "historical_average": (
+            historical_averages.get(account_id) if account_id is not None else None
+        ),
+        "items": [
+            int(player[column])
+            for column in (
+                "item_0", "item_1", "item_2", "item_3", "item_4", "item_5"
+            )
+            if player[column] is not None and int(player[column]) > 0
+        ],
+    }
+
+
+def _opendota_player_identities(
+    connection: PostgresSession,
+    match_id: int,
+) -> dict[tuple[int, int], dict[str, str]]:
+    """Read display names from the verified raw OpenDota match response."""
+
+    row = connection.execute(
+        """SELECT artifact_id
+             FROM raw_source_artifacts
+            WHERE source='opendota' AND artifact_use='primary'
+              AND endpoint=? AND match_id=?
+            ORDER BY received_at DESC, artifact_id DESC
+            LIMIT 1""",
+        (f"/api/matches/{match_id}", match_id),
+    ).fetchone()
+    if row is None:
+        return {}
+    try:
+        path = verify_registered_raw_source_artifact(
+            connection,
+            str(row["artifact_id"]),
+        )
+        payload = json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("match_id") != match_id:
+        return {}
+
+    identities: dict[tuple[int, int], dict[str, str]] = {}
+    for raw_player in payload.get("players") or []:
+        if not isinstance(raw_player, dict):
+            continue
+        player_slot = raw_player.get("player_slot")
+        hero_id = raw_player.get("hero_id")
+        if type(player_slot) is not int or type(hero_id) is not int or hero_id <= 0:
+            continue
+        for field, source in (
+            ("name", "opendota_name"),
+            ("personaname", "opendota_personaname"),
+        ):
+            value = raw_player.get(field)
+            if isinstance(value, str) and 0 < len(value.strip()) <= 100:
+                identities[(player_slot, hero_id)] = {
+                    "name": value.strip(),
+                    "source": source,
+                }
+                break
+    return identities
+
+
+def _player_historical_averages(
+    connection: PostgresSession,
+    player_rows: list[DatabaseRow],
+    *,
+    before_start_time: object,
+) -> dict[int, dict[str, Any]]:
+    """Return pre-match averages over all collected maps for known accounts."""
+
+    if type(before_start_time) is not int or before_start_time <= 0:
+        return {}
+    account_ids = sorted(
+        {
+            int(player["account_id"])
+            for player in player_rows
+            if type(player["account_id"]) is int and int(player["account_id"]) > 0
+        }
+    )
+    if not account_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in account_ids)
+    rows = connection.execute(
+        f"""SELECT player.account_id,
+                   COUNT(DISTINCT player.match_id) AS sample_size,
+                   MIN(match.start_time) AS sample_start_time,
+                   MAX(match.start_time) AS sample_end_time,
+                   AVG(player.kills::double precision) AS kills,
+                   AVG(player.deaths::double precision) AS deaths,
+                   AVG(player.assists::double precision) AS assists,
+                   AVG(player.gold_per_min::double precision) AS gold_per_min,
+                   AVG(player.xp_per_min::double precision) AS xp_per_min,
+                   AVG(player.net_worth::double precision) AS net_worth,
+                   AVG(player.last_hits::double precision) AS last_hits,
+                   AVG(player.hero_damage::double precision) AS hero_damage,
+                   AVG(player.tower_damage::double precision) AS tower_damage
+              FROM match_players AS player
+              JOIN matches AS match ON match.match_id=player.match_id
+             WHERE player.account_id IN ({placeholders})
+               AND match.start_time>0
+               AND match.start_time<?
+               AND match.radiant_win IS NOT NULL
+             GROUP BY player.account_id""",
+        (*account_ids, before_start_time),
+    ).fetchall()
+    metric_names = (
+        "kills",
+        "deaths",
+        "assists",
+        "gold_per_min",
+        "xp_per_min",
+        "net_worth",
+        "last_hits",
+        "hero_damage",
+        "tower_damage",
+    )
+    return {
+        int(row["account_id"]): {
+            "sample_size": int(row["sample_size"]),
+            "source": "opendota_collected_history",
+            "cutoff": "before_match_start",
+            "sample_start_date": datetime.fromtimestamp(
+                int(row["sample_start_time"]),
+                tz=timezone.utc,
+            ).date().isoformat(),
+            "sample_end_date": datetime.fromtimestamp(
+                int(row["sample_end_time"]),
+                tz=timezone.utc,
+            ).date().isoformat(),
+            **{
+                metric: (
+                    round(float(row[metric]), 1)
+                    if row[metric] is not None
+                    else None
+                )
+                for metric in metric_names
+            },
+        }
+        for row in rows
+        if row["account_id"] is not None and int(row["sample_size"] or 0) > 0
+    }
+
+
+def _stratz_enrichment(
+    connection: PostgresSession,
+    match_id: int,
+) -> tuple[dict[tuple[int, int], int], dict[str, Any]]:
+    row = connection.execute(
+        """SELECT artifact_id, received_at
+             FROM raw_source_artifacts
+            WHERE source='stratz' AND artifact_use='primary'
+              AND endpoint='/graphql/match-detail-enrichment'
+              AND match_id=?
+            ORDER BY received_at DESC, artifact_id DESC
+            LIMIT 1""",
+        (match_id,),
+    ).fetchone()
+    if row is None:
+        blocker = _stratz_source_blocker(connection)
+        if blocker is not None:
+            return {}, {
+                "provider": "stratz",
+                "status": "blocked",
+                "reason": blocker[0],
+                "observed_at": blocker[1],
+            }
+        return {}, {
+            "provider": "stratz",
+            "status": "not_available",
+            "reason": "optional_enrichment_not_ingested",
+            "observed_at": None,
+        }
+    try:
+        path = verify_registered_raw_source_artifact(
+            connection,
+            str(row["artifact_id"]),
+        )
+        payload = json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
+        positions = stratz_player_positions(payload, expected_match_id=match_id)
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        RuntimeError,
+        json.JSONDecodeError,
+        StratzDetailError,
+    ):
+        return {}, {
+            "provider": "stratz",
+            "status": "invalid",
+            "reason": "optional_enrichment_invalid",
+            "observed_at": row["received_at"],
+        }
+    return positions, {
+        "provider": "stratz",
+        "status": "available" if positions else "partial",
+        "reason": (
+            "player_positions_available"
+            if positions
+            else "player_positions_missing"
+        ),
+        "observed_at": row["received_at"],
+    }
+
+
+def _stratz_source_blocker(
+    connection: PostgresSession,
+) -> tuple[str, object] | None:
+    row = connection.execute(
+        """SELECT last_error_at, details_json
+             FROM service_health
+            WHERE component='postmatch_worker' AND status IN ('degraded', 'unhealthy')"""
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        details = json.loads(str(row["details_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    enrichment = details.get("stratz_enrichment") if isinstance(details, dict) else None
+    reasons = enrichment.get("failure_reasons") if isinstance(enrichment, dict) else None
+    if not isinstance(reasons, list):
+        return None
+    stable_reasons = sorted(
+        reason.strip()
+        for value in reasons
+        if isinstance(value, str) and (reason := value.strip())
+    )
+    if not stable_reasons:
+        return None
+    return stable_reasons[0], row["last_error_at"]
+
+
+def _advantage_points(
+    connection: PostgresSession,
+    table: str,
+    match_id: int,
+) -> list[dict[str, int]]:
+    if table not in {"gold_advantage", "xp_advantage"}:
+        raise ValueError("unsupported advantage table")
+    return [
+        {"minute": int(row["time_min"]), "value": int(row["value"])}
+        for row in connection.execute(
+            f"SELECT time_min, value FROM {table} WHERE match_id=? ORDER BY time_min",
+            (match_id,),
+        ).fetchall()
+        if row["time_min"] is not None and row["value"] is not None
+    ]
+
+
+def _row_availability(count: int, *, expected: int) -> str:
+    if count >= expected:
+        return "available"
+    return "partial" if count else "missing"
 
 
 def winner_timeline(
@@ -424,9 +1199,13 @@ def winner_timeline(
     max_points: int | None = 1200,
     period: str | None = None,
     as_of: datetime | None = None,
+    processing_status: str = "processed",
+    deduplicate_ended: bool = True,
 ) -> list[dict[str, Any]]:
+    if processing_status not in {"processed", "audit_only"}:
+        raise ValueError("unsupported odds processing status")
     cutoff = _aware_utc(as_of).isoformat() if as_of is not None else None
-    ended_match = connection.execute(
+    ended_match = deduplicate_ended and connection.execute(
         "SELECT 1 FROM raybet_matches WHERE raybet_match_id=? AND status='3'",
         (raybet_match_id,),
     ).fetchone() is not None
@@ -496,18 +1275,27 @@ def winner_timeline(
                                transport.observed_at
                            )<=CAST(? AS timestamptz))
                        AND transport.timing_status='on_time'
-                      AND transport.processing_status='processed'
+                       AND transport.processing_status=?
                       AND outcome.market_type='winner'
                       AND outcome.supported=1
                       AND (CAST(? AS text) IS NULL OR outcome.period=?)
                     ORDER BY transport.observed_at, transport.observation_key,
                              outcome.period, outcome.odds_group_id,
                              outcome.odds_id""",
-                    (raybet_match_id, cutoff, cutoff, period, period),
-            )
+                    (
+                        raybet_match_id,
+                        cutoff,
+                        cutoff,
+                        processing_status,
+                        period,
+                        period,
+                    ),
+                )
         except SQLAlchemyError:
             return []
     else:
+        if processing_status != "processed":
+            return []
         has_alignment_relation = connection.execute(
             """SELECT 1 FROM information_schema.tables
                 WHERE table_schema=current_schema()
@@ -569,7 +1357,6 @@ def winner_timeline(
         grouped[key].append(row)
 
     points: list[dict[str, Any]] = []
-    ended_signatures: dict[str, tuple[object, ...]] = {}
     for (
         observed_at,
         _response_key,
@@ -656,21 +1443,509 @@ def winner_timeline(
                 else None
             ),
         }
-        if ended_match:
-            signature = (
-                tuple(sorted(prices.items())),
-                tuple(sorted(point["status"].items())),
-                point["game_clock_seconds"],
-                point["map_number"],
-                None
-                if point["alignment"] is None
-                else tuple(sorted(point["alignment"].items())),
-            )
-            if ended_signatures.get(point_period) == signature:
-                continue
-            ended_signatures[point_period] = signature
         points.append(point)
+    if ended_match:
+        points = _deduplicate_winner_timeline(points)
     return points if max_points is None else _downsample(points, max_points)
+
+
+def _deduplicate_winner_timeline(
+    points: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    signatures: dict[str, tuple[object, ...]] = {}
+    output: list[dict[str, Any]] = []
+    for point in points:
+        period = str(point["period"])
+        signature = (
+            tuple(sorted(point["prices"].items())),
+            tuple(sorted(point["status"].items())),
+            point["game_clock_seconds"],
+            point["map_number"],
+            None
+            if point["alignment"] is None
+            else tuple(sorted(point["alignment"].items())),
+        )
+        if signatures.get(period) == signature:
+            continue
+        signatures[period] = signature
+        output.append(point)
+    return output
+
+
+def _series_game_details(
+    connection: PostgresSession,
+    *,
+    summary: dict[str, Any],
+    prematch_timeline: list[dict[str, Any]],
+    collection_timeline: list[dict[str, Any]],
+    vision: list[dict[str, Any]],
+    latest_capture: dict[str, Any] | None,
+    game_snapshots: list[dict[str, Any]],
+    latest_huds: dict[int, dict[str, Any]],
+    vision_runtime: dict[str, Any] | None,
+    markets: list[dict[str, Any]],
+    postmatch: dict[str, Any],
+    raybet_final_map_numbers: set[int],
+    max_points: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    match_id = str(summary["raybet_match_id"])
+    map_numbers = _locked_draft_map_numbers(connection, match_id)
+    map_numbers.update(
+        int(point["map_number"])
+        for point in (*vision, *game_snapshots)
+        if type(point.get("map_number")) is int
+    )
+    map_numbers.update(
+        int(item["map_number"])
+        for item in (*postmatch["games"], *postmatch["unresolved_maps"])
+    )
+    map_numbers.update(raybet_final_map_numbers)
+    if (
+        summary.get("lifecycle") == "live"
+        and type(summary.get("current_map_number")) is int
+    ):
+        map_numbers.add(int(summary["current_map_number"]))
+
+    market_map_numbers = {
+        value
+        for point in (*prematch_timeline, *collection_timeline)
+        if (value := _map_number_from_period(str(point["period"]))) is not None
+    }
+    market_map_numbers.update(
+        value
+        for market in markets
+        if (value := _map_number_from_period(str(market["period"]))) is not None
+    )
+
+    games: list[dict[str, Any]] = []
+    for map_number in sorted(map_numbers):
+        period = f"map_{map_number}"
+        raw_game_timeline = [
+            point for point in collection_timeline if point["period"] == period
+        ]
+        game_timeline = (
+            _deduplicate_winner_timeline(raw_game_timeline)
+            if summary["lifecycle"] == "ended"
+            else raw_game_timeline
+        )
+        game_timeline = _downsample(game_timeline, max_points)
+        game_prematch = [
+            point for point in prematch_timeline if point["period"] == period
+        ]
+        game_vision = [
+            point for point in vision if point["map_number"] == map_number
+        ]
+        snapshots = [
+            point
+            for point in game_snapshots
+            if point["map_number"] == map_number
+        ]
+        mapping = latest_live_draft_mapping(
+            connection,
+            match_id,
+            map_number=map_number,
+        )
+        game_postmatch = _postmatch_for_game(postmatch, map_number)
+        official_match_id, link_status, link_reason = _map_link_identity(
+            game_postmatch
+        )
+        state = _series_game_state(
+            lifecycle=str(summary["lifecycle"]),
+            current_map_number=summary.get("current_map_number"),
+            map_number=map_number,
+            has_postmatch=bool(game_postmatch["games"]),
+            has_confirmed_raybet_final=map_number in raybet_final_map_numbers,
+        )
+        capture = (
+            latest_capture
+            if latest_capture is not None
+            and latest_capture.get("map_number") == map_number
+            else None
+        )
+        hud = latest_huds.get(map_number)
+        runtime = (
+            vision_runtime
+            if vision_runtime is not None
+            and vision_runtime.get("map_number") == map_number
+            else None
+        )
+        games.append(
+            {
+                "game_id": f"{match_id}:map_{map_number}",
+                "map_id": f"{match_id}:map_{map_number}",
+                "map_number": map_number,
+                "period": period,
+                "official_match_id": official_match_id,
+                "link_status": link_status,
+                "link_reason": link_reason,
+                "play_evidence": [
+                    source
+                    for source, available in (
+                        ("locked_draft_mapping", mapping is not None and mapping["is_locked"]),
+                        ("verified_game_frame", bool(game_vision)),
+                        ("trusted_game_snapshot", bool(snapshots)),
+                        ("raybet_final_market", map_number in raybet_final_map_numbers),
+                        ("official_map_result", bool(game_postmatch["games"])),
+                        (
+                            "provider_live_map",
+                            summary.get("lifecycle") == "live"
+                            and summary.get("current_map_number") == map_number,
+                        ),
+                    )
+                    if available
+                ],
+                "state": state,
+                "winner": _latest_game_winner(game_timeline, state=state),
+                "prematch_winner": _latest_game_winner(
+                    game_prematch,
+                    state="scheduled",
+                ),
+                "winner_timeline": game_timeline,
+                "odds_coverage": _odds_coverage_summary(
+                    game_prematch,
+                    raw_game_timeline,
+                    game_state=state,
+                ),
+                "vision": game_vision,
+                "latest_vision": game_vision[-1] if game_vision else None,
+                "latest_capture": capture,
+                "draft_mapping": mapping,
+                "game_snapshots": snapshots,
+                "latest_game_snapshot": snapshots[-1] if snapshots else None,
+                "latest_hud_observation": hud,
+                "vision_runtime": runtime,
+                "markets": [
+                    market for market in markets if market["period"] == period
+                ],
+                "postmatch": game_postmatch,
+                "decision_checkpoints": latest_map_checkpoints(
+                    connection,
+                    match_id,
+                    map_number,
+                ),
+            }
+        )
+    market_evidence = [
+        _market_only_map_evidence(
+            match_id=match_id,
+            map_number=map_number,
+            prematch_timeline=prematch_timeline,
+            collection_timeline=collection_timeline,
+            markets=markets,
+        )
+        for map_number in sorted(market_map_numbers - map_numbers)
+    ]
+    return games, market_evidence
+
+
+def _locked_draft_map_numbers(
+    connection: PostgresSession,
+    raybet_match_id: str,
+) -> set[int]:
+    try:
+        rows = connection.execute(
+            """WITH latest AS (
+                   SELECT map_number, MAX(version) AS version
+                     FROM live_draft_mappings
+                    WHERE raybet_match_id=?
+                    GROUP BY map_number
+               )
+               SELECT mapping.map_number
+                 FROM live_draft_mappings AS mapping
+                 JOIN latest
+                   ON latest.map_number=mapping.map_number
+                  AND latest.version=mapping.version
+                WHERE mapping.raybet_match_id=?
+                GROUP BY mapping.map_number
+               HAVING COUNT(*)=10
+                  AND COUNT(DISTINCT mapping.hero_id)=10
+                  AND COUNT(*) FILTER (WHERE mapping.is_locked=1)=10
+                  AND COUNT(*) FILTER (WHERE mapping.side='radiant')=5
+                  AND COUNT(*) FILTER (WHERE mapping.side='dire')=5
+                  AND COUNT(DISTINCT mapping.position)
+                      FILTER (WHERE mapping.side='radiant')=5
+                  AND COUNT(DISTINCT mapping.position)
+                      FILTER (WHERE mapping.side='dire')=5""",
+            (raybet_match_id, raybet_match_id),
+        ).fetchall()
+    except SQLAlchemyError as error:
+        if _is_schema_missing_error(error):
+            return set()
+        raise
+    return {int(row["map_number"]) for row in rows}
+
+
+def _map_link_identity(
+    postmatch: dict[str, Any],
+) -> tuple[str | None, str, str]:
+    if postmatch["games"]:
+        game = postmatch["games"][0]
+        return (
+            str(game["official_match_id"]),
+            "confirmed",
+            str(game.get("identity_reason") or "exact_map_result"),
+        )
+    if postmatch["unresolved_maps"]:
+        unresolved = postmatch["unresolved_maps"][0]
+        official_match_id = unresolved.get("official_match_id")
+        return (
+            str(official_match_id) if official_match_id is not None else None,
+            "unlinked",
+            str(unresolved.get("reason") or "exact_map_link_unresolved"),
+        )
+    return None, "unlinked", "exact_official_match_id_not_available"
+
+
+def _market_only_map_evidence(
+    *,
+    match_id: str,
+    map_number: int,
+    prematch_timeline: list[dict[str, Any]],
+    collection_timeline: list[dict[str, Any]],
+    markets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    period = f"map_{map_number}"
+    prematch = [point for point in prematch_timeline if point["period"] == period]
+    live = [point for point in collection_timeline if point["period"] == period]
+    return {
+        "market_id": f"{match_id}:{period}",
+        "map_number": map_number,
+        "period": period,
+        "status": "market_only",
+        "reason": "no_play_evidence",
+        "prematch_winner": _latest_game_winner(prematch, state="scheduled"),
+        "winner_timeline": live,
+        "odds_coverage": _odds_coverage_summary(
+            prematch,
+            live,
+            game_state="unconfirmed",
+        ),
+        "markets": [market for market in markets if market["period"] == period],
+    }
+
+
+def _map_number_from_period(period: str) -> int | None:
+    matched = _MAP_PERIOD_PATTERN.fullmatch(period)
+    return int(matched.group(1)) if matched else None
+
+
+def _series_game_state(
+    *,
+    lifecycle: str,
+    current_map_number: object,
+    map_number: int,
+    has_postmatch: bool,
+    has_confirmed_raybet_final: bool,
+) -> str:
+    if has_postmatch or has_confirmed_raybet_final:
+        return "ended"
+    if type(current_map_number) is int:
+        if map_number < current_map_number:
+            return "ended"
+        if map_number == current_map_number and lifecycle in {"live", "degraded"}:
+            return "live"
+    if lifecycle == "upcoming":
+        return "scheduled"
+    return "unconfirmed" if lifecycle == "ended" else "scheduled"
+
+
+def _confirmed_raybet_final_map_numbers(row: DatabaseRow) -> set[int]:
+    best_of = row["best_of"]
+    if type(best_of) is not int or not 1 <= int(best_of) <= 5:
+        return set()
+    try:
+        payload = json.loads(str(row["raw_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    confirmed = set()
+    for map_number in range(1, int(best_of) + 1):
+        try:
+            evidence = parse_raybet_map_final(payload, map_number)
+        except (TypeError, ValueError):
+            continue
+        if (
+            evidence.status == "confirmed"
+            and evidence.reason == "raybet_final_confirmed"
+            and evidence.winner_side in {"team_one", "team_two"}
+        ):
+            confirmed.add(map_number)
+    return confirmed
+
+
+def _latest_game_winner(
+    points: list[dict[str, Any]],
+    *,
+    state: str,
+) -> dict[str, Any] | None:
+    if not points:
+        return None
+    eligible = [
+        point
+        for point in points
+        if (
+            all(str(value) == "5" for value in point["status"].values())
+            if state == "ended"
+            else all(raybet_odds_is_open(value) for value in point["status"].values())
+        )
+    ]
+    if not eligible:
+        return None
+    point = max(eligible, key=lambda item: _parse_time(item["observed_at"]))
+    return {**point, "complete": True}
+
+
+def _postmatch_for_game(
+    postmatch: dict[str, Any],
+    map_number: int,
+) -> dict[str, Any]:
+    games = [game for game in postmatch["games"] if game["map_number"] == map_number]
+    unresolved = [
+        item
+        for item in postmatch["unresolved_maps"]
+        if item["map_number"] == map_number
+    ]
+    if games:
+        status = "available" if games[0]["status"] == "available" else "partial"
+        reason = f"map_{map_number}_postmatch_available"
+    elif unresolved:
+        status = "waiting"
+        reason = str(unresolved[0]["reason"])
+    else:
+        status = "waiting"
+        reason = f"map_{map_number}_not_observed"
+    return {
+        **postmatch,
+        "status": status,
+        "reason": reason,
+        "games": games,
+        "unresolved_maps": unresolved,
+    }
+
+
+def _odds_coverage_summary(
+    prematch_points: list[dict[str, Any]],
+    live_points: list[dict[str, Any]],
+    *,
+    game_state: str,
+) -> dict[str, Any]:
+    prematch = _odds_phase_coverage(prematch_points)
+    live = _odds_phase_coverage(live_points)
+    if not live_points:
+        live["status"] = (
+            "pending" if game_state in {"scheduled", "live"} else "missing"
+        )
+
+    if game_state == "unconfirmed" and live_points:
+        point = max(
+            live_points,
+            key=lambda item: _parse_time(item["observed_at"]),
+        )
+        closing = {
+            "status": "unconfirmed",
+            "observed_at": point["observed_at"],
+            "prices": point["prices"],
+            "probabilities": point["probabilities"],
+        }
+    elif game_state == "ended":
+        if live_points:
+            point = max(
+                live_points,
+                key=lambda item: _parse_time(item["observed_at"]),
+            )
+            closing = {
+                "status": "available",
+                "observed_at": point["observed_at"],
+                "prices": point["prices"],
+                "probabilities": point["probabilities"],
+            }
+        else:
+            closing = {
+                "status": "missing",
+                "observed_at": None,
+                "prices": None,
+                "probabilities": None,
+            }
+    else:
+        closing = {
+            "status": "pending",
+            "observed_at": None,
+            "prices": None,
+            "probabilities": None,
+        }
+
+    return {
+        "source": "raybet_direct",
+        "gap_threshold_seconds": _ODDS_GAP_THRESHOLD_SECONDS,
+        "prematch": prematch,
+        "live": live,
+        "closing": closing,
+    }
+
+
+def _odds_phase_coverage(points: list[dict[str, Any]]) -> dict[str, Any]:
+    if not points:
+        return {
+            "status": "missing",
+            "complete_snapshot_count": 0,
+            "observation_count": 0,
+            "first_observed_at": None,
+            "last_observed_at": None,
+            "gap_count": 0,
+            "longest_gap_seconds": None,
+            "periods": [],
+        }
+
+    by_period: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for point in points:
+        by_period[str(point["period"])].append(point)
+    observation_times = sorted(
+        {str(point["observed_at"]) for point in points},
+        key=_parse_time,
+    )
+    gap_count, longest_gap = _odds_gap_metrics(observation_times)
+    periods = []
+    for period in sorted(by_period, key=_period_sort_key):
+        period_points = by_period[period]
+        period_times = sorted(
+            {str(point["observed_at"]) for point in period_points},
+            key=_parse_time,
+        )
+        period_gap_count, period_longest_gap = _odds_gap_metrics(period_times)
+        periods.append(
+            {
+                "period": period,
+                "complete_snapshot_count": len(period_points),
+                "observation_count": len(period_times),
+                "first_observed_at": period_times[0],
+                "last_observed_at": period_times[-1],
+                "gap_count": period_gap_count,
+                "longest_gap_seconds": period_longest_gap,
+            }
+        )
+    return {
+        "status": "available",
+        "complete_snapshot_count": len(points),
+        "observation_count": len(observation_times),
+        "first_observed_at": observation_times[0],
+        "last_observed_at": observation_times[-1],
+        "gap_count": gap_count,
+        "longest_gap_seconds": longest_gap,
+        "periods": periods,
+    }
+
+
+def _odds_gap_metrics(observed_at_values: list[str]) -> tuple[int, float | None]:
+    timestamps = sorted(
+        value for value in map(_parse_time, observed_at_values) if value
+    )
+    gaps = [
+        (current - previous).total_seconds()
+        for previous, current in zip(timestamps, timestamps[1:])
+        if (current - previous).total_seconds() > _ODDS_GAP_THRESHOLD_SECONDS
+    ]
+    return len(gaps), round(max(gaps), 3) if gaps else None
 
 
 def current_markets(
@@ -1229,14 +2504,47 @@ def _monitor_match(
                 ORDER BY received_at DESC, id DESC LIMIT 1""",
             (match_id, now.isoformat()),
         )
-    latest_vision = _latest_valid_vision_row(connection, match_id, now=now)
+    provider_status = str(row["status"] or "")
+    provider_map_limit = (
+        _provider_current_map_number(row) if provider_status == "2" else None
+    )
+    latest_vision = _latest_valid_vision_row(
+        connection,
+        match_id,
+        now=now,
+        maximum_map_number=provider_map_limit,
+    )
     mapping_readiness = _mapping_readiness(connection, match_id, now)
     latest_odds_activity = _latest_odds_activity(connection, match_id, now=now)
 
-    odds_readiness = _freshness(latest_odds, now, warning=15.0, stale=60.0)
-    vision_readiness = _freshness(latest_vision, now, warning=20.0, stale=120.0)
+    if provider_status.casefold() in _UPCOMING_MATCH_STATUSES:
+        latest_prematch_odds = _latest_row(
+            connection,
+            """SELECT observed_at FROM odds_transport_observations
+                WHERE raybet_match_id=?
+                  AND source='direct'
+                  AND live_text_timestamp_utc(observed_at)<=CAST(? AS timestamptz)
+                  AND timing_status='on_time'
+                  AND processing_status='audit_only'
+                ORDER BY observed_at DESC, observation_key DESC LIMIT 1""",
+            (match_id, now.isoformat()),
+        )
+        odds_readiness = _freshness(
+            latest_prematch_odds,
+            now,
+            warning=150.0,
+            stale=300.0,
+        )
+    else:
+        odds_readiness = _freshness(latest_odds, now, warning=15.0, stale=60.0)
+    vision_readiness = _vision_readiness(
+        latest_vision,
+        provider_status=provider_status,
+        scheduled_at=row["scheduled_at"],
+        now=now,
+    )
     lifecycle = _lifecycle(
-        str(row["status"] or ""),
+        provider_status,
         row["scheduled_at"],
         row["updated_at"],
         latest_vision,
@@ -1252,20 +2560,17 @@ def _monitor_match(
         else None
     )
     provider_map_number = (
-        _provider_current_map_number(row)
+        provider_map_limit
         if lifecycle in {"live", "degraded"}
         else None
     )
-    map_candidates = [
-        value
-        for value in (provider_map_number, vision_map_number)
-        if value is not None
-    ]
-    current_map_number = max(map_candidates) if map_candidates else None
+    current_map_number = (
+        provider_map_number if provider_map_number is not None else vision_map_number
+    )
     current_winner = _current_winner(
         connection,
         match_id,
-        provider_status=str(row["status"] or ""),
+        provider_status=provider_status,
         preferred_period=(
             f"map_{current_map_number}" if current_map_number is not None else None
         ),
@@ -1274,11 +2579,11 @@ def _monitor_match(
         _current_winner(
             connection,
             match_id,
-            provider_status=str(row["status"] or ""),
+            provider_status=provider_status,
             processing_status="audit_only",
             transport_only=True,
         )
-        if str(row["status"] or "").casefold() in _UPCOMING_MATCH_STATUSES
+        if provider_status.casefold() in _UPCOMING_MATCH_STATUSES
         else None
     )
     history_eligible = _history_eligible(
@@ -1290,13 +2595,10 @@ def _monitor_match(
         checked_at=now,
     )
     watch_link = _watch_link(connection, row)
-    official_match_id = _official_match_id(connection, match_id)
     return {
         "raybet_match_id": match_id,
-        "official_match_id": official_match_id,
         "display_name": match_display_name(
             raybet_match_id=match_id,
-            official_match_id=official_match_id,
             team_one=str(row["team_one"] or "") or None,
             team_two=str(row["team_two"] or "") or None,
             tournament=str(row["tournament"] or "") or None,
@@ -1330,29 +2632,6 @@ def _monitor_match(
             "vision": vision_readiness,
         },
     }
-
-
-def _official_match_id(
-    connection: PostgresSession,
-    raybet_match_id: str,
-) -> str | None:
-    row = connection.execute(
-        """SELECT provider_match_id
-             FROM match_links
-            WHERE raybet_match_id=?
-              AND provider IN ('opendota', 'stratz')
-              AND status='accepted'
-            ORDER BY CASE provider
-                       WHEN 'stratz' THEN 0
-                       WHEN 'opendota' THEN 1
-                       ELSE 2
-                     END
-            LIMIT 1""",
-        (raybet_match_id,),
-    ).fetchone()
-    return str(row["provider_match_id"]) if row is not None else None
-
-
 def _provider_current_map_number(row: DatabaseRow) -> int | None:
     try:
         payload = json.loads(str(row["raw_json"]))
@@ -1781,6 +3060,7 @@ def _vision_timeline(
     *,
     now: datetime | None = None,
     max_points: int = 1200,
+    maximum_map_number: int | None = None,
 ) -> list[dict[str, Any]]:
     return [
         _vision_point(row, raybet_match_id)
@@ -1789,6 +3069,7 @@ def _vision_timeline(
             raybet_match_id,
             now=_aware_utc(now or utc_now()),
             max_points=max_points,
+            maximum_map_number=maximum_map_number,
         )
     ]
 
@@ -1832,13 +3113,20 @@ def _latest_capture_row(
     *,
     now: datetime,
     source_frame_ref: str | None = None,
+    maximum_map_number: int | None = None,
 ) -> DatabaseRow | None:
     frame_filter = (
         "AND observation.source_frame_ref=?" if source_frame_ref is not None else ""
     )
-    params: tuple[Any, ...] = (raybet_match_id, now.isoformat())
-    if source_frame_ref is not None:
-        params += (source_frame_ref,)
+    map_filter = (
+        "AND observation.map_number<=?" if maximum_map_number is not None else ""
+    )
+    params: tuple[Any, ...] = (raybet_match_id,)
+    if maximum_map_number is not None:
+        if type(maximum_map_number) is not int or maximum_map_number <= 0:
+            raise ValueError("maximum_map_number must be a positive integer")
+        params += (maximum_map_number,)
+    params += (now.isoformat(),)
     try:
         return connection.execute(
             f"""SELECT observation.captured_at,
@@ -1861,6 +3149,7 @@ def _latest_capture_row(
                    AND frame.content_sha256=observation.source_frame_sha256
                    AND frame.byte_length=observation.source_frame_bytes
                  WHERE observation.raybet_match_id=?
+                   {map_filter}
                    AND live_text_timestamp_utc(
                            observation.captured_at
                        ) IS NOT NULL
@@ -1881,7 +3170,11 @@ def _latest_capture_row(
                  ORDER BY observation.captured_at DESC,
                           observation.source_frame_ref DESC
                  LIMIT 1""",
-            (*params[:2], VISION_FRAME_REF_PREFIX, *params[2:]),
+            (
+                *params,
+                VISION_FRAME_REF_PREFIX,
+                *(() if source_frame_ref is None else (source_frame_ref,)),
+            ),
         ).fetchone()
     except SQLAlchemyError as error:
         if _is_schema_missing_error(error):
@@ -1894,14 +3187,252 @@ def _latest_valid_vision_row(
     raybet_match_id: str,
     *,
     now: datetime,
+    maximum_map_number: int | None = None,
 ) -> DatabaseRow | None:
     rows = _valid_vision_rows(
         connection,
         raybet_match_id,
         now=now,
         max_points=1,
+        maximum_map_number=maximum_map_number,
     )
     return rows[0] if rows else None
+
+
+def _latest_hud_observations(
+    raybet_match_id: str,
+    *,
+    now: datetime,
+    valid_vision_points: list[dict[str, Any]],
+    maximum_map_number: int | None = None,
+) -> dict[int, dict[str, Any]]:
+    valid_frame_keys = {
+        (int(point["map_number"]), captured_at, str(point["source_frame_ref"]))
+        for point in valid_vision_points
+        if type(point.get("map_number")) is int
+        and int(point["map_number"]) > 0
+        and (captured_at := _parse_time(point.get("captured_at"))) is not None
+        and isinstance(point.get("source_frame_ref"), str)
+        and str(point["source_frame_ref"]).startswith(VISION_FRAME_REF_PREFIX)
+    }
+    expected_maps = {
+        map_number
+        for map_number, _, _ in valid_frame_keys
+        if maximum_map_number is None or map_number <= maximum_map_number
+    }
+    latest_by_map: dict[int, dict[str, Any]] = {}
+    path = _vision_observation_path(raybet_match_id)
+    for payload in _reverse_jsonl_payloads(path):
+        try:
+            observation = parse_observation(payload)
+        except (TypeError, ValueError):
+            continue
+        if observation.raybet_match_id != raybet_match_id:
+            continue
+        map_number = observation.map_number
+        if (
+            map_number is None
+            or map_number not in expected_maps
+            or map_number in latest_by_map
+        ):
+            continue
+        if (
+            maximum_map_number is not None
+            and map_number > maximum_map_number
+        ):
+            continue
+        captured_at = _aware_utc(observation.captured_at)
+        if captured_at > now + _TIMESTAMP_ROUNDING_GRACE:
+            continue
+        if (
+            map_number,
+            captured_at,
+            observation.source_frame_ref,
+        ) not in valid_frame_keys:
+            continue
+        latest_by_map[map_number] = _hud_observation_point(
+            observation,
+            observation_file=observation_file_name(raybet_match_id),
+        )
+        if latest_by_map.keys() == expected_maps:
+            break
+    return latest_by_map
+
+
+def _vision_runtime_status(
+    connection: PostgresSession,
+    raybet_match_id: str,
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    health = next(
+        (
+            item
+            for item in derive_health(connection, now=now)
+            if item["component"] == "vision_worker"
+        ),
+        None,
+    )
+    if health is None:
+        return None
+    watchers = health["details"].get("watchers")
+    if not isinstance(watchers, dict):
+        return None
+    watcher = watchers.get(raybet_match_id)
+    if not isinstance(watcher, dict):
+        return None
+    fields = {
+        key: value if isinstance(value, str) and value else None
+        for key in (
+            "capture_state",
+            "reason",
+            "blocker_code",
+            "replay_gate_status",
+            "screen_state",
+        )
+        if (value := watcher.get(key)) is not None
+    }
+    return {
+        "worker_status": health["status"],
+        "freshness": health["freshness"],
+        "observed_at": health["last_heartbeat_at"],
+        "map_number": (
+            int(watcher["map_number"])
+            if type(watcher.get("map_number")) is int
+            else None
+        ),
+        **fields,
+    }
+
+
+def _vision_observation_path(raybet_match_id: str) -> Path:
+    configured = os.environ.get("VISION_OBSERVATION_DIR", "").strip()
+    root = Path(configured) if configured else _DEFAULT_VISION_OBSERVATION_DIR
+    return root / observation_file_name(raybet_match_id)
+
+
+def _reverse_jsonl_payloads(path: Path) -> Iterator[dict[str, Any]]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            position = handle.tell()
+            remainder = b""
+            while position > 0:
+                read_size = min(position, _JSONL_REVERSE_CHUNK_BYTES)
+                position -= read_size
+                handle.seek(position)
+                block = handle.read(read_size) + remainder
+                lines = block.split(b"\n")
+                remainder = lines[0]
+                for raw_line in reversed(lines[1:]):
+                    payload = _jsonl_payload(raw_line)
+                    if payload is not None:
+                        yield payload
+            payload = _jsonl_payload(remainder)
+            if payload is not None:
+                yield payload
+    except OSError:
+        return
+
+
+def _jsonl_payload(raw_line: bytes) -> dict[str, Any] | None:
+    if not raw_line.strip():
+        return None
+    try:
+        payload = json.loads(raw_line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _hud_observation_point(
+    observation: VisionObservation,
+    *,
+    observation_file: str,
+) -> dict[str, Any]:
+    comeback_state = observation.comeback_state
+    clock_confirmed = (
+        observation.map_number is not None
+        and observation.game_clock_seconds is not None
+        and observation.clock_confidence >= 0.9
+        and observation.screen_state == "game"
+    )
+    hud_confirmed = observation.is_hud_confirmed
+    draft_confirmed = observation.is_confirmed
+    frame_digest = (
+        observation.source_frame_ref.removeprefix(VISION_FRAME_REF_PREFIX)
+        if observation.source_frame_ref.startswith(VISION_FRAME_REF_PREFIX)
+        else None
+    )
+    frame_url = (
+        f"/api/monitor/matches/{url_quote(observation.raybet_match_id, safe='')}"
+        f"/vision-frames/{frame_digest}.jpg"
+        if frame_digest is not None and re.fullmatch(r"[0-9a-f]{64}", frame_digest)
+        else None
+    )
+    return {
+        "status": "available" if hud_confirmed else "unavailable",
+        "source": comeback_state.source if hud_confirmed else None,
+        "observation_file": observation_file,
+        "source_frame_ref": observation.source_frame_ref,
+        "frame_url": frame_url,
+        "captured_at": observation.captured_at.isoformat(),
+        "map_number": observation.map_number if clock_confirmed else None,
+        "game_clock_seconds": (
+            observation.game_clock_seconds if clock_confirmed else None
+        ),
+        "is_paused": observation.is_paused if clock_confirmed else None,
+        "screen_state": observation.screen_state,
+        "clock_confidence": round(observation.clock_confidence, 6),
+        "draft_confidence": round(observation.draft_confidence, 6),
+        "hud_confidence": round(comeback_state.confidence, 6),
+        "draft_confirmed": draft_confirmed,
+        "radiant_hero_count": len(observation.radiant_hero_ids),
+        "dire_hero_count": len(observation.dire_hero_ids),
+        "radiant_hero_ids": (
+            list(observation.radiant_hero_ids) if draft_confirmed else []
+        ),
+        "dire_hero_ids": (
+            list(observation.dire_hero_ids) if draft_confirmed else []
+        ),
+        "radiant_kills": comeback_state.radiant_kills if hud_confirmed else None,
+        "dire_kills": comeback_state.dire_kills if hud_confirmed else None,
+        "radiant_net_worth": comeback_state.radiant_net_worth
+        if hud_confirmed
+        else None,
+        "dire_net_worth": comeback_state.dire_net_worth if hud_confirmed else None,
+        "net_worth_advantage_side": (
+            comeback_state.net_worth_advantage_side if hud_confirmed else None
+        ),
+        "net_worth_advantage_min": (
+            comeback_state.net_worth_advantage_min if hud_confirmed else None
+        ),
+        "net_worth_advantage_max": (
+            comeback_state.net_worth_advantage_max if hud_confirmed else None
+        ),
+        "unavailable_reason": None
+        if hud_confirmed
+        else _hud_unavailable_reason(observation),
+    }
+
+
+def _hud_unavailable_reason(observation: VisionObservation) -> str:
+    comeback_state = observation.comeback_state
+    if observation.screen_state != "game":
+        return f"screen_state_{observation.screen_state}"
+    if (
+        observation.map_number is None
+        or observation.game_clock_seconds is None
+        or observation.clock_confidence < 0.9
+    ):
+        return "clock_unconfirmed"
+    if comeback_state.status != "available":
+        return comeback_state.unavailable_reason or "hud_unavailable"
+    if comeback_state.source != "vision_hud":
+        return "hud_source_unavailable"
+    if comeback_state.confidence < 0.9:
+        return "hud_confidence_low"
+    return "hud_unavailable"
 
 
 def _valid_vision_rows(
@@ -1911,6 +3442,7 @@ def _valid_vision_rows(
     now: datetime,
     max_points: int,
     source_frame_ref: str | None = None,
+    maximum_map_number: int | None = None,
 ) -> list[DatabaseRow]:
     if type(max_points) is not int or max_points <= 0:
         raise ValueError("max_points must be a positive integer")
@@ -1918,10 +3450,40 @@ def _valid_vision_rows(
     frame_filter = (
         "AND observation.source_frame_ref=?" if source_frame_ref is not None else ""
     )
-    params: tuple[Any, ...] = (raybet_match_id, now.isoformat())
+    map_filter = (
+        "AND observation.map_number<=?" if maximum_map_number is not None else ""
+    )
+    provider_start_times = _provider_map_start_times(connection, raybet_match_id)
+    provider_boundary_clauses = "".join(
+        """
+        OR (
+            observation.map_number=?
+            AND live_text_timestamp_utc(observation.captured_at)>=
+                CAST(? AS timestamptz)
+        )"""
+        for map_number in provider_start_times
+        if map_number > 1
+    )
+    params: list[Any] = [raybet_match_id]
+    if maximum_map_number is not None:
+        if type(maximum_map_number) is not int or maximum_map_number <= 0:
+            raise ValueError("maximum_map_number must be a positive integer")
+        params.append(maximum_map_number)
+    params.extend(
+        [
+            VISION_FRAME_REF_PREFIX,
+            -MAP_START_EVIDENCE_WINDOW_SECONDS,
+            MAP_START_EVIDENCE_WINDOW_SECONDS,
+            VISION_FRAME_REF_PREFIX,
+        ]
+    )
+    for map_number, started_at in provider_start_times.items():
+        if map_number > 1:
+            params.extend((map_number, started_at.isoformat()))
+    params.append(now.isoformat())
     if source_frame_ref is not None:
-        params += (source_frame_ref,)
-    params += (limit,)
+        params.append(source_frame_ref)
+    params.append(limit)
     try:
         return list(
             connection.execute(
@@ -1940,24 +3502,62 @@ def _valid_vision_rows(
                                    observation.source_frame_ref,
                                    observation.screen_state,
                                    observation.confirmed,
-                                   CASE
-                                       WHEN frame.frame_ref IS NOT NULL
-                                        AND observation.source_frame_ref=
-                                            ? || frame.content_sha256
-                                       THEN frame.content_sha256
-                                       ELSE NULL
-                                   END AS _frame_digest
+                                   frame.content_sha256 AS _frame_digest
                                FROM vision_observations AS observation
-                               LEFT JOIN active_vision_frame_artifacts AS frame
+                               JOIN active_vision_frame_artifacts AS frame
                                 ON frame.frame_ref=observation.source_frame_ref
                                AND frame.content_sha256=
                                    observation.source_frame_sha256
                                AND frame.byte_length=observation.source_frame_bytes
                               WHERE observation.raybet_match_id=?
+                                {map_filter}
                                 AND observation.map_number IS NOT NULL
                                 AND observation.game_clock_seconds IS NOT NULL
                                 AND observation.screen_state='game'
                                 AND observation.clock_confidence>=0.9
+                                AND observation.source_frame_ref=
+                                    ? || frame.content_sha256
+                                AND (
+                                    observation.map_number=1
+                                    OR EXISTS (
+                                        SELECT 1
+                                          FROM vision_observations AS map_start
+                                          JOIN active_vision_frame_artifacts AS start_frame
+                                            ON start_frame.frame_ref=
+                                               map_start.source_frame_ref
+                                           AND start_frame.content_sha256=
+                                               map_start.source_frame_sha256
+                                           AND start_frame.byte_length=
+                                               map_start.source_frame_bytes
+                                         WHERE map_start.raybet_match_id=
+                                               observation.raybet_match_id
+                                           AND map_start.map_number=
+                                               observation.map_number
+                                           AND map_start.game_clock_seconds
+                                               BETWEEN ? AND ?
+                                           AND map_start.screen_state='game'
+                                           AND map_start.clock_confidence>=0.9
+                                           AND map_start.source_frame_ref=
+                                               ? || start_frame.content_sha256
+                                           AND live_text_timestamp_utc(
+                                                   map_start.captured_at
+                                               )<=live_text_timestamp_utc(
+                                                   observation.captured_at
+                                               )
+                                           AND NOT EXISTS (
+                                               SELECT 1
+                                                 FROM vision_observation_invalidations
+                                                      AS start_invalidation
+                                                WHERE start_invalidation.raybet_match_id=
+                                                      map_start.raybet_match_id
+                                                  AND start_invalidation.captured_at=
+                                                      map_start.captured_at
+                                                  AND start_invalidation.source_frame_ref=
+                                                      map_start.source_frame_ref
+                                           )
+                                    )
+                                    {provider_boundary_clauses}
+                                )
                                AND live_text_timestamp_utc(
                                        observation.captured_at
                                    ) IS NOT NULL
@@ -1980,13 +3580,32 @@ def _valid_vision_rows(
                              LIMIT ?
                        ) AS recent
                       ORDER BY recent.captured_at, recent.source_frame_ref""",
-                (VISION_FRAME_REF_PREFIX, *params),
+                tuple(params),
             ).fetchall()
         )
     except SQLAlchemyError as error:
         if _is_schema_missing_error(error):
             return []
         raise
+
+
+def _provider_map_start_times(
+    connection: PostgresSession,
+    raybet_match_id: str,
+) -> dict[int, datetime]:
+    row = connection.execute(
+        "SELECT raw_json, best_of FROM raybet_matches WHERE raybet_match_id=?",
+        (raybet_match_id,),
+    ).fetchone()
+    if row is None or type(row[1]) is not int:
+        return {}
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return explicit_raybet_map_times(payload, int(row[1]))
 
 
 def _vision_point(row: DatabaseRow, raybet_match_id: str) -> dict[str, Any]:
@@ -2055,6 +3674,35 @@ def _freshness(
         "status": status,
         "observed_at": observed_at.isoformat(),
         "age_seconds": round(age, 3),
+    }
+
+
+def _vision_readiness(
+    row: DatabaseRow | None,
+    *,
+    provider_status: str,
+    scheduled_at: object,
+    now: datetime,
+) -> dict[str, Any]:
+    readiness = _freshness(row, now, warning=20.0, stale=120.0)
+    if row is not None:
+        return readiness
+    scheduled = _parse_schedule(scheduled_at)
+    if provider_status.casefold() in _UPCOMING_MATCH_STATUSES and scheduled is not None:
+        watch_starts_at = scheduled - _VISION_PREMATCH_WATCH_WINDOW
+        return {
+            **readiness,
+            "reason": (
+                "waiting_for_watch_window"
+                if now < watch_starts_at
+                else "stream_probe_pending"
+            ),
+            "watch_starts_at": watch_starts_at.isoformat(),
+        }
+    return {
+        **readiness,
+        "reason": "stream_probe_pending",
+        "watch_starts_at": None,
     }
 
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -23,6 +25,8 @@ class VisionDebugSink:
         self.root = Path(root)
         self.minimum_interval = minimum_interval
         self.maximum_events = maximum_events
+        if maximum_events < 1:
+            raise ValueError("maximum_events must be positive")
         self._last_written: dict[str, float] = {}
         self._event_count = self._existing_event_count()
 
@@ -30,6 +34,51 @@ class VisionDebugSink:
         if not self.root.exists():
             return 0
         return sum(1 for _ in self.root.rglob("metadata.json"))
+
+    def _protected_event_paths(self) -> set[str] | None:
+        label_root = self.root.parent / "vision_calibration" / "labels"
+        if not label_root.exists():
+            return set()
+        protected: set[str] = set()
+        for path in label_root.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+            relative = payload.get("event_relative_path") if isinstance(payload, dict) else None
+            if not isinstance(relative, str) or not relative.strip():
+                continue
+            normalized = Path(relative.strip())
+            if normalized.is_absolute() or ".." in normalized.parts:
+                continue
+            protected.add(normalized.as_posix())
+        return protected
+
+    def _make_room(self) -> bool:
+        metadata_paths = list(self.root.rglob("metadata.json"))
+        self._event_count = len(metadata_paths)
+        if self._event_count < self.maximum_events:
+            return True
+
+        protected = self._protected_event_paths()
+        if protected is None:
+            return False
+        oldest_first = sorted(
+            metadata_paths,
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+        )
+        for metadata_path in oldest_first:
+            relative = metadata_path.parent.relative_to(self.root).as_posix()
+            if relative in protected:
+                continue
+            try:
+                shutil.rmtree(metadata_path.parent)
+            except OSError:
+                continue
+            self._event_count -= 1
+            if self._event_count < self.maximum_events:
+                return True
+        return False
 
     @staticmethod
     def _serializable(value: object) -> object:
@@ -59,24 +108,63 @@ class VisionDebugSink:
         layout_name: str | None,
         diagnostics: object,
         hero_regions: Iterable[object] = (),
+        raybet_match_id: str | None = None,
+        map_number: int | None = None,
+        captured_at_utc: datetime | None = None,
+        source_frame_ref: str | None = None,
     ) -> bool:
         now = time.time()
-        key = f"{layout_name or 'unknown'}:{reason}"
+        match_id = str(raybet_match_id or "").strip()
+        has_identity = bool(match_id) and map_number is not None
+        if bool(match_id) != (map_number is not None):
+            raise ValueError("Vision debug identity requires both Series ID and Map number")
+        if has_identity and (
+            type(map_number) is not int
+            or any(
+                not character.isascii()
+                or (not character.isalnum() and character not in {"-", "_"})
+                for character in match_id
+            )
+            or not 1 <= int(map_number) <= 10
+            or captured_at_utc is None
+            or not isinstance(source_frame_ref, str)
+            or not source_frame_ref.strip()
+        ):
+            raise ValueError("Vision debug identity is invalid")
+        if captured_at_utc is not None and (
+            captured_at_utc.tzinfo is None or captured_at_utc.utcoffset() is None
+        ):
+            raise ValueError("Vision debug capture time must be timezone-aware")
+        captured_at = (
+            captured_at_utc.astimezone(timezone.utc).timestamp()
+            if captured_at_utc is not None
+            else now
+        )
+        identity_key = f"{match_id}:map:{map_number}" if has_identity else "unassigned"
+        key = f"{identity_key}:{layout_name or 'unknown'}:{reason}"
         previous = self._last_written.get(key)
         if previous is not None and now - previous < self.minimum_interval:
             return False
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.size == 0:
             return False
-        self._event_count = max(self._event_count, self._existing_event_count())
-        if self._event_count >= self.maximum_events:
+        if not self._make_room():
             return False
 
-        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))
-        event_dir = self.root / (layout_name or "unknown") / f"{stamp}_{reason}"
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(captured_at))
+        event_root = (
+            self.root
+            / "series"
+            / match_id
+            / f"map_{map_number}"
+            / (layout_name or "unknown")
+            if has_identity
+            else self.root / (layout_name or "unknown")
+        )
+        event_dir = event_root / f"{stamp}_{reason}"
         suffix = 0
         while event_dir.exists():
             suffix += 1
-            event_dir = self.root / (layout_name or "unknown") / f"{stamp}_{reason}_{suffix}"
+            event_dir = event_root / f"{stamp}_{reason}_{suffix}"
         event_dir.mkdir(parents=True, exist_ok=False)
 
         if not cv2.imwrite(str(event_dir / "frame.jpg"), image):
@@ -95,9 +183,14 @@ class VisionDebugSink:
                 crop_paths.append(path.name)
 
         metadata = {
-            "captured_at": now,
+            "captured_at": captured_at,
+            "recorded_at": now,
             "reason": reason,
             "layout": layout_name,
+            "raybet_match_id": match_id or None,
+            "map_number": map_number if has_identity else None,
+            "source_frame_ref": source_frame_ref if has_identity else None,
+            "identity_status": "explicit_watcher_context" if has_identity else "missing",
             "hero_crops": crop_paths,
             "diagnostics": self._serializable(diagnostics),
         }

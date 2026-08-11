@@ -69,6 +69,9 @@ const candidate: VisionCalibrationCandidate = {
   layout: event.layout,
   profile_id: event.profile_id,
   hero_ids: label.hero_ids,
+  added_variant_count: 10,
+  base_candidate_id: null,
+  base_feature_sha256: "c".repeat(64),
   created_at: "2026-08-08T12:11:00+00:00",
   feature_sha256: "a".repeat(64),
   production_feature_sha256: "b".repeat(64),
@@ -398,9 +401,11 @@ describe("VisionCalibrationPage", () => {
     expect(screen.queryByText("38416111.jsonl")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("tab", { name: "候选模板" }));
+    expect(screen.getByRole("combobox", { name: "候选基线" })).toHaveValue(candidate.candidate_id);
     fireEvent.click(screen.getByRole("button", { name: "从当前标签构建候选" }));
     await waitFor(() => expect(api.buildVisionCalibrationCandidate).toHaveBeenCalledWith(
       event.event_id,
+      candidate.candidate_id,
       "csrf",
     ));
 

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Cookie, Header, HTTPException, Path, Query, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from live_betting.vision_frame_registry import (
@@ -29,12 +29,16 @@ from live_betting.raybet import (
     RayBetProviderResponseError,
 )
 from live_betting.sanitize import verified_ephemeral_stream_url
+from live_betting.map_decision_checkpoints import (
+    latest_map_checkpoints,
+    record_pregame_checkpoint,
+)
+from live_betting.series_acceptance import audit_acceptance_progress
 from event_intelligence.live_draft_prospective_bridge import (
     LOCK_CONFIRMATION,
     LiveDraftProspectiveBridgeRepository,
     generate_live_draft_prediction,
 )
-
 from .. import monitoring, queries
 from .control import _COOKIE_NAME
 from .mappings import _require_control
@@ -59,6 +63,7 @@ class SaveDraftMappingRequest(BaseModel):
     slots: list[DraftSlotRequest] = Field(min_length=10, max_length=10)
     is_locked: bool = False
     actor: str = Field(default="local-operator", min_length=1, max_length=100)
+    evidence_source_url: HttpUrl | None = None
 
 
 class CorrectGameSnapshotRequest(BaseModel):
@@ -76,10 +81,6 @@ class LiveDraftPredictionRequest(BaseModel):
     mapping_version: int = Field(gt=0)
     operator_identity: str = Field(default="local-operator", min_length=1, max_length=100)
     confirmation_text: str
-    game_clock_seconds: int | None = Field(default=None, ge=0)
-    vision_frame_timestamp: datetime | None = None
-    draft_state_marker: str | None = Field(default=None, max_length=64)
-    live_state_input_used: bool = False
 
 
 def _build_snapshot() -> dict[str, object]:
@@ -118,6 +119,22 @@ def health() -> dict[str, object]:
     connection = queries.get_db()
     try:
         return {"data": monitoring.derive_health(connection)}
+    finally:
+        connection.close()
+
+
+@router.get("/acceptance")
+def acceptance(
+    limit: int = Query(10, ge=1, le=100),
+    verify_frame_bytes: bool = Query(False),
+) -> dict[str, object]:
+    connection = queries.get_db()
+    try:
+        return audit_acceptance_progress(
+            connection,
+            limit=limit,
+            verify_frame_bytes=verify_frame_bytes,
+        )
     finally:
         connection.close()
 
@@ -260,6 +277,11 @@ def save_draft_mapping(
     csrf_token: str | None = Header(default=None, alias="X-Monitor-CSRF"),
 ) -> dict[str, object]:
     _require_control(request, session_id, csrf_token)
+    if payload.is_locked and payload.evidence_source_url is None:
+        raise HTTPException(
+            status_code=422,
+            detail="locked manual draft mapping requires evidence_source_url",
+        )
     connection = queries.get_db()
     try:
         if connection.execute(
@@ -268,7 +290,7 @@ def save_draft_mapping(
         ).fetchone() is None:
             raise HTTPException(status_code=404, detail="RayBet match not found")
         try:
-            return save_live_draft_mapping(
+            saved = save_live_draft_mapping(
                 connection,
                 raybet_match_id=raybet_match_id,
                 map_number=map_number,
@@ -284,7 +306,55 @@ def save_draft_mapping(
                 ),
                 is_locked=payload.is_locked,
                 actor=payload.actor,
+                evidence_source_url=(
+                    str(payload.evidence_source_url)
+                    if payload.evidence_source_url is not None
+                    else None
+                ),
             )
+            if not saved["is_locked"]:
+                return saved
+            decided_at = datetime.now(timezone.utc)
+            try:
+                automation = generate_live_draft_prediction(
+                    LiveDraftProspectiveBridgeRepository(connection),
+                    artifact_root=os.environ.get(
+                        "LIVE_DRAFT_PROSPECTIVE_ARTIFACT_ROOT",
+                        "dogfood-output/live-draft-prospective-artifacts",
+                    ),
+                    raybet_match_id=raybet_match_id,
+                    map_number=map_number,
+                    mapping_version=int(saved["version"]),
+                    operator_identity=str(saved["created_by"]),
+                    confirmation_text=LOCK_CONFIRMATION,
+                    confirmed_at=decided_at,
+                )
+            except ValueError as error:
+                automation = {
+                    "status": "blocked",
+                    "missing_reason": str(error),
+                    "prediction": None,
+                }
+            try:
+                checkpoint = record_pregame_checkpoint(
+                    connection,
+                    mapping=saved,
+                    prediction=automation.get("prediction"),
+                    decided_at=decided_at,
+                )
+                checkpoint_status = "available"
+                checkpoint_missing_reason = None
+            except (RuntimeError, SQLAlchemyError, ValueError) as error:
+                checkpoint = None
+                checkpoint_status = "blocked"
+                checkpoint_missing_reason = str(error)
+            return {
+                **saved,
+                "prediction_automation": automation,
+                "decision_checkpoint": checkpoint,
+                "decision_checkpoint_status": checkpoint_status,
+                "decision_checkpoint_missing_reason": checkpoint_missing_reason,
+            }
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
     finally:
@@ -304,9 +374,15 @@ def get_live_draft_prediction(
             map_number,
             mapping_version,
         )
+        checkpoints = latest_map_checkpoints(
+            connection,
+            raybet_match_id,
+            map_number,
+        )
         return {
             "status": "available" if prediction is not None else "not_found",
             "prediction": prediction,
+            "decision_checkpoints": checkpoints,
         }
     finally:
         connection.close()
@@ -327,8 +403,15 @@ def create_live_draft_prediction(
     connection = queries.get_db()
     try:
         try:
-            return generate_live_draft_prediction(
-                LiveDraftProspectiveBridgeRepository(connection),
+            repository = LiveDraftProspectiveBridgeRepository(connection)
+            mapping = repository.load_mapping(
+                raybet_match_id,
+                map_number,
+                payload.mapping_version,
+            )
+            decided_at = datetime.now(timezone.utc)
+            result = generate_live_draft_prediction(
+                repository,
                 artifact_root=os.environ.get(
                     "LIVE_DRAFT_PROSPECTIVE_ARTIFACT_ROOT",
                     "dogfood-output/live-draft-prospective-artifacts",
@@ -338,12 +421,15 @@ def create_live_draft_prediction(
                 mapping_version=payload.mapping_version,
                 operator_identity=payload.operator_identity,
                 confirmation_text=payload.confirmation_text,
-                confirmed_at=datetime.now(timezone.utc),
-                game_clock_seconds=payload.game_clock_seconds,
-                vision_frame_timestamp=payload.vision_frame_timestamp,
-                draft_state_marker=payload.draft_state_marker,
-                live_state_input_used=payload.live_state_input_used,
+                confirmed_at=decided_at,
             )
+            checkpoint = record_pregame_checkpoint(
+                connection,
+                mapping=mapping,
+                prediction=result.get("prediction"),
+                decided_at=decided_at,
+            )
+            return {**result, "decision_checkpoint": checkpoint}
         except ValueError as error:
             status = 409 if "immutable" in str(error) else 422
             raise HTTPException(status_code=status, detail=str(error)) from error

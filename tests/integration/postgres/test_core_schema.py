@@ -73,6 +73,7 @@ def test_core_migration_and_transaction_contract(postgres_database_url: str) -> 
     try:
         inspector = inspect(engine)
         assert CORE_TABLES <= set(inspector.get_table_names())
+        assert "live_draft_value_recommendations" not in inspector.get_table_names()
         assert inspector.get_foreign_keys("match_players")
         player_columns = {
             column["name"]: column
@@ -108,7 +109,7 @@ def test_core_migration_and_transaction_contract(postgres_database_url: str) -> 
                 )
             ).one()
         assert count == 0
-        assert revision == "20260807_0034"
+        assert revision == "20260807_0035"
         assert live_versions == [12]
         assert runtime_contract == (
             1,

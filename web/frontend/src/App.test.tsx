@@ -48,6 +48,11 @@ vi.mock("./components/MatchWorkspace", () => ({
 vi.mock("./components/OperationsPanel", () => ({
   OperationsPanel: () => <main>operations</main>,
 }));
+vi.mock("./components/FanMatchRecap", () => ({
+  FanMatchRecap: ({ match }: { match: MonitorMatch | null }) => (
+    <main>{match ? `recap-${match.raybet_match_id}` : "empty-recap"}</main>
+  ),
+}));
 vi.mock("./components/VisionCalibrationPage", () => ({
   VisionCalibrationPage: ({ csrfToken }: { csrfToken: string | null }) => (
     <main>vision-calibration-{csrfToken || "readonly"}</main>
@@ -94,6 +99,7 @@ const snapshot: MonitorSnapshot = {
 const historyMatch: MonitorMatch = {
   ...match,
   raybet_match_id: "history-1",
+  display_name: "RayBet Series history-1 · Radiant vs Dire · Event",
   lifecycle: "ended",
   history_eligible: true,
 };
@@ -136,6 +142,36 @@ describe("App", () => {
 
     expect(screen.getByText("Dota 2 实时阵容预测")).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: "live-1" }));
+    await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
+  });
+
+  it("does not cancel a slow match detail request when an SSE snapshot arrives", async () => {
+    let snapshotListener: (event: MessageEvent<string>) => void = (_event) => {
+      throw new Error("snapshot listener was not registered");
+    };
+    let resolveDetail: (value: unknown) => void = (_value) => {
+      throw new Error("detail resolver was not registered");
+    };
+    api.snapshotStream.mockReturnValue({
+      addEventListener: vi.fn((name: string, listener: (event: MessageEvent<string>) => void) => {
+        if (name === "snapshot") snapshotListener = listener;
+      }),
+      close: vi.fn(),
+      onerror: null,
+    });
+    api.fetchMatchDetail.mockReturnValue(new Promise((resolve) => {
+      resolveDetail = resolve;
+    }));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "live-1" }));
+    await waitFor(() => expect(api.fetchMatchDetail).toHaveBeenCalledTimes(1));
+    snapshotListener({
+      data: JSON.stringify({ ...snapshot, cursor: "next-cursor" }),
+    } as MessageEvent<string>);
+    expect(api.fetchMatchDetail).toHaveBeenCalledTimes(1);
+
+    resolveDetail({ ...match, winner_timeline: [], vision: [], markets: [] });
     await waitFor(() => expect(screen.getByText("workspace-live-1")).toBeInTheDocument());
   });
 
@@ -196,6 +232,20 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("history-2")).toBeInTheDocument());
     expect(screen.getByText("history-1")).toBeInTheDocument();
     expect(api.fetchMonitorHistory).toHaveBeenLastCalledWith("cursor-2");
+  });
+
+  it("opens the player recap as a separate history presentation", async () => {
+    window.history.replaceState(null, "", "/monitor?view=recap");
+    render(<App />);
+
+    expect(await screen.findByText("Dota 2 比赛复盘")).toBeInTheDocument();
+    expect(screen.getByRole("banner")).toHaveClass("recap-header-mode");
+    fireEvent.click(await screen.findByRole("button", { name: "history-1" }));
+
+    await waitFor(() => expect(screen.getByText("recap-history-1")).toBeInTheDocument());
+    expect(screen.getByText(/^Event · /)).toBeInTheDocument();
+    expect(screen.queryByText(historyMatch.display_name!)).not.toBeInTheDocument();
+    expect(screen.queryByText("workspace-history-1")).not.toBeInTheDocument();
   });
 
   it("opens Vision calibration as a standalone page without the match rail", async () => {

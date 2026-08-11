@@ -109,11 +109,13 @@ describe("OperationsPanel", () => {
         }),
         healthItem("raybet_full_odds_worker", "degraded", {
           errors: 1,
+          failed_match_ids: ["38423645"],
           interval_seconds: 120,
           listed: 3,
           matches: 0,
         }),
         healthItem("vision_worker"),
+        healthItem("map_decision_worker"),
         healthItem("postmatch_worker", "unhealthy"),
         healthItem("strict_ingest_worker"),
         healthItem("draft_publisher", "unhealthy"),
@@ -131,11 +133,13 @@ describe("OperationsPanel", () => {
     expect(screen.getByText("常规赔率通道")).toBeInTheDocument();
     expect(screen.queryByText("全量赔率采集")).not.toBeInTheDocument();
     expect(screen.getByText("主循环心跳正常，1 条子通道异常已在下方定位。")).toBeInTheDocument();
-    expect(screen.getAllByText("1 场比赛在本轮采集失败，下一轮将自动重试。")).toHaveLength(1);
+    expect(screen.getAllByText("1 场比赛在本轮采集失败：38423645，下一轮将自动重试。")).toHaveLength(1);
     expect(screen.queryByText("1 full odds collection error(s)")).not.toBeInTheDocument();
     expect(screen.getByText(/正常空闲状态/)).toBeInTheDocument();
 
-    expect(screen.getByText("赛后结算")).toBeInTheDocument();
+    expect(screen.getByText("赛后数据同步")).toBeInTheDocument();
+    expect(screen.getByText("Map 决策检查点")).toBeInTheDocument();
+    expect(screen.getByText(/每个五分钟节点生成可追溯的 shadow 决策/)).toBeInTheDocument();
     expect(screen.getByText("正式赛果入库")).toBeInTheDocument();
     expect(screen.queryByText("draft_publisher")).not.toBeInTheDocument();
     expect(screen.getByText("RayBet stale")).toBeInTheDocument();

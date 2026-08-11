@@ -13,7 +13,7 @@ from database.session import DatabaseResult, PostgresSession
 
 
 CURRENT_SCHEMA_VERSION = 10
-ALEMBIC_HEAD = "20260807_0034"
+ALEMBIC_HEAD = "20260807_0035"
 
 
 class IntelligenceStorage:

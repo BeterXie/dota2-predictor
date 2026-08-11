@@ -19,31 +19,19 @@ def test_observation_filename_rejects_unsafe_keys(value: str) -> None:
         observation_file_name(value)
 
 
-def test_match_display_name_prefers_official_identity() -> None:
+def test_match_display_name_uses_series_identity() -> None:
     assert match_display_name(
         raybet_match_id="38417147",
-        official_match_id="8123456789",
         team_one="Team A",
         team_two="Team B",
         tournament="The International 2026",
-    ) == "官方 Match ID 8123456789 · Team A vs Team B · The International 2026"
-
-
-def test_match_display_name_falls_back_to_raybet_identity() -> None:
-    assert match_display_name(
-        raybet_match_id="38417147",
-        official_match_id=None,
-        team_one="Team A",
-        team_two="Team B",
-        tournament=None,
-    ) == "RayBet 38417147 · Team A vs Team B"
+    ) == "RayBet Series 38417147 · Team A vs Team B · The International 2026"
 
 
 class _IdentityResult:
     def fetchone(self) -> dict[str, object]:
         return {
             "raybet_match_id": "38417147",
-            "official_match_id": "8123456789",
             "team_one": "Team A",
             "team_two": "Team B",
             "tournament": "The International 2026",
@@ -53,6 +41,8 @@ class _IdentityResult:
 class _IdentityConnection:
     def execute(self, query: str, params: tuple[object, ...]) -> _IdentityResult:
         assert "FROM raybet_matches AS match_row" in query
+        assert "map_results" not in query
+        assert "match_links" not in query
         assert params == ("38417147",)
         return _IdentityResult()
 
@@ -65,9 +55,9 @@ def test_observation_metadata_resolves_stable_filename() -> None:
 
     assert metadata == {
         "raybet_match_id": "38417147",
-        "official_match_id": "8123456789",
+        "official_match_id": None,
         "display_name": (
-            "官方 Match ID 8123456789 · Team A vs Team B · "
+            "RayBet Series 38417147 · Team A vs Team B · "
             "The International 2026"
         ),
     }

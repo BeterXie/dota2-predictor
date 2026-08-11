@@ -23,6 +23,7 @@ import { RelativeAge } from "./RelativeAge";
 
 
 const RETAINED_HEALTH_COMPONENTS = new Set([
+  "map_decision_worker",
   "postmatch_worker",
   "raybet_full_odds_worker",
   "raybet_priority_odds_worker",
@@ -49,9 +50,13 @@ const CONTROL_COPY: Record<ControlComponent["component"], {
 };
 
 const DOWNSTREAM_COPY: Record<string, { description: string; label: string }> = {
+  map_decision_worker: {
+    description: "在 BP 锁定及每个五分钟节点生成可追溯的 shadow 决策或明确 skip。",
+    label: "Map 决策检查点",
+  },
   postmatch_worker: {
-    description: "处理已结束比赛的归档和结算状态。",
-    label: "赛后结算",
+    description: "精确绑定官方 Match ID，并同步 OpenDota 赛后详情。",
+    label: "赛后数据同步",
   },
   strict_ingest_worker: {
     description: "同步正式赛果和官方比赛身份。",
@@ -540,7 +545,13 @@ function channelExplanation(item: HealthItem | null, type: "priority" | "regular
   if (!item) return "尚未收到通道心跳。";
   if (item.freshness !== "fresh") return "通道心跳不新鲜，请检查 RayBet 采集进程。";
   const errors = numberDetail(item, "errors") || 0;
-  if (errors > 0) return `${errors} 场比赛在本轮采集失败，下一轮将自动重试。`;
+  if (errors > 0) {
+    const failedMatchIds = stringListDetail(item, "failed_match_ids");
+    const failedMatches = failedMatchIds.length
+      ? `：${failedMatchIds.join("、")}`
+      : "";
+    return `${errors} 场比赛在本轮采集失败${failedMatches}，下一轮将自动重试。`;
+  }
   const listed = numberDetail(item, "listed") || 0;
   if (type === "priority" && listed === 0) {
     return "当前没有已锁定且正在直播的比赛，通道处于正常空闲状态。";
@@ -553,6 +564,13 @@ function channelExplanation(item: HealthItem | null, type: "priority" | "regular
 function numberDetail(item: HealthItem | null, key: string): number | null {
   const value = item?.details[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+
+function stringListDetail(item: HealthItem | null, key: string): string[] {
+  const value = item?.details[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 }
 
 

@@ -21,19 +21,20 @@ import {
 import { formatClock, formatDateTime, formatOdds, formatPercent } from "../../format";
 import type {
   CanonicalTeam,
+  GameWorkspaceDetail,
   LiveDraftContextTeam,
   LiveDraftMapping,
   LiveDraftProspectivePrediction,
   LiveDraftSlot,
-  MatchDetail,
+  MapDecisionCheckpoint,
+  LiveHudObservation,
   PrematchHero,
   PrematchHeroGrid,
 } from "../../types";
-import { deriveLiveDraftValueDecision } from "./liveDraftValueDecision";
 
 interface LiveDataControlsProps {
   csrfToken: string | null;
-  detail: MatchDetail;
+  detail: GameWorkspaceDetail;
   readOnly?: boolean;
 }
 
@@ -59,7 +60,7 @@ function blankSlots(): LiveDraftSlot[] {
   })));
 }
 
-function contextSlots(detail: MatchDetail): LiveDraftSlot[] {
+function contextSlots(detail: GameWorkspaceDetail): LiveDraftSlot[] {
   if (detail.draft_mapping) return detail.draft_mapping.slots;
   const teams = detail.draft_context?.status === "ready"
     ? detail.draft_context.teams
@@ -85,29 +86,40 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
     detail.current_map_number
       || detail.draft_mapping?.map_number
       || detail.latest_game_snapshot?.map_number
+      || detail.latest_hud_observation?.map_number
       || detail.latest_vision?.map_number
       || detail.latest_capture?.map_number
       || 1,
   );
   const [locked, setLocked] = useState(detail.draft_mapping?.is_locked || false);
+  const [evidenceSourceUrl, setEvidenceSourceUrl] = useState(
+    detail.draft_mapping?.evidence_source_url || "",
+  );
   const [editorOpen, setEditorOpen] = useState(false);
   const [mappingBusy, setMappingBusy] = useState(false);
   const [mappingMessage, setMappingMessage] = useState<string | null>(null);
   const [prediction, setPrediction] = useState<LiveDraftProspectivePrediction | null>(null);
+  const [decisionCheckpoints, setDecisionCheckpoints] = useState<MapDecisionCheckpoint[]>(
+    detail.decision_checkpoints || [],
+  );
   const [previousPrediction, setPreviousPrediction] = useState<LiveDraftProspectivePrediction | null>(null);
   const [predictionConfirmed, setPredictionConfirmed] = useState(false);
   const [predictionBusy, setPredictionBusy] = useState(false);
   const [predictionMessage, setPredictionMessage] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState(detail.game_snapshots || []);
   const latest = snapshots.at(-1) || detail.latest_game_snapshot || null;
+  const pregameCheckpoint = decisionCheckpoints.find((item) => item.phase === "pregame") || null;
+  const latestHud = detail.latest_hud_observation || null;
+  const visionRuntime = detail.vision_runtime || null;
   const [gameValues, setGameValues] = useState({
     game_time_seconds: latest?.game_time_seconds
+      ?? latestHud?.game_clock_seconds
       ?? detail.latest_vision?.game_clock_seconds
       ?? 0,
     radiant_networth: latest?.radiant_networth ?? 0,
     dire_networth: latest?.dire_networth ?? 0,
-    radiant_kills: latest?.radiant_kills ?? null,
-    dire_kills: latest?.dire_kills ?? null,
+    radiant_kills: latest?.radiant_kills ?? latestHud?.radiant_kills ?? null,
+    dire_kills: latest?.dire_kills ?? latestHud?.dire_kills ?? null,
   });
   const [snapshotBusy, setSnapshotBusy] = useState(false);
   const [snapshotMessage, setSnapshotMessage] = useState<string | null>(null);
@@ -125,15 +137,11 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
   const [attribute, setAttribute] = useState<Attribute>("str");
   const [heroSearch, setHeroSearch] = useState("");
   const heroSearchRef = useRef<HTMLInputElement>(null);
-  const valueDecision = useMemo(
-    () => deriveLiveDraftValueDecision(detail, mapping, prediction),
-    [detail, mapping, prediction],
-  );
-
   useEffect(() => {
     setMapping(detail.draft_mapping || null);
     setSlots(contextSlots(detail));
     setLocked(detail.draft_mapping?.is_locked || false);
+    setEvidenceSourceUrl(detail.draft_mapping?.evidence_source_url || "");
     setSnapshots(detail.game_snapshots || []);
     const nextLatest = detail.latest_game_snapshot;
     if (nextLatest) {
@@ -160,6 +168,7 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
   useEffect(() => {
     if (!mapping?.is_locked) {
       setPrediction(null);
+      setDecisionCheckpoints([]);
       setPredictionMessage(null);
       return undefined;
     }
@@ -171,6 +180,7 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
       controller.signal,
     ).then((response) => {
       setPrediction((current) => current ?? response.prediction);
+      setDecisionCheckpoints(response.decision_checkpoints || []);
     }).catch((error) => {
       if (!controller.signal.aborted) {
         setPredictionMessage(error instanceof Error ? error.message : "阵容预测读取失败");
@@ -228,10 +238,6 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
   const selectedHeroIds = useMemo(
     () => new Set(slots.filter((slot) => slot.hero_id > 0).map((slot) => slot.hero_id)),
     [slots],
-  );
-  const hudLineup = useMemo(
-    () => completeHudLineup(detail, mapNumber),
-    [detail, mapNumber],
   );
   const selectableTeams = useMemo(() => {
     const contextTeams = (detail.draft_context?.teams || []).map((team) => ({
@@ -323,12 +329,25 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
         mapNumber,
         slots,
         locked,
+        locked ? evidenceSourceUrl.trim() : null,
         csrfToken,
       );
       if (prediction && prediction.identity.mapping_version !== saved.version) {
         setPreviousPrediction(prediction);
       }
-      setPrediction(null);
+      const automation = saved.prediction_automation;
+      setPrediction(automation?.prediction || null);
+      if (saved.decision_checkpoint) {
+        setDecisionCheckpoints((current) => [
+          ...current.filter((item) => item.checkpoint_id !== saved.decision_checkpoint?.checkpoint_id),
+          saved.decision_checkpoint as MapDecisionCheckpoint,
+        ]);
+      }
+      if (automation) {
+        setPredictionMessage(automation.status === "blocked"
+          ? automation.missing_reason || "阵容预测前置条件不可用"
+          : automation.status === "unchanged" ? "已复用不可变预测" : "阵容预测已自动保存");
+      }
       setPredictionConfirmed(false);
       setMapping(saved);
       setSlots(saved.slots);
@@ -342,16 +361,6 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
     }
   };
 
-  const applyHudLineup = () => {
-    if (!hudLineup) return;
-    setSlots((current) => current.map((slot) => ({
-      ...slot,
-      hero_id: hudLineup[slot.side][slot.position - 1],
-    })));
-    setMappingMessage("已应用当前地图的 HUD 十英雄识别，请确认 1–5 号位后保存");
-    loadHeroCatalog();
-  };
-
   const generatePrediction = async () => {
     if (!csrfToken || !mapping?.is_locked || !predictionConfirmed) return;
     setPredictionBusy(true);
@@ -362,9 +371,14 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
         mapping.map_number,
         mapping.version,
         csrfToken,
-        latest?.game_time_seconds ?? null,
       );
       setPrediction(response.prediction);
+      if (response.decision_checkpoint) {
+        setDecisionCheckpoints((current) => [
+          ...current.filter((item) => item.checkpoint_id !== response.decision_checkpoint?.checkpoint_id),
+          response.decision_checkpoint as MapDecisionCheckpoint,
+        ]);
+      }
       setPredictionMessage(response.status === "blocked"
         ? response.missing_reason || "阵容预测前置条件不可用"
         : response.status === "unchanged" ? "已复用不可变预测" : "阵容预测已保存");
@@ -408,6 +422,11 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
           </div>
           <Lock size={19} aria-hidden="true" />
         </div>
+        {mapping?.evidence_source_url && (
+          <a href={mapping.evidence_source_url} rel="noreferrer" target="_blank">
+            阵容证据来源
+          </a>
+        )}
         <div className="live-draft-summary-teams">
           <DraftSummaryTeam
             side="radiant"
@@ -457,34 +476,33 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
               <div><dt>因果状态</dt><dd>{prediction.causal_evidence.causal_status}</dd></div>
               <div><dt>生成时间</dt><dd>{formatDateTime(prediction.created_at)}</dd></div>
             </div>
-            <div className="live-state-summary" aria-label="影子投注决策">
-              <div>
-                <dt>影子决策</dt>
-                <dd>{valueDecision.status === "candidate"
-                  ? "候选"
-                  : valueDecision.status === "no_bet" ? "不下注" : "等待"}</dd>
+            {pregameCheckpoint ? (
+              <>
+                <div className="live-state-summary" aria-label="影子投注决策">
+                  <div>
+                    <dt>影子决策</dt>
+                    <dd>{pregameCheckpoint.decision}</dd>
+                  </div>
+                  <div><dt>策略版本</dt><dd>map-decision-shadow-v1</dd></div>
+                  {pregameCheckpoint.selected_edge != null && (
+                    <div><dt>价值差</dt><dd>{formatPercent(pregameCheckpoint.selected_edge)}</dd></div>
+                  )}
+                  {pregameCheckpoint.observed_price != null && (
+                    <div><dt>决策赔率</dt><dd>{formatOdds(pregameCheckpoint.observed_price)}</dd></div>
+                  )}
+                  <div><dt>原因</dt><dd>{pregameCheckpoint.reason}</dd></div>
+                  <div><dt>检查点 ID</dt><dd>#{pregameCheckpoint.checkpoint_id}</dd></div>
+                </div>
+                <p className="live-form-message">
+                  服务端已追加只读记录；该建议不会回写 P0/P1、创建订单或提交真实投注。
+                </p>
+              </>
+            ) : (
+              <div className="live-state-empty" role="status">
+                <WarningCircle size={18} aria-hidden="true" />
+                <span>尚未保存赛前决策检查点</span>
               </div>
-              <div><dt>策略版本</dt><dd>{valueDecision.strategyVersion}</dd></div>
-              {valueDecision.selectedTeamName && (
-                <div><dt>选择</dt><dd>{valueDecision.selectedTeamName}</dd></div>
-              )}
-              {valueDecision.modelProbability != null && (
-                <div><dt>模型概率</dt><dd>{formatPercent(valueDecision.modelProbability)}</dd></div>
-              )}
-              {valueDecision.marketProbability != null && (
-                <div><dt>市场概率</dt><dd>{formatPercent(valueDecision.marketProbability)}</dd></div>
-              )}
-              {valueDecision.edge != null && (
-                <div><dt>价值差</dt><dd>{formatPercent(valueDecision.edge)}</dd></div>
-              )}
-              {valueDecision.price != null && (
-                <div><dt>当前赔率</dt><dd>{formatOdds(valueDecision.price)}</dd></div>
-              )}
-              <div><dt>原因</dt><dd>{valueDecision.reason}</dd></div>
-            </div>
-            <p className="live-form-message">
-              该决策仅比较不可变 P1 与当前地图完整胜负盘，不会回写 P0/P1，也不会提交真实投注。
-            </p>
+            )}
           </>
         ) : readOnly ? (
           <div className="live-state-empty" role="status">该 mapping 没有保存预测。</div>
@@ -522,7 +540,11 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
             <h2>Vision 实时状态</h2>
             <p>{latest
               ? `${latest.source === "vision" ? "自动识别" : "人工修正"} · ${formatDateTime(latest.captured_at)}`
-              : "等待稳定确认的比赛时间与双方经济"}</p>
+              : latestHud?.status === "available"
+                ? `Vision HUD · ${formatDateTime(latestHud.captured_at)}`
+              : visionRuntime
+                ? `Stable Vision · ${formatVisionCaptureState(visionRuntime.capture_state)} · ${formatDateTime(visionRuntime.observed_at)}`
+                : "等待稳定确认的比赛时间与双方经济"}</p>
           </div>
           <Pulse size={19} aria-hidden="true" />
         </div>
@@ -535,10 +557,23 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
             <div><dt>击杀</dt><dd>{latest.radiant_kills ?? "-"} : {latest.dire_kills ?? "-"}</dd></div>
             <div><dt>置信度</dt><dd>{formatPercent(latest.vision_confidence)}</dd></div>
           </dl>
+        ) : latestHud?.status === "available" ? (
+          <dl className="live-state-summary">
+            <div><dt>比赛时间</dt><dd>{formatClock(latestHud.game_clock_seconds ?? 0)}</dd></div>
+            <div><dt>状态</dt><dd>{latestHud.is_paused === null ? "-" : latestHud.is_paused ? "暂停" : "进行中"}</dd></div>
+            <div><dt>击杀</dt><dd>{latestHud.radiant_kills ?? "-"} : {latestHud.dire_kills ?? "-"}</dd></div>
+            <div><dt>经济领先</dt><dd>{formatHudAdvantage(latestHud)}</dd></div>
+            <div><dt>精确总经济</dt><dd>{formatHudNetworth(latestHud)}</dd></div>
+            <div><dt>HUD 置信度</dt><dd>{formatPercent(latestHud.hud_confidence)}</dd></div>
+          </dl>
         ) : (
           <div className="live-state-empty">
             <WarningCircle size={18} aria-hidden="true" />
-            <span>绝对总经济 OCR 尚未产生有效快照，可先人工纠正。</span>
+            <span>{visionRuntime?.blocker_code || visionRuntime?.reason
+              ? `Vision 暂不产出可信状态：${formatVisionBlocker(visionRuntime.blocker_code || visionRuntime.reason)}`
+              : latestHud?.unavailable_reason
+                ? `HUD 暂不可用：${formatVisionBlocker(latestHud.unavailable_reason)}`
+                : "绝对总经济 OCR 尚未产生有效快照，可先人工纠正。"}</span>
           </div>
         )}
         {!readOnly && <div className="manual-state-grid">
@@ -656,15 +691,6 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
               >
                 交换天辉 / 夜魇
               </Button>
-              {hudLineup && (
-                <Button
-                  icon={<Pulse size={17} />}
-                  onClick={applyHudLineup}
-                  type="button"
-                >
-                  应用 HUD 识别阵容
-                </Button>
-              )}
             </div>
             <div className="live-team-selectors">
               {sides.map((side) => (
@@ -707,6 +733,17 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
               />
             </div>
             <div className="live-form-actions">
+              {locked && (
+                <label className="live-field draft-evidence-source">
+                  <span>阵容证据 URL</span>
+                  <input
+                    onChange={(event) => setEvidenceSourceUrl(event.target.value)}
+                    required
+                    type="url"
+                    value={evidenceSourceUrl}
+                  />
+                </label>
+              )}
               <label className="lock-toggle">
                 <input
                   checked={locked}
@@ -717,7 +754,12 @@ export function LiveDataControls({ csrfToken, detail, readOnly = false }: LiveDa
               </label>
               <Button
                 appearance="primary"
-                disabled={!csrfToken || !validSlots || mappingBusy}
+                disabled={
+                  !csrfToken
+                  || !validSlots
+                  || mappingBusy
+                  || (locked && !evidenceSourceUrl.trim())
+                }
                 type="submit"
               >
                 {mappingBusy ? "保存中" : mapping ? "保存新版本" : "提交阵容"}
@@ -887,27 +929,6 @@ function HeroImage({ hero }: { hero: PrematchHero }) {
 }
 
 
-function completeHudLineup(
-  detail: MatchDetail,
-  mapNumber: number,
-): Record<Side, number[]> | null {
-  const point = [
-    detail.latest_capture,
-    detail.latest_vision,
-    ...[...detail.vision].reverse(),
-  ].find((candidate) => candidate?.map_number === mapNumber
-    && candidate.radiant_hero_ids?.length === 5
-    && candidate.dire_hero_ids?.length === 5);
-  if (!point?.radiant_hero_ids || !point.dire_hero_ids) return null;
-  const heroes = [...point.radiant_hero_ids, ...point.dire_hero_ids];
-  if (heroes.some((heroId) => !Number.isInteger(heroId) || heroId <= 0)) return null;
-  if (new Set(heroes).size !== 10) return null;
-  return {
-    radiant: point.radiant_hero_ids,
-    dire: point.dire_hero_ids,
-  };
-}
-
 function NumericField({
   label,
   onChange,
@@ -939,4 +960,44 @@ function formatNetworth(value: number): string {
 function formatLead(value: number): string {
   if (value === 0) return "持平";
   return `${value > 0 ? "天辉" : "夜魇"} +${Math.abs(value).toLocaleString("zh-CN")}`;
+}
+
+function formatHudAdvantage(observation: LiveHudObservation): string {
+  const side = observation.net_worth_advantage_side;
+  const minimum = observation.net_worth_advantage_min;
+  const maximum = observation.net_worth_advantage_max;
+  if (!side || minimum === null || maximum === null) return "未提供";
+  const label = side === "radiant" ? "天辉" : "夜魇";
+  const range = minimum === maximum
+    ? minimum.toLocaleString("zh-CN")
+    : `${minimum.toLocaleString("zh-CN")}–${maximum.toLocaleString("zh-CN")}`;
+  return `${label} +${range}`;
+}
+
+function formatHudNetworth(observation: LiveHudObservation): string {
+  if (observation.radiant_net_worth === null && observation.dire_net_worth === null) {
+    return "未提供";
+  }
+  if (observation.radiant_net_worth === null || observation.dire_net_worth === null) {
+    return "不完整";
+  }
+  return `天辉 ${formatNetworth(observation.radiant_net_worth)} / 夜魇 ${formatNetworth(observation.dire_net_worth)}`;
+}
+
+function formatVisionCaptureState(value?: string | null): string {
+  if (value === "capturing_partial") return "采集中，等待可信帧";
+  if (value === "capturing") return "采集中";
+  if (value === "producing_trusted") return "直播状态已可信";
+  if (value === "producing") return "稳定产出";
+  return value || "状态待确认";
+}
+
+function formatVisionBlocker(value?: string | null): string {
+  if (value === "replay_gate_untrusted") return "直播或回放状态尚未可信确认";
+  if (value === "draft_incomplete" || value === "draft_unconfirmed") {
+    return "十英雄阵容尚未可信确认";
+  }
+  if (value === "clock_unconfirmed") return "比赛时钟尚未可信确认";
+  if (value?.startsWith("screen_state_")) return `当前画面为 ${value.slice(13)}`;
+  return value || "原因待确认";
 }

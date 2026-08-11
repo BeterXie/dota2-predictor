@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -312,11 +314,12 @@ def test_global_hero_assignment_never_duplicates_heroes() -> None:
     assert draft.slot_diagnostics[1].best_hero_id == 2
 
 
-def test_debug_capture_is_rate_limited_and_bounded_across_restarts(
+def test_debug_capture_is_rate_limited_and_rolls_unlabeled_events_across_restarts(
     tmp_path: Path,
 ) -> None:
     image = np.full((24, 32, 3), 100, dtype=np.uint8)
-    sink = VisionDebugSink(tmp_path, minimum_interval=30.0, maximum_events=1)
+    debug_root = tmp_path / "data" / "live_betting" / "vision_debug"
+    sink = VisionDebugSink(debug_root, minimum_interval=30.0, maximum_events=1)
 
     assert sink.record(
         image,
@@ -331,13 +334,123 @@ def test_debug_capture_is_rate_limited_and_bounded_across_restarts(
         diagnostics={"blocker": "draft_unconfirmed"},
     )
 
-    restarted = VisionDebugSink(tmp_path, minimum_interval=0.0, maximum_events=1)
+    first_event = next(debug_root.rglob("metadata.json")).parent
+    restarted = VisionDebugSink(debug_root, minimum_interval=0.0, maximum_events=1)
+    assert restarted.record(
+        image,
+        reason="clock_unconfirmed",
+        layout_name="standard",
+        diagnostics={"blocker": "clock_unconfirmed"},
+    )
+    assert not first_event.exists()
+    assert len(list(debug_root.rglob("metadata.json"))) == 1
+
+
+def test_debug_capture_is_independent_per_series_and_map(tmp_path: Path) -> None:
+    image = np.full((24, 32, 3), 100, dtype=np.uint8)
+    debug_root = tmp_path / "data" / "live_betting" / "vision_debug"
+    sink = VisionDebugSink(debug_root, minimum_interval=30.0, maximum_events=10)
+    captured_at = datetime(2026, 8, 11, 4, 5, 6, tzinfo=timezone.utc)
+
+    def record(match_id: str, map_number: int, frame_ref: str) -> bool:
+        return sink.record(
+            image,
+            reason="draft_unconfirmed",
+            layout_name="standard",
+            diagnostics={"blocker": "draft_unconfirmed"},
+            raybet_match_id=match_id,
+            map_number=map_number,
+            captured_at_utc=captured_at,
+            source_frame_ref=frame_ref,
+        )
+
+    assert record("series-one", 1, "stream:series-one:map-1:1")
+    assert not record("series-one", 1, "stream:series-one:map-1:2")
+    assert record("series-one", 2, "stream:series-one:map-2:1")
+    assert record("series-two", 1, "stream:series-two:map-1:1")
+
+    metadata_paths = sorted(debug_root.rglob("metadata.json"))
+    assert len(metadata_paths) == 3
+    assert {
+        path.parent.relative_to(debug_root).parts[:3]
+        for path in metadata_paths
+    } == {
+        ("series", "series-one", "map_1"),
+        ("series", "series-one", "map_2"),
+        ("series", "series-two", "map_1"),
+    }
+    metadata = json.loads(
+        next(
+            path
+            for path in metadata_paths
+            if path.parent.relative_to(debug_root).parts[:3]
+            == ("series", "series-one", "map_2")
+        ).read_text(encoding="utf-8")
+    )
+    assert metadata["raybet_match_id"] == "series-one"
+    assert metadata["map_number"] == 2
+    assert metadata["captured_at"] == captured_at.timestamp()
+    assert metadata["source_frame_ref"] == "stream:series-one:map-2:1"
+    assert metadata["identity_status"] == "explicit_watcher_context"
+
+
+def test_debug_capture_collision_suffix_stays_inside_its_map(tmp_path: Path) -> None:
+    image = np.full((24, 32, 3), 100, dtype=np.uint8)
+    debug_root = tmp_path / "vision_debug"
+    sink = VisionDebugSink(debug_root, minimum_interval=0.0, maximum_events=10)
+    captured_at = datetime(2026, 8, 11, 4, 5, 6, tzinfo=timezone.utc)
+    payload = {
+        "reason": "clock_unconfirmed",
+        "layout_name": "standard",
+        "diagnostics": {"blocker": "clock_unconfirmed"},
+        "raybet_match_id": "series-one",
+        "map_number": 2,
+        "captured_at_utc": captured_at,
+        "source_frame_ref": "stream:series-one:map-2:1",
+    }
+
+    assert sink.record(image, **payload)
+    payload["source_frame_ref"] = "stream:series-one:map-2:2"
+    assert sink.record(image, **payload)
+
+    event_dirs = sorted(path.parent for path in debug_root.rglob("metadata.json"))
+    assert len(event_dirs) == 2
+    assert all(
+        path.relative_to(debug_root).parts[:3]
+        == ("series", "series-one", "map_2")
+        for path in event_dirs
+    )
+
+
+def test_debug_capture_never_prunes_a_labeled_event(tmp_path: Path) -> None:
+    image = np.full((24, 32, 3), 100, dtype=np.uint8)
+    data_root = tmp_path / "data" / "live_betting"
+    debug_root = data_root / "vision_debug"
+    sink = VisionDebugSink(debug_root, minimum_interval=0.0, maximum_events=1)
+    assert sink.record(
+        image,
+        reason="draft_unconfirmed",
+        layout_name="standard",
+        diagnostics={"blocker": "draft_unconfirmed"},
+    )
+    protected_event = next(debug_root.rglob("metadata.json")).parent
+    relative = protected_event.relative_to(debug_root).as_posix()
+    label_root = data_root / "vision_calibration" / "labels"
+    label_root.mkdir(parents=True)
+    (label_root / "label.json").write_text(
+        json.dumps({"event_relative_path": relative}),
+        encoding="utf-8",
+    )
+
+    restarted = VisionDebugSink(debug_root, minimum_interval=0.0, maximum_events=1)
     assert not restarted.record(
         image,
         reason="clock_unconfirmed",
         layout_name="standard",
         diagnostics={"blocker": "clock_unconfirmed"},
     )
+    assert protected_event.exists()
+    assert len(list(debug_root.rglob("metadata.json"))) == 1
 
 
 def test_layout_switching_is_captured_with_tracker_diagnostics() -> None:

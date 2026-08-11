@@ -6,8 +6,12 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from database.session import PostgresSession
+
+
+DRAFT_MAPPING_AUTHORITY_VERSION = "sourced-manual-draft-v1"
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,61 @@ class DraftSlotInput:
     position: int
     hero_id: int
     player_id: int | None = None
+
+
+def sourced_manual_draft_authority(actor: str, evidence_source_url: str) -> str:
+    operator = _required_text(actor, "actor")
+    source_url = _required_text(evidence_source_url, "evidence_source_url")
+    if len(source_url) > 2048:
+        raise ValueError("evidence_source_url is too long")
+    parsed = urlsplit(source_url)
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("evidence_source_url must be an HTTPS URL without credentials")
+    return json.dumps(
+        {
+            "version": DRAFT_MAPPING_AUTHORITY_VERSION,
+            "actor": operator,
+            "evidence_source_url": source_url,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def parse_sourced_manual_draft_authority(value: object) -> dict[str, str] | None:
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "actor",
+        "evidence_source_url",
+    }:
+        return None
+    if payload.get("version") != DRAFT_MAPPING_AUTHORITY_VERSION:
+        return None
+    try:
+        encoded = sourced_manual_draft_authority(
+            str(payload.get("actor") or ""),
+            str(payload.get("evidence_source_url") or ""),
+        )
+    except ValueError:
+        return None
+    if encoded != str(value):
+        return None
+    return {
+        "version": DRAFT_MAPPING_AUTHORITY_VERSION,
+        "actor": str(payload["actor"]),
+        "evidence_source_url": str(payload["evidence_source_url"]),
+    }
 
 
 def live_draft_context(
@@ -172,20 +231,20 @@ def save_live_draft_mapping(
     slots: Iterable[DraftSlotInput],
     is_locked: bool,
     actor: str,
+    evidence_source_url: str | None = None,
     created_at: datetime | None = None,
 ) -> dict[str, Any]:
     normalized = _validated_slots(slots)
     match_id = _required_text(raybet_match_id, "raybet_match_id")
-    created_by = _required_text(actor, "actor")
+    created_by = (
+        sourced_manual_draft_authority(actor, str(evidence_source_url or ""))
+        if is_locked
+        else _required_text(actor, "actor")
+    )
     if not 1 <= map_number <= 5:
         raise ValueError("map_number must be between 1 and 5")
     observed_at = _aware_utc(created_at or datetime.now(timezone.utc)).isoformat()
-    lock_key = f"live-draft:{match_id}:{map_number}"
     with connection.transaction():
-        connection.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-            (lock_key,),
-        )
         row = connection.execute(
             """SELECT COALESCE(MAX(version), 0) + 1
                  FROM live_draft_mappings
@@ -264,13 +323,22 @@ def latest_live_draft_mapping(
     ).fetchall()
     if len(rows) != 10:
         return None
+    created_by = str(rows[0][7])
+    authority = parse_sourced_manual_draft_authority(created_by)
     return {
         "raybet_match_id": match_id,
         "map_number": selected_map,
         "version": version,
         "source": str(rows[0][5]),
         "is_locked": bool(rows[0][6]),
-        "created_by": str(rows[0][7]),
+        "created_by": created_by,
+        "actor": authority["actor"] if authority is not None else created_by,
+        "evidence_source_url": (
+            authority["evidence_source_url"] if authority is not None else None
+        ),
+        "authority_version": (
+            authority["version"] if authority is not None else None
+        ),
         "created_at": str(rows[0][8]),
         "slots": [
             {

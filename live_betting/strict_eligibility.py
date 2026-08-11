@@ -22,7 +22,8 @@ from database.session import DatabaseRow, PostgresSession
 
 
 STRICT_MAPPING_VERSION = "strict-live-map-v3"
-MINIMUM_PRIZE_POOL_USD = 1_000_000
+FORMAL_EVENT_TIERS = frozenset({"tier_1", "tier_2"})
+MINIMUM_FORMAL_PRIZE_POOL_USD = 0
 RAYBET_MATCH_HEAD_TO_HEAD = "head_to_head"
 RAYBET_MATCH_NON_HEAD_TO_HEAD = "non_head_to_head"
 RAYBET_MATCH_FORMAT_UNKNOWN = "unknown"
@@ -1213,9 +1214,9 @@ def _formal_event_reason(event: _EventPolicy, as_of: datetime) -> str | None:
         return "event_not_approved"
     if event.evidence_status != "manually_audited":
         return "event_evidence_not_manually_audited"
-    if event.tier != "tier_1":
-        return "event_tier_not_tier_1"
-    if event.prize_pool_usd < MINIMUM_PRIZE_POOL_USD:
+    if event.tier not in FORMAL_EVENT_TIERS:
+        return "event_tier_not_formal"
+    if event.prize_pool_usd < MINIMUM_FORMAL_PRIZE_POOL_USD:
         return "event_prize_below_minimum"
     if not event.approved_by:
         return "event_approval_evidence_missing"
@@ -2161,7 +2162,8 @@ def _write_transaction(connection: PostgresSession) -> Iterator[None]:
 
 
 __all__ = [
-    "MINIMUM_PRIZE_POOL_USD",
+    "FORMAL_EVENT_TIERS",
+    "MINIMUM_FORMAL_PRIZE_POOL_USD",
     "STRICT_MAPPING_VERSION",
     "StrictLiveEligibility",
     "StrictLiveMapMapping",

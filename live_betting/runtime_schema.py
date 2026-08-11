@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from database.session import PostgresSession
 
 
-ALEMBIC_HEAD = "20260807_0034"
+ALEMBIC_HEAD = "20260807_0035"
 CURRENT_RUNTIME_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_CONTRACT_DIGEST = (
     "eb58ed6794cd39cdf4b9947a9132f2c2683cb20c769770586e3ca5c9f093beb9"
@@ -27,6 +27,8 @@ _REQUIRED_TABLES = frozenset(
         "monitor_alert_candidates",
         "live_draft_prospective_predictions",
         "live_draft_prospective_settlements",
+        "map_decision_checkpoints",
+        "map_decision_checkpoint_settlements",
         "monitor_alert_incidents",
         "monitor_alert_audit",
     }
@@ -35,6 +37,7 @@ _REQUIRED_INDEXES = frozenset(
     {
         "idx_monitor_alert_active_key",
         "idx_monitor_alert_status_opened",
+        "ix_map_decision_checkpoints_map_time",
     }
 )
 _REQUIRED_TRIGGERS = frozenset(
@@ -43,6 +46,9 @@ _REQUIRED_TRIGGERS = frozenset(
         "monitor_control_audit_no_delete",
         "monitor_alert_audit_no_update",
         "monitor_alert_audit_no_delete",
+        "map_decision_checkpoints_append_only",
+        "map_decision_checkpoint_settlements_append_only",
+        "map_decision_checkpoint_settlements_insert_guard",
     }
 )
 

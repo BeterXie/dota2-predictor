@@ -8,8 +8,7 @@ import { MatchRail } from "./MatchRail";
 
 const liveMatch: MonitorMatch = {
   raybet_match_id: "live-1",
-  official_match_id: "8123456789",
-  display_name: "官方 Match ID 8123456789 · Alpha vs Beta · Elite League",
+  display_name: "RayBet Series live-1 · Alpha vs Beta · Elite League",
   tournament: "Elite League",
   team_one: "Alpha",
   team_two: "Beta",
@@ -40,8 +39,7 @@ const liveMatch: MonitorMatch = {
 const prematchMatch: MonitorMatch = {
   ...liveMatch,
   raybet_match_id: "prematch-1",
-  official_match_id: null,
-  display_name: "RayBet prematch-1 · Gamma vs Delta · EPL 大师赛",
+  display_name: "RayBet Series prematch-1 · Gamma vs Delta · EPL 大师赛",
   tournament: "EPL 大师赛",
   team_one: "Gamma",
   team_two: "Delta",
@@ -78,8 +76,8 @@ describe("MatchRail", () => {
     expect(screen.getByLabelText("实时与赛前赛事列表")).toHaveClass("match-list-page");
     expect(screen.getByText("正在进行")).toBeInTheDocument();
     expect(screen.getByText("赛前赛事")).toBeInTheDocument();
-    expect(screen.getByText("官方 Match ID 8123456789")).toBeInTheDocument();
-    expect(screen.getByText("RayBet prematch-1")).toBeInTheDocument();
+    expect(screen.getByText("RayBet Series live-1")).toBeInTheDocument();
+    expect(screen.getByText("RayBet Series prematch-1")).toBeInTheDocument();
     expect(screen.getByText("赛前")).toBeInTheDocument();
     expect(screen.queryByText("数据降级")).not.toBeInTheDocument();
     expect(screen.getByText("1.72")).toBeInTheDocument();
@@ -101,5 +99,46 @@ describe("MatchRail", () => {
     expect(within(list).queryByText("Alpha")).not.toBeInTheDocument();
     expect(within(list).queryByText("正在进行")).not.toBeInTheDocument();
     expect(within(list).getByText("赛前赛事")).toBeInTheDocument();
+  });
+
+  it("uses player-facing copy in recap mode", () => {
+    render(
+      <FluentProvider theme={webDarkTheme}>
+        <MatchRail
+          matches={[{ ...liveMatch, lifecycle: "ended", history_eligible: true }]}
+          mode="recap"
+          onSelect={vi.fn()}
+          selectedId={null}
+          variant="page"
+        />
+      </FluentProvider>,
+    );
+
+    expect(screen.getByLabelText("比赛复盘赛事列表")).toBeInTheDocument();
+    expect(screen.getByText("最近结束")).toBeInTheDocument();
+    expect(screen.getByText("查看比赛复盘")).toBeInTheDocument();
+    expect(screen.getByText("赛果、阵容与关键走势")).toBeInTheDocument();
+    expect(screen.queryByText("收盘快照")).not.toBeInTheDocument();
+    expect(screen.queryByText("1.72")).not.toBeInTheDocument();
+    expect(screen.queryByText("比赛已结束")).not.toBeInTheDocument();
+    expect(screen.getAllByText("已结束")).toHaveLength(1);
+  });
+
+  it("shows a loading state while the first recap page is requested", () => {
+    render(
+      <FluentProvider theme={webDarkTheme}>
+        <MatchRail
+          loadingMore
+          matches={[]}
+          mode="recap"
+          onSelect={vi.fn()}
+          selectedId={null}
+          variant="page"
+        />
+      </FluentProvider>,
+    );
+
+    expect(screen.getByText("正在加载历史赛事…")).toBeInTheDocument();
+    expect(screen.queryByText("暂无赛事")).not.toBeInTheDocument();
   });
 });

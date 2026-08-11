@@ -35,8 +35,13 @@ from event_intelligence.team_rating import (
     effective_team_rating,
     team_rating_probability,
 )
+from live_betting.live_match_state import (
+    live_draft_context,
+    parse_sourced_manual_draft_authority,
+)
 from live_betting.rosh_parity import ExactByteArtifactStore
 from live_betting.stratz_rosh_client import StratzRoshClient, StratzRoshError
+from live_betting.vision_frame_registry import verify_registered_vision_frame
 
 
 UTC = timezone.utc
@@ -178,6 +183,14 @@ def canonical_mapping_hash(mapping: Mapping[str, Any]) -> str:
     if int(payload["map_number"]) not in range(1, 6) or int(payload["version"]) <= 0:
         raise ValueError("draft mapping identity is invalid")
     return _hash(payload)
+
+
+@dataclass(frozen=True)
+class VisionDraftAuthority:
+    captured_at: datetime
+    game_clock_seconds: int | None
+    screen_state: str
+    source_frame_ref: str
 
 
 @dataclass(frozen=True)
@@ -381,6 +394,164 @@ class LiveDraftProspectiveBridgeRepository:
         }
         canonical_mapping_hash(mapping)
         return mapping
+
+    def validate_mapping_authority(
+        self,
+        mapping: Mapping[str, Any],
+    ) -> VisionDraftAuthority:
+        payload = _mapping_payload(mapping)
+        match_id = str(payload["raybet_match_id"])
+        map_number = int(payload["map_number"])
+        if parse_sourced_manual_draft_authority(payload["created_by"]) is None:
+            raise ValueError("draft_position_authority_unverified")
+        locked_at = _parse_utc(payload["created_at"], "operator_locked_at")
+        anchor = self.connection.execute(
+            """SELECT radiant_hero_ids, dire_hero_ids, radiant_team_side,
+                      anchored_at, source_frame_ref, status, conflict_at,
+                      team_side_anchored_at, team_side_source_frame_ref
+                 FROM vision_draft_anchors
+                WHERE raybet_match_id=? AND map_number=?""",
+            (match_id, map_number),
+        ).fetchone()
+        if anchor is None:
+            raise ValueError("vision_draft_anchor_unavailable")
+        if str(anchor[5]) != "anchored" or anchor[6] is not None:
+            raise ValueError("vision_draft_anchor_conflict")
+        radiant_team_side = str(anchor[2] or "")
+        if radiant_team_side not in {"team_one", "team_two"}:
+            raise ValueError("vision_team_side_unconfirmed")
+        anchored_at = _parse_utc(anchor[3], "vision draft anchored_at")
+        team_side_anchored_at = _parse_utc(
+            anchor[7],
+            "vision team side anchored_at",
+        )
+        if anchored_at > locked_at or team_side_anchored_at > locked_at:
+            raise ValueError("vision_authority_follows_mapping_lock")
+
+        try:
+            radiant_heroes = tuple(int(value) for value in json.loads(str(anchor[0])))
+            dire_heroes = tuple(int(value) for value in json.loads(str(anchor[1])))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("vision_draft_anchor_invalid") from error
+        heroes = radiant_heroes + dire_heroes
+        if (
+            len(radiant_heroes) != 5
+            or len(dire_heroes) != 5
+            or any(hero_id <= 0 for hero_id in heroes)
+            or len(set(heroes)) != 10
+        ):
+            raise ValueError("vision_draft_anchor_invalid")
+        slots = payload["slots"]
+        assert isinstance(slots, list)
+        mapped_heroes = {
+            side: {
+                int(row["hero_id"])
+                for row in slots
+                if row["side"] == side
+            }
+            for side in ("radiant", "dire")
+        }
+        if (
+            mapped_heroes["radiant"] != set(radiant_heroes)
+            or mapped_heroes["dire"] != set(dire_heroes)
+        ):
+            raise ValueError("vision_draft_anchor_mapping_mismatch")
+
+        context = live_draft_context(
+            self.connection,
+            match_id,
+            as_of=locked_at,
+        )
+        if context is None or context.get("status") != "ready":
+            raise ValueError("canonical_teams_unresolved")
+        teams = context.get("teams")
+        if not isinstance(teams, list) or len(teams) != 2:
+            raise ValueError("canonical_teams_unresolved")
+        teams_by_match_side = {
+            str(team["match_side"]): int(team["team_id"])
+            for team in teams
+            if isinstance(team, Mapping)
+        }
+        expected_radiant = teams_by_match_side.get(radiant_team_side)
+        expected_dire = teams_by_match_side.get(
+            "team_two" if radiant_team_side == "team_one" else "team_one"
+        )
+        mapped_teams = {
+            side: {
+                int(row["team_id"])
+                for row in slots
+                if row["side"] == side
+            }
+            for side in ("radiant", "dire")
+        }
+        if (
+            expected_radiant is None
+            or expected_dire is None
+            or mapped_teams["radiant"] != {expected_radiant}
+            or mapped_teams["dire"] != {expected_dire}
+        ):
+            raise ValueError("vision_team_side_mapping_mismatch")
+
+        source_frame_ref = str(anchor[4])
+        observation = self.connection.execute(
+            """SELECT captured_at, game_clock_seconds, screen_state,
+                      source_frame_sha256, source_frame_bytes,
+                      clock_confidence, draft_confidence, is_paused
+                 FROM vision_observations
+                WHERE raybet_match_id=? AND map_number=?
+                  AND source_frame_ref=? AND confirmed=1
+                ORDER BY live_text_timestamp_utc(captured_at), source_frame_ref
+                LIMIT 1""",
+            (match_id, map_number, source_frame_ref),
+        ).fetchone()
+        if observation is None:
+            raise ValueError("vision_confirmed_observation_unavailable")
+        captured_at = _parse_utc(observation[0], "vision observation captured_at")
+        if captured_at != anchored_at:
+            raise ValueError("vision_draft_anchor_timestamp_mismatch")
+        game_clock_seconds = observation[1]
+        screen_state = str(observation[2] or "")
+        if screen_state == "draft":
+            if (
+                game_clock_seconds is not None
+                or float(observation[5]) != 0.0
+                or float(observation[6]) < 0.9
+                or observation[7] is not None
+            ):
+                raise ValueError("vision_confirmed_draft_frame_invalid")
+            confirmed_clock = None
+        elif screen_state == "game":
+            if (
+                type(game_clock_seconds) is not int
+                or int(game_clock_seconds) < 0
+                or float(observation[5]) < 0.9
+                or float(observation[6]) < 0.9
+            ):
+                raise ValueError("vision_confirmed_game_frame_invalid")
+            confirmed_clock = int(game_clock_seconds)
+        else:
+            raise ValueError("vision_draft_frame_unavailable")
+        try:
+            verify_registered_vision_frame(
+                self.connection,
+                source_frame_ref,
+                expected_sha256=str(observation[3]),
+                expected_bytes=int(observation[4]),
+            )
+            team_side_source_ref = str(anchor[8])
+            if team_side_source_ref != source_frame_ref:
+                verify_registered_vision_frame(
+                    self.connection,
+                    team_side_source_ref,
+                )
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise ValueError("vision_frame_authority_invalid") from error
+        return VisionDraftAuthority(
+            captured_at=captured_at,
+            game_clock_seconds=confirmed_clock,
+            screen_state=screen_state,
+            source_frame_ref=source_frame_ref,
+        )
 
     def validate_prediction_target(self, raybet_match_id: str, map_number: int) -> str | None:
         result = self.connection.execute(
@@ -710,10 +881,6 @@ def generate_live_draft_prediction(
     operator_identity: str,
     confirmation_text: str,
     confirmed_at: datetime,
-    game_clock_seconds: int | None = None,
-    vision_frame_timestamp: datetime | None = None,
-    draft_state_marker: str | None = None,
-    live_state_input_used: bool = False,
     candidate: ProspectiveRoshCandidate | None = None,
 ) -> dict[str, object]:
     if confirmation_text != LOCK_CONFIRMATION:
@@ -726,10 +893,14 @@ def generate_live_draft_prediction(
     locked_at = _parse_utc(mapping_payload["created_at"], "operator_locked_at")
     if confirmed < locked_at:
         raise ValueError("confirmation cannot precede operator lock")
-    existing = repository.load_prediction(raybet_match_id, map_number, mapping_version)
     lifecycle_status = repository.validate_prediction_target(raybet_match_id, map_number)
+    authority = repository.validate_mapping_authority(mapping)
+    existing = repository.load_prediction(raybet_match_id, map_number, mapping_version)
     if existing is not None:
-        return {"status": "unchanged", "prediction": existing}
+        return {
+            "status": "unchanged",
+            "prediction": existing,
+        }
     p0 = repository.build_p0(mapping, observed_at=confirmed)
     if p0 is None:
         return {
@@ -786,17 +957,10 @@ def generate_live_draft_prediction(
             pure_rosh_score=evidence.pure_rosh_score,
         )
         pure_score = evidence.pure_rosh_score
-    persisted_clock = repository.latest_observed_game_clock(
-        raybet_match_id,
-        map_number,
-        confirmed,
-    )
-    effective_clock = persisted_clock if persisted_clock is not None else game_clock_seconds
-    if effective_clock is not None and effective_clock < 0:
-        raise ValueError("game_clock_seconds must be non-negative")
-    marker = None if draft_state_marker is None else str(draft_state_marker).strip()
+    effective_clock = authority.game_clock_seconds
+    marker = "draft_complete" if authority.screen_state == "draft" else "in_game"
     causal_status, causal_reason = _causal_status(
-        live_state_input_used=bool(live_state_input_used),
+        live_state_input_used=False,
         game_clock_seconds=effective_clock,
         draft_state_marker=marker,
         lifecycle_status=lifecycle_status,
@@ -825,11 +989,9 @@ def generate_live_draft_prediction(
         rosh_evidence=evidence,
         missing_reason=missing_reason,
         game_clock_seconds=effective_clock,
-        vision_frame_timestamp=(
-            None if vision_frame_timestamp is None else _utc(vision_frame_timestamp, "vision_frame_timestamp")
-        ),
+        vision_frame_timestamp=authority.captured_at,
         draft_state_marker=marker,
-        live_state_input_used=bool(live_state_input_used),
+        live_state_input_used=False,
         causal_status=causal_status,
         causal_reason=causal_reason,
         created_at=max(datetime.now(UTC), confirmed),
@@ -851,6 +1013,7 @@ __all__ = [
     "LiveDraftProspectiveBridgeRepository",
     "LiveDraftProspectivePrediction",
     "LiveTeamRatingP0",
+    "VisionDraftAuthority",
     "canonical_mapping_hash",
     "generate_live_draft_prediction",
 ]

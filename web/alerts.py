@@ -20,6 +20,8 @@ _MONITORED_COMPONENTS = frozenset(
         "strict_ingest_worker",
         "stream_supervisor",
         "vision_worker",
+        "map_decision_worker",
+        "postmatch_worker",
     }
 )
 

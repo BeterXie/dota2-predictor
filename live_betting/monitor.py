@@ -48,7 +48,8 @@ from .strict_eligibility import (
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_LIST_CACHE_TTL_SECONDS = 60.0
-PREMATCH_COLLECTION_LEAD_TIME = timedelta(hours=2)
+PREMATCH_ODDS_REFRESH_INTERVAL = timedelta(minutes=2)
+PREMATCH_ODDS_REFRESH_GRACE = timedelta(seconds=5)
 SCHEDULED_LIVE_FALLBACK_RETENTION = timedelta(hours=12)
 RAYBET_SCHEDULE_TIMEZONE = timezone(timedelta(hours=8))
 ODDS_BACKOFF_INITIAL_SECONDS = 3.0
@@ -755,19 +756,11 @@ def _prematch_collection_due(
     if until_start <= timedelta(0):
         return False
 
-    # Keep one early quote available for the pre-match page even when the
-    # provider lists a match more than two hours before kickoff. The first
-    # quote is audit-only and cannot enter production odds inputs. Once the
-    # match reaches the normal lead window, refresh once within that window.
-    window_start = (
-        scheduled_at - PREMATCH_COLLECTION_LEAD_TIME
-        if until_start <= PREMATCH_COLLECTION_LEAD_TIME
-        else datetime(1970, 1, 1, tzinfo=timezone.utc)
-    )
-    window_end = (
-        scheduled_at
-        if until_start <= PREMATCH_COLLECTION_LEAD_TIME
-        else now_utc
+    # Prematch responses remain audit-only, but the schedule-discovery path still
+    # avoids duplicate requests inside this window. The full odds channel bypasses
+    # this check so its first cycle after a restart cannot defer a required refresh.
+    refresh_cutoff = now_utc - (
+        PREMATCH_ODDS_REFRESH_INTERVAL - PREMATCH_ODDS_REFRESH_GRACE
     )
     row = store.connection.execute(
         """SELECT 1 FROM direct_response_audit
@@ -778,10 +771,10 @@ def _prematch_collection_due(
                AND reason='prematch_observed'
                AND live_text_timestamp_utc(observed_at)>=
                    live_text_timestamp_utc(?)
-               AND live_text_timestamp_utc(observed_at)<
+               AND live_text_timestamp_utc(observed_at)<=
                    live_text_timestamp_utc(?)
              LIMIT 1""",
-        (match_id, window_start.isoformat(), window_end.isoformat()),
+        (match_id, refresh_cutoff.isoformat(), now_utc.isoformat()),
     ).fetchone()
     return row is None
 
@@ -999,6 +992,7 @@ def _empty_odds_summary(*, listed: int) -> dict[str, Any]:
         "prematch_skipped": 0,
         "required_match_ids": [],
         "last_successful_match_ids": [],
+        "failed_match_ids": [],
         "maximum_request_duration_seconds": 0.0,
     }
 
@@ -1067,21 +1061,24 @@ def _collect_priority_rows(
 
     workers = max(1, min(max_workers, len(rows)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 _collect_priority_row,
                 database_url,
                 raw_dir,
                 row,
                 backoff,
-            )
+            ): str(row.get("id") or "")
             for row in rows
-        ]
+        }
         for future in as_completed(futures):
             try:
                 result = future.result()
             except Exception as error:
                 summary["errors"] += 1
+                failed_match_id = futures[future]
+                if failed_match_id.isdigit():
+                    summary["failed_match_ids"].append(failed_match_id)
                 logger.warning(
                     "priority RayBet odds worker failed (%s)",
                     type(error).__name__,
@@ -1104,12 +1101,16 @@ def _collect_priority_rows(
             summary["required_match_ids"].extend(
                 result.get("required_match_ids", [])
             )
+            summary["failed_match_ids"].extend(
+                result.get("failed_match_ids", [])
+            )
             summary["maximum_request_duration_seconds"] = max(
                 summary["maximum_request_duration_seconds"],
                 float(result["maximum_request_duration_seconds"]),
             )
     summary["last_successful_match_ids"].sort()
     summary["required_match_ids"].sort()
+    summary["failed_match_ids"] = sorted(set(summary["failed_match_ids"]))
     return summary
 
 
@@ -1172,6 +1173,7 @@ def _odds_channel_loop(
                         audit_match_list=False,
                         backoff=backoff,
                         collector_name=collector,
+                        force_prematch_refresh=True,
                     )
                 cycle_duration = time.monotonic() - started
                 cycle_healthy = _odds_collection_cycle_healthy(summary)
@@ -1324,6 +1326,7 @@ def collect_once(
     wall_clock: Callable[[], datetime] = utc_now,
     collector_name: str = "raybet",
     retain_backoff: bool = True,
+    force_prematch_refresh: bool = False,
 ) -> dict[str, Any]:
     _require_store_archive_root(store, raw_dir)
     if list_rows is None:
@@ -1343,8 +1346,8 @@ def collect_once(
     prematch_skipped = 0
     required_match_ids: list[str] = []
     successful_match_ids: list[str] = []
+    failed_match_ids: list[str] = []
     request_durations: list[float] = []
-    collection_now = wall_clock()
     raw_fingerprints = raw_fingerprints if raw_fingerprints is not None else {}
     if audit_match_list:
         _audit_match_list(
@@ -1379,8 +1382,12 @@ def collect_once(
                 str(list_row.get("status") or "") == "1"
                 and list_row.get("_force_live_poll") is not True
             )
-            if is_prematch and not _prematch_collection_due(
-                store, match_id, list_row, now=collection_now
+            if (
+                is_prematch
+                and not force_prematch_refresh
+                and not _prematch_collection_due(
+                    store, match_id, list_row, now=wall_clock()
+                )
             ):
                 prematch_skipped += 1
                 continue
@@ -1412,6 +1419,8 @@ def collect_once(
                 backoff.record_success(endpoint, request_identity)
         except Exception as error:
             error_count += 1
+            if match_id.isdigit():
+                failed_match_ids.append(match_id)
             if backoff is not None and request_identity and not is_prematch:
                 backoff.record_failure(
                     endpoint,
@@ -1452,6 +1461,7 @@ def collect_once(
         "prematch_skipped": prematch_skipped,
         "required_match_ids": required_match_ids,
         "last_successful_match_ids": successful_match_ids,
+        "failed_match_ids": sorted(set(failed_match_ids)),
         "maximum_request_duration_seconds": max(request_durations, default=0.0),
     }
 
@@ -2000,7 +2010,7 @@ def parse_args() -> argparse.Namespace:
         "--prematch-interval",
         type=float,
         default=60.0,
-        help="seconds between schedule discovery refreshes; odds are captured once inside T-2h",
+        help="seconds between schedule discovery refreshes; prematch odds remain audit-only",
     )
     parser.add_argument("--completed-interval", type=float, default=300.0)
     parser.add_argument("--max-backoff", type=float, default=300.0)

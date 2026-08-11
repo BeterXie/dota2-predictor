@@ -1,5 +1,5 @@
 import { Tab, TabList } from "@fluentui/react-components";
-import { ArrowLeft, Broadcast, ClockCounterClockwise, Flask, GearSix } from "@phosphor-icons/react";
+import { ArrowLeft, Broadcast, ClockCounterClockwise, Flask, GearSix, Trophy } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -15,8 +15,10 @@ import {
   invalidateMapping,
   snapshotStream,
 } from "./api";
+import { formatDateTime } from "./format";
 import { MatchRail } from "./components/MatchRail";
 import { MatchWorkspace } from "./components/MatchWorkspace";
+import { FanMatchRecap } from "./components/FanMatchRecap";
 import { OperationsPanel } from "./components/OperationsPanel";
 import { VisionCalibrationPage } from "./components/VisionCalibrationPage";
 import type {
@@ -30,7 +32,8 @@ import type {
 } from "./types";
 
 
-type ViewMode = "live" | "replay" | "operations" | "vision";
+type ViewMode = "live" | "recap" | "replay" | "operations" | "vision";
+const MATCH_DETAIL_REFRESH_MS = 5_000;
 
 
 export default function App() {
@@ -76,7 +79,7 @@ export default function App() {
   }, [view]);
 
   useEffect(() => {
-    if (view !== "replay") return undefined;
+    if (view !== "replay" && view !== "recap") return undefined;
     const controller = new AbortController();
     setHistoryLoading(true);
     setHistoryError(null);
@@ -112,18 +115,37 @@ export default function App() {
       setDetail(null);
       return undefined;
     }
-    const controller = new AbortController();
+    let controller: AbortController | null = null;
+    let refreshTimer: number | null = null;
+    let stopped = false;
     setLoading(true);
-    fetchMatchDetail(selectedId, controller.signal).then((value) => {
-      setDetail(value);
-      setError(null);
-    }).catch((reason: Error) => {
-      if (reason.name !== "AbortError") setError(reason.message || "无法加载赛事详情");
-    }).finally(() => {
-      if (!controller.signal.aborted) setLoading(false);
-    });
-    return () => controller.abort();
-  }, [selectedId, view, snapshot?.cursor]);
+    const load = async () => {
+      controller = new AbortController();
+      try {
+        const value = await fetchMatchDetail(selectedId, controller.signal);
+        if (stopped) return;
+        setDetail(value);
+        setError(null);
+      } catch (reason) {
+        if (!stopped && (reason as Error).name !== "AbortError") {
+          setError((reason as Error).message || "无法加载赛事详情");
+        }
+      } finally {
+        if (!stopped) {
+          setLoading(false);
+          if (view === "live") {
+            refreshTimer = window.setTimeout(() => void load(), MATCH_DETAIL_REFRESH_MS);
+          }
+        }
+      }
+    };
+    void load();
+    return () => {
+      stopped = true;
+      controller?.abort();
+      if (refreshTimer != null) window.clearTimeout(refreshTimer);
+    };
+  }, [selectedId, view]);
 
   useEffect(() => {
     if (!selectedId || view !== "operations") {
@@ -138,9 +160,10 @@ export default function App() {
     return () => controller.abort();
   }, [selectedId, view, snapshot?.mapping_revision]);
 
-  const matches = view === "replay" ? history : snapshot?.matches || [];
+  const historyView = view === "replay" || view === "recap";
+  const matches = historyView ? history : snapshot?.matches || [];
   const visibleMatches = useMemo(
-    () => view === "replay"
+    () => view === "replay" || view === "recap"
       ? matches.filter((match) => match.history_eligible)
       : matches.filter((match) => match.lifecycle !== "ended" && !match.history_eligible),
     [matches, view],
@@ -227,10 +250,17 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className={view === "vision" ? "app-header vision-header-mode" : "app-header"}>
+      <header className={[
+        "app-header",
+        view === "vision" ? "vision-header-mode" : "",
+        view === "recap" ? "recap-header-mode" : "",
+      ].filter(Boolean).join(" ")}>
         <div className="brand-block">
           <Broadcast size={24} aria-hidden="true" />
-          <div><strong>Dota 2 实时阵容预测</strong><span>RayBet · HUD · Team Rating · R.O.S.H.</span></div>
+          <div>
+            <strong>{view === "recap" ? "Dota 2 比赛复盘" : "Dota 2 实时阵容预测"}</strong>
+            <span>{view === "recap" ? "赛果、阵容与关键走势" : "RayBet · HUD · Team Rating · R.O.S.H."}</span>
+          </div>
         </div>
         <TabList
           aria-label="产品导航"
@@ -239,6 +269,7 @@ export default function App() {
           onTabSelect={(_, data) => changeView(data.value as ViewMode)}
         >
           <Tab icon={<Broadcast size={17} />} value="live">实时赛事</Tab>
+          <Tab icon={<Trophy size={17} />} value="recap">比赛复盘</Tab>
           <Tab icon={<ClockCounterClockwise size={17} />} value="replay">历史结果</Tab>
           <Tab icon={<GearSix size={17} />} value="operations">运行控制</Tab>
           <Tab icon={<Flask size={17} />} value="vision">Vision 校正</Tab>
@@ -249,7 +280,7 @@ export default function App() {
       <div className={[
         "app-content",
         view === "vision" ? "vision-mode" : "",
-        view === "live" || view === "replay"
+        view === "live" || view === "replay" || view === "recap"
           ? selectedId ? "detail-mode" : "list-mode"
           : "",
       ].filter(Boolean).join(" ")}>
@@ -286,7 +317,9 @@ export default function App() {
           <div className="live-detail-view">
             <div className="live-detail-toolbar">
               <button
-                aria-label={view === "replay" ? "返回历史结果列表" : "返回实时与赛前赛事列表"}
+                aria-label={view === "recap"
+                  ? "返回比赛复盘列表"
+                  : view === "replay" ? "返回历史结果列表" : "返回实时与赛前赛事列表"}
                 className="live-detail-back"
                 onClick={() => {
                   setSelectedId(null);
@@ -295,34 +328,45 @@ export default function App() {
                 type="button"
               >
                 <ArrowLeft size={17} weight="bold" aria-hidden="true" />
-                <span>{view === "replay" ? "历史结果" : "赛事列表"}</span>
+                <span>{view === "recap" ? "比赛复盘" : view === "replay" ? "历史结果" : "赛事列表"}</span>
               </button>
               <div className="live-detail-context">
                 <strong>{selectedMatch
                   ? `${selectedMatch.team_one || "队伍一"} vs ${selectedMatch.team_two || "队伍二"}`
                   : "赛事详情"}</strong>
-                <span>{selectedMatch?.display_name
-                  || selectedMatch?.tournament
-                  || `RayBet ${selectedId}`}</span>
+                <span>{view === "recap"
+                  ? `${selectedMatch?.tournament || "赛事待确认"} · ${formatDateTime(selectedMatch?.scheduled_at)}`
+                  : selectedMatch?.display_name
+                    || selectedMatch?.tournament
+                    || `RayBet ${selectedId}`}</span>
               </div>
             </div>
-            <MatchWorkspace
-              csrfToken={controlSession?.csrf_token || null}
-              detail={detail}
-              error={error}
-              loading={loading || (view === "replay" && historyLoading && history.length === 0)}
-              match={selectedMatch}
-              replay={view === "replay"}
-            />
+            {view === "recap" ? (
+              <FanMatchRecap
+                detail={detail}
+                error={error}
+                loading={loading || (historyLoading && history.length === 0)}
+                match={selectedMatch}
+              />
+            ) : (
+              <MatchWorkspace
+                csrfToken={controlSession?.csrf_token || null}
+                detail={detail}
+                error={error}
+                loading={loading || (view === "replay" && historyLoading && history.length === 0)}
+                match={selectedMatch}
+                replay={view === "replay"}
+              />
+            )}
           </div>
         ) : (
           <MatchRail
-            hasMore={view === "replay" && historyHasMore}
-            loadError={view === "replay" ? historyError : null}
-            loadingMore={view === "replay" && historyLoading}
+            hasMore={historyView && historyHasMore}
+            loadError={historyView ? historyError : null}
+            loadingMore={historyView && historyLoading}
             matches={visibleMatches}
-            mode={view === "replay" ? "history" : "live"}
-            onLoadMore={view === "replay" ? () => void loadMoreHistory() : undefined}
+            mode={view === "recap" ? "recap" : view === "replay" ? "history" : "live"}
+            onLoadMore={historyView ? () => void loadMoreHistory() : undefined}
             onSelect={setSelectedId}
             selectedId={null}
             variant="page"
@@ -336,7 +380,9 @@ export default function App() {
 
 function initialView(): ViewMode {
   const value = new URLSearchParams(window.location.search).get("view");
-  return value === "replay" || value === "operations" || value === "vision" ? value : "live";
+  return value === "recap" || value === "replay" || value === "operations" || value === "vision"
+    ? value
+    : "live";
 }
 
 

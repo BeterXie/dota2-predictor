@@ -16,6 +16,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from contracts.live_observation import MAP_START_EVIDENCE_WINDOW_SECONDS
 from database.engine import build_engine
 from database.session import DatabaseResult, DatabaseRow, PostgresSession
 
@@ -37,6 +38,7 @@ from .odds_response_authority import (
     response_state_identity as canonical_response_state_identity,
     snapshot_derived_payload,
 )
+from .raybet_state import explicit_raybet_map_times
 from .sanitize import (
     PUBLIC_STREAM_EVIDENCE_KEY,
     public_stream_evidence,
@@ -54,7 +56,7 @@ from .vision_frame_registry import (
 
 
 CURRENT_SCHEMA_VERSION = 12
-ALEMBIC_HEAD = "20260807_0034"
+ALEMBIC_HEAD = "20260807_0035"
 VISION_DRAFT_CONFLICT_REASON = "confirmed_draft_conflict"
 _DIRECT_RESPONSE_ENDPOINTS = {
     "live_match_list": "https://raybet.local/v2/match/live",
@@ -63,6 +65,69 @@ _DIRECT_RESPONSE_ENDPOINTS = {
     "completed_odds": "https://raybet.local/v2/odds",
     "final_odds": "https://raybet.local/v2/odds",
 }
+
+
+def _verified_vision_map_start(
+    connection: PostgresSession,
+    *,
+    raybet_match_id: str,
+    map_number: int,
+    captured_at: datetime,
+) -> bool:
+    if map_number == 1:
+        return True
+    row = connection.execute(
+        """SELECT 1
+             FROM vision_observations AS observation
+             JOIN active_vision_frame_artifacts AS frame
+               ON frame.frame_ref=observation.source_frame_ref
+              AND frame.content_sha256=observation.source_frame_sha256
+              AND frame.byte_length=observation.source_frame_bytes
+            WHERE observation.raybet_match_id=?
+              AND observation.map_number=?
+              AND observation.game_clock_seconds BETWEEN ? AND ?
+              AND observation.screen_state='game'
+              AND observation.clock_confidence>=0.9
+              AND observation.source_frame_ref=
+                  'vision-frame:sha256:' || frame.content_sha256
+              AND live_text_timestamp_utc(observation.captured_at)<=
+                  CAST(? AS timestamptz)
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM vision_observation_invalidations AS invalidation
+                   WHERE invalidation.raybet_match_id=
+                         observation.raybet_match_id
+                     AND invalidation.captured_at=observation.captured_at
+                     AND invalidation.source_frame_ref=observation.source_frame_ref
+              )
+            LIMIT 1""",
+        (
+            raybet_match_id,
+            map_number,
+            -MAP_START_EVIDENCE_WINDOW_SECONDS,
+            MAP_START_EVIDENCE_WINDOW_SECONDS,
+            captured_at.isoformat(),
+        ),
+    ).fetchone()
+    if row is not None:
+        return True
+    provider = connection.execute(
+        "SELECT raw_json, best_of FROM raybet_matches WHERE raybet_match_id=?",
+        (raybet_match_id,),
+    ).fetchone()
+    if provider is None or type(provider[1]) is not int:
+        return False
+    try:
+        payload = json.loads(str(provider[0]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    provider_started_at = explicit_raybet_map_times(
+        payload,
+        int(provider[1]),
+    ).get(map_number)
+    return provider_started_at is not None and captured_at >= provider_started_at
 
 
 def _load_odds_raw_artifact(
@@ -1780,21 +1845,6 @@ class LiveBettingStore:
             *state[2:],
         )
 
-    def upsert_match_link(
-        self, raybet_match_id: str, provider: str, provider_match_id: str,
-        confidence: float, status: str, reason: str, created_at: datetime,
-    ) -> None:
-        self.execute(
-            """INSERT INTO match_links VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(raybet_match_id, provider) DO UPDATE SET
-              provider_match_id=CASE WHEN match_links.status='accepted'
-                THEN match_links.provider_match_id ELSE excluded.provider_match_id END,
-              confidence=excluded.confidence, status=CASE WHEN match_links.status='accepted'
-                THEN match_links.status ELSE excluded.status END, reason=excluded.reason""",
-            (raybet_match_id, provider, provider_match_id, confidence, status, reason,
-             created_at.isoformat()),
-        )
-
     def insert_odds(self, snapshot: OddsSnapshot) -> bool:
         market = snapshot.market
         previous = self.connection.execute(
@@ -1881,7 +1931,10 @@ class LiveBettingStore:
             observation.radiant_hero_ids,
             observation.dire_hero_ids,
             observation.source_frame_ref,
-        ) and bool(observation.is_confirmed) and frame_receipt is not None
+        ) and bool(
+            observation.is_confirmed
+            or getattr(observation, "is_draft_confirmed", False)
+        ) and frame_receipt is not None
         with self.transaction():
             if frame_receipt is not None:
                 register_vision_frame_artifact(
@@ -1975,6 +2028,12 @@ class LiveBettingStore:
             and state.confidence >= 0.9
             and type(state.radiant_net_worth) is int
             and type(state.dire_net_worth) is int
+            and _verified_vision_map_start(
+                self.connection,
+                raybet_match_id=observation.raybet_match_id,
+                map_number=observation.map_number,
+                captured_at=observation.captured_at,
+            )
         ):
             try:
                 append_live_game_snapshot(

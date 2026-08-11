@@ -33,6 +33,7 @@ def promoted_profile_feature_path(
     if (
         not isinstance(manifest, dict)
         or manifest.get("profile_id") != profile_id
+        or manifest.get("source_identity_verified") is not True
         or not feature_path.is_file()
     ):
         return None

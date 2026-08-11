@@ -186,29 +186,55 @@ class TeamSideRecognizer:
 
     def __init__(
         self,
-        team_one_logo: np.ndarray,
-        team_two_logo: np.ndarray,
+        team_one_logo: np.ndarray | None,
+        team_two_logo: np.ndarray | None,
         layout: BroadcastLayout = STANDARD_DOTA_HUD,
         *,
         team_names: tuple[str, str] | None = None,
         use_ocr: bool = True,
     ) -> None:
-        if layout.radiant_team_logo is None or layout.dire_team_logo is None:
+        if (team_one_logo is None) != (team_two_logo is None):
+            raise ValueError("team logo templates must be both present or both absent")
+        logo_mode = team_one_logo is not None and team_two_logo is not None
+        if logo_mode and (
+            layout.radiant_team_logo is None or layout.dire_team_logo is None
+        ):
             raise ValueError("layout does not define team logo regions")
-        self.team_one_hash = compute_phash(_silhouette(team_one_logo), hash_size=8)
-        self.team_two_hash = compute_phash(_silhouette(team_two_logo), hash_size=8)
         self.layout = layout
         self.team_name_keys = (
             tuple(_normalize(name) for name in team_names)
             if team_names is not None
             else None
         )
+        if not logo_mode and (
+            self.team_name_keys is None
+            or any(not name for name in self.team_name_keys)
+            or self.team_name_keys[0] == self.team_name_keys[1]
+            or layout.radiant_team_name is None
+            or layout.dire_team_name is None
+        ):
+            raise ValueError("name-only team-side recognition requires two distinct names")
+        self.team_one_hash = (
+            compute_phash(_silhouette(team_one_logo), hash_size=8)
+            if team_one_logo is not None
+            else None
+        )
+        self.team_two_hash = (
+            compute_phash(_silhouette(team_two_logo), hash_size=8)
+            if team_two_logo is not None
+            else None
+        )
+        self.use_ocr = use_ocr
         self.ocr = None
+        self._ensure_ocr()
+
+    def _ensure_ocr(self) -> None:
         if (
-            use_ocr
+            self.use_ocr
+            and self.ocr is None
             and self.team_name_keys is not None
-            and layout.radiant_team_name is not None
-            and layout.dire_team_name is not None
+            and self.layout.radiant_team_name is not None
+            and self.layout.dire_team_name is not None
         ):
             try:
                 from rapidocr_onnxruntime import RapidOCR
@@ -216,6 +242,15 @@ class TeamSideRecognizer:
                 self.ocr = RapidOCR()
             except ImportError:
                 pass
+
+    def set_layout(self, layout: BroadcastLayout) -> None:
+        if self.team_one_hash is None:
+            if layout.radiant_team_name is None or layout.dire_team_name is None:
+                raise ValueError("layout does not define team name regions")
+        elif layout.radiant_team_logo is None or layout.dire_team_logo is None:
+            raise ValueError("layout does not define team logo regions")
+        self.layout = layout
+        self._ensure_ocr()
 
     @staticmethod
     def from_database(
@@ -254,15 +289,15 @@ class TeamSideRecognizer:
                 )
                 for index in range(2)
             ]
-        for index, urls in enumerate(candidates):
-            if not urls:
-                return TeamSideRecognizerLoad(
-                    None,
-                    f"team_{'one' if index == 0 else 'two'}_logo_missing",
-                )
-        images: list[np.ndarray] = []
+        images: list[np.ndarray | None] = []
+        logo_errors: list[str] = []
         with httpx.Client(timeout=20.0, follow_redirects=False) as client:
             for index, urls in enumerate(candidates):
+                team = "one" if index == 0 else "two"
+                if not urls:
+                    images.append(None)
+                    logo_errors.append(f"team_{team}_logo_missing")
+                    continue
                 image = None
                 for url in urls:
                     try:
@@ -272,19 +307,43 @@ class TeamSideRecognizer:
                     if image is not None:
                         break
                 if image is None:
-                    return TeamSideRecognizerLoad(
-                        None,
-                        f"team_{'one' if index == 0 else 'two'}_logo_invalid",
-                    )
+                    logo_errors.append(f"team_{team}_logo_invalid")
                 images.append(image)
+        if all(image is not None for image in images):
+            return TeamSideRecognizerLoad(
+                TeamSideRecognizer(images[0], images[1], team_names=team_names),
+                None,
+            )
+        try:
+            recognizer = TeamSideRecognizer(
+                None,
+                None,
+                team_names=team_names,
+            )
+        except ValueError:
+            return TeamSideRecognizerLoad(None, ",".join(logo_errors))
+        if recognizer.ocr is None:
+            return TeamSideRecognizerLoad(None, ",".join(logo_errors))
         return TeamSideRecognizerLoad(
-            TeamSideRecognizer(images[0], images[1], team_names=team_names),
-            None,
+            recognizer,
+            f"{','.join(logo_errors)}:team_name_ocr_fallback",
         )
 
     @staticmethod
     def _similarity(one: np.ndarray, two: np.ndarray) -> float:
         return 1.0 - float(np.mean(one != two))
+
+    @staticmethod
+    def _ocr_left_edge(item: object) -> float:
+        try:
+            points = np.asarray(item[0], dtype=np.float32)  # type: ignore[index]
+        except (IndexError, TypeError, ValueError):
+            return float("inf")
+        if points.size == 0:
+            return float("inf")
+        if points.ndim == 1:
+            return float(points[0])
+        return float(np.min(points[..., 0]))
 
     def _team_name_readings(
         self,
@@ -298,10 +357,14 @@ class TeamSideRecognizer:
             return ()
         enlarged = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         result, _ = self.ocr(enlarged)
+        ordered = sorted(
+            (item for item in result or () if len(item) >= 3),
+            key=self._ocr_left_edge,
+        )
         readings = tuple(
             (_normalize(str(item[1])), float(item[2]))
-            for item in result or ()
-            if len(item) >= 3 and _normalize(str(item[1]))
+            for item in ordered
+            if _normalize(str(item[1]))
         )
         if len(readings) <= 1:
             return readings
@@ -336,6 +399,10 @@ class TeamSideRecognizer:
         return None
 
     def read(self, image: np.ndarray) -> TeamSideReading:
+        if self.team_one_hash is None or self.team_two_hash is None:
+            return self._read_team_names(image) or TeamSideReading(None, 0.0)
+        assert self.layout.radiant_team_logo is not None
+        assert self.layout.dire_team_logo is not None
         left = compute_phash(
             _silhouette(self.layout.radiant_team_logo.crop(image)), hash_size=8
         )

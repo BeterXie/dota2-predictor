@@ -27,21 +27,27 @@ class MapStateTracker:
         self.pause_frames = pause_frames
         self.map_number = 1
         self.last_seconds: int | None = None
+        self.last_raw_seconds: int | None = None
         self.same_count = 0
         self._recent: deque[int] = deque(maxlen=confirmations)
         self._jump_recent: deque[int] = deque(maxlen=confirmations)
         self.frozen = False
         self.min_confidence = min_confidence
         self.regression_count = 0
+        self._pregame_countdown = False
+        self._pregame_detection_open = True
 
     def reset_map(self, map_number: int) -> None:
         self.map_number = map_number
         self.last_seconds = None
+        self.last_raw_seconds = None
         self.same_count = 0
         self._recent.clear()
         self._jump_recent.clear()
         self.frozen = False
         self.regression_count = 0
+        self._pregame_countdown = False
+        self._pregame_detection_open = True
 
     def update(self, reading: ClockReading) -> ConfirmedClock | None:
         if (
@@ -50,7 +56,46 @@ class MapStateTracker:
             or reading.confidence < self.min_confidence
         ):
             return None
-        seconds = reading.seconds
+        raw_seconds = reading.seconds
+        seconds = raw_seconds
+        if self._pregame_countdown:
+            if (
+                self.last_raw_seconds is not None
+                and self.last_raw_seconds <= 3
+                and raw_seconds > self.last_raw_seconds
+            ):
+                # EPL omits the minus sign before the horn.  Once the visible
+                # counter starts increasing from zero, begin a fresh positive
+                # confirmation sequence for the real game clock.
+                self._pregame_countdown = False
+                self._pregame_detection_open = False
+                self.last_seconds = None
+                self.same_count = 0
+                self._recent.clear()
+                self._jump_recent.clear()
+                self.regression_count = 0
+            else:
+                seconds = -raw_seconds
+        elif self._pregame_detection_open:
+            previous_raw = self.last_raw_seconds
+            if raw_seconds > 180:
+                self._pregame_detection_open = False
+            elif (
+                previous_raw is not None
+                and 0 <= raw_seconds < previous_raw <= 180
+                and previous_raw - raw_seconds <= 3
+            ):
+                self._pregame_countdown = True
+                self.last_seconds = -previous_raw
+                self.same_count = 0
+                self._recent.clear()
+                self._recent.append(-previous_raw)
+                self._jump_recent.clear()
+                self.regression_count = 0
+                seconds = -raw_seconds
+            elif previous_raw is not None and raw_seconds > previous_raw:
+                self._pregame_detection_open = False
+        self.last_raw_seconds = raw_seconds
         if self.last_seconds is not None:
             if seconds > self.last_seconds + 10:
                 self._jump_recent.append(seconds)

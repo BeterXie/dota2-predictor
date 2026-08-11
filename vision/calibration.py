@@ -17,7 +17,11 @@ import cv2
 import numpy as np
 
 from vision.hero_recognizer import DEFAULT_FEATURE_PATH
-from vision.image_features import color_histogram, compute_phash
+from vision.image_features import (
+    MAX_VARIANTS_PER_HERO,
+    color_histogram,
+    compute_phash,
+)
 from vision.profile_features import promoted_profile_feature_path
 from vision.stable_runtime import _LAYOUTS
 
@@ -96,6 +100,11 @@ class VisionCalibrationService:
                 "calibration label requires a RayBet match ID and map number"
             )
         event = self._event(event_id)
+        self._require_event_identity(
+            event,
+            raybet_match_id=normalized_match_id,
+            map_number=map_number,
+        )
         now = datetime.now(timezone.utc).isoformat()
         label = {
             "label_id": event_id,
@@ -106,6 +115,9 @@ class VisionCalibrationService:
             "hero_ids": list(hero_ids),
             "raybet_match_id": normalized_match_id,
             "map_number": map_number,
+            "event_captured_at": event["captured_at"],
+            "event_source_frame_ref": event["source_frame_ref"],
+            "source_identity_verified": True,
             "note": note,
             "updated_at": now,
         }
@@ -113,17 +125,51 @@ class VisionCalibrationService:
         self._write_json(path, label)
         return label
 
-    def build_candidate(self, label_id: str) -> dict[str, object]:
+    def build_candidate(
+        self,
+        label_id: str,
+        *,
+        base_candidate_id: str | None = None,
+    ) -> dict[str, object]:
         label = self._label(label_id)
         event = self._event(str(label["event_id"]))
+        self._require_label_event_identity(label, event)
         if label["layout"] not in _LAYOUTS:
             raise ValueError("candidate building requires a supported layout")
         crop_paths = [Path(str(path)) for path in event["crop_paths"]]
         if len(crop_paths) != 10:
             raise ValueError("candidate building requires ten retained hero crops")
         hero_ids = tuple(int(value) for value in label["hero_ids"])
+        profile_id = self._profile_id(label.get("layout"))
+        base_candidate: dict[str, object] | None = None
+        if base_candidate_id is not None:
+            base_candidate = self._candidate(base_candidate_id)
+            base_profile_id = self._profile_id(
+                base_candidate.get("profile_id") or base_candidate.get("layout")
+            )
+            if base_profile_id != profile_id:
+                raise ValueError("base candidate belongs to another UI profile")
+            if base_candidate.get("source_identity_verified") is not True:
+                raise ValueError("base candidate has no verified source identity")
+            base_feature_path = (
+                self.paths.calibration_root
+                / "candidates"
+                / f"{base_candidate_id}.npz"
+            )
+            if (
+                not base_feature_path.is_file()
+                or self._sha256(base_feature_path)
+                != str(base_candidate.get("feature_sha256") or "")
+            ):
+                raise ValueError("base candidate feature artifact failed integrity verification")
+        else:
+            promoted_feature_path = promoted_profile_feature_path(
+                profile_id,
+                calibration_root=self.paths.calibration_root,
+            )
+            base_feature_path = promoted_feature_path or self.feature_path
 
-        with np.load(str(self.feature_path)) as source:
+        with np.load(str(base_feature_path)) as source:
             ids = np.asarray(source["ids"], dtype=np.int32).copy()
             names = (
                 np.asarray(source["variant_names"]).astype(str).copy()
@@ -134,6 +180,7 @@ class VisionCalibrationService:
             histograms = np.asarray(source["histograms"], dtype=np.float32).copy()
             thumbnails = np.asarray(source["thumbnails"], dtype=np.uint8).copy()
 
+        added_variants = 0
         for hero_id, crop_path in zip(hero_ids, crop_paths, strict=True):
             base_rows = np.flatnonzero((ids == hero_id) & (names == str(hero_id)))
             if len(base_rows) != 1:
@@ -141,15 +188,40 @@ class VisionCalibrationService:
             crop = cv2.imread(str(crop_path))
             if crop is None or crop.size == 0:
                 raise ValueError(f"unreadable calibration crop: {crop_path.name}")
-            row = int(base_rows[0])
-            hashes[row] = compute_phash(crop, hash_size=8)
-            histograms[row] = color_histogram(crop)
+            crop_hash = compute_phash(crop, hash_size=8)
+            variant_digest = hashlib.sha256(crop.tobytes()).hexdigest()[:12]
+            variant_name = f"{hero_id}__calibration_{variant_digest}"
+            existing_rows = np.flatnonzero(
+                (ids == hero_id) & (names == variant_name)
+            )
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            thumbnails[row] = cv2.resize(
+            thumbnail = cv2.resize(
                 gray,
                 (48, 32),
                 interpolation=cv2.INTER_AREA,
             )
+            histogram = color_histogram(crop)
+            if len(existing_rows) == 1:
+                row = int(existing_rows[0])
+                hashes[row] = crop_hash
+                histograms[row] = histogram
+                thumbnails[row] = thumbnail
+                continue
+            hero_variant_count = int(np.count_nonzero(ids == hero_id))
+            if hero_variant_count >= MAX_VARIANTS_PER_HERO:
+                raise ValueError(
+                    f"hero {hero_id} reached the {MAX_VARIANTS_PER_HERO} variant limit"
+                )
+            ids = np.append(ids, np.int32(hero_id))
+            names = np.append(names, variant_name)
+            hashes = np.concatenate((hashes, crop_hash[np.newaxis, :]), axis=0)
+            histograms = np.concatenate(
+                (histograms, histogram[np.newaxis, :]), axis=0
+            )
+            thumbnails = np.concatenate(
+                (thumbnails, thumbnail[np.newaxis, :, :]), axis=0
+            )
+            added_variants += 1
 
         candidate_id = f"candidate-{label_id}-{uuid4().hex[:8]}"
         candidate_root = self.paths.calibration_root / "candidates"
@@ -171,8 +243,15 @@ class VisionCalibrationService:
             "candidate_id": candidate_id,
             "label_id": label_id,
             "layout": label["layout"],
-            "profile_id": self._profile_id(label.get("layout")),
+            "profile_id": profile_id,
+            "source_identity_verified": True,
+            "raybet_match_id": label["raybet_match_id"],
+            "map_number": label["map_number"],
+            "event_source_frame_ref": label["event_source_frame_ref"],
             "hero_ids": list(hero_ids),
+            "added_variant_count": added_variants,
+            "base_candidate_id": base_candidate_id,
+            "base_feature_sha256": self._sha256(base_feature_path),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "feature_sha256": self._sha256(feature_path),
             "production_feature_sha256": self._sha256(self.feature_path),
@@ -191,6 +270,11 @@ class VisionCalibrationService:
         if len(unique_ids) < 2:
             raise ValueError("promotion requires two held-out perception evaluations")
         candidate = self._candidate(candidate_id)
+        if candidate.get("source_identity_verified") is not True:
+            raise ValueError("candidate has no verified source identity")
+        label = self._label(str(candidate.get("label_id") or ""))
+        event = self._event(str(label.get("event_id") or ""))
+        self._require_label_event_identity(label, event)
         profile_id = self._profile_id(
             candidate.get("profile_id") or candidate.get("layout")
         )
@@ -232,6 +316,11 @@ class VisionCalibrationService:
             "evaluation_ids": list(unique_ids),
             "promoted_at": datetime.now(timezone.utc).isoformat(),
             "promoted": True,
+            "source_identity_verified": True,
+            "label_id": label["label_id"],
+            "raybet_match_id": label["raybet_match_id"],
+            "map_number": label["map_number"],
+            "event_source_frame_ref": label["event_source_frame_ref"],
         }
         self._write_json(promoted_root / f"{profile_id}.json", manifest)
         if (
@@ -261,6 +350,10 @@ class VisionCalibrationService:
             raise ValueError("evaluation mode must be perception or runtime")
         label = self._label(label_id)
         candidate = self._candidate(candidate_id)
+        if candidate.get("source_identity_verified") is not True:
+            raise ValueError("candidate has no verified source identity")
+        event = self._event(str(label.get("event_id") or ""))
+        self._require_label_event_identity(label, event)
         label_profile = self._profile_id(label.get("layout"))
         candidate_profile = self._profile_id(
             candidate.get("profile_id") or candidate.get("layout")
@@ -455,6 +548,33 @@ class VisionCalibrationService:
             else []
         )
         label = self._optional_json(self._label_path(event_id))
+        raw_match_id = payload.get("raybet_match_id")
+        raybet_match_id = (
+            str(raw_match_id).strip()
+            if isinstance(raw_match_id, str) and str(raw_match_id).strip()
+            else None
+        )
+        raw_map_number = payload.get("map_number")
+        map_number = (
+            int(raw_map_number)
+            if type(raw_map_number) is int and int(raw_map_number) > 0
+            else None
+        )
+        source_frame_ref = payload.get("source_frame_ref")
+        source_frame_ref = (
+            str(source_frame_ref).strip()
+            if isinstance(source_frame_ref, str) and str(source_frame_ref).strip()
+            else None
+        )
+        relative_parts = Path(relative).parts
+        identity_verified = (
+            payload.get("identity_status") == "explicit_watcher_context"
+            and raybet_match_id is not None
+            and map_number is not None
+            and source_frame_ref is not None
+            and relative_parts[:3]
+            == ("series", raybet_match_id, f"map_{map_number}")
+        )
         return {
             "event_id": event_id,
             "relative_path": relative,
@@ -463,6 +583,10 @@ class VisionCalibrationService:
             "layout": payload.get("layout"),
             "profile_id": self._profile_id(payload.get("layout")),
             "reason": str(payload.get("reason") or "unknown"),
+            "raybet_match_id": raybet_match_id,
+            "map_number": map_number,
+            "source_frame_ref": source_frame_ref,
+            "identity_status": "verified" if identity_verified else "missing",
             "blocker_code": hud.get("blocker_code"),
             "screen_state": hud.get("screen_state"),
             "replay_gate_status": hud.get("replay_gate_status"),
@@ -484,12 +608,93 @@ class VisionCalibrationService:
         root = self.paths.calibration_root / "candidates"
         if not root.exists():
             return []
-        rows = [self._optional_json(path) for path in root.glob("*.json")]
+
+        promoted_by_candidate: dict[str, dict[str, object]] = {}
+        promoted_root = self.paths.calibration_root / "promoted"
+        if promoted_root.exists():
+            for path in promoted_root.glob("*.json"):
+                manifest = self._optional_json(path)
+                if not manifest or manifest.get("promoted") is not True:
+                    continue
+                profile_id = str(manifest.get("profile_id") or "")
+                candidate_id = str(manifest.get("candidate_id") or "")
+                if (
+                    not candidate_id
+                    or promoted_profile_feature_path(
+                        profile_id,
+                        calibration_root=self.paths.calibration_root,
+                    )
+                    is None
+                ):
+                    continue
+                promoted_by_candidate[candidate_id] = manifest
+
+        rows: list[dict[str, object]] = []
+        for path in root.glob("*.json"):
+            stored = self._optional_json(path)
+            if stored is None:
+                continue
+            row = dict(stored)
+            manifest = promoted_by_candidate.get(str(row.get("candidate_id") or ""))
+            is_promoted = (
+                manifest is not None
+                and manifest.get("feature_sha256") == row.get("feature_sha256")
+                and manifest.get("source_identity_verified") is True
+            )
+            row["promoted"] = is_promoted
+            if is_promoted:
+                row["promoted_at"] = manifest.get("promoted_at")
+                row["promotion_evaluation_ids"] = manifest.get("evaluation_ids", [])
+            rows.append(row)
         return sorted(
-            (row for row in rows if row is not None),
+            rows,
             key=lambda row: str(row.get("created_at") or ""),
             reverse=True,
         )
+
+    @staticmethod
+    def _require_event_identity(
+        event: dict[str, object],
+        *,
+        raybet_match_id: str,
+        map_number: int,
+    ) -> None:
+        if event.get("identity_status") != "verified":
+            raise ValueError("calibration event has no verified Series/Map identity")
+        if (
+            event.get("raybet_match_id") != raybet_match_id
+            or event.get("map_number") != map_number
+        ):
+            raise ValueError("calibration label identity differs from its debug event")
+        screen_state = event.get("screen_state")
+        replay_gate_status = event.get("replay_gate_status")
+        if screen_state == "game" and replay_gate_status != "live":
+            raise ValueError("calibration game event is replay or untrusted")
+        if screen_state not in {"draft", "game"}:
+            raise ValueError("calibration event is not a draft or game frame")
+
+    @classmethod
+    def _require_label_event_identity(
+        cls,
+        label: dict[str, object],
+        event: dict[str, object],
+    ) -> None:
+        if label.get("source_identity_verified") is not True:
+            raise ValueError("calibration label has no verified source identity")
+        match_id = str(label.get("raybet_match_id") or "").strip()
+        map_number = label.get("map_number")
+        if not match_id or type(map_number) is not int:
+            raise ValueError("calibration label identity is invalid")
+        cls._require_event_identity(
+            event,
+            raybet_match_id=match_id,
+            map_number=map_number,
+        )
+        if (
+            label.get("event_captured_at") != event.get("captured_at")
+            or label.get("event_source_frame_ref") != event.get("source_frame_ref")
+        ):
+            raise ValueError("calibration label source differs from its debug event")
 
     @classmethod
     def _profiles(

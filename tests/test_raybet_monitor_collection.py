@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -157,11 +157,17 @@ def test_due_scheduled_unlisted_match_is_retained_for_live_odds_polling() -> Non
     ]
 
 
-def test_future_prematch_collects_one_initial_audit_snapshot() -> None:
+def test_future_prematch_collects_when_no_recent_audit_snapshot() -> None:
+    now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
     class Connection:
         def execute(self, query: str, params: tuple[str, ...]) -> SimpleNamespace:
             assert "FROM direct_response_audit" in query
-            assert params[0] == "42"
+            assert params == (
+                "42",
+                (now - timedelta(seconds=115)).isoformat(),
+                now.isoformat(),
+            )
             return SimpleNamespace(fetchone=lambda: None)
 
     store = SimpleNamespace(connection=Connection())
@@ -173,8 +179,121 @@ def test_future_prematch_collects_one_initial_audit_snapshot() -> None:
             "status": "1",
             "start_time": "2026-08-09 23:00:00",
         },
+        now=now,
+    )
+
+
+def test_future_prematch_waits_for_two_minute_refresh_interval() -> None:
+    class Connection:
+        def execute(self, query: str, params: tuple[str, ...]) -> SimpleNamespace:
+            assert "FROM direct_response_audit" in query
+            return SimpleNamespace(fetchone=lambda: {"recent": 1})
+
+    store = SimpleNamespace(connection=Connection())
+
+    assert not monitor._prematch_collection_due(
+        store,
+        "42",
+        {
+            "id": "42",
+            "status": "1",
+            "start_time": "2026-08-09 23:00:00",
+        },
         now=datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc),
     )
+
+
+def test_prematch_due_clock_advances_for_each_serial_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_checked_at = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+    second_checked_at = first_checked_at + timedelta(seconds=9)
+    checked_at: list[datetime] = []
+    clock_values = iter((first_checked_at, second_checked_at))
+
+    def collection_due(
+        store: object,
+        match_id: str,
+        list_row: dict[str, object],
+        *,
+        now: datetime,
+    ) -> bool:
+        checked_at.append(now)
+        return True
+
+    monkeypatch.setattr(monitor, "_prematch_collection_due", collection_due)
+    monkeypatch.setattr(
+        monitor,
+        "_collect_odds_response",
+        lambda *args, **kwargs: (0, 2, "fingerprint", False),
+    )
+    store = SimpleNamespace(
+        raw_archive_root=tmp_path.resolve(),
+        record_collector=lambda *args, **kwargs: None,
+    )
+    rows = [
+        {
+            "id": match_id,
+            "status": "1",
+            "start_time": "2026-08-09 23:00:00",
+        }
+        for match_id in ("42", "43")
+    ]
+
+    result = monitor.collect_once(
+        store,
+        object(),
+        tmp_path.resolve(),
+        list_rows=rows,
+        audit_match_list=False,
+        wall_clock=lambda: next(clock_values),
+    )
+
+    assert result["prematch_collected"] == 2
+    assert checked_at == [first_checked_at, second_checked_at]
+
+
+def test_forced_prematch_refresh_does_not_defer_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_due_check(*args: object, **kwargs: object) -> bool:
+        raise AssertionError("full channel must collect immediately")
+
+    monkeypatch.setattr(
+        monitor,
+        "_prematch_collection_due",
+        unexpected_due_check,
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_collect_odds_response",
+        lambda *args, **kwargs: (0, 2, "fingerprint", False),
+    )
+    store = SimpleNamespace(
+        raw_archive_root=tmp_path.resolve(),
+        record_collector=lambda *args, **kwargs: None,
+    )
+
+    result = monitor.collect_once(
+        store,
+        object(),
+        tmp_path.resolve(),
+        list_rows=[
+            {
+                "id": "42",
+                "status": "1",
+                "start_time": "2026-08-09 23:00:00",
+            }
+        ],
+        audit_match_list=False,
+        force_prematch_refresh=True,
+    )
+
+    assert result["matches"] == 1
+    assert result["prematch_collected"] == 1
+    assert result["prematch_skipped"] == 0
 
 
 def test_scheduled_fallback_can_use_priority_polling() -> None:
@@ -260,3 +379,35 @@ def test_forced_scheduled_poll_is_not_treated_as_prematch(
             "audit_only": False,
         }
     ]
+
+
+def test_failed_odds_collection_reports_the_match_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_collection(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(monitor, "_collect_odds_response", fail_collection)
+    store = SimpleNamespace(
+        raw_archive_root=tmp_path.resolve(),
+        record_collector=lambda *args, **kwargs: None,
+    )
+
+    result = monitor.collect_once(
+        store,
+        object(),
+        tmp_path.resolve(),
+        list_rows=[{
+            "id": "42",
+            "status": "unlisted",
+            "start_time": "2026-08-08 17:00:00",
+            "_force_live_poll": True,
+        }],
+        audit_match_list=False,
+    )
+
+    assert result["errors"] == 1
+    assert result["required_match_ids"] == ["42"]
+    assert result["last_successful_match_ids"] == []
+    assert result["failed_match_ids"] == ["42"]

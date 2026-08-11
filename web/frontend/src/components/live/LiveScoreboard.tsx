@@ -1,11 +1,13 @@
 import { ArrowSquareOut, Clock } from "@phosphor-icons/react";
 import { formatClock, formatDateTime } from "../../format";
-import type { MonitorMatch, WatchLink } from "../../types";
+import type { MatchGameState, MonitorMatch, WatchLink } from "../../types";
 import { RelativeAge } from "../RelativeAge";
 import { LifecycleBadge } from "../StatusBadge";
 
 interface LiveScoreboardProps {
   match: MonitorMatch;
+  gameState: MatchGameState;
+  mapNumber: number | null;
   trustedVision: { game_clock_seconds?: number | null; map_number?: number | null } | null;
   now?: number;
   oddsObservedAt: string | null;
@@ -16,6 +18,8 @@ interface LiveScoreboardProps {
 
 export function LiveScoreboard({
   match,
+  gameState,
+  mapNumber,
   trustedVision,
   now,
   oddsObservedAt,
@@ -23,19 +27,17 @@ export function LiveScoreboard({
   oddsSnapshotLabel,
   watchLink,
 }: LiveScoreboardProps) {
-  const isLive = match.lifecycle === "live";
-  const isPrematch = match.lifecycle === "upcoming"
-    || ["1", "upcoming", "scheduled", "not_started"]
-      .includes(match.provider_status.trim().toLowerCase());
+  const isLive = gameState === "live";
+  const isPrematch = gameState === "scheduled";
   const gameClock = trustedVision?.game_clock_seconds;
-  const mapNum = trustedVision?.map_number;
+  const mapNum = trustedVision?.map_number || mapNumber;
 
   return (
     <section className="live-scoreboard-banner" aria-label="赛事概览">
       <div className="scoreboard-topline">
         <div className="scoreboard-meta">
           <strong>{match.tournament || "未知赛事"}</strong>
-          <LifecycleBadge lifecycle={isPrematch ? "upcoming" : match.lifecycle} />
+          <LifecycleBadge lifecycle={isLive ? "live" : isPrematch ? "upcoming" : match.lifecycle} />
           <span className="scoreboard-best-of">BO{match.best_of || "?"}</span>
         </div>
         <div className="scoreboard-actions">
